@@ -12,7 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 const s3ReadChunk = 188 * 56

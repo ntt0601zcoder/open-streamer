@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/open-streamer/open-streamer/internal/buffer"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/buffer"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 // dashRunOpts configures one shard of a multi-bitrate DASH ladder (nil = single-representation packager).

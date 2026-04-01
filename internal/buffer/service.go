@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/open-streamer/open-streamer/config"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/config"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/samber/do/v2"
 )
 

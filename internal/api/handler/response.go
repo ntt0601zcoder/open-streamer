@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/open-streamer/open-streamer/internal/store"
+	"github.com/ntthuan060102github/open-streamer/internal/store"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

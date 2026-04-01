@@ -16,10 +16,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/open-streamer/open-streamer/config"
-	"github.com/open-streamer/open-streamer/internal/domain"
-	"github.com/open-streamer/open-streamer/internal/events"
-	"github.com/open-streamer/open-streamer/internal/store"
+	"github.com/ntthuan060102github/open-streamer/config"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/events"
+	"github.com/ntthuan060102github/open-streamer/internal/store"
 	"github.com/samber/do/v2"
 )
 

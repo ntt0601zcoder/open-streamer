@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 const httpReadChunk = 188 * 56

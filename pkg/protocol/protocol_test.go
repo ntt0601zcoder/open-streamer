@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/open-streamer/open-streamer/pkg/protocol"
+	"github.com/ntthuan060102github/open-streamer/pkg/protocol"
 )
 
 func TestDetect(t *testing.T) {

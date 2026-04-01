@@ -11,7 +11,7 @@ import (
 	gortsp "github.com/yapingcat/gomedia/go-rtsp"
 	"github.com/yapingcat/gomedia/go-rtsp/sdp"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 const rtspChanSize = 512
@@ -125,10 +125,12 @@ type rtspClientHandler struct {
 	hasAudio bool
 }
 
+// HandleOption implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleOption(_ *gortsp.RtspClient, _ gortsp.RtspResponse, _ []string) error {
 	return nil
 }
 
+// HandleDescribe implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleDescribe(_ *gortsp.RtspClient, _ gortsp.RtspResponse, _ *sdp.Sdp, tracks map[string]*gortsp.RtspTrack) error {
 	for name, track := range tracks {
 		track := track // capture loop variable
@@ -181,42 +183,52 @@ func (h *rtspClientHandler) HandleDescribe(_ *gortsp.RtspClient, _ gortsp.RtspRe
 	return nil
 }
 
+// HandleSetup implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleSetup(_ *gortsp.RtspClient, _ gortsp.RtspResponse, _ *gortsp.RtspTrack, _ map[string]*gortsp.RtspTrack, _ string, _ int) error {
 	return nil
 }
 
+// HandleAnnounce implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleAnnounce(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
 
+// HandlePlay implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandlePlay(_ *gortsp.RtspClient, _ gortsp.RtspResponse, _ *gortsp.RangeTime, _ *gortsp.RtpInfo) error {
 	return nil
 }
 
+// HandlePause implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandlePause(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
 
+// HandleTeardown implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleTeardown(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
 
+// HandleGetParameter implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleGetParameter(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
 
+// HandleSetParameter implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleSetParameter(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
 
+// HandleRedirect implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleRedirect(_ *gortsp.RtspClient, _ gortsp.RtspRequest, _ string, _ *gortsp.RangeTime) error {
 	return nil
 }
 
+// HandleRecord implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleRecord(_ *gortsp.RtspClient, _ gortsp.RtspResponse, _ *gortsp.RangeTime, _ *gortsp.RtpInfo) error {
 	return nil
 }
 
+// HandleRequest implements gortsp.ClientHandle.
 func (h *rtspClientHandler) HandleRequest(_ *gortsp.RtspClient, _ gortsp.RtspRequest) error {
 	return nil
 }

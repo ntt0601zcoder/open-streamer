@@ -19,8 +19,8 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/open-streamer/open-streamer/internal/domain"
-	"github.com/open-streamer/open-streamer/internal/store"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/store"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // register "pgx" driver for database/sql
 )
@@ -71,6 +71,7 @@ VALUES ($1, $2, NOW())
 ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
 `
 
+// Save implements store.StreamRepository.
 func (r *streamRepo) Save(ctx context.Context, stream *domain.Stream) error {
 	payload, err := json.Marshal(stream)
 	if err != nil {
@@ -83,6 +84,7 @@ func (r *streamRepo) Save(ctx context.Context, stream *domain.Stream) error {
 	return nil
 }
 
+// FindByCode implements store.StreamRepository.
 func (r *streamRepo) FindByCode(ctx context.Context, code domain.StreamCode) (*domain.Stream, error) {
 	var row struct {
 		Data []byte `db:"data"`
@@ -102,6 +104,7 @@ func (r *streamRepo) FindByCode(ctx context.Context, code domain.StreamCode) (*d
 	return &s, nil
 }
 
+// List implements store.StreamRepository.
 func (r *streamRepo) List(ctx context.Context, filter store.StreamFilter) ([]*domain.Stream, error) {
 	q := `SELECT data FROM streams`
 	var args []any
@@ -129,6 +132,7 @@ func (r *streamRepo) List(ctx context.Context, filter store.StreamFilter) ([]*do
 	return out, nil
 }
 
+// Delete implements store.StreamRepository.
 func (r *streamRepo) Delete(ctx context.Context, code domain.StreamCode) error {
 	_, err := r.db.ExecContext(ctx, `DELETE FROM streams WHERE id = $1`, string(code))
 	if err != nil {
@@ -147,6 +151,7 @@ VALUES ($1, $2, $3, NOW())
 ON CONFLICT (id) DO UPDATE SET stream_id = EXCLUDED.stream_id, data = EXCLUDED.data, updated_at = NOW()
 `
 
+// Save implements store.RecordingRepository.
 func (r *recordingRepo) Save(ctx context.Context, rec *domain.Recording) error {
 	payload, err := json.Marshal(rec)
 	if err != nil {
@@ -159,6 +164,7 @@ func (r *recordingRepo) Save(ctx context.Context, rec *domain.Recording) error {
 	return nil
 }
 
+// FindByID implements store.RecordingRepository.
 func (r *recordingRepo) FindByID(ctx context.Context, id domain.RecordingID) (*domain.Recording, error) {
 	var row struct {
 		Data []byte `db:"data"`
@@ -178,6 +184,7 @@ func (r *recordingRepo) FindByID(ctx context.Context, id domain.RecordingID) (*d
 	return &rec, nil
 }
 
+// ListByStream implements store.RecordingRepository.
 func (r *recordingRepo) ListByStream(ctx context.Context, streamCode domain.StreamCode) ([]*domain.Recording, error) {
 	var rows []struct {
 		Data []byte `db:"data"`
@@ -201,6 +208,7 @@ func (r *recordingRepo) ListByStream(ctx context.Context, streamCode domain.Stre
 	return out, nil
 }
 
+// Delete implements store.RecordingRepository.
 func (r *recordingRepo) Delete(ctx context.Context, id domain.RecordingID) error {
 	_, err := r.db.ExecContext(ctx, `DELETE FROM recordings WHERE id = $1`, string(id))
 	if err != nil {
@@ -219,6 +227,7 @@ VALUES ($1, $2, NOW())
 ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
 `
 
+// Save implements store.HookRepository.
 func (r *hookRepo) Save(ctx context.Context, hook *domain.Hook) error {
 	payload, err := json.Marshal(hook)
 	if err != nil {
@@ -231,6 +240,7 @@ func (r *hookRepo) Save(ctx context.Context, hook *domain.Hook) error {
 	return nil
 }
 
+// FindByID implements store.HookRepository.
 func (r *hookRepo) FindByID(ctx context.Context, id domain.HookID) (*domain.Hook, error) {
 	var row struct {
 		Data []byte `db:"data"`
@@ -250,6 +260,7 @@ func (r *hookRepo) FindByID(ctx context.Context, id domain.HookID) (*domain.Hook
 	return &h, nil
 }
 
+// List implements store.HookRepository.
 func (r *hookRepo) List(ctx context.Context) ([]*domain.Hook, error) {
 	var rows []struct {
 		Data []byte `db:"data"`
@@ -269,6 +280,7 @@ func (r *hookRepo) List(ctx context.Context) ([]*domain.Hook, error) {
 	return out, nil
 }
 
+// Delete implements store.HookRepository.
 func (r *hookRepo) Delete(ctx context.Context, id domain.HookID) error {
 	_, err := r.db.ExecContext(ctx, `DELETE FROM hooks WHERE id = $1`, string(id))
 	if err != nil {

@@ -11,7 +11,7 @@ import (
 	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 	gortmp "github.com/yapingcat/gomedia/go-rtmp"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 const rtmpChanSize = 512

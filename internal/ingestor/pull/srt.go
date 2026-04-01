@@ -8,7 +8,7 @@ import (
 	"time"
 
 	srt "github.com/datarhei/gosrt"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 const srtReadChunk = 188 * 7 // one SRT datagram = 1316 bytes = 7 TS packets

@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
-	"github.com/open-streamer/open-streamer/internal/ingestor/pull"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/ingestor/pull"
 )
 
 // ReadCloser is a minimal interface matching pull readers for test helpers.

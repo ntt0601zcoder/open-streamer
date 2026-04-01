@@ -1,4 +1,4 @@
-module github.com/open-streamer/open-streamer
+module github.com/ntthuan060102github/open-streamer
 
 go 1.25.5
 

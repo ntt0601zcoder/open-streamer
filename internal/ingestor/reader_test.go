@@ -6,9 +6,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/open-streamer/open-streamer/config"
-	"github.com/open-streamer/open-streamer/internal/domain"
-	"github.com/open-streamer/open-streamer/internal/ingestor"
+	"github.com/ntthuan060102github/open-streamer/config"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/ingestor"
 )
 
 var testCfg = config.IngestorConfig{

@@ -122,7 +122,7 @@ This starts:
 
 ```bash
 # Requires Go 1.25+ and FFmpeg on PATH
-git clone https://github.com/open-streamer/open-streamer
+git clone https://github.com/ntthuan060102github/open-streamer
 cd open-streamer
 go build -o bin/open-streamer ./cmd/server
 ./bin/open-streamer

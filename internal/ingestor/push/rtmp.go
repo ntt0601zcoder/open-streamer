@@ -14,9 +14,9 @@ import (
 	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 	gortmp "github.com/yapingcat/gomedia/go-rtmp"
 
-	"github.com/open-streamer/open-streamer/config"
-	"github.com/open-streamer/open-streamer/internal/buffer"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/config"
+	"github.com/ntthuan060102github/open-streamer/internal/buffer"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 // Registry maps a stream key to the stream's buffer hub slot.

@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/grafov/m3u8"
-	"github.com/open-streamer/open-streamer/internal/buffer"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/buffer"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 // segmenterOpts configures native MPEG-TS segment files + optional HLS playlist.

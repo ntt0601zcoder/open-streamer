@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
-	"github.com/open-streamer/open-streamer/internal/store"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/store"
 )
 
 // Store is a JSON-backed implementation of all repositories.
@@ -79,6 +79,7 @@ func (s *Store) writeAll(name string, src any) error {
 
 type streamRepo struct{ s *Store }
 
+// Save implements store.StreamRepository.
 func (r *streamRepo) Save(_ context.Context, stream *domain.Stream) error {
 	streams, err := r.load()
 	if err != nil {
@@ -88,6 +89,7 @@ func (r *streamRepo) Save(_ context.Context, stream *domain.Stream) error {
 	return r.s.writeAll("streams.json", streams)
 }
 
+// FindByCode implements store.StreamRepository.
 func (r *streamRepo) FindByCode(_ context.Context, code domain.StreamCode) (*domain.Stream, error) {
 	streams, err := r.load()
 	if err != nil {
@@ -100,6 +102,7 @@ func (r *streamRepo) FindByCode(_ context.Context, code domain.StreamCode) (*dom
 	return s, nil
 }
 
+// List implements store.StreamRepository.
 func (r *streamRepo) List(_ context.Context, filter store.StreamFilter) ([]*domain.Stream, error) {
 	streams, err := r.load()
 	if err != nil {
@@ -115,6 +118,7 @@ func (r *streamRepo) List(_ context.Context, filter store.StreamFilter) ([]*doma
 	return result, nil
 }
 
+// Delete implements store.StreamRepository.
 func (r *streamRepo) Delete(_ context.Context, code domain.StreamCode) error {
 	streams, err := r.load()
 	if err != nil {
@@ -133,6 +137,7 @@ func (r *streamRepo) load() (map[string]*domain.Stream, error) {
 
 type recordingRepo struct{ s *Store }
 
+// Save implements store.RecordingRepository.
 func (r *recordingRepo) Save(_ context.Context, rec *domain.Recording) error {
 	recs, err := r.load()
 	if err != nil {
@@ -142,6 +147,7 @@ func (r *recordingRepo) Save(_ context.Context, rec *domain.Recording) error {
 	return r.s.writeAll("recordings.json", recs)
 }
 
+// FindByID implements store.RecordingRepository.
 func (r *recordingRepo) FindByID(_ context.Context, id domain.RecordingID) (*domain.Recording, error) {
 	recs, err := r.load()
 	if err != nil {
@@ -154,6 +160,7 @@ func (r *recordingRepo) FindByID(_ context.Context, id domain.RecordingID) (*dom
 	return rec, nil
 }
 
+// ListByStream implements store.RecordingRepository.
 func (r *recordingRepo) ListByStream(_ context.Context, streamCode domain.StreamCode) ([]*domain.Recording, error) {
 	recs, err := r.load()
 	if err != nil {
@@ -168,6 +175,7 @@ func (r *recordingRepo) ListByStream(_ context.Context, streamCode domain.Stream
 	return result, nil
 }
 
+// Delete implements store.RecordingRepository.
 func (r *recordingRepo) Delete(_ context.Context, id domain.RecordingID) error {
 	recs, err := r.load()
 	if err != nil {
@@ -186,6 +194,7 @@ func (r *recordingRepo) load() (map[string]*domain.Recording, error) {
 
 type hookRepo struct{ s *Store }
 
+// Save implements store.HookRepository.
 func (r *hookRepo) Save(_ context.Context, hook *domain.Hook) error {
 	hooks, err := r.load()
 	if err != nil {
@@ -195,6 +204,7 @@ func (r *hookRepo) Save(_ context.Context, hook *domain.Hook) error {
 	return r.s.writeAll("hooks.json", hooks)
 }
 
+// FindByID implements store.HookRepository.
 func (r *hookRepo) FindByID(_ context.Context, id domain.HookID) (*domain.Hook, error) {
 	hooks, err := r.load()
 	if err != nil {
@@ -207,6 +217,7 @@ func (r *hookRepo) FindByID(_ context.Context, id domain.HookID) (*domain.Hook, 
 	return h, nil
 }
 
+// List implements store.HookRepository.
 func (r *hookRepo) List(_ context.Context) ([]*domain.Hook, error) {
 	hooks, err := r.load()
 	if err != nil {
@@ -219,6 +230,7 @@ func (r *hookRepo) List(_ context.Context) ([]*domain.Hook, error) {
 	return result, nil
 }
 
+// Delete implements store.HookRepository.
 func (r *hookRepo) Delete(_ context.Context, id domain.HookID) error {
 	hooks, err := r.load()
 	if err != nil {

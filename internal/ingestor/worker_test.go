@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/open-streamer/open-streamer/internal/buffer"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/buffer"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 // ---- mock Reader ----

@@ -13,9 +13,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	_ "github.com/open-streamer/open-streamer/api/docs" // swag Register(SwaggerInfo)
-	"github.com/open-streamer/open-streamer/config"
-	"github.com/open-streamer/open-streamer/internal/api/handler"
+	_ "github.com/ntthuan060102github/open-streamer/api/docs" // swag Register(SwaggerInfo)
+	"github.com/ntthuan060102github/open-streamer/config"
+	"github.com/ntthuan060102github/open-streamer/internal/api/handler"
 	"github.com/samber/do/v2"
 )
 

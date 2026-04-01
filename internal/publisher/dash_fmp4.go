@@ -19,8 +19,8 @@ import (
 	"github.com/Eyevinn/mp4ff/mp4"
 	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
-	"github.com/open-streamer/open-streamer/internal/buffer"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/buffer"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 const dashVideoTimescale = 90000

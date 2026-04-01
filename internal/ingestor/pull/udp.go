@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 const udpReadSize = 188 * 7 // 7 TS packets per read — typical UDP MTU alignment

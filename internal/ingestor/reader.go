@@ -26,10 +26,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/open-streamer/open-streamer/config"
-	"github.com/open-streamer/open-streamer/internal/domain"
-	"github.com/open-streamer/open-streamer/internal/ingestor/pull"
-	"github.com/open-streamer/open-streamer/pkg/protocol"
+	"github.com/ntthuan060102github/open-streamer/config"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/ingestor/pull"
+	"github.com/ntthuan060102github/open-streamer/pkg/protocol"
 )
 
 // Reader is implemented by all pull-mode ingest sources.

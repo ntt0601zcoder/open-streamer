@@ -14,8 +14,8 @@ import (
 	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 	rtmpmedia "github.com/yapingcat/gomedia/go-rtmp"
 
-	"github.com/open-streamer/open-streamer/internal/buffer"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/buffer"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 func (s *Service) pushToDestination(ctx context.Context, logicalCode, mediaBufferID domain.StreamCode, dest domain.PushDestination) {

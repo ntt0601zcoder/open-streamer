@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 const fileReadChunk = 188 * 56 // ~10 KiB per read

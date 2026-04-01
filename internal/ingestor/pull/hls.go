@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/grafov/m3u8"
-	"github.com/open-streamer/open-streamer/config"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/config"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 // HLSReader polls an HLS playlist and downloads new segments in order.

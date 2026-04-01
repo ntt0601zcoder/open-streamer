@@ -9,12 +9,12 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/open-streamer/open-streamer/internal/buffer"
-	"github.com/open-streamer/open-streamer/internal/domain"
-	"github.com/open-streamer/open-streamer/internal/manager"
-	"github.com/open-streamer/open-streamer/internal/publisher"
-	"github.com/open-streamer/open-streamer/internal/store"
-	"github.com/open-streamer/open-streamer/internal/transcoder"
+	"github.com/ntthuan060102github/open-streamer/internal/buffer"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/manager"
+	"github.com/ntthuan060102github/open-streamer/internal/publisher"
+	"github.com/ntthuan060102github/open-streamer/internal/store"
+	"github.com/ntthuan060102github/open-streamer/internal/transcoder"
 	"github.com/samber/do/v2"
 )
 

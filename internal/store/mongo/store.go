@@ -12,8 +12,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
-	"github.com/open-streamer/open-streamer/internal/store"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -76,6 +76,7 @@ func (s *Store) Hooks() store.HookRepository {
 
 type streamRepo struct{ col *mongo.Collection }
 
+// Save implements store.StreamRepository.
 func (r *streamRepo) Save(ctx context.Context, stream *domain.Stream) error {
 	payload, err := json.Marshal(stream)
 	if err != nil {
@@ -96,6 +97,7 @@ func (r *streamRepo) Save(ctx context.Context, stream *domain.Stream) error {
 	return nil
 }
 
+// FindByCode implements store.StreamRepository.
 func (r *streamRepo) FindByCode(ctx context.Context, code domain.StreamCode) (*domain.Stream, error) {
 	var doc struct {
 		Data []byte `bson:"data"`
@@ -114,6 +116,7 @@ func (r *streamRepo) FindByCode(ctx context.Context, code domain.StreamCode) (*d
 	return &s, nil
 }
 
+// List implements store.StreamRepository.
 func (r *streamRepo) List(ctx context.Context, filter store.StreamFilter) ([]*domain.Stream, error) {
 	cur, err := r.col.Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
@@ -144,6 +147,7 @@ func (r *streamRepo) List(ctx context.Context, filter store.StreamFilter) ([]*do
 	return out, nil
 }
 
+// Delete implements store.StreamRepository.
 func (r *streamRepo) Delete(ctx context.Context, code domain.StreamCode) error {
 	_, err := r.col.DeleteOne(ctx, bson.M{"_id": string(code)})
 	if err != nil {
@@ -156,6 +160,7 @@ func (r *streamRepo) Delete(ctx context.Context, code domain.StreamCode) error {
 
 type recordingRepo struct{ col *mongo.Collection }
 
+// Save implements store.RecordingRepository.
 func (r *recordingRepo) Save(ctx context.Context, rec *domain.Recording) error {
 	payload, err := json.Marshal(rec)
 	if err != nil {
@@ -177,6 +182,7 @@ func (r *recordingRepo) Save(ctx context.Context, rec *domain.Recording) error {
 	return nil
 }
 
+// FindByID implements store.RecordingRepository.
 func (r *recordingRepo) FindByID(ctx context.Context, id domain.RecordingID) (*domain.Recording, error) {
 	var doc struct {
 		Data []byte `bson:"data"`
@@ -195,6 +201,7 @@ func (r *recordingRepo) FindByID(ctx context.Context, id domain.RecordingID) (*d
 	return &rec, nil
 }
 
+// ListByStream implements store.RecordingRepository.
 func (r *recordingRepo) ListByStream(ctx context.Context, streamCode domain.StreamCode) ([]*domain.Recording, error) {
 	cur, err := r.col.Find(ctx, bson.M{"stream_code": string(streamCode)}, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
@@ -222,6 +229,7 @@ func (r *recordingRepo) ListByStream(ctx context.Context, streamCode domain.Stre
 	return out, nil
 }
 
+// Delete implements store.RecordingRepository.
 func (r *recordingRepo) Delete(ctx context.Context, id domain.RecordingID) error {
 	_, err := r.col.DeleteOne(ctx, bson.M{"_id": string(id)})
 	if err != nil {
@@ -234,6 +242,7 @@ func (r *recordingRepo) Delete(ctx context.Context, id domain.RecordingID) error
 
 type hookRepo struct{ col *mongo.Collection }
 
+// Save implements store.HookRepository.
 func (r *hookRepo) Save(ctx context.Context, hook *domain.Hook) error {
 	payload, err := json.Marshal(hook)
 	if err != nil {
@@ -254,6 +263,7 @@ func (r *hookRepo) Save(ctx context.Context, hook *domain.Hook) error {
 	return nil
 }
 
+// FindByID implements store.HookRepository.
 func (r *hookRepo) FindByID(ctx context.Context, id domain.HookID) (*domain.Hook, error) {
 	var doc struct {
 		Data []byte `bson:"data"`
@@ -272,6 +282,7 @@ func (r *hookRepo) FindByID(ctx context.Context, id domain.HookID) (*domain.Hook
 	return &h, nil
 }
 
+// List implements store.HookRepository.
 func (r *hookRepo) List(ctx context.Context) ([]*domain.Hook, error) {
 	cur, err := r.col.Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
@@ -299,6 +310,7 @@ func (r *hookRepo) List(ctx context.Context) ([]*domain.Hook, error) {
 	return out, nil
 }
 
+// Delete implements store.HookRepository.
 func (r *hookRepo) Delete(ctx context.Context, id domain.HookID) error {
 	_, err := r.col.DeleteOne(ctx, bson.M{"_id": string(id)})
 	if err != nil {

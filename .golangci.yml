@@ -4,6 +4,15 @@ linters:
   exclusions:
     paths:
       - api/docs
+    rules:
+      # Allow fmt.Errorf without %w in test files
+      - path: _test\.go
+        linters:
+          - errcheck
+      # Allow TODO comments in handlers/stores during scaffolding
+      - text: "TODO"
+        linters:
+          - godot
   enable:
     - errcheck
     - govet
@@ -18,6 +27,20 @@ linters:
     - unparam
     - prealloc
     - nilerr
+  settings:
+    exhaustive:
+      default-signifies-exhaustive: false
+      check:
+        - switch
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - "checkPrivateReceivers"
+            - "sayRepetitiveInsteadOfStutters"
+    godot:
+      scope: declarations
+      capital: false
 
 # gofumpt is a formatter in v2, not a linter — see https://golangci-lint.run/docs/formatters/
 formatters:
@@ -25,32 +48,5 @@ formatters:
     - gofumpt
   settings:
     gofumpt:
-      module-path: github.com/open-streamer/open-streamer
-
-linters-settings:
-  exhaustive:
-    default-signifies-exhaustive: false
-    check:
-      - switch
-
-  revive:
-    rules:
-      - name: exported
-        arguments:
-          - "checkPrivateReceivers"
-          - "sayRepetitiveInsteadOfStutters"
-
-  godot:
-    scope: declarations
-    capital: false
-
-issues:
-  exclude-rules:
-    # Allow fmt.Errorf without %w in test files
-    - path: _test\.go
-      linters:
-        - errcheck
-    # Allow TODO comments in handlers/stores during scaffolding
-    - text: "TODO"
-      linters:
-        - godot
+      module-path: github.com/ntthuan060102github/open-streamer
+ 

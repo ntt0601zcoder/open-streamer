@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/open-streamer/open-streamer/internal/buffer"
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/buffer"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 // Registry maps ingest credentials (stream key, SRT stream ID) to the

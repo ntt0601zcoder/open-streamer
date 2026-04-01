@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 // HandlerFunc is a function that processes a single event.
@@ -61,6 +61,7 @@ func Start(ctx context.Context, b Bus) {
 	}
 }
 
+// Publish queues an event for async delivery (implements Bus).
 func (b *inProcessBus) Publish(_ context.Context, event domain.Event) {
 	select {
 	case b.queue <- event:
@@ -72,6 +73,7 @@ func (b *inProcessBus) Publish(_ context.Context, event domain.Event) {
 	}
 }
 
+// Subscribe registers a handler and returns unsubscribe (implements Bus).
 func (b *inProcessBus) Subscribe(eventType domain.EventType, handler HandlerFunc) func() {
 	b.mu.Lock()
 	b.nextID++

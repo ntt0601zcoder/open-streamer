@@ -1,6 +1,6 @@
 package transcoder
 
-import "github.com/open-streamer/open-streamer/internal/domain"
+import "github.com/ntthuan060102github/open-streamer/internal/domain"
 
 // RenditionTarget binds one encoded ladder rung to its Buffer Hub output slot.
 type RenditionTarget struct {

@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
-	"github.com/open-streamer/open-streamer/internal/events"
-	"github.com/open-streamer/open-streamer/internal/ingestor"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/events"
+	"github.com/ntthuan060102github/open-streamer/internal/ingestor"
 	"github.com/samber/do/v2"
 )
 

@@ -3,7 +3,7 @@ package buffer
 import (
 	"fmt"
 
-	"github.com/open-streamer/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
 // RenditionBufferID is the Buffer Hub id for one transcoded video profile (ABR ladder).
