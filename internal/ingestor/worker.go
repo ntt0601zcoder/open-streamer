@@ -26,6 +26,7 @@ var httpStatusPattern = regexp.MustCompile(`\bhttp (\d{3})\b`)
 func runPullWorker(
 	ctx context.Context,
 	streamID domain.StreamCode,
+	bufferWriteID domain.StreamCode,
 	input domain.Input,
 	r Reader,
 	buf *buffer.Service,
@@ -63,7 +64,7 @@ func runPullWorker(
 		)
 		delay = reconnectBaseDelay // reset on successful open
 
-		readErr := readLoop(ctx, streamID, input, r, buf, onPacket)
+		readErr := readLoop(ctx, streamID, bufferWriteID, input, r, buf, onPacket)
 		r.Close()
 
 		if ctx.Err() != nil {
@@ -108,6 +109,7 @@ func runPullWorker(
 func readLoop(
 	ctx context.Context,
 	streamID domain.StreamCode,
+	bufferWriteID domain.StreamCode,
 	input domain.Input,
 	r Reader,
 	buf *buffer.Service,
@@ -121,7 +123,7 @@ func readLoop(
 		if len(pkt) == 0 {
 			continue
 		}
-		if writeErr := buf.Write(streamID, buffer.Packet(pkt)); writeErr != nil {
+		if writeErr := buf.Write(bufferWriteID, buffer.Packet(pkt)); writeErr != nil {
 			slog.Error("ingestor: buffer write failed",
 				"stream_code", streamID,
 				"input_priority", input.Priority,

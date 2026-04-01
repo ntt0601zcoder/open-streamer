@@ -84,13 +84,13 @@ func (s *Service) OnPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, e
 	return &base.Response{StatusCode: base.StatusOK}, nil
 }
 
-func (s *Service) serveRTSP(ctx context.Context, streamID domain.StreamCode) {
-	sub, err := s.buf.Subscribe(streamID)
+func (s *Service) serveRTSP(ctx context.Context, streamID domain.StreamCode, mediaBufferID domain.StreamCode) {
+	sub, err := s.buf.Subscribe(mediaBufferID)
 	if err != nil {
-		slog.Error("publisher: RTSP subscribe failed", "stream_code", streamID, "err", err)
+		slog.Error("publisher: RTSP subscribe failed", "stream_code", streamID, "buffer_id", mediaBufferID, "err", err)
 		return
 	}
-	defer s.buf.Unsubscribe(streamID, sub)
+	defer s.buf.Unsubscribe(mediaBufferID, sub)
 
 	mount := publisherLiveMountPath(streamID)
 

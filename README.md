@@ -175,9 +175,9 @@ POST /streams
     "mode": "transcode",
     "hw_accel": "nvenc",
     "video_profiles": [
-      { "name": "1080p", "width": 1920, "height": 1080, "bitrate": 4000, "codec": "h264", "preset": "p5" },
-      { "name": "720p",  "width": 1280, "height": 720,  "bitrate": 2000, "codec": "h264", "preset": "p5" },
-      { "name": "480p",  "width": 854,  "height": 480,  "bitrate": 800,  "codec": "h264", "preset": "p5" }
+      { "width": 1920, "height": 1080, "bitrate": 4000, "codec": "h264", "preset": "p5" },
+      { "width": 1280, "height": 720,  "bitrate": 2000, "codec": "h264", "preset": "p5" },
+      { "width": 854,  "height": 480,  "bitrate": 800,  "codec": "h264", "preset": "p5" }
     ],
     "audio": { "codec": "aac", "bitrate": 128, "channels": 2 },
     "segment_align": true

@@ -17,8 +17,9 @@ type Registry struct {
 }
 
 type registryEntry struct {
-	streamID domain.StreamCode
-	buf      *buffer.Service
+	streamID      domain.StreamCode // logical stream (logging, health)
+	bufferWriteID domain.StreamCode // Buffer Hub id passed to buf.Write
+	buf           *buffer.Service
 }
 
 // NewRegistry constructs an empty Registry.
@@ -27,13 +28,18 @@ func NewRegistry() *Registry {
 }
 
 // Register maps key (stream key or SRT stream ID) to a stream's buffer.
+// bufferWriteID is the slot used for buf.Write; if empty, streamID is used.
 // Registering the same key twice overwrites the previous entry.
-func (r *Registry) Register(key string, streamID domain.StreamCode, buf *buffer.Service) {
+func (r *Registry) Register(key string, streamID domain.StreamCode, buf *buffer.Service, bufferWriteID domain.StreamCode) {
+	if bufferWriteID == "" {
+		bufferWriteID = streamID
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.entries[key] = registryEntry{
-		streamID: streamID,
-		buf:      buf,
+		streamID:      streamID,
+		bufferWriteID: bufferWriteID,
+		buf:           buf,
 	}
 }
 
@@ -44,13 +50,13 @@ func (r *Registry) Unregister(key string) {
 	delete(r.entries, key)
 }
 
-// Lookup returns the buffer associated with key, or an error if not found.
-func (r *Registry) Lookup(key string) (domain.StreamCode, *buffer.Service, error) {
+// Lookup returns the buffer write target, logical stream id, and buffer service for key.
+func (r *Registry) Lookup(key string) (bufferWriteID domain.StreamCode, streamID domain.StreamCode, buf *buffer.Service, err error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	e, ok := r.entries[key]
 	if !ok {
-		return "", nil, fmt.Errorf("ingestor: no stream registered for key %q", key)
+		return "", "", nil, fmt.Errorf("ingestor: no stream registered for key %q", key)
 	}
-	return e.streamID, e.buf, nil
+	return e.bufferWriteID, e.streamID, e.buf, nil
 }

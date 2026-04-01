@@ -667,9 +667,6 @@ definitions:
         description: MaxBitrate caps the peak bitrate in kbps (CBR/VBR ceiling). 0
           = no cap.
         type: integer
-      name:
-        description: Name is the human-readable label, e.g. "1080p", "720p", "480p".
-        type: string
       preset:
         description: |-
           Preset controls the encoder speed/quality tradeoff.

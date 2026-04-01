@@ -107,11 +107,15 @@ func (s *Service) Run(ctx context.Context) error {
 //   - Otherwise → pull: start a goroutine that connects to the URL and reads data.
 //
 // Calling Start again for the same stream replaces the previous worker/registration.
-func (s *Service) Start(ctx context.Context, streamID domain.StreamCode, input domain.Input) error {
-	if protocol.IsPushListen(input.URL) {
-		return s.startPushRegistration(streamID, input)
+// bufferWriteID is the Buffer Hub slot for MPEG-TS writes; if empty, streamID is used.
+func (s *Service) Start(ctx context.Context, streamID domain.StreamCode, input domain.Input, bufferWriteID domain.StreamCode) error {
+	if bufferWriteID == "" {
+		bufferWriteID = streamID
 	}
-	return s.startPullWorker(ctx, streamID, input)
+	if protocol.IsPushListen(input.URL) {
+		return s.startPushRegistration(streamID, input, bufferWriteID)
+	}
+	return s.startPullWorker(ctx, streamID, input, bufferWriteID)
 }
 
 // Probe performs a short pull-read health probe for one input.
@@ -156,7 +160,7 @@ func (s *Service) Stop(streamID domain.StreamCode) {
 
 // ---- private ----
 
-func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCode, input domain.Input) error {
+func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCode, input domain.Input, bufferWriteID domain.StreamCode) error {
 	reader, err := NewReader(input, s.cfg)
 	if err != nil {
 		return fmt.Errorf("ingestor: create reader: %w", err)
@@ -182,7 +186,7 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 		observer := s.onPacket
 		errObserver := s.onInputError
 		s.mu.Unlock()
-		runPullWorker(workerCtx, streamID, input, reader, s.buf, observer, errObserver)
+		runPullWorker(workerCtx, streamID, bufferWriteID, input, reader, s.buf, observer, errObserver)
 		cancel()
 		s.bus.Publish(context.Background(), domain.Event{
 			Type:       domain.EventInputFailed,
@@ -193,13 +197,13 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 	return nil
 }
 
-func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain.Input) error {
+func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain.Input, bufferWriteID domain.StreamCode) error {
 	key := pushStreamKey(input)
 	if key == "" {
 		return fmt.Errorf("ingestor: cannot determine stream key from URL %q (path must end in /<key>)", input.URL)
 	}
 
-	s.registry.Register(key, streamID, s.buf)
+	s.registry.Register(key, streamID, s.buf, bufferWriteID)
 
 	slog.Info("ingestor: push slot registered",
 		"stream_code", streamID,

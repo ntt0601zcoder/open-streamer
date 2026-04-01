@@ -52,10 +52,8 @@ const (
 
 // VideoProfile is a single rendition in the ABR (Adaptive Bitrate) ladder.
 // The Transcoder produces one FFmpeg output per profile.
+// Stable rendition ids are derived from slice order: track_1, track_2, track_3, … (1-based).
 type VideoProfile struct {
-	// Name is the human-readable label, e.g. "1080p", "720p", "480p".
-	Name string `json:"name"`
-
 	// Width and Height define the output resolution.
 	// Set to 0 to keep the source dimensions (Width=0 & Height=0 = no scaling).
 	Width  int `json:"width"`

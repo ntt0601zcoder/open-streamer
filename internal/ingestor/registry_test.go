@@ -18,11 +18,29 @@ func TestRegistry_RegisterAndLookup(t *testing.T) {
 	buf := buffer.NewServiceForTesting(64)
 	reg := ingestor.NewRegistry()
 
-	reg.Register("mykey", "stream-1", buf)
+	reg.Register("mykey", "stream-1", buf, "")
 
-	streamID, gotBuf, err := reg.Lookup("mykey")
+	writeID, streamID, gotBuf, err := reg.Lookup("mykey")
 	require.NoError(t, err)
+	assert.Equal(t, domain.StreamCode("stream-1"), writeID)
 	assert.Equal(t, domain.StreamCode("stream-1"), streamID)
+	assert.Same(t, buf, gotBuf)
+}
+
+func TestRegistry_RegisterSeparateBufferWriteID(t *testing.T) {
+	t.Parallel()
+
+	buf := buffer.NewServiceForTesting(64)
+	reg := ingestor.NewRegistry()
+	logical := domain.StreamCode("cam1")
+	raw := buffer.RawIngestBufferID(logical)
+
+	reg.Register("pushkey", logical, buf, raw)
+
+	writeID, streamID, gotBuf, err := reg.Lookup("pushkey")
+	require.NoError(t, err)
+	assert.Equal(t, raw, writeID)
+	assert.Equal(t, logical, streamID)
 	assert.Same(t, buf, gotBuf)
 }
 
@@ -30,7 +48,7 @@ func TestRegistry_Lookup_NotFound(t *testing.T) {
 	t.Parallel()
 
 	reg := ingestor.NewRegistry()
-	_, _, err := reg.Lookup("nonexistent")
+	_, _, _, err := reg.Lookup("nonexistent")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "nonexistent")
 }
@@ -42,11 +60,12 @@ func TestRegistry_Overwrite(t *testing.T) {
 	buf2 := buffer.NewServiceForTesting(64)
 	reg := ingestor.NewRegistry()
 
-	reg.Register("key", "stream-1", buf1)
-	reg.Register("key", "stream-2", buf2)
+	reg.Register("key", "stream-1", buf1, "")
+	reg.Register("key", "stream-2", buf2, "")
 
-	streamID, gotBuf, err := reg.Lookup("key")
+	writeID, streamID, gotBuf, err := reg.Lookup("key")
 	require.NoError(t, err)
+	assert.Equal(t, domain.StreamCode("stream-2"), writeID)
 	assert.Equal(t, domain.StreamCode("stream-2"), streamID)
 	assert.Same(t, buf2, gotBuf)
 }
@@ -57,10 +76,10 @@ func TestRegistry_Unregister(t *testing.T) {
 	buf := buffer.NewServiceForTesting(64)
 	reg := ingestor.NewRegistry()
 
-	reg.Register("key", "stream-1", buf)
+	reg.Register("key", "stream-1", buf, "")
 	reg.Unregister("key")
 
-	_, _, err := reg.Lookup("key")
+	_, _, _, err := reg.Lookup("key")
 	require.Error(t, err)
 }
 
@@ -79,15 +98,15 @@ func TestRegistry_MultipleKeys(t *testing.T) {
 	buf := buffer.NewServiceForTesting(64)
 
 	keys := []string{"stream-a", "stream-b", "stream-c"}
-	for i, k := range keys {
-		reg.Register(k, domain.StreamCode(k), buf)
-		_ = i
+	for _, k := range keys {
+		reg.Register(k, domain.StreamCode(k), buf, "")
 	}
 
 	for _, k := range keys {
-		id, _, err := reg.Lookup(k)
+		writeID, streamID, _, err := reg.Lookup(k)
 		require.NoError(t, err)
-		assert.Equal(t, domain.StreamCode(k), id)
+		assert.Equal(t, domain.StreamCode(k), writeID)
+		assert.Equal(t, domain.StreamCode(k), streamID)
 	}
 }
 
@@ -105,8 +124,8 @@ func TestRegistry_ConcurrentAccess(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			key := "key"
-			reg.Register(key, domain.StreamCode("s"), buf)
-			_, _, _ = reg.Lookup(key)
+			reg.Register(key, domain.StreamCode("s"), buf, "")
+			_, _, _, _ = reg.Lookup(key)
 			if i%5 == 0 {
 				reg.Unregister(key)
 			}

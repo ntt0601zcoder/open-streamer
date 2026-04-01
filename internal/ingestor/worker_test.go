@@ -112,7 +112,7 @@ func TestReadLoop_WritesPacketsToBuffer(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- readLoop(context.Background(), streamID, domain.Input{}, r, buf, nil)
+		errCh <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil)
 	}()
 
 	var received [][]byte
@@ -149,7 +149,7 @@ func TestReadLoop_ContextCancelled(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		cancel()
-		errCh <- readLoop(ctx, streamID, domain.Input{}, r, buf, nil)
+		errCh <- readLoop(ctx, streamID, streamID, domain.Input{}, r, buf, nil)
 	}()
 
 	select {
@@ -177,7 +177,7 @@ func TestReadLoop_SkipsEmptyPackets(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- readLoop(context.Background(), streamID, domain.Input{}, r, buf, nil)
+		done <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil)
 	}()
 
 	select {
@@ -212,7 +212,7 @@ func TestRunPullWorker_ReadsAndWritesToBuffer(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runPullWorker(ctx, streamID, domain.Input{Priority: 0}, r, buf, nil, nil)
+		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, r, buf, nil, nil)
 	}()
 
 	select {
@@ -246,7 +246,7 @@ func TestRunPullWorker_StopsOnContextCancel(t *testing.T) {
 	go func() {
 		defer close(done)
 		r.packets = [][]byte{endlessPkt, endlessPkt, endlessPkt}
-		runPullWorker(ctx, streamID, domain.Input{Priority: 0}, r, buf, nil, nil)
+		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, r, buf, nil, nil)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -305,7 +305,7 @@ func TestRunPullWorker_ReconnectsAfterOpenError(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		runPullWorker(ctx, streamID, domain.Input{Priority: 0}, origReader, buf, nil, nil)
+		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, origReader, buf, nil, nil)
 	}()
 
 	select {

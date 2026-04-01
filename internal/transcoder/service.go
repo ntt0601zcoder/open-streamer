@@ -1,13 +1,15 @@
 // Package transcoder manages a bounded pool of FFmpeg worker processes.
-// Each worker reads from the Buffer Hub and produces one or more output profiles (ABR).
-// GPU acceleration (NVENC) is used when available.
+// Each stream may run one FFmpeg process per ladder profile (ABR); all read the same raw ingest.
+// GPU acceleration (NVENC) is used when configured on profiles / global HW.
 package transcoder
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
-	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/open-streamer/open-streamer/config"
@@ -17,26 +19,30 @@ import (
 )
 
 // Profile defines a single transcoding output rendition.
+// Rendition label in logs and URLs is track_<n> from ladder order (see buffer.VideoTrackSlug).
 type Profile struct {
-	Name    string // e.g. "1080p", "720p", "480p"
-	Width   int
-	Height  int
-	Bitrate string // e.g. "4000k"
-	Codec   string // e.g. "h264_nvenc", "libx264"
-	Preset  string // e.g. "p5" (NVENC), "fast" (libx264)
+	Width            int
+	Height           int
+	Bitrate          string // e.g. "4000k"
+	Codec            string // e.g. "h264_nvenc", "libx264"
+	Preset           string // e.g. "p5" (NVENC), "fast" (libx264)
+	CodecProfile     string // H.264/HEVC profile (baseline, main, high)
+	CodecLevel       string // e.g. 4.1
+	MaxBitrate       int    // kbps peak (0 = omit -maxrate)
+	Framerate        float64
+	KeyframeInterval int // GOP target in seconds (0 = encoder default)
 }
 
-// DefaultProfiles are the standard ABR output renditions.
+// DefaultProfiles are the standard ABR output renditions (CPU libx264 for broad portability).
 var DefaultProfiles = []Profile{
-	{Name: "1080p", Width: 1920, Height: 1080, Bitrate: "5000k", Codec: "h264_nvenc", Preset: "p5"},
-	{Name: "720p", Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264_nvenc", Preset: "p5"},
-	{Name: "480p", Width: 854, Height: 480, Bitrate: "1000k", Codec: "h264_nvenc", Preset: "p5"},
+	{Width: 1920, Height: 1080, Bitrate: "5000k", Codec: "libx264", Preset: "fast"},
+	{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "libx264", Preset: "fast"},
+	{Width: 854, Height: 480, Bitrate: "1000k", Codec: "libx264", Preset: "fast"},
 }
 
-// worker is a single FFmpeg process handling one stream.
+// worker is a logical transcoding job for one stream (may spawn multiple FFmpeg processes).
 type worker struct {
-	streamID domain.StreamCode
-	cancel   context.CancelFunc
+	cancel context.CancelFunc
 }
 
 // Service manages the FFmpeg worker pool.
@@ -61,82 +67,87 @@ func New(i do.Injector) (*Service, error) {
 	}, nil
 }
 
-// Start subscribes to the buffer and launches an FFmpeg worker for the stream.
-func (s *Service) Start(ctx context.Context, streamID domain.StreamCode, profiles []Profile) error {
+// Start launches one FFmpeg encoder per RenditionTarget (same raw ingest, different output buffers).
+func (s *Service) Start(
+	ctx context.Context,
+	logStreamCode domain.StreamCode,
+	rawIngestID domain.StreamCode,
+	tc *domain.TranscoderConfig,
+	targets []RenditionTarget,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.workers[streamID]; ok {
-		return fmt.Errorf("transcoder: stream %s already running", streamID)
+	if _, ok := s.workers[logStreamCode]; ok {
+		return fmt.Errorf("transcoder: stream %s already running", logStreamCode)
+	}
+
+	if len(targets) == 0 {
+		return fmt.Errorf("transcoder: no rendition targets")
 	}
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	s.workers[streamID] = &worker{streamID: streamID, cancel: cancel}
+	s.workers[logStreamCode] = &worker{cancel: cancel}
 
-	go s.runWorker(workerCtx, streamID, profiles)
+	go s.runStreamJob(workerCtx, logStreamCode, rawIngestID, tc, targets)
 	return nil
 }
 
-// Stop cancels the FFmpeg worker for a stream.
+// Stop cancels all FFmpeg encoders for a stream.
 func (s *Service) Stop(streamID domain.StreamCode) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if w, ok := s.workers[streamID]; ok {
 		w.cancel()
 		delete(s.workers, streamID)
 	}
+	s.mu.Unlock()
 }
 
-func (s *Service) runWorker(ctx context.Context, streamID domain.StreamCode, profiles []Profile) {
-	// acquire semaphore slot
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	case <-ctx.Done():
-		return
-	}
-
-	sub, err := s.buf.Subscribe(streamID)
-	if err != nil {
-		slog.Error("transcoder: subscribe failed", "stream_code", streamID, "err", err)
-		return
-	}
-	defer s.buf.Unsubscribe(streamID, sub)
-
-	cmd := s.buildFFmpegCmd(ctx, profiles)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		slog.Error("transcoder: stdin pipe failed", "stream_code", streamID, "err", err)
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		slog.Error("transcoder: ffmpeg start failed", "stream_code", streamID, "err", err)
-		return
-	}
-
-	slog.Info("transcoder: worker started", "stream_code", streamID, "profiles", len(profiles))
-
-	go func() {
-		defer stdin.Close()
-		for pkt := range sub.Recv() {
-			if _, err := stdin.Write(pkt); err != nil {
-				return
-			}
-		}
+func (s *Service) runStreamJob(
+	ctx context.Context,
+	logStreamCode domain.StreamCode,
+	rawIngestID domain.StreamCode,
+	tc *domain.TranscoderConfig,
+	targets []RenditionTarget,
+) {
+	defer func() {
+		s.mu.Lock()
+		delete(s.workers, logStreamCode)
+		s.mu.Unlock()
 	}()
 
-	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-		slog.Error("transcoder: ffmpeg exited with error", "stream_code", streamID, "err", err)
+	slog.Info("transcoder: stream job started",
+		"stream_code", logStreamCode,
+		"profiles", len(targets),
+		"read_from", rawIngestID,
+	)
+
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Add(1)
+		go func(profileIndex int, t RenditionTarget) {
+			defer wg.Done()
+			s.runProfileEncoder(ctx, logStreamCode, rawIngestID, t.BufferID, tc, profileIndex, t.Profile)
+		}(i, t)
 	}
+	wg.Wait()
 }
 
-func (s *Service) buildFFmpegCmd(ctx context.Context, _ []Profile) *exec.Cmd {
-	// TODO: build multi-output FFmpeg command from profiles
-	return exec.CommandContext(ctx, s.cfg.FFmpegPath,
-		"-i", "pipe:0",
-		"-c:v", "h264_nvenc",
-		"-preset", "p5",
-		"-f", "mpegts", "pipe:1",
-	)
+func (s *Service) logStderr(streamID domain.StreamCode, profile string, r io.Reader) {
+	sc := bufio.NewScanner(r)
+	const maxLine = 64 * 1024
+	buf := make([]byte, maxLine)
+	sc.Buffer(buf, maxLine)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			continue
+		}
+		// FFmpeg compensates PTS/DTS jumps (common when ingest fails over between HLS variants).
+		if strings.Contains(line, "timestamp discontinuity") && strings.Contains(line, "new offset") {
+			slog.Debug("transcoder: ffmpeg timestamp resync", "stream_code", streamID, "profile", profile, "msg", line)
+			continue
+		}
+		slog.Warn("transcoder: ffmpeg stderr", "stream_code", streamID, "profile", profile, "msg", line)
+	}
 }

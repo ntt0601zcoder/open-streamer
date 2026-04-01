@@ -27,12 +27,13 @@ type InputHealth struct {
 
 // streamState holds the monitoring context for a stream.
 type streamState struct {
-	inputs       map[int]*InputHealth // key = Input.Priority
-	active       int                  // active Input.Priority
-	degradedAt   map[int]time.Time
-	probing      map[int]bool
-	lastSwitchAt time.Time
-	cancel       context.CancelFunc
+	inputs        map[int]*InputHealth // key = Input.Priority
+	active        int                  // active Input.Priority
+	bufferWriteID domain.StreamCode    // Buffer Hub id for ingest writes (may differ when transcoding)
+	degradedAt    map[int]time.Time
+	probing       map[int]bool
+	lastSwitchAt  time.Time
+	cancel        context.CancelFunc
 }
 
 // RuntimeStatus is a snapshot of manager state for one stream (for the HTTP API).
@@ -79,18 +80,24 @@ func New(i do.Injector) (*Service, error) {
 }
 
 // Register starts health monitoring for a stream's inputs and begins ingest on the best input.
-func (s *Service) Register(ctx context.Context, stream *domain.Stream) error {
+// bufferWriteID is the Buffer Hub slot ingest uses; if empty, stream.Code is used.
+func (s *Service) Register(ctx context.Context, stream *domain.Stream, bufferWriteID domain.StreamCode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	monCtx, cancel := context.WithCancel(ctx)
 
+	if bufferWriteID == "" {
+		bufferWriteID = stream.Code
+	}
+
 	state := &streamState{
-		inputs:       make(map[int]*InputHealth),
-		degradedAt:   make(map[int]time.Time),
-		probing:      make(map[int]bool),
-		lastSwitchAt: time.Now(),
-		cancel:       cancel,
+		inputs:        make(map[int]*InputHealth),
+		bufferWriteID: bufferWriteID,
+		degradedAt:    make(map[int]time.Time),
+		probing:       make(map[int]bool),
+		lastSwitchAt:  time.Now(),
+		cancel:        cancel,
 	}
 	for _, input := range stream.Inputs {
 		state.inputs[input.Priority] = &InputHealth{
@@ -104,7 +111,7 @@ func (s *Service) Register(ctx context.Context, stream *domain.Stream) error {
 
 	if best := s.selectBest(state); best != nil {
 		state.active = best.Input.Priority
-		if err := s.ingestor.Start(monCtx, stream.Code, best.Input); err != nil {
+		if err := s.ingestor.Start(monCtx, stream.Code, best.Input, state.bufferWriteID); err != nil {
 			slog.Error("manager: initial ingest start failed",
 				"stream_code", stream.Code,
 				"input_priority", best.Input.Priority,
@@ -305,7 +312,7 @@ func (s *Service) tryFailover(ctx context.Context, streamID domain.StreamCode, s
 		"to", best.Input.Priority,
 	)
 
-	if err := s.ingestor.Start(ctx, streamID, best.Input); err != nil {
+	if err := s.ingestor.Start(ctx, streamID, best.Input, state.bufferWriteID); err != nil {
 		slog.Error("manager: failed to start new ingestor", "stream_code", streamID, "err", err)
 		return
 	}

@@ -49,7 +49,7 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 		// We inspect the StreamID to decide: PUBLISH, SUBSCRIBE, or REJECT.
 		HandleConnect: func(req srt.ConnRequest) srt.ConnType {
 			streamKey := extractStreamKey(req.StreamId())
-			if _, _, err := s.registry.Lookup(streamKey); err != nil {
+			if _, _, _, err := s.registry.Lookup(streamKey); err != nil {
 				slog.Warn("srt: rejecting unknown stream key",
 					"stream_id_raw", req.StreamId(),
 					"stream_key", streamKey,
@@ -62,7 +62,7 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 		// HandlePublish is called when an accepted PUBLISH connection is ready.
 		HandlePublish: func(conn srt.Conn) {
 			streamKey := extractStreamKey(conn.StreamId())
-			streamID, buf, err := s.registry.Lookup(streamKey)
+			writeID, streamID, buf, err := s.registry.Lookup(streamKey)
 			if err != nil {
 				// Should not happen — HandleConnect already checked.
 				conn.Close()
@@ -73,7 +73,7 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 				"stream_code", streamID,
 				"remote", conn.RemoteAddr(),
 			)
-			handleSRTConn(ctx, conn, streamID, buf)
+			handleSRTConn(ctx, conn, writeID, streamID, buf)
 		},
 	}
 
@@ -95,7 +95,7 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 }
 
 // handleSRTConn reads MPEG-TS from the SRT connection and writes to the buffer.
-func handleSRTConn(ctx context.Context, conn srt.Conn, streamID domain.StreamCode, buf *buffer.Service) {
+func handleSRTConn(ctx context.Context, conn srt.Conn, bufferWriteID, streamID domain.StreamCode, buf *buffer.Service) {
 	defer conn.Close()
 	defer slog.Info("srt: publisher disconnected", "stream_code", streamID)
 
@@ -110,7 +110,7 @@ func handleSRTConn(ctx context.Context, conn srt.Conn, streamID domain.StreamCod
 		if n > 0 {
 			pkt := make([]byte, n)
 			copy(pkt, readBuf[:n])
-			if writeErr := buf.Write(streamID, buffer.Packet(pkt)); writeErr != nil {
+			if writeErr := buf.Write(bufferWriteID, buffer.Packet(pkt)); writeErr != nil {
 				slog.Error("srt: buffer write failed",
 					"stream_code", streamID,
 					"err", writeErr,

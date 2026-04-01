@@ -39,5 +39,6 @@ func (s *Service) serveDASH(ctx context.Context, streamID domain.StreamCode) {
 		s.cfg.DASH.LiveWindow,
 		s.cfg.DASH.LiveHistory,
 		s.cfg.DASH.LiveEphemeral,
+		nil,
 	)
 }

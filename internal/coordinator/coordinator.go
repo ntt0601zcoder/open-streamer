@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
 
 	"github.com/open-streamer/open-streamer/internal/buffer"
 	"github.com/open-streamer/open-streamer/internal/domain"
@@ -23,15 +24,19 @@ type Coordinator struct {
 	mgr *manager.Service
 	tc  *transcoder.Service
 	pub *publisher.Service
+
+	rendMu     sync.Mutex
+	renditions map[domain.StreamCode][]string // ABR rendition slugs per stream (for buffer teardown)
 }
 
 // New registers a Coordinator with the DI injector.
 func New(i do.Injector) (*Coordinator, error) {
 	return &Coordinator{
-		buf: do.MustInvoke[*buffer.Service](i),
-		mgr: do.MustInvoke[*manager.Service](i),
-		tc:  do.MustInvoke[*transcoder.Service](i),
-		pub: do.MustInvoke[*publisher.Service](i),
+		buf:        do.MustInvoke[*buffer.Service](i),
+		mgr:        do.MustInvoke[*manager.Service](i),
+		tc:         do.MustInvoke[*transcoder.Service](i),
+		pub:        do.MustInvoke[*publisher.Service](i),
+		renditions: make(map[domain.StreamCode][]string),
 	}, nil
 }
 
@@ -50,25 +55,54 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 
 	c.buf.Create(stream.Code)
 
-	if err := c.mgr.Register(ctx, stream); err != nil {
+	ingestWriteID := stream.Code
+	if shouldRunTranscoder(stream) {
+		ingestWriteID = buffer.RawIngestBufferID(stream.Code)
+		c.buf.Create(ingestWriteID)
+	}
+
+	if err := c.mgr.Register(ctx, stream, ingestWriteID); err != nil {
 		c.buf.Delete(stream.Code)
+		if ingestWriteID != stream.Code {
+			c.buf.Delete(ingestWriteID)
+		}
 		return fmt.Errorf("coordinator: register manager: %w", err)
 	}
 
 	if err := c.pub.Start(ctx, stream); err != nil {
 		c.mgr.Unregister(stream.Code)
 		c.buf.Delete(stream.Code)
+		if ingestWriteID != stream.Code {
+			c.buf.Delete(ingestWriteID)
+		}
 		return fmt.Errorf("coordinator: publisher: %w", err)
 	}
 
 	if shouldRunTranscoder(stream) {
 		profiles := transcoderProfilesFromDomain(stream.Transcoder.Video.Profiles)
-		if err := c.tc.Start(ctx, stream.Code, profiles); err != nil {
+		rawID := buffer.RawIngestBufferID(stream.Code)
+		var slugs []string
+		targets := make([]transcoder.RenditionTarget, 0, len(profiles))
+		for i := range profiles {
+			slug := buffer.VideoTrackSlug(i)
+			bid := buffer.RenditionBufferID(stream.Code, slug)
+			c.buf.Create(bid)
+			slugs = append(slugs, slug)
+			targets = append(targets, transcoder.RenditionTarget{BufferID: bid, Profile: profiles[i]})
+		}
+		if err := c.tc.Start(ctx, stream.Code, rawID, stream.Transcoder, targets); err != nil {
+			for _, slug := range slugs {
+				c.buf.Delete(buffer.RenditionBufferID(stream.Code, slug))
+			}
 			c.pub.Stop(stream.Code)
 			c.mgr.Unregister(stream.Code)
 			c.buf.Delete(stream.Code)
+			c.buf.Delete(rawID)
 			return fmt.Errorf("coordinator: transcoder: %w", err)
 		}
+		c.rendMu.Lock()
+		c.renditions[stream.Code] = slugs
+		c.rendMu.Unlock()
 	}
 
 	return nil
@@ -84,6 +118,16 @@ func (c *Coordinator) Stop(streamID domain.StreamCode) {
 	c.pub.Stop(streamID)
 	c.tc.Stop(streamID)
 	c.mgr.Unregister(streamID)
+
+	c.rendMu.Lock()
+	slugs := c.renditions[streamID]
+	delete(c.renditions, streamID)
+	c.rendMu.Unlock()
+	for _, slug := range slugs {
+		c.buf.Delete(buffer.RenditionBufferID(streamID, slug))
+	}
+
+	c.buf.Delete(buffer.RawIngestBufferID(streamID))
 	c.buf.Delete(streamID)
 }
 
@@ -135,21 +179,21 @@ func transcoderProfilesFromDomain(profiles []domain.VideoProfile) []transcoder.P
 		if p.Bitrate <= 0 {
 			br = "2500k"
 		}
-		name := p.Name
-		if name == "" {
-			name = fmt.Sprintf("%dx%d", p.Width, p.Height)
-		}
 		preset := p.Preset
 		if preset == "" {
 			preset = "fast"
 		}
 		out = append(out, transcoder.Profile{
-			Name:    name,
-			Width:   p.Width,
-			Height:  p.Height,
-			Bitrate: br,
-			Codec:   codec,
-			Preset:  preset,
+			Width:              p.Width,
+			Height:             p.Height,
+			Bitrate:            br,
+			Codec:              codec,
+			Preset:             preset,
+			CodecProfile:       p.Profile,
+			CodecLevel:         p.Level,
+			MaxBitrate:         p.MaxBitrate,
+			Framerate:          p.Framerate,
+			KeyframeInterval:   p.KeyframeInterval,
 		})
 	}
 	return out

@@ -22,7 +22,7 @@ import (
 // Registry maps a stream key to the stream's buffer hub slot.
 // Implemented by ingestor.Registry and injected at construction time.
 type Registry interface {
-	Lookup(key string) (domain.StreamCode, *buffer.Service, error)
+	Lookup(key string) (bufferWriteID domain.StreamCode, streamID domain.StreamCode, buf *buffer.Service, err error)
 }
 
 // RTMPServer is a single-port RTMP push server.
@@ -99,8 +99,9 @@ type rtmpSession struct {
 	audioPid uint16
 	hasVideo bool
 	hasAudio bool
-	streamID domain.StreamCode
-	buf      *buffer.Service
+	streamID      domain.StreamCode // logical stream (logs)
+	bufferWriteID domain.StreamCode // buf.Write target
+	buf           *buffer.Service
 }
 
 func (s *rtmpSession) run() {
@@ -111,7 +112,7 @@ func (s *rtmpSession) run() {
 		}
 		pkt := make([]byte, len(pkg))
 		copy(pkt, pkg)
-		if err := s.buf.Write(s.streamID, buffer.Packet(pkt)); err != nil {
+		if err := s.buf.Write(s.bufferWriteID, buffer.Packet(pkt)); err != nil {
 			slog.Error("rtmp: buffer write failed", "stream_code", s.streamID, "err", err)
 		}
 	}
@@ -123,13 +124,14 @@ func (s *rtmpSession) run() {
 	})
 
 	s.handle.OnPublish(func(app, streamName string) gortmp.StatusCode {
-		streamID, buf, err := s.registry.Lookup(streamName)
+		writeID, streamID, buf, err := s.registry.Lookup(streamName)
 		if err != nil {
 			slog.Warn("rtmp: rejected unknown stream key", "key", streamName)
 			return gortmp.NETCONNECT_CONNECT_REJECTED
 		}
 		s.mu.Lock()
 		s.streamID = streamID
+		s.bufferWriteID = writeID
 		s.buf = buf
 		s.mu.Unlock()
 		slog.Info("rtmp: publisher connected", "stream_key", streamName, "stream_code", streamID)

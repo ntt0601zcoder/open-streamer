@@ -132,12 +132,13 @@ func (s *Service) runSRTSubscriber(ctx context.Context, streamID domain.StreamCo
 		_ = conn.Close()
 	}()
 
-	sub, err := s.buf.Subscribe(streamID)
+	mediaID := s.mediaBufferFor(streamID)
+	sub, err := s.buf.Subscribe(mediaID)
 	if err != nil {
-		slog.Error("publisher: SRT subscriber buffer subscribe failed", "stream_code", streamID, "err", err)
+		slog.Error("publisher: SRT subscriber buffer subscribe failed", "stream_code", streamID, "buffer_id", mediaID, "err", err)
 		return
 	}
-	defer s.buf.Unsubscribe(streamID, sub)
+	defer s.buf.Unsubscribe(mediaID, sub)
 
 	slog.Info("publisher: SRT playback client connected",
 		"stream_code", streamID,

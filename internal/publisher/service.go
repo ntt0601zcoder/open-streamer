@@ -32,6 +32,9 @@ type Service struct {
 	workers map[domain.StreamCode]context.CancelFunc
 	// streamWorkCtx is the per-stream publisher worker context (same lifetime as workers).
 	streamWorkCtx map[domain.StreamCode]context.Context
+	// mediaBuffer is the Buffer Hub id for single-rendition outputs (RTSP, RTMP, SRT, push, DVR via API).
+	// When transcoding produces an ABR ladder, this is the best rung ($r$...), not the logical stream code.
+	mediaBuffer map[domain.StreamCode]domain.StreamCode
 
 	rtspMu     sync.RWMutex
 	rtspSrv    *gortsplib.Server
@@ -57,6 +60,7 @@ func New(i do.Injector) (*Service, error) {
 		buf:           buf,
 		workers:       make(map[domain.StreamCode]context.CancelFunc),
 		streamWorkCtx: make(map[domain.StreamCode]context.Context),
+		mediaBuffer:   make(map[domain.StreamCode]domain.StreamCode),
 		rtspMounts:    make(map[string]*gortsplib.ServerStream),
 		rtmpActive:    make(map[domain.StreamCode]struct{}),
 		srtActive:     make(map[domain.StreamCode]struct{}),
@@ -87,27 +91,37 @@ func (s *Service) Start(ctx context.Context, stream *domain.Stream) error {
 	workerCtx, cancel := context.WithCancel(ctx)
 	s.workers[stream.Code] = cancel
 	s.streamWorkCtx[stream.Code] = workerCtx
+	s.mediaBuffer[stream.Code] = buffer.PlaybackBufferID(stream.Code, stream.Transcoder)
 
-	s.spawnOutputs(workerCtx, stream.Code, stream.Push, p)
+	s.spawnOutputs(workerCtx, stream, p)
 
 	return nil
 }
 
 func (s *Service) spawnOutputs(
 	workerCtx context.Context,
-	code domain.StreamCode,
-	push []domain.PushDestination,
+	stream *domain.Stream,
 	p domain.OutputProtocols,
 ) {
+	code := stream.Code
 	if p.HLS {
-		go s.serveHLS(workerCtx, code)
+		if publisherABRActive(stream) {
+			go s.serveHLSAdaptive(workerCtx, stream)
+		} else {
+			go s.serveHLS(workerCtx, s.mediaBufferForLocked(code))
+		}
 	}
 	if p.DASH {
-		go s.serveDASH(workerCtx, code)
+		if publisherABRActive(stream) {
+			go s.serveDASHAdaptive(workerCtx, stream)
+		} else {
+			go s.serveDASH(workerCtx, s.mediaBufferForLocked(code))
+		}
 	}
 
+	playID := s.mediaBufferForLocked(code)
 	if p.RTSP {
-		go s.serveRTSP(workerCtx, code)
+		go s.serveRTSP(workerCtx, code, playID)
 	}
 	if p.RTMP {
 		go s.serveRTMP(workerCtx, code)
@@ -118,11 +132,33 @@ func (s *Service) spawnOutputs(
 	if p.RTS {
 		go s.serveRTS(workerCtx, code)
 	}
-	for _, dest := range push {
+	for _, dest := range stream.Push {
 		if dest.Enabled {
-			go s.pushToDestination(workerCtx, code, dest)
+			go s.pushToDestination(workerCtx, code, playID, dest)
 		}
 	}
+}
+
+func publisherABRActive(stream *domain.Stream) bool {
+	if stream == nil {
+		return false
+	}
+	return len(buffer.RenditionsForTranscoder(stream.Code, stream.Transcoder)) > 0
+}
+
+// mediaBufferForLocked returns the buffer id for MPEG-TS playout; caller must hold s.mu.
+func (s *Service) mediaBufferForLocked(code domain.StreamCode) domain.StreamCode {
+	if id, ok := s.mediaBuffer[code]; ok {
+		return id
+	}
+	return code
+}
+
+// mediaBufferFor returns the buffer id for logical stream code (RTMP play path, etc.).
+func (s *Service) mediaBufferFor(code domain.StreamCode) domain.StreamCode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mediaBufferForLocked(code)
 }
 
 // Stop cancels all output workers for a stream.
@@ -133,5 +169,6 @@ func (s *Service) Stop(streamID domain.StreamCode) {
 		delete(s.workers, streamID)
 	}
 	delete(s.streamWorkCtx, streamID)
+	delete(s.mediaBuffer, streamID)
 	s.mu.Unlock()
 }

@@ -159,12 +159,13 @@ func (s *Service) handleRTMPPlayConn(conn net.Conn) {
 }
 
 func (s *Service) runRTMPMediaPump(ctx context.Context, streamID domain.StreamCode, handle *rtmpmedia.RtmpServerHandle) {
-	sub, err := s.buf.Subscribe(streamID)
+	mediaID := s.mediaBufferFor(streamID)
+	sub, err := s.buf.Subscribe(mediaID)
 	if err != nil {
-		slog.Error("publisher: RTMP play subscribe failed", "stream_code", streamID, "err", err)
+		slog.Error("publisher: RTMP play subscribe failed", "stream_code", streamID, "buffer_id", mediaID, "err", err)
 		return
 	}
-	defer s.buf.Unsubscribe(streamID, sub)
+	defer s.buf.Unsubscribe(mediaID, sub)
 
 	pr, pw := io.Pipe()
 	defer func() { _ = pr.Close() }()

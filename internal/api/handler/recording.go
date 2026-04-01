@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/open-streamer/open-streamer/internal/buffer"
 	"github.com/open-streamer/open-streamer/internal/domain"
 	"github.com/open-streamer/open-streamer/internal/dvr"
 	"github.com/open-streamer/open-streamer/internal/store"
@@ -43,11 +44,15 @@ func (h *RecordingHandler) Start(w http.ResponseWriter, r *http.Request) {
 	streamCode := domain.StreamCode(chi.URLParam(r, "code"))
 
 	var segmentDuration time.Duration
-	if stream, err := h.streamRepo.FindByCode(r.Context(), streamCode); err == nil && stream != nil && stream.DVR != nil {
-		segmentDuration = time.Duration(stream.DVR.SegmentDuration) * time.Second
+	var mediaBuf domain.StreamCode
+	if stream, err := h.streamRepo.FindByCode(r.Context(), streamCode); err == nil && stream != nil {
+		if stream.DVR != nil {
+			segmentDuration = time.Duration(stream.DVR.SegmentDuration) * time.Second
+		}
+		mediaBuf = buffer.PlaybackBufferID(streamCode, stream.Transcoder)
 	}
 
-	rec, err := h.dvr.StartRecording(r.Context(), streamCode, segmentDuration)
+	rec, err := h.dvr.StartRecording(r.Context(), streamCode, mediaBuf, segmentDuration)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "RECORDING_START_FAILED", err.Error())
 		return

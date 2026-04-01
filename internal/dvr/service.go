@@ -56,9 +56,10 @@ func New(i do.Injector) (*Service, error) {
 }
 
 // StartRecording begins writing segments for the given stream.
+// mediaBufferID is the Buffer Hub id to read (use buffer.PlaybackBufferID when transcoding ABR); if empty, streamID is used.
 // segmentDuration controls how long each MPEG-TS segment file will be.
 // If 0, defaults to 6 seconds. Pass the stream's DVR config value if available.
-func (s *Service) StartRecording(ctx context.Context, streamID domain.StreamCode, segmentDuration time.Duration) (*domain.Recording, error) {
+func (s *Service) StartRecording(ctx context.Context, streamID domain.StreamCode, mediaBufferID domain.StreamCode, segmentDuration time.Duration) (*domain.Recording, error) {
 	if !s.cfg.Enabled {
 		return nil, fmt.Errorf("dvr: disabled in config")
 	}
@@ -87,7 +88,11 @@ func (s *Service) StartRecording(ctx context.Context, streamID domain.StreamCode
 	if segmentDuration <= 0 {
 		segmentDuration = 6 * time.Second
 	}
-	go s.record(workerCtx, rec, segmentDuration)
+	subscribeID := mediaBufferID
+	if subscribeID == "" {
+		subscribeID = streamID
+	}
+	go s.record(workerCtx, rec, subscribeID, segmentDuration)
 
 	s.bus.Publish(ctx, domain.Event{
 		Type:     domain.EventRecordingStarted,
@@ -133,13 +138,13 @@ func (s *Service) StopRecording(ctx context.Context, streamID domain.StreamCode)
 	return nil
 }
 
-func (s *Service) record(ctx context.Context, rec *domain.Recording, segDuration time.Duration) {
-	sub, err := s.buf.Subscribe(rec.StreamCode)
+func (s *Service) record(ctx context.Context, rec *domain.Recording, subscribeID domain.StreamCode, segDuration time.Duration) {
+	sub, err := s.buf.Subscribe(subscribeID)
 	if err != nil {
-		slog.Error("dvr: subscribe failed", "stream_code", rec.StreamCode, "err", err)
+		slog.Error("dvr: subscribe failed", "stream_code", rec.StreamCode, "buffer_id", subscribeID, "err", err)
 		return
 	}
-	defer s.buf.Unsubscribe(rec.StreamCode, sub)
+	defer s.buf.Unsubscribe(subscribeID, sub)
 	var (
 		segBuf   []byte
 		segStart = time.Now()

@@ -74,7 +74,7 @@ func (s *Server) buildRouter(
 	r.Get("/swagger/", serveSwaggerIndex)
 	r.Get("/{code}/index.m3u8", s.serveManifest("index.m3u8", "application/vnd.apple.mpegurl", s.hlsDir))
 	r.Get("/{code}/index.mpd", s.serveManifest("index.mpd", "application/dash+xml", s.dashDir))
-	r.Get("/{code}/{asset}", s.serveStreamAsset())
+	r.Get("/{code}/*", s.serveStreamNested())
 
 	r.Route("/streams", func(r chi.Router) {
 		r.Get("/", stream.List)
@@ -166,19 +166,22 @@ func (s *Server) serveManifest(filename, contentType, rootDir string) http.Handl
 	}
 }
 
-func (s *Server) serveStreamAsset() http.HandlerFunc {
+// serveStreamNested serves HLS/DASH assets under /{code}/… including ABR paths like 1080p/index.m3u8.
+func (s *Server) serveStreamNested() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		code := chi.URLParam(r, "code")
-		asset := chi.URLParam(r, "asset")
-		if code == "" || asset == "" {
+		suffix := strings.TrimPrefix(chi.URLParam(r, "*"), "/")
+		if code == "" || suffix == "" {
 			http.NotFound(w, r)
 			return
 		}
-		if asset != filepath.Base(asset) {
+		rel := filepath.Clean(suffix)
+		if rel == "." || strings.HasPrefix(rel, "..") {
 			http.NotFound(w, r)
 			return
 		}
-		ext := strings.ToLower(filepath.Ext(asset))
+		baseName := filepath.Base(rel)
+		ext := strings.ToLower(filepath.Ext(baseName))
 		baseDir := ""
 		switch ext {
 		case ".ts", ".m3u8":
@@ -189,6 +192,9 @@ func (s *Server) serveStreamAsset() http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
-		http.ServeFile(w, r, filepath.Join(baseDir, code, asset))
+		if ext == ".mpd" {
+			w.Header().Set("Cache-Control", "no-store, max-age=0, must-revalidate")
+		}
+		http.ServeFile(w, r, filepath.Join(baseDir, code, rel))
 	}
 }

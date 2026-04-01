@@ -18,15 +18,15 @@ import (
 	"github.com/open-streamer/open-streamer/internal/domain"
 )
 
-func (s *Service) pushToDestination(ctx context.Context, streamID domain.StreamCode, dest domain.PushDestination) {
-	sub, err := s.buf.Subscribe(streamID)
+func (s *Service) pushToDestination(ctx context.Context, logicalCode, mediaBufferID domain.StreamCode, dest domain.PushDestination) {
+	sub, err := s.buf.Subscribe(mediaBufferID)
 	if err != nil {
-		slog.Error("publisher: push subscribe failed", "stream_code", streamID, "url", dest.URL, "err", err)
+		slog.Error("publisher: push subscribe failed", "stream_code", logicalCode, "buffer_id", mediaBufferID, "url", dest.URL, "err", err)
 		return
 	}
-	defer s.buf.Unsubscribe(streamID, sub)
+	defer s.buf.Unsubscribe(mediaBufferID, sub)
 
-	slog.Info("publisher: push destination started", "stream_code", streamID, "url", dest.URL)
+	slog.Info("publisher: push destination started", "stream_code", logicalCode, "buffer_id", mediaBufferID, "url", dest.URL)
 
 	retryDelay := time.Duration(dest.RetryTimeoutSec) * time.Second
 	if retryDelay <= 0 {
@@ -40,7 +40,7 @@ func (s *Service) pushToDestination(ctx context.Context, streamID domain.StreamC
 		}
 		if dest.Limit > 0 && attempt >= dest.Limit {
 			slog.Warn("publisher: push retry limit reached",
-				"stream_code", streamID,
+				"stream_code", logicalCode,
 				"url", dest.URL,
 				"limit", dest.Limit,
 			)
@@ -61,7 +61,7 @@ func (s *Service) pushToDestination(ctx context.Context, streamID domain.StreamC
 		}
 
 		slog.Warn("publisher: push failed, retrying",
-			"stream_code", streamID,
+			"stream_code", logicalCode,
 			"url", dest.URL,
 			"attempt", attempt,
 			"err", pushErr,

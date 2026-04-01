@@ -1,0 +1,120 @@
+package transcoder
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"os/exec"
+	"sync"
+
+	"github.com/open-streamer/open-streamer/internal/buffer"
+	"github.com/open-streamer/open-streamer/internal/domain"
+)
+
+// runProfileEncoder is one FFmpeg process: raw MPEG-TS in → one profile MPEG-TS out → buffer.
+// profileIndex is the 0-based ladder position (log label = buffer.VideoTrackSlug(profileIndex)).
+func (s *Service) runProfileEncoder(
+	ctx context.Context,
+	logStream domain.StreamCode,
+	rawIngestID, outBufferID domain.StreamCode,
+	tc *domain.TranscoderConfig,
+	profileIndex int,
+	prof Profile,
+) {
+	track := buffer.VideoTrackSlug(profileIndex)
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-ctx.Done():
+		return
+	}
+
+	args, err := buildFFmpegArgs([]Profile{prof}, tc)
+	if err != nil {
+		slog.Error("transcoder: build ffmpeg args", "stream_code", logStream, "profile", track, "err", err)
+		return
+	}
+
+	sub, err := s.buf.Subscribe(rawIngestID)
+	if err != nil {
+		slog.Error("transcoder: subscribe failed", "stream_code", logStream, "profile", track, "err", err)
+		return
+	}
+	defer s.buf.Unsubscribe(rawIngestID, sub)
+
+	cmd := exec.CommandContext(ctx, s.cfg.FFmpegPath, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		slog.Error("transcoder: stdin pipe failed", "stream_code", logStream, "profile", track, "err", err)
+		return
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slog.Error("transcoder: stdout pipe failed", "stream_code", logStream, "profile", track, "err", err)
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		slog.Error("transcoder: stderr pipe failed", "stream_code", logStream, "profile", track, "err", err)
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		slog.Error("transcoder: ffmpeg start failed", "stream_code", logStream, "profile", track, "err", err)
+		return
+	}
+
+	slog.Info("transcoder: profile encoder started",
+		"stream_code", logStream,
+		"profile", track,
+		"write_to", outBufferID,
+	)
+
+	go s.logStderr(logStream, track, stderr)
+
+	var stdinWG sync.WaitGroup
+	stdinWG.Add(1)
+	go func() {
+		defer stdinWG.Done()
+		defer func() { _ = stdin.Close() }()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case pkt, ok := <-sub.Recv():
+				if !ok {
+					return
+				}
+				if _, werr := stdin.Write(pkt); werr != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	readBuf := make([]byte, 256*1024)
+	for {
+		n, rerr := stdout.Read(readBuf)
+		if n > 0 {
+			out := make([]byte, n)
+			copy(out, readBuf[:n])
+			if werr := s.buf.Write(outBufferID, buffer.Packet(out)); werr != nil {
+				slog.Error("transcoder: buffer write failed", "stream_code", logStream, "profile", track, "err", werr)
+				break
+			}
+		}
+		if rerr != nil {
+			if rerr != io.EOF {
+				slog.Debug("transcoder: stdout read ended", "stream_code", logStream, "profile", track, "err", rerr)
+			}
+			break
+		}
+	}
+
+	_ = stdin.Close()
+	stdinWG.Wait()
+
+	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+		slog.Error("transcoder: ffmpeg exited with error", "stream_code", logStream, "profile", track, "err", err)
+	}
+}

@@ -54,6 +54,7 @@ func runDASHFMP4Packager(
 	manifestPath string,
 	segSec, window, history int,
 	ephemeral bool,
+	opts *dashRunOpts,
 ) {
 	if segSec <= 0 {
 		segSec = 2
@@ -77,6 +78,15 @@ func runDASHFMP4Packager(
 		audioCodec:   "mp4a.40.2",
 		width:        1280,
 		height:       720,
+		packAudio:    true,
+	}
+	if opts != nil {
+		p.abrMaster = opts.abrMaster
+		p.abrSlug = opts.abrSlug
+		if opts.videoBandwidthBps > 0 {
+			p.videoBW = opts.videoBandwidthBps
+		}
+		p.packAudio = opts.packAudio
 	}
 
 	pr, pw := io.Pipe()
@@ -205,6 +215,11 @@ type dashFMP4Packager struct {
 
 	// Set once when the first media segment exists; required for type=dynamic MPD (dash.js / ISO 23009-1).
 	availabilityStart time.Time
+
+	abrMaster *dashABRMaster
+	abrSlug   string
+	videoBW   int
+	packAudio bool
 }
 
 func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
@@ -238,6 +253,9 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		}
 
 	case mpeg2.TS_STREAM_AAC:
+		if !p.packAudio {
+			return
+		}
 		if p.audioInit != nil {
 			p.ingestADTSLocked(frame, pts)
 			return
@@ -688,8 +706,15 @@ func windowTailUint64(vals []uint64, n int) []uint64 {
 	return vals[len(vals)-n:]
 }
 
+func (p *dashFMP4Packager) effectiveVideoBW() int {
+	if p.videoBW > 0 {
+		return p.videoBW
+	}
+	return 5_000_000
+}
+
 func (p *dashFMP4Packager) writeManifestLocked() error {
-	if p.manifestPath == "" {
+	if p.manifestPath == "" && p.abrMaster == nil {
 		return nil
 	}
 
@@ -755,7 +780,7 @@ func (p *dashFMP4Packager) writeManifestLocked() error {
 				ID:        "v0",
 				MimeType:  "video/mp4",
 				Codecs:    p.videoCodec,
-				Bandwidth: 5_000_000,
+				Bandwidth: p.effectiveVideoBW(),
 				Width:     p.width,
 				Height:    p.height,
 				SegmentTemplate: mpdSegmentTemplate{
@@ -819,6 +844,11 @@ func (p *dashFMP4Packager) writeManifestLocked() error {
 		return nil
 	}
 
+	if p.abrMaster != nil {
+		p.abrMaster.onShardUpdated(p)
+		return nil
+	}
+
 	out, err := xml.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
@@ -872,6 +902,7 @@ type mpdRepresentation struct {
 	Width               int                `xml:"width,attr,omitempty"`
 	Height              int                `xml:"height,attr,omitempty"`
 	AudioSamplingRate   *int               `xml:"audioSamplingRate,attr,omitempty"`
+	BaseURL             string             `xml:"BaseURL,omitempty"`
 	SegmentTemplate     mpdSegmentTemplate `xml:"SegmentTemplate"`
 }
 
