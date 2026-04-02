@@ -16,6 +16,7 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/events"
 	"github.com/ntthuan060102github/open-streamer/internal/store"
+	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
 	"github.com/samber/do/v2"
 )
 
@@ -149,6 +150,7 @@ func (s *Service) record(ctx context.Context, rec *domain.Recording, subscribeID
 		segBuf   []byte
 		segStart = time.Now()
 		segIdx   int
+		avMux    *tsmux.FromAV
 	)
 
 	for {
@@ -162,7 +164,9 @@ func (s *Service) record(ctx context.Context, rec *domain.Recording, subscribeID
 			if !ok {
 				return
 			}
-			segBuf = append(segBuf, pkt...)
+			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+				segBuf = append(segBuf, b...)
+			})
 
 			if time.Since(segStart) >= segDuration {
 				s.flushSegment(ctx, rec, segIdx, segBuf, time.Since(segStart))

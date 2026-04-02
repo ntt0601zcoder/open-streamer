@@ -28,7 +28,7 @@ func runPullWorker(
 	streamID domain.StreamCode,
 	bufferWriteID domain.StreamCode,
 	input domain.Input,
-	r Reader,
+	r PacketReader,
 	buf *buffer.Service,
 	onPacket func(streamID domain.StreamCode, inputPriority int),
 	onInputError func(streamID domain.StreamCode, inputPriority int, err error),
@@ -111,28 +111,31 @@ func readLoop(
 	streamID domain.StreamCode,
 	bufferWriteID domain.StreamCode,
 	input domain.Input,
-	r Reader,
+	r PacketReader,
 	buf *buffer.Service,
 	onPacket func(streamID domain.StreamCode, inputPriority int),
 ) error {
 	for {
-		pkt, err := r.Read(ctx)
+		batch, err := r.ReadPackets(ctx)
 		if err != nil {
 			return err
 		}
-		if len(pkt) == 0 {
-			continue
-		}
-		if writeErr := buf.Write(bufferWriteID, buffer.Packet(pkt)); writeErr != nil {
-			slog.Error("ingestor: buffer write failed",
-				"stream_code", streamID,
-				"input_priority", input.Priority,
-				"err", writeErr,
-			)
-			return writeErr
-		}
-		if onPacket != nil {
-			onPacket(streamID, input.Priority)
+		for _, p := range batch {
+			if len(p.Data) == 0 {
+				continue
+			}
+			cl := p.Clone()
+			if writeErr := buf.Write(bufferWriteID, buffer.Packet{AV: cl}); writeErr != nil {
+				slog.Error("ingestor: buffer write failed",
+					"stream_code", streamID,
+					"input_priority", input.Priority,
+					"err", writeErr,
+				)
+				return writeErr
+			}
+			if onPacket != nil {
+				onPacket(streamID, input.Priority)
+			}
 		}
 	}
 }

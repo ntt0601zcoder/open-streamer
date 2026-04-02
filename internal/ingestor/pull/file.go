@@ -2,16 +2,16 @@ package pull
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
-
-const fileReadChunk = 188 * 56 // ~10 KiB per read
 
 // FileReader reads a local media file and emits its bytes as MPEG-TS chunks.
 // If the input URL has the query parameter "loop=true", the file is read
@@ -24,7 +24,8 @@ type FileReader struct {
 	path  string
 	loop  bool
 	f     *os.File
-	buf   []byte
+
+	demux Demuxer
 }
 
 // NewFileReader constructs a FileReader for the given input.
@@ -34,52 +35,73 @@ func NewFileReader(input domain.Input) *FileReader {
 		input: input,
 		path:  path,
 		loop:  loop,
-		buf:   make([]byte, fileReadChunk),
 	}
 }
 
 // Open opens the underlying file for reading.
 func (r *FileReader) Open(_ context.Context) error {
+	st, err := os.Stat(r.path)
+	if err != nil {
+		return fmt.Errorf("file reader: stat %q: %w", r.path, err)
+	}
+	if st.IsDir() {
+		return fmt.Errorf("file reader: path %q is a directory", r.path)
+	}
+	if !shouldUseNativeMP4(r.path) {
+		f, err := os.Open(r.path)
+		if err != nil {
+			return fmt.Errorf("file reader: open %q: %w", r.path, err)
+		}
+		r.f = f
+		r.demux = newPassthroughDemuxer(r.f, 188*56)
+		return nil
+	}
 	f, err := os.Open(r.path)
 	if err != nil {
 		return fmt.Errorf("file reader: open %q: %w", r.path, err)
 	}
 	r.f = f
+	dmx, err := newMP4ToTSDemuxer(r.f, r.loop)
+	if err != nil {
+		_ = f.Close()
+		r.f = nil
+		return fmt.Errorf("file reader: mp4 demux init: %w", err)
+	}
+	r.demux = dmx
 	return nil
 }
 
 func (r *FileReader) Read(ctx context.Context) ([]byte, error) {
-	for {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 
-		n, err := r.f.Read(r.buf)
-		if n > 0 {
-			out := make([]byte, n)
-			copy(out, r.buf[:n])
-			return out, nil
-		}
-		if err == io.EOF {
-			if !r.loop {
-				return nil, io.EOF
-			}
-			// Seek back to the beginning for looping.
-			if _, seekErr := r.f.Seek(0, io.SeekStart); seekErr != nil {
-				return nil, fmt.Errorf("file reader: seek to start: %w", seekErr)
-			}
-			continue
+	if r.demux == nil {
+		return nil, fmt.Errorf("file reader: not opened")
+	}
+	chunk, err := r.demux.Read(ctx)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, io.EOF
 		}
 		return nil, fmt.Errorf("file reader: read: %w", err)
 	}
+	return chunk, nil
 }
 
 // Close closes the open file, if any.
 func (r *FileReader) Close() error {
-	if r.f != nil {
-		return r.f.Close()
+	var closeErr error
+	if r.demux != nil {
+		_ = r.demux.Close()
+		r.demux = nil
 	}
-	return nil
+	if r.f != nil {
+		if err := r.f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			closeErr = err
+		}
+	}
+	return closeErr
 }
 
 // parseFileURL extracts the filesystem path and loop flag from a URL.
@@ -93,4 +115,13 @@ func parseFileURL(rawURL string) (path string, loop bool) {
 		}
 	}
 	return rawURL, false
+}
+
+func shouldUseNativeMP4(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mp4", ".m4v", ".mov":
+		return true
+	default:
+		return false
+	}
 }

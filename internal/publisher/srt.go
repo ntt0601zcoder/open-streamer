@@ -12,6 +12,7 @@ import (
 	srt "github.com/datarhei/gosrt"
 
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
 )
 
 func (s *Service) srtListenPort() int {
@@ -147,6 +148,7 @@ func (s *Service) runSRTSubscriber(ctx context.Context, streamID domain.StreamCo
 	)
 	defer slog.Info("publisher: SRT playback client disconnected", "stream_code", streamID)
 
+	var avMux *tsmux.FromAV
 	for {
 		select {
 		case <-ctx.Done():
@@ -155,7 +157,14 @@ func (s *Service) runSRTSubscriber(ctx context.Context, streamID domain.StreamCo
 			if !ok {
 				return
 			}
-			if _, werr := conn.Write(pkt); werr != nil {
+			var werr error
+			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+				if werr != nil {
+					return
+				}
+				_, werr = conn.Write(b)
+			})
+			if werr != nil {
 				return
 			}
 		}

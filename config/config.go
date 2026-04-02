@@ -20,10 +20,21 @@ type Config struct {
 	Buffer     BufferConfig
 	Transcoder TranscoderConfig
 	Publisher  PublisherConfig
+	Manager    ManagerConfig
 	DVR        DVRConfig
 	Hooks      HooksConfig
 	Metrics    MetricsConfig
 	Log        LogConfig
+}
+
+// ManagerConfig controls Stream Manager failover and input health checks.
+type ManagerConfig struct {
+	// InputPacketTimeoutSec is the maximum gap without a successful read on the
+	// active input before it is marked failed. Pull protocols that deliver in
+	// bursts (e.g. HLS: one segment per Read) need this at least as large as the
+	// typical interval between reads (segment duration + playlist poll), or a
+	// healthy primary will be falsely failed over to a lower priority.
+	InputPacketTimeoutSec int `mapstructure:"input_packet_timeout_sec"`
 }
 
 // ServerConfig holds HTTP/gRPC server settings.
@@ -225,6 +236,8 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("transcoder.max_workers", 4)
 	v.SetDefault("transcoder.ffmpeg_path", "ffmpeg")
+
+	v.SetDefault("manager.input_packet_timeout_sec", 30)
 
 	v.SetDefault("publisher.hls.dir", "./hls")
 	v.SetDefault("publisher.hls.base_url", "http://localhost:8080/hls")

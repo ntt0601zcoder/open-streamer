@@ -124,7 +124,7 @@ func (s *Service) Probe(ctx context.Context, input domain.Input) error {
 	if protocol.IsPushListen(input.URL) {
 		return fmt.Errorf("ingestor: probe unsupported for push-listen input %q", input.URL)
 	}
-	reader, err := NewReader(input, s.cfg)
+	reader, err := NewPacketReader(input, s.cfg)
 	if err != nil {
 		return err
 	}
@@ -133,14 +133,19 @@ func (s *Service) Probe(ctx context.Context, input domain.Input) error {
 	if err := reader.Open(ctx); err != nil {
 		return err
 	}
-	pkt, err := reader.Read(ctx)
+	batch, err := reader.ReadPackets(ctx)
 	if err != nil {
 		return err
 	}
-	if len(pkt) == 0 {
-		return fmt.Errorf("ingestor: probe got empty packet")
+	if len(batch) == 0 {
+		return fmt.Errorf("ingestor: probe got empty batch")
 	}
-	return nil
+	for _, p := range batch {
+		if len(p.Data) > 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("ingestor: probe got no payload")
 }
 
 // Stop cancels the pull worker or unregisters the push key for streamID.
@@ -161,9 +166,9 @@ func (s *Service) Stop(streamID domain.StreamCode) {
 // ---- private ----
 
 func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCode, input domain.Input, bufferWriteID domain.StreamCode) error {
-	reader, err := NewReader(input, s.cfg)
+	reader, err := NewPacketReader(input, s.cfg)
 	if err != nil {
-		return fmt.Errorf("ingestor: create reader: %w", err)
+		return fmt.Errorf("ingestor: create packet reader: %w", err)
 	}
 
 	s.mu.Lock()

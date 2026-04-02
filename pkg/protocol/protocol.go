@@ -15,12 +15,10 @@ type Kind string
 const (
 	KindUDP     Kind = "udp"  // raw MPEG-TS over UDP (unicast or multicast)
 	KindHLS     Kind = "hls"  // HLS playlist pull over HTTP/HTTPS
-	KindHTTP    Kind = "http" // raw byte-stream over HTTP/HTTPS (e.g. MPEG-TS over HTTP)
 	KindFile    Kind = "file" // local filesystem path
 	KindRTMP    Kind = "rtmp" // RTMP / RTMPS (pull or push-listen)
 	KindRTSP    Kind = "rtsp" // RTSP pull
 	KindSRT     Kind = "srt"  // SRT (pull caller or push listener)
-	KindS3      Kind = "s3"   // AWS S3 / S3-compatible object (MinIO, etc.)
 	KindUnknown Kind = "unknown"
 )
 
@@ -35,7 +33,6 @@ const (
 //	udp://...                 → KindUDP
 //	rtsp:// or rtsps://...    → KindRTSP
 //	http(s)://...*.m3u8       → KindHLS
-//	http(s)://...             → KindHTTP
 //	file:// or /absolute/path → KindFile
 func Detect(rawURL string) Kind {
 	u, err := url.Parse(rawURL)
@@ -48,8 +45,6 @@ func Detect(rawURL string) Kind {
 		return KindRTMP
 	case "srt":
 		return KindSRT
-	case "s3":
-		return KindS3
 	case "udp":
 		return KindUDP
 	case "rtsp", "rtsps":
@@ -61,7 +56,7 @@ func Detect(rawURL string) Kind {
 			strings.HasSuffix(strings.ToLower(u.Path), ".m3u") {
 			return KindHLS
 		}
-		return KindHTTP
+		return KindUnknown
 	case "":
 		// Bare path — treat as local file.
 		if strings.HasPrefix(rawURL, "/") {

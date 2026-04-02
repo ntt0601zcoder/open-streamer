@@ -110,7 +110,7 @@ func handleSRTConn(ctx context.Context, conn srt.Conn, bufferWriteID, streamID d
 		if n > 0 {
 			pkt := make([]byte, n)
 			copy(pkt, readBuf[:n])
-			if writeErr := buf.Write(bufferWriteID, buffer.Packet(pkt)); writeErr != nil {
+			if writeErr := buf.Write(bufferWriteID, buffer.TSPacket(pkt)); writeErr != nil {
 				slog.Error("srt: buffer write failed",
 					"stream_code", streamID,
 					"err", writeErr,

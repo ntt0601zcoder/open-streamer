@@ -33,6 +33,9 @@ func (s *Service) serveHLS(ctx context.Context, streamID domain.StreamCode) {
 		window:      s.cfg.HLS.LiveWindow,
 		history:     s.cfg.HLS.LiveHistory,
 		ephemeral:   s.cfg.HLS.LiveEphemeral,
+		currentFailoverGen: func() uint64 {
+			return s.hlsFailoverGenSnapshot(streamID)
+		},
 	})
 }
 

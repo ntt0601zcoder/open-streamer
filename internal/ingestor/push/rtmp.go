@@ -112,7 +112,7 @@ func (s *rtmpSession) run() {
 		}
 		pkt := make([]byte, len(pkg))
 		copy(pkt, pkg)
-		if err := s.buf.Write(s.bufferWriteID, buffer.Packet(pkt)); err != nil {
+		if err := s.buf.Write(s.bufferWriteID, buffer.TSPacket(pkt)); err != nil {
 			slog.Error("rtmp: buffer write failed", "stream_code", s.streamID, "err", err)
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ntthuan060102github/open-streamer/config"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/events"
 	"github.com/ntthuan060102github/open-streamer/internal/ingestor"
@@ -53,10 +54,11 @@ type InputHealthSnapshot struct {
 
 // Service monitors all streams and orchestrates failover.
 type Service struct {
-	bus      events.Bus
-	ingestor *ingestor.Service
-	mu       sync.RWMutex
-	streams  map[domain.StreamCode]*streamState
+	bus              events.Bus
+	ingestor         *ingestor.Service
+	packetTimeout    time.Duration // max gap without packets on active input
+	mu               sync.RWMutex
+	streams          map[domain.StreamCode]*streamState
 }
 
 const (
@@ -67,12 +69,18 @@ const (
 
 // New creates a Service and registers it with the DI injector.
 func New(i do.Injector) (*Service, error) {
+	cfg := do.MustInvoke[*config.Config](i)
 	bus := do.MustInvoke[events.Bus](i)
 	ing := do.MustInvoke[*ingestor.Service](i)
+	sec := cfg.Manager.InputPacketTimeoutSec
+	if sec <= 0 {
+		sec = 30
+	}
 	svc := &Service{
-		bus:      bus,
-		ingestor: ing,
-		streams:  make(map[domain.StreamCode]*streamState),
+		bus:           bus,
+		ingestor:      ing,
+		packetTimeout: time.Duration(sec) * time.Second,
+		streams:       make(map[domain.StreamCode]*streamState),
 	}
 	ing.SetPacketObserver(svc.RecordPacket)
 	ing.SetInputErrorObserver(svc.ReportInputError)
@@ -238,9 +246,11 @@ func (s *Service) checkHealth(ctx context.Context, streamID domain.StreamCode) {
 		return
 	}
 
-	const timeout = 5 * time.Second
+	timeout := s.packetTimeout
 	for priority, h := range state.inputs {
-		if time.Since(h.LastPacketAt) > timeout && h.Status == domain.StatusActive {
+		// Only the live input receives packets; others must not be judged by a stale
+		// LastPacketAt or we mark them degraded after every failback and ping-pong sources.
+		if priority == state.active && time.Since(h.LastPacketAt) > timeout && h.Status == domain.StatusActive {
 			slog.Warn("manager: input timeout detected",
 				"stream_code", streamID,
 				"input_priority", priority,
@@ -318,6 +328,10 @@ func (s *Service) tryFailover(ctx context.Context, streamID domain.StreamCode, s
 	}
 
 	prev := state.active
+	if prevH, ok := state.inputs[prev]; ok && prevH.Status == domain.StatusActive {
+		// Replaced worker no longer ingests; avoid leaving StatusActive with a frozen clock.
+		prevH.Status = domain.StatusIdle
+	}
 	state.active = best.Input.Priority
 	state.lastSwitchAt = time.Now()
 

@@ -34,15 +34,15 @@ func TestDetect(t *testing.T) {
 		{name: "https m3u8", url: "https://cdn.example.com/live/playlist.m3u8", want: protocol.KindHLS},
 		{name: "http m3u", url: "http://cdn.example.com/live/playlist.m3u", want: protocol.KindHLS},
 		{name: "uppercase M3U8 extension", url: "http://cdn.example.com/LIVE.M3U8", want: protocol.KindHLS},
-		// HTTP raw stream
-		{name: "http ts stream", url: "http://cdn.example.com/live.ts", want: protocol.KindHTTP},
-		{name: "https stream", url: "https://cdn.example.com/live", want: protocol.KindHTTP},
+		// HTTP raw byte-stream is intentionally not supported (only HLS playlists).
+		{name: "http ts stream (unsupported)", url: "http://cdn.example.com/live.ts", want: protocol.KindUnknown},
+		{name: "https stream (unsupported)", url: "https://cdn.example.com/live", want: protocol.KindUnknown},
 		// File
 		{name: "file scheme", url: "file:///recordings/source.ts", want: protocol.KindFile},
 		{name: "absolute path", url: "/recordings/source.ts", want: protocol.KindFile},
-		// S3
-		{name: "s3 bucket key", url: "s3://my-bucket/streams/live.ts", want: protocol.KindS3},
-		{name: "s3 with query", url: "s3://my-bucket/file.ts?region=ap-southeast-1", want: protocol.KindS3},
+		// S3 is intentionally not supported.
+		{name: "s3 bucket key (unsupported)", url: "s3://my-bucket/streams/live.ts", want: protocol.KindUnknown},
+		{name: "s3 with query (unsupported)", url: "s3://my-bucket/file.ts?region=ap-southeast-1", want: protocol.KindUnknown},
 		// Unknown
 		{name: "unknown scheme", url: "ftp://server/file", want: protocol.KindUnknown},
 		{name: "empty url", url: "", want: protocol.KindUnknown},

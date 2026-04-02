@@ -14,6 +14,7 @@ import (
 	rtmpmedia "github.com/yapingcat/gomedia/go-rtmp"
 
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
 )
 
 func (s *Service) rtmpListenPort() int {
@@ -175,6 +176,7 @@ func (s *Service) runRTMPMediaPump(ctx context.Context, streamID domain.StreamCo
 
 	go func() {
 		defer func() { _ = pw.Close() }()
+		var avMux *tsmux.FromAV
 		for {
 			select {
 			case <-ctx.Done():
@@ -183,7 +185,14 @@ func (s *Service) runRTMPMediaPump(ctx context.Context, streamID domain.StreamCo
 				if !ok {
 					return
 				}
-				if _, werr := pw.Write(pkt); werr != nil {
+				var werr error
+				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+					if werr != nil {
+						return
+					}
+					_, werr = pw.Write(b)
+				})
+				if werr != nil {
 					return
 				}
 			}

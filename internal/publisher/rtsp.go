@@ -15,6 +15,7 @@ import (
 
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
 )
 
 func (s *Service) rtspListenPort() int {
@@ -161,6 +162,7 @@ func pumpRTSPMPEGTS(ctx context.Context, sub *buffer.Subscriber, stream *gortspl
 	start := time.Now()
 	var carry tsPacketBuf
 	var pending [][]byte
+	var avMux *tsmux.FromAV
 
 	flush := func() {
 		if len(pending) == 0 {
@@ -188,12 +190,14 @@ func pumpRTSPMPEGTS(ctx context.Context, sub *buffer.Subscriber, stream *gortspl
 			if !ok {
 				return
 			}
-			for _, tsb := range carry.Feed(pkt) {
-				pending = append(pending, tsb)
-				if len(pending) >= 7 {
-					flush()
+			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+				for _, tsb := range carry.Feed(b) {
+					pending = append(pending, tsb)
+					if len(pending) >= 7 {
+						flush()
+					}
 				}
-			}
+			})
 			if len(pending) > 0 {
 				flush()
 			}

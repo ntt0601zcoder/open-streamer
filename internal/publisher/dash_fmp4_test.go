@@ -4,8 +4,29 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/Eyevinn/mp4ff/avc"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDashPSExtractAfterLeadingIDR(t *testing.T) {
+	t.Parallel()
+	// Simulate videoPS that grew with a slice AU first, then an AU with SPS/PPS (IDR AU).
+	// GetParameterSetsFromByteStream returns empty here; full Extract must find PS.
+	leadingIDR := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x88}
+	thenPS := []byte{
+		0x00, 0x00, 0x00, 0x01, 0x09, 0xf0,
+		0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e,
+		0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80,
+	}
+	buf := annexB4To3ForPSExtract(append(append([]byte(nil), leadingIDR...), thenPS...))
+	sps := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_SPS, buf, false)
+	pps := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_PPS, buf, false)
+	require.NotEmpty(t, sps)
+	require.NotEmpty(t, pps)
+	gotSPS, gotPPS := avc.GetParameterSetsFromByteStream(buf)
+	require.Empty(t, gotSPS, "GetParameterSetsFromByteStream should fail when scan starts at VCL")
+	require.Empty(t, gotPPS)
+}
 
 func TestParseDashSegMediaNumber(t *testing.T) {
 	t.Parallel()

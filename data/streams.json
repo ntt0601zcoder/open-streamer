@@ -10,55 +10,12 @@
     "status": "idle",
     "inputs": [
       {
-        "url": "http://10.241.1.84/test1/index.m3u8",
+        "url": "rtmp://10.241.1.100/static/test1",
         "priority": 0,
-        "net": {}
-      },
-      {
-        "url": "http://10.241.1.84/test2/index.m3u8",
-        "priority": 1,
         "net": {}
       }
     ],
-    "transcoder": {
-      "video": {
-        "copy": false,
-        "profiles": [
-          {
-            "width": 1280,
-            "height": 720,
-            "bitrate": 2500,
-            "keyframe_interval": 2,
-            "codec": "h264",
-            "preset": "veryfast",
-            "profile": "high",
-            "level": "4.0"
-          },
-          {
-            "width": 854,
-            "height": 480,
-            "bitrate": 1000,
-            "keyframe_interval": 2,
-            "codec": "h264",
-            "preset": "veryfast",
-            "profile": "high",
-            "level": "3.1"
-          }
-        ]
-      },
-      "audio": {
-        "copy": false,
-        "codec": "aac",
-        "bitrate": 128,
-        "sample_rate": 48000,
-        "channels": 2
-      },
-      "decoder": {},
-      "global": {
-        "external": false,
-        "hw": "none"
-      }
-    },
+    "transcoder": null,
     "protocols": {
       "hls": true,
       "dash": true,

@@ -9,6 +9,7 @@ import (
 
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
 )
 
 // runProfileEncoder is one FFmpeg process: raw MPEG-TS in → one profile MPEG-TS out → buffer.
@@ -77,6 +78,7 @@ func (s *Service) runProfileEncoder(
 	go func() {
 		defer stdinWG.Done()
 		defer func() { _ = stdin.Close() }()
+		var avMux *tsmux.FromAV
 		for {
 			select {
 			case <-ctx.Done():
@@ -85,7 +87,14 @@ func (s *Service) runProfileEncoder(
 				if !ok {
 					return
 				}
-				if _, werr := stdin.Write(pkt); werr != nil {
+				var werr error
+				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+					if werr != nil {
+						return
+					}
+					_, werr = stdin.Write(b)
+				})
+				if werr != nil {
 					return
 				}
 			}
@@ -98,7 +107,7 @@ func (s *Service) runProfileEncoder(
 		if n > 0 {
 			out := make([]byte, n)
 			copy(out, readBuf[:n])
-			if werr := s.buf.Write(outBufferID, buffer.Packet(out)); werr != nil {
+			if werr := s.buf.Write(outBufferID, buffer.TSPacket(out)); werr != nil {
 				slog.Error("transcoder: buffer write failed", "stream_code", logStream, "profile", track, "err", werr)
 				break
 			}

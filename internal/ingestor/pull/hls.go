@@ -86,14 +86,13 @@ func (r *HLSReader) Close() error {
 // poll continuously fetches and parses the playlist, queuing new segments.
 func (r *HLSReader) poll(ctx context.Context) {
 	seen := make(map[string]struct{})
-	var mediaSeqBase uint64
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		pl, targetDuration, isVOD, err := r.fetchPlaylist(ctx)
+		pl, segSeq, targetDuration, isVOD, err := r.fetchPlaylist(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -107,7 +106,14 @@ func (r *HLSReader) poll(ctx context.Context) {
 		}
 
 		for i, seg := range pl {
-			key := segmentKey(seg, mediaSeqBase+uint64(i))
+			if seg == "" {
+				continue
+			}
+			if i >= len(segSeq) {
+				break
+			}
+			// Stable id: EXT-X-MEDIA-SEQUENCE + playlist index (correct even when some segment slots are nil).
+			key := segmentKey(seg, segSeq[i])
 			if _, already := seen[key]; already {
 				continue
 			}
@@ -153,12 +159,11 @@ func (r *HLSReader) poll(ctx context.Context) {
 }
 
 // fetchPlaylist downloads and parses the M3U8 at r.input.URL.
-// Returns the ordered list of absolute segment URLs, the target duration,
-// a flag indicating it is a finished VOD, and any error.
-func (r *HLSReader) fetchPlaylist(ctx context.Context) (segs []string, targetDuration float64, isVOD bool, err error) {
+// segSeq[i] is the media sequence number for segs[i] (EXT-X-MEDIA-SEQUENCE + index in the parsed playlist).
+func (r *HLSReader) fetchPlaylist(ctx context.Context) (segs []string, segSeq []uint64, targetDuration float64, isVOD bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.input.URL, nil)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, nil, 0, false, err
 	}
 	for k, v := range r.input.Headers {
 		req.Header.Set(k, v)
@@ -166,51 +171,52 @@ func (r *HLSReader) fetchPlaylist(ctx context.Context) (segs []string, targetDur
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, nil, 0, false, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, false, fmt.Errorf("http %d", resp.StatusCode)
+		return nil, nil, 0, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
 	pl, listType, err := m3u8.DecodeFrom(resp.Body, true)
 	if err != nil {
-		return nil, 0, false, fmt.Errorf("m3u8 decode: %w", err)
+		return nil, nil, 0, false, fmt.Errorf("m3u8 decode: %w", err)
 	}
 
 	base, _ := url.Parse(r.input.URL)
 
 	switch listType {
 	case m3u8.ListType(0):
-		return nil, 0, false, fmt.Errorf("hls reader: undefined playlist type")
+		return nil, nil, 0, false, fmt.Errorf("hls reader: undefined playlist type")
 	case m3u8.MEDIA:
 		media := pl.(*m3u8.MediaPlaylist)
-		for _, seg := range media.Segments {
+		for i, seg := range media.Segments {
 			if seg == nil {
 				continue
 			}
 			abs := resolveURL(base, seg.URI)
 			segs = append(segs, abs)
+			segSeq = append(segSeq, media.SeqNo+uint64(i))
 		}
 		if media.Closed {
 			isVOD = true
 		}
-		return segs, media.TargetDuration, isVOD, nil
+		return segs, segSeq, media.TargetDuration, isVOD, nil
 
 	case m3u8.MASTER:
 		// If we received a master playlist, pick the first (or highest bandwidth) variant.
 		master := pl.(*m3u8.MasterPlaylist)
 		best := pickBestVariant(master)
 		if best == "" {
-			return nil, 0, false, fmt.Errorf("hls reader: master playlist has no variants")
+			return nil, nil, 0, false, fmt.Errorf("hls reader: master playlist has no variants")
 		}
 		// Update URL and recurse once.
 		r.input.URL = resolveURL(base, best)
 		return r.fetchPlaylist(ctx)
 
 	default:
-		return nil, 0, false, fmt.Errorf("hls reader: unknown playlist type")
+		return nil, nil, 0, false, fmt.Errorf("hls reader: unknown playlist type")
 	}
 }
 

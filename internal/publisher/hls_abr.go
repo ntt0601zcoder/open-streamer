@@ -57,6 +57,9 @@ func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream) {
 				window:      s.cfg.HLS.LiveWindow,
 				history:     s.cfg.HLS.LiveHistory,
 				ephemeral:   s.cfg.HLS.LiveEphemeral,
+				currentFailoverGen: func() uint64 {
+					return s.hlsFailoverGenSnapshot(code)
+				},
 			})
 		}(r)
 	}

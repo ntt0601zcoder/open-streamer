@@ -3,12 +3,14 @@ package publisher
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
 )
 
 const dashVideoTimescale = 90000
@@ -32,6 +35,16 @@ const (
 )
 
 // parseDashSegMediaNumber returns the numeric suffix in seg_v_00054.m4s / seg_a_00012.m4s (0 if invalid).
+// annexB4To3ForPSExtract collapses 4-byte Annex-B start codes to 3-byte so mp4ff's
+// Annex-B scanners (which use 0x000001) align NAL headers correctly on mux output
+// that uses 0x00000001.
+func annexB4To3ForPSExtract(b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	return bytes.ReplaceAll(b, []byte{0x00, 0x00, 0x00, 0x01}, []byte{0x00, 0x00, 0x01})
+}
+
 func parseDashSegMediaNumber(kind byte, name string) int {
 	prefix := "seg_" + string(kind) + "_"
 	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".m4s") {
@@ -93,6 +106,44 @@ func runDASHFMP4Packager(
 
 	go func() {
 		defer func() { _ = pw.Close() }()
+		var tsBuf []byte
+		var avMux *tsmux.FromAV
+
+		writeAlignedTS := func(in []byte) error {
+			if len(in) == 0 {
+				return nil
+			}
+			tsBuf = append(tsBuf, in...)
+
+			for len(tsBuf) >= 188 {
+				if tsBuf[0] != 0x47 {
+					idx := bytes.IndexByte(tsBuf, 0x47)
+					if idx < 0 {
+						if len(tsBuf) > 187 {
+							tsBuf = append([]byte(nil), tsBuf[len(tsBuf)-187:]...)
+						}
+						return nil
+					}
+					tsBuf = tsBuf[idx:]
+					if len(tsBuf) < 188 {
+						return nil
+					}
+				}
+
+				// Guard against false sync: require next packet sync when available.
+				if len(tsBuf) >= 376 && tsBuf[188] != 0x47 {
+					tsBuf = tsBuf[1:]
+					continue
+				}
+
+				if _, err := pw.Write(tsBuf[:188]); err != nil {
+					return err
+				}
+				tsBuf = tsBuf[188:]
+			}
+			return nil
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -101,7 +152,14 @@ func runDASHFMP4Packager(
 				if !ok {
 					return
 				}
-				if _, err := pw.Write(pkt); err != nil {
+				var werr error
+				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+					if werr != nil {
+						return
+					}
+					werr = writeAlignedTS(b)
+				})
+				if werr != nil {
 					return
 				}
 			}
@@ -291,7 +349,13 @@ func (p *dashFMP4Packager) tryInitVideoLocked() {
 	if p.videoInit != nil || len(p.videoPS) < 20 {
 		return
 	}
-	spss, ppss := avc.GetParameterSetsFromByteStream(p.videoPS)
+	psBuf := annexB4To3ForPSExtract(p.videoPS)
+	// GetParameterSetsFromByteStream stops scanning when the NAL after a start code is
+	// VCL (type < 6). videoPS is a running aggregate: it may start with P/IDR bytes before
+	// later AUs add SPS/PPS — then PS extraction would return empty forever. Extract with
+	// stopAtVideo=false scans the full buffer.
+	spss := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_SPS, psBuf, false)
+	ppss := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_PPS, psBuf, false)
 	if len(spss) == 0 || len(ppss) == 0 {
 		return
 	}
@@ -377,6 +441,84 @@ func splitADTSFrames(data []byte) [][]byte {
 	return out
 }
 
+// h264AnnexBToAVCC converts one H.264 access unit (Annex B) to mp4/MSE-style length-prefixed NALUs.
+// ConvertByteStreamToNaluSample can return empty for some edge layouts; dropping those samples breaks
+// reference chains and shows as heavy macroblocking. We fall back via ExtractNalusFromByteStream.
+func h264AnnexBToAVCC(annexB []byte) []byte {
+	if len(annexB) == 0 {
+		return nil
+	}
+	cp := append([]byte(nil), annexB...)
+	if out := avc.ConvertByteStreamToNaluSample(cp); len(out) > 0 {
+		return out
+	}
+	norm := bytes.ReplaceAll(append([]byte(nil), annexB...), []byte{0x00, 0x00, 0x00, 0x01}, []byte{0x00, 0x00, 0x01})
+	cp2 := append([]byte(nil), norm...)
+	if out := avc.ConvertByteStreamToNaluSample(cp2); len(out) > 0 {
+		return out
+	}
+	nalus := avc.ExtractNalusFromByteStream(norm)
+	if len(nalus) == 0 {
+		nalus = avc.ExtractNalusFromByteStream(annexB)
+	}
+	if len(nalus) == 0 {
+		return nil
+	}
+	var out []byte
+	lf := make([]byte, 4)
+	for _, n := range nalus {
+		if len(n) == 0 {
+			continue
+		}
+		binary.BigEndian.PutUint32(lf, uint32(len(n)))
+		out = append(out, lf...)
+		out = append(out, n...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func dashSortVideoSamplesByDTS(annex [][]byte, dts, pts []uint64) {
+	n := len(dts)
+	if n <= 1 {
+		return
+	}
+	ok := true
+	for i := 1; i < n; i++ {
+		if dts[i] < dts[i-1] {
+			ok = false
+			break
+		}
+	}
+	if ok {
+		return
+	}
+	idx := make([]int, n)
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.Slice(idx, func(a, b int) bool {
+		da, db := dts[idx[a]], dts[idx[b]]
+		if da != db {
+			return da < db
+		}
+		return idx[a] < idx[b]
+	})
+	tmpA := make([][]byte, n)
+	tmpD := make([]uint64, n)
+	tmpP := make([]uint64, n)
+	for i, j := range idx {
+		tmpA[i] = annex[j]
+		tmpD[i] = dts[j]
+		tmpP[i] = pts[j]
+	}
+	copy(annex, tmpA)
+	copy(dts, tmpD)
+	copy(pts, tmpP)
+}
+
 func encodeInitToFile(path string, init *mp4.InitSegment) error {
 	var buf bytes.Buffer
 	if err := init.Encode(&buf); err != nil {
@@ -416,7 +558,7 @@ func (p *dashFMP4Packager) queuedVideoStartsWithIDRLocked() bool {
 	if len(p.vAnnex) == 0 {
 		return false
 	}
-	avcc := avc.ConvertByteStreamToNaluSample(p.vAnnex[0])
+	avcc := h264AnnexBToAVCC(p.vAnnex[0])
 	return len(avcc) > 0 && avc.IsIDRSample(avcc)
 }
 
@@ -430,7 +572,7 @@ func (p *dashFMP4Packager) takeVideoFlushChunkLocked(targetTicks uint64, wallDue
 	if p.vSegN == 0 {
 		skip := 0
 		for skip < len(p.vAnnex) {
-			avcc := avc.ConvertByteStreamToNaluSample(p.vAnnex[skip])
+			avcc := h264AnnexBToAVCC(p.vAnnex[skip])
 			if len(avcc) > 0 && avc.IsIDRSample(avcc) {
 				break
 			}
@@ -574,6 +716,7 @@ func (p *dashFMP4Packager) flushSegmentLocked() error {
 }
 
 func (p *dashFMP4Packager) writeVideoSegmentLocked(baseName string, seqNr uint32, annex [][]byte, dts, pts []uint64) error {
+	dashSortVideoSamplesByDTS(annex, dts, pts)
 	segStartDecode := p.videoNextDecode
 	nextDecode := segStartDecode
 	frag, err := mp4.CreateFragment(seqNr, p.videoTID)
@@ -581,7 +724,7 @@ func (p *dashFMP4Packager) writeVideoSegmentLocked(baseName string, seqNr uint32
 		return err
 	}
 	for i := range annex {
-		avcc := avc.ConvertByteStreamToNaluSample(annex[i])
+		avcc := h264AnnexBToAVCC(annex[i])
 		if len(avcc) == 0 {
 			continue
 		}

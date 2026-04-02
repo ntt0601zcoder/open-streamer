@@ -12,9 +12,6 @@ import (
 	"github.com/samber/do/v2"
 )
 
-// Packet is a raw MPEG-TS packet chunk written by the Ingestor.
-type Packet []byte
-
 // Subscriber is a read cursor into a stream's ring buffer.
 type Subscriber struct {
 	ch chan Packet
@@ -30,13 +27,18 @@ type ringBuffer struct {
 }
 
 func (rb *ringBuffer) write(pkt Packet) {
+	if pkt.empty() {
+		return
+	}
 	rb.mu.Lock()
 	subs := rb.subs
 	rb.mu.Unlock()
 
 	for _, s := range subs {
+		// Independent copy per subscriber (consumers must not share backing slices).
+		pc := clonePacket(pkt)
 		select {
-		case s.ch <- pkt:
+		case s.ch <- pc:
 		default:
 			// slow consumer: drop packet rather than block the writer
 		}
@@ -96,7 +98,7 @@ func (s *Service) Create(id domain.StreamCode) {
 	}
 }
 
-// Write pushes a packet into the stream's ring buffer.
+// Write pushes a packet into the stream's ring buffer (deep-copied for subscribers).
 // Only the active Ingestor goroutine for this stream should call Write.
 func (s *Service) Write(id domain.StreamCode, pkt Packet) error {
 	s.mu.RLock()

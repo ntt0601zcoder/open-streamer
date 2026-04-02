@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	_ "github.com/ntthuan060102github/open-streamer/api/docs" // swag Register(SwaggerInfo)
 	"github.com/ntthuan060102github/open-streamer/config"
 	"github.com/ntthuan060102github/open-streamer/internal/api/handler"
+	"github.com/ntthuan060102github/open-streamer/internal/mediaserve"
 	"github.com/samber/do/v2"
 )
 
@@ -72,9 +72,7 @@ func (s *Server) buildRouter(
 	r.Get("/swagger/doc.json", serveSwaggerJSON)
 	r.Get("/swagger", http.RedirectHandler("/swagger/", http.StatusMovedPermanently).ServeHTTP)
 	r.Get("/swagger/", serveSwaggerIndex)
-	r.Get("/{code}/index.m3u8", s.serveManifest("index.m3u8", "application/vnd.apple.mpegurl", s.hlsDir))
-	r.Get("/{code}/index.mpd", s.serveManifest("index.mpd", "application/dash+xml", s.dashDir))
-	r.Get("/{code}/*", s.serveStreamNested())
+	mediaserve.Mount(r, s.hlsDir, s.dashDir)
 
 	r.Route("/streams", func(r chi.Router) {
 		r.Get("/", stream.List)
@@ -152,51 +150,3 @@ func readyz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-func (s *Server) serveManifest(filename, contentType, rootDir string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		code := chi.URLParam(r, "code")
-		if code == "" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", contentType)
-		if filename == "index.mpd" {
-			// Live MPD changes every segment; avoid stale segment indices after restart (dash.js caching seg_00011 while disk reset to 00001).
-			w.Header().Set("Cache-Control", "no-store, max-age=0, must-revalidate")
-		}
-		http.ServeFile(w, r, filepath.Join(rootDir, code, filename))
-	}
-}
-
-// serveStreamNested serves HLS/DASH assets under /{code}/… including ABR paths like 1080p/index.m3u8.
-func (s *Server) serveStreamNested() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		code := chi.URLParam(r, "code")
-		suffix := strings.TrimPrefix(chi.URLParam(r, "*"), "/")
-		if code == "" || suffix == "" {
-			http.NotFound(w, r)
-			return
-		}
-		rel := filepath.Clean(suffix)
-		if rel == "." || strings.HasPrefix(rel, "..") {
-			http.NotFound(w, r)
-			return
-		}
-		baseName := filepath.Base(rel)
-		ext := strings.ToLower(filepath.Ext(baseName))
-		baseDir := ""
-		switch ext {
-		case ".ts", ".m3u8":
-			baseDir = s.hlsDir
-		case ".m4s", ".mpd", ".mp4":
-			baseDir = s.dashDir
-		default:
-			http.NotFound(w, r)
-			return
-		}
-		if ext == ".mpd" {
-			w.Header().Set("Cache-Control", "no-store, max-age=0, must-revalidate")
-		}
-		http.ServeFile(w, r, filepath.Join(baseDir, code, rel))
-	}
-}

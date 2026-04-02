@@ -15,31 +15,36 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
-// ---- mock Reader ----
+// ---- mock PacketReader ----
 
-type mockReader struct {
-	mu      sync.Mutex
-	opens   int
-	closes  int
-	openErr error
-	packets [][]byte
-	readErr error
+type mockPacketReader struct {
+	mu       sync.Mutex
+	opens    int
+	closes   int
+	openErr  error
+	packets  [][]byte // each ReadPackets yields one H264 AU with this payload
+	readErr  error
 }
 
-func (m *mockReader) Open(_ context.Context) error {
+func (m *mockPacketReader) Open(_ context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.opens++
 	return m.openErr
 }
 
-func (m *mockReader) Read(_ context.Context) ([]byte, error) {
+func (m *mockPacketReader) ReadPackets(_ context.Context) ([]domain.AVPacket, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.packets) > 0 {
 		pkt := m.packets[0]
 		m.packets = m.packets[1:]
-		return pkt, nil
+		return []domain.AVPacket{{
+			Codec: domain.AVCodecH264,
+			Data:  pkt,
+			PTSms: 0,
+			DTSms: 0,
+		}}, nil
 	}
 	if m.readErr != nil {
 		return nil, m.readErr
@@ -47,7 +52,7 @@ func (m *mockReader) Read(_ context.Context) ([]byte, error) {
 	return nil, io.EOF
 }
 
-func (m *mockReader) Close() error {
+func (m *mockPacketReader) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closes++
@@ -96,7 +101,7 @@ func TestReadLoop_WritesPacketsToBuffer(t *testing.T) {
 	pkt1 := []byte("pkt-one-188-bytes-padded-to-length-xxxxxxxxxxxxxxxxxxxxxxxx")
 	pkt2 := []byte("pkt-two-188-bytes-padded-to-length-xxxxxxxxxxxxxxxxxxxxxxxx")
 
-	r := &mockReader{packets: [][]byte{pkt1, pkt2}}
+	r := &mockPacketReader{packets: [][]byte{pkt1, pkt2}}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -108,7 +113,8 @@ func TestReadLoop_WritesPacketsToBuffer(t *testing.T) {
 	for len(received) < 2 {
 		select {
 		case p := <-sub.Recv():
-			received = append(received, []byte(p))
+			require.NotNil(t, p.AV)
+			received = append(received, append([]byte(nil), p.AV.Data...))
 		case <-timeout:
 			t.Fatal("timed out waiting for packets")
 		}
@@ -117,7 +123,6 @@ func TestReadLoop_WritesPacketsToBuffer(t *testing.T) {
 	assert.Equal(t, pkt1, received[0])
 	assert.Equal(t, pkt2, received[1])
 
-	// After exhausting packets, readLoop returns io.EOF.
 	err = <-errCh
 	assert.ErrorIs(t, err, io.EOF)
 }
@@ -131,8 +136,7 @@ func TestReadLoop_ContextCancelled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Reader that blocks until context is cancelled.
-	r := &mockReader{readErr: context.Canceled}
+	r := &mockPacketReader{readErr: context.Canceled}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -160,8 +164,9 @@ func TestReadLoop_SkipsEmptyPackets(t *testing.T) {
 	defer buf.Unsubscribe(streamID, sub)
 
 	realPkt := []byte("real-packet")
-	// Reader returns: empty, real, EOF
-	r := &mockReader{packets: [][]byte{{}, realPkt}}
+	r := &mockPacketReader{
+		packets: [][]byte{{}, realPkt},
+	}
 
 	done := make(chan error, 1)
 	go func() {
@@ -170,7 +175,8 @@ func TestReadLoop_SkipsEmptyPackets(t *testing.T) {
 
 	select {
 	case p := <-sub.Recv():
-		assert.Equal(t, realPkt, []byte(p))
+		require.NotNil(t, p.AV)
+		assert.Equal(t, realPkt, p.AV.Data)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out")
 	}
@@ -191,12 +197,11 @@ func TestRunPullWorker_ReadsAndWritesToBuffer(t *testing.T) {
 	defer buf.Unsubscribe(streamID, sub)
 
 	pkt := []byte("ts-packet-data")
-	r := &mockReader{packets: [][]byte{pkt}}
+	r := &mockPacketReader{packets: [][]byte{pkt}}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Worker exits naturally on EOF.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -205,7 +210,8 @@ func TestRunPullWorker_ReadsAndWritesToBuffer(t *testing.T) {
 
 	select {
 	case received := <-sub.Recv():
-		assert.Equal(t, pkt, []byte(received))
+		require.NotNil(t, received.AV)
+		assert.Equal(t, pkt, received.AV.Data)
 	case <-time.After(2 * time.Second):
 		t.Fatal("no packet received")
 	}
@@ -224,17 +230,14 @@ func TestRunPullWorker_StopsOnContextCancel(t *testing.T) {
 	buf := buffer.NewServiceForTesting(32)
 	buf.Create(streamID)
 
-	// Reader that never gives EOF: simulates infinite stream.
-	endlessPkt := make([]byte, 188)
-	r := &mockReader{readErr: errors.New("connection reset")}
+	block := &blockingPacketReader{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		r.packets = [][]byte{endlessPkt, endlessPkt, endlessPkt}
-		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, r, buf, nil, nil)
+		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, block, buf, nil, nil)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -246,6 +249,17 @@ func TestRunPullWorker_StopsOnContextCancel(t *testing.T) {
 		t.Fatal("worker did not stop after ctx cancel")
 	}
 }
+
+type blockingPacketReader struct{}
+
+func (blockingPacketReader) Open(_ context.Context) error { return nil }
+
+func (blockingPacketReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (blockingPacketReader) Close() error { return nil }
 
 func TestRunPullWorker_ReconnectsAfterOpenError(t *testing.T) {
 	t.Parallel()
@@ -259,19 +273,11 @@ func TestRunPullWorker_ReconnectsAfterOpenError(t *testing.T) {
 	defer buf.Unsubscribe(streamID, sub)
 
 	pkt := []byte("success-packet")
-	r := &mockReader{}
 
-	callCount := 0
-	openErrOnFirst := &mockReader{
-		openErr: errors.New("transient error"),
-	}
-	_ = openErrOnFirst
-
-	// First Open fails, second succeeds and returns a packet.
 	var mu sync.Mutex
-	r.openErr = errors.New("first open fails")
+	callCount := 0
 
-	origReader := &controlledReader{
+	origReader := &controlledPacketReader{
 		openFn: func() error {
 			mu.Lock()
 			defer mu.Unlock()
@@ -279,12 +285,15 @@ func TestRunPullWorker_ReconnectsAfterOpenError(t *testing.T) {
 			if callCount == 1 {
 				return errors.New("transient dial error")
 			}
-			r.openErr = nil
-			r.packets = [][]byte{pkt}
 			return nil
 		},
-		readFn: func() ([]byte, error) {
-			return r.Read(context.Background())
+		readFn: func() ([]domain.AVPacket, error) {
+			return []domain.AVPacket{{
+				Codec: domain.AVCodecH264,
+				Data:  pkt,
+				PTSms: 0,
+				DTSms: 0,
+			}}, nil
 		},
 		closeFn: func() error { return nil },
 	}
@@ -298,19 +307,44 @@ func TestRunPullWorker_ReconnectsAfterOpenError(t *testing.T) {
 
 	select {
 	case received := <-sub.Recv():
-		assert.Equal(t, pkt, []byte(received))
+		require.NotNil(t, received.AV)
+		assert.Equal(t, pkt, received.AV.Data)
 	case <-time.After(4 * time.Second):
 		t.Fatal("worker never recovered after transient open error")
 	}
 }
 
-// controlledReader is a Reader whose behavior is governed by function fields.
-type controlledReader struct {
+type controlledPacketReader struct {
 	openFn  func() error
-	readFn  func() ([]byte, error)
+	readFn  func() ([]domain.AVPacket, error)
 	closeFn func() error
+	readMu  sync.Mutex
+	readOne bool
 }
 
-func (c *controlledReader) Open(_ context.Context) error           { return c.openFn() }
-func (c *controlledReader) Read(_ context.Context) ([]byte, error) { return c.readFn() }
-func (c *controlledReader) Close() error                           { return c.closeFn() }
+func (c *controlledPacketReader) Open(_ context.Context) error {
+	err := c.openFn()
+	c.readMu.Lock()
+	if err == nil {
+		c.readOne = false
+	}
+	c.readMu.Unlock()
+	return err
+}
+
+func (c *controlledPacketReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if c.readOne {
+		return nil, io.EOF
+	}
+	c.readOne = true
+	return c.readFn()
+}
+
+func (c *controlledPacketReader) Close() error {
+	if c.closeFn != nil {
+		return c.closeFn()
+	}
+	return nil
+}

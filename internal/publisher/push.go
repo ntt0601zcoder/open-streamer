@@ -16,6 +16,7 @@ import (
 
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
 )
 
 func (s *Service) pushToDestination(ctx context.Context, logicalCode, mediaBufferID domain.StreamCode, dest domain.PushDestination) {
@@ -156,6 +157,7 @@ func (s *Service) pushRTMP(ctx context.Context, url string, sub *buffer.Subscrib
 	pr, pw := io.Pipe()
 	go func() {
 		defer func() { _ = pw.Close() }()
+		var avMux *tsmux.FromAV
 		for {
 			select {
 			case <-ctx.Done():
@@ -164,7 +166,14 @@ func (s *Service) pushRTMP(ctx context.Context, url string, sub *buffer.Subscrib
 				if !ok {
 					return
 				}
-				if _, werr := pw.Write(pkt); werr != nil {
+				var werr error
+				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+					if werr != nil {
+						return
+					}
+					_, werr = pw.Write(b)
+				})
+				if werr != nil {
 					return
 				}
 			}

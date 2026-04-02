@@ -21,15 +21,21 @@ import (
 	"github.com/ntthuan060102github/open-streamer/config"
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/events"
 	"github.com/samber/do/v2"
 )
 
 // Service manages all output workers for active streams.
 type Service struct {
-	cfg     config.PublisherConfig
-	buf     *buffer.Service
-	mu      sync.Mutex
-	workers map[domain.StreamCode]context.CancelFunc
+	cfg config.PublisherConfig
+	buf *buffer.Service
+	bus events.Bus
+	// hlsFailoverGen: incremented on each input.failover so every ABR variant segmenter can tag
+	// exactly one EXT-X-DISCONTINUITY on its next flush (bool map would only let the first variant win).
+	hlsFailoverMu   sync.Mutex
+	hlsFailoverGen  map[domain.StreamCode]uint64
+	mu                  sync.Mutex
+	workers             map[domain.StreamCode]context.CancelFunc
 	// streamWorkCtx is the per-stream publisher worker context (same lifetime as workers).
 	streamWorkCtx map[domain.StreamCode]context.Context
 	// mediaBuffer is the Buffer Hub id for single-rendition outputs (RTSP, RTMP, SRT, push, DVR via API).
@@ -53,18 +59,35 @@ type Service struct {
 func New(i do.Injector) (*Service, error) {
 	cfg := do.MustInvoke[*config.Config](i)
 	buf := do.MustInvoke[*buffer.Service](i)
+	bus := do.MustInvoke[events.Bus](i)
 	pub := &cfg.Publisher
 
-	return &Service{
-		cfg:           *pub,
-		buf:           buf,
-		workers:       make(map[domain.StreamCode]context.CancelFunc),
-		streamWorkCtx: make(map[domain.StreamCode]context.Context),
-		mediaBuffer:   make(map[domain.StreamCode]domain.StreamCode),
-		rtspMounts:    make(map[string]*gortsplib.ServerStream),
-		rtmpActive:    make(map[domain.StreamCode]struct{}),
-		srtActive:     make(map[domain.StreamCode]struct{}),
-	}, nil
+	svc := &Service{
+		cfg:             *pub,
+		buf:             buf,
+		bus:             bus,
+		hlsFailoverGen: make(map[domain.StreamCode]uint64),
+		workers:         make(map[domain.StreamCode]context.CancelFunc),
+		streamWorkCtx:   make(map[domain.StreamCode]context.Context),
+		mediaBuffer:     make(map[domain.StreamCode]domain.StreamCode),
+		rtspMounts:      make(map[string]*gortsplib.ServerStream),
+		rtmpActive:      make(map[domain.StreamCode]struct{}),
+		srtActive:       make(map[domain.StreamCode]struct{}),
+	}
+	bus.Subscribe(domain.EventInputFailover, func(_ context.Context, e domain.Event) error {
+		svc.hlsFailoverMu.Lock()
+		svc.hlsFailoverGen[e.StreamCode]++
+		svc.hlsFailoverMu.Unlock()
+		return nil
+	})
+	return svc, nil
+}
+
+// hlsFailoverGenSnapshot returns the current failover generation for streamID (for segmenter local state).
+func (s *Service) hlsFailoverGenSnapshot(streamID domain.StreamCode) uint64 {
+	s.hlsFailoverMu.Lock()
+	defer s.hlsFailoverMu.Unlock()
+	return s.hlsFailoverGen[streamID]
 }
 
 // Start launches all serve-endpoints and push-destination workers for a stream.
@@ -171,4 +194,8 @@ func (s *Service) Stop(streamID domain.StreamCode) {
 	delete(s.streamWorkCtx, streamID)
 	delete(s.mediaBuffer, streamID)
 	s.mu.Unlock()
+
+	s.hlsFailoverMu.Lock()
+	delete(s.hlsFailoverGen, streamID)
+	s.hlsFailoverMu.Unlock()
 }
