@@ -10,7 +10,7 @@
     "status": "idle",
     "inputs": [
       {
-        "url": "rtmp://10.241.1.100/static/test1",
+        "url": "rtsp://10.241.1.100:7777/test1",
         "priority": 0,
         "net": {}
       }
