@@ -13,12 +13,13 @@ type Kind string
 
 // Kind constants classify ingest URLs; see Detect.
 const (
-	KindUDP     Kind = "udp"  // raw MPEG-TS over UDP (unicast or multicast)
-	KindHLS     Kind = "hls"  // HLS playlist pull over HTTP/HTTPS
-	KindFile    Kind = "file" // local filesystem path
-	KindRTMP    Kind = "rtmp" // RTMP / RTMPS (pull or push-listen)
-	KindRTSP    Kind = "rtsp" // RTSP pull
-	KindSRT     Kind = "srt"  // SRT (pull caller or push listener)
+	KindUDP     Kind = "udp"     // raw MPEG-TS over UDP (unicast or multicast)
+	KindHLS     Kind = "hls"     // HLS playlist pull over HTTP/HTTPS
+	KindFile    Kind = "file"    // local filesystem path
+	KindRTMP    Kind = "rtmp"    // RTMP / RTMPS (pull or push-listen)
+	KindRTSP    Kind = "rtsp"    // RTSP pull
+	KindSRT     Kind = "srt"     // SRT (pull caller or push listener)
+	KindPublish Kind = "publish" // accept any push protocol; stream code is the routing key
 	KindUnknown Kind = "unknown"
 )
 
@@ -29,11 +30,11 @@ const (
 //	rtmp://...                → KindRTMP
 //	rtmps://...               → KindRTMP
 //	srt://...                 → KindSRT
-//	s3://bucket/key           → KindS3
 //	udp://...                 → KindUDP
 //	rtsp:// or rtsps://...    → KindRTSP
 //	http(s)://...*.m3u8       → KindHLS
 //	file:// or /absolute/path → KindFile
+//	publish://                → KindPublish (push-listen, any protocol)
 func Detect(rawURL string) Kind {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -51,6 +52,8 @@ func Detect(rawURL string) Kind {
 		return KindRTSP
 	case "file":
 		return KindFile
+	case "publish":
+		return KindPublish
 	case "http", "https":
 		if strings.HasSuffix(strings.ToLower(u.Path), ".m3u8") ||
 			strings.HasSuffix(strings.ToLower(u.Path), ".m3u") {
@@ -67,22 +70,32 @@ func Detect(rawURL string) Kind {
 	return KindUnknown
 }
 
-// IsPushListen returns true when the URL describes a local address on which
-// the server should listen for incoming encoder connections (push mode).
-// This applies to RTMP and SRT when the host resolves to a wildcard or
-// loopback address — meaning the URL is "our bind address", not a remote source.
+// IsPushListen returns true when the URL signals that the server should
+// accept incoming encoder connections (push mode) for a stream.
+//
+// Two forms are recognised:
+//
+//  1. publish:// — the preferred, protocol-agnostic form.  Encoders may push
+//     via RTMP or SRT; the stream code is the only routing key needed.
+//
+//  2. Legacy wildcard-host form — rtmp://0.0.0.0:port/... or srt://0.0.0.0:port/...
+//     Still recognised for backward compatibility.
 //
 // Examples:
 //
-//	rtmp://0.0.0.0:1935/live  → true  (our RTMP server)
-//	srt://0.0.0.0:9999        → true  (our SRT server)
-//	rtmp://server.com/live    → false (remote RTMP source to pull from)
+//	publish://          → true  (preferred)
+//	rtmp://0.0.0.0:1935 → true  (legacy)
+//	srt://0.0.0.0:9999  → true  (legacy)
+//	rtmp://server.com   → false (remote pull source)
 func IsPushListen(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return false
 	}
 	scheme := strings.ToLower(u.Scheme)
+	if scheme == "publish" {
+		return true
+	}
 	if scheme != "rtmp" && scheme != "rtmps" && scheme != "srt" {
 		return false
 	}

@@ -143,13 +143,13 @@ type hlsSegmenter struct {
 	mu sync.Mutex
 
 	// Current segment accumulator (aligned 188-byte MPEG-TS packets).
-	segBuf    []byte
-	segStart  time.Time
-	discNext  bool // schedule EXT-X-DISCONTINUITY for the next flushed segment
+	segBuf   []byte
+	segStart time.Time
+	discNext bool // schedule EXT-X-DISCONTINUITY for the next flushed segment
 
 	// Sliding-window manifest state.
-	segN    uint64
-	onDisk  []hlsSegEntry
+	segN   uint64
+	onDisk []hlsSegEntry
 
 	// Failover generation tracking (TS path; AV path uses pkt.AV.Discontinuity).
 	failoverGen func() uint64

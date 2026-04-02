@@ -101,10 +101,11 @@ func (s *Service) Run(ctx context.Context) error {
 
 // Start activates ingest for the given input on streamID.
 //
-// The mode is derived entirely from the URL:
-//   - If the URL host is a wildcard/loopback address (e.g. rtmp://0.0.0.0:1935/live/key)
-//     → push-listen: register the stream key in the push server routing table.
-//   - Otherwise → pull: start a goroutine that connects to the URL and reads data.
+// The mode is derived from the URL:
+//   - publish:// → push-listen: register the stream code in the push server
+//     routing table so encoders can connect with just the stream code as key.
+//   - rtmp://0.0.0.0:... / srt://0.0.0.0:... → legacy push-listen (same effect).
+//   - Any other URL → pull: start a goroutine that connects to the URL.
 //
 // Calling Start again for the same stream replaces the previous worker/registration.
 // bufferWriteID is the Buffer Hub slot for MPEG-TS writes; if empty, streamID is used.
@@ -204,9 +205,9 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 }
 
 func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain.Input, bufferWriteID domain.StreamCode) error {
-	key := pushStreamKey(input)
+	key := pushStreamKey(streamID, input)
 	if key == "" {
-		return fmt.Errorf("ingestor: cannot determine stream key from URL %q (path must end in /<key>)", input.URL)
+		return fmt.Errorf("ingestor: cannot determine stream key from URL %q", input.URL)
 	}
 
 	s.registry.Register(key, streamID, s.buf, bufferWriteID)
@@ -220,13 +221,21 @@ func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain
 	return nil
 }
 
-// pushStreamKey extracts the routing key from the last path segment of the URL.
+// pushStreamKey returns the routing key that encoders must use when connecting.
 //
-// Example: rtmp://0.0.0.0:1935/live/myshow → "myshow".
-func pushStreamKey(input domain.Input) string {
-	url := strings.TrimRight(input.URL, "/")
-	if idx := strings.LastIndex(url, "/"); idx >= 0 {
-		return url[idx+1:]
+// For publish:// URLs the key is the stream code itself — the encoder only
+// needs to know the stream code, no app-name prefix is required.
+//
+// For legacy wildcard-host URLs (rtmp://0.0.0.0:1935/live/<key>) the last
+// path segment is used, preserving backward compatibility.
+func pushStreamKey(streamID domain.StreamCode, input domain.Input) string {
+	if protocol.Detect(input.URL) == protocol.KindPublish {
+		return string(streamID)
+	}
+	// Legacy: extract last path segment from rtmp://0.0.0.0:…/live/<key>
+	raw := strings.TrimRight(input.URL, "/")
+	if idx := strings.LastIndex(raw, "/"); idx >= 0 {
+		return raw[idx+1:]
 	}
 	return ""
 }

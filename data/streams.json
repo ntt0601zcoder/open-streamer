@@ -1,16 +1,14 @@
 {
   "test_udp": {
     "code": "test_udp",
-    "name": "string",
-    "description": "string",
-    "tags": [
-      "string"
-    ],
-    "stream_key": "string",
+    "name": "Test UDP / RTMP stream",
+    "description": "",
+    "tags": [],
+    "stream_key": "test_udp",
     "status": "idle",
     "inputs": [
       {
-        "url": "",
+        "url": "publish://",
         "priority": 0,
         "net": {}
       }

@@ -2,6 +2,7 @@ package push
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 
@@ -46,11 +47,13 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 		Config: &srtCfg,
 
 		// HandleConnect is called for every new connection request.
-		// We inspect the StreamID to decide: PUBLISH, SUBSCRIBE, or REJECT.
+		// We do a lightweight existence check here so clearly unknown keys
+		// are rejected at the SRT protocol level before the handshake completes.
+		// The one-pusher exclusivity check (Acquire) is done in HandlePublish.
 		HandleConnect: func(req srt.ConnRequest) srt.ConnType {
 			streamKey := extractStreamKey(req.StreamId())
 			if _, _, _, err := s.registry.Lookup(streamKey); err != nil {
-				slog.Warn("srt: rejecting unknown stream key",
+				slog.Warn("srt: rejecting unknown stream code",
 					"stream_id_raw", req.StreamId(),
 					"stream_key", streamKey,
 				)
@@ -60,11 +63,23 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 		},
 
 		// HandlePublish is called when an accepted PUBLISH connection is ready.
+		// We Acquire the slot here (one active pusher at a time) and Release
+		// it when the connection closes.
 		HandlePublish: func(conn srt.Conn) {
 			streamKey := extractStreamKey(conn.StreamId())
-			writeID, streamID, buf, err := s.registry.Lookup(streamKey)
+			writeID, streamID, buf, err := s.registry.Acquire(streamKey)
 			if err != nil {
-				// Should not happen — HandleConnect already checked.
+				if errors.Is(err, ErrStreamAlreadyActive) {
+					slog.Warn("srt: rejected, stream already has an active pusher",
+						"stream_key", streamKey,
+						"remote", conn.RemoteAddr(),
+					)
+				} else {
+					slog.Warn("srt: rejected unknown stream code",
+						"stream_key", streamKey,
+						"remote", conn.RemoteAddr(),
+					)
+				}
 				_ = conn.Close()
 				return
 			}
@@ -73,7 +88,7 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 				"stream_code", streamID,
 				"remote", conn.RemoteAddr(),
 			)
-			handleSRTConn(ctx, conn, writeID, streamID, buf)
+			handleSRTConn(ctx, conn, writeID, streamID, streamKey, buf, s.registry)
 		},
 	}
 
@@ -95,9 +110,21 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 }
 
 // handleSRTConn reads MPEG-TS from the SRT connection and writes to the buffer.
-func handleSRTConn(ctx context.Context, conn srt.Conn, bufferWriteID, streamID domain.StreamCode, buf *buffer.Service) {
+// It releases the registry slot when the connection closes.
+func handleSRTConn(
+	ctx context.Context,
+	conn srt.Conn,
+	bufferWriteID, streamID domain.StreamCode,
+	streamKey string,
+	buf *buffer.Service,
+	reg Registry,
+) {
 	defer func() { _ = conn.Close() }()
-	defer slog.Info("srt: publisher disconnected", "stream_code", streamID)
+	defer reg.Release(streamKey)
+	defer slog.Info("srt: publisher disconnected",
+		"stream_key", streamKey,
+		"stream_code", streamID,
+	)
 
 	readBuf := make([]byte, 1316*4) // read a few SRT payloads at a time
 
