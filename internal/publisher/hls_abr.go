@@ -1,5 +1,19 @@
 package publisher
 
+// hls_abr.go — ABR HLS publisher.
+//
+// Topology:
+//
+//	Buffer (per rendition) ──► hlsSegmenter ──► <streamDir>/<slug>/seg_XXXXXX.ts
+//	                                        └──► <streamDir>/<slug>/index.m3u8
+//	                                        └──► hlsABRMaster.onShardUpdated()
+//	                                                    │ debounced 100 ms
+//	                                                    ▼
+//	                                        <streamDir>/index.m3u8  (master playlist)
+//
+// The master playlist lists every ladder rung with EXT-X-STREAM-INF.  Per-rendition
+// playlists are written by each shard's hlsSegmenter independently.
+
 import (
 	"context"
 	"fmt"
@@ -7,83 +21,184 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
+// hlsABRRep holds metadata about one ladder rung, shared with the master playlist writer.
+type hlsABRRep struct {
+	slug    string
+	bwBps   int
+	width   int
+	height  int
+	hasData bool // at least one segment has been flushed
+}
+
+// hlsABRMaster coordinates writing the root master HLS playlist.
+// Each per-rendition hlsSegmenter calls onShardUpdated; the master debounces
+// and rewrites the root index.m3u8 at most every 100 ms.
+type hlsABRMaster struct {
+	mu       sync.Mutex
+	rootPath string // absolute path to the master index.m3u8
+	streamID domain.StreamCode
+	reps     map[string]*hlsABRRep
+	debounce *time.Timer
+}
+
+func newHLSABRMaster(rootPath string, streamID domain.StreamCode) *hlsABRMaster {
+	return &hlsABRMaster{
+		rootPath: rootPath,
+		streamID: streamID,
+		reps:     make(map[string]*hlsABRRep),
+	}
+}
+
+// onShardUpdated is called by each rendition segmenter after every segment flush.
+func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r := m.reps[slug]
+	if r == nil {
+		r = &hlsABRRep{}
+		m.reps[slug] = r
+	}
+	r.slug = slug
+	r.bwBps = bwBps
+	r.width = width
+	r.height = height
+	r.hasData = true
+
+	if m.debounce != nil {
+		m.debounce.Stop()
+	}
+	m.debounce = time.AfterFunc(100*time.Millisecond, m.flushRoot)
+}
+
+func (m *hlsABRMaster) flushRoot() {
+	m.mu.Lock()
+	slugs := make([]string, 0, len(m.reps))
+	for s, r := range m.reps {
+		if r.hasData {
+			slugs = append(slugs, s)
+		}
+	}
+	sort.Strings(slugs)
+	repSnap := make([]hlsABRRep, 0, len(slugs))
+	for _, s := range slugs {
+		repSnap = append(repSnap, *m.reps[s])
+	}
+	rootPath := m.rootPath
+	streamID := m.streamID
+	m.mu.Unlock()
+
+	if len(repSnap) == 0 {
+		return
+	}
+
+	if err := writeHLSMasterPlaylist(rootPath, repSnap); err != nil {
+		slog.Warn("publisher: HLS ABR master playlist write failed",
+			"stream_code", streamID, "err", err)
+	}
+}
+
+// writeHLSMasterPlaylist serialises an HLS master playlist and writes it atomically.
+func writeHLSMasterPlaylist(path string, reps []hlsABRRep) error {
+	var sb strings.Builder
+	sb.WriteString("#EXTM3U\n")
+	sb.WriteString("#EXT-X-VERSION:3\n")
+	sb.WriteString("\n")
+
+	for _, r := range reps {
+		codec := hlsCodecString(r.width, r.height)
+		res := ""
+		if r.width > 0 && r.height > 0 {
+			res = fmt.Sprintf(",RESOLUTION=%dx%d", r.width, r.height)
+		}
+		fmt.Fprintf(&sb,
+			"#EXT-X-STREAM-INF:BANDWIDTH=%d%s,CODECS=%q\n%s/index.m3u8\n",
+			r.bwBps, res, codec, r.slug,
+		)
+	}
+
+	return writeFileAtomic(path, []byte(sb.String()))
+}
+
+// serveHLSAdaptive is the ABR HLS output goroutine.  It spawns one segmenter
+// goroutine per ladder rung and waits for all of them to finish.
 func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream) {
 	code := stream.Code
+	hlsDir := strings.TrimSpace(s.cfg.HLS.Dir)
+	if hlsDir == "" {
+		slog.Error("publisher: HLS ABR — hls.dir empty", "stream_code", code)
+		return
+	}
+
 	rends := buffer.RenditionsForTranscoder(code, stream.Transcoder)
 	if len(rends) == 0 {
-		s.serveHLS(ctx, code)
+		// Fall back to single-rendition if the transcoder has no ABR ladder.
+		s.serveHLS(ctx, s.mediaBufferForLocked(code))
 		return
 	}
 
-	streamDir := filepath.Join(s.cfg.HLS.Dir, string(code))
-	if err := resetOutputDir(streamDir); err != nil {
-		slog.Error("publisher: HLS ABR setup dir failed", "stream_code", code, "dir", streamDir, "err", err)
+	streamBase := filepath.Join(hlsDir, string(code))
+	if err := resetOutputDir(streamBase); err != nil {
+		slog.Error("publisher: HLS ABR setup dir failed",
+			"stream_code", code, "dir", streamBase, "err", err)
 		return
 	}
 
-	masterPath := filepath.Join(streamDir, "index.m3u8")
-	if err := writeHLSMasterPlaylist(masterPath, rends); err != nil {
-		slog.Error("publisher: HLS ABR master playlist failed", "stream_code", code, "err", err)
-	}
+	rootManifest := filepath.Join(streamBase, "index.m3u8")
+	master := newHLSABRMaster(rootManifest, code)
+
+	segSec := s.cfg.HLS.LiveSegmentSec
+	win := s.cfg.HLS.LiveWindow
+	hist := s.cfg.HLS.LiveHistory
+	eph := s.cfg.HLS.LiveEphemeral
+
+	slog.Info("publisher: HLS ABR serve started",
+		"stream_code", code,
+		"renditions", len(rends),
+		"hls_dir", streamBase,
+	)
 
 	var wg sync.WaitGroup
 	for _, r := range rends {
 		wg.Add(1)
 		go func(r buffer.RenditionPlayout) {
 			defer wg.Done()
+
 			sub, err := s.buf.Subscribe(r.BufferID)
 			if err != nil {
-				slog.Error("publisher: HLS ABR subscribe failed", "stream_code", code, "slug", r.Slug, "err", err)
+				slog.Error("publisher: HLS ABR subscribe failed",
+					"stream_code", code, "slug", r.Slug, "err", err)
 				return
 			}
 			defer s.buf.Unsubscribe(r.BufferID, sub)
 
-			rd := filepath.Join(streamDir, r.Slug)
-			if err := os.MkdirAll(rd, 0o755); err != nil {
-				slog.Error("publisher: HLS ABR mkdir failed", "stream_code", code, "slug", r.Slug, "err", err)
+			shardDir := filepath.Join(streamBase, r.Slug)
+			if err := os.MkdirAll(shardDir, 0o755); err != nil {
+				slog.Error("publisher: HLS ABR mkdir failed",
+					"stream_code", code, "slug", r.Slug, "err", err)
 				return
 			}
-			playlist := filepath.Join(rd, "index.m3u8")
-			runFilesystemSegmenter(ctx, code, sub, segmenterOpts{
-				streamDir:   rd,
-				hlsPlaylist: playlist,
-				segmentSec:  s.cfg.HLS.LiveSegmentSec,
-				window:      s.cfg.HLS.LiveWindow,
-				history:     s.cfg.HLS.LiveHistory,
-				ephemeral:   s.cfg.HLS.LiveEphemeral,
-				currentFailoverGen: func() uint64 {
-					return s.hlsFailoverGenSnapshot(code)
-				},
-			})
+
+			shardManifest := filepath.Join(shardDir, "index.m3u8")
+			opts := &hlsRunOpts{
+				abrMaster:   master,
+				abrSlug:     r.Slug,
+				bwBps:       r.BandwidthBps(),
+				width:       r.Width,
+				height:      r.Height,
+				failoverGen: func() uint64 { return s.hlsFailoverGenSnapshot(code) },
+			}
+			runHLSSegmenter(ctx, code, sub, shardDir, shardManifest,
+				segSec, win, hist, eph, opts)
 		}(r)
 	}
 	wg.Wait()
-}
-
-func writeHLSMasterPlaylist(path string, rends []buffer.RenditionPlayout) error {
-	if len(rends) == 0 {
-		return nil
-	}
-	ordered := append([]buffer.RenditionPlayout(nil), rends...)
-	sort.Slice(ordered, func(i, j int) bool {
-		return ordered[i].BandwidthBps() > ordered[j].BandwidthBps()
-	})
-
-	var b []byte
-	b = append(b, "#EXTM3U\n#EXT-X-VERSION:3\n"...)
-	for _, r := range ordered {
-		res := ""
-		if r.Width > 0 && r.Height > 0 {
-			res = fmt.Sprintf(",RESOLUTION=%dx%d", r.Width, r.Height)
-		}
-		b = append(b, fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d%s\n%s/index.m3u8\n",
-			r.BandwidthBps(), res, r.Slug)...)
-	}
-	return writeFileAtomic(path, b)
 }
