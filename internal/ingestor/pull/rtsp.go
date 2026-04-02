@@ -184,24 +184,25 @@ func (r *RTSPReader) readLoop() {
 		if c == nil {
 			return
 		}
-
-		pkt, err := c.ReadPacket()
-		if err != nil {
-			if err == joyrtsp.ErrCodecDataChange {
-				if !r.handleCodecDataChange(c) {
-					return
-				}
-				continue
-			}
-			slog.Warn("rtsp reader: read packet ended",
-				"url", r.input.URL, "err", err)
-			return
-		}
-
-		if r.emitJoyRTSPPacket(pkt) {
+		if stop := r.readOnce(c); stop {
 			return
 		}
 	}
+}
+
+// readOnce reads one packet from the RTSP client and emits it.
+// Returns true when the read loop should stop.
+func (r *RTSPReader) readOnce(c *joyrtsp.Client) bool {
+	pkt, err := c.ReadPacket()
+	if err != nil {
+		if err == joyrtsp.ErrCodecDataChange {
+			return !r.handleCodecDataChange(c)
+		}
+		slog.Warn("rtsp reader: read packet ended",
+			"url", r.input.URL, "err", err)
+		return true
+	}
+	return r.emitJoyRTSPPacket(pkt)
 }
 
 // emitJoyRTSPPacket converts one joy4 av.Packet to domain.AVPacket and sends it.
@@ -244,7 +245,7 @@ func (r *RTSPReader) emitJoyRTSPPacket(pkt joyav.Packet) bool {
 		}
 
 	case joyav.AAC:
-		data := rtspAACForADTS(r.aacCfg, pkt.Data)
+		data := aacFrameToADTS(r.aacCfg, pkt.Data)
 		if len(data) == 0 {
 			return false
 		}
@@ -341,20 +342,3 @@ func (r *RTSPReader) Close() error {
 	return nil
 }
 
-// rtspAACForADTS wraps a raw AAC payload in an ADTS header.
-// Returns the input unchanged when it already contains an ADTS header or
-// when no MPEG4AudioConfig is available.
-func rtspAACForADTS(cfg *aacparser.MPEG4AudioConfig, raw []byte) []byte {
-	if len(raw) >= 2 && raw[0] == 0xff && raw[1]&0xf0 == 0xf0 {
-		return raw // already ADTS
-	}
-	if cfg == nil {
-		return raw
-	}
-	hdr := make([]byte, aacparser.ADTSHeaderLength)
-	aacparser.FillADTSHeader(hdr, *cfg, 1024, len(raw))
-	out := make([]byte, 0, len(hdr)+len(raw))
-	out = append(out, hdr...)
-	out = append(out, raw...)
-	return out
-}
