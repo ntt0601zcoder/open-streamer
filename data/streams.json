@@ -1,6 +1,6 @@
 {
-  "test_failover": {
-    "code": "test_failover",
+  "test_udp": {
+    "code": "test_udp",
     "name": "string",
     "description": "string",
     "tags": [
@@ -10,18 +10,8 @@
     "status": "idle",
     "inputs": [
       {
-        "url": "http://10.241.1.100/test1/index.m3u8",
+        "url": "",
         "priority": 0,
-        "net": {}
-      },
-      {
-        "url": "http://10.241.1.100/test2/index.m3u8",
-        "priority": 1,
-        "net": {}
-      },
-      {
-        "url": "http://10.241.1.100/test3/index.m3u8",
-        "priority": 1,
         "net": {}
       }
     ],

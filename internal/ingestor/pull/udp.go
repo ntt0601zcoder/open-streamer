@@ -1,65 +1,188 @@
-// Package pull contains pull-mode Reader implementations.
-// Each reader connects to a remote source and emits raw MPEG-TS chunks.
 package pull
+
+// udp.go — UDP MPEG-TS ingestor (pull mode, listen socket).
+//
+// Listens on a UDP port, reads raw MPEG-TS datagrams, and forwards them to
+// TSDemuxPacketReader. A background pump goroutine reads from the socket and
+// sends validated datagrams to a buffered channel; Read() never spawns a
+// goroutine per call, giving fast, cheap context cancellation.
+//
+// # Multicast support
+//
+// When the bind address is an IPv4 or IPv6 multicast group, the socket
+// automatically issues an IGMP / MLD join using golang.org/x/net/ipv4 and
+// golang.org/x/net/ipv6.  Source-Specific Multicast (SSM, RFC 4607) is also
+// supported for IPv4 via ?source=<src-ip>.
+//
+// # RTP stripping
+//
+// Many broadcast encoders wrap MPEG-TS inside RTP (RFC 2250). If a datagram
+// does NOT start with the MPEG-TS sync byte (0x47) but its first byte looks
+// like an RTP version-2 header, the 12-byte (+ optional CSRC/extension) RTP
+// header is stripped automatically. Set ?rtp=0 in the URL to disable.
+//
+// # URL formats
+//
+//	udp://0.0.0.0:5000                     — unicast, bind all interfaces
+//	udp://239.1.1.1:5000                   — IPv4 multicast, any source
+//	udp://[ff02::1]:5000                   — IPv6 multicast
+//	udp://239.1.1.1:5000?iface=eth0        — multicast on specific interface
+//	udp://239.1.1.1:5000?source=10.0.0.1   — IPv4 source-specific multicast
+//	udp://host:5000?rtp=0                  — disable RTP auto-stripping
+//	udp://host:5000?pkt_size=65536         — override max datagram buffer size
+//
+// # Lifecycle for worker reconnection
+//
+// Open → (Read loop) → Close → Open → … is explicitly supported; each Open()
+// creates a fresh socket and pump goroutine; Close() tears them down and waits.
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
+	"strconv"
+	"sync"
 	"time"
+
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
 
-const udpReadSize = 188 * 7 // 7 TS packets per read — typical UDP MTU alignment
+const (
+	udpDefaultPktSize = 188 * 7        // 1316 bytes — typical MPEG-TS datagram
+	udpMaxPktSize     = 65536          // maximum useful UDP payload
+	udpChanBuf        = 128            // datagrams buffered between pump and Read
+	udpOSBufSize      = 4 * 1024 * 1024 // 4 MiB OS receive buffer
+	udpPollDeadline   = 400 * time.Millisecond // deadline for done-check polling
+)
 
-// UDPReader reads raw MPEG-TS from a UDP unicast or multicast address.
-// Expected URL format: udp://[group@]host:port
-// Example:
-//
-//	udp://239.1.1.1:5000   — multicast group
-//	udp://0.0.0.0:5000     — unicast, listen on all interfaces
-type UDPReader struct {
-	input domain.Input
-	conn  net.PacketConn
-	buf   []byte
+// udpOpts holds parsed URL query parameters for UDPReader.
+type udpOpts struct {
+	pktSize int    // max UDP read buffer size
+	iface   string // network interface name for multicast join
+	source  string // SSM source address (empty = any-source multicast)
+	rtpAuto bool   // true = auto-detect and strip RTP headers
 }
 
-// NewUDPReader constructs a UDPReader for the given input.
+// UDPReader listens on a UDP port and emits raw MPEG-TS chunks.
+// It implements TSChunkReader and is intended to be wrapped with
+// NewTSDemuxPacketReader.
+type UDPReader struct {
+	input domain.Input
+	opts  udpOpts
+
+	conn   *net.UDPConn
+	chunks chan []byte
+	done   chan struct{}
+	wg     sync.WaitGroup
+
+	// pumpErr holds the first non-timeout error from the pump goroutine.
+	// It is written by pump() before close(r.chunks) and read by Read() after
+	// the channel close — the channel-close happens-before ordering makes this
+	// access race-free without a mutex.
+	// Reset to nil on each Open() call so reconnection cycles start clean.
+	pumpErr error
+}
+
+// NewUDPReader constructs a UDPReader for the given input without opening a
+// connection.
 func NewUDPReader(input domain.Input) *UDPReader {
 	return &UDPReader{
 		input: input,
-		buf:   make([]byte, udpReadSize),
+		opts:  parseUDPOpts(input.URL),
 	}
 }
 
-// Open binds a UDP socket for the URL host (unicast or multicast listen address).
-func (r *UDPReader) Open(ctx context.Context) error {
+// Open binds the UDP socket, optionally joins a multicast group, and starts the
+// background pump goroutine.
+//
+// Each Open() call creates a fresh socket so the reader can be reused after
+// Close() by the ingestor reconnection loop.
+func (r *UDPReader) Open(_ context.Context) error {
+	r.pumpErr = nil // reset from any previous lifecycle
 	u, err := url.Parse(r.input.URL)
 	if err != nil {
-		return fmt.Errorf("udp reader: parse url %q: %w", r.input.URL, err)
+		return fmt.Errorf("udp: parse url %q: %w", r.input.URL, err)
 	}
 
-	lc := net.ListenConfig{}
-	pc, err := lc.ListenPacket(ctx, "udp", u.Host)
+	addr, err := net.ResolveUDPAddr("udp", u.Host)
 	if err != nil {
-		return fmt.Errorf("udp reader: listen %q: %w", u.Host, err)
+		return fmt.Errorf("udp: resolve %q: %w", u.Host, err)
 	}
 
-	// Multicast: URL user-info carries the group address, e.g. udp://239.1.1.1@0.0.0.0:5000
-	// Joining a multicast group requires the golang.org/x/net/ipv4 package which is
-	// not a direct dependency. For now we accept the connection as-is; the OS will
-	// route multicast traffic to the bound UDP socket if the kernel has the group
-	// membership configured externally (e.g. via `ip maddr add`).
-	// TODO: add ipv4.PacketConn.JoinGroup / ipv6.PacketConn.JoinGroup for auto-join.
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return fmt.Errorf("udp: listen %q: %w", u.Host, err)
+	}
+	_ = conn.SetReadBuffer(udpOSBufSize)
 
-	r.conn = pc
+	if err := r.joinMulticast(conn, addr); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("udp: multicast join %s: %w", addr.IP, err)
+	}
+
+	r.conn = conn
+	r.chunks = make(chan []byte, udpChanBuf)
+	r.done = make(chan struct{})
+	r.wg.Add(1)
+	go r.pump()
 	return nil
 }
 
-// LocalAddr returns the local network address the connection is bound to.
-// Useful for tests that need to know the OS-assigned port (udp://host:0).
+// Read returns the next validated MPEG-TS datagram (with any RTP header stripped).
+//
+// When the pump goroutine exits due to a real network error, Read returns that
+// error (not io.EOF) so the upstream pumpChunks goroutine can store it in
+// TSDemuxPacketReader.readErr and the worker will reconnect instead of triggering
+// permanent failover.
+//
+// Returns (nil, io.EOF) only when Close() is called cleanly without a pump error.
+// Returns (nil, ctx.Err()) when the caller's context is cancelled.
+func (r *UDPReader) Read(ctx context.Context) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case chunk, ok := <-r.chunks:
+		if !ok {
+			// The pump goroutine exited.  If it recorded a real error (network
+			// failure, unexpected OS error) propagate it so the caller can
+			// distinguish this from a clean shutdown or natural stream end.
+			if r.pumpErr != nil {
+				return nil, r.pumpErr
+			}
+			return nil, io.EOF
+		}
+		return chunk, nil
+	}
+}
+
+// Close stops the pump goroutine, closes the UDP socket, and waits for clean
+// shutdown. Safe to call before Open or multiple times.
+func (r *UDPReader) Close() error {
+	if r.done != nil {
+		select {
+		case <-r.done:
+		default:
+			close(r.done)
+		}
+	}
+	var err error
+	if r.conn != nil {
+		err = r.conn.Close()
+		r.conn = nil
+	}
+	r.wg.Wait()
+	r.done = nil
+	r.chunks = nil
+	return err
+}
+
+// LocalAddr returns the local address the socket is bound to.
+// Returns nil if the socket has not been opened yet.
 func (r *UDPReader) LocalAddr() net.Addr {
 	if r.conn == nil {
 		return nil
@@ -67,56 +190,207 @@ func (r *UDPReader) LocalAddr() net.Addr {
 	return r.conn.LocalAddr()
 }
 
-func (r *UDPReader) Read(ctx context.Context) ([]byte, error) {
-	// Propagate context cancellation by setting a near-immediate deadline when
-	// the context is already done, or use the context deadline if one exists.
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		r.conn.SetReadDeadline(deadline) //nolint:errcheck
-	} else {
-		// No deadline: clear any previously set deadline.
-		r.conn.SetReadDeadline(time.Time{}) //nolint:errcheck
-	}
+// ─── Internal pump goroutine ────────────────────────────────────────────────
 
-	type result struct {
-		data []byte
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		n, _, err := r.conn.ReadFrom(r.buf)
+// pump is the background goroutine that reads UDP datagrams from the socket
+// and sends them to r.chunks.
+//
+// A short read deadline is set each iteration so the goroutine can check
+// r.done without blocking indefinitely — no extra goroutine is spawned.
+//
+// Slow consumers: if r.chunks is full a datagram is silently dropped rather
+// than blocking the pump (which would stall the OS receive buffer).
+func (r *UDPReader) pump() {
+	defer r.wg.Done()
+	defer close(r.chunks)
+
+	buf := make([]byte, r.opts.pktSize)
+	for {
+		// Fast-path: check for shutdown before blocking on the socket.
+		select {
+		case <-r.done:
+			return
+		default:
+		}
+
+		_ = r.conn.SetReadDeadline(time.Now().Add(udpPollDeadline))
+		n, _, err := r.conn.ReadFromUDP(buf)
 		if err != nil {
-			ch <- result{err: err}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue // deadline expired; loop back and check r.done
+			}
+			// Real network error (connection reset, socket closed by Close(), …).
+			// Store it so Read() can return it instead of a generic io.EOF, giving
+			// the ingestor worker a chance to reconnect rather than trigger failover.
+			r.pumpErr = err
 			return
 		}
-		out := make([]byte, n)
-		copy(out, r.buf[:n])
-		ch <- result{data: out}
-	}()
-
-	select {
-	case <-ctx.Done():
-		r.conn.SetReadDeadline(time.Now()) //nolint:errcheck // unblock ReadFrom
-		return nil, ctx.Err()
-	case res := <-ch:
-		if res.err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, fmt.Errorf("udp reader: read: %w", res.err)
+		if n == 0 {
+			continue
 		}
-		return res.data, nil
+
+		pkt := r.processPacket(buf[:n])
+		if pkt == nil {
+			continue // not a recognisable MPEG-TS payload
+		}
+
+		cp := make([]byte, len(pkt))
+		copy(cp, pkt)
+
+		select {
+		case r.chunks <- cp:
+		case <-r.done:
+			return
+		default:
+			// Drop: consumer is too slow. Packet loss is preferable to
+			// stalling the pump and growing the OS receive buffer backlog.
+		}
 	}
 }
 
-// Close closes the UDP packet connection.
-func (r *UDPReader) Close() error {
-	if r.conn != nil {
-		err := r.conn.Close()
-		r.conn = nil
-		return err
+// processPacket returns the MPEG-TS payload from a UDP datagram, or nil if the
+// datagram should be discarded.
+//
+//   - Datagrams starting with 0x47 are raw MPEG-TS and returned as-is.
+//   - With rtpAuto=true, datagrams that look like RTP version-2 packets
+//     have their header stripped; the remainder must start with 0x47.
+//   - Everything else is silently discarded.
+func (r *UDPReader) processPacket(pkt []byte) []byte {
+	if len(pkt) == 0 {
+		return nil
+	}
+	if pkt[0] == 0x47 {
+		return pkt // already raw MPEG-TS
+	}
+	if r.opts.rtpAuto {
+		return stripRTPHeader(pkt) // returns nil if not valid RTP/MPEG-TS
 	}
 	return nil
+}
+
+// stripRTPHeader strips the RTP header from pkt and returns the MPEG-TS payload.
+// Returns nil if pkt does not look like an RTP/MPEG-TS datagram.
+//
+// Header layout (RFC 3550):
+//
+//	0         1         2         3
+//	0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|V=2|P|X|  CC   |M|     PT      |       Sequence Number         |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|                           Timestamp                           |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|           Synchronization Source (SSRC) identifier            |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|              Contributing Source (CSRC) identifiers …         |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	| Optional extension header …                                   |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	| MPEG-TS payload (0x47 …)                                      |
+func stripRTPHeader(pkt []byte) []byte {
+	if len(pkt) < 12 {
+		return nil
+	}
+	// Version field must be 2 (top 2 bits of first byte = 0b10).
+	if pkt[0]&0xC0 != 0x80 {
+		return nil
+	}
+
+	// Fixed header: 12 bytes.
+	// CSRC list: CC (lower 4 bits of byte 0) × 4 bytes.
+	hdrLen := 12 + int(pkt[0]&0x0F)*4
+
+	// Optional header extension (bit 4 of byte 0 = X bit).
+	if pkt[0]&0x10 != 0 {
+		if len(pkt) < hdrLen+4 {
+			return nil
+		}
+		// Extension length field is the number of 32-bit words that follow
+		// the 4-byte extension header.
+		extWords := int(pkt[hdrLen+2])<<8 | int(pkt[hdrLen+3])
+		hdrLen += 4 + extWords*4
+	}
+
+	if hdrLen >= len(pkt) {
+		return nil
+	}
+	payload := pkt[hdrLen:]
+	if payload[0] != 0x47 {
+		return nil // payload is not MPEG-TS
+	}
+	return payload
+}
+
+// ─── Multicast join ─────────────────────────────────────────────────────────
+
+// joinMulticast joins the multicast group encoded in addr when addr.IP is a
+// multicast address.  No-op for unicast addresses.
+func (r *UDPReader) joinMulticast(conn *net.UDPConn, addr *net.UDPAddr) error {
+	if !addr.IP.IsMulticast() {
+		return nil
+	}
+
+	var iface *net.Interface
+	if r.opts.iface != "" {
+		var err error
+		iface, err = net.InterfaceByName(r.opts.iface)
+		if err != nil {
+			return fmt.Errorf("interface %q: %w", r.opts.iface, err)
+		}
+	}
+
+	if addr.IP.To4() != nil {
+		return r.joinIPv4(conn, addr, iface)
+	}
+	return r.joinIPv6(conn, addr, iface)
+}
+
+// joinIPv4 issues an IGMP join for the given group on conn.
+// When source is set in opts, a source-specific (SSM) join is used instead.
+func (r *UDPReader) joinIPv4(conn *net.UDPConn, group *net.UDPAddr, iface *net.Interface) error {
+	pc := ipv4.NewPacketConn(conn)
+	if r.opts.source != "" {
+		src := net.ParseIP(r.opts.source)
+		if src == nil {
+			return fmt.Errorf("invalid SSM source address %q", r.opts.source)
+		}
+		return pc.JoinSourceSpecificGroup(iface, &net.UDPAddr{IP: group.IP}, &net.UDPAddr{IP: src})
+	}
+	return pc.JoinGroup(iface, &net.UDPAddr{IP: group.IP})
+}
+
+// joinIPv6 issues an MLD join for the given group on conn.
+func (r *UDPReader) joinIPv6(conn *net.UDPConn, group *net.UDPAddr, iface *net.Interface) error {
+	return ipv6.NewPacketConn(conn).JoinGroup(iface, &net.UDPAddr{IP: group.IP})
+}
+
+// ─── URL option parsing ──────────────────────────────────────────────────────
+
+// parseUDPOpts extracts recognised query parameters from rawURL.
+// Unknown parameters are silently ignored.
+func parseUDPOpts(rawURL string) udpOpts {
+	opts := udpOpts{
+		pktSize: udpDefaultPktSize,
+		rtpAuto: true,
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return opts
+	}
+	q := u.Query()
+	if v := q.Get("iface"); v != "" {
+		opts.iface = v
+	}
+	if v := q.Get("source"); v != "" {
+		opts.source = v
+	}
+	if v := q.Get("pkt_size"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= udpMaxPktSize {
+			opts.pktSize = n
+		}
+	}
+	if v := q.Get("rtp"); v == "0" || v == "false" {
+		opts.rtpAuto = false
+	}
+	return opts
 }

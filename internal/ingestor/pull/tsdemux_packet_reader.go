@@ -23,7 +23,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 
 	gocodec "github.com/yapingcat/gomedia/go-codec"
@@ -39,6 +41,14 @@ const (
 
 	// avQueueSize is the maximum number of decoded AVPackets buffered before the caller drains them.
 	avQueueSize = 16384
+
+	// maxDemuxRestarts caps the number of times runDemux will recreate the TSDemuxer after a
+	// parse error without any successful frame in between.  The gompeg2 demuxer stops on the
+	// first bad TS packet; restarting it allows resync after transient corruption (e.g. the
+	// first UDP burst before the encoder settles, or adaptation-field oddities).
+	// A counter reset to 0 on every successful OnFrame call, so only truly unrecoverable
+	// streams hit this ceiling.
+	maxDemuxRestarts = 8
 )
 
 // TSChunkReader is an MPEG-TS byte source (UDP, HLS, file, SRT, …).
@@ -163,6 +173,18 @@ func (d *TSDemuxPacketReader) captureReadErr(err error, ctx context.Context) {
 }
 
 // runDemux feeds chanReader into the MPEG-TS demuxer and emits AVPackets onto q.
+//
+// The gompeg2 TSDemuxer returns immediately on any parse error (e.g. bad adaptation
+// field, unexpected PES, bad sync byte).  For live ingest (UDP, SRT) this causes a
+// spurious end-of-stream for what is just a transient corruption or a startup burst
+// before the encoder stabilises.
+//
+// To work around the library limitation, runDemux restarts the demuxer after a parse
+// error.  The chanReader picks up exactly where it left off (it buffers the channel
+// in rem), and the new demuxer's probe() call will re-scan for the next 0x47 sync
+// byte, re-syncing within one TS packet.  A counter (consecutiveErrors) tracks how
+// many restarts happened without a single successful frame; once it reaches
+// maxDemuxRestarts the goroutine gives up so the caller can reconnect.
 func (d *TSDemuxPacketReader) runDemux() {
 	// Capture both channels locally to avoid closing nil if Close races.
 	q := d.q
@@ -172,21 +194,68 @@ func (d *TSDemuxPacketReader) runDemux() {
 	defer close(q)
 
 	cr := &chanReader{ch: d.chunks}
-	demux := gompeg2.NewTSDemuxer()
-	demux.OnFrame = func(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
-		if len(frame) == 0 {
+
+	consecutiveErrors := 0
+	for {
+		demux := gompeg2.NewTSDemuxer()
+		demux.OnFrame = func(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
+			if len(frame) == 0 {
+				return
+			}
+			p, ok := buildAVPacket(cid, frame, pts, dts)
+			if !ok {
+				return
+			}
+			// A successful frame means the demuxer re-synced; reset the error counter
+			// so the pipeline can tolerate isolated bad patches without hitting the cap.
+			consecutiveErrors = 0
+			select {
+			case q <- p:
+			case <-done:
+			}
+		}
+
+		err := demuxInputSafe(demux, cr)
+		if err == nil {
+			// Normal exit: chanReader returned io.EOF because d.chunks was closed.
 			return
 		}
-		p, ok := buildAVPacket(cid, frame, pts, dts)
-		if !ok {
+
+		// Parse error from gompeg2 (e.g. "ts packet must start with 0x47", bad
+		// adaptation field, …).  Restart with a fresh demuxer so probe() can
+		// re-find the sync byte and resume processing.
+		consecutiveErrors++
+		slog.Debug("ts demux: parse error, restarting demuxer",
+			"err", err,
+			"consecutive_errors", consecutiveErrors,
+			"max", maxDemuxRestarts,
+		)
+		if consecutiveErrors >= maxDemuxRestarts {
+			// Persistent parse failures — the stream is likely unrecoverable.
+			// Return so the caller (ReadPackets) sees io.EOF and triggers
+			// a reconnect via the normal error path.
+			slog.Warn("ts demux: too many consecutive parse errors, giving up",
+				"consecutive_errors", consecutiveErrors,
+			)
 			return
-		}
-		select {
-		case q <- p:
-		case <-done:
 		}
 	}
-	_ = demux.Input(cr)
+}
+
+// demuxInputSafe calls demux.Input and converts any panic into a returned error.
+//
+// The gompeg2 library panics on certain malformed TS packets — for example, an
+// adaptation field that claims a length larger than the remaining bytes in the
+// 188-byte packet causes BitStream.GetBits to panic with "OUT OF RANGE".
+// Catching the panic here lets runDemux restart the demuxer and resync instead
+// of crashing the whole process.
+func demuxInputSafe(demux *gompeg2.TSDemuxer, cr *chanReader) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("ts demux panic: %v", r)
+		}
+	}()
+	return demux.Input(cr)
 }
 
 // buildAVPacket constructs a domain.AVPacket from a TSDemuxer frame callback.
