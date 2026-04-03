@@ -1,7 +1,7 @@
 {
   "test_file_no_transcode": {
     "code": "test_file_no_transcode",
-    "disabled": false,
+    "disabled": true,
     "name": "File no transcode", 
     "description": "",
     "tags": [],
@@ -64,7 +64,7 @@
   },
   "test_hls_no_transcode": {
     "code": "test_hls_no_transcode",
-    "disabled": false,
+    "disabled": true,
     "name": "HLS no transcode", 
     "description": "",
     "tags": [],
@@ -127,7 +127,7 @@
   },
   "test_rtmp_no_transcode": {
     "code": "test_rtmp_no_transcode",
-    "disabled": false,
+    "disabled": true,
     "name": "RTMP no transcode", 
     "description": "",
     "tags": [],
@@ -190,7 +190,7 @@
   },
   "test_srt_no_transcode": {
     "code": "test_srt_no_transcode",
-    "disabled": false,
+    "disabled": true,
     "name": "SRT no transcode", 
     "description": "",
     "tags": [],
