@@ -60,9 +60,9 @@ Legend for **Completion**:
 |---------|------------|--------|
 | Pull — HLS | Complete | |
 | Pull — HTTP | Complete | |
-| Pull — RTSP | Complete | |
+| Pull — RTSP | Partial | Manual tests: **HLS/DASH output can stutter / feel laggy** vs file-HLS-RTMP paths; investigate timing, RTP jitter, and segment cadence |
 | Pull — RTMP | Complete | |
-| Pull — SRT (caller) | Complete | |
+| Pull — SRT (caller) | Partial | Code path complete; **HLS/DASH publisher combos not yet verified** in manual matrix below |
 | Pull — UDP / MPEG-TS | Partial | Multicast auto-join TODO in `pull/udp.go` |
 | Pull — file | Complete | |
 | Pull — S3 | Complete | |
@@ -120,7 +120,7 @@ Legend for **Completion**:
 |---------|------------|--------|
 | Start pipeline (buffer, manager, publisher, transcoder) | Complete | Creates raw + rendition buffers as needed |
 | Stop pipeline / teardown buffers | Complete | Including `$r$…` slugs |
-| Bootstrap persisted streams on startup | Complete | Skips stopped / no-input streams |
+| Bootstrap persisted streams on startup | Complete | Skips stopped, disabled, and no-input streams |
 
 ---
 
@@ -163,6 +163,32 @@ Legend for **Completion**:
 
 ---
 
+## Manual matrix — ingest × publisher
+
+Results from **manual** checks (not automated CI). **OK** = playback acceptable in test; **—** = not tested yet; **Issue** = visible stutter / lag.
+
+### Without internal transcode
+
+| Ingest (pull) | HLS publisher | DASH publisher |
+|---------------|---------------|----------------|
+| File | OK | OK |
+| HLS | OK | OK |
+| RTMP | OK | OK |
+| SRT | — | — |
+| RTSP | Issue | Issue |
+
+### With internal transcode (FFmpeg ladder)
+
+| Ingest (pull) | HLS publisher | DASH publisher |
+|---------------|---------------|----------------|
+| File | OK | OK |
+| HLS | OK | OK |
+| RTMP | OK | OK |
+| SRT | — | — |
+| RTSP | Issue | Issue |
+
+---
+
 ## Operational assumptions
 
 - **FFmpeg** must be available where `transcoder` expects (`FFmpegPath` in config).
@@ -171,4 +197,4 @@ Legend for **Completion**:
 
 ---
 
-*Last reviewed against repository layout and code paths (internal packages). Update this file when features move between columns.*
+*Last reviewed against repository layout and code paths (internal packages). Manual matrix updated from operator test notes (SRT not yet verified; RTSP + segment publishers: smoothness issues). Update this file when features move between columns.*
