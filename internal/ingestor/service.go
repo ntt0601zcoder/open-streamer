@@ -21,6 +21,7 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/events"
+	"github.com/ntthuan060102github/open-streamer/internal/ingestor/push"
 	"github.com/ntthuan060102github/open-streamer/pkg/protocol"
 	"github.com/samber/do/v2"
 )
@@ -43,8 +44,9 @@ type Service struct {
 	onPacket     func(streamID domain.StreamCode, inputPriority int)
 	onInputError func(streamID domain.StreamCode, inputPriority int, err error)
 
-	mu      sync.Mutex
-	workers map[domain.StreamCode]*pullWorkerEntry
+	mu             sync.Mutex
+	workers        map[domain.StreamCode]*pullWorkerEntry
+	pushPriorities map[domain.StreamCode]int // streamID → priority of the active publish:// input
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -57,8 +59,9 @@ func New(i do.Injector) (*Service, error) {
 		cfg:      cfg.Ingestor,
 		buf:      buf,
 		bus:      bus,
-		registry: NewRegistry(),
-		workers:  make(map[domain.StreamCode]*pullWorkerEntry),
+		registry:       NewRegistry(),
+		workers:        make(map[domain.StreamCode]*pullWorkerEntry),
+		pushPriorities: make(map[domain.StreamCode]int),
 	}, nil
 }
 
@@ -82,7 +85,20 @@ func (s *Service) Run(ctx context.Context) error {
 	g, _ := errgroup.WithContext(ctx)
 
 	if s.cfg.RTMPEnabled {
-		// TODO: start RTMP push server
+		rtmpSrv, err := push.NewRTMPServer(
+			s.cfg.RTMPAddr,
+			s.registry,
+			func(ctx context.Context, streamID, bufferWriteID domain.StreamCode, input domain.Input) error {
+				s.mu.Lock()
+				input.Priority = s.pushPriorities[streamID]
+				s.mu.Unlock()
+				return s.startPullWorker(ctx, streamID, input, bufferWriteID)
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("ingestor: create rtmp server: %w", err)
+		}
+		g.Go(func() error { return rtmpSrv.Run(ctx) })
 	}
 
 	if s.cfg.SRTEnabled {
@@ -203,6 +219,9 @@ func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain
 		return fmt.Errorf("ingestor: cannot determine stream key from URL %q", input.URL)
 	}
 
+	s.mu.Lock()
+	s.pushPriorities[streamID] = input.Priority
+	s.mu.Unlock()
 	s.registry.Register(key, streamID, s.buf, bufferWriteID)
 
 	slog.Info("ingestor: push slot registered",
