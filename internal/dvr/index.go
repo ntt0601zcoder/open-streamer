@@ -70,15 +70,15 @@ func parsePlaylist(segDir string) ([]segmentMeta, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var (
-		segments      []segmentMeta
-		pendingWall   time.Time
-		pendingDur    time.Duration
-		pendingDisc   bool
-		hasDur        bool
-		needDateTime  = true
+		segments     []segmentMeta
+		pendingWall  time.Time
+		pendingDur   time.Duration
+		pendingDisc  bool
+		hasDur       bool
+		needDateTime = true
 	)
 
 	scanner := bufio.NewScanner(f)

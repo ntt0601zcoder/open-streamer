@@ -35,10 +35,10 @@ func TestIsH264AVCCAccessUnit(t *testing.T) {
 	t.Run("two_nalus", func(t *testing.T) {
 		t.Parallel()
 		// NAL len 2 + 0x09 0xF0, NAL len 3 + 0x67 0x42 0x00
-		var b []byte
 		n1 := []byte{0x09, 0xF0}
 		n2 := []byte{0x67, 0x42, 0x00}
 		tmp := make([]byte, 4)
+		b := make([]byte, 0, len(tmp)+len(n1)+len(tmp)+len(n2))
 		binary.BigEndian.PutUint32(tmp, uint32(len(n1)))
 		b = append(b, tmp...)
 		b = append(b, n1...)
@@ -54,8 +54,8 @@ func TestIsH264AVCCAccessUnit(t *testing.T) {
 		// 0x00000100 = 256 — contains 00 00 01; must still be AVCC, not mistaken for Annex-B.
 		n := make([]byte, 256)
 		n[0] = 0x67 // SPS-like header
-		var b []byte
 		tmp := make([]byte, 4)
+		b := make([]byte, 0, len(tmp)+len(n))
 		binary.BigEndian.PutUint32(tmp, 256)
 		b = append(b, tmp...)
 		b = append(b, n...)
@@ -67,7 +67,8 @@ func TestIsH264AVCCAccessUnit(t *testing.T) {
 	t.Run("annex_b_long_nal_not_avcc", func(t *testing.T) {
 		t.Parallel()
 		// 00 00 00 01 + 200-byte NAL: first uint32=1 would fake AVCC; walk must fail.
-		b := []byte{0, 0, 0, 1, 0x67}
+		b := make([]byte, 0, 200)
+		b = append(b, 0, 0, 0, 1, 0x67)
 		b = append(b, make([]byte, 195)...)
 		require.False(t, isH264AVCCAccessUnit(b))
 		require.Equal(t, b, h264ForTSMuxer(b))

@@ -245,7 +245,7 @@ func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
 			})
 
 		case <-tick.C:
-			p.tickFlush(segDur, maxDur)
+			p.tickFlush(maxDur)
 		}
 	}
 }
@@ -254,7 +254,7 @@ func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
 //   - TS-path time-based segmenting
 //   - Fallback force-flush for stuck AV paths
 //   - Failover generation detection (TS path)
-func (p *hlsSegmenter) tickFlush(segDur, maxDur time.Duration) {
+func (p *hlsSegmenter) tickFlush(maxDur time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

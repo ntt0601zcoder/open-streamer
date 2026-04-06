@@ -70,7 +70,7 @@ func (s *Service) serveDASHAdaptive(ctx context.Context, stream *domain.Stream) 
 		}
 
 		wg.Add(1)
-		go func(rSub *buffer.Subscriber, shardD, sl string, o *dashRunOpts) {
+		go func(rSub *buffer.Subscriber, shardD string, _ string, o *dashRunOpts) {
 			defer wg.Done()
 			defer s.buf.Unsubscribe(r.BufferID, rSub)
 			runDASHFMP4Packager(

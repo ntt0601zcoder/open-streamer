@@ -30,6 +30,8 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 	}
 	f.mux.OnPacket = onPacket
 	switch p.Codec {
+	case domain.AVCodecUnknown:
+		return // unsupported
 	case domain.AVCodecH264:
 		if !f.hasV {
 			f.vpid = f.mux.AddStream(gompeg2.TS_STREAM_H264)

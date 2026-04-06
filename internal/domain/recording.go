@@ -9,6 +9,7 @@ type RecordingID string
 // RecordingStatus represents the lifecycle state of a recording.
 type RecordingStatus string
 
+// RecordingStatus values.
 const (
 	RecordingStatusRecording RecordingStatus = "recording"
 	RecordingStatusStopped   RecordingStatus = "stopped"

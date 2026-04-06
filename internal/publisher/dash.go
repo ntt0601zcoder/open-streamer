@@ -52,4 +52,3 @@ func (s *Service) serveDASH(ctx context.Context, streamID domain.StreamCode) {
 
 	slog.Info("publisher: DASH serve stopped", "stream_code", streamID)
 }
-

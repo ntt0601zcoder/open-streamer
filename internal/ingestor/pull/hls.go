@@ -99,9 +99,9 @@ type hlsMediaPlaylist struct {
 }
 
 type hlsSegment struct {
-	uri          string
-	seq          uint64
-	duration     float64
+	uri           string
+	seq           uint64
+	duration      float64
 	discontinuity bool
 }
 
@@ -493,6 +493,8 @@ type parseState struct {
 }
 
 // parseLine processes one M3U8 tag or URI line, updating parseState.
+//
+//nolint:unparam // error return reserved for future use
 func parseLine(line string, base *url.URL, scanner *bufio.Scanner, st *parseState) error {
 	switch {
 	case strings.HasPrefix(line, m3u8TagMediaSeq):
@@ -527,9 +529,9 @@ func parseLine(line string, base *url.URL, scanner *bufio.Scanner, st *parseStat
 	case !strings.HasPrefix(line, "#") && *st.pendingDur > 0:
 		seqNo := *st.seqBase + uint64(len(*st.segments))
 		*st.segments = append(*st.segments, hlsSegment{
-			uri:          resolveHLSURL(base, line),
-			seq:          seqNo,
-			duration:     *st.pendingDur,
+			uri:           resolveHLSURL(base, line),
+			seq:           seqNo,
+			duration:      *st.pendingDur,
 			discontinuity: *st.pendingDisc,
 		})
 		*st.pendingDur = 0

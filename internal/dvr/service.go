@@ -316,7 +316,6 @@ func (s *Service) record(
 					segWallStart, pendingDiscontinuity, segDir)
 				segBuf = segBuf[:0]
 				segIdx++
-				pendingDiscontinuity = false
 			}
 			avMux = nil
 			hasPTS = false

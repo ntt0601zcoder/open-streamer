@@ -160,12 +160,12 @@ type dashFMP4Packager struct {
 	audioNextDecode uint64 // audioSR Hz
 
 	// Sliding-window state for MPD generation.
-	onDiskV    []string  // filenames of written video segments
-	onDiskA    []string  // filenames of written audio segments
-	vSegDurs   []uint64  // per-segment duration in 90 kHz ticks
-	aSegDurs   []uint64  // per-segment duration in audioSR ticks
-	vSegStarts []uint64  // tfdt of first sample per video segment
-	aSegStarts []uint64  // tfdt of first sample per audio segment
+	onDiskV    []string // filenames of written video segments
+	onDiskA    []string // filenames of written audio segments
+	vSegDurs   []uint64 // per-segment duration in 90 kHz ticks
+	aSegDurs   []uint64 // per-segment duration in audioSR ticks
+	vSegStarts []uint64 // tfdt of first sample per video segment
+	aSegStarts []uint64 // tfdt of first sample per audio segment
 
 	// Set on first segment available; needed for MPD availabilityStartTime.
 	availabilityStart time.Time
@@ -770,7 +770,7 @@ func h264AnnexBToAVCC(annexB []byte) []byte {
 	if len(nalus) == 0 {
 		return nil
 	}
-	var out []byte
+	out := make([]byte, 0, len(nalus)*5) // 4-byte length prefix + approximate nalu size
 	for _, nalu := range nalus {
 		n := len(nalu)
 		out = append(out, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))

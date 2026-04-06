@@ -157,8 +157,8 @@ func (h *RecordingHandler) Info(w http.ResponseWriter, r *http.Request) {
 				StartedAt:     idx.StartedAt,
 				LastSegmentAt: idx.LastSegmentAt,
 			},
-			"gaps":            idx.Gaps,
-			"segment_count":   idx.SegmentCount,
+			"gaps":             idx.Gaps,
+			"segment_count":    idx.SegmentCount,
 			"total_size_bytes": idx.TotalSizeBytes,
 		},
 	})
@@ -325,7 +325,7 @@ func (h *RecordingHandler) Timeshift(w http.ResponseWriter, r *http.Request) {
 	// Slice the segment list to the requested window.
 	// A segment is included if its wall_time >= startTime and it falls within windowDur.
 	endTime := startTime.Add(windowDur)
-	var window []dvr.SegmentMeta
+	window := make([]dvr.SegmentMeta, 0, len(segments))
 	for _, seg := range segments {
 		if seg.WallTime.IsZero() {
 			continue

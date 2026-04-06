@@ -66,6 +66,9 @@ func NewPacketReader(input domain.Input, cfg config.IngestorConfig) (PacketReade
 		return pull.NewTSDemuxPacketReader(pull.NewFileReader(input)), nil
 	case protocol.KindSRT:
 		return pull.NewTSDemuxPacketReader(pull.NewSRTReader(input)), nil
+	case protocol.KindPublish, protocol.KindUnknown:
+		// KindPublish is handled before this switch; KindUnknown falls through to error.
+		fallthrough
 	default:
 		return nil, fmt.Errorf(
 			"ingestor: cannot infer protocol from URL %q — unsupported scheme",

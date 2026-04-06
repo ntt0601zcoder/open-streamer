@@ -99,9 +99,7 @@ func (s *Service) Run(ctx context.Context) error {
 		g.Go(func() error { return rtmpSrv.Run(ctx) })
 	}
 
-	if s.cfg.SRTEnabled {
-		// TODO: start SRT push server
-	}
+	// TODO: start SRT push server when SRTEnabled
 
 	return g.Wait()
 }

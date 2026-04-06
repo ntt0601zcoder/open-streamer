@@ -273,6 +273,9 @@ func buildAVPacket(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) (d
 		keyFrame = gocodec.IsH265IDRFrame(frame)
 	case gompeg2.TS_STREAM_AAC:
 		cdc = domain.AVCodecAAC
+	case gompeg2.TS_STREAM_AUDIO_MPEG1, gompeg2.TS_STREAM_AUDIO_MPEG2:
+		// unsupported audio codecs — skip
+		return domain.AVPacket{}, false
 	default:
 		return domain.AVPacket{}, false
 	}

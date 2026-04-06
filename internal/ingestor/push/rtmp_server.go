@@ -64,7 +64,7 @@ func NewRTMPServer(addr string, registry Registry, onConnect ConnectFunc) (*RTMP
 
 // Run binds the TCP listener and accepts RTMP connections until ctx is cancelled.
 func (s *RTMPServer) Run(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.addr)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("rtmp server: listen %q: %w", s.addr, err)
 	}
@@ -257,7 +257,7 @@ func (r *rtmpRelay) stop() {
 		copy(subs, r.subs)
 		r.mu.Unlock()
 		for _, sub := range subs {
-			sub.stop()         // signal quit channel
+			sub.stop()           // signal quit channel
 			_ = sub.conn.Close() // unblock any pending TCP write
 		}
 		close(r.quit)

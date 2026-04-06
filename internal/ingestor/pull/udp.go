@@ -53,10 +53,10 @@ import (
 )
 
 const (
-	udpDefaultPktSize = 188 * 7        // 1316 bytes — typical MPEG-TS datagram
-	udpMaxPktSize     = 65536          // maximum useful UDP payload
-	udpChanBuf        = 128            // datagrams buffered between pump and Read
-	udpOSBufSize      = 4 * 1024 * 1024 // 4 MiB OS receive buffer
+	udpDefaultPktSize = 188 * 7                // 1316 bytes — typical MPEG-TS datagram
+	udpMaxPktSize     = 65536                  // maximum useful UDP payload
+	udpChanBuf        = 128                    // datagrams buffered between pump and Read
+	udpOSBufSize      = 4 * 1024 * 1024        // 4 MiB OS receive buffer
 	udpPollDeadline   = 400 * time.Millisecond // deadline for done-check polling
 )
 

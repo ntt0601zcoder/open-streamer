@@ -10,13 +10,11 @@ package publisher
 import (
 	"context"
 	"fmt"
-	"net"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/bluenviron/gortsplib/v5"
-	srt "github.com/datarhei/gosrt"
 
 	"github.com/ntthuan060102github/open-streamer/config"
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
@@ -43,17 +41,9 @@ type Service struct {
 	// When transcoding produces an ABR ladder, this is the best rung ($r$...), not the logical stream code.
 	mediaBuffer map[domain.StreamCode]domain.StreamCode
 
-	rtspMu     sync.RWMutex
-	rtspSrv    *gortsplib.Server
 	rtspMounts map[string]*gortsplib.ServerStream // path -> stream (see publisherLiveMountPath)
-
-	rtmpMu     sync.Mutex
-	rtmpLn     net.Listener
 	rtmpActive map[domain.StreamCode]struct{}
-
-	srtMu     sync.Mutex
-	srtLn     srt.Listener
-	srtActive map[domain.StreamCode]struct{}
+	srtActive  map[domain.StreamCode]struct{}
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -149,13 +139,7 @@ func (s *Service) spawnOutputs(
 		}
 	}
 
-	playID := s.mediaBufferForLocked(code)
-	_ = playID
-	for _, dest := range stream.Push {
-		if dest.Enabled {
-			// TODO: Implement push to destination
-		}
-	}
+	// TODO: push destinations not yet implemented
 }
 
 func publisherABRActive(stream *domain.Stream) bool {

@@ -303,7 +303,7 @@ func (s *Service) monitor(ctx context.Context, streamID domain.StreamCode) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.checkHealth(streamID)
+			s.checkHealth(streamID) //nolint:contextcheck // checkHealth uses state.monCtx internally
 		}
 	}
 }
@@ -345,7 +345,7 @@ func (s *Service) checkHealth(streamID domain.StreamCode) {
 		s.tryFailover(streamID, state)
 	}
 	for _, task := range probeTasks {
-		go s.runProbe(streamID, state, task)
+		go s.runProbe(streamID, state, task) //nolint:contextcheck // probe uses state.monCtx internally
 	}
 }
 

@@ -18,12 +18,12 @@ import (
 // ---- mock PacketReader ----
 
 type mockPacketReader struct {
-	mu       sync.Mutex
-	opens    int
-	closes   int
-	openErr  error
-	packets  [][]byte // each ReadPackets yields one H264 AU with this payload
-	readErr  error
+	mu      sync.Mutex
+	opens   int
+	closes  int
+	openErr error
+	packets [][]byte // each ReadPackets yields one H264 AU with this payload
+	readErr error
 }
 
 func (m *mockPacketReader) Open(_ context.Context) error {

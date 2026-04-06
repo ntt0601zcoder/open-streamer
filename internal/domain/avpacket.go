@@ -3,6 +3,7 @@ package domain
 // AVCodec identifies elementary stream codec for AVPacket payloads.
 type AVCodec uint8
 
+// AVCodec values.
 const (
 	AVCodecUnknown AVCodec = iota
 	AVCodecH264

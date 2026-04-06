@@ -41,8 +41,8 @@ import (
 )
 
 const (
-	fileTSChunk   = 188 * 56    // ~10 KB; aligned to TS packet boundary
-	flvReadBuf    = 32 * 1024   // 32 KB read buffer for FLV chunk feeding
+	fileTSChunk = 188 * 56  // ~10 KB; aligned to TS packet boundary
+	flvReadBuf  = 32 * 1024 // 32 KB read buffer for FLV chunk feeding
 )
 
 // fileHandler is the internal strategy selected based on the file extension.
@@ -92,7 +92,7 @@ func (r *FileReader) Open(_ context.Context) error {
 		r.handler = h
 
 	case ".flv":
-		h, err := newFLVHandler(r.path, r.loop)
+		h, err := newFLVHandler(r.path, r.loop) //nolint:contextcheck // ctx stored in h.paceCtx per-read
 		if err != nil {
 			return fmt.Errorf("file reader: flv init %q: %w", r.path, err)
 		}
@@ -316,6 +316,10 @@ func (h *mp4Handler) muxPacket(pkt *gomp4.AVPacket) {
 			h.aset = true
 		}
 		_ = h.mux.Write(h.apid, pkt.Data, pkt.Pts, pkt.Dts)
+
+	case gomp4.MP4_CODEC_G711A, gomp4.MP4_CODEC_G711U,
+		gomp4.MP4_CODEC_MP2, gomp4.MP4_CODEC_MP3, gomp4.MP4_CODEC_OPUS:
+		// unsupported audio codecs — skip
 	}
 }
 
@@ -431,6 +435,11 @@ func (h *flvHandler) muxFrame(cid gocodec.CodecID, frame []byte, pts uint32, dts
 			h.aset = true
 		}
 		_ = h.mux.Write(h.apid, frame, uint64(pts), uint64(dts))
+
+	case gocodec.CODECID_VIDEO_VP8,
+		gocodec.CODECID_AUDIO_G711A, gocodec.CODECID_AUDIO_G711U,
+		gocodec.CODECID_AUDIO_OPUS, gocodec.CODECID_AUDIO_MP3:
+		// unsupported codecs — skip
 	}
 }
 
@@ -461,7 +470,7 @@ func (h *flvHandler) read(ctx context.Context) ([]byte, error) {
 			return nil, ctx.Err()
 		}
 
-		if err := h.feedChunk(); err != nil {
+		if err := h.feedChunk(); err != nil { //nolint:contextcheck // ctx passed via h.paceCtx
 			return nil, err
 		}
 	}

@@ -50,7 +50,7 @@ type RTMPReader struct {
 
 	filtered            []joyav.CodecData
 	idxMap              map[int]int // source stream index → index in filtered
-	h264KeyPrefixAnnexB [][]byte   // per filtered index: 4-byte SC + SPS + 4-byte SC + PPS
+	h264KeyPrefixAnnexB [][]byte    // per filtered index: 4-byte SC + SPS + 4-byte SC + PPS
 	aacCfg              *aacparser.MPEG4AudioConfig
 }
 
