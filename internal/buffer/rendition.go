@@ -36,6 +36,8 @@ func RenditionsForTranscoder(code domain.StreamCode, tc *domain.TranscoderConfig
 	switch tc.Mode {
 	case domain.TranscodeModePassthrough, domain.TranscodeModeRemux:
 		return nil
+	case domain.TranscodeModeFull, "":
+		// continue to build renditions below
 	}
 	if tc.Video.Copy || len(tc.Video.Profiles) == 0 {
 		slug := VideoTrackSlug(0)

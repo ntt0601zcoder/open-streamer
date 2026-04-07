@@ -206,6 +206,8 @@ func shouldRunTranscoder(stream *domain.Stream) bool {
 	switch stream.Transcoder.Mode {
 	case domain.TranscodeModePassthrough, domain.TranscodeModeRemux:
 		return false
+	case domain.TranscodeModeFull, "":
+		return true
 	}
 	return true
 }

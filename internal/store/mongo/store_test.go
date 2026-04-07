@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	mongostore "github.com/ntthuan060102github/open-streamer/internal/store/mongo"
 	"github.com/ntthuan060102github/open-streamer/internal/store"
+	mongostore "github.com/ntthuan060102github/open-streamer/internal/store/mongo"
 	"github.com/ntthuan060102github/open-streamer/internal/store/storetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,7 +19,9 @@ import (
 // requireDocker skips the test if the Docker daemon is not reachable.
 func requireDocker(t *testing.T) {
 	t.Helper()
-	if err := exec.Command("docker", "info").Run(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "docker", "info").Run(); err != nil {
 		t.Skip("Docker not available:", err)
 	}
 }

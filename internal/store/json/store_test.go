@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	jsonstore "github.com/ntthuan060102github/open-streamer/internal/store/json"
 	"github.com/ntthuan060102github/open-streamer/internal/store"
+	jsonstore "github.com/ntthuan060102github/open-streamer/internal/store/json"
 	"github.com/ntthuan060102github/open-streamer/internal/store/storetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
