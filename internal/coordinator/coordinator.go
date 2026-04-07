@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/dvr"
 	"github.com/ntthuan060102github/open-streamer/internal/events"
 	"github.com/ntthuan060102github/open-streamer/internal/manager"
+	"github.com/ntthuan060102github/open-streamer/internal/metrics"
 	"github.com/ntthuan060102github/open-streamer/internal/publisher"
 	"github.com/ntthuan060102github/open-streamer/internal/store"
 	"github.com/ntthuan060102github/open-streamer/internal/transcoder"
@@ -28,6 +30,7 @@ type Coordinator struct {
 	pub        *publisher.Service
 	dvr        *dvr.Service
 	bus        events.Bus
+	m          *metrics.Metrics
 	streamRepo store.StreamRepository
 
 	rendMu     sync.Mutex
@@ -43,6 +46,7 @@ func New(i do.Injector) (*Coordinator, error) {
 		pub:        do.MustInvoke[*publisher.Service](i),
 		dvr:        do.MustInvoke[*dvr.Service](i),
 		bus:        do.MustInvoke[events.Bus](i),
+		m:          do.MustInvoke[*metrics.Metrics](i),
 		streamRepo: do.MustInvoke[store.StreamRepository](i),
 		renditions: make(map[domain.StreamCode][]string),
 	}
@@ -146,6 +150,8 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 		}
 	}
 
+	c.m.StreamStartTimeSeconds.WithLabelValues(string(stream.Code)).Set(float64(time.Now().Unix()))
+
 	c.bus.Publish(ctx, domain.Event{
 		Type:       domain.EventStreamStarted,
 		StreamCode: stream.Code,
@@ -180,6 +186,8 @@ func (c *Coordinator) Stop(streamID domain.StreamCode) {
 
 	c.buf.Delete(buffer.RawIngestBufferID(streamID))
 	c.buf.Delete(streamID)
+
+	c.m.StreamStartTimeSeconds.DeleteLabelValues(string(streamID))
 
 	c.bus.Publish(context.Background(), domain.Event{
 		Type:       domain.EventStreamStopped,

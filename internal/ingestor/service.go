@@ -23,6 +23,7 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/events"
 	"github.com/ntthuan060102github/open-streamer/internal/ingestor/push"
+	"github.com/ntthuan060102github/open-streamer/internal/metrics"
 	"github.com/ntthuan060102github/open-streamer/pkg/protocol"
 	"github.com/samber/do/v2"
 )
@@ -43,6 +44,7 @@ type Service struct {
 	cfg          config.IngestorConfig
 	buf          *buffer.Service
 	bus          events.Bus
+	m            *metrics.Metrics
 	registry     *Registry
 	onPacket     func(streamID domain.StreamCode, inputPriority int)
 	onInputError func(streamID domain.StreamCode, inputPriority int, err error)
@@ -58,11 +60,13 @@ func New(i do.Injector) (*Service, error) {
 	cfg := do.MustInvoke[*config.Config](i)
 	buf := do.MustInvoke[*buffer.Service](i)
 	bus := do.MustInvoke[events.Bus](i)
+	m := do.MustInvoke[*metrics.Metrics](i)
 
 	return &Service{
 		cfg:      cfg.Ingestor,
 		buf:      buf,
 		bus:      bus,
+		m:        m,
 		registry: NewRegistry(),
 		workers:  make(map[domain.StreamCode]*pullWorkerEntry),
 	}, nil
@@ -215,6 +219,8 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 		"protocol", protocol.Detect(input.URL),
 	)
 
+	proto := string(protocol.Detect(input.URL))
+
 	go func() {
 		s.mu.Lock()
 		cb := pullWorkerCallbacks{
@@ -233,11 +239,17 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 					StreamCode: id,
 					Payload:    map[string]any{"input_priority": priority, "error": err.Error()},
 				})
+				s.m.IngestorErrorsTotal.WithLabelValues(string(id), "reconnect").Inc()
+			},
+			onPacketBytes: func(id domain.StreamCode, _ int, n int) {
+				s.m.IngestorBytesTotal.WithLabelValues(string(id), proto).Add(float64(n))
+				s.m.IngestorPacketsTotal.WithLabelValues(string(id), proto).Inc()
 			},
 		}
 		s.mu.Unlock()
 		runPullWorker(workerCtx, streamID, bufferWriteID, input, reader, s.buf, cb)
 		cancel()
+		s.m.IngestorErrorsTotal.WithLabelValues(string(streamID), "failover").Inc()
 		//nolint:contextcheck // worker ctx is cancelled; publish must outlive it for hooks/manager.
 		s.bus.Publish(context.Background(), domain.Event{
 			Type:       domain.EventInputFailed,

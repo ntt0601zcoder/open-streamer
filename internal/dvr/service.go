@@ -35,13 +35,14 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/events"
+	"github.com/ntthuan060102github/open-streamer/internal/metrics"
 	"github.com/ntthuan060102github/open-streamer/internal/store"
 	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
 	"github.com/samber/do/v2"
 )
 
 const (
-	defaultRootDir         = "./dvr"
+	defaultRootDir         = "./out/dvr"
 	defaultSegmentDuration = 4 * time.Second
 	// gapTimeoutFactor: gap timer = factor × segmentDuration.
 	gapTimeoutFactor = 2
@@ -60,6 +61,7 @@ type recordingSession struct {
 type Service struct {
 	buf     *buffer.Service
 	bus     events.Bus
+	m       *metrics.Metrics
 	recRepo store.RecordingRepository
 
 	mu       sync.Mutex
@@ -70,11 +72,13 @@ type Service struct {
 func New(i do.Injector) (*Service, error) {
 	buf := do.MustInvoke[*buffer.Service](i)
 	bus := do.MustInvoke[events.Bus](i)
+	m := do.MustInvoke[*metrics.Metrics](i)
 	recRepo := do.MustInvoke[store.RecordingRepository](i)
 
 	return &Service{
 		buf:      buf,
 		bus:      bus,
+		m:        m,
 		recRepo:  recRepo,
 		sessions: make(map[domain.StreamCode]*recordingSession),
 	}, nil
@@ -451,6 +455,8 @@ func (s *Service) flushSegment(
 		slog.Warn("dvr: save recording failed", "stream_code", sess.recording.StreamCode, "err", err)
 	}
 
+	s.m.DVRSegmentsWrittenTotal.WithLabelValues(string(sess.recording.StreamCode)).Inc()
+	s.m.DVRBytesWrittenTotal.WithLabelValues(string(sess.recording.StreamCode)).Add(float64(size))
 	s.bus.Publish(context.WithoutCancel(ctx), domain.Event{
 		Type:       domain.EventSegmentWritten,
 		StreamCode: sess.recording.StreamCode,

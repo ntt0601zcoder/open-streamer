@@ -83,6 +83,8 @@ func (s *Service) runProfileEncoder(
 			},
 		})
 
+		s.m.TranscoderRestartsTotal.WithLabelValues(string(logStream)).Inc()
+
 		if fatal {
 			slog.Error("transcoder: ffmpeg exceeded max restarts, giving up",
 				"stream_code", logStream,

@@ -17,6 +17,7 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/events"
+	"github.com/ntthuan060102github/open-streamer/internal/metrics"
 	"github.com/samber/do/v2"
 )
 
@@ -45,6 +46,7 @@ type Service struct {
 	cfg     config.TranscoderConfig
 	buf     *buffer.Service
 	bus     events.Bus
+	m       *metrics.Metrics
 	sem     chan struct{} // bounded semaphore to cap concurrent FFmpeg processes
 	mu      sync.Mutex
 	workers map[domain.StreamCode]*worker
@@ -65,11 +67,13 @@ func New(i do.Injector) (*Service, error) {
 	cfg := do.MustInvoke[*config.Config](i)
 	buf := do.MustInvoke[*buffer.Service](i)
 	bus := do.MustInvoke[events.Bus](i)
+	m := do.MustInvoke[*metrics.Metrics](i)
 
 	return &Service{
 		cfg:     cfg.Transcoder,
 		buf:     buf,
 		bus:     bus,
+		m:       m,
 		sem:     make(chan struct{}, cfg.Transcoder.MaxWorkers),
 		workers: make(map[domain.StreamCode]*worker),
 	}, nil
@@ -122,6 +126,8 @@ func (s *Service) runStreamJob(
 		s.mu.Lock()
 		delete(s.workers, logStreamCode)
 		s.mu.Unlock()
+		s.m.TranscoderWorkersActive.WithLabelValues(string(logStreamCode)).Set(0)
+		s.m.TranscoderQualitiesActive.WithLabelValues(string(logStreamCode)).Set(0)
 		s.bus.Publish(context.Background(), domain.Event{
 			Type:       domain.EventTranscoderStopped,
 			StreamCode: logStreamCode,
@@ -135,6 +141,8 @@ func (s *Service) runStreamJob(
 		"read_from", rawIngestID,
 	)
 
+	s.m.TranscoderWorkersActive.WithLabelValues(string(logStreamCode)).Set(float64(len(targets)))
+	s.m.TranscoderQualitiesActive.WithLabelValues(string(logStreamCode)).Set(float64(len(targets)))
 	s.bus.Publish(ctx, domain.Event{
 		Type:       domain.EventTranscoderStarted,
 		StreamCode: logStreamCode,

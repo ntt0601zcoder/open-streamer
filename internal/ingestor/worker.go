@@ -24,10 +24,11 @@ var httpStatusPattern = regexp.MustCompile(`(?i)\bhttp (\d{3})\b`)
 
 // pullWorkerCallbacks groups optional observer callbacks for runPullWorker.
 type pullWorkerCallbacks struct {
-	onPacket     func(streamID domain.StreamCode, inputPriority int)
-	onInputError func(streamID domain.StreamCode, inputPriority int, err error)
-	onConnect    func(streamID domain.StreamCode, inputPriority int)
-	onReconnect  func(streamID domain.StreamCode, inputPriority int, err error)
+	onPacket      func(streamID domain.StreamCode, inputPriority int)
+	onInputError  func(streamID domain.StreamCode, inputPriority int, err error)
+	onConnect     func(streamID domain.StreamCode, inputPriority int)
+	onReconnect   func(streamID domain.StreamCode, inputPriority int, err error)
+	onPacketBytes func(streamID domain.StreamCode, inputPriority, bytes int)
 }
 
 // runPullWorker reads from reader in a loop, writing each chunk to the buffer.
@@ -76,7 +77,7 @@ func runPullWorker(
 			cb.onConnect(streamID, input.Priority)
 		}
 
-		readErr := readLoop(ctx, streamID, bufferWriteID, input, r, buf, cb.onPacket)
+		readErr := readLoop(ctx, streamID, bufferWriteID, input, r, buf, &cb)
 		_ = r.Close()
 
 		if ctx.Err() != nil {
@@ -134,7 +135,7 @@ func readLoop(
 	input domain.Input,
 	r PacketReader,
 	buf *buffer.Service,
-	onPacket func(streamID domain.StreamCode, inputPriority int),
+	cb *pullWorkerCallbacks,
 ) error {
 	firstPacket := true
 	for {
@@ -159,8 +160,11 @@ func readLoop(
 				)
 				return writeErr
 			}
-			if onPacket != nil {
-				onPacket(streamID, input.Priority)
+			if cb != nil && cb.onPacket != nil {
+				cb.onPacket(streamID, input.Priority)
+			}
+			if cb != nil && cb.onPacketBytes != nil {
+				cb.onPacketBytes(streamID, input.Priority, len(p.Data))
 			}
 		}
 	}

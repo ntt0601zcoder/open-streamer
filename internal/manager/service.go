@@ -26,6 +26,7 @@ package manager
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/events"
 	"github.com/ntthuan060102github/open-streamer/internal/ingestor"
+	"github.com/ntthuan060102github/open-streamer/internal/metrics"
 	"github.com/samber/do/v2"
 )
 
@@ -105,6 +107,7 @@ type probeTask struct {
 type Service struct {
 	bus           events.Bus
 	ingestor      *ingestor.Service
+	m             *metrics.Metrics
 	packetTimeout time.Duration
 
 	mu      sync.RWMutex
@@ -135,6 +138,7 @@ func New(i do.Injector) (*Service, error) {
 	cfg := do.MustInvoke[*config.Config](i)
 	bus := do.MustInvoke[events.Bus](i)
 	ing := do.MustInvoke[*ingestor.Service](i)
+	m := do.MustInvoke[*metrics.Metrics](i)
 	sec := cfg.Manager.InputPacketTimeoutSec
 	if sec <= 0 {
 		sec = 30
@@ -142,6 +146,7 @@ func New(i do.Injector) (*Service, error) {
 	svc := &Service{
 		bus:           bus,
 		ingestor:      ing,
+		m:             m,
 		packetTimeout: time.Duration(sec) * time.Second,
 		streams:       make(map[domain.StreamCode]*streamState),
 	}
@@ -274,6 +279,7 @@ func (s *Service) RecordPacket(streamID domain.StreamCode, inputPriority int) {
 			if h.Status != domain.StatusActive {
 				h.Status = domain.StatusActive
 				delete(state.degradedAt, inputPriority)
+				s.m.ManagerInputHealth.WithLabelValues(string(streamID), strconv.Itoa(inputPriority)).Set(1)
 			}
 		}
 	}
@@ -310,6 +316,7 @@ func (s *Service) ReportInputError(streamID domain.StreamCode, inputPriority int
 		"input_priority", inputPriority,
 		"err", err,
 	)
+	s.m.ManagerInputHealth.WithLabelValues(string(streamID), strconv.Itoa(inputPriority)).Set(0)
 	s.bus.Publish(state.monCtx, domain.Event{
 		Type:       domain.EventInputDegraded,
 		StreamCode: streamID,
@@ -360,6 +367,7 @@ func (s *Service) checkHealth(streamID domain.StreamCode) {
 			"stream_code", streamID,
 			"input_priority", timedOutPriority,
 		)
+		s.m.ManagerInputHealth.WithLabelValues(string(streamID), strconv.Itoa(timedOutPriority)).Set(0)
 		s.bus.Publish(state.monCtx, domain.Event{
 			Type:       domain.EventInputDegraded,
 			StreamCode: streamID,
@@ -479,6 +487,7 @@ func (s *Service) tryFailover(streamID domain.StreamCode, state *streamState) {
 	}
 	state.mu.Unlock()
 
+	s.m.ManagerFailoversTotal.WithLabelValues(string(streamID)).Inc()
 	s.bus.Publish(ctx, domain.Event{
 		Type:       domain.EventInputFailover,
 		StreamCode: streamID,
