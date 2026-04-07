@@ -167,6 +167,7 @@ func startAll(ctx context.Context, i *do.RootScope) error {
 	g.Go(func() error { return ing.Run(gCtx) })
 	g.Go(func() error { return pub.RunRTSPPlayServer(gCtx) })
 	g.Go(func() error { return pub.RunRTMPPlayServer(gCtx) })
+	g.Go(func() error { return pub.RunSRTPlayServer(gCtx) })
 
 	// Best-effort: let RTMP/SRT listeners bind before registering push routes from persisted streams.
 	time.Sleep(50 * time.Millisecond)

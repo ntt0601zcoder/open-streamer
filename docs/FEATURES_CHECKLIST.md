@@ -119,7 +119,7 @@ Legend for **Completion**:
 | DASH — ABR (root MPD + per-track directories) | Complete | Audio packaged only on best track folder |
 | RTSP play (H.264 + AAC, gortsplib) | Complete | Shared gortsplib.Server; lazy stream mount after codec detection; clients use `rtsp://host:port_min/live/<code>` |
 | RTMP play (gomedia) | Complete | Shared port with ingest (:1935) via `PlayFunc` callback; optional dedicated port via `publisher.rtmp.port`; clients use `rtmp://host:port/live/<code>` |
-| SRT listen (gosrt) | Stub | Fields reserved in publisher.Service; no serve goroutine yet |
+| SRT listen (gosrt) | Complete | gosrt.Server listener; per-client buffer subscriber; raw MPEG-TS output; clients use `srt://host:port?streamid=live/<code>` |
 | RTMP push out (re-stream to platform) | Complete | `rtmp://` destinations; auto-reconnect with backoff; RTMPS/WebRTC return clear error |
 | RTS / WebRTC (WHEP) | Stub | Logs "not implemented"; use HLS/DASH for browsers |
 
