@@ -545,7 +545,7 @@ func extractSPSPPS(annexB []byte) (sps, pps []byte) {
 			pps = append([]byte(nil), nalu...)
 		}
 	}
-	return
+	return sps, pps
 }
 
 // annexBToNALUs splits an Annex-B H.264 byte stream into individual raw NAL units
