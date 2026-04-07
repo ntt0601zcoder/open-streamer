@@ -14,7 +14,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
+
+	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/ntthuan060102github/open-streamer/config"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
@@ -28,10 +31,12 @@ var ErrHookTestUnsupported = errors.New("hooks: test delivery not supported for 
 
 // Service subscribes to the event bus and dispatches events to registered hooks.
 type Service struct {
-	cfg      config.HooksConfig
-	hookRepo store.HookRepository
-	bus      events.Bus
-	client   *http.Client
+	cfg            config.HooksConfig
+	hookRepo       store.HookRepository
+	bus            events.Bus
+	client         *http.Client
+	kafkaWritersMu sync.Mutex
+	kafkaWriters   map[string]*kafka.Writer // topic → writer, lazy-initialized
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -41,9 +46,10 @@ func New(i do.Injector) (*Service, error) {
 	bus := do.MustInvoke[events.Bus](i)
 
 	svc := &Service{
-		cfg:      cfg.Hooks,
-		hookRepo: hookRepo,
-		bus:      bus,
+		cfg:          cfg.Hooks,
+		hookRepo:     hookRepo,
+		bus:          bus,
+		kafkaWriters: make(map[string]*kafka.Writer),
 		// No client-level timeout — each delivery applies its own per-hook timeout
 		// via context.WithTimeout in deliverHTTP.
 		client: &http.Client{},
@@ -57,18 +63,16 @@ func (s *Service) DeliverTestEvent(ctx context.Context, id domain.HookID) error 
 	if err != nil {
 		return err
 	}
+	ev := domain.Event{
+		ID:         fmt.Sprintf("test-%d", time.Now().UnixNano()),
+		Type:       domain.EventStreamCreated,
+		StreamCode: "_open_streamer_test_",
+		OccurredAt: time.Now(),
+		Payload:    map[string]any{"test": true, "hook_id": string(h.ID)},
+	}
 	switch h.Type {
-	case domain.HookTypeHTTP:
-		ev := domain.Event{
-			ID:         fmt.Sprintf("test-%d", time.Now().UnixNano()),
-			Type:       domain.EventStreamCreated,
-			StreamCode: "_open_streamer_test_",
-			OccurredAt: time.Now(),
-			Payload:    map[string]any{"test": true, "hook_id": string(h.ID)},
-		}
+	case domain.HookTypeHTTP, domain.HookTypeKafka:
 		return s.deliver(ctx, h, ev)
-	case domain.HookTypeKafka:
-		return fmt.Errorf("%w: %s", ErrHookTestUnsupported, h.Type)
 	default:
 		return fmt.Errorf("%w: %s", ErrHookTestUnsupported, h.Type)
 	}
@@ -80,10 +84,13 @@ func (s *Service) Start(ctx context.Context) error {
 	allEvents := []domain.EventType{
 		domain.EventStreamCreated, domain.EventStreamStarted,
 		domain.EventStreamStopped, domain.EventStreamDeleted,
+		domain.EventInputConnected, domain.EventInputReconnecting,
 		domain.EventInputDegraded, domain.EventInputFailed,
 		domain.EventInputFailover, domain.EventRecordingStarted,
 		domain.EventRecordingStopped, domain.EventRecordingFailed,
 		domain.EventSegmentWritten,
+		domain.EventTranscoderStarted, domain.EventTranscoderStopped,
+		domain.EventTranscoderError,
 	}
 
 	unsubs := make([]func(), 0, len(allEvents))
@@ -99,6 +106,13 @@ func (s *Service) Start(ctx context.Context) error {
 
 	for _, unsub := range unsubs {
 		unsub()
+	}
+
+	// Close any open Kafka writers.
+	s.kafkaWritersMu.Lock()
+	defer s.kafkaWritersMu.Unlock()
+	for _, w := range s.kafkaWriters {
+		_ = w.Close()
 	}
 	return nil
 }
@@ -178,10 +192,37 @@ func (s *Service) deliver(ctx context.Context, h *domain.Hook, event domain.Even
 	case domain.HookTypeHTTP:
 		return s.deliverHTTP(ctx, h, event)
 	case domain.HookTypeKafka:
-		return fmt.Errorf("kafka delivery: not implemented")
+		return s.deliverKafka(ctx, h, event)
 	default:
 		return fmt.Errorf("unknown hook type: %s", h.Type)
 	}
+}
+
+func (s *Service) deliverKafka(ctx context.Context, h *domain.Hook, event domain.Event) error {
+	if len(s.cfg.KafkaBrokers) == 0 {
+		return fmt.Errorf("kafka delivery: no brokers configured")
+	}
+	body, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal event: %w", err)
+	}
+
+	s.kafkaWritersMu.Lock()
+	w, ok := s.kafkaWriters[h.Target]
+	if !ok {
+		w = &kafka.Writer{
+			Addr:     kafka.TCP(s.cfg.KafkaBrokers...),
+			Topic:    h.Target,
+			Balancer: &kafka.LeastBytes{},
+		}
+		s.kafkaWriters[h.Target] = w
+	}
+	s.kafkaWritersMu.Unlock()
+
+	return w.WriteMessages(ctx, kafka.Message{
+		Key:   []byte(event.StreamCode),
+		Value: body,
+	})
 }
 
 func (s *Service) deliverHTTP(ctx context.Context, h *domain.Hook, event domain.Event) error {

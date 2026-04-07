@@ -8,17 +8,29 @@ type EventType string
 
 // EventType values are emitted on the event bus for stream lifecycle, inputs, recordings, and segments.
 const (
-	EventStreamCreated    EventType = "stream.created"
-	EventStreamStarted    EventType = "stream.started"
-	EventStreamStopped    EventType = "stream.stopped"
-	EventStreamDeleted    EventType = "stream.deleted"
-	EventInputDegraded    EventType = "input.degraded"
-	EventInputFailed      EventType = "input.failed"
-	EventInputFailover    EventType = "input.failover"
+	// Stream lifecycle — published by coordinator and API handler.
+	EventStreamCreated EventType = "stream.created"
+	EventStreamStarted EventType = "stream.started"
+	EventStreamStopped EventType = "stream.stopped"
+	EventStreamDeleted EventType = "stream.deleted"
+
+	// Input health — published by ingestor worker and stream manager.
+	EventInputConnected    EventType = "input.connected"    // source connected successfully
+	EventInputReconnecting EventType = "input.reconnecting" // transient error, retrying
+	EventInputDegraded     EventType = "input.degraded"     // error detected by manager
+	EventInputFailed       EventType = "input.failed"       // worker exited / non-retriable
+	EventInputFailover     EventType = "input.failover"     // switched to lower-priority input
+
+	// DVR recordings — published by dvr.Service.
 	EventRecordingStarted EventType = "recording.started"
 	EventRecordingStopped EventType = "recording.stopped"
 	EventRecordingFailed  EventType = "recording.failed"
 	EventSegmentWritten   EventType = "segment.written"
+
+	// Transcoder — published by transcoder.Service.
+	EventTranscoderStarted EventType = "transcoder.started"
+	EventTranscoderStopped EventType = "transcoder.stopped"
+	EventTranscoderError   EventType = "transcoder.error"
 )
 
 // Event is an immutable fact describing a domain state change.

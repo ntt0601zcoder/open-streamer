@@ -16,6 +16,7 @@ import (
 	"github.com/ntthuan060102github/open-streamer/config"
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/events"
 	"github.com/samber/do/v2"
 )
 
@@ -43,6 +44,7 @@ type worker struct {
 type Service struct {
 	cfg     config.TranscoderConfig
 	buf     *buffer.Service
+	bus     events.Bus
 	sem     chan struct{} // bounded semaphore to cap concurrent FFmpeg processes
 	mu      sync.Mutex
 	workers map[domain.StreamCode]*worker
@@ -52,10 +54,12 @@ type Service struct {
 func New(i do.Injector) (*Service, error) {
 	cfg := do.MustInvoke[*config.Config](i)
 	buf := do.MustInvoke[*buffer.Service](i)
+	bus := do.MustInvoke[events.Bus](i)
 
 	return &Service{
 		cfg:     cfg.Transcoder,
 		buf:     buf,
+		bus:     bus,
 		sem:     make(chan struct{}, cfg.Transcoder.MaxWorkers),
 		workers: make(map[domain.StreamCode]*worker),
 	}, nil
@@ -108,6 +112,11 @@ func (s *Service) runStreamJob(
 		s.mu.Lock()
 		delete(s.workers, logStreamCode)
 		s.mu.Unlock()
+		s.bus.Publish(context.Background(), domain.Event{
+			Type:       domain.EventTranscoderStopped,
+			StreamCode: logStreamCode,
+			Payload:    map[string]any{"profiles": len(targets)},
+		})
 	}()
 
 	slog.Info("transcoder: stream job started",
@@ -115,6 +124,12 @@ func (s *Service) runStreamJob(
 		"profiles", len(targets),
 		"read_from", rawIngestID,
 	)
+
+	s.bus.Publish(ctx, domain.Event{
+		Type:       domain.EventTranscoderStarted,
+		StreamCode: logStreamCode,
+		Payload:    map[string]any{"profiles": len(targets), "raw_ingest_id": string(rawIngestID)},
+	})
 
 	var wg sync.WaitGroup
 	for i, t := range targets {

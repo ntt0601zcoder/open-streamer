@@ -144,5 +144,10 @@ func (s *Service) runProfileEncoder(
 
 	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
 		slog.Error("transcoder: ffmpeg exited with error", "stream_code", logStream, "profile", track, "err", err)
+		s.bus.Publish(context.Background(), domain.Event{
+			Type:       domain.EventTranscoderError,
+			StreamCode: logStream,
+			Payload:    map[string]any{"profile": track, "error": err.Error()},
+		})
 	}
 }

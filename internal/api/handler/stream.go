@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/ntthuan060102github/open-streamer/internal/coordinator"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntthuan060102github/open-streamer/internal/events"
 	"github.com/ntthuan060102github/open-streamer/internal/manager"
 	"github.com/ntthuan060102github/open-streamer/internal/store"
 	"github.com/samber/do/v2"
@@ -20,6 +21,7 @@ type StreamHandler struct {
 	streamRepo  store.StreamRepository
 	coordinator *coordinator.Coordinator
 	manager     *manager.Service
+	bus         events.Bus
 }
 
 // NewStreamHandler creates a StreamHandler and registers it with the DI injector.
@@ -28,6 +30,7 @@ func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
 		streamRepo:  do.MustInvoke[store.StreamRepository](i),
 		coordinator: do.MustInvoke[*coordinator.Coordinator](i),
 		manager:     do.MustInvoke[*manager.Service](i),
+		bus:         do.MustInvoke[events.Bus](i),
 	}, nil
 }
 
@@ -127,6 +130,10 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !exists {
+		h.bus.Publish(r.Context(), domain.Event{
+			Type:       domain.EventStreamCreated,
+			StreamCode: body.Code,
+		})
 		writeJSON(w, http.StatusCreated, map[string]any{"data": *body})
 		return
 	}
@@ -202,6 +209,10 @@ func (h *StreamHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "DELETE_FAILED", "failed to delete stream")
 		return
 	}
+	h.bus.Publish(r.Context(), domain.Event{
+		Type:       domain.EventStreamDeleted,
+		StreamCode: code,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 

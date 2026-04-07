@@ -205,7 +205,7 @@ func TestRunPullWorker_ReadsAndWritesToBuffer(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, r, buf, nil, nil)
+		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, r, buf, pullWorkerCallbacks{})
 	}()
 
 	select {
@@ -237,7 +237,7 @@ func TestRunPullWorker_StopsOnContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, block, buf, nil, nil)
+		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, block, buf, pullWorkerCallbacks{})
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -302,7 +302,7 @@ func TestRunPullWorker_ReconnectsAfterOpenError(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, origReader, buf, nil, nil)
+		runPullWorker(ctx, streamID, streamID, domain.Input{Priority: 0}, origReader, buf, pullWorkerCallbacks{})
 	}()
 
 	select {

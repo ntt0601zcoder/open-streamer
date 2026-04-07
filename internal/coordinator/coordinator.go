@@ -12,6 +12,7 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/dvr"
+	"github.com/ntthuan060102github/open-streamer/internal/events"
 	"github.com/ntthuan060102github/open-streamer/internal/manager"
 	"github.com/ntthuan060102github/open-streamer/internal/publisher"
 	"github.com/ntthuan060102github/open-streamer/internal/store"
@@ -26,6 +27,7 @@ type Coordinator struct {
 	tc  *transcoder.Service
 	pub *publisher.Service
 	dvr *dvr.Service
+	bus events.Bus
 
 	rendMu     sync.Mutex
 	renditions map[domain.StreamCode][]string // ABR rendition slugs per stream (for buffer teardown)
@@ -39,6 +41,7 @@ func New(i do.Injector) (*Coordinator, error) {
 		tc:         do.MustInvoke[*transcoder.Service](i),
 		pub:        do.MustInvoke[*publisher.Service](i),
 		dvr:        do.MustInvoke[*dvr.Service](i),
+		bus:        do.MustInvoke[events.Bus](i),
 		renditions: make(map[domain.StreamCode][]string),
 	}, nil
 }
@@ -137,6 +140,11 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 		}
 	}
 
+	c.bus.Publish(ctx, domain.Event{
+		Type:       domain.EventStreamStarted,
+		StreamCode: stream.Code,
+	})
+
 	return nil
 }
 
@@ -166,6 +174,11 @@ func (c *Coordinator) Stop(streamID domain.StreamCode) {
 
 	c.buf.Delete(buffer.RawIngestBufferID(streamID))
 	c.buf.Delete(streamID)
+
+	c.bus.Publish(context.Background(), domain.Event{
+		Type:       domain.EventStreamStopped,
+		StreamCode: streamID,
+	})
 }
 
 // BootstrapPersistedStreams loads every stream from the store (except those marked stopped

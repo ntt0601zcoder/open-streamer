@@ -164,10 +164,10 @@ Legend for **Completion**:
 | Feature | Completion | Notes |
 |---------|------------|-------|
 | In-process event bus | Complete | Typed events; bounded queue (512); worker pool |
-| Event types | Complete | `stream.*`, `input.*`, `recording.*`, `segment.written` |
+| Event types | Complete | `stream.*`, `input.*`, `recording.*`, `segment.written`, `transcoder.*` — all wired and published |
 | HTTP webhook delivery | Complete | Retries, timeout, optional HMAC (`X-OpenStreamer-Signature`) |
-| NATS delivery | Stub | Returns "not implemented" |
-| Kafka delivery | Stub | Returns "not implemented" |
+| Kafka delivery | Complete | `segmentio/kafka-go`; lazy writer per topic; brokers via `hooks.kafka_brokers` config |
+| Event documentation | Complete | `docs/EVENTS.md` — full payload schemas, volume guide, delivery details |
 
 ---
 
@@ -241,4 +241,4 @@ Legend for **Completion**:
 
 ---
 
-*Updated against codebase state 2026-04-07 (RTMP play wired to shared port). Update this file when feature status changes.*
+*Updated against codebase state 2026-04-07 (Kafka hook delivery, full event wiring, EVENTS.md). Update this file when feature status changes.*

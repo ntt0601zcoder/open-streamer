@@ -413,6 +413,15 @@ func (s *Service) flushSegment(
 
 	if err := os.WriteFile(absPath, data, 0o644); err != nil {
 		slog.Error("dvr: write segment failed", "path", absPath, "err", err)
+		s.bus.Publish(context.Background(), domain.Event{
+			Type:       domain.EventRecordingFailed,
+			StreamCode: sess.recording.StreamCode,
+			Payload: map[string]any{
+				"recording_id": sess.recording.ID,
+				"segment":      filename,
+				"error":        err.Error(),
+			},
+		})
 		return
 	}
 
@@ -441,6 +450,19 @@ func (s *Service) flushSegment(
 	if err := s.recRepo.Save(ctx, sess.recording); err != nil {
 		slog.Warn("dvr: save recording failed", "stream_code", sess.recording.StreamCode, "err", err)
 	}
+
+	s.bus.Publish(context.Background(), domain.Event{
+		Type:       domain.EventSegmentWritten,
+		StreamCode: sess.recording.StreamCode,
+		Payload: map[string]any{
+			"recording_id":  sess.recording.ID,
+			"segment":       filename,
+			"duration_sec":  dur.Seconds(),
+			"size_bytes":    size,
+			"wall_time":     wallTime.Format(time.RFC3339),
+			"discontinuity": discontinuity,
+		},
+	})
 
 	slog.Debug("dvr: segment flushed",
 		"stream_code", sess.recording.StreamCode,

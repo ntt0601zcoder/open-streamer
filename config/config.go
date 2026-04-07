@@ -159,6 +159,11 @@ type PublisherSRTListenerConfig struct {
 type HooksConfig struct {
 	// WorkerCount is the number of concurrent hook delivery goroutines.
 	WorkerCount int `mapstructure:"worker_count"`
+
+	// KafkaBrokers is the list of Kafka broker addresses used by all Kafka-type hooks.
+	// Example: ["localhost:9092", "broker2:9092"].
+	// Empty = Kafka hooks are not available.
+	KafkaBrokers []string `mapstructure:"kafka_brokers"`
 }
 
 // MetricsConfig controls Prometheus exposition.

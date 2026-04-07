@@ -22,6 +22,14 @@ const (
 // to cover both "HTTP 404" (typical ingestor errors) and "http 404".
 var httpStatusPattern = regexp.MustCompile(`(?i)\bhttp (\d{3})\b`)
 
+// pullWorkerCallbacks groups optional observer callbacks for runPullWorker.
+type pullWorkerCallbacks struct {
+	onPacket    func(streamID domain.StreamCode, inputPriority int)
+	onInputError func(streamID domain.StreamCode, inputPriority int, err error)
+	onConnect   func(streamID domain.StreamCode, inputPriority int)
+	onReconnect func(streamID domain.StreamCode, inputPriority int, err error)
+}
+
 // runPullWorker reads from reader in a loop, writing each chunk to the buffer.
 // It reconnects automatically after transient failures using exponential backoff.
 // The loop exits cleanly when ctx is cancelled.
@@ -32,8 +40,7 @@ func runPullWorker(
 	input domain.Input,
 	r PacketReader,
 	buf *buffer.Service,
-	onPacket func(streamID domain.StreamCode, inputPriority int),
-	onInputError func(streamID domain.StreamCode, inputPriority int, err error),
+	cb pullWorkerCallbacks,
 ) {
 	delay := reconnectBaseDelay
 
@@ -65,8 +72,11 @@ func runPullWorker(
 			"url", input.URL,
 		)
 		delay = reconnectBaseDelay // reset on successful open
+		if cb.onConnect != nil {
+			cb.onConnect(streamID, input.Priority)
+		}
 
-		readErr := readLoop(ctx, streamID, bufferWriteID, input, r, buf, onPacket)
+		readErr := readLoop(ctx, streamID, bufferWriteID, input, r, buf, cb.onPacket)
 		_ = r.Close()
 
 		if ctx.Err() != nil {
@@ -81,8 +91,8 @@ func runPullWorker(
 				"stream_code", streamID,
 				"input_priority", input.Priority,
 			)
-			if onInputError != nil {
-				onInputError(streamID, input.Priority, io.EOF)
+			if cb.onInputError != nil {
+				cb.onInputError(streamID, input.Priority, io.EOF)
 			}
 			return
 		}
@@ -99,10 +109,13 @@ func runPullWorker(
 				"input_priority", input.Priority,
 				"err", readErr,
 			)
-			if onInputError != nil {
-				onInputError(streamID, input.Priority, readErr)
+			if cb.onInputError != nil {
+				cb.onInputError(streamID, input.Priority, readErr)
 			}
 			return
+		}
+		if cb.onReconnect != nil {
+			cb.onReconnect(streamID, input.Priority, readErr)
 		}
 		if !waitBackoff(ctx, delay) {
 			return
