@@ -26,6 +26,8 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/publisher"
 	"github.com/ntthuan060102github/open-streamer/internal/store"
 	jsonstore "github.com/ntthuan060102github/open-streamer/internal/store/json"
+	mongostore "github.com/ntthuan060102github/open-streamer/internal/store/mongo"
+	sqlstore "github.com/ntthuan060102github/open-streamer/internal/store/sql"
 	"github.com/ntthuan060102github/open-streamer/internal/transcoder"
 	"github.com/ntthuan060102github/open-streamer/pkg/logger"
 	"github.com/samber/do/v2"
@@ -65,14 +67,10 @@ func wire(i *do.RootScope, cfg *config.Config) error {
 	// Config
 	do.ProvideValue(i, cfg)
 
-	// Storage (JSON backend by default; swap driver in config)
-	jsonStore, err := jsonstore.New(cfg.Storage.JSONDir)
-	if err != nil {
-		return fmt.Errorf("json store: %w", err)
+	// Storage — select backend based on cfg.Storage.Driver
+	if err := wireStorage(i, cfg); err != nil {
+		return err
 	}
-	do.ProvideValue(i, jsonStore.Streams())
-	do.ProvideValue(i, jsonStore.Recordings())
-	do.ProvideValue(i, jsonStore.Hooks())
 
 	// Infrastructure
 	do.Provide(i, func(_ do.Injector) (events.Bus, error) {
@@ -97,6 +95,54 @@ func wire(i *do.RootScope, cfg *config.Config) error {
 	do.Provide(i, handler.NewHookHandler)
 	do.Provide(i, api.New)
 
+	return nil
+}
+
+// wireStorage connects to the configured storage backend and registers
+// the three repository interfaces into the DI injector.
+func wireStorage(i *do.RootScope, cfg *config.Config) error {
+	switch cfg.Storage.Driver {
+	case "sql":
+		s, err := sqlstore.New(cfg.Storage.SQLDSN)
+		if err != nil {
+			return fmt.Errorf("sql store: %w", err)
+		}
+		migrateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.Migrate(migrateCtx); err != nil {
+			return fmt.Errorf("sql store: migrate: %w", err)
+		}
+		do.ProvideValue(i, s.Streams())
+		do.ProvideValue(i, s.Recordings())
+		do.ProvideValue(i, s.Hooks())
+
+	case "mongo":
+		connCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		s, err := mongostore.New(connCtx, cfg.Storage.MongoURI, cfg.Storage.MongoDatabase)
+		if err != nil {
+			return fmt.Errorf("mongo store: %w", err)
+		}
+		idxCtx, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel2()
+		if err := s.EnsureIndexes(idxCtx); err != nil {
+			return fmt.Errorf("mongo store: ensure indexes: %w", err)
+		}
+		do.ProvideValue(i, s.Streams())
+		do.ProvideValue(i, s.Recordings())
+		do.ProvideValue(i, s.Hooks())
+
+	default: // "json" or empty
+		s, err := jsonstore.New(cfg.Storage.JSONDir)
+		if err != nil {
+			return fmt.Errorf("json store: %w", err)
+		}
+		do.ProvideValue(i, s.Streams())
+		do.ProvideValue(i, s.Recordings())
+		do.ProvideValue(i, s.Hooks())
+	}
+
+	slog.Info("server: storage backend ready", "driver", cfg.Storage.Driver)
 	return nil
 }
 

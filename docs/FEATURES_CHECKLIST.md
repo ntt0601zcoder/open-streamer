@@ -29,9 +29,9 @@ Legend for **Completion**:
 | Feature | Completion | Notes |
 |---------|------------|-------|
 | Stream repository — JSON file | Complete | Default store; configurable dir |
-| Stream repository — SQL (Postgres/MySQL) | Partial | Package exists; schema + wiring depend on deployment |
-| Stream repository — MongoDB | Partial | Package exists; wiring depends on deployment |
-| Recording repository | Complete | Backed by same driver; DVR writes recording metadata on every segment flush |
+| Stream repository — SQL (Postgres/MySQL) | Complete | pgx + sqlx; JSONB storage; auto-migrate on startup |
+| Stream repository — MongoDB | Complete | mongo-driver v2; BSON+JSON; indexes created on startup |
+| Recording repository | Complete | All 3 drivers; DVR writes recording metadata on every segment flush |
 | Hook repository | Complete | Full CRUD + test endpoint |
 | REST API — streams CRUD / start / stop / status | Complete | Chi router under `/streams` |
 | REST API — recordings (start / stop / list / get / delete / info) | Complete | Full lifecycle + `info` endpoint (dvr_range, gaps, size) |
