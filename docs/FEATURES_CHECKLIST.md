@@ -39,7 +39,7 @@ Legend for **Completion**:
 | REST API — recordings timeshift.m3u8 | Complete | Dynamic VOD M3U8; `from`, `offset_sec`, `duration` query params |
 | REST API — recordings segment serve | Complete | `GET /recordings/{rid}/{file}` — path traversal protected |
 | REST API — hooks CRUD + test (HTTP) | Complete | HTTP hook test fires real outbound request |
-| REST API — hooks test (NATS/Kafka) | Stub | Returns "not implemented" |
+| REST API — hooks test (Kafka) | Stub | Returns "not implemented" |
 | OpenAPI / Swagger | Complete | Generated via `swag`; served at `/swagger/` |
 | HTTP static delivery — HLS master + segments | Complete | `/{code}/index.m3u8`, `/{code}/*` |
 | HTTP static delivery — DASH MPD + segments | Complete | `/{code}/index.mpd`, `/{code}/*` |

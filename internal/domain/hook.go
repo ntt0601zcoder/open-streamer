@@ -9,7 +9,6 @@ type HookType string
 // HookType values name supported hook transports.
 const (
 	HookTypeHTTP  HookType = "http"
-	HookTypeNATS  HookType = "nats"
 	HookTypeKafka HookType = "kafka"
 )
 
@@ -18,7 +17,7 @@ type Hook struct {
 	ID     HookID   `json:"id"`
 	Name   string   `json:"name"`
 	Type   HookType `json:"type"`
-	Target string   `json:"target"` // HTTP URL, NATS subject, or Kafka topic
+	Target string   `json:"target"` // HTTP URL or Kafka topic
 	Secret string   `json:"secret"` // HMAC-SHA256 signing secret (HTTP only)
 
 	// EventTypes filters which events trigger delivery. nil = all events.

@@ -1,6 +1,6 @@
 // Package hooks implements the Hook dispatcher.
 // It subscribes to the Event Bus and delivers events to registered external hooks
-// via HTTP webhook, NATS, or Kafka — asynchronously and with retry logic.
+// via HTTP webhook or Kafka — asynchronously and with retry logic.
 package hooks
 
 import (
@@ -67,7 +67,7 @@ func (s *Service) DeliverTestEvent(ctx context.Context, id domain.HookID) error 
 			Payload:    map[string]any{"test": true, "hook_id": string(h.ID)},
 		}
 		return s.deliver(ctx, h, ev)
-	case domain.HookTypeNATS, domain.HookTypeKafka:
+	case domain.HookTypeKafka:
 		return fmt.Errorf("%w: %s", ErrHookTestUnsupported, h.Type)
 	default:
 		return fmt.Errorf("%w: %s", ErrHookTestUnsupported, h.Type)
@@ -177,8 +177,6 @@ func (s *Service) deliver(ctx context.Context, h *domain.Hook, event domain.Even
 	switch h.Type {
 	case domain.HookTypeHTTP:
 		return s.deliverHTTP(ctx, h, event)
-	case domain.HookTypeNATS:
-		return fmt.Errorf("nats delivery: not implemented")
 	case domain.HookTypeKafka:
 		return fmt.Errorf("kafka delivery: not implemented")
 	default:
