@@ -3,6 +3,8 @@ package json_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
@@ -285,4 +287,84 @@ func TestJSONHookRepo_Delete(t *testing.T) {
 	_, err := repo.FindByID(ctx, "del_hook")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, store.ErrNotFound))
+}
+
+// --- Concurrent access ---
+
+func TestJSONStreamRepo_ConcurrentSaveAndFind(t *testing.T) {
+	ctx := context.Background()
+	repo := newStore(t).Streams()
+
+	const workers = 10
+	var wg sync.WaitGroup
+
+	for i := range workers {
+		code := domain.StreamCode(fmt.Sprintf("concurrent_%d", i))
+		s := storetest.NewFullStream(code)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			require.NoError(t, repo.Save(ctx, s))
+			got, err := repo.FindByCode(ctx, code)
+			require.NoError(t, err)
+			assert.Equal(t, code, got.Code)
+		}()
+	}
+	wg.Wait()
+
+	all, err := repo.List(ctx, store.StreamFilter{})
+	require.NoError(t, err)
+	assert.Len(t, all, workers)
+}
+
+func TestJSONRecordingRepo_ConcurrentSaveAndFind(t *testing.T) {
+	ctx := context.Background()
+	repo := newStore(t).Recordings()
+
+	const workers = 10
+	var wg sync.WaitGroup
+
+	for i := range workers {
+		id := domain.RecordingID(fmt.Sprintf("rec_%d", i))
+		r := storetest.NewFullRecording(id, "stream1")
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			require.NoError(t, repo.Save(ctx, r))
+			got, err := repo.FindByID(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, id, got.ID)
+		}()
+	}
+	wg.Wait()
+
+	all, err := repo.ListByStream(ctx, "stream1")
+	require.NoError(t, err)
+	assert.Len(t, all, workers)
+}
+
+func TestJSONHookRepo_ConcurrentSaveAndFind(t *testing.T) {
+	ctx := context.Background()
+	repo := newStore(t).Hooks()
+
+	const workers = 10
+	var wg sync.WaitGroup
+
+	for i := range workers {
+		id := domain.HookID(fmt.Sprintf("hook_%d", i))
+		h := storetest.NewFullHook(id)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			require.NoError(t, repo.Save(ctx, h))
+			got, err := repo.FindByID(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, id, got.ID)
+		}()
+	}
+	wg.Wait()
+
+	all, err := repo.List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, all, workers)
 }

@@ -41,10 +41,8 @@ func (s *Store) Hooks() store.HookRepository { return &hookRepo{s} }
 
 // --- helpers ---
 
-func (s *Store) readAll(name string, dst any) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+// readFile reads and unmarshals a JSON file. Caller must hold at least s.mu.RLock.
+func (s *Store) readFile(name string, dst any) error {
 	data, err := os.ReadFile(filepath.Join(s.dir, name))
 	if os.IsNotExist(err) {
 		return nil
@@ -55,10 +53,8 @@ func (s *Store) readAll(name string, dst any) error {
 	return json.Unmarshal(data, dst)
 }
 
-func (s *Store) writeAll(name string, src any) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+// writeFile marshals and atomically writes a JSON file. Caller must hold s.mu.Lock.
+func (s *Store) writeFile(name string, src any) error {
 	data, err := json.MarshalIndent(src, "", "  ")
 	if err != nil {
 		return fmt.Errorf("json store: marshal %s: %w", name, err)
@@ -75,27 +71,46 @@ func (s *Store) writeAll(name string, src any) error {
 	return nil
 }
 
+// readAll reads a JSON file under a read lock.
+func (s *Store) readAll(name string, dst any) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.readFile(name, dst)
+}
+
+// modify performs an atomic read-modify-write under a single write lock.
+func (s *Store) modify(name string, dst any, fn func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.readFile(name, dst); err != nil {
+		return err
+	}
+	if err := fn(); err != nil {
+		return err
+	}
+	return s.writeFile(name, dst)
+}
+
 // --- StreamRepository ---
 
 type streamRepo struct{ s *Store }
 
 // Save implements store.StreamRepository.
 func (r *streamRepo) Save(_ context.Context, stream *domain.Stream) error {
-	streams, err := r.load()
-	if err != nil {
-		return err
-	}
-	streams[string(stream.Code)] = stream
-	return r.s.writeAll("streams.json", streams)
+	m := make(map[string]*domain.Stream)
+	return r.s.modify("streams.json", &m, func() error {
+		m[string(stream.Code)] = stream
+		return nil
+	})
 }
 
 // FindByCode implements store.StreamRepository.
 func (r *streamRepo) FindByCode(_ context.Context, code domain.StreamCode) (*domain.Stream, error) {
-	streams, err := r.load()
-	if err != nil {
+	m := make(map[string]*domain.Stream)
+	if err := r.s.readAll("streams.json", &m); err != nil {
 		return nil, err
 	}
-	s, ok := streams[string(code)]
+	s, ok := m[string(code)]
 	if !ok {
 		return nil, fmt.Errorf("stream %s: %w", code, store.ErrNotFound)
 	}
@@ -104,12 +119,12 @@ func (r *streamRepo) FindByCode(_ context.Context, code domain.StreamCode) (*dom
 
 // List implements store.StreamRepository.
 func (r *streamRepo) List(_ context.Context, filter store.StreamFilter) ([]*domain.Stream, error) {
-	streams, err := r.load()
-	if err != nil {
+	m := make(map[string]*domain.Stream)
+	if err := r.s.readAll("streams.json", &m); err != nil {
 		return nil, err
 	}
-	result := make([]*domain.Stream, 0, len(streams))
-	for _, s := range streams {
+	result := make([]*domain.Stream, 0, len(m))
+	for _, s := range m {
 		if filter.Status != nil && s.Status != *filter.Status {
 			continue
 		}
@@ -120,17 +135,11 @@ func (r *streamRepo) List(_ context.Context, filter store.StreamFilter) ([]*doma
 
 // Delete implements store.StreamRepository.
 func (r *streamRepo) Delete(_ context.Context, code domain.StreamCode) error {
-	streams, err := r.load()
-	if err != nil {
-		return err
-	}
-	delete(streams, string(code))
-	return r.s.writeAll("streams.json", streams)
-}
-
-func (r *streamRepo) load() (map[string]*domain.Stream, error) {
 	m := make(map[string]*domain.Stream)
-	return m, r.s.readAll("streams.json", &m)
+	return r.s.modify("streams.json", &m, func() error {
+		delete(m, string(code))
+		return nil
+	})
 }
 
 // --- RecordingRepository ---
@@ -139,21 +148,20 @@ type recordingRepo struct{ s *Store }
 
 // Save implements store.RecordingRepository.
 func (r *recordingRepo) Save(_ context.Context, rec *domain.Recording) error {
-	recs, err := r.load()
-	if err != nil {
-		return err
-	}
-	recs[string(rec.ID)] = rec
-	return r.s.writeAll("recordings.json", recs)
+	m := make(map[string]*domain.Recording)
+	return r.s.modify("recordings.json", &m, func() error {
+		m[string(rec.ID)] = rec
+		return nil
+	})
 }
 
 // FindByID implements store.RecordingRepository.
 func (r *recordingRepo) FindByID(_ context.Context, id domain.RecordingID) (*domain.Recording, error) {
-	recs, err := r.load()
-	if err != nil {
+	m := make(map[string]*domain.Recording)
+	if err := r.s.readAll("recordings.json", &m); err != nil {
 		return nil, err
 	}
-	rec, ok := recs[string(id)]
+	rec, ok := m[string(id)]
 	if !ok {
 		return nil, fmt.Errorf("recording %s: %w", id, store.ErrNotFound)
 	}
@@ -162,12 +170,12 @@ func (r *recordingRepo) FindByID(_ context.Context, id domain.RecordingID) (*dom
 
 // ListByStream implements store.RecordingRepository.
 func (r *recordingRepo) ListByStream(_ context.Context, streamCode domain.StreamCode) ([]*domain.Recording, error) {
-	recs, err := r.load()
-	if err != nil {
+	m := make(map[string]*domain.Recording)
+	if err := r.s.readAll("recordings.json", &m); err != nil {
 		return nil, err
 	}
 	result := make([]*domain.Recording, 0)
-	for _, rec := range recs {
+	for _, rec := range m {
 		if rec.StreamCode == streamCode {
 			result = append(result, rec)
 		}
@@ -177,17 +185,11 @@ func (r *recordingRepo) ListByStream(_ context.Context, streamCode domain.Stream
 
 // Delete implements store.RecordingRepository.
 func (r *recordingRepo) Delete(_ context.Context, id domain.RecordingID) error {
-	recs, err := r.load()
-	if err != nil {
-		return err
-	}
-	delete(recs, string(id))
-	return r.s.writeAll("recordings.json", recs)
-}
-
-func (r *recordingRepo) load() (map[string]*domain.Recording, error) {
 	m := make(map[string]*domain.Recording)
-	return m, r.s.readAll("recordings.json", &m)
+	return r.s.modify("recordings.json", &m, func() error {
+		delete(m, string(id))
+		return nil
+	})
 }
 
 // --- HookRepository ---
@@ -196,21 +198,20 @@ type hookRepo struct{ s *Store }
 
 // Save implements store.HookRepository.
 func (r *hookRepo) Save(_ context.Context, hook *domain.Hook) error {
-	hooks, err := r.load()
-	if err != nil {
-		return err
-	}
-	hooks[string(hook.ID)] = hook
-	return r.s.writeAll("hooks.json", hooks)
+	m := make(map[string]*domain.Hook)
+	return r.s.modify("hooks.json", &m, func() error {
+		m[string(hook.ID)] = hook
+		return nil
+	})
 }
 
 // FindByID implements store.HookRepository.
 func (r *hookRepo) FindByID(_ context.Context, id domain.HookID) (*domain.Hook, error) {
-	hooks, err := r.load()
-	if err != nil {
+	m := make(map[string]*domain.Hook)
+	if err := r.s.readAll("hooks.json", &m); err != nil {
 		return nil, err
 	}
-	h, ok := hooks[string(id)]
+	h, ok := m[string(id)]
 	if !ok {
 		return nil, fmt.Errorf("hook %s: %w", id, store.ErrNotFound)
 	}
@@ -219,12 +220,12 @@ func (r *hookRepo) FindByID(_ context.Context, id domain.HookID) (*domain.Hook, 
 
 // List implements store.HookRepository.
 func (r *hookRepo) List(_ context.Context) ([]*domain.Hook, error) {
-	hooks, err := r.load()
-	if err != nil {
+	m := make(map[string]*domain.Hook)
+	if err := r.s.readAll("hooks.json", &m); err != nil {
 		return nil, err
 	}
-	result := make([]*domain.Hook, 0, len(hooks))
-	for _, h := range hooks {
+	result := make([]*domain.Hook, 0, len(m))
+	for _, h := range m {
 		result = append(result, h)
 	}
 	return result, nil
@@ -232,15 +233,9 @@ func (r *hookRepo) List(_ context.Context) ([]*domain.Hook, error) {
 
 // Delete implements store.HookRepository.
 func (r *hookRepo) Delete(_ context.Context, id domain.HookID) error {
-	hooks, err := r.load()
-	if err != nil {
-		return err
-	}
-	delete(hooks, string(id))
-	return r.s.writeAll("hooks.json", hooks)
-}
-
-func (r *hookRepo) load() (map[string]*domain.Hook, error) {
 	m := make(map[string]*domain.Hook)
-	return m, r.s.readAll("hooks.json", &m)
+	return r.s.modify("hooks.json", &m, func() error {
+		delete(m, string(id))
+		return nil
+	})
 }

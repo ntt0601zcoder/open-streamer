@@ -2,6 +2,7 @@ package ingestor_test
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,6 +11,7 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/ingestor"
+	"github.com/ntthuan060102github/open-streamer/internal/ingestor/push"
 )
 
 func TestRegistry_RegisterAndLookup(t *testing.T) {
@@ -107,6 +109,133 @@ func TestRegistry_MultipleKeys(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, domain.StreamCode(k), writeID)
 		assert.Equal(t, domain.StreamCode(k), streamID)
+	}
+}
+
+// ---- Acquire / Release -------------------------------------------------------
+
+func TestRegistry_Acquire_Success(t *testing.T) {
+	t.Parallel()
+
+	buf := buffer.NewServiceForTesting(64)
+	reg := ingestor.NewRegistry()
+	reg.Register("key", "stream-1", buf, "raw-slot")
+
+	writeID, streamID, gotBuf, err := reg.Acquire("key")
+	require.NoError(t, err)
+	assert.Equal(t, domain.StreamCode("raw-slot"), writeID)
+	assert.Equal(t, domain.StreamCode("stream-1"), streamID)
+	assert.Same(t, buf, gotBuf)
+}
+
+func TestRegistry_Acquire_NotFound(t *testing.T) {
+	t.Parallel()
+
+	reg := ingestor.NewRegistry()
+	_, _, _, err := reg.Acquire("no-such-key")
+	require.Error(t, err)
+}
+
+func TestRegistry_Acquire_AlreadyActive(t *testing.T) {
+	t.Parallel()
+
+	buf := buffer.NewServiceForTesting(64)
+	reg := ingestor.NewRegistry()
+	reg.Register("key", "stream-1", buf, "")
+
+	_, _, _, err := reg.Acquire("key")
+	require.NoError(t, err)
+
+	// Second Acquire must fail with ErrStreamAlreadyActive.
+	_, _, _, err2 := reg.Acquire("key")
+	require.ErrorIs(t, err2, push.ErrStreamAlreadyActive)
+}
+
+func TestRegistry_Release_AllowsReacquire(t *testing.T) {
+	t.Parallel()
+
+	buf := buffer.NewServiceForTesting(64)
+	reg := ingestor.NewRegistry()
+	reg.Register("key", "stream-1", buf, "")
+
+	_, _, _, err := reg.Acquire("key")
+	require.NoError(t, err)
+
+	reg.Release("key")
+
+	// After Release, Acquire must succeed again.
+	_, _, _, err2 := reg.Acquire("key")
+	require.NoError(t, err2)
+}
+
+func TestRegistry_Release_NonExistent(t *testing.T) {
+	t.Parallel()
+
+	reg := ingestor.NewRegistry()
+	// Must not panic on a missing key.
+	assert.NotPanics(t, func() { reg.Release("ghost") })
+}
+
+func TestRegistry_Release_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	buf := buffer.NewServiceForTesting(64)
+	reg := ingestor.NewRegistry()
+	reg.Register("key", "s", buf, "")
+
+	_, _, _, err := reg.Acquire("key")
+	require.NoError(t, err)
+
+	reg.Release("key")
+	reg.Release("key") // second Release must be a no-op, not panic
+
+	// Still acquirable.
+	_, _, _, err2 := reg.Acquire("key")
+	require.NoError(t, err2)
+}
+
+func TestRegistry_Acquire_DefaultWriteID(t *testing.T) {
+	t.Parallel()
+
+	buf := buffer.NewServiceForTesting(64)
+	reg := ingestor.NewRegistry()
+	reg.Register("key", "stream-x", buf, "") // empty bufferWriteID → defaults to streamID
+
+	writeID, streamID, _, err := reg.Acquire("key")
+	require.NoError(t, err)
+	assert.Equal(t, domain.StreamCode("stream-x"), writeID)
+	assert.Equal(t, domain.StreamCode("stream-x"), streamID)
+}
+
+func TestRegistry_ConcurrentAcquireRelease(t *testing.T) {
+	t.Parallel()
+
+	buf := buffer.NewServiceForTesting(64)
+	reg := ingestor.NewRegistry()
+	reg.Register("slot", "stream-1", buf, "")
+
+	const workers = 20
+	// Each worker races to Acquire; exactly one per cycle must succeed.
+	// After the winner releases, the next cycle begins.
+	for range 5 {
+		var (
+			wg      sync.WaitGroup
+			winners int64
+		)
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _, _, err := reg.Acquire("slot")
+				if err == nil {
+					atomic.AddInt64(&winners, 1)
+					reg.Release("slot")
+				}
+			}()
+		}
+		wg.Wait()
+		// At least one goroutine must have acquired the slot per cycle.
+		assert.GreaterOrEqual(t, atomic.LoadInt64(&winners), int64(1))
 	}
 }
 
