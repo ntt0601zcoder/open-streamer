@@ -21,8 +21,4 @@ type OutputProtocols struct {
 
 	// SRT opens an SRT listener port for contribution-quality pull.
 	SRT bool `json:"srt"`
-
-	// RTS enables WebRTC-based real-time streaming (WHEP endpoint).
-	// Sub-second glass-to-glass latency.
-	RTS bool `json:"rts"`
 }

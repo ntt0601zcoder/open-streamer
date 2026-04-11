@@ -96,7 +96,6 @@ func NewFullStream(code domain.StreamCode) *domain.Stream {
 			RTSP: false,
 			RTMP: true,
 			SRT:  false,
-			RTS:  false,
 		},
 		Push: []domain.PushDestination{
 			{

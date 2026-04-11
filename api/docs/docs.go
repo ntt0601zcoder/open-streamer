@@ -1365,10 +1365,6 @@ const docTemplate = `{
                     "description": "RTMP opens an RTMP publish endpoint for legacy players/CDNs.",
                     "type": "boolean"
                 },
-                "rts": {
-                    "description": "RTS enables WebRTC-based real-time streaming (WHEP endpoint).\nSub-second glass-to-glass latency.",
-                    "type": "boolean"
-                },
                 "rtsp": {
                     "description": "RTSP opens an RTSP listener for pull clients (VLC, broadcast tools).",
                     "type": "boolean"
