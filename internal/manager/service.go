@@ -60,7 +60,7 @@ type InputHealth struct {
 type streamState struct {
 	mu sync.Mutex
 
-	inputs        map[int]*InputHealth // keyed by Input.Priority; populated at Register, never mutated
+	inputs        map[int]*InputHealth // keyed by Input.Priority
 	active        int                  // active Input.Priority
 	bufferWriteID domain.StreamCode
 	degradedAt    map[int]time.Time // when each input was last marked degraded
@@ -541,6 +541,116 @@ func (s *Service) runProbe(streamID domain.StreamCode, state *streamState, task 
 	// currently running on, and the switch cooldown has elapsed — switch back.
 	if task.priority < currentActive && sinceSwitch >= failbackSwitchCooldown {
 		s.tryFailover(streamID, state)
+	}
+}
+
+// UpdateInputs patches the live input routing table while the monitor is running.
+//   - removed: deleted from state.inputs; if the active input is removed, failover is triggered.
+//   - added: inserted as StatusIdle; if a higher-priority input is added, failover is triggered.
+//   - updated: Input field replaced; if the active input is updated, the ingestor is restarted.
+func (s *Service) UpdateInputs(
+	streamID domain.StreamCode,
+	added, removed, updated []domain.Input,
+) {
+	s.mu.RLock()
+	state, ok := s.streams[streamID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	var needFailover bool
+	var restartInput *domain.Input
+
+	state.mu.Lock()
+	if state.dead {
+		state.mu.Unlock()
+		return
+	}
+
+	for _, inp := range removed {
+		delete(state.inputs, inp.Priority)
+		delete(state.degradedAt, inp.Priority)
+		delete(state.probing, inp.Priority)
+		if inp.Priority == state.active {
+			needFailover = true
+		}
+		slog.Info("manager: input removed", "stream_code", streamID, "priority", inp.Priority)
+	}
+
+	for _, inp := range added {
+		state.inputs[inp.Priority] = &InputHealth{
+			Input:  inp,
+			Status: domain.StatusIdle,
+		}
+		if inp.Priority < state.active {
+			needFailover = true
+		}
+		slog.Info("manager: input added", "stream_code", streamID, "priority", inp.Priority)
+	}
+
+	for _, inp := range updated {
+		if h, ok := state.inputs[inp.Priority]; ok {
+			h.Input = inp
+			if inp.Priority == state.active {
+				ri := inp
+				restartInput = &ri
+			}
+			slog.Info("manager: input updated", "stream_code", streamID, "priority", inp.Priority)
+		}
+	}
+	bufID := state.bufferWriteID
+	ctx := state.monCtx
+	state.mu.Unlock()
+
+	if needFailover {
+		s.tryFailover(streamID, state)
+	} else if restartInput != nil {
+		if err := s.ingestor.Start(ctx, streamID, *restartInput, bufID); err != nil {
+			slog.Error("manager: restart active input failed",
+				"stream_code", streamID,
+				"input_priority", restartInput.Priority,
+				"err", err,
+			)
+		}
+	}
+}
+
+// UpdateBufferWriteID changes the buffer slot where the ingestor writes packets.
+// Used when adding/removing the transcoder (buffer topology change).
+// The active ingestor is restarted to write to the new buffer.
+func (s *Service) UpdateBufferWriteID(streamID domain.StreamCode, newBufID domain.StreamCode) {
+	s.mu.RLock()
+	state, ok := s.streams[streamID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	state.mu.Lock()
+	if state.dead {
+		state.mu.Unlock()
+		return
+	}
+	state.bufferWriteID = newBufID
+	activeH := state.inputs[state.active]
+	ctx := state.monCtx
+	state.mu.Unlock()
+
+	if activeH == nil {
+		return
+	}
+
+	slog.Info("manager: buffer write ID updated",
+		"stream_code", streamID,
+		"new_buffer_id", newBufID,
+	)
+
+	if err := s.ingestor.Start(ctx, streamID, activeH.Input, newBufID); err != nil {
+		slog.Error("manager: restart ingestor for new buffer failed",
+			"stream_code", streamID,
+			"err", err,
+		)
 	}
 }
 
