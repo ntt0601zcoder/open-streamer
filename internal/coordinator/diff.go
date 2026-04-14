@@ -102,7 +102,7 @@ func diffInputs(old, new *domain.Stream, d *StreamDiff) {
 
 // diffTranscoder compares transcoder configs with two granularity levels:
 // 1. Topology change (buffer layout changes) → full restart needed
-// 2. Per-profile diff (only specific FFmpeg processes need restart)
+// 2. Per-profile diff (only specific FFmpeg processes need restart).
 func diffTranscoder(old, new *domain.Stream, d *StreamDiff) {
 	if reflect.DeepEqual(old.Transcoder, new.Transcoder) {
 		return

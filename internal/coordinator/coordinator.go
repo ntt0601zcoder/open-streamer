@@ -206,6 +206,7 @@ func (c *Coordinator) Update(ctx context.Context, old, new *domain.Stream) error
 	diff := ComputeDiff(old, new)
 
 	if diff.NowDisabled {
+		//nolint:contextcheck // Stop uses background context for cleanup publishing; by design
 		c.Stop(new.Code)
 		return nil
 	}
@@ -218,7 +219,8 @@ func (c *Coordinator) Update(ctx context.Context, old, new *domain.Stream) error
 
 	// Per-profile transcoder changes: stop/start only affected FFmpeg processes.
 	if diff.TranscoderChanged && diff.ProfilesDiff != nil {
-		if err := c.reloadProfiles(ctx, new, diff.ProfilesDiff); err != nil {
+		//nolint:contextcheck // StartProfile derives from streamWorker.baseCtx; by design
+		if err := c.reloadProfiles(new, diff.ProfilesDiff); err != nil {
 			return fmt.Errorf("coordinator: reload profiles: %w", err)
 		}
 	}
@@ -260,6 +262,7 @@ func (c *Coordinator) reloadTranscoderFull(ctx context.Context, old, new *domain
 		}
 	}
 	c.pub.Stop(new.Code)
+	//nolint:contextcheck // tc.Stop uses its own baseCtx from Start; by design
 	c.tc.Stop(new.Code)
 
 	// Tear down old rendition buffers.
@@ -326,7 +329,7 @@ func (c *Coordinator) reloadTranscoderFull(ctx context.Context, old, new *domain
 // Updated profiles: stop+start the corresponding FFmpeg process.
 // Added profiles: create rendition buffer + start FFmpeg process.
 // Removed profiles: stop FFmpeg process + delete rendition buffer.
-func (c *Coordinator) reloadProfiles(ctx context.Context, new *domain.Stream, pd *ProfilesDiff) error {
+func (c *Coordinator) reloadProfiles(new *domain.Stream, pd *ProfilesDiff) error {
 	newProfiles := transcoderProfilesFromDomain(&new.Transcoder.Video)
 
 	// Removed: stop encoders and delete their buffers.

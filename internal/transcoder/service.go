@@ -134,6 +134,7 @@ func (s *Service) Start(
 	})
 
 	for i, t := range targets {
+		//nolint:contextcheck // spawnProfile derives its context from sw.baseCtx; by design
 		s.spawnProfile(logStreamCode, sw, i, t)
 	}
 	return nil
