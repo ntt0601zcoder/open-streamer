@@ -26,7 +26,7 @@ import (
 	gocodec "github.com/yapingcat/gomedia/go-codec"
 	gortmp "github.com/yapingcat/gomedia/go-rtmp"
 
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // ConnectFunc is invoked when an encoder starts publishing a registered stream.

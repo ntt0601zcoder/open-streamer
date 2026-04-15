@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/ntthuan060102github/open-streamer/config"
+	"github.com/ntt0601zcoder/open-streamer/config"
 )
 
 // New creates a slog.Logger from the given LogConfig.

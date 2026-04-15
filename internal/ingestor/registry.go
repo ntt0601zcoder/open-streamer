@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/ntthuan060102github/open-streamer/internal/buffer"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/ingestor/push"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/push"
 )
 
 // Registry maps ingest credentials (stream code used as key) to the

@@ -25,8 +25,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ntthuan060102github/open-streamer/internal/buffer"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // hlsABRRep holds metadata about one ladder rung, shared with the master playlist writer.

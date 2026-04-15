@@ -18,13 +18,13 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/ntthuan060102github/open-streamer/config"
-	"github.com/ntthuan060102github/open-streamer/internal/buffer"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/events"
-	"github.com/ntthuan060102github/open-streamer/internal/ingestor/push"
-	"github.com/ntthuan060102github/open-streamer/internal/metrics"
-	"github.com/ntthuan060102github/open-streamer/pkg/protocol"
+	"github.com/ntt0601zcoder/open-streamer/config"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/push"
+	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
+	"github.com/ntt0601zcoder/open-streamer/pkg/protocol"
 	"github.com/samber/do/v2"
 )
 

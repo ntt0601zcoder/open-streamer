@@ -19,8 +19,8 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // register "pgx" driver for database/sql
 )

@@ -39,9 +39,9 @@ import (
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
-	"github.com/ntthuan060102github/open-streamer/internal/buffer"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
 // maxRTSPPendingFrames is the maximum number of video frames buffered while

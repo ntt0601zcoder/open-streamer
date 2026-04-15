@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"path/filepath"
 
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // serveDASH starts a single-rendition MPEG-DASH publisher for streamID.

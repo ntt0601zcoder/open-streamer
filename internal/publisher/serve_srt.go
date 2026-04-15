@@ -27,8 +27,8 @@ import (
 
 	srt "github.com/datarhei/gosrt"
 
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
 // RunSRTPlayServer starts the SRT play listener.

@@ -35,9 +35,9 @@ import (
 	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 	gortmp "github.com/yapingcat/gomedia/go-rtmp"
 
-	"github.com/ntthuan060102github/open-streamer/internal/buffer"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
 // HandleRTMPPlay is the play handler registered with the ingestor's RTMP server.

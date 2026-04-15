@@ -1,7 +1,7 @@
 // Package apidocs holds OpenAPI response/request shapes referenced from swag comments.
 package apidocs
 
-import "github.com/ntthuan060102github/open-streamer/internal/domain"
+import "github.com/ntt0601zcoder/open-streamer/internal/domain"
 
 // ErrorBody matches handler writeError JSON shape.
 type ErrorBody struct {

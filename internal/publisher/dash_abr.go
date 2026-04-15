@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ntthuan060102github/open-streamer/internal/buffer"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // serveDASHAdaptive starts one fMP4 packager goroutine per ABR rendition and a

@@ -37,7 +37,7 @@ import (
 	gomp4 "github.com/yapingcat/gomedia/go-mp4"
 	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 const (

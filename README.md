@@ -1,9 +1,9 @@
 # Open Streamer
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/ntthuan060102github/open-streamer.svg)](https://pkg.go.dev/github.com/ntthuan060102github/open-streamer)
-[![CI](https://github.com/ntthuan060102github/open-streamer/actions/workflows/ci.yml/badge.svg)](https://github.com/ntthuan060102github/open-streamer/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ntthuan060102github/open-streamer)](https://goreportcard.com/report/github.com/ntthuan060102github/open-streamer)
-[![Coverage](https://codecov.io/gh/ntthuan060102github/open-streamer/branch/main/graph/badge.svg)](https://codecov.io/gh/ntthuan060102github/open-streamer)
+[![Go Reference](https://pkg.go.dev/badge/github.com/ntt0601zcoder/open-streamer.svg)](https://pkg.go.dev/github.com/ntt0601zcoder/open-streamer)
+[![CI](https://github.com/ntt0601zcoder/open-streamer/actions/workflows/ci.yml/badge.svg)](https://github.com/ntt0601zcoder/open-streamer/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ntt0601zcoder/open-streamer)](https://goreportcard.com/report/github.com/ntt0601zcoder/open-streamer)
+[![Coverage](https://codecov.io/gh/ntt0601zcoder/open-streamer/branch/main/graph/badge.svg)](https://codecov.io/gh/ntt0601zcoder/open-streamer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A high-availability live media server written in pure Go. Open Streamer ingests streams from virtually any source, normalises them to an internal MPEG-TS pipeline, transcodes on demand, and publishes to consumers over HLS, DASH, RTMP, RTSP, and SRT — all without spawning a process per stream.
@@ -172,7 +172,7 @@ Once running, the Swagger UI is available at `http://localhost:8080/swagger/`.
 
 ```bash
 # Requires Go 1.25.9+ and FFmpeg on PATH (only needed for transcoding)
-git clone https://github.com/ntthuan060102github/open-streamer
+git clone https://github.com/ntt0601zcoder/open-streamer
 cd open-streamer
 make build       # → bin/open-streamer
 make run         # run without building binary
@@ -681,7 +681,7 @@ Contributions are welcome. Please follow these steps:
 
 ### Reporting issues
 
-Please open a [GitHub issue](https://github.com/ntthuan060102github/open-streamer/issues) and include:
+Please open a [GitHub issue](https://github.com/ntt0601zcoder/open-streamer/issues) and include:
 
 - Go version (`go version`)
 - Open Streamer version or commit hash
@@ -691,4 +691,4 @@ Please open a [GitHub issue](https://github.com/ntthuan060102github/open-streame
 
 ## License
 
-[MIT](LICENSE) © ntthuan060102github
+[MIT](LICENSE) © ntt0601zcoder

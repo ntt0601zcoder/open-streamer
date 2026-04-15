@@ -14,12 +14,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ntthuan060102github/open-streamer/internal/buffer"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/events"
-	"github.com/ntthuan060102github/open-streamer/internal/manager"
-	"github.com/ntthuan060102github/open-streamer/internal/publisher"
-	"github.com/ntthuan060102github/open-streamer/internal/transcoder"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
+	"github.com/ntt0601zcoder/open-streamer/internal/manager"
+	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 )
 
 // ─── spy implementations ──────────────────────────────────────────────────────

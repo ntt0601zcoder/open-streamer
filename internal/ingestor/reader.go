@@ -25,10 +25,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/ntthuan060102github/open-streamer/config"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/ingestor/pull"
-	"github.com/ntthuan060102github/open-streamer/pkg/protocol"
+	"github.com/ntt0601zcoder/open-streamer/config"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
+	"github.com/ntt0601zcoder/open-streamer/pkg/protocol"
 )
 
 // PacketReader is a pull source that yields elementary-stream access units

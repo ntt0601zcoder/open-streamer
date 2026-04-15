@@ -30,11 +30,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ntthuan060102github/open-streamer/config"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/events"
-	"github.com/ntthuan060102github/open-streamer/internal/ingestor"
-	"github.com/ntthuan060102github/open-streamer/internal/metrics"
+	"github.com/ntt0601zcoder/open-streamer/config"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor"
+	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/samber/do/v2"
 )
 

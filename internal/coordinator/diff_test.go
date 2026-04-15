@@ -3,7 +3,7 @@ package coordinator
 import (
 	"testing"
 
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/stretchr/testify/assert"
 )
 

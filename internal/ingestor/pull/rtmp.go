@@ -30,7 +30,7 @@ import (
 
 	gocodec "github.com/yapingcat/gomedia/go-codec"
 
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 const rtmpChanSize = 16384

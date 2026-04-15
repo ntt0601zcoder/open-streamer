@@ -12,10 +12,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	_ "github.com/ntthuan060102github/open-streamer/api/docs" // swag Register(SwaggerInfo)
-	"github.com/ntthuan060102github/open-streamer/config"
-	"github.com/ntthuan060102github/open-streamer/internal/api/handler"
-	"github.com/ntthuan060102github/open-streamer/internal/mediaserve"
+	_ "github.com/ntt0601zcoder/open-streamer/api/docs" // swag Register(SwaggerInfo)
+	"github.com/ntt0601zcoder/open-streamer/config"
+	"github.com/ntt0601zcoder/open-streamer/internal/api/handler"
+	"github.com/ntt0601zcoder/open-streamer/internal/mediaserve"
 	"github.com/samber/do/v2"
 )
 

@@ -48,5 +48,5 @@ formatters:
     - gofumpt
   settings:
     gofumpt:
-      module-path: github.com/ntthuan060102github/open-streamer
+      module-path: github.com/ntt0601zcoder/open-streamer
  

@@ -8,11 +8,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/ntthuan060102github/open-streamer/internal/coordinator"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/events"
-	"github.com/ntthuan060102github/open-streamer/internal/manager"
-	"github.com/ntthuan060102github/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
+	"github.com/ntt0601zcoder/open-streamer/internal/manager"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/samber/do/v2"
 )
 

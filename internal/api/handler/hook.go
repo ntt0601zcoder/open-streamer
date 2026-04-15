@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/hooks"
-	"github.com/ntthuan060102github/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/hooks"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/samber/do/v2"
 )
 

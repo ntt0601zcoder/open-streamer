@@ -1,6 +1,6 @@
 services:
   open-streamer:
-    image: ghcr.io/ntthuan060102github/open-streamer:latest
+    image: ghcr.io/ntt0601zcoder/open-streamer:latest
     # build:
     #   context: ..
     #   dockerfile: build/Dockerfile

@@ -44,9 +44,9 @@ import (
 	"github.com/Eyevinn/mp4ff/mp4"
 	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
-	"github.com/ntthuan060102github/open-streamer/internal/buffer"
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
-	"github.com/ntthuan060102github/open-streamer/internal/tsmux"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
 // dashVideoTimescale is the standard MPEG timescale for video tracks (90 kHz).

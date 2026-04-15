@@ -4,7 +4,7 @@ import (
 	gocodec "github.com/yapingcat/gomedia/go-codec"
 	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
-	"github.com/ntthuan060102github/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // FromAV wraps a gomedia TSMuxer and converts AVPackets into 188-byte MPEG-TS packets.
