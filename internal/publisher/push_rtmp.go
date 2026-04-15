@@ -1,6 +1,6 @@
 package publisher
 
-// push_rtmp.go — outbound RTMP re-stream (push to external RTMP endpoint).
+// push_rtmp.go — outbound RTMP/RTMPS re-stream (push to external endpoint).
 //
 // Data flow:
 //
@@ -8,7 +8,7 @@ package publisher
 //	                                                        │
 //	                                        H.264 Annex-B + AAC ADTS
 //	                                                        │
-//	                         joy4 RTMP publish → remote RTMP server
+//	                         joy4 RTMP publish → remote RTMP(S) server
 //
 // Codec probing: accumulates SPS+PPS bytes from H.264 frames and AAC config
 // from the first ADTS frame. Once both are known, dials the destination and
@@ -19,12 +19,19 @@ package publisher
 // Reconnect: on any dial or write error the session ends; the caller
 // (serveRTMPPush) waits RetryTimeoutSec and retries. Codec data is preserved
 // across reconnects so the connection can be re-established quickly.
+//
+// RTMPS: rtmps:// URLs use a TLS-wrapped connection (default port 443).
+// joy4's NewConn accepts any net.Conn, so the RTMP handshake and framing
+// are identical — only the transport layer changes.
 
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -278,7 +285,55 @@ func (p *rtmpPushPackager) enqueueOrWrite(pkt joyav.Packet) {
 	}
 }
 
-// connect dials the RTMP URL and calls WriteHeader.
+// rtmpDial opens a joy4 RTMP connection for both rtmp:// and rtmps:// URLs.
+//
+//   - rtmp://  — plain TCP, default port 1935.
+//   - rtmps:// — TLS over TCP, default port 443.  joy4's NewConn wraps any
+//     net.Conn, so the RTMP framing layer is identical in both cases.
+func rtmpDial(rawURL string, timeout time.Duration) (*joyrtmp.Conn, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse url: %w", err)
+	}
+
+	// Apply scheme-specific default port when none is present.
+	host := u.Host
+	if _, _, splitErr := net.SplitHostPort(host); splitErr != nil {
+		switch u.Scheme {
+		case "rtmps":
+			host += ":443"
+		default:
+			host += ":1935"
+		}
+		u.Host = host
+	}
+
+	dialer := &net.Dialer{Timeout: timeout}
+
+	var netconn net.Conn
+	switch u.Scheme {
+	case "rtmps":
+		tlsDialer := &tls.Dialer{
+			NetDialer: dialer,
+			Config:    &tls.Config{ServerName: u.Hostname()},
+		}
+		netconn, err = tlsDialer.DialContext(context.Background(), "tcp", host)
+		if err != nil {
+			return nil, fmt.Errorf("tls dial: %w", err)
+		}
+	default: // "rtmp"
+		netconn, err = dialer.Dial("tcp", host)
+		if err != nil {
+			return nil, fmt.Errorf("tcp dial: %w", err)
+		}
+	}
+
+	conn := joyrtmp.NewConn(netconn)
+	conn.URL = u
+	return conn, nil
+}
+
+// connect dials the RTMP/RTMPS URL and calls WriteHeader.
 func (p *rtmpPushPackager) connect() error {
 	timeout := time.Duration(p.timeoutSec) * time.Second
 	if timeout <= 0 {
@@ -287,7 +342,7 @@ func (p *rtmpPushPackager) connect() error {
 
 	slog.Info("publisher: RTMP push connecting", "stream_code", p.streamID, "url", p.url)
 
-	conn, err := joyrtmp.DialTimeout(p.url, timeout)
+	conn, err := rtmpDial(p.url, timeout)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -393,8 +448,8 @@ func (s *Service) serveRTMPPush(
 	mediaBufferID domain.StreamCode,
 	dest domain.PushDestination,
 ) {
-	if !strings.HasPrefix(dest.URL, "rtmp://") {
-		slog.Warn("publisher: RTMP push unsupported scheme (only rtmp:// supported)",
+	if !strings.HasPrefix(dest.URL, "rtmp://") && !strings.HasPrefix(dest.URL, "rtmps://") {
+		slog.Warn("publisher: RTMP push unsupported scheme (only rtmp:// and rtmps:// supported)",
 			"stream_code", streamID, "url", dest.URL)
 		return
 	}
@@ -405,9 +460,7 @@ func (s *Service) serveRTMPPush(
 	}
 
 	attempts := 0
-
-	// Codec data (SPS/PPS, AAC config) is preserved across reconnects.
-	var preserved *rtmpPushPackager
+	var preserved *rtmpPushPackager // codec data reused across reconnects
 
 	for {
 		if ctx.Err() != nil {
@@ -420,34 +473,7 @@ func (s *Service) serveRTMPPush(
 		}
 		attempts++
 
-		sub, err := s.buf.Subscribe(mediaBufferID)
-		if err != nil {
-			slog.Warn("publisher: RTMP push subscribe failed",
-				"stream_code", streamID, "url", dest.URL, "err", err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(retryDelay):
-				continue
-			}
-		}
-
-		p := &rtmpPushPackager{
-			streamID:   streamID,
-			url:        dest.URL,
-			timeoutSec: dest.TimeoutSec,
-		}
-		// Reuse codec data from previous session so reconnect is fast.
-		if preserved != nil {
-			p.h264CD = preserved.h264CD
-			p.aacCD = preserved.aacCD
-			p.aacCfg = preserved.aacCfg
-		}
-
-		sessionErr := p.run(ctx, sub)
-		s.buf.Unsubscribe(mediaBufferID, sub)
-
-		// Preserve codec data for next session.
+		p, sessionErr := s.runOnePushSession(ctx, streamID, mediaBufferID, dest, preserved)
 		preserved = p
 
 		if ctx.Err() != nil {
@@ -465,4 +491,38 @@ func (s *Service) serveRTMPPush(
 		case <-time.After(retryDelay):
 		}
 	}
+}
+
+// runOnePushSession subscribes to the media buffer, runs one packager session,
+// then unsubscribes.  Returns the packager (for codec reuse on the next attempt)
+// and any session error.
+func (s *Service) runOnePushSession(
+	ctx context.Context,
+	streamID domain.StreamCode,
+	mediaBufferID domain.StreamCode,
+	dest domain.PushDestination,
+	preserved *rtmpPushPackager,
+) (*rtmpPushPackager, error) {
+	sub, err := s.buf.Subscribe(mediaBufferID)
+	if err != nil {
+		slog.Warn("publisher: RTMP push subscribe failed",
+			"stream_code", streamID, "url", dest.URL, "err", err)
+		return preserved, err
+	}
+
+	p := &rtmpPushPackager{
+		streamID:   streamID,
+		url:        dest.URL,
+		timeoutSec: dest.TimeoutSec,
+	}
+	// Reuse codec data from previous session so reconnect is fast.
+	if preserved != nil {
+		p.h264CD = preserved.h264CD
+		p.aacCD = preserved.aacCD
+		p.aacCfg = preserved.aacCfg
+	}
+
+	sessionErr := p.run(ctx, sub)
+	s.buf.Unsubscribe(mediaBufferID, sub)
+	return p, sessionErr
 }
