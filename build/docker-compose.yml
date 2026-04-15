@@ -5,7 +5,6 @@ services:
       dockerfile: build/Dockerfile
     ports:
       - "8080:8080"   # HTTP API
-      - "9090:9090"   # gRPC
       - "9091:9091"   # Prometheus metrics
     env_file:
       - ../.env

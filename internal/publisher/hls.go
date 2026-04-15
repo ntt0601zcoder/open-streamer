@@ -14,7 +14,6 @@ package publisher
 // In both modes, a 3/2 × segSec force-flush prevents runaway segments.
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -184,69 +183,49 @@ func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
 				p.doFlush()
 				return
 			}
-
 			if pkt.AV != nil {
-				// Discontinuity detected at the packet level (AV path).
-				if pkt.AV.Discontinuity {
-					p.mu.Lock()
-					// Flush old-source data before mixing in new-source data.
-					if len(p.segBuf) > 0 {
-						p.flushLocked()
-					}
-					p.discNext = true
-					p.mu.Unlock()
-				}
-
-				// IDR (keyframe) on AV path: flush the previous segment BEFORE writing
-				// the IDR bytes, so the new segment starts with the keyframe.
-				if pkt.AV.KeyFrame {
-					p.mu.Lock()
-					if len(p.segBuf) > 0 && !p.segStart.IsZero() &&
-						time.Since(p.segStart) >= segDur {
-						p.flushLocked()
-					}
-					p.mu.Unlock()
-				}
+				p.handleAVPacket(pkt.AV, segDur)
 			}
-
-			// Reassemble raw TS bytes and accumulate into segBuf.
 			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
-				tsCarry = append(tsCarry, b...)
-				for len(tsCarry) >= 188 {
-					if tsCarry[0] != 0x47 {
-						idx := bytes.IndexByte(tsCarry, 0x47)
-						if idx < 0 {
-							// No sync found; keep last 187 bytes as carry.
-							if len(tsCarry) > 187 {
-								tsCarry = tsCarry[len(tsCarry)-187:]
-							}
-							return
-						}
-						tsCarry = tsCarry[idx:]
-						if len(tsCarry) < 188 {
-							return
-						}
-					}
-					// Double-sync guard: skip one byte if the next packet
-					// doesn't also start with 0x47.
-					if len(tsCarry) >= 376 && tsCarry[188] != 0x47 {
-						tsCarry = tsCarry[1:]
-						continue
-					}
+				alignedFeed(b, &tsCarry, func(pkt188 []byte) bool {
 					p.mu.Lock()
 					if p.segStart.IsZero() {
 						p.segStart = time.Now()
 					}
-					p.segBuf = append(p.segBuf, tsCarry[:188]...)
+					p.segBuf = append(p.segBuf, pkt188...)
 					p.mu.Unlock()
-
-					tsCarry = tsCarry[188:]
-				}
+					return true
+				})
 			})
 
 		case <-tick.C:
 			p.tickFlush(maxDur)
 		}
+	}
+}
+
+// handleAVPacket processes AV-path control signals: discontinuity flushing and
+// IDR-aligned segment splitting.  Must not be called with p.mu held.
+func (p *hlsSegmenter) handleAVPacket(av *domain.AVPacket, segDur time.Duration) {
+	if av.Discontinuity {
+		p.mu.Lock()
+		// Flush old-source data before mixing in new-source data.
+		if len(p.segBuf) > 0 {
+			p.flushLocked()
+		}
+		p.discNext = true
+		p.mu.Unlock()
+	}
+
+	// IDR (keyframe): flush the previous segment BEFORE writing the IDR bytes
+	// so the new segment starts at a clean keyframe boundary.
+	if av.KeyFrame {
+		p.mu.Lock()
+		if len(p.segBuf) > 0 && !p.segStart.IsZero() &&
+			time.Since(p.segStart) >= segDur {
+			p.flushLocked()
+		}
+		p.mu.Unlock()
 	}
 }
 

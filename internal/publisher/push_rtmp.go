@@ -84,52 +84,7 @@ type rtmpPushPackager struct {
 // Returns when ctx is cancelled or a write/dial error occurs.
 func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) error {
 	tb := newTSBuffer()
-
-	go func() {
-		defer tb.Close()
-		var tsCarry []byte
-		var avMux *tsmux.FromAV
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case pkt, ok := <-sub.Recv():
-				if !ok {
-					return
-				}
-				if pkt.AV != nil && pkt.AV.Discontinuity {
-					tsCarry = tsCarry[:0]
-				}
-				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
-					tsCarry = append(tsCarry, b...)
-					for len(tsCarry) >= 188 {
-						if tsCarry[0] != 0x47 {
-							idx := bytes.IndexByte(tsCarry, 0x47)
-							if idx < 0 {
-								if len(tsCarry) > 187 {
-									tsCarry = tsCarry[len(tsCarry)-187:]
-								}
-								return
-							}
-							tsCarry = tsCarry[idx:]
-							if len(tsCarry) < 188 {
-								return
-							}
-						}
-						if len(tsCarry) >= 376 && tsCarry[188] != 0x47 {
-							tsCarry = tsCarry[1:]
-							continue
-						}
-						if _, err := tb.Write(tsCarry[:188]); err != nil {
-							return
-						}
-						tsCarry = tsCarry[188:]
-					}
-				})
-			}
-		}
-	}()
+	go p.feedLoop(ctx, sub, tb)
 
 	demux := mpeg2.NewTSDemuxer()
 	demux.OnFrame = p.onTSFrame
@@ -154,6 +109,34 @@ func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) erro
 		return p.connErr
 	}
 	return nil
+}
+
+// feedLoop reads packets from sub, reassembles 188-byte TS packets via
+// alignedFeed, and pipes them into tb.  Runs in its own goroutine.
+func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber, tb *tsBuffer) {
+	defer tb.Close()
+	var tsCarry []byte
+	var avMux *tsmux.FromAV
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case pkt, ok := <-sub.Recv():
+			if !ok {
+				return
+			}
+			if pkt.AV != nil && pkt.AV.Discontinuity {
+				tsCarry = tsCarry[:0]
+			}
+			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+				alignedFeed(b, &tsCarry, func(pkt188 []byte) bool {
+					_, err := tb.Write(pkt188)
+					return err == nil
+				})
+			})
+		}
+	}
 }
 
 // onTSFrame is the TSDemuxer callback; runs in the demuxer goroutine.
