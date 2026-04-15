@@ -38,8 +38,30 @@ type ManagerConfig struct {
 
 // ServerConfig holds HTTP/gRPC server settings.
 type ServerConfig struct {
-	HTTPAddr string `mapstructure:"http_addr"`
-	GRPCAddr string `mapstructure:"grpc_addr"`
+	HTTPAddr string     `mapstructure:"http_addr"`
+	GRPCAddr string     `mapstructure:"grpc_addr"`
+	CORS     CORSConfig `mapstructure:"cors"`
+}
+
+// CORSConfig controls Cross-Origin Resource Sharing for the HTTP API and
+// static media routes mounted on the same listener.
+type CORSConfig struct {
+	// Enabled turns CORS middleware on for the HTTP listener.
+	Enabled bool `mapstructure:"enabled"`
+	// AllowedOrigins lists values for Access-Control-Allow-Origin. Use "*"
+	// for any origin (cannot be used together with AllowCredentials).
+	AllowedOrigins []string `mapstructure:"allowed_origins"`
+	// AllowedMethods lists Access-Control-Allow-Methods; empty uses a REST default set.
+	AllowedMethods []string `mapstructure:"allowed_methods"`
+	// AllowedHeaders lists Access-Control-Allow-Headers; empty uses a common API default set.
+	AllowedHeaders []string `mapstructure:"allowed_headers"`
+	// ExposedHeaders lists Access-Control-Expose-Headers.
+	ExposedHeaders []string `mapstructure:"exposed_headers"`
+	// AllowCredentials sets Access-Control-Allow-Credentials. Must be false
+	// when AllowedOrigins contains "*".
+	AllowCredentials bool `mapstructure:"allow_credentials"`
+	// MaxAge is the preflight cache duration in seconds (Access-Control-Max-Age).
+	MaxAge int `mapstructure:"max_age"`
 }
 
 // StorageConfig selects the storage backend and its connection details.
@@ -215,9 +237,13 @@ func Load() (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.http_addr", ":8080")
 	v.SetDefault("server.grpc_addr", ":9090")
+	v.SetDefault("server.cors.enabled", true)
+	v.SetDefault("server.cors.allowed_origins", []string{"*"})
+	v.SetDefault("server.cors.allow_credentials", false)
+	v.SetDefault("server.cors.max_age", 300)
 
 	v.SetDefault("storage.driver", "json")
-	v.SetDefault("storage.json_dir", "./data")
+	v.SetDefault("storage.json_dir", "./test_data")
 	v.SetDefault("storage.mongo_database", "open_streamer")
 
 	v.SetDefault("buffer.capacity", 1000)

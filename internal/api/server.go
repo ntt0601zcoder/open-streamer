@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	_ "github.com/ntt0601zcoder/open-streamer/api/docs" // swag Register(SwaggerInfo)
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api/handler"
@@ -62,6 +63,9 @@ func (s *Server) buildRouter(
 
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
+	if s.cfg.CORS.Enabled {
+		r.Use(cors.Handler(corsOptions(s.cfg.CORS)))
+	}
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Timeout(120 * time.Second))
@@ -112,6 +116,41 @@ func (s *Server) buildRouter(
 	})
 
 	return r
+}
+
+func corsOptions(cfg config.CORSConfig) cors.Options {
+	origins := cfg.AllowedOrigins
+	if len(origins) == 0 {
+		origins = []string{"*"}
+	}
+	methods := cfg.AllowedMethods
+	if len(methods) == 0 {
+		methods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+	}
+	headers := cfg.AllowedHeaders
+	if len(headers) == 0 {
+		headers = []string{"Accept", "Authorization", "Content-Type", "X-Request-ID"}
+	}
+	allowCredentials := cfg.AllowCredentials
+	if allowCredentials {
+		for _, o := range origins {
+			if o == "*" {
+				allowCredentials = false
+				break
+			}
+		}
+	}
+	opts := cors.Options{
+		AllowedOrigins:   origins,
+		AllowedMethods:   methods,
+		AllowedHeaders:   headers,
+		ExposedHeaders:   cfg.ExposedHeaders,
+		AllowCredentials: allowCredentials,
+	}
+	if cfg.MaxAge > 0 {
+		opts.MaxAge = cfg.MaxAge
+	}
+	return opts
 }
 
 // Start begins accepting HTTP connections. Blocks until ctx is cancelled.
