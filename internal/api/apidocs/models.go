@@ -73,12 +73,7 @@ type ConfigData struct {
 	WatermarkPositions []domain.WatermarkPosition `json:"watermarkPositions"`
 }
 
-// StreamStatusData combines persisted stream, pipeline flag, and manager runtime snapshot.
-type StreamStatusData struct {
-	Data map[string]any `json:"data"`
-}
-
-// StreamActionData is returned by POST .../start and .../stop.
+// StreamActionData is returned by POST .../restart.
 type StreamActionData struct {
 	Data StreamActionInner `json:"data"`
 }

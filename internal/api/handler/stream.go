@@ -24,20 +24,14 @@ type StreamHandler struct {
 	bus         events.Bus
 }
 
-// streamRuntime holds live pipeline state overlaid on the persisted stream config.
-// Fields are nil/zero when the pipeline is not running. Extended as new runtime
-// observability is added without changing the top-level response shape.
-type streamRuntime struct {
-	ActiveInputPriority int `json:"active_input_priority"`
-}
-
 // streamResponse is the API representation of a stream.
 // It embeds the persisted domain.Stream (whose Status field is json:"-") and
 // overlays runtime-computed fields so clients always see the live state.
 type streamResponse struct {
 	*domain.Stream
-	Status  domain.StreamStatus `json:"status"`
-	Runtime *streamRuntime      `json:"runtime"`
+	Status         domain.StreamStatus  `json:"status"`
+	PipelineActive bool                 `json:"pipeline_active"`
+	Runtime        *manager.RuntimeStatus `json:"runtime,omitempty"`
 }
 
 func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
@@ -46,9 +40,8 @@ func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
 		Status: h.coordinator.StreamStatus(s.Code),
 	}
 	if rt, ok := h.manager.RuntimeStatus(s.Code); ok {
-		resp.Runtime = &streamRuntime{
-			ActiveInputPriority: rt.ActiveInputPriority,
-		}
+		resp.PipelineActive = true
+		resp.Runtime = &rt
 	}
 	return resp
 }
@@ -149,6 +142,7 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wasRunning := exists && h.coordinator.IsRunning(code)
+	nowEnabled := exists && cur.Disabled && !body.Disabled
 
 	// Save first so the pipeline continues with the old config if persistence fails.
 	if err := h.streamRepo.Save(r.Context(), body); err != nil {
@@ -159,6 +153,12 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	if wasRunning {
 		if err := h.coordinator.Update(r.Context(), cur, body); err != nil {
 			writeError(w, http.StatusInternalServerError, "UPDATE_FAILED", err.Error())
+			return
+		}
+	} else if nowEnabled {
+		// Stream was disabled → re-enabled: start the pipeline.
+		if err := h.coordinator.Start(r.Context(), body); err != nil {
+			writeError(w, http.StatusInternalServerError, "START_FAILED", err.Error())
 			return
 		}
 	}
@@ -319,28 +319,3 @@ func (h *StreamHandler) SwitchInput(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]string{"status": "switched"}})
 }
 
-// Status returns persisted stream, whether the pipeline is registered, and manager runtime snapshot.
-// @Summary Stream status
-// @Tags streams
-// @Produce json
-// @Param code path string true "Stream code"
-// @Success 200 {object} apidocs.StreamStatusData
-// @Failure 404 {object} apidocs.ErrorBody
-// @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/status [get].
-func (h *StreamHandler) Status(w http.ResponseWriter, r *http.Request) {
-	code := domain.StreamCode(chi.URLParam(r, "code"))
-	stream, err := h.streamRepo.FindByCode(r.Context(), code)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	rt, live := h.manager.RuntimeStatus(code)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"data": map[string]any{
-			"stream":          stream,
-			"pipeline_active": live,
-			"runtime":         rt,
-		},
-	})
-}

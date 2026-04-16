@@ -796,46 +796,6 @@ const docTemplate = `{
                     }
                 }
             }
-        },
-        "/streams/{code}/status": {
-            "get": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "streams"
-                ],
-                "summary": "Stream status",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Stream code",
-                        "name": "code",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.StreamStatusData"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
         }
     },
     "definitions": {
@@ -1161,15 +1121,6 @@ const docTemplate = `{
             "properties": {
                 "active_input_priority": {
                     "type": "integer"
-                }
-            }
-        },
-        "apidocs.StreamStatusData": {
-            "type": "object",
-            "properties": {
-                "data": {
-                    "type": "object",
-                    "additionalProperties": {}
                 }
             }
         },
