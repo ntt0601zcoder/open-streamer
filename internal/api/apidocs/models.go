@@ -59,7 +59,7 @@ type StreamList struct {
 
 // ConfigData wraps the GET /config response.
 type ConfigData struct {
-	HWAccels           []domain.HWAccel          `json:"hwAccels"`
+	HWAccels           []domain.HWAccel           `json:"hwAccels"`
 	VideoCodecs        []domain.VideoCodec        `json:"videoCodecs"`
 	AudioCodecs        []domain.AudioCodec        `json:"audioCodecs"`
 	OutputProtocols    []string                   `json:"outputProtocols"`
