@@ -346,13 +346,6 @@ definitions:
           healthy primary will be falsely failed over to a lower priority.
         type: integer
     type: object
-  config.MetricsConfig:
-    properties:
-      addr:
-        type: string
-      path:
-        type: string
-    type: object
   config.PublisherConfig:
     properties:
       dash:
@@ -585,8 +578,6 @@ definitions:
         $ref: '#/definitions/config.LogConfig'
       manager:
         $ref: '#/definitions/config.ManagerConfig'
-      metrics:
-        $ref: '#/definitions/config.MetricsConfig'
       publisher:
         $ref: '#/definitions/config.PublisherConfig'
       server:

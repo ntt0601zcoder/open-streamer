@@ -1329,17 +1329,6 @@ const docTemplate = `{
                 }
             }
         },
-        "config.MetricsConfig": {
-            "type": "object",
-            "properties": {
-                "addr": {
-                    "type": "string"
-                },
-                "path": {
-                    "type": "string"
-                }
-            }
-        },
         "config.PublisherConfig": {
             "type": "object",
             "properties": {
@@ -1636,9 +1625,6 @@ const docTemplate = `{
                 },
                 "manager": {
                     "$ref": "#/definitions/config.ManagerConfig"
-                },
-                "metrics": {
-                    "$ref": "#/definitions/config.MetricsConfig"
                 },
                 "publisher": {
                     "$ref": "#/definitions/config.PublisherConfig"
