@@ -1027,23 +1027,6 @@ paths:
       tags:
       - system
   /recordings/{rid}:
-    delete:
-      parameters:
-      - description: Recording ID (= stream code)
-        in: path
-        name: rid
-        required: true
-        type: string
-      responses:
-        "204":
-          description: No Content
-        "500":
-          description: Internal Server Error
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Delete recording metadata
-      tags:
-      - recordings
     get:
       parameters:
       - description: Recording ID (= stream code)
@@ -1300,50 +1283,6 @@ paths:
           schema:
             $ref: '#/definitions/apidocs.ErrorBody'
       summary: List recordings by stream
-      tags:
-      - recordings
-  /streams/{code}/recordings/start:
-    post:
-      parameters:
-      - description: Stream code
-        in: path
-        name: code
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "201":
-          description: Created
-          schema:
-            $ref: '#/definitions/apidocs.RecordingData'
-        "500":
-          description: Internal Server Error
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Start recording
-      tags:
-      - recordings
-  /streams/{code}/recordings/stop:
-    post:
-      parameters:
-      - description: Stream code
-        in: path
-        name: code
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/apidocs.StreamActionData'
-        "500":
-          description: Internal Server Error
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Stop recording
       tags:
       - recordings
   /streams/{code}/start:

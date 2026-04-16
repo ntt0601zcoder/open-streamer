@@ -90,15 +90,12 @@ func (s *Server) buildRouter(
 			r.Post("/stop", stream.Stop)
 			r.Get("/status", stream.Status)
 
-			r.Post("/recordings/start", recording.Start)
-			r.Post("/recordings/stop", recording.Stop)
 			r.Get("/recordings", recording.ListByStream)
 		})
 	})
 
 	r.Route("/recordings/{rid}", func(r chi.Router) {
 		r.Get("/", recording.Get)
-		r.Delete("/", recording.Delete)
 		r.Get("/info", recording.Info)
 		r.Get("/playlist.m3u8", recording.Playlist)
 		r.Get("/timeshift.m3u8", recording.Timeshift)
@@ -189,7 +186,6 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 // @Tags system
 // @Success 200 {string} string "ok"
 // @Router /readyz [get].
-func readyz(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
+func readyz(w http.ResponseWriter, r *http.Request) {
+	healthz(w, r)
 }

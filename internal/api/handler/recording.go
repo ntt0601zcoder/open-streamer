@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/dvr"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
@@ -20,61 +19,16 @@ import (
 
 // RecordingHandler handles DVR recording and playback REST endpoints.
 type RecordingHandler struct {
-	dvr        *dvr.Service
-	recRepo    store.RecordingRepository
-	streamRepo store.StreamRepository
+	dvr     *dvr.Service
+	recRepo store.RecordingRepository
 }
 
 // NewRecordingHandler creates a RecordingHandler and registers it with the DI injector.
 func NewRecordingHandler(i do.Injector) (*RecordingHandler, error) {
 	return &RecordingHandler{
-		dvr:        do.MustInvoke[*dvr.Service](i),
-		recRepo:    do.MustInvoke[store.RecordingRepository](i),
-		streamRepo: do.MustInvoke[store.StreamRepository](i),
+		dvr:     do.MustInvoke[*dvr.Service](i),
+		recRepo: do.MustInvoke[store.RecordingRepository](i),
 	}, nil
-}
-
-// Start begins DVR recording for the stream.
-// @Summary Start recording
-// @Tags recordings
-// @Produce json
-// @Param code path string true "Stream code"
-// @Success 201 {object} apidocs.RecordingData
-// @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/recordings/start [post].
-func (h *RecordingHandler) Start(w http.ResponseWriter, r *http.Request) {
-	streamCode := domain.StreamCode(chi.URLParam(r, "code"))
-
-	var dvrCfg *domain.StreamDVRConfig
-	var mediaBuf domain.StreamCode
-	if stream, err := h.streamRepo.FindByCode(r.Context(), streamCode); err == nil && stream != nil {
-		dvrCfg = stream.DVR
-		mediaBuf = buffer.PlaybackBufferID(streamCode, stream.Transcoder)
-	}
-
-	rec, err := h.dvr.StartRecording(r.Context(), streamCode, mediaBuf, dvrCfg)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "RECORDING_START_FAILED", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"data": rec})
-}
-
-// Stop ends the active recording for the stream.
-// @Summary Stop recording
-// @Tags recordings
-// @Produce json
-// @Param code path string true "Stream code"
-// @Success 200 {object} apidocs.StreamActionData
-// @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/recordings/stop [post].
-func (h *RecordingHandler) Stop(w http.ResponseWriter, r *http.Request) {
-	streamCode := domain.StreamCode(chi.URLParam(r, "code"))
-	if err := h.dvr.StopRecording(r.Context(), streamCode); err != nil {
-		writeError(w, http.StatusInternalServerError, "RECORDING_STOP_FAILED", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]string{"status": "stopped"}})
 }
 
 // ListByStream lists recording metadata for a stream.
@@ -162,23 +116,6 @@ func (h *RecordingHandler) Info(w http.ResponseWriter, r *http.Request) {
 			"total_size_bytes": idx.TotalSizeBytes,
 		},
 	})
-}
-
-// Delete removes recording metadata from the store.
-// Does NOT delete segment files on disk.
-// @Summary Delete recording metadata
-// @Tags recordings
-// @Param rid path string true "Recording ID (= stream code)"
-// @Success 204 "No Content"
-// @Failure 500 {object} apidocs.ErrorBody
-// @Router /recordings/{rid} [delete].
-func (h *RecordingHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	rid := domain.RecordingID(chi.URLParam(r, "rid"))
-	if err := h.recRepo.Delete(r.Context(), rid); err != nil {
-		writeError(w, http.StatusInternalServerError, "DELETE_FAILED", "failed to delete recording")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // Playlist serves the M3U8 playlist written to disk by the DVR worker.

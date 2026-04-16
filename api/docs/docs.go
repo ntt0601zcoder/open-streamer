@@ -331,32 +331,6 @@ const docTemplate = `{
                         }
                     }
                 }
-            },
-            "delete": {
-                "tags": [
-                    "recordings"
-                ],
-                "summary": "Delete recording metadata",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Recording ID (= stream code)",
-                        "name": "rid",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "204": {
-                        "description": "No Content"
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
             }
         },
         "/recordings/{rid}/info": {
@@ -711,74 +685,6 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/apidocs.RecordingList"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
-        "/streams/{code}/recordings/start": {
-            "post": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "recordings"
-                ],
-                "summary": "Start recording",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Stream code",
-                        "name": "code",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "201": {
-                        "description": "Created",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.RecordingData"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
-        "/streams/{code}/recordings/stop": {
-            "post": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "recordings"
-                ],
-                "summary": "Stop recording",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Stream code",
-                        "name": "code",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.StreamActionData"
                         }
                     },
                     "500": {
