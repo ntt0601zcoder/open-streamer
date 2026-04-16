@@ -117,9 +117,14 @@ type hlsVariant struct {
 //
 // Expected URL format: http[s]://host/path/to/playlist.m3u8
 // Master playlists are transparently resolved to the highest-bandwidth variant.
+//
+// Open/Close may be called multiple times (runPullWorker reconnects on error).
+// Each Open() creates a fresh output channel so that the previous poll goroutine's
+// deferred close does not affect the new one.
 type HLSReader struct {
-	input domain.Input
-	cfg   config.IngestorConfig
+	input  domain.Input
+	cfg    config.IngestorConfig
+	maxBuf int
 
 	// plClient: short-timeout client for playlist GETs.
 	// segClient: long-timeout client for segment body reads.
@@ -138,14 +143,15 @@ func NewHLSReader(input domain.Input, cfg config.IngestorConfig) *HLSReader {
 		maxBuf = 8
 	}
 	return &HLSReader{
-		input: input,
-		cfg:   cfg,
-		out:   make(chan hlsResult, maxBuf),
+		input:  input,
+		cfg:    cfg,
+		maxBuf: maxBuf,
 	}
 }
 
 // Open starts the background polling goroutine.
 // Returns immediately; segments arrive asynchronously via Read.
+// Safe to call again after Close — each call creates a fresh output channel.
 func (r *HLSReader) Open(ctx context.Context) error {
 	plTimeout := time.Duration(r.input.Net.ConnectTimeoutSec) * time.Second
 	if plTimeout == 0 {
@@ -159,10 +165,16 @@ func (r *HLSReader) Open(ctx context.Context) error {
 	r.plClient = &http.Client{Timeout: plTimeout}
 	r.segClient = &http.Client{Timeout: segTimeout}
 
+	// Fresh channel and once per Open() call so the previous poll goroutine's
+	// deferred close(out) cannot race with this new goroutine's close.
+	out := make(chan hlsResult, r.maxBuf)
+	r.out = out
+	r.once = sync.Once{}
+
 	pollCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 
-	go r.poll(pollCtx, r.input.URL)
+	go r.poll(pollCtx, r.input.URL, out)
 	return nil
 }
 
@@ -192,8 +204,8 @@ func (r *HLSReader) Close() error {
 
 // ─── Poll loop ───────────────────────────────────────────────────────────────
 
-func (r *HLSReader) poll(ctx context.Context, rawURL string) {
-	defer close(r.out)
+func (r *HLSReader) poll(ctx context.Context, rawURL string, out chan hlsResult) {
+	defer close(out)
 
 	mediaURL := rawURL
 	var started bool
@@ -206,17 +218,17 @@ func (r *HLSReader) poll(ctx context.Context, rawURL string) {
 
 		pl, err := r.fetchPlaylistWithRetry(ctx, &mediaURL)
 		if err != nil {
-			r.sendResult(ctx, hlsResult{err: err})
+			r.sendResult(ctx, out, hlsResult{err: err})
 			return
 		}
 
-		delivered := r.deliverNewSegments(ctx, pl, &started, &lastSeq)
+		delivered := r.deliverNewSegments(ctx, pl, &started, &lastSeq, out)
 		if !delivered {
 			return // context cancelled inside deliverNewSegments
 		}
 
 		if pl.ended {
-			r.sendResult(ctx, hlsResult{err: io.EOF})
+			r.sendResult(ctx, out, hlsResult{err: io.EOF})
 			return
 		}
 
@@ -233,6 +245,7 @@ func (r *HLSReader) deliverNewSegments(
 	pl *hlsMediaPlaylist,
 	started *bool,
 	lastSeq *uint64,
+	out chan hlsResult,
 ) bool {
 	for _, seg := range pl.segments {
 		if *started && seg.seq <= *lastSeq {
@@ -247,7 +260,7 @@ func (r *HLSReader) deliverNewSegments(
 				"url", seg.uri, "err", err)
 			continue
 		}
-		if !r.sendResult(ctx, hlsResult{data: data}) {
+		if !r.sendResult(ctx, out, hlsResult{data: data}) {
 			return false
 		}
 		*lastSeq = seg.seq
@@ -256,10 +269,10 @@ func (r *HLSReader) deliverNewSegments(
 	return true
 }
 
-// sendResult sends a result to the out channel, returning false if cancelled.
-func (r *HLSReader) sendResult(ctx context.Context, res hlsResult) bool {
+// sendResult sends a result to out, returning false if ctx is cancelled.
+func (r *HLSReader) sendResult(ctx context.Context, out chan hlsResult, res hlsResult) bool {
 	select {
-	case r.out <- res:
+	case out <- res:
 		return true
 	case <-ctx.Done():
 		return false
