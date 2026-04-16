@@ -2,12 +2,12 @@ package yaml_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
 
+	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/ntt0601zcoder/open-streamer/internal/store/storetest"
@@ -126,22 +126,28 @@ func TestYAMLHookRepo_Delete(t *testing.T) {
 	assert.True(t, errors.Is(err, store.ErrNotFound))
 }
 
-// --- SettingsRepository ---
+// --- GlobalConfigRepository ---
 
-func TestYAMLSettingsRepo_GetSet(t *testing.T) {
+func TestYAMLGlobalConfigRepo_GetSet(t *testing.T) {
 	ctx := context.Background()
-	repo := newStore(t).Settings()
+	repo := newStore(t).GlobalConfig()
 
-	_, err := repo.Get(ctx, "missing")
+	_, err := repo.Get(ctx)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, store.ErrNotFound))
 
-	val := json.RawMessage(`{"foo":"bar"}`)
-	require.NoError(t, repo.Set(ctx, "test_key", val))
+	want := &domain.GlobalConfig{
+		Server: &config.ServerConfig{HTTPAddr: ":9090"},
+		Log:    &config.LogConfig{Level: "debug", Format: "json"},
+	}
+	require.NoError(t, repo.Set(ctx, want))
 
-	got, err := repo.Get(ctx, "test_key")
+	got, err := repo.Get(ctx)
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"foo":"bar"}`, string(got))
+	assert.Equal(t, want.Server.HTTPAddr, got.Server.HTTPAddr)
+	assert.Equal(t, want.Log.Level, got.Log.Level)
+	assert.Equal(t, want.Log.Format, got.Log.Format)
+	assert.Nil(t, got.Ingestor)
 }
 
 // --- Concurrent access ---

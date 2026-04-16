@@ -17,6 +17,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api/handler"
 	"github.com/ntt0601zcoder/open-streamer/internal/mediaserve"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/samber/do/v2"
 )
 
@@ -70,6 +71,7 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 
 	r.Get("/healthz", healthz)
 	r.Get("/readyz", readyz)
+	r.Handle("/metrics", promhttp.Handler())
 	r.Get("/config", s.configH.GetConfig)
 	r.Post("/config", s.configH.UpdateConfig)
 

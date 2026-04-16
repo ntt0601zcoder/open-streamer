@@ -169,12 +169,6 @@ type HooksConfig struct {
 	KafkaBrokers []string `mapstructure:"kafka_brokers" json:"kafka_brokers,omitempty" yaml:"kafka_brokers,omitempty"`
 }
 
-// MetricsConfig controls Prometheus exposition.
-type MetricsConfig struct {
-	Addr string `mapstructure:"addr" json:"addr" yaml:"addr"`
-	Path string `mapstructure:"path" json:"path" yaml:"path"`
-}
-
 // LogConfig controls structured logging output.
 type LogConfig struct {
 	Level  string `mapstructure:"level" json:"level" yaml:"level"`    // debug | info | warn | error
@@ -190,9 +184,9 @@ func LoadStorage() (StorageConfig, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
-	v.SetDefault("storage.driver", "yaml")
-	v.SetDefault("storage.json_dir", "./data")
-	v.SetDefault("storage.yaml_dir", "./data")
+	v.SetDefault("storage.driver", "json")
+	v.SetDefault("storage.json_dir", "./test_data")
+	v.SetDefault("storage.yaml_dir", "./test_data")
 
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")

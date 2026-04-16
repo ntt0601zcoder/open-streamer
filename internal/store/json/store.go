@@ -35,7 +35,7 @@ type db struct {
 	Streams    map[string]*domain.Stream    `json:"streams"`
 	Recordings map[string]*domain.Recording `json:"recordings"`
 	Hooks      map[string]*domain.Hook      `json:"hooks"`
-	Global     map[string]json.RawMessage   `json:"global,omitempty"`
+	Global     *domain.GlobalConfig         `json:"global,omitempty"`
 }
 
 // Store is a JSON-backed implementation of all repositories.
@@ -62,8 +62,8 @@ func (s *Store) Recordings() store.RecordingRepository { return &recordingRepo{s
 // Hooks returns a HookRepository backed by this Store.
 func (s *Store) Hooks() store.HookRepository { return &hookRepo{s} }
 
-// Settings returns a SettingsRepository backed by this Store.
-func (s *Store) Settings() store.SettingsRepository { return &settingsRepo{s} }
+// GlobalConfig returns a GlobalConfigRepository backed by this Store.
+func (s *Store) GlobalConfig() store.GlobalConfigRepository { return &globalConfigRepo{s} }
 
 // --- internal helpers ---
 

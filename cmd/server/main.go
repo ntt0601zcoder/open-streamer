@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -62,8 +61,8 @@ func run() error {
 	}
 
 	// 3. Load GlobalConfig from store, seeding defaults on first boot.
-	settingsRepo := do.MustInvoke[store.SettingsRepository](injector)
-	gcfg, err := loadOrSeedGlobalConfig(settingsRepo)
+	gcRepo := do.MustInvoke[store.GlobalConfigRepository](injector)
+	gcfg, err := loadGlobalConfig(gcRepo)
 	if err != nil {
 		return fmt.Errorf("load global config: %w", err)
 	}
@@ -81,14 +80,14 @@ func run() error {
 
 	// 6. Assemble RuntimeManager deps from DI.
 	rtm := runtime.New(ctx, runtime.Deps{
-		Ingestor:     do.MustInvoke[*ingestor.Service](injector),
-		Publisher:    do.MustInvoke[*publisher.Service](injector),
-		Coordinator:  do.MustInvoke[*coordinator.Coordinator](injector),
-		HooksSvc:     do.MustInvoke[*hooks.Service](injector),
-		APISrv:       do.MustInvoke[*api.Server](injector),
-		Bus:          do.MustInvoke[events.Bus](injector),
-		StreamRepo:   do.MustInvoke[store.StreamRepository](injector),
-		SettingsRepo: settingsRepo,
+		Ingestor:         do.MustInvoke[*ingestor.Service](injector),
+		Publisher:        do.MustInvoke[*publisher.Service](injector),
+		Coordinator:      do.MustInvoke[*coordinator.Coordinator](injector),
+		HooksSvc:         do.MustInvoke[*hooks.Service](injector),
+		APISrv:           do.MustInvoke[*api.Server](injector),
+		Bus:              do.MustInvoke[events.Bus](injector),
+		StreamRepo:       do.MustInvoke[store.StreamRepository](injector),
+		GlobalConfigRepo: gcRepo,
 	})
 
 	// 7. Inject RuntimeManager into ConfigHandler (breaks circular DI dependency).
@@ -125,7 +124,7 @@ func wireStorage(i *do.RootScope, cfg config.StorageConfig) error {
 		do.ProvideValue(i, s.Streams())
 		do.ProvideValue(i, s.Recordings())
 		do.ProvideValue(i, s.Hooks())
-		do.ProvideValue(i, s.Settings())
+		do.ProvideValue(i, s.GlobalConfig())
 
 	default: // "yaml" or empty
 		s, err := yamlstore.New(cfg.YAMLDir)
@@ -135,7 +134,7 @@ func wireStorage(i *do.RootScope, cfg config.StorageConfig) error {
 		do.ProvideValue(i, s.Streams())
 		do.ProvideValue(i, s.Recordings())
 		do.ProvideValue(i, s.Hooks())
-		do.ProvideValue(i, s.Settings())
+		do.ProvideValue(i, s.GlobalConfig())
 	}
 
 	slog.Info("server: storage backend ready", "driver", cfg.Driver)
@@ -144,34 +143,24 @@ func wireStorage(i *do.RootScope, cfg config.StorageConfig) error {
 
 // provideSubConfigs extracts individual sub-configs from the GlobalConfig and
 // registers them in the DI injector so each service only sees its own config type.
+// Zero-value configs are provided for nil sections so DI constructors never panic.
 func provideSubConfigs(i *do.RootScope, gcfg *domain.GlobalConfig) {
-	if gcfg.Server != nil {
-		do.ProvideValue(i, *gcfg.Server)
+	do.ProvideValue(i, deref(gcfg.Server))
+	do.ProvideValue(i, deref(gcfg.Ingestor))
+	do.ProvideValue(i, deref(gcfg.Buffer))
+	do.ProvideValue(i, deref(gcfg.Transcoder))
+	do.ProvideValue(i, deref(gcfg.Publisher))
+	do.ProvideValue(i, deref(gcfg.Manager))
+	do.ProvideValue(i, deref(gcfg.Hooks))
+	do.ProvideValue(i, deref(gcfg.Log))
+}
+
+func deref[T any](p *T) T {
+	if p != nil {
+		return *p
 	}
-	if gcfg.Ingestor != nil {
-		do.ProvideValue(i, *gcfg.Ingestor)
-	}
-	if gcfg.Buffer != nil {
-		do.ProvideValue(i, *gcfg.Buffer)
-	}
-	if gcfg.Transcoder != nil {
-		do.ProvideValue(i, *gcfg.Transcoder)
-	}
-	if gcfg.Publisher != nil {
-		do.ProvideValue(i, *gcfg.Publisher)
-	}
-	if gcfg.Manager != nil {
-		do.ProvideValue(i, *gcfg.Manager)
-	}
-	if gcfg.Hooks != nil {
-		do.ProvideValue(i, *gcfg.Hooks)
-	}
-	if gcfg.Metrics != nil {
-		do.ProvideValue(i, *gcfg.Metrics)
-	}
-	if gcfg.Log != nil {
-		do.ProvideValue(i, *gcfg.Log)
-	}
+	var zero T
+	return zero
 }
 
 // wireServices registers all non-storage services into the DI injector.
@@ -202,29 +191,17 @@ func wireServices(i *do.RootScope) {
 	do.Provide(i, api.New)
 }
 
-// loadOrSeedGlobalConfig reads the GlobalConfig from the settings store.
-// On first boot (key not found), it seeds the store with DefaultGlobalConfig.
-func loadOrSeedGlobalConfig(repo store.SettingsRepository) (*domain.GlobalConfig, error) {
-	raw, err := repo.Get(context.Background(), "global")
+// loadGlobalConfig reads the GlobalConfig from the store.
+// Returns an empty GlobalConfig (all sections nil) when none has been saved yet.
+func loadGlobalConfig(repo store.GlobalConfigRepository) (*domain.GlobalConfig, error) {
+	gcfg, err := repo.Get(context.Background())
 	if err == nil {
-		var gcfg domain.GlobalConfig
-		if err := json.Unmarshal(raw, &gcfg); err != nil {
-			return nil, fmt.Errorf("unmarshal stored config: %w", err)
-		}
 		slog.Info("server: loaded global config from store")
-		return &gcfg, nil
+		return gcfg, nil
 	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return nil, fmt.Errorf("read stored config: %w", err)
+	if errors.Is(err, store.ErrNotFound) {
+		slog.Info("server: no global config in store, starting unconfigured")
+		return &domain.GlobalConfig{}, nil
 	}
-
-	// First boot — seed defaults.
-	gcfg := domain.DefaultGlobalConfig()
-	raw, _ = json.Marshal(gcfg)
-	if err := repo.Set(context.Background(), "global", raw); err != nil {
-		slog.Warn("server: failed to seed default config", "err", err)
-	} else {
-		slog.Info("server: seeded default global config to store")
-	}
-	return gcfg, nil
+	return nil, fmt.Errorf("read stored config: %w", err)
 }

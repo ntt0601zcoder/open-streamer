@@ -5,10 +5,10 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"sync"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/api"
@@ -19,6 +19,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 )
 
 // serviceEntry tracks one running service goroutine.
@@ -30,14 +31,14 @@ type serviceEntry struct {
 // Deps holds all service references needed by the Manager.
 // Populated by main.go from the DI injector.
 type Deps struct {
-	Ingestor     *ingestor.Service
-	Publisher    *publisher.Service
-	Coordinator  *coordinator.Coordinator
-	HooksSvc     *hooks.Service
-	APISrv       *api.Server
-	Bus          events.Bus
-	StreamRepo   store.StreamRepository
-	SettingsRepo store.SettingsRepository
+	Ingestor         *ingestor.Service
+	Publisher        *publisher.Service
+	Coordinator      *coordinator.Coordinator
+	HooksSvc         *hooks.Service
+	APISrv           *api.Server
+	Bus              events.Bus
+	StreamRepo       store.StreamRepository
+	GlobalConfigRepo store.GlobalConfigRepository
 }
 
 // Manager owns the lifecycle of all long-running services.
@@ -98,11 +99,7 @@ func (m *Manager) CurrentConfig() *domain.GlobalConfig {
 // Apply saves a new GlobalConfig to the store and diffs against the current
 // config to start/stop services as needed.
 func (m *Manager) Apply(ctx context.Context, newCfg *domain.GlobalConfig) error {
-	raw, err := json.Marshal(newCfg)
-	if err != nil {
-		return fmt.Errorf("runtime: marshal config: %w", err)
-	}
-	if err := m.deps.SettingsRepo.Set(ctx, "global", raw); err != nil {
+	if err := m.deps.GlobalConfigRepo.Set(ctx, newCfg); err != nil {
 		return fmt.Errorf("runtime: save config: %w", err)
 	}
 
@@ -130,31 +127,17 @@ func (m *Manager) WaitAll() {
 
 // --- internal ---
 
-const settingsKey = "global"
-
 func (m *Manager) loadOrSeed() (*domain.GlobalConfig, error) {
-	raw, err := m.deps.SettingsRepo.Get(context.Background(), settingsKey)
+	gcfg, err := m.deps.GlobalConfigRepo.Get(context.Background())
 	if err == nil {
-		var gcfg domain.GlobalConfig
-		if err := json.Unmarshal(raw, &gcfg); err != nil {
-			return nil, fmt.Errorf("unmarshal stored config: %w", err)
-		}
 		slog.Info("runtime: loaded global config from store")
-		return &gcfg, nil
+		return gcfg, nil
 	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return nil, fmt.Errorf("read stored config: %w", err)
+	if errors.Is(err, store.ErrNotFound) {
+		slog.Info("runtime: no global config in store, starting unconfigured")
+		return &domain.GlobalConfig{}, nil
 	}
-
-	// First boot — seed defaults.
-	gcfg := domain.DefaultGlobalConfig()
-	raw, _ = json.Marshal(gcfg)
-	if err := m.deps.SettingsRepo.Set(context.Background(), settingsKey, raw); err != nil {
-		slog.Warn("runtime: failed to seed default config", "err", err)
-	} else {
-		slog.Info("runtime: seeded default global config to store")
-	}
-	return gcfg, nil
+	return nil, fmt.Errorf("read stored config: %w", err)
 }
 
 // applyAll starts all services that are configured (initial boot).
@@ -254,6 +237,14 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 		func(ctx context.Context) error {
 			return m.deps.HooksSvc.Start(ctx)
 		})
+
+	// Log — not a long-running service, just swap the global logger.
+	if configChanged(old.Log, new.Log) {
+		if new.Log != nil {
+			slog.SetDefault(logger.New(*new.Log))
+			slog.Info("runtime: log config applied", "level", new.Log.Level, "format", new.Log.Format)
+		}
+	}
 }
 
 // diffService handles the transition for a single service:
@@ -318,8 +309,8 @@ func (m *Manager) stopService(name string) {
 	}
 }
 
-// configChanged compares two config sections by JSON serialization.
-// Returns true when the serialized forms differ or one is nil and the other is not.
+// configChanged compares two config sections by value.
+// Returns true when the values differ or one is nil and the other is not.
 func configChanged(a, b any) bool {
 	if a == nil && b == nil {
 		return false
@@ -327,9 +318,7 @@ func configChanged(a, b any) bool {
 	if a == nil || b == nil {
 		return true
 	}
-	ja, _ := json.Marshal(a)
-	jb, _ := json.Marshal(b)
-	return string(ja) != string(jb)
+	return !reflect.DeepEqual(a, b)
 }
 
 func ptrIf[T any](cond bool, v *T) *T {

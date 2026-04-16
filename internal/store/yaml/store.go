@@ -17,7 +17,6 @@ package yaml
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,7 +36,7 @@ type db struct {
 	Streams    map[string]*domain.Stream    `yaml:"streams,omitempty"`
 	Recordings map[string]*domain.Recording `yaml:"recordings,omitempty"`
 	Hooks      map[string]*domain.Hook      `yaml:"hooks,omitempty"`
-	Global     map[string]any               `yaml:"global,omitempty"` // native YAML values; converted to/from JSON at the repo layer
+	Global     *domain.GlobalConfig         `yaml:"global,omitempty"`
 }
 
 // Store is a YAML-backed implementation of all repositories.
@@ -64,8 +63,8 @@ func (s *Store) Recordings() store.RecordingRepository { return &recordingRepo{s
 // Hooks returns a HookRepository backed by this Store.
 func (s *Store) Hooks() store.HookRepository { return &hookRepo{s} }
 
-// Settings returns a SettingsRepository backed by this Store.
-func (s *Store) Settings() store.SettingsRepository { return &settingsRepo{s} }
+// GlobalConfig returns a GlobalConfigRepository backed by this Store.
+func (s *Store) GlobalConfig() store.GlobalConfigRepository { return &globalConfigRepo{s} }
 
 // --- internal helpers ---
 
@@ -297,41 +296,27 @@ func (r *hookRepo) Delete(_ context.Context, id domain.HookID) error {
 	})
 }
 
-// --- SettingsRepository ---
+// --- GlobalConfigRepository ---
 
-type settingsRepo struct{ s *Store }
+type globalConfigRepo struct{ s *Store }
 
-// Get implements store.SettingsRepository.
-// The native YAML value is marshalled back to JSON for the interface contract.
-func (r *settingsRepo) Get(_ context.Context, key string) (json.RawMessage, error) {
-	var result json.RawMessage
+// Get implements store.GlobalConfigRepository.
+func (r *globalConfigRepo) Get(_ context.Context) (*domain.GlobalConfig, error) {
+	var result *domain.GlobalConfig
 	err := r.s.readAll(func(d db) error {
-		v, ok := d.Global[key]
-		if !ok {
-			return fmt.Errorf("settings %s: %w", key, store.ErrNotFound)
+		if d.Global == nil {
+			return fmt.Errorf("global config: %w", store.ErrNotFound)
 		}
-		raw, err := json.Marshal(v)
-		if err != nil {
-			return fmt.Errorf("settings %s: marshal: %w", key, err)
-		}
-		result = raw
+		result = d.Global
 		return nil
 	})
 	return result, err
 }
 
-// Set implements store.SettingsRepository.
-// The JSON value is unmarshalled to a native Go value so it is stored as proper YAML.
-func (r *settingsRepo) Set(_ context.Context, key string, value json.RawMessage) error {
+// Set implements store.GlobalConfigRepository.
+func (r *globalConfigRepo) Set(_ context.Context, cfg *domain.GlobalConfig) error {
 	return r.s.modify(func(d *db) error {
-		if d.Global == nil {
-			d.Global = make(map[string]any)
-		}
-		var v any
-		if err := json.Unmarshal(value, &v); err != nil {
-			return fmt.Errorf("settings %s: unmarshal: %w", key, err)
-		}
-		d.Global[key] = v
+		d.Global = cfg
 		return nil
 	})
 }
