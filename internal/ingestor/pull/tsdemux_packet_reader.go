@@ -125,8 +125,17 @@ func (d *TSDemuxPacketReader) Open(ctx context.Context) error {
 	d.demuxDone = make(chan struct{})
 	d.started = true
 
+	// Capture channel references in the calling goroutine (under mutex) before
+	// launching workers.  Close() sets d.q = nil; if the goroutine scheduler
+	// delays runDemux until after Close runs, reading d.q inside runDemux would
+	// yield nil → panic on close(nil channel).
+	q := d.q
+	done := d.done
+	chunks := d.chunks
+	demuxDone := d.demuxDone
+
 	go d.pumpChunks(ctx)
-	go d.runDemux()
+	go d.runDemux(q, done, chunks, demuxDone)
 	return nil
 }
 
@@ -185,15 +194,16 @@ func (d *TSDemuxPacketReader) captureReadErr(err error, ctx context.Context) {
 // byte, re-syncing within one TS packet.  A counter (consecutiveErrors) tracks how
 // many restarts happened without a single successful frame; once it reaches
 // maxDemuxRestarts the goroutine gives up so the caller can reconnect.
-func (d *TSDemuxPacketReader) runDemux() {
-	// Capture both channels locally to avoid closing nil if Close races.
-	q := d.q
-	done := d.done
-
-	defer close(d.demuxDone)
+func (d *TSDemuxPacketReader) runDemux(
+	q chan domain.AVPacket,
+	done chan struct{},
+	chunks chan []byte,
+	demuxDone chan struct{},
+) {
+	defer close(demuxDone)
 	defer close(q)
 
-	cr := &chanReader{ch: d.chunks}
+	cr := &chanReader{ch: chunks}
 
 	consecutiveErrors := 0
 	for {

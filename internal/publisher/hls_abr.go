@@ -188,7 +188,7 @@ func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream, s
 	}
 
 	streamBase := filepath.Join(hlsDir, string(code))
-	if err := resetOutputDir(streamBase); err != nil {
+	if err := os.MkdirAll(streamBase, 0o755); err != nil {
 		slog.Error("publisher: HLS ABR setup dir failed",
 			"stream_code", code, "dir", streamBase, "err", err)
 		return

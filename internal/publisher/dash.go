@@ -3,6 +3,7 @@ package publisher
 import (
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -18,8 +19,8 @@ func (s *Service) serveDASH(ctx context.Context, streamID domain.StreamCode) {
 	cfg := s.cfg.DASH
 	streamDir := filepath.Join(cfg.Dir, string(streamID))
 
-	if err := resetOutputDir(streamDir); err != nil {
-		slog.Error("publisher: DASH reset output dir failed",
+	if err := os.MkdirAll(streamDir, 0o755); err != nil {
+		slog.Error("publisher: DASH setup dir failed",
 			"stream_code", streamID, "dir", streamDir, "err", err)
 		return
 	}

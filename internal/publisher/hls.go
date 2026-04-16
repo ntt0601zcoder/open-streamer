@@ -63,7 +63,7 @@ func (s *Service) serveHLS(ctx context.Context, streamID domain.StreamCode) {
 	slog.Info("publisher: HLS serve started", "stream_code", streamID, "hls_dir", hlsDir)
 
 	streamDir := filepath.Join(hlsDir, string(streamID))
-	if err := resetOutputDir(streamDir); err != nil {
+	if err := os.MkdirAll(streamDir, 0o755); err != nil {
 		slog.Error("publisher: HLS setup dir failed", "stream_code", streamID, "dir", streamDir, "err", err)
 		return
 	}

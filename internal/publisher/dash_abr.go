@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -30,8 +31,8 @@ func (s *Service) serveDASHAdaptive(ctx context.Context, stream *domain.Stream) 
 	cfg := s.cfg.DASH
 	rootDir := filepath.Join(cfg.Dir, string(stream.Code))
 
-	if err := resetOutputDir(rootDir); err != nil {
-		slog.Error("publisher: DASH ABR reset output dir",
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		slog.Error("publisher: DASH ABR setup dir failed",
 			"stream_code", stream.Code, "err", err)
 		return
 	}
@@ -50,8 +51,8 @@ func (s *Service) serveDASHAdaptive(ctx context.Context, stream *domain.Stream) 
 		slug := r.Slug
 		shardDir := filepath.Join(rootDir, slug)
 
-		if err := resetOutputDir(shardDir); err != nil {
-			slog.Error("publisher: DASH ABR reset shard dir",
+		if err := os.MkdirAll(shardDir, 0o755); err != nil {
+			slog.Error("publisher: DASH ABR setup shard dir failed",
 				"stream_code", stream.Code, "slug", slug, "err", err)
 			continue
 		}
