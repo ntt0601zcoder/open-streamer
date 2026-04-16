@@ -836,40 +836,6 @@ const docTemplate = `{
                     }
                 }
             }
-        },
-        "/streams/{code}/stop": {
-            "post": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "streams"
-                ],
-                "summary": "Stop stream pipeline",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Stream code",
-                        "name": "code",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.StreamActionData"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
         }
     },
     "definitions": {

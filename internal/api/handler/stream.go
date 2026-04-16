@@ -319,21 +319,6 @@ func (h *StreamHandler) SwitchInput(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]string{"status": "switched"}})
 }
 
-// Stop tears down the stream pipeline. Blocks until all goroutines have exited
-// and on-disk segments have been cleaned up.
-// @Summary Stop stream pipeline
-// @Tags streams
-// @Produce json
-// @Param code path string true "Stream code"
-// @Success 200 {object} apidocs.StreamActionData
-// @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/stop [post].
-func (h *StreamHandler) Stop(w http.ResponseWriter, r *http.Request) {
-	code := domain.StreamCode(chi.URLParam(r, "code"))
-	h.coordinator.Stop(code)
-	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]string{"status": "stopped"}})
-}
-
 // Status returns persisted stream, whether the pipeline is registered, and manager runtime snapshot.
 // @Summary Stream status
 // @Tags streams
