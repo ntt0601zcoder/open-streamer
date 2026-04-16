@@ -35,6 +35,9 @@ type Coordinator struct {
 
 	rendMu     sync.Mutex
 	renditions map[domain.StreamCode][]string // ABR rendition slugs per stream (for buffer teardown)
+
+	statusMu sync.RWMutex
+	status   map[domain.StreamCode]domain.StreamStatus // runtime status per running stream
 }
 
 // New registers a Coordinator with the DI injector.
@@ -49,6 +52,7 @@ func New(i do.Injector) (*Coordinator, error) {
 		m:          do.MustInvoke[*metrics.Metrics](i),
 		streamRepo: do.MustInvoke[store.StreamRepository](i),
 		renditions: make(map[domain.StreamCode][]string),
+		status:     make(map[domain.StreamCode]domain.StreamStatus),
 	}
 	c.tc.SetFatalCallback(c.handleTranscoderFatal)
 	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
@@ -75,11 +79,41 @@ func newForTesting(
 		bus:        bus,
 		m:          m,
 		renditions: make(map[domain.StreamCode][]string),
+		status:     make(map[domain.StreamCode]domain.StreamStatus),
 	}
 	c.tc.SetFatalCallback(c.handleTranscoderFatal)
 	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
 	c.mgr.SetRestoredCallback(c.handleInputRestored)
 	return c
+}
+
+// StreamStatus returns the runtime status of a stream pipeline.
+// It is derived purely from in-memory state — never read from the store.
+//
+//   - StatusStopped  — pipeline is not registered (never started, or was stopped)
+//   - StatusActive   — pipeline is running and at least one input is live
+//   - StatusDegraded — pipeline is running but all inputs are currently exhausted
+func (c *Coordinator) StreamStatus(code domain.StreamCode) domain.StreamStatus {
+	if !c.IsRunning(code) {
+		return domain.StatusStopped
+	}
+	c.statusMu.RLock()
+	st := c.status[code]
+	c.statusMu.RUnlock()
+	if st == "" {
+		return domain.StatusActive
+	}
+	return st
+}
+
+func (c *Coordinator) setStatus(code domain.StreamCode, st domain.StreamStatus) {
+	c.statusMu.Lock()
+	if st == "" || st == domain.StatusActive {
+		delete(c.status, code) // active is the default; no need to store it explicitly
+	} else {
+		c.status[code] = st
+	}
+	c.statusMu.Unlock()
 }
 
 // Start creates the buffer, registers the stream with the manager (ingest + failover),
@@ -180,6 +214,8 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 		c.m.StreamStartTimeSeconds.WithLabelValues(string(stream.Code)).Set(float64(time.Now().Unix()))
 	}
 
+	c.setStatus(stream.Code, domain.StatusActive)
+
 	c.bus.Publish(ctx, domain.Event{
 		Type:       domain.EventStreamStarted,
 		StreamCode: stream.Code,
@@ -218,6 +254,8 @@ func (c *Coordinator) Stop(streamID domain.StreamCode) {
 	if c.m != nil {
 		c.m.StreamStartTimeSeconds.DeleteLabelValues(string(streamID))
 	}
+
+	c.setStatus(streamID, domain.StatusActive)
 
 	c.bus.Publish(context.Background(), domain.Event{
 		Type:       domain.EventStreamStopped,
@@ -476,22 +514,10 @@ func (c *Coordinator) reloadDVRIfBufferChanged(ctx context.Context, old, new *do
 }
 
 // handleAllInputsExhausted is called by the manager when all inputs are degraded.
-// It persists stream status as degraded so operators and hooks are notified.
 func (c *Coordinator) handleAllInputsExhausted(streamCode domain.StreamCode) {
-	slog.Warn("coordinator: all inputs exhausted, marking stream degraded",
-		"stream_code", streamCode,
-	)
-	ctx := context.Background()
-	st, err := c.streamRepo.FindByCode(ctx, streamCode)
-	if err != nil {
-		slog.Warn("coordinator: exhausted — could not load stream", "stream_code", streamCode, "err", err)
-		return
-	}
-	st.Status = domain.StatusDegraded
-	if err := c.streamRepo.Save(ctx, st); err != nil {
-		slog.Warn("coordinator: exhausted — could not persist stream status", "stream_code", streamCode, "err", err)
-	}
-	c.bus.Publish(ctx, domain.Event{
+	slog.Warn("coordinator: all inputs exhausted, stream degraded", "stream_code", streamCode)
+	c.setStatus(streamCode, domain.StatusDegraded)
+	c.bus.Publish(context.Background(), domain.Event{
 		Type:       domain.EventInputDegraded,
 		StreamCode: streamCode,
 		Payload:    map[string]any{"reason": "all_inputs_exhausted"},
@@ -499,47 +525,23 @@ func (c *Coordinator) handleAllInputsExhausted(streamCode domain.StreamCode) {
 }
 
 // handleInputRestored is called by the manager when failover succeeds after all inputs
-// were previously exhausted. Marks the stream active again.
+// were previously exhausted.
 func (c *Coordinator) handleInputRestored(streamCode domain.StreamCode) {
-	slog.Info("coordinator: input restored, marking stream active",
-		"stream_code", streamCode,
-	)
-	ctx := context.Background()
-	st, err := c.streamRepo.FindByCode(ctx, streamCode)
-	if err != nil {
-		slog.Warn("coordinator: restored — could not load stream", "stream_code", streamCode, "err", err)
-		return
-	}
-	st.Status = domain.StatusActive
-	if err := c.streamRepo.Save(ctx, st); err != nil {
-		slog.Warn("coordinator: restored — could not persist stream status", "stream_code", streamCode, "err", err)
-	}
+	slog.Info("coordinator: input restored, stream active", "stream_code", streamCode)
+	c.setStatus(streamCode, domain.StatusActive)
 }
 
 // handleTranscoderFatal is called by the transcoder when a profile exceeds MaxRestarts.
-// It stops the full pipeline and marks the stream as stopped in the store.
+// It stops the full pipeline; status transitions to StatusStopped automatically via Stop().
 func (c *Coordinator) handleTranscoderFatal(streamCode domain.StreamCode) {
-	slog.Error("coordinator: transcoder fatal, stopping stream pipeline",
-		"stream_code", streamCode,
-	)
+	slog.Error("coordinator: transcoder fatal, stopping stream pipeline", "stream_code", streamCode)
 	c.Stop(streamCode)
-
-	ctx := context.Background()
-	st, err := c.streamRepo.FindByCode(ctx, streamCode)
-	if err != nil {
-		slog.Warn("coordinator: transcoder fatal — could not load stream to update status",
-			"stream_code", streamCode, "err", err)
-		return
-	}
-	st.Status = domain.StatusStopped
-	if err := c.streamRepo.Save(ctx, st); err != nil {
-		slog.Warn("coordinator: transcoder fatal — could not persist stream status",
-			"stream_code", streamCode, "err", err)
-	}
 }
 
-// BootstrapPersistedStreams loads every stream from the store (except those marked stopped
-// or disabled) and starts the ingest + publish pipeline for each stream that has at least one input.
+// BootstrapPersistedStreams starts the pipeline for every non-disabled stream that
+// has at least one input configured.  Stream status is never persisted, so all
+// eligible streams are started fresh on every boot regardless of their last
+// known runtime state.
 func BootstrapPersistedStreams(ctx context.Context, log *slog.Logger, repo store.StreamRepository, coord *Coordinator) {
 	streams, err := repo.List(ctx, store.StreamFilter{})
 	if err != nil {
@@ -548,9 +550,6 @@ func BootstrapPersistedStreams(ctx context.Context, log *slog.Logger, repo store
 	}
 	for _, st := range streams {
 		if st == nil {
-			continue
-		}
-		if st.Status == domain.StatusStopped {
 			continue
 		}
 		if st.Disabled {

@@ -24,6 +24,18 @@ type StreamHandler struct {
 	bus         events.Bus
 }
 
+// streamResponse is the API representation of a stream.
+// It embeds the persisted domain.Stream (whose Status field is json:"-") and
+// overlays a runtime-computed status so clients always see the live state.
+type streamResponse struct {
+	*domain.Stream
+	Status domain.StreamStatus `json:"status"`
+}
+
+func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
+	return streamResponse{Stream: s, Status: h.coordinator.StreamStatus(s.Code)}
+}
+
 // NewStreamHandler creates a StreamHandler and registers it with the DI injector.
 func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
 	return &StreamHandler{
@@ -44,24 +56,33 @@ func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
 // @Failure 500 {object} apidocs.ErrorBody
 // @Router /streams [get].
 func (h *StreamHandler) List(w http.ResponseWriter, r *http.Request) {
-	filter := store.StreamFilter{}
+	var statusFilter *domain.StreamStatus
 	if q := r.URL.Query().Get("status"); q != "" {
 		st := domain.StreamStatus(q)
 		switch st {
 		case domain.StatusIdle, domain.StatusActive, domain.StatusDegraded, domain.StatusStopped:
-			filter.Status = &st
+			statusFilter = &st
 		default:
 			writeError(w, http.StatusBadRequest, "INVALID_QUERY", "unknown status filter")
 			return
 		}
 	}
 
-	streams, err := h.streamRepo.List(r.Context(), filter)
+	streams, err := h.streamRepo.List(r.Context(), store.StreamFilter{})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "LIST_FAILED", "failed to list streams")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": streams, "total": len(streams)})
+
+	resp := make([]streamResponse, 0, len(streams))
+	for _, s := range streams {
+		sr := h.withStatus(s)
+		if statusFilter != nil && sr.Status != *statusFilter {
+			continue
+		}
+		resp = append(resp, sr)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": resp, "total": len(resp)})
 }
 
 // Get returns one stream by code.
@@ -80,7 +101,7 @@ func (h *StreamHandler) Get(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": stream})
+	writeJSON(w, http.StatusOK, map[string]any{"data": h.withStatus(stream)})
 }
 
 // Put creates or replaces a stream configuration.
@@ -184,9 +205,6 @@ func decodeStreamPutBody(
 		}
 	} else {
 		body.CreatedAt = time.Now()
-		if body.Status == "" {
-			body.Status = domain.StatusIdle
-		}
 	}
 	body.UpdatedAt = time.Now()
 	return &body, nil
@@ -233,41 +251,24 @@ func (h *StreamHandler) Start(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "STREAM_DISABLED", "stream is disabled; clear disabled flag before starting")
 		return
 	}
-	stream.Status = domain.StatusActive
 	if err := h.coordinator.Start(r.Context(), stream); err != nil {
 		writeError(w, http.StatusInternalServerError, "START_FAILED", err.Error())
-		return
-	}
-	if err := h.streamRepo.Save(r.Context(), stream); err != nil {
-		writeError(w, http.StatusInternalServerError, "SAVE_FAILED", "stream started but failed to persist status")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]string{"status": "started"}})
 }
 
-// Stop tears down the stream pipeline and persists status stopped.
+// Stop tears down the stream pipeline.
 // @Summary Stop stream pipeline
 // @Tags streams
 // @Produce json
 // @Param code path string true "Stream code"
 // @Success 200 {object} apidocs.StreamActionData
-// @Failure 404 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
 // @Router /streams/{code}/stop [post].
 func (h *StreamHandler) Stop(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
-	stream, err := h.streamRepo.FindByCode(r.Context(), code)
-	if err != nil {
-		h.coordinator.Stop(code)
-		writeStoreError(w, err)
-		return
-	}
 	h.coordinator.Stop(code)
-	stream.Status = domain.StatusStopped
-	if err := h.streamRepo.Save(r.Context(), stream); err != nil {
-		writeError(w, http.StatusInternalServerError, "SAVE_FAILED", "failed to persist stream status")
-		return
-	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]string{"status": "stopped"}})
 }
 

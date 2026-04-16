@@ -56,8 +56,10 @@ type Stream struct {
 	// StreamKey is used to authenticate RTMP/SRT push ingest.
 	StreamKey string `json:"stream_key"`
 
-	// Status is the runtime lifecycle state (not persisted between restarts).
-	Status StreamStatus `json:"status"`
+	// Status is the runtime lifecycle state.
+	// It is never persisted — always computed from the coordinator's in-memory
+	// state and overlaid by the API layer before returning responses to clients.
+	Status StreamStatus `json:"-"`
 
 	// Disabled when true excludes the stream from server bootstrap and rejects pipeline Start.
 	Disabled bool `json:"disabled"`

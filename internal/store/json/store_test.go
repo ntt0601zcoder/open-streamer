@@ -40,7 +40,6 @@ func TestJSONStreamRepo_SaveAndFindByCode(t *testing.T) {
 	assert.Equal(t, want.Description, got.Description)
 	assert.Equal(t, want.Tags, got.Tags)
 	assert.Equal(t, want.StreamKey, got.StreamKey)
-	assert.Equal(t, want.Status, got.Status)
 	assert.Equal(t, want.Disabled, got.Disabled)
 
 	require.Len(t, got.Inputs, 2)
@@ -121,7 +120,6 @@ func TestJSONStreamRepo_List(t *testing.T) {
 
 	s1 := storetest.NewFullStream("stream1")
 	s2 := storetest.NewFullStream("stream2")
-	s2.Status = domain.StatusStopped
 
 	require.NoError(t, repo.Save(ctx, s1))
 	require.NoError(t, repo.Save(ctx, s2))
@@ -129,12 +127,6 @@ func TestJSONStreamRepo_List(t *testing.T) {
 	all, err := repo.List(ctx, store.StreamFilter{})
 	require.NoError(t, err)
 	assert.Len(t, all, 2)
-
-	activeStatus := domain.StatusActive
-	active, err := repo.List(ctx, store.StreamFilter{Status: &activeStatus})
-	require.NoError(t, err)
-	assert.Len(t, active, 1)
-	assert.Equal(t, domain.StreamCode("stream1"), active[0].Code)
 }
 
 func TestJSONStreamRepo_Update(t *testing.T) {
@@ -145,13 +137,11 @@ func TestJSONStreamRepo_Update(t *testing.T) {
 	require.NoError(t, repo.Save(ctx, s))
 
 	s.Name = "Updated Name"
-	s.Status = domain.StatusStopped
 	require.NoError(t, repo.Save(ctx, s))
 
 	got, err := repo.FindByCode(ctx, "update_me")
 	require.NoError(t, err)
 	assert.Equal(t, "Updated Name", got.Name)
-	assert.Equal(t, domain.StatusStopped, got.Status)
 }
 
 func TestJSONStreamRepo_Delete(t *testing.T) {
@@ -182,7 +172,6 @@ func TestJSONRecordingRepo_SaveAndFindByID(t *testing.T) {
 
 	assert.Equal(t, want.ID, got.ID)
 	assert.Equal(t, want.StreamCode, got.StreamCode)
-	assert.Equal(t, want.Status, got.Status)
 	assert.Equal(t, want.SegmentDir, got.SegmentDir)
 	assert.Equal(t, want.StartedAt.UTC(), got.StartedAt.UTC())
 	require.NotNil(t, got.StoppedAt)

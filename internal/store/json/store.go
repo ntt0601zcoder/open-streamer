@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -166,16 +167,22 @@ func (r *streamRepo) FindByCode(_ context.Context, code domain.StreamCode) (*dom
 }
 
 // List implements store.StreamRepository.
-func (r *streamRepo) List(_ context.Context, filter store.StreamFilter) ([]*domain.Stream, error) {
+func (r *streamRepo) List(_ context.Context, _ store.StreamFilter) ([]*domain.Stream, error) {
 	var result []*domain.Stream
 	err := r.s.readAll(func(d db) error {
 		result = make([]*domain.Stream, 0, len(d.Streams))
 		for _, s := range d.Streams {
-			if filter.Status != nil && s.Status != *filter.Status {
-				continue
-			}
 			result = append(result, s)
 		}
+		slices.SortFunc(result, func(a, b *domain.Stream) int {
+			if a.Code < b.Code {
+				return -1
+			}
+			if a.Code > b.Code {
+				return 1
+			}
+			return 0
+		})
 		return nil
 	})
 	return result, err

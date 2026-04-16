@@ -14,9 +14,9 @@ import (
 var ErrNotFound = errors.New("store: not found")
 
 // StreamFilter holds optional filters for listing streams.
-type StreamFilter struct {
-	Status *domain.StreamStatus
-}
+// Stream status is runtime-only and never persisted, so there is no Status filter here;
+// callers that need status filtering must do so after querying the coordinator.
+type StreamFilter struct{}
 
 // StreamRepository persists stream configurations and state.
 type StreamRepository interface {

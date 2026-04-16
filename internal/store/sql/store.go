@@ -105,19 +105,13 @@ func (r *streamRepo) FindByCode(ctx context.Context, code domain.StreamCode) (*d
 }
 
 // List implements store.StreamRepository.
-func (r *streamRepo) List(ctx context.Context, filter store.StreamFilter) ([]*domain.Stream, error) {
-	q := `SELECT data FROM streams`
-	var args []any
-	if filter.Status != nil {
-		q += ` WHERE data->>'status' = $1`
-		args = append(args, string(*filter.Status))
-	}
-	q += ` ORDER BY id`
+func (r *streamRepo) List(ctx context.Context, _ store.StreamFilter) ([]*domain.Stream, error) {
+	const q = `SELECT data FROM streams ORDER BY data->>'code'`
 
 	var rows []struct {
 		Data []byte `db:"data"`
 	}
-	if err := r.db.SelectContext(ctx, &rows, q, args...); err != nil {
+	if err := r.db.SelectContext(ctx, &rows, q); err != nil {
 		return nil, fmt.Errorf("sql streams.List: %w", err)
 	}
 	out := make([]*domain.Stream, 0, len(rows))

@@ -136,9 +136,6 @@ func (r *streamRepo) List(ctx context.Context, filter store.StreamFilter) ([]*do
 		if err := json.Unmarshal(doc.Data, &s); err != nil {
 			return nil, fmt.Errorf("mongo streams.List: unmarshal: %w", err)
 		}
-		if filter.Status != nil && s.Status != *filter.Status {
-			continue
-		}
 		out = append(out, &s)
 	}
 	if err := cur.Err(); err != nil {
