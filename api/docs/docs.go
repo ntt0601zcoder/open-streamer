@@ -29,7 +29,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/handler.configResponse"
+                            "$ref": "#/definitions/apidocs.ConfigData"
                         }
                     }
                 }
@@ -906,6 +906,53 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "apidocs.ConfigData": {
+            "type": "object",
+            "properties": {
+                "audioCodecs": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.AudioCodec"
+                    }
+                },
+                "hwAccels": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.HWAccel"
+                    }
+                },
+                "outputProtocols": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "streamStatuses": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.StreamStatus"
+                    }
+                },
+                "videoCodecs": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.VideoCodec"
+                    }
+                },
+                "watermarkPositions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.WatermarkPosition"
+                    }
+                },
+                "watermarkTypes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.WatermarkType"
+                    }
+                }
+            }
+        },
         "apidocs.ErrorBody": {
             "type": "object",
             "properties": {
@@ -1005,7 +1052,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "data": {
-                    "$ref": "#/definitions/domain.Stream"
+                    "$ref": "#/definitions/apidocs.StreamResponse"
                 }
             }
         },
@@ -1015,7 +1062,7 @@ const docTemplate = `{
                 "data": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/definitions/domain.Stream"
+                        "$ref": "#/definitions/apidocs.StreamResponse"
                     }
                 },
                 "total": {
@@ -1070,6 +1117,109 @@ const docTemplate = `{
                 },
                 "watermark": {
                     "$ref": "#/definitions/domain.WatermarkConfig"
+                }
+            }
+        },
+        "apidocs.StreamResponse": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "description": "Code is the unique key chosen by the user ([a-zA-Z0-9_]).",
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "disabled": {
+                    "description": "Disabled when true excludes the stream from server bootstrap and rejects pipeline Start.",
+                    "type": "boolean"
+                },
+                "dvr": {
+                    "description": "DVR overrides the global DVR settings for this specific stream.\nIf nil, the global config is used (when DVR is enabled globally).",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.StreamDVRConfig"
+                        }
+                    ]
+                },
+                "inputs": {
+                    "description": "Inputs are the available ingest sources ordered by Priority.\nThe Stream Manager monitors health and switches between them on failure.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.Input"
+                    }
+                },
+                "name": {
+                    "type": "string"
+                },
+                "protocols": {
+                    "description": "Protocols defines which delivery protocols are opened for this stream.\nThe server opens a listener/packager for each enabled protocol.\nProtocol-level config (ports, segment duration, CDN URL) lives in server config.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.OutputProtocols"
+                        }
+                    ]
+                },
+                "push": {
+                    "description": "Push is the list of external destinations the server actively pushes to.\nEach entry defines one push target (YouTube, Facebook, Twitch, CDN relay, etc.).",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.PushDestination"
+                    }
+                },
+                "runtime": {
+                    "$ref": "#/definitions/apidocs.StreamRuntime"
+                },
+                "status": {
+                    "$ref": "#/definitions/domain.StreamStatus"
+                },
+                "stream_key": {
+                    "description": "StreamKey is used to authenticate RTMP/SRT push ingest.",
+                    "type": "string"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "thumbnail": {
+                    "description": "Thumbnail controls periodic screenshot generation for preview images.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.ThumbnailConfig"
+                        }
+                    ]
+                },
+                "transcoder": {
+                    "description": "Transcoder controls encoding/decoding settings.\nnil means no transcoding for this stream.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.TranscoderConfig"
+                        }
+                    ]
+                },
+                "updated_at": {
+                    "type": "string"
+                },
+                "watermark": {
+                    "description": "Watermark is an optional text or image overlay applied before encoding.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.WatermarkConfig"
+                        }
+                    ]
+                }
+            }
+        },
+        "apidocs.StreamRuntime": {
+            "type": "object",
+            "properties": {
+                "active_input_priority": {
+                    "type": "integer"
                 }
             }
         },
@@ -1482,95 +1632,6 @@ const docTemplate = `{
                 "RecordingStatusFailed"
             ]
         },
-        "domain.Stream": {
-            "type": "object",
-            "properties": {
-                "code": {
-                    "description": "Code is the unique key chosen by the user ([a-zA-Z0-9_]).",
-                    "type": "string"
-                },
-                "created_at": {
-                    "type": "string"
-                },
-                "description": {
-                    "type": "string"
-                },
-                "disabled": {
-                    "description": "Disabled when true excludes the stream from server bootstrap and rejects pipeline Start.",
-                    "type": "boolean"
-                },
-                "dvr": {
-                    "description": "DVR overrides the global DVR settings for this specific stream.\nIf nil, the global config is used (when DVR is enabled globally).",
-                    "allOf": [
-                        {
-                            "$ref": "#/definitions/domain.StreamDVRConfig"
-                        }
-                    ]
-                },
-                "inputs": {
-                    "description": "Inputs are the available ingest sources ordered by Priority.\nThe Stream Manager monitors health and switches between them on failure.",
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/domain.Input"
-                    }
-                },
-                "name": {
-                    "type": "string"
-                },
-                "protocols": {
-                    "description": "Protocols defines which delivery protocols are opened for this stream.\nThe server opens a listener/packager for each enabled protocol.\nProtocol-level config (ports, segment duration, CDN URL) lives in server config.",
-                    "allOf": [
-                        {
-                            "$ref": "#/definitions/domain.OutputProtocols"
-                        }
-                    ]
-                },
-                "push": {
-                    "description": "Push is the list of external destinations the server actively pushes to.\nEach entry defines one push target (YouTube, Facebook, Twitch, CDN relay, etc.).",
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/domain.PushDestination"
-                    }
-                },
-                "stream_key": {
-                    "description": "StreamKey is used to authenticate RTMP/SRT push ingest.",
-                    "type": "string"
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "thumbnail": {
-                    "description": "Thumbnail controls periodic screenshot generation for preview images.",
-                    "allOf": [
-                        {
-                            "$ref": "#/definitions/domain.ThumbnailConfig"
-                        }
-                    ]
-                },
-                "transcoder": {
-                    "description": "Transcoder controls encoding/decoding settings.\nnil means no transcoding for this stream.",
-                    "allOf": [
-                        {
-                            "$ref": "#/definitions/domain.TranscoderConfig"
-                        }
-                    ]
-                },
-                "updated_at": {
-                    "type": "string"
-                },
-                "watermark": {
-                    "description": "Watermark is an optional text or image overlay applied before encoding.",
-                    "allOf": [
-                        {
-                            "$ref": "#/definitions/domain.WatermarkConfig"
-                        }
-                    ]
-                }
-            }
-        },
         "domain.StreamDVRConfig": {
             "type": "object",
             "properties": {
@@ -1853,53 +1914,6 @@ const docTemplate = `{
                 "WatermarkTypeText",
                 "WatermarkTypeImage"
             ]
-        },
-        "handler.configResponse": {
-            "type": "object",
-            "properties": {
-                "audioCodecs": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/domain.AudioCodec"
-                    }
-                },
-                "hwAccels": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/domain.HWAccel"
-                    }
-                },
-                "outputProtocols": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "streamStatuses": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/domain.StreamStatus"
-                    }
-                },
-                "videoCodecs": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/domain.VideoCodec"
-                    }
-                },
-                "watermarkPositions": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/domain.WatermarkPosition"
-                    }
-                },
-                "watermarkTypes": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/domain.WatermarkType"
-                    }
-                }
-            }
         }
     }
 }`

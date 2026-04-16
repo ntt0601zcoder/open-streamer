@@ -11,9 +11,23 @@ type ErrorBody struct {
 	} `json:"error"`
 }
 
-// StreamData wraps a single stream.
+// StreamRuntime holds live pipeline state overlaid on the persisted stream config.
+// Null when the pipeline is not running.
+type StreamRuntime struct {
+	ActiveInputPriority int `json:"active_input_priority"`
+}
+
+// StreamResponse is the API representation of a stream returned by GET /streams and GET /streams/{code}.
+// It adds runtime-computed fields on top of the persisted configuration.
+type StreamResponse struct {
+	domain.Stream
+	Status  domain.StreamStatus `json:"status"`
+	Runtime *StreamRuntime      `json:"runtime"`
+}
+
+// StreamData wraps a single stream response.
 type StreamData struct {
-	Data *domain.Stream `json:"data"`
+	Data StreamResponse `json:"data"`
 }
 
 // StreamPutRequest is request body for PUT /streams/{code}.
@@ -39,8 +53,19 @@ type StreamPutRequest struct {
 
 // StreamList wraps listed streams.
 type StreamList struct {
-	Data  []*domain.Stream `json:"data"`
+	Data  []StreamResponse `json:"data"`
 	Total int              `json:"total"`
+}
+
+// ConfigData wraps the GET /config response.
+type ConfigData struct {
+	HWAccels           []domain.HWAccel          `json:"hwAccels"`
+	VideoCodecs        []domain.VideoCodec        `json:"videoCodecs"`
+	AudioCodecs        []domain.AudioCodec        `json:"audioCodecs"`
+	OutputProtocols    []string                   `json:"outputProtocols"`
+	StreamStatuses     []domain.StreamStatus      `json:"streamStatuses"`
+	WatermarkTypes     []domain.WatermarkType     `json:"watermarkTypes"`
+	WatermarkPositions []domain.WatermarkPosition `json:"watermarkPositions"`
 }
 
 // StreamStatusData combines persisted stream, pipeline flag, and manager runtime snapshot.

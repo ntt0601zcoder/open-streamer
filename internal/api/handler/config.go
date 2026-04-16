@@ -24,7 +24,7 @@ type configResponse struct {
 // @Description Returns available hardware accelerators (OS-detected) and static enum lists for building configuration forms.
 // @Tags        system
 // @Produce     json
-// @Success     200 {object} configResponse
+// @Success     200 {object} apidocs.ConfigData
 // @Router      /config [get].
 func GetConfig(w http.ResponseWriter, _ *http.Request) {
 	resp := configResponse{

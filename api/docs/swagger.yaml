@@ -1,5 +1,36 @@
 basePath: /
 definitions:
+  apidocs.ConfigData:
+    properties:
+      audioCodecs:
+        items:
+          $ref: '#/definitions/domain.AudioCodec'
+        type: array
+      hwAccels:
+        items:
+          $ref: '#/definitions/domain.HWAccel'
+        type: array
+      outputProtocols:
+        items:
+          type: string
+        type: array
+      streamStatuses:
+        items:
+          $ref: '#/definitions/domain.StreamStatus'
+        type: array
+      videoCodecs:
+        items:
+          $ref: '#/definitions/domain.VideoCodec'
+        type: array
+      watermarkPositions:
+        items:
+          $ref: '#/definitions/domain.WatermarkPosition'
+        type: array
+      watermarkTypes:
+        items:
+          $ref: '#/definitions/domain.WatermarkType'
+        type: array
+    type: object
   apidocs.ErrorBody:
     properties:
       error:
@@ -63,13 +94,13 @@ definitions:
   apidocs.StreamData:
     properties:
       data:
-        $ref: '#/definitions/domain.Stream'
+        $ref: '#/definitions/apidocs.StreamResponse'
     type: object
   apidocs.StreamList:
     properties:
       data:
         items:
-          $ref: '#/definitions/domain.Stream'
+          $ref: '#/definitions/apidocs.StreamResponse'
         type: array
       total:
         type: integer
@@ -106,6 +137,83 @@ definitions:
         $ref: '#/definitions/domain.TranscoderConfig'
       watermark:
         $ref: '#/definitions/domain.WatermarkConfig'
+    type: object
+  apidocs.StreamResponse:
+    properties:
+      code:
+        description: Code is the unique key chosen by the user ([a-zA-Z0-9_]).
+        type: string
+      created_at:
+        type: string
+      description:
+        type: string
+      disabled:
+        description: Disabled when true excludes the stream from server bootstrap
+          and rejects pipeline Start.
+        type: boolean
+      dvr:
+        allOf:
+        - $ref: '#/definitions/domain.StreamDVRConfig'
+        description: |-
+          DVR overrides the global DVR settings for this specific stream.
+          If nil, the global config is used (when DVR is enabled globally).
+      inputs:
+        description: |-
+          Inputs are the available ingest sources ordered by Priority.
+          The Stream Manager monitors health and switches between them on failure.
+        items:
+          $ref: '#/definitions/domain.Input'
+        type: array
+      name:
+        type: string
+      protocols:
+        allOf:
+        - $ref: '#/definitions/domain.OutputProtocols'
+        description: |-
+          Protocols defines which delivery protocols are opened for this stream.
+          The server opens a listener/packager for each enabled protocol.
+          Protocol-level config (ports, segment duration, CDN URL) lives in server config.
+      push:
+        description: |-
+          Push is the list of external destinations the server actively pushes to.
+          Each entry defines one push target (YouTube, Facebook, Twitch, CDN relay, etc.).
+        items:
+          $ref: '#/definitions/domain.PushDestination'
+        type: array
+      runtime:
+        $ref: '#/definitions/apidocs.StreamRuntime'
+      status:
+        $ref: '#/definitions/domain.StreamStatus'
+      stream_key:
+        description: StreamKey is used to authenticate RTMP/SRT push ingest.
+        type: string
+      tags:
+        items:
+          type: string
+        type: array
+      thumbnail:
+        allOf:
+        - $ref: '#/definitions/domain.ThumbnailConfig'
+        description: Thumbnail controls periodic screenshot generation for preview
+          images.
+      transcoder:
+        allOf:
+        - $ref: '#/definitions/domain.TranscoderConfig'
+        description: |-
+          Transcoder controls encoding/decoding settings.
+          nil means no transcoding for this stream.
+      updated_at:
+        type: string
+      watermark:
+        allOf:
+        - $ref: '#/definitions/domain.WatermarkConfig'
+        description: Watermark is an optional text or image overlay applied before
+          encoding.
+    type: object
+  apidocs.StreamRuntime:
+    properties:
+      active_input_priority:
+        type: integer
     type: object
   apidocs.StreamStatusData:
     properties:
@@ -458,74 +566,6 @@ definitions:
     - RecordingStatusRecording
     - RecordingStatusStopped
     - RecordingStatusFailed
-  domain.Stream:
-    properties:
-      code:
-        description: Code is the unique key chosen by the user ([a-zA-Z0-9_]).
-        type: string
-      created_at:
-        type: string
-      description:
-        type: string
-      disabled:
-        description: Disabled when true excludes the stream from server bootstrap
-          and rejects pipeline Start.
-        type: boolean
-      dvr:
-        allOf:
-        - $ref: '#/definitions/domain.StreamDVRConfig'
-        description: |-
-          DVR overrides the global DVR settings for this specific stream.
-          If nil, the global config is used (when DVR is enabled globally).
-      inputs:
-        description: |-
-          Inputs are the available ingest sources ordered by Priority.
-          The Stream Manager monitors health and switches between them on failure.
-        items:
-          $ref: '#/definitions/domain.Input'
-        type: array
-      name:
-        type: string
-      protocols:
-        allOf:
-        - $ref: '#/definitions/domain.OutputProtocols'
-        description: |-
-          Protocols defines which delivery protocols are opened for this stream.
-          The server opens a listener/packager for each enabled protocol.
-          Protocol-level config (ports, segment duration, CDN URL) lives in server config.
-      push:
-        description: |-
-          Push is the list of external destinations the server actively pushes to.
-          Each entry defines one push target (YouTube, Facebook, Twitch, CDN relay, etc.).
-        items:
-          $ref: '#/definitions/domain.PushDestination'
-        type: array
-      stream_key:
-        description: StreamKey is used to authenticate RTMP/SRT push ingest.
-        type: string
-      tags:
-        items:
-          type: string
-        type: array
-      thumbnail:
-        allOf:
-        - $ref: '#/definitions/domain.ThumbnailConfig'
-        description: Thumbnail controls periodic screenshot generation for preview
-          images.
-      transcoder:
-        allOf:
-        - $ref: '#/definitions/domain.TranscoderConfig'
-        description: |-
-          Transcoder controls encoding/decoding settings.
-          nil means no transcoding for this stream.
-      updated_at:
-        type: string
-      watermark:
-        allOf:
-        - $ref: '#/definitions/domain.WatermarkConfig'
-        description: Watermark is an optional text or image overlay applied before
-          encoding.
-    type: object
   domain.StreamDVRConfig:
     properties:
       enabled:
@@ -764,37 +804,6 @@ definitions:
     x-enum-varnames:
     - WatermarkTypeText
     - WatermarkTypeImage
-  handler.configResponse:
-    properties:
-      audioCodecs:
-        items:
-          $ref: '#/definitions/domain.AudioCodec'
-        type: array
-      hwAccels:
-        items:
-          $ref: '#/definitions/domain.HWAccel'
-        type: array
-      outputProtocols:
-        items:
-          type: string
-        type: array
-      streamStatuses:
-        items:
-          $ref: '#/definitions/domain.StreamStatus'
-        type: array
-      videoCodecs:
-        items:
-          $ref: '#/definitions/domain.VideoCodec'
-        type: array
-      watermarkPositions:
-        items:
-          $ref: '#/definitions/domain.WatermarkPosition'
-        type: array
-      watermarkTypes:
-        items:
-          $ref: '#/definitions/domain.WatermarkType'
-        type: array
-    type: object
 info:
   contact: {}
   description: REST API for live stream configuration, ingest/publish lifecycle, DVR
@@ -812,7 +821,7 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/handler.configResponse'
+            $ref: '#/definitions/apidocs.ConfigData'
       summary: Get server configuration.
       tags:
       - system
