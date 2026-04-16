@@ -1419,6 +1419,13 @@ const docTemplate = `{
                     "description": "MaxRetries is the number of delivery attempts before giving up.\n0 means use the server default (3).",
                     "type": "integer"
                 },
+                "metadata": {
+                    "description": "Metadata holds user-defined key-value pairs merged into every event payload\ndelivered by this hook. Useful for tagging events with custom context\n(e.g. environment, tenant ID, region) without modifying the server config.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
                 "name": {
                     "type": "string"
                 },

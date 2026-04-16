@@ -131,7 +131,7 @@ func (s *Service) dispatch(ctx context.Context, event domain.Event) error {
 			continue
 		}
 
-		if err := s.deliverWithRetry(ctx, h, event); err != nil {
+		if err := s.deliverWithRetry(ctx, h, withMetadata(event, h.Metadata)); err != nil {
 			slog.Error("hooks: delivery failed",
 				"hook_id", h.ID,
 				"event_type", event.Type,
@@ -141,6 +141,23 @@ func (s *Service) dispatch(ctx context.Context, event domain.Event) error {
 		}
 	}
 	return nil
+}
+
+// withMetadata returns a shallow copy of event with hook metadata merged into the payload.
+// Hook metadata keys are prefixed with "meta." to avoid collisions with system payload fields.
+func withMetadata(event domain.Event, metadata map[string]string) domain.Event {
+	if len(metadata) == 0 {
+		return event
+	}
+	merged := make(map[string]any, len(event.Payload)+len(metadata))
+	for k, v := range event.Payload {
+		merged[k] = v
+	}
+	for k, v := range metadata {
+		merged["meta."+k] = v
+	}
+	event.Payload = merged
+	return event
 }
 
 func (s *Service) matches(h *domain.Hook, event domain.Event) bool {

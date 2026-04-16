@@ -381,6 +381,14 @@ definitions:
           MaxRetries is the number of delivery attempts before giving up.
           0 means use the server default (3).
         type: integer
+      metadata:
+        additionalProperties:
+          type: string
+        description: |-
+          Metadata holds user-defined key-value pairs merged into every event payload
+          delivered by this hook. Useful for tagging events with custom context
+          (e.g. environment, tenant ID, region) without modifying the server config.
+        type: object
       name:
         type: string
       secret:

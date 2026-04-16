@@ -58,6 +58,11 @@ type Hook struct {
 	// Omitting the field (nil) means all streams are included.
 	StreamCodes *StreamCodeFilter `json:"stream_codes,omitempty"`
 
+	// Metadata holds user-defined key-value pairs merged into every event payload
+	// delivered by this hook. Useful for tagging events with custom context
+	// (e.g. environment, tenant ID, region) without modifying the server config.
+	Metadata map[string]string `json:"metadata,omitempty"`
+
 	Enabled bool `json:"enabled"`
 
 	// MaxRetries is the number of delivery attempts before giving up.
