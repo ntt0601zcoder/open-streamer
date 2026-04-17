@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"path/filepath"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
@@ -66,7 +68,7 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 		r.Use(cors.Handler(corsOptions(serverCfg.CORS)))
 	}
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Logger)
+	r.Use(skipMediaLogger(middleware.Logger))
 	r.Use(middleware.Timeout(120 * time.Second))
 
 	r.Get("/healthz", healthz)
@@ -114,6 +116,28 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	})
 
 	return r
+}
+
+// skipMediaLogger wraps a logging middleware so that requests for HLS/DASH
+// media files (.m3u8, .ts, .m4s, .mpd, .mp4) bypass the logger entirely.
+func skipMediaLogger(logger func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	skip := map[string]bool{
+		".m3u8": true,
+		".ts":   true,
+		".m4s":  true,
+		".mpd":  true,
+		".mp4":  true,
+	}
+	return func(next http.Handler) http.Handler {
+		logged := logger(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if skip[strings.ToLower(filepath.Ext(r.URL.Path))] {
+				next.ServeHTTP(w, r)
+				return
+			}
+			logged.ServeHTTP(w, r)
+		})
+	}
 }
 
 func corsOptions(cfg config.CORSConfig) cors.Options {

@@ -128,6 +128,23 @@ func New(i do.Injector) (*Service, error) {
 	return svc, nil
 }
 
+// NewServiceForTesting creates a Service without DI, for use in integration tests.
+func NewServiceForTesting(cfg config.PublisherConfig, buf *buffer.Service, bus events.Bus) *Service {
+	return &Service{
+		cfg:            cfg,
+		buf:            buf,
+		bus:            bus,
+		ffmpegPath:     "ffmpeg",
+		hlsFailoverGen: make(map[domain.StreamCode]uint64),
+		streams:        make(map[domain.StreamCode]*streamState),
+		mediaBuffer:    make(map[domain.StreamCode]domain.StreamCode),
+		rtspMounts:     make(map[string]*gortsplib.ServerStream),
+		rtspSrvReady:   make(chan struct{}),
+		rtmpActive:     make(map[domain.StreamCode]struct{}),
+		srtActive:      make(map[domain.StreamCode]struct{}),
+	}
+}
+
 // cleanupAllOutputDirs wipes the HLS and DASH root directories on startup so
 // stale segments from a previous run are never served to clients.
 func (s *Service) cleanupAllOutputDirs() {

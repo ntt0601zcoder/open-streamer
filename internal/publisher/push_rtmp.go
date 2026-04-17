@@ -20,6 +20,13 @@ package publisher
 // (serveRTMPPush) waits RetryTimeoutSec and retries. Codec data is preserved
 // across reconnects so the connection can be re-established quickly.
 //
+// Input switching: when the ingestor switches to a different input source it
+// marks the first packet with Discontinuity=true.  feedLoop detects this,
+// closes the tsBuffer (which causes the TSDemuxer to exit), and signals the
+// session to end via errDiscontinuity.  serveRTMPPush then immediately starts
+// a fresh session with clean codec probing — no retry delay, no preserved
+// codec data — because the new source may have different codec parameters.
+//
 // RTMPS: rtmps:// URLs use a TLS-wrapped connection (default port 443).
 // joy4's NewConn accepts any net.Conn, so the RTMP handshake and framing
 // are identical — only the transport layer changes.
@@ -28,11 +35,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Eyevinn/mp4ff/aac"
@@ -52,6 +61,11 @@ const (
 	// rtmpPushPendingMax caps the pending frame queue while waiting for codec init.
 	rtmpPushPendingMax = 300
 )
+
+// errDiscontinuity signals that the input source changed (failover / manual
+// switch).  The session must be torn down and restarted with fresh codec
+// probing because the new source may have different codec parameters.
+var errDiscontinuity = errors.New("input discontinuity")
 
 // rtmpPendingFrame is one queued frame before the connection is established.
 type rtmpPendingFrame struct {
@@ -85,12 +99,24 @@ type rtmpPushPackager struct {
 
 	// connErr is set on first write failure; run() checks it to exit the session.
 	connErr error
+
+	// tsBuf is the TS buffer fed by feedLoop and read by the demuxer.  Stored
+	// on the packager so onTSFrame can close it from the demuxer goroutine
+	// when a write error occurs — this unblocks the demuxer and lets run()
+	// exit so serveRTMPPush can retry.
+	tsBuf *tsBuffer
+
+	// gotDiscontinuity is set by feedLoop when it receives a packet with
+	// Discontinuity=true (input source changed).  run() checks this after the
+	// demuxer exits and returns errDiscontinuity to the caller.
+	gotDiscontinuity atomic.Bool
 }
 
 // run is the entry point: wires the TS pipe, demuxer, and drives the session.
 // Returns when ctx is cancelled or a write/dial error occurs.
 func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) error {
 	tb := newTSBuffer()
+	p.tsBuf = tb
 	go p.feedLoop(ctx, sub, tb)
 
 	demux := mpeg2.NewTSDemuxer()
@@ -104,14 +130,29 @@ func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) erro
 		tb.Close()
 		<-demuxDone
 	case err := <-demuxDone:
-		if err != nil && ctx.Err() == nil {
+		if err != nil && ctx.Err() == nil && !p.gotDiscontinuity.Load() {
 			slog.Warn("publisher: RTMP push TS demux ended",
 				"stream_code", p.streamID, "url", p.url, "err", err)
 		}
 	}
 
+	// Flush any buffered frames before closing so the remote endpoint sees a
+	// clean end-of-stream rather than a truncated TCP close mid-frame.
+	if p.conn != nil && p.ready && p.connErr == nil {
+		if err := p.conn.WriteTrailer(); err != nil {
+			slog.Debug("publisher: RTMP push write trailer",
+				"stream_code", p.streamID, "url", p.url, "err", err)
+		}
+	}
 	p.closeConn()
 
+	if p.gotDiscontinuity.Load() {
+		slog.Info("publisher: RTMP push session ending on discontinuity",
+			"stream_code", p.streamID, "url", p.url,
+			"had_h264_cd", p.h264CD != nil, "had_aac_cd", p.aacCD != nil,
+			"was_ready", p.ready)
+		return errDiscontinuity
+	}
 	if p.connErr != nil {
 		return p.connErr
 	}
@@ -120,6 +161,10 @@ func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) erro
 
 // feedLoop reads packets from sub, reassembles 188-byte TS packets via
 // alignedFeed, and pipes them into tb.  Runs in its own goroutine.
+//
+// When a Discontinuity packet arrives (input source changed), feedLoop sets
+// gotDiscontinuity and returns.  The deferred tb.Close() causes the demuxer
+// to exit, which in turn causes run() to return errDiscontinuity.
 func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber, tb *tsBuffer) {
 	defer tb.Close()
 	var tsCarry []byte
@@ -134,8 +179,8 @@ func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber,
 				return
 			}
 			if pkt.AV != nil && pkt.AV.Discontinuity {
-				avMux = nil
-				tsCarry = nil
+				p.gotDiscontinuity.Store(true)
+				return
 			}
 			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
 				alignedFeed(b, &tsCarry, func(pkt188 []byte) bool {
@@ -264,6 +309,9 @@ func (p *rtmpPushPackager) enqueueOrWrite(pkt joyav.Packet) {
 				slog.Warn("publisher: RTMP push connect failed",
 					"stream_code", p.streamID, "url", p.url, "err", err)
 				p.connErr = err
+				if p.tsBuf != nil {
+					p.tsBuf.Close()
+				}
 				return
 			}
 			// Flush pending from first keyframe.
@@ -280,9 +328,16 @@ func (p *rtmpPushPackager) enqueueOrWrite(pkt joyav.Packet) {
 
 	if err := p.conn.WritePacket(pkt); err != nil {
 		slog.Warn("publisher: RTMP push write error",
-			"stream_code", p.streamID, "url", p.url, "err", err)
+			"stream_code", p.streamID, "url", p.url, "err", err,
+			"local_addr", connLocalAddr(p.conn))
 		p.connErr = err
 		p.closeConn()
+		// Unblock the demuxer so run() can return and serveRTMPPush can
+		// retry.  Without this the session would zombify — conn is closed,
+		// onTSFrame drops all frames, but the session never exits.
+		if p.tsBuf != nil {
+			p.tsBuf.Close()
+		}
 	}
 }
 
@@ -356,8 +411,22 @@ func (p *rtmpPushPackager) connect() error {
 
 	p.conn = conn
 	p.ready = true
-	slog.Info("publisher: RTMP push connected", "stream_code", p.streamID, "url", p.url)
+	slog.Info("publisher: RTMP push connected",
+		"stream_code", p.streamID, "url", p.url,
+		"local_addr", connLocalAddr(conn))
 	return nil
+}
+
+// connLocalAddr returns the local TCP address of the connection (best-effort,
+// for log correlation with kernel error messages like "write tcp <local>...").
+func connLocalAddr(c *joyrtmp.Conn) string {
+	if c == nil || c.NetConn() == nil {
+		return ""
+	}
+	if a := c.NetConn().LocalAddr(); a != nil {
+		return a.String()
+	}
+	return ""
 }
 
 // flushPending writes queued frames starting from the first video keyframe.
@@ -373,9 +442,13 @@ func (p *rtmpPushPackager) flushPending() {
 	for _, f := range p.pending[start:] {
 		if err := p.conn.WritePacket(f.pkt); err != nil {
 			slog.Warn("publisher: RTMP push flush error",
-				"stream_code", p.streamID, "url", p.url, "err", err)
+				"stream_code", p.streamID, "url", p.url, "err", err,
+				"local_addr", connLocalAddr(p.conn))
 			p.connErr = err
 			p.closeConn()
+			if p.tsBuf != nil {
+				p.tsBuf.Close()
+			}
 			break
 		}
 	}
@@ -443,6 +516,11 @@ func aacSampleRateIndex(hz int) uint {
 
 // serveRTMPPush is the publisher goroutine for one outbound PushDestination.
 // It creates a fresh packager session per connection attempt and reconnects on error.
+//
+// On input discontinuity (source switch / failover), the current session is torn
+// down and a new one starts immediately with fresh codec probing.  This ensures
+// the RTMP connection is re-established with codec headers that match the new
+// source, even if the resolution, bitrate, or codec parameters differ.
 func (s *Service) serveRTMPPush(
 	ctx context.Context,
 	streamID domain.StreamCode,
@@ -474,15 +552,45 @@ func (s *Service) serveRTMPPush(
 		}
 		attempts++
 
+		slog.Info("publisher: RTMP push session starting",
+			"stream_code", streamID, "url", dest.URL,
+			"attempt", attempts, "preserved_codec", preserved != nil)
+
 		p, sessionErr := s.runOnePushSession(ctx, streamID, mediaBufferID, dest, preserved)
-		preserved = p
 
 		if ctx.Err() != nil {
 			return
 		}
+
+		// Input switched — restart with fresh codec state after a small grace
+		// period.  The grace gives the remote endpoint (e.g. Flussonic) time
+		// to clean up its publisher state before we re-publish on the same
+		// stream URL; without it some servers reject the new connection or
+		// keep the old session in a half-open state.
+		if errors.Is(sessionErr, errDiscontinuity) {
+			const discontinuityGrace = 750 * time.Millisecond
+			slog.Info("publisher: RTMP push input discontinuity, restarting session",
+				"stream_code", streamID, "url", dest.URL,
+				"grace", discontinuityGrace)
+			preserved = nil
+			attempts = 0
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(discontinuityGrace):
+			}
+			continue
+		}
+
+		preserved = p
+
 		if sessionErr != nil {
 			slog.Warn("publisher: RTMP push session ended, retrying",
 				"stream_code", streamID, "url", dest.URL, "err", sessionErr,
+				"retry_in", retryDelay)
+		} else {
+			slog.Info("publisher: RTMP push session ended cleanly, retrying",
+				"stream_code", streamID, "url", dest.URL,
 				"retry_in", retryDelay)
 		}
 
