@@ -41,6 +41,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -86,7 +87,7 @@ type rtmpPushPackager struct {
 
 	// Connection state — reset on each reconnect attempt.
 	conn  *joyrtmp.Conn
-	ready bool // WriteHeader has been called
+	ready atomic.Bool // true once WriteHeader has succeeded
 
 	// Pending frames buffered before conn is ready.
 	pending []rtmpPendingFrame
@@ -97,19 +98,38 @@ type rtmpPushPackager struct {
 	baseADTS    uint64
 	baseADTSSet bool
 
-	// connErr is set on first write failure; run() checks it to exit the session.
-	connErr error
+	// connErr holds the first connection failure (write error or server-side
+	// close).  Set under failOnce so the first error wins; subsequent
+	// failures are dropped.  run() reads it after the demuxer exits to
+	// decide what to return.  atomic.Pointer makes cross-goroutine access
+	// race-free without taking a mutex on the hot write path.
+	connErr   atomic.Pointer[error]
+	failOnce  sync.Once
+	closeOnce sync.Once
 
 	// tsBuf is the TS buffer fed by feedLoop and read by the demuxer.  Stored
-	// on the packager so onTSFrame can close it from the demuxer goroutine
-	// when a write error occurs — this unblocks the demuxer and lets run()
-	// exit so serveRTMPPush can retry.
+	// on the packager so other goroutines (onTSFrame, drainServerMessages)
+	// can close it on connection failure — this unblocks the demuxer and
+	// lets run() exit so serveRTMPPush can retry.
 	tsBuf *tsBuffer
 
 	// gotDiscontinuity is set by feedLoop when it receives a packet with
 	// Discontinuity=true (input source changed).  run() checks this after the
 	// demuxer exits and returns errDiscontinuity to the caller.
 	gotDiscontinuity atomic.Bool
+}
+
+// failConn marks the session as failed and unblocks the demuxer so run() can
+// exit and serveRTMPPush can retry.  Safe to call from multiple goroutines;
+// the first call wins, subsequent calls are no-ops.
+func (p *rtmpPushPackager) failConn(err error) {
+	p.failOnce.Do(func() {
+		p.connErr.Store(&err)
+		p.closeConn()
+		if p.tsBuf != nil {
+			p.tsBuf.Close()
+		}
+	})
 }
 
 // run is the entry point: wires the TS pipe, demuxer, and drives the session.
@@ -138,7 +158,7 @@ func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) erro
 
 	// Flush any buffered frames before closing so the remote endpoint sees a
 	// clean end-of-stream rather than a truncated TCP close mid-frame.
-	if p.conn != nil && p.ready && p.connErr == nil {
+	if p.conn != nil && p.ready.Load() && p.connErr.Load() == nil {
 		if err := p.conn.WriteTrailer(); err != nil {
 			slog.Debug("publisher: RTMP push write trailer",
 				"stream_code", p.streamID, "url", p.url, "err", err)
@@ -150,11 +170,11 @@ func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) erro
 		slog.Info("publisher: RTMP push session ending on discontinuity",
 			"stream_code", p.streamID, "url", p.url,
 			"had_h264_cd", p.h264CD != nil, "had_aac_cd", p.aacCD != nil,
-			"was_ready", p.ready)
+			"was_ready", p.ready.Load())
 		return errDiscontinuity
 	}
-	if p.connErr != nil {
-		return p.connErr
+	if errPtr := p.connErr.Load(); errPtr != nil {
+		return *errPtr
 	}
 	return nil
 }
@@ -194,7 +214,7 @@ func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber,
 
 // onTSFrame is the TSDemuxer callback; runs in the demuxer goroutine.
 func (p *rtmpPushPackager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
-	if p.connErr != nil {
+	if p.connErr.Load() != nil {
 		return
 	}
 
@@ -302,16 +322,13 @@ func (p *rtmpPushPackager) handleAudioFrame(frame []byte, dts uint64) {
 // enqueueOrWrite either buffers the packet (during codec init / before connect)
 // or writes it directly to the open connection.
 func (p *rtmpPushPackager) enqueueOrWrite(pkt joyav.Packet) {
-	if !p.ready {
+	if !p.ready.Load() {
 		// Try to connect now that we may have codec data.
 		if p.h264CD != nil && p.aacCD != nil {
 			if err := p.connect(); err != nil {
 				slog.Warn("publisher: RTMP push connect failed",
 					"stream_code", p.streamID, "url", p.url, "err", err)
-				p.connErr = err
-				if p.tsBuf != nil {
-					p.tsBuf.Close()
-				}
+				p.failConn(err)
 				return
 			}
 			// Flush pending from first keyframe.
@@ -330,14 +347,10 @@ func (p *rtmpPushPackager) enqueueOrWrite(pkt joyav.Packet) {
 		slog.Warn("publisher: RTMP push write error",
 			"stream_code", p.streamID, "url", p.url, "err", err,
 			"local_addr", connLocalAddr(p.conn))
-		p.connErr = err
-		p.closeConn()
-		// Unblock the demuxer so run() can return and serveRTMPPush can
-		// retry.  Without this the session would zombify — conn is closed,
-		// onTSFrame drops all frames, but the session never exits.
-		if p.tsBuf != nil {
-			p.tsBuf.Close()
-		}
+		// failConn closes the conn and tsBuf so the demuxer unblocks and
+		// run() returns — without this the session would zombify (conn
+		// closed, onTSFrame drops all frames, no retry triggered).
+		p.failConn(err)
 	}
 }
 
@@ -410,11 +423,61 @@ func (p *rtmpPushPackager) connect() error {
 	}
 
 	p.conn = conn
-	p.ready = true
+	p.ready.Store(true)
 	slog.Info("publisher: RTMP push connected",
 		"stream_code", p.streamID, "url", p.url,
 		"local_addr", connLocalAddr(conn))
+
+	go p.drainServerMessages(conn)
 	return nil
+}
+
+// drainServerMessages reads any data the RTMP server sends after WriteHeader
+// and discards it.  Joy4's publish path is write-only after handshake — it
+// never reads from the connection again — so the kernel TCP receive buffer
+// fills with server-side messages (e.g. Window Acknowledgement, UserControl
+// PingRequest).  Some servers (Flussonic, nginx-rtmp) expect a PingResponse
+// within ~60s and close the connection if none arrives, manifesting as the
+// next WritePacket failing with "broken pipe".
+//
+// This goroutine is purely diagnostic: it logs the first batch of received
+// bytes (so we can identify the message type) and detects server-initiated
+// close immediately rather than waiting for the next write to fail.  It does
+// NOT send any reply, so it will not by itself prevent the disconnect — but
+// the log output is what tells us whether ping/pong is the actual cause.
+func (p *rtmpPushPackager) drainServerMessages(conn *joyrtmp.Conn) {
+	nc := conn.NetConn()
+	if nc == nil {
+		return
+	}
+	buf := make([]byte, 4096)
+	logged := false
+	totalRx := 0
+	for {
+		n, err := nc.Read(buf)
+		if n > 0 {
+			totalRx += n
+			if !logged {
+				slog.Info("publisher: RTMP push received server data",
+					"stream_code", p.streamID, "url", p.url,
+					"local_addr", connLocalAddr(conn),
+					"first_bytes_hex", fmt.Sprintf("%x", buf[:n]),
+					"len", n)
+				logged = true
+			}
+		}
+		if err != nil {
+			slog.Info("publisher: RTMP push server-side connection ended",
+				"stream_code", p.streamID, "url", p.url,
+				"local_addr", connLocalAddr(conn),
+				"total_rx_bytes", totalRx, "err", err)
+			// Treat server close like a write error — exit the session so
+			// serveRTMPPush can retry.  failConn is idempotent so this is
+			// safe even if a concurrent write also fails.
+			p.failConn(fmt.Errorf("server closed connection: %w", err))
+			return
+		}
+	}
 }
 
 // connLocalAddr returns the local TCP address of the connection (best-effort,
@@ -444,23 +507,22 @@ func (p *rtmpPushPackager) flushPending() {
 			slog.Warn("publisher: RTMP push flush error",
 				"stream_code", p.streamID, "url", p.url, "err", err,
 				"local_addr", connLocalAddr(p.conn))
-			p.connErr = err
-			p.closeConn()
-			if p.tsBuf != nil {
-				p.tsBuf.Close()
-			}
+			p.failConn(err)
 			break
 		}
 	}
 	p.pending = p.pending[:0]
 }
 
+// closeConn closes the RTMP connection exactly once.  Safe to call from
+// multiple goroutines (failConn from drain/onTSFrame, plus run() at end).
 func (p *rtmpPushPackager) closeConn() {
-	if p.conn != nil {
-		_ = p.conn.Close()
-		p.conn = nil
-	}
-	p.ready = false
+	p.closeOnce.Do(func() {
+		if p.conn != nil {
+			_ = p.conn.Close()
+		}
+		p.ready.Store(false)
+	})
 }
 
 // tryBuildH264CD scans accumulated videoPS for SPS+PPS and builds joy4 CodecData.
@@ -562,23 +624,22 @@ func (s *Service) serveRTMPPush(
 			return
 		}
 
-		// Input switched — restart with fresh codec state after a small grace
-		// period.  The grace gives the remote endpoint (e.g. Flussonic) time
-		// to clean up its publisher state before we re-publish on the same
-		// stream URL; without it some servers reject the new connection or
-		// keep the old session in a half-open state.
+		// Input switched — restart immediately with preserved codec data so the
+		// new session can connect on the very first frame from the new source
+		// instead of waiting to re-probe SPS/PPS + AAC config.  This minimises
+		// the publish gap when switching between mirrors / backup feeds of the
+		// same channel (the common case).
+		//
+		// If the new source actually uses different codec parameters, viewers
+		// may see a brief decoder glitch until the next IDR's in-band SPS/PPS
+		// allows decoders to resync — accepted trade-off for minimum downtime.
 		if errors.Is(sessionErr, errDiscontinuity) {
-			const discontinuityGrace = 750 * time.Millisecond
+			preservedCodec := p != nil && p.h264CD != nil
 			slog.Info("publisher: RTMP push input discontinuity, restarting session",
 				"stream_code", streamID, "url", dest.URL,
-				"grace", discontinuityGrace)
-			preserved = nil
+				"preserved_codec", preservedCodec)
+			preserved = p
 			attempts = 0
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(discontinuityGrace):
-			}
 			continue
 		}
 
