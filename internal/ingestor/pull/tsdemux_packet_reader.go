@@ -27,6 +27,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	gocodec "github.com/yapingcat/gomedia/go-codec"
 	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
@@ -99,11 +100,36 @@ type TSDemuxPacketReader struct {
 
 	readLoopDone chan struct{}
 	demuxDone    chan struct{}
+
+	// pacing throttles AVPacket emission to wall-clock based on DTS.  Used for
+	// chunk-based sources that deliver media faster than real-time (HLS pulls
+	// each segment as one HTTP GET → hundreds of packets in microseconds).
+	// Without this, downstream RTMP push to YouTube/etc. sends timestamps that
+	// jump 13–26× wall-clock and the ingest server closes the connection.
+	pacing   bool
+	paceOnce bool
+	paceRef  int64 // first observed DTS (ms)
+	paceAt   time.Time
+}
+
+// TSDemuxOption configures a TSDemuxPacketReader at construction time.
+type TSDemuxOption func(*TSDemuxPacketReader)
+
+// WithRealtimePacing enables DTS-based real-time throttling on AVPacket emission.
+// Use it for chunk-based sources (HLS) that deliver bursts faster than playback
+// rate; do not use it for live transports (UDP, SRT, RTMP) where the source
+// already paces itself.
+func WithRealtimePacing() TSDemuxOption {
+	return func(d *TSDemuxPacketReader) { d.pacing = true }
 }
 
 // NewTSDemuxPacketReader wraps r and emits domain.AVPacket values.
-func NewTSDemuxPacketReader(r TSChunkReader) *TSDemuxPacketReader {
-	return &TSDemuxPacketReader{r: r}
+func NewTSDemuxPacketReader(r TSChunkReader, opts ...TSDemuxOption) *TSDemuxPacketReader {
+	d := &TSDemuxPacketReader{r: r}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
 }
 
 // Open starts the pump and demux goroutines.
@@ -219,6 +245,9 @@ func (d *TSDemuxPacketReader) runDemux(
 			// A successful frame means the demuxer re-synced; reset the error counter
 			// so the pipeline can tolerate isolated bad patches without hitting the cap.
 			consecutiveErrors = 0
+			if d.pacing {
+				d.pace(int64(dts), done)
+			}
 			select {
 			case q <- p:
 			case <-done:
@@ -249,6 +278,32 @@ func (d *TSDemuxPacketReader) runDemux(
 			)
 			return
 		}
+	}
+}
+
+// pace blocks until wall-clock catches up to the packet's DTS, mirroring the
+// real-time emission rate of the source.  The first call captures the reference
+// (paceRef = first DTS, paceAt = now); subsequent calls sleep until
+// paceAt + (dts - paceRef).  Signed arithmetic tolerates out-of-order DTS
+// between audio and video streams without underflowing — a packet whose DTS
+// is behind the reference simply skips the wait.  Cancellable via done.
+func (d *TSDemuxPacketReader) pace(dtsMS int64, done <-chan struct{}) {
+	if !d.paceOnce {
+		d.paceOnce = true
+		d.paceRef = dtsMS
+		d.paceAt = time.Now()
+		return
+	}
+	target := d.paceAt.Add(time.Duration(dtsMS-d.paceRef) * time.Millisecond)
+	wait := time.Until(target)
+	if wait <= 0 {
+		return
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
 	}
 }
 

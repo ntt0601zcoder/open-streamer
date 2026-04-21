@@ -77,7 +77,10 @@ func NewPacketReader(input domain.Input, cfg config.IngestorConfig, vods VODReso
 	case protocol.KindUDP:
 		return pull.NewTSDemuxPacketReader(pull.NewUDPReader(input)), nil
 	case protocol.KindHLS:
-		return pull.NewTSDemuxPacketReader(pull.NewHLSReader(input, cfg)), nil
+		return pull.NewTSDemuxPacketReader(
+			pull.NewHLSReader(input, cfg),
+			pull.WithRealtimePacing(),
+		), nil
 	case protocol.KindFile:
 		if vods == nil {
 			return nil, fmt.Errorf("ingestor: cannot resolve %q — no VOD resolver configured", input.URL)
