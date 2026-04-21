@@ -4,7 +4,7 @@
 //   - Serve endpoints (HLS, DASH, RTSP, RTMP listen, SRT listen): the server listens,
 //     clients connect and pull. HLS uses MPEG-TS segments + m3u8; DASH uses fMP4 (init + .m4s) + dynamic MPD (Eyevinn mp4ff); RTSP/RTMP/SRT use gortsplib/gomedia/gosrt — no FFmpeg in this package.
 //     RTSP, RTMP play, and SRT listen each use one shared TCP/UDP port (publisher.*.port_min); streams are selected by path (/live/<code>), RTMP app "live", or SRT streamid (live/<code>).
-//   - Push destinations: rtmp:// (plain TCP) and rtmps:// (TLS, default port 443) via joy4 client; other schemes return a clear error.
+//   - Push destinations: rtmp:// (plain TCP) and rtmps:// (TLS, default port 443) via gomedia go-rtmp client; other schemes return a clear error.
 package publisher
 
 import (
