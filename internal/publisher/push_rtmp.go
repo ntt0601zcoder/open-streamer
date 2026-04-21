@@ -241,7 +241,7 @@ func (p *rtmpPushPackager) connect(ctx context.Context) error {
 		return werr
 	})
 	cli.OnStateChange(func(s rtmp.RtmpState) {
-		switch s {
+		switch s { //nolint:exhaustive // only the two terminal publish states drive the session
 		case rtmp.STATE_RTMP_PUBLISH_START:
 			p.ready.Store(true)
 			close(p.readyCh)
@@ -363,7 +363,7 @@ func (p *rtmpPushPackager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		return
 	}
 
-	switch cid {
+	switch cid { //nolint:exhaustive // RTMP push only carries H.264 video and AAC audio; everything else is dropped
 	case mpeg2.TS_STREAM_H264:
 		if len(frame) == 0 {
 			return
