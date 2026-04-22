@@ -1,0 +1,152 @@
+# Cross-compile binaries for every supported OS/arch and (when a v* tag is pushed)
+# attach them to a GitHub Release.
+#
+# Triggers:
+#   - workflow_dispatch — manual run from the Actions tab. Produces downloadable
+#     artifacts only (no Release is created). Useful for ad-hoc test builds.
+#   - push tag matching v* — full build + GitHub Release creation with checksums.
+#     Tag from CLI:    git tag v0.1.0 && git push origin v0.1.0
+#
+# This workflow does NOT run on every push/PR — release builds are expensive and
+# rarely needed. Day-to-day correctness is covered by CI.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label baked into archive filenames (e.g. v0.1.0-rc1). Leave empty to use commit SHA."
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            archive: tar.gz
+          - os: linux
+            arch: arm64
+            archive: tar.gz
+          - os: darwin
+            arch: amd64
+            archive: tar.gz
+          - os: darwin
+            arch: arm64
+            archive: tar.gz
+          - os: windows
+            arch: amd64
+            archive: zip
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine version label
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="dev-${GITHUB_SHA::8}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "stage=open-streamer-${{ matrix.os }}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p stage/${{ steps.version.outputs.stage }}/bin
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o stage/${{ steps.version.outputs.stage }}/bin/open-streamer${{ matrix.ext }} \
+            ./cmd/server
+
+      - name: Stage Linux extras (systemd unit + installer)
+        if: matrix.os == 'linux'
+        run: |
+          DST=stage/${{ steps.version.outputs.stage }}
+          mkdir -p "$DST/build"
+          cp build/install.sh "$DST/build/"
+          cp build/open-streamer.service "$DST/build/"
+          chmod +x "$DST/build/install.sh" "$DST/bin/open-streamer"
+
+      - name: Stage docs
+        run: |
+          DST=stage/${{ steps.version.outputs.stage }}
+          cp README.md LICENSE "$DST/"
+
+      - name: Create tar.gz archive
+        if: matrix.archive == 'tar.gz'
+        run: |
+          ARCHIVE="open-streamer-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
+          tar -C stage -czf "$ARCHIVE" "${{ steps.version.outputs.stage }}"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Create zip archive
+        if: matrix.archive == 'zip'
+        run: |
+          ARCHIVE="open-streamer-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}.zip"
+          (cd stage && zip -r "../$ARCHIVE" "${{ steps.version.outputs.stage }}")
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload archive as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-streamer-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

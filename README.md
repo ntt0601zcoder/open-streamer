@@ -169,12 +169,45 @@ are configurable at runtime via `POST /config`.
 
 ### Production install (Linux + systemd)
 
-```bash
-sudo make install-service        # build, install binary, enable + start systemd unit
-systemctl status open-streamer
-journalctl -u open-streamer -f   # follow logs
+Production servers should not have the Go toolchain installed. Pre-built archives
+(`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`) are
+produced by the [Release workflow](.github/workflows/release.yml) and attached to every
+GitHub Release.
 
-sudo make uninstall-service      # stop, remove binary + unit + user (data dir kept)
+**Trigger a release build** (one of):
+
+- Push a tag: `git tag v0.1.0 && git push origin v0.1.0` → builds all targets and
+  publishes a GitHub Release with archives + `SHA256SUMS`.
+- Manual: GitHub → Actions → *Release* → *Run workflow* → optional version label →
+  archives appear as workflow artifacts (no Release created).
+
+**Install on the server** (Linux example):
+
+```bash
+# Download the linux/amd64 archive from the Release page, then:
+tar -xzf open-streamer-v0.1.0-linux-amd64.tar.gz
+cd open-streamer-linux-amd64
+sudo build/install.sh
+
+systemctl status open-streamer
+journalctl -u open-streamer -f       # follow logs
+```
+
+To upgrade: download the new archive, extract over the previous folder, re-run
+`sudo build/install.sh` — idempotent, won't touch `/var/lib/open-streamer/`.
+
+To uninstall (data dir preserved):
+
+```bash
+sudo build/install.sh uninstall      # from extracted archive
+# OR from a git checkout:
+sudo make uninstall-service
+```
+
+**Local install from a git checkout** (when Go is available on the same machine):
+
+```bash
+sudo make install-service            # builds + installs + enables in one step
 ```
 
 The installer creates a system user `open-streamer`, copies the binary to `/usr/local/bin/`,
