@@ -1212,10 +1212,46 @@ definitions:
         type: integer
       pipeline_active:
         type: boolean
+      publisher:
+        $ref: '#/definitions/publisher.RuntimeStatus'
       status:
         $ref: '#/definitions/domain.StreamStatus'
       transcoder:
         $ref: '#/definitions/transcoder.RuntimeStatus'
+    type: object
+  publisher.PushSnapshot:
+    properties:
+      attempt:
+        type: integer
+      connected_at:
+        type: string
+      errors:
+        items:
+          $ref: '#/definitions/domain.ErrorEntry'
+        type: array
+      status:
+        $ref: '#/definitions/publisher.PushStatus'
+      url:
+        type: string
+    type: object
+  publisher.PushStatus:
+    enum:
+    - starting
+    - active
+    - reconnecting
+    - failed
+    type: string
+    x-enum-varnames:
+    - PushStatusStarting
+    - PushStatusActive
+    - PushStatusReconnecting
+    - PushStatusFailed
+  publisher.RuntimeStatus:
+    properties:
+      pushes:
+        items:
+          $ref: '#/definitions/publisher.PushSnapshot'
+        type: array
     type: object
   transcoder.ProfileSnapshot:
     properties:

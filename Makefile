@@ -62,7 +62,7 @@ generate: ## Run go generate (e.g. Swagger from swag annotations)
 
 .PHONY: swagger
 swagger: ## Regenerate api/docs (OpenAPI 2) via swag; run from repo root
-	cd cmd/server && $(GO) run github.com/swaggo/swag/cmd/swag@latest init -g doc_swagger.go -o ../../api/docs --parseGoList=false -d .,../../internal/api,../../internal/api/handler,../../internal/api/apidocs,../../internal/domain,../../internal/manager,../../internal/transcoder,../../internal/vod,../../config,../../pkg/version
+	cd cmd/server && $(GO) run github.com/swaggo/swag/cmd/swag@latest init -g doc_swagger.go -o ../../api/docs --parseGoList=false -d .,../../internal/api,../../internal/api/handler,../../internal/api/apidocs,../../internal/domain,../../internal/manager,../../internal/publisher,../../internal/transcoder,../../internal/vod,../../config,../../pkg/version
 
 .PHONY: tidy
 tidy: ## go mod tidy

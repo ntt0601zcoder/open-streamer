@@ -12,6 +12,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/manager"
+	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/samber/do/v2"
@@ -23,6 +24,7 @@ type StreamHandler struct {
 	coordinator *coordinator.Coordinator
 	manager     *manager.Service
 	transcoder  *transcoder.Service
+	publisher   *publisher.Service
 	bus         events.Bus
 }
 
@@ -40,11 +42,14 @@ func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
 	rt.Status = h.coordinator.StreamStatus(s.Code)
 	rt.PipelineActive = registered
 	if registered {
-		// Nest transcoder live state under the same envelope; keeps it from
-		// colliding with the persisted Stream.Transcoder config field on the
-		// same json tag.
+		// Nest transcoder + push runtime under the same envelope; keeps them
+		// from colliding with the persisted Stream.Transcoder / Stream.Push
+		// config fields on the same json tags.
 		if tc, ok := h.transcoder.RuntimeStatus(s.Code); ok {
 			rt.Transcoder = &tc
+		}
+		if pr, ok := h.publisher.RuntimeStatus(s.Code); ok {
+			rt.Publisher = &pr
 		}
 	}
 	if rt.Inputs == nil {
@@ -62,6 +67,7 @@ func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
 		coordinator: do.MustInvoke[*coordinator.Coordinator](i),
 		manager:     do.MustInvoke[*manager.Service](i),
 		transcoder:  do.MustInvoke[*transcoder.Service](i),
+		publisher:   do.MustInvoke[*publisher.Service](i),
 		bus:         do.MustInvoke[events.Bus](i),
 	}, nil
 }

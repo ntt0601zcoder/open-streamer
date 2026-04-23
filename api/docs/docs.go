@@ -2897,11 +2897,63 @@ const docTemplate = `{
                 "pipeline_active": {
                     "type": "boolean"
                 },
+                "publisher": {
+                    "$ref": "#/definitions/publisher.RuntimeStatus"
+                },
                 "status": {
                     "$ref": "#/definitions/domain.StreamStatus"
                 },
                 "transcoder": {
                     "$ref": "#/definitions/transcoder.RuntimeStatus"
+                }
+            }
+        },
+        "publisher.PushSnapshot": {
+            "type": "object",
+            "properties": {
+                "attempt": {
+                    "type": "integer"
+                },
+                "connected_at": {
+                    "type": "string"
+                },
+                "errors": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.ErrorEntry"
+                    }
+                },
+                "status": {
+                    "$ref": "#/definitions/publisher.PushStatus"
+                },
+                "url": {
+                    "type": "string"
+                }
+            }
+        },
+        "publisher.PushStatus": {
+            "type": "string",
+            "enum": [
+                "starting",
+                "active",
+                "reconnecting",
+                "failed"
+            ],
+            "x-enum-varnames": [
+                "PushStatusStarting",
+                "PushStatusActive",
+                "PushStatusReconnecting",
+                "PushStatusFailed"
+            ]
+        },
+        "publisher.RuntimeStatus": {
+            "type": "object",
+            "properties": {
+                "pushes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/publisher.PushSnapshot"
+                    }
                 }
             }
         },

@@ -86,6 +86,11 @@ type rtmpPushPackager struct {
 	url        string
 	timeoutSec int
 
+	// onPublishStart fires once after the lal Push handshake completes —
+	// surfaced so the runtime status can flip from "starting" to "active"
+	// without leaking PushSession internals to the Service layer.
+	onPublishStart func()
+
 	session *rtmp.PushSession
 	remuxer *remux.AvPacket2RtmpRemuxer
 
@@ -242,6 +247,10 @@ func (p *rtmpPushPackager) connect(ctx context.Context) error {
 	slog.Info("publisher: RTMP push publish started",
 		"stream_code", p.streamID, "url", p.url)
 
+	if p.onPublishStart != nil {
+		p.onPublishStart()
+	}
+
 	// Wire the codec → FLV tag → RtmpMsg adapter. SPS/PPS and AAC ASC are
 	// extracted from the input stream itself and emitted as sequence headers
 	// the first time they appear.
@@ -351,6 +360,10 @@ func (p *rtmpPushPackager) closeConn() {
 // serveRTMPPush is the publisher goroutine for one outbound PushDestination.
 // It creates a fresh packager session per connection attempt and reconnects
 // on error or input discontinuity.
+//
+// Runtime state: each lifecycle event updates the per-(stream,url) pushState
+// so the API can show what each push destination is doing right now —
+// starting, active, reconnecting (with last 5 errors), or failed.
 func (s *Service) serveRTMPPush(
 	ctx context.Context,
 	streamID domain.StreamCode,
@@ -362,6 +375,11 @@ func (s *Service) serveRTMPPush(
 			"stream_code", streamID, "url", dest.URL)
 		return
 	}
+
+	// Track this destination from spawn through teardown so the API never
+	// shows a stale "starting" entry after the goroutine has exited.
+	s.setPushStatus(streamID, dest.URL, PushStatusStarting)
+	defer s.removePushState(streamID, dest.URL)
 
 	retryDelay := time.Duration(dest.RetryTimeoutSec) * time.Second
 	if retryDelay <= 0 {
@@ -377,9 +395,11 @@ func (s *Service) serveRTMPPush(
 		if dest.Limit > 0 && attempts >= dest.Limit {
 			slog.Warn("publisher: RTMP push reached retry limit",
 				"stream_code", streamID, "url", dest.URL, "limit", dest.Limit)
+			s.setPushStatus(streamID, dest.URL, PushStatusFailed)
 			return
 		}
 		attempts++
+		s.setPushAttempt(streamID, dest.URL, attempts)
 
 		slog.Info("publisher: RTMP push session starting",
 			"stream_code", streamID, "url", dest.URL, "attempt", attempts)
@@ -394,6 +414,7 @@ func (s *Service) serveRTMPPush(
 			slog.Info("publisher: RTMP push input discontinuity, restarting session",
 				"stream_code", streamID, "url", dest.URL)
 			attempts = 0
+			s.setPushAttempt(streamID, dest.URL, 0)
 			continue
 		}
 
@@ -401,11 +422,13 @@ func (s *Service) serveRTMPPush(
 			slog.Warn("publisher: RTMP push session ended, retrying",
 				"stream_code", streamID, "url", dest.URL, "err", sessionErr,
 				"retry_in", retryDelay)
+			s.recordPushError(streamID, dest.URL, sessionErr.Error())
 		} else {
 			slog.Info("publisher: RTMP push session ended cleanly, retrying",
 				"stream_code", streamID, "url", dest.URL,
 				"retry_in", retryDelay)
 		}
+		s.setPushStatus(streamID, dest.URL, PushStatusReconnecting)
 
 		select {
 		case <-ctx.Done():
@@ -434,6 +457,9 @@ func (s *Service) runOnePushSession(
 		streamID:   streamID,
 		url:        dest.URL,
 		timeoutSec: dest.TimeoutSec,
+		onPublishStart: func() {
+			s.setPushStatus(streamID, dest.URL, PushStatusActive)
+		},
 	}
 
 	sessionErr := p.run(ctx, sub)

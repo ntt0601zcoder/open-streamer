@@ -36,6 +36,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
+	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/samber/do/v2"
 )
@@ -111,10 +112,11 @@ type streamState struct {
 // clients have a single root for all live data.
 //
 // Status and PipelineActive are populated by the API handler from the
-// coordinator (not by manager itself), so the envelope can be returned even
-// when no manager pipeline is registered (status will be "stopped" / "idle"
-// with PipelineActive=false). Transcoder is similarly populated by the
-// handler when an FFmpeg pipeline is running for this stream.
+// coordinator (not by manager itself). Transcoder and Publisher are also
+// handler-populated and named after the subsystem they wrap, so frontend
+// reads `runtime.transcoder.profiles[]` and `runtime.publisher.pushes[]` —
+// no collision with the persisted `transcoder` / `push` config fields on
+// domain.Stream.
 //
 // Exhausted is true when every input has degraded and no failover candidate
 // remains — the stream is effectively offline at the source.
@@ -126,6 +128,7 @@ type RuntimeStatus struct {
 	Exhausted             bool                      `json:"exhausted"`
 	Inputs                []InputHealthSnapshot     `json:"inputs"`
 	Transcoder            *transcoder.RuntimeStatus `json:"transcoder,omitempty"`
+	Publisher             *publisher.RuntimeStatus  `json:"publisher,omitempty"`
 }
 
 // InputHealthSnapshot is a serialisable copy of one input's health.

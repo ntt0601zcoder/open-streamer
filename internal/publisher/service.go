@@ -94,6 +94,13 @@ type Service struct {
 	rtspSrvReady chan struct{}                      // closed when server is ready or disabled
 	rtmpActive   map[domain.StreamCode]struct{}
 	srtActive    map[domain.StreamCode]struct{}
+
+	// pushStates is the per-(stream, url) push destination runtime state used
+	// by RuntimeStatus. Updated by serveRTMPPush at session boundaries.
+	// Separate mutex from s.mu to avoid blocking output orchestration when
+	// the API polls runtime status.
+	pushMu     sync.Mutex
+	pushStates map[domain.StreamCode]map[string]*pushState
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -122,6 +129,7 @@ func New(i do.Injector) (*Service, error) {
 		rtspSrvReady:   make(chan struct{}),
 		rtmpActive:     make(map[domain.StreamCode]struct{}),
 		srtActive:      make(map[domain.StreamCode]struct{}),
+		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
 	}
 	bus.Subscribe(domain.EventInputFailover, func(_ context.Context, e domain.Event) error {
 		svc.hlsFailoverMu.Lock()
@@ -149,6 +157,7 @@ func NewServiceForTesting(cfg config.PublisherConfig, buf *buffer.Service, bus e
 		rtspSrvReady:   make(chan struct{}),
 		rtmpActive:     make(map[domain.StreamCode]struct{}),
 		srtActive:      make(map[domain.StreamCode]struct{}),
+		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
 	}
 }
 
