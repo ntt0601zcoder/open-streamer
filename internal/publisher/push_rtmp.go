@@ -315,13 +315,17 @@ func (p *rtmpPushPackager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		p.baseDTS = int64(dts)
 		p.baseDTSSet = true
 	}
-	// 90 kHz MPEG-TS ticks → milliseconds. Clamp negatives to 0 in case of
-	// out-of-order frames or wrap-around near the base.
-	relDTS := (int64(dts) - p.baseDTS) / 90
+	// mpeg2.TSDemuxer.OnFrame already converts MPEG-TS 90 kHz ticks to ms
+	// before calling us (see ts-demuxer.go: `stream.pkg.pts/90`). Do NOT
+	// divide again here — that's the bug that caused YouTube/Flussonic to
+	// receive frames with timestamps 90× too small, decoder treats them as
+	// all-at-once and only renders the seed frame.
+	// Clamp negatives to 0 to absorb any out-of-order frames near the base.
+	relDTS := int64(dts) - p.baseDTS
 	if relDTS < 0 {
 		relDTS = 0
 	}
-	relPTS := (int64(pts) - p.baseDTS) / 90
+	relPTS := int64(pts) - p.baseDTS
 	if relPTS < 0 {
 		relPTS = 0
 	}
