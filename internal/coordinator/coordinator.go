@@ -614,24 +614,24 @@ func transcoderProfilesFromDomain(video *domain.VideoTranscodeConfig) []transcod
 	}
 	out := make([]transcoder.Profile, 0, len(video.Profiles))
 	for _, p := range video.Profiles {
+		// Leave codec/preset empty when not set — buildFFmpegArgs +
+		// normalizeVideoEncoder route on Global.HW (e.g. "" → h264_nvenc when
+		// hw=nvenc, libx264 when hw=none). Defaulting to "libx264"/"fast" here
+		// hardcodes the CPU encoder and silently ignores the HW config.
 		codec := string(p.Codec)
-		if codec == "" || codec == string(domain.VideoCodecCopy) {
-			codec = "libx264"
+		if codec == string(domain.VideoCodecCopy) {
+			codec = ""
 		}
 		br := strconv.Itoa(p.Bitrate) + "k"
 		if p.Bitrate <= 0 {
 			br = "2500k"
-		}
-		preset := p.Preset
-		if preset == "" {
-			preset = "fast"
 		}
 		out = append(out, transcoder.Profile{
 			Width:            p.Width,
 			Height:           p.Height,
 			Bitrate:          br,
 			Codec:            codec,
-			Preset:           preset,
+			Preset:           p.Preset,
 			CodecProfile:     p.Profile,
 			CodecLevel:       p.Level,
 			MaxBitrate:       p.MaxBitrate,
@@ -643,11 +643,8 @@ func transcoderProfilesFromDomain(video *domain.VideoTranscodeConfig) []transcod
 }
 
 func singleOriginCopyProfile() []transcoder.Profile {
+	// Empty codec/preset → buildFFmpegArgs picks based on Global.HW.
 	return []transcoder.Profile{{
-		Width:   0,
-		Height:  0,
 		Bitrate: "2500k",
-		Codec:   "libx264",
-		Preset:  "fast",
 	}}
 }
