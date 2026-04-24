@@ -69,7 +69,7 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 		r.Use(cors.Handler(corsOptions(serverCfg.CORS)))
 	}
 	r.Use(middleware.Recoverer)
-	r.Use(skipMediaLogger(middleware.Logger))
+	r.Use(skipMediaLogger(slogAccessLogger))
 	r.Use(middleware.Timeout(120 * time.Second))
 
 	r.Get("/healthz", healthz)
@@ -133,6 +133,37 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	})
 
 	return r
+}
+
+// slogAccessLogger is a chi-style access-log middleware that emits via slog
+// at INFO level (one structured event per request). Replacing chi's
+// middleware.Logger — which writes via the std `log` package and so
+// bypasses slog level filtering — means setting `log.level: error` in the
+// global config now actually silences these access lines as the operator
+// expects. Format: "api: http request" with method/path/status/duration_ms
+// and remote ip; chi's RequestID is included when present.
+func slogAccessLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip the work entirely when slog will discard the line — saves
+		// the ResponseWriter wrap + status capture on hot paths when the
+		// operator runs at WARN/ERROR level.
+		if !slog.Default().Enabled(r.Context(), slog.LevelInfo) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		start := time.Now()
+		next.ServeHTTP(ww, r)
+		slog.Info("api: http request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", ww.Status(),
+			"bytes", ww.BytesWritten(),
+			"duration_ms", time.Since(start).Milliseconds(),
+			"remote", r.RemoteAddr,
+			"request_id", middleware.GetReqID(r.Context()),
+		)
+	})
 }
 
 // skipMediaLogger wraps a logging middleware so that requests for HLS/DASH
