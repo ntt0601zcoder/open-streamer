@@ -43,7 +43,8 @@ type Coordinator struct {
 	renditions map[domain.StreamCode][]string // ABR rendition slugs per stream (for buffer teardown)
 
 	abrMu     sync.RWMutex
-	abrCopies map[domain.StreamCode]*abrCopyEntry // streams currently running as ABR copy
+	abrCopies map[domain.StreamCode]*abrCopyEntry  // streams currently running as ABR copy
+	abrMixers map[domain.StreamCode]*abrMixerEntry // streams currently running as ABR mixer (mirror video ladder + audio fan-out)
 
 	statusMu sync.RWMutex
 	status   map[domain.StreamCode]domain.StreamStatus // runtime status per running stream
@@ -70,6 +71,7 @@ func New(i do.Injector) (*Coordinator, error) {
 		},
 		renditions: make(map[domain.StreamCode][]string),
 		abrCopies:  make(map[domain.StreamCode]*abrCopyEntry),
+		abrMixers:  make(map[domain.StreamCode]*abrMixerEntry),
 		status:     make(map[domain.StreamCode]domain.StreamStatus),
 	}
 	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
@@ -97,6 +99,7 @@ func newForTesting(
 		m:          m,
 		renditions: make(map[domain.StreamCode][]string),
 		abrCopies:  make(map[domain.StreamCode]*abrCopyEntry),
+		abrMixers:  make(map[domain.StreamCode]*abrMixerEntry),
 		status:     make(map[domain.StreamCode]domain.StreamStatus),
 	}
 	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
@@ -161,6 +164,9 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 
 	if upstream := c.detectABRCopy(stream); upstream != nil {
 		return c.startABRCopy(ctx, stream, upstream)
+	}
+	if videoUp, audioUp, ok := c.detectABRMixer(stream); ok {
+		return c.startABRMixer(ctx, stream, videoUp, audioUp)
 	}
 
 	c.buf.Create(stream.Code)
@@ -267,16 +273,17 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 }
 
 // IsRunning reports whether the stream pipeline is active in memory.
-// Covers both the normal pipeline (manager-registered) and the ABR-copy
-// pipeline (no manager registration; tracked in c.abrCopies instead).
+// Covers the normal pipeline (manager-registered) plus the in-process bypass
+// paths (ABR copy, ABR mixer) that don't go through the manager.
 func (c *Coordinator) IsRunning(streamID domain.StreamCode) bool {
 	if c.mgr.IsRegistered(streamID) {
 		return true
 	}
 	c.abrMu.RLock()
-	_, ok := c.abrCopies[streamID]
+	_, copyOK := c.abrCopies[streamID]
+	_, mixerOK := c.abrMixers[streamID]
 	c.abrMu.RUnlock()
-	return ok
+	return copyOK || mixerOK
 }
 
 // Stop tears down publisher, transcoder, manager (ingest), and the buffer.
@@ -288,10 +295,19 @@ func (c *Coordinator) Stop(ctx context.Context, streamID domain.StreamCode) {
 	if isABR {
 		delete(c.abrCopies, streamID)
 	}
+	mix, isMix := c.abrMixers[streamID]
+	if isMix {
+		delete(c.abrMixers, streamID)
+	}
 	c.abrMu.Unlock()
 	if isABR {
 		slog.Info("coordinator: stopping abr copy pipeline", "stream_code", streamID)
 		c.stopABRCopy(ctx, streamID, abr)
+		return
+	}
+	if isMix {
+		slog.Info("coordinator: stopping abr mixer pipeline", "stream_code", streamID)
+		c.stopABRMixer(ctx, streamID, mix)
 		return
 	}
 
@@ -336,14 +352,18 @@ func (c *Coordinator) Update(ctx context.Context, old, new *domain.Stream) error
 		return fmt.Errorf("coordinator: Update requires both old and new stream")
 	}
 
-	// ABR copy uses a custom pipeline (no ingestor / transcoder), so the
-	// per-component diff routing doesn't apply. Whenever either side is an
-	// ABR copy we full-cycle: stop whatever is running, then start fresh.
+	// ABR copy / ABR mixer use custom pipelines (no ingestor / transcoder),
+	// so the per-component diff routing doesn't apply. Whenever either side
+	// is on one of these paths we full-cycle: stop whatever is running, then
+	// start fresh.
 	c.abrMu.RLock()
 	wasABRCopy := c.abrCopies[old.Code] != nil
+	wasABRMixer := c.abrMixers[old.Code] != nil
 	c.abrMu.RUnlock()
 	willBeABRCopy := !new.Disabled && c.detectABRCopy(new) != nil
-	if wasABRCopy || willBeABRCopy {
+	_, _, willBeABRMixer := c.detectABRMixer(new)
+	willBeABRMixer = willBeABRMixer && !new.Disabled
+	if wasABRCopy || wasABRMixer || willBeABRCopy || willBeABRMixer {
 		c.Stop(ctx, old.Code)
 		if new.Disabled || len(new.Inputs) == 0 {
 			return nil

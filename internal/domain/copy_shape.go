@@ -132,16 +132,12 @@ func ValidateCopyShape(s *Stream, lookup StreamLookup) error {
 		}
 	}
 
-	// Rule 2(b): ABR-copy + own transcoder is ambiguous.
-	if abrIdx >= 0 && s.Transcoder != nil {
-		return &CopyShapeError{
-			StreamCode: s.Code,
-			Reason: fmt.Sprintf(
-				"copy://%s targets an ABR upstream — downstream must not configure its own transcoder (ladder is inherited)",
-				classes[abrIdx].target,
-			),
-		}
-	}
+	// Rule 2(b) (formerly "ABR-copy + own transcoder is ambiguous") was
+	// removed: downstream MAY configure its own transcoder when copying from
+	// an ABR upstream. In that case the runtime taps only the BEST rendition
+	// of the upstream (single source) and feeds the downstream transcoder,
+	// which builds its own ladder. Other upstream rungs are unused — mirroring
+	// is reserved for the no-transcoder case.
 
 	// Rule 3: mixed-shape inputs (copy from single + copy from ABR mix
 	// already caught by rule 2(a)). The remaining concern is mixing

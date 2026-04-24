@@ -7,11 +7,21 @@
 // the system's point of view there is no network IO at all — the data
 // flows through the in-memory Buffer Hub.
 //
-// Scope (v1 / single-stream): the upstream MUST be single-stream
-// (no transcoder, or transcoder with video.copy=true). ABR upstreams use
-// a separate coordinator path that creates N parallel taps; this reader
-// only handles the 1-buffer case. ValidateCopyShape rejects the mismatch
-// at write time so we never reach Open with an ABR upstream.
+// Two upstream shapes are supported:
+//
+//  1. Single-stream upstream (no transcoder, or video.copy=true): subscribe
+//     to the upstream's main buffer (= upstream code). Packets are AVPackets
+//     written directly by the upstream's ingestor.
+//
+//  2. ABR upstream + downstream HAS its own transcoder: subscribe to the
+//     upstream's BEST rendition buffer (highest resolution/bitrate rung).
+//     That buffer carries TS bytes, so we wrap it in an internal TS demuxer
+//     to produce AVPackets the downstream transcoder can consume.
+//
+// ABR upstream + downstream WITHOUT transcoder is routed through a separate
+// coordinator path (N tap goroutines mirroring the ladder), never reaching
+// this reader — Coordinator.detectABRCopy diverts that case before
+// NewPacketReader is called.
 
 package pull
 
@@ -32,11 +42,19 @@ import (
 type StreamLookup func(domain.StreamCode) (*domain.Stream, bool)
 
 // CopyReader implements ingestor.PacketReader for `copy://<upstream>` URLs.
+//
+// One of two modes is selected at construction based on the upstream shape:
+//   - sub != nil: single-stream mode — subscribe to upstream's main buffer
+//     (AVPackets); ReadPackets reads sub.Recv() directly.
+//   - abrInner != nil: ABR mode — best rendition buffer is wrapped through
+//     a TS demuxer; ReadPackets delegates to abrInner.ReadPackets.
 type CopyReader struct {
 	target   domain.StreamCode
-	bufID    domain.StreamCode // resolved at construction (= upstream's main buffer)
+	bufID    domain.StreamCode // resolved at construction (= upstream's main buffer or best rendition)
 	bufSvc   *buffer.Service
-	sub      *buffer.Subscriber
+	sub      *buffer.Subscriber   // single-stream mode
+	abrInner *TSDemuxPacketReader // ABR mode (nil otherwise)
+	abrChunk *bufferTSChunkReader // ABR mode underlying source (kept for Close ordering)
 	closed   atomic.Bool
 	closeErr error
 }
@@ -45,9 +63,13 @@ type CopyReader struct {
 //   - URL malformed (`copy://` grammar violation) — propagates protocol error
 //   - upstream missing in lookup — runtime error; coordinator surfaces it
 //     as input degraded so the manager can switch to a fallback
-//   - upstream has ABR transcoder — copy:// from ABR routes via the
-//     coordinator's ABR path, never through this single-stream reader;
-//     reaching here with ABR upstream is a configuration bug
+//
+// Mode selection:
+//   - upstream is single-stream → subscribe upstream's main buffer (AVPackets)
+//   - upstream is ABR → subscribe upstream's BEST rendition buffer (TS bytes)
+//     and demux to AVPackets via TSDemuxPacketReader. Coordinator only routes
+//     this case here when downstream has its own transcoder; the no-transcoder
+//     ABR-copy mirror path is handled by Coordinator.startABRCopy.
 func NewCopyReader(input domain.Input, bufSvc *buffer.Service, lookup StreamLookup) (*CopyReader, error) {
 	if bufSvc == nil {
 		return nil, errors.New("copy reader: nil buffer service")
@@ -66,31 +88,36 @@ func NewCopyReader(input domain.Input, bufSvc *buffer.Service, lookup StreamLook
 		return nil, fmt.Errorf("copy reader: upstream stream %q not found", target)
 	}
 
-	if streamHasRenditions(upstream) {
-		return nil, fmt.Errorf(
-			"copy reader: upstream %q has an ABR ladder — single-stream copy reader cannot tap an ABR upstream (must be routed via coordinator's ABR path)",
-			target,
-		)
-	}
-
-	// Single-stream upstream → main buffer is the stream code itself
-	// (PlaybackBufferID with nil/copy transcoder returns code).
+	// PlaybackBufferID returns the main buffer for single-stream upstreams
+	// (AVPackets) and the best rendition buffer for ABR (TS bytes).
 	bufID := buffer.PlaybackBufferID(target, upstream.Transcoder)
+	r := &CopyReader{target: target, bufID: bufID, bufSvc: bufSvc}
 
-	return &CopyReader{
-		target: target,
-		bufID:  bufID,
-		bufSvc: bufSvc,
-	}, nil
+	if streamHasRenditions(upstream) {
+		// ABR mode: rendition buffer carries TS bytes. Wrap in a TS demuxer
+		// so the rest of the pipeline still gets AVPackets.
+		r.abrChunk = newBufferTSChunkReader(bufSvc, bufID)
+		r.abrInner = NewTSDemuxPacketReader(r.abrChunk)
+	}
+	return r, nil
 }
 
 // Open subscribes to the upstream buffer. Returns an error when the
 // buffer doesn't exist yet (upstream not started, or torn down).
 func (r *CopyReader) Open(ctx context.Context) error {
-	_ = ctx // subscription is sync; ctx is honoured by ReadPackets only
 	if r.closed.Load() {
 		return errors.New("copy reader: open after close")
 	}
+	if r.abrInner != nil {
+		// ABR mode: delegate to the inner demuxer (which Opens its
+		// underlying bufferTSChunkReader and starts the demux loop).
+		if err := r.abrInner.Open(ctx); err != nil {
+			return fmt.Errorf("copy reader: abr open %q: %w", r.bufID, err)
+		}
+		return nil
+	}
+	// Single-stream mode: subscription is sync; ctx is honoured by
+	// ReadPackets only.
 	sub, err := r.bufSvc.Subscribe(r.bufID)
 	if err != nil {
 		return fmt.Errorf("copy reader: subscribe %q: %w", r.bufID, err)
@@ -102,13 +129,13 @@ func (r *CopyReader) Open(ctx context.Context) error {
 // ReadPackets blocks until one upstream packet arrives or ctx is done.
 // Returns io.EOF when upstream tears down (subscriber channel closes).
 //
-// Packets without an AV payload (raw TS bytes from a transcoded
-// rendition buffer) are skipped silently — single-stream upstreams write
-// AV packets exclusively. A TS-only packet here means the upstream
-// shape changed mid-flight (e.g. transcoder added) and the downstream
-// stream needs to be restarted; we return an empty slice and let the
-// next call block again.
+// Single-stream mode: packets without an AV payload (TS-only) are skipped
+// silently — they shouldn't normally appear in a main buffer. ABR mode
+// delegates to the inner TS demuxer.
 func (r *CopyReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error) {
+	if r.abrInner != nil {
+		return r.abrInner.ReadPackets(ctx)
+	}
 	if r.sub == nil {
 		return nil, errors.New("copy reader: ReadPackets called before Open")
 	}
@@ -131,6 +158,12 @@ func (r *CopyReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error)
 // Close unsubscribes. Idempotent — safe to call from multiple goroutines.
 func (r *CopyReader) Close() error {
 	if r.closed.Swap(true) {
+		return r.closeErr
+	}
+	if r.abrInner != nil {
+		// Closing the inner demuxer cascades to bufferTSChunkReader.Close
+		// which unsubscribes from the upstream rendition buffer.
+		r.closeErr = r.abrInner.Close()
 		return r.closeErr
 	}
 	if r.sub != nil {

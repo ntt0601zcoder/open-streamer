@@ -49,38 +49,34 @@ func TestValidateMixerShape_RejectsFallbackInput(t *testing.T) {
 	require.Contains(t, err.Error(), "must be the only input")
 }
 
-// ABR upstream as video source is rejected.
-func TestValidateMixerShape_RejectsABRVideoUpstream(t *testing.T) {
+// ABR upstream as video source is now ALLOWED — runtime taps best
+// rendition (or mirrors ladder when no downstream transcoder).
+func TestValidateMixerShape_AllowsABRVideoUpstream(t *testing.T) {
 	t.Parallel()
 	s := mkMixerStream("camABR", "radio")
-	err := ValidateMixerShape(s, mkLookup(mkABRStream("camABR", 2), mkSingleStream("radio")))
-	require.Error(t, err)
-	require.True(t, IsMixerShapeError(err))
-	require.Contains(t, err.Error(), "video upstream")
-	require.Contains(t, err.Error(), "ABR ladder")
+	require.NoError(t, ValidateMixerShape(s,
+		mkLookup(mkABRStream("camABR", 2), mkSingleStream("radio"))))
 }
 
-// ABR upstream as audio source is rejected.
-func TestValidateMixerShape_RejectsABRAudioUpstream(t *testing.T) {
+// ABR upstream as audio source is now ALLOWED — runtime taps audio from
+// the best rendition.
+func TestValidateMixerShape_AllowsABRAudioUpstream(t *testing.T) {
 	t.Parallel()
 	s := mkMixerStream("cam", "radioABR")
-	err := ValidateMixerShape(s, mkLookup(mkSingleStream("cam"), mkABRStream("radioABR", 3)))
-	require.Error(t, err)
-	require.True(t, IsMixerShapeError(err))
-	require.Contains(t, err.Error(), "audio upstream")
+	require.NoError(t, ValidateMixerShape(s,
+		mkLookup(mkSingleStream("cam"), mkABRStream("radioABR", 3))))
 }
 
-// Downstream having its own transcoder is rejected.
-func TestValidateMixerShape_RejectsDownstreamTranscoder(t *testing.T) {
+// Downstream having its own transcoder is now ALLOWED — runtime taps best
+// video + best audio rendition and feeds the encoder.
+func TestValidateMixerShape_AllowsDownstreamTranscoder(t *testing.T) {
 	t.Parallel()
 	s := mkMixerStream("cam", "radio")
 	s.Transcoder = &TranscoderConfig{
 		Video: VideoTranscodeConfig{Profiles: []VideoProfile{{Width: 1280, Height: 720}}},
 	}
-	err := ValidateMixerShape(s, mkLookup(mkSingleStream("cam"), mkSingleStream("radio")))
-	require.Error(t, err)
-	require.True(t, IsMixerShapeError(err))
-	require.Contains(t, err.Error(), "must not configure its own transcoder")
+	require.NoError(t, ValidateMixerShape(s,
+		mkLookup(mkSingleStream("cam"), mkSingleStream("radio"))))
 }
 
 // Single + single upstream as sole input + no transcoder = the supported v1 case.

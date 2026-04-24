@@ -44,23 +44,34 @@ func TestNewCopyReader_RejectsMissingUpstream(t *testing.T) {
 	require.Contains(t, err.Error(), "not found")
 }
 
-// ABR upstream MUST NOT reach this single-stream reader — the coordinator
-// routes ABR copies via a different path. ValidateCopyShape catches it at
-// write time; this is the runtime safety net.
-func TestNewCopyReader_RejectsABRUpstream(t *testing.T) {
+// ABR upstream is now ACCEPTED in CopyReader: subscribes to the best
+// rendition buffer and demuxes TS bytes back into AVPackets internally.
+// This is the path used when a downstream stream copies an ABR upstream
+// AND adds its own transcoder. (Coordinator's startABRCopy handles the
+// no-transcoder mirror case.)
+func TestNewCopyReader_AcceptsABRUpstream(t *testing.T) {
 	t.Parallel()
 	bs := buffer.NewServiceForTesting(8)
 	abr := &domain.Stream{
 		Code: "up",
 		Transcoder: &domain.TranscoderConfig{
 			Video: domain.VideoTranscodeConfig{
-				Profiles: []domain.VideoProfile{{Width: 1920, Height: 1080, Bitrate: 4500}},
+				Profiles: []domain.VideoProfile{
+					{Width: 1920, Height: 1080, Bitrate: 4500},
+					{Width: 1280, Height: 720, Bitrate: 2500},
+				},
 			},
 		},
 	}
-	_, err := NewCopyReader(domain.Input{URL: "copy://up"}, bs, mkLookup(abr))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "ABR")
+	r, err := NewCopyReader(domain.Input{URL: "copy://up"}, bs, mkLookup(abr))
+	require.NoError(t, err)
+	require.NotNil(t, r)
+
+	// Best rendition (track_1 = 1080p) should be selected as the source.
+	bestSlug := buffer.VideoTrackSlug(0)
+	wantBufID := buffer.RenditionBufferID("up", bestSlug)
+	require.Equal(t, wantBufID, r.bufID)
+	require.NotNil(t, r.abrInner, "ABR mode must wrap a TS demuxer")
 }
 
 // Subscribing before the upstream's buffer exists is an error — the

@@ -18,9 +18,12 @@
 //     forwarding video-only — operator opt-in for "video must stay up no
 //     matter what" semantics.
 //
-// Both upstreams MUST be single-stream (no ABR ladder); ValidateMixerShape
-// rejects ABR upstreams at write time so reaching Open with one is a config
-// bug.
+// ABR upstreams ARE supported here: when an upstream has an ABR ladder, the
+// reader subscribes to its BEST rendition buffer (highest resolution/bitrate
+// rung) and demuxes TS bytes back into AVPackets. This is the path used when
+// the downstream stream has its own transcoder; the no-downstream-transcoder
+// + ABR-video case is routed through a dedicated coordinator path that
+// mirrors the video ladder, never reaching this reader.
 
 package pull
 
@@ -30,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
@@ -37,6 +41,15 @@ import (
 )
 
 // MixerReader implements ingestor.PacketReader for `mixer://` URLs.
+//
+// Each source (video, audio) selects one of two modes at construction:
+//   - direct mode: subscribe upstream's main buffer (single-stream upstream;
+//     packets arrive as AVPackets). Uses the *Sub fields below.
+//   - ABR mode: subscribe upstream's best rendition (TS bytes) and demux
+//     via TSDemuxPacketReader. Uses the *Inner / *Chunk fields below.
+//
+// The two modes can mix freely: e.g. ABR video + single-stream audio is the
+// common case for "replace audio of an ABR camera with internet radio".
 type MixerReader struct {
 	video                domain.StreamCode
 	audio                domain.StreamCode
@@ -44,9 +57,29 @@ type MixerReader struct {
 	videoBufID           domain.StreamCode
 	audioBufID           domain.StreamCode
 	bufSvc               *buffer.Service
-	videoSub             *buffer.Subscriber
-	audioSub             *buffer.Subscriber // nil after audio tear-down in continue mode
-	closed               atomic.Bool
+
+	// Direct mode (single-stream upstream).
+	videoSub *buffer.Subscriber
+	audioSub *buffer.Subscriber // nil after audio tear-down in continue mode
+
+	// ABR mode (TS-demuxed best rendition).
+	videoInner *TSDemuxPacketReader
+	videoChunk *bufferTSChunkReader
+	audioInner *TSDemuxPacketReader
+	audioChunk *bufferTSChunkReader
+	// Lazy-pumped channels feeding the select in ReadPackets — populated by
+	// videoPump / audioPump goroutines that copy from the inner ReadPackets
+	// loop into a chan. Needed because TSDemuxPacketReader's ReadPackets is
+	// blocking (no select-friendly channel exposed).
+	videoChan chan domain.AVPacket
+	audioChan chan domain.AVPacket
+	pumpCtx   context.Context
+	pumpStop  context.CancelFunc
+	pumpWg    sync.WaitGroup
+	videoEOF  atomic.Bool
+	audioEOF  atomic.Bool
+
+	closed atomic.Bool
 }
 
 // NewMixerReader constructs a MixerReader from a mixer:// input. Errors:
@@ -54,8 +87,9 @@ type MixerReader struct {
 //   - either upstream missing in lookup → runtime error; coordinator surfaces
 //     as input degraded so the manager can switch to a fallback (none allowed
 //     in v1, so effectively the stream stops)
-//   - either upstream has ABR transcoder → mixer requires single-stream
-//     upstreams in v1; reaching here with ABR is a configuration bug
+//
+// Mode per source: ABR upstream → tap best rendition + TS demux; otherwise
+// → subscribe main buffer directly. Modes are independent for video vs audio.
 func NewMixerReader(input domain.Input, bufSvc *buffer.Service, lookup StreamLookup) (*MixerReader, error) {
 	if bufSvc == nil {
 		return nil, errors.New("mixer reader: nil buffer service")
@@ -77,86 +111,165 @@ func NewMixerReader(input domain.Input, bufSvc *buffer.Service, lookup StreamLoo
 	if !ok {
 		return nil, fmt.Errorf("mixer reader: audio upstream %q not found", audio)
 	}
-	if streamHasRenditions(upV) {
-		return nil, fmt.Errorf(
-			"mixer reader: video upstream %q has an ABR ladder — single-stream upstream required in v1",
-			video,
-		)
-	}
-	if streamHasRenditions(upA) {
-		return nil, fmt.Errorf(
-			"mixer reader: audio upstream %q has an ABR ladder — single-stream upstream required in v1",
-			audio,
-		)
-	}
 
-	return &MixerReader{
+	r := &MixerReader{
 		video:                video,
 		audio:                audio,
 		audioFailureContinue: audioContinue,
 		videoBufID:           buffer.PlaybackBufferID(video, upV.Transcoder),
 		audioBufID:           buffer.PlaybackBufferID(audio, upA.Transcoder),
 		bufSvc:               bufSvc,
-	}, nil
+	}
+	if streamHasRenditions(upV) {
+		r.videoChunk = newBufferTSChunkReader(bufSvc, r.videoBufID)
+		r.videoInner = NewTSDemuxPacketReader(r.videoChunk)
+	}
+	if streamHasRenditions(upA) {
+		r.audioChunk = newBufferTSChunkReader(bufSvc, r.audioBufID)
+		r.audioInner = NewTSDemuxPacketReader(r.audioChunk)
+	}
+	return r, nil
 }
 
-// Open subscribes to both upstream buffers. Either subscribe failure undoes
-// the other (no leaked subscriber).
+// Open subscribes to both upstream buffers and (for ABR sources) starts pump
+// goroutines that bridge TS-demux output into select-friendly channels. On
+// any failure, partial state is rolled back.
 func (r *MixerReader) Open(ctx context.Context) error {
-	_ = ctx
 	if r.closed.Load() {
 		return errors.New("mixer reader: open after close")
+	}
+
+	// Pump context outlives the request ctx — request is "open the reader",
+	// not "run the pumps forever". Close() cancels this ctx.
+	r.pumpCtx, r.pumpStop = context.WithCancel(context.Background())
+
+	if err := r.openVideoSource(ctx); err != nil {
+		r.pumpStop()
+		return err
+	}
+	if err := r.openAudioSource(ctx); err != nil {
+		r.closeVideoSource()
+		r.pumpStop()
+		return err
+	}
+	return nil
+}
+
+func (r *MixerReader) openVideoSource(ctx context.Context) error {
+	if r.videoInner != nil {
+		if err := r.videoInner.Open(ctx); err != nil {
+			return fmt.Errorf("mixer reader: subscribe video %q: %w", r.videoBufID, err)
+		}
+		r.videoChan = make(chan domain.AVPacket, 32)
+		r.pumpWg.Add(1)
+		//nolint:contextcheck // pumpCtx is intentionally detached; cancelled by Close()
+		go r.pumpInner(r.pumpCtx, r.videoInner, r.videoChan, &r.videoEOF, "video")
+		return nil
 	}
 	vsub, err := r.bufSvc.Subscribe(r.videoBufID)
 	if err != nil {
 		return fmt.Errorf("mixer reader: subscribe video %q: %w", r.videoBufID, err)
 	}
+	r.videoSub = vsub
+	return nil
+}
+
+func (r *MixerReader) openAudioSource(ctx context.Context) error {
+	if r.audioInner != nil {
+		if err := r.audioInner.Open(ctx); err != nil {
+			return fmt.Errorf("mixer reader: subscribe audio %q: %w", r.audioBufID, err)
+		}
+		r.audioChan = make(chan domain.AVPacket, 32)
+		r.pumpWg.Add(1)
+		//nolint:contextcheck // pumpCtx is intentionally detached; cancelled by Close()
+		go r.pumpInner(r.pumpCtx, r.audioInner, r.audioChan, &r.audioEOF, "audio")
+		return nil
+	}
 	asub, err := r.bufSvc.Subscribe(r.audioBufID)
 	if err != nil {
-		r.bufSvc.Unsubscribe(r.videoBufID, vsub)
 		return fmt.Errorf("mixer reader: subscribe audio %q: %w", r.audioBufID, err)
 	}
-	r.videoSub = vsub
 	r.audioSub = asub
 	return nil
+}
+
+// pumpInner runs ReadPackets in a loop and forwards each packet to ch. On
+// error or EOF it sets the eof flag (so ReadPackets can apply policy) and
+// closes ch.
+func (r *MixerReader) pumpInner(
+	ctx context.Context,
+	inner *TSDemuxPacketReader,
+	ch chan<- domain.AVPacket,
+	eofFlag *atomic.Bool,
+	label string,
+) {
+	defer r.pumpWg.Done()
+	defer close(ch)
+	for {
+		batch, err := inner.ReadPackets(ctx)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				slog.Debug("mixer reader: inner pump done",
+					"source", label, "err", err)
+			}
+			eofFlag.Store(true)
+			return
+		}
+		for _, p := range batch {
+			select {
+			case <-ctx.Done():
+				eofFlag.Store(true)
+				return
+			case ch <- p:
+			}
+		}
+	}
 }
 
 // ReadPackets blocks until one upstream packet arrives or ctx is done.
 //
 // Selection rules:
-//   - video subscriber close → io.EOF (always; downstream stream stops)
-//   - audio subscriber close + audio_failure=down (default) → io.EOF
-//   - audio subscriber close + audio_failure=continue → unsubscribe audio
-//     and continue forwarding video-only; subsequent calls only watch video
+//   - video source ends (sub close or pump EOF) → io.EOF (always; downstream
+//     stream stops)
+//   - audio source ends + audio_failure=down (default) → io.EOF
+//   - audio source ends + audio_failure=continue → drop the audio source
+//     and keep forwarding video-only on subsequent calls
 //   - packets whose codec doesn't match the source channel are dropped
 //     (e.g. video upstream emitting an audio AAC packet — we want video only
 //     from the video source)
 func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error) {
-	if r.videoSub == nil {
+	if !r.videoOpen() {
 		return nil, errors.New("mixer reader: ReadPackets called before Open")
 	}
 
-	// Re-derive audio channel each call so nil-ing audioSub after failure
-	// disables that select case (a nil receive channel never selects).
-	var audioCh <-chan buffer.Packet
-	if r.audioSub != nil {
-		audioCh = r.audioSub.Recv()
-	}
+	videoSubCh := r.videoSubCh()
+	videoABRCh := r.videoABRCh()
+	audioSubCh := r.audioSubCh()
+	audioABRCh := r.audioABRCh()
 
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case pkt, ok := <-r.videoSub.Recv():
+
+	case pkt, ok := <-videoSubCh:
 		if !ok {
 			return nil, fmt.Errorf("mixer reader: video upstream %q closed: %w", r.video, io.EOF)
 		}
 		if pkt.AV == nil || !pkt.AV.Codec.IsVideo() {
-			// Audio (or unknown) frames from the video source are dropped —
-			// caller (readLoop) treats nil batch as "try again".
 			return nil, nil
 		}
 		return []domain.AVPacket{*pkt.AV}, nil
-	case pkt, ok := <-audioCh:
+
+	case avp, ok := <-videoABRCh:
+		if !ok {
+			return nil, fmt.Errorf("mixer reader: video upstream %q closed: %w", r.video, io.EOF)
+		}
+		if !avp.Codec.IsVideo() {
+			return nil, nil
+		}
+		return []domain.AVPacket{avp}, nil
+
+	case pkt, ok := <-audioSubCh:
 		if !ok {
 			return r.handleAudioClose()
 		}
@@ -164,13 +277,55 @@ func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error
 			return nil, nil
 		}
 		return []domain.AVPacket{*pkt.AV}, nil
+
+	case avp, ok := <-audioABRCh:
+		if !ok {
+			return r.handleAudioClose()
+		}
+		if !avp.Codec.IsAudio() {
+			return nil, nil
+		}
+		return []domain.AVPacket{avp}, nil
 	}
 }
 
-// handleAudioClose applies the audio-failure policy when the audio
-// subscriber's channel closes (upstream torn down). In `continue` mode it
-// drops the audio subscriber and tells the caller to try again (nil batch);
-// otherwise it returns io.EOF to abort the whole stream.
+// videoOpen reports whether either video mode has been initialised.
+func (r *MixerReader) videoOpen() bool { return r.videoSub != nil || r.videoInner != nil }
+
+// videoSubCh returns the direct-mode subscriber channel, or nil if in ABR
+// mode (which makes the corresponding select case never fire).
+func (r *MixerReader) videoSubCh() <-chan buffer.Packet {
+	if r.videoSub == nil {
+		return nil
+	}
+	return r.videoSub.Recv()
+}
+
+// videoABRCh returns the ABR-mode pump channel, or nil in direct mode.
+func (r *MixerReader) videoABRCh() <-chan domain.AVPacket {
+	if r.videoChan == nil {
+		return nil
+	}
+	return r.videoChan
+}
+
+func (r *MixerReader) audioSubCh() <-chan buffer.Packet {
+	if r.audioSub == nil {
+		return nil
+	}
+	return r.audioSub.Recv()
+}
+
+func (r *MixerReader) audioABRCh() <-chan domain.AVPacket {
+	if r.audioChan == nil {
+		return nil
+	}
+	return r.audioChan
+}
+
+// handleAudioClose applies the audio-failure policy when the audio source
+// ends. In continue mode it drops the audio source and tells the caller to
+// try again (nil batch); otherwise it returns io.EOF to abort the stream.
 func (r *MixerReader) handleAudioClose() ([]domain.AVPacket, error) {
 	if !r.audioFailureContinue {
 		return nil, fmt.Errorf("mixer reader: audio upstream %q closed: %w", r.audio, io.EOF)
@@ -178,21 +333,47 @@ func (r *MixerReader) handleAudioClose() ([]domain.AVPacket, error) {
 	slog.Warn("mixer reader: audio upstream closed, continuing video-only",
 		"audio_upstream", r.audio,
 	)
-	r.bufSvc.Unsubscribe(r.audioBufID, r.audioSub)
-	r.audioSub = nil
+	r.closeAudioSource()
 	return nil, nil
 }
 
-// Close unsubscribes from both upstreams. Idempotent.
+// closeVideoSource releases video-side resources (direct sub or ABR inner +
+// pump). Idempotent — safe to call from Close after a partial Open failure.
+func (r *MixerReader) closeVideoSource() {
+	if r.videoInner != nil {
+		_ = r.videoInner.Close()
+		r.videoInner = nil
+	}
+	if r.videoSub != nil {
+		r.bufSvc.Unsubscribe(r.videoBufID, r.videoSub)
+		r.videoSub = nil
+	}
+}
+
+func (r *MixerReader) closeAudioSource() {
+	if r.audioInner != nil {
+		_ = r.audioInner.Close()
+		r.audioInner = nil
+		// Pump goroutine exits via inner Close → ReadPackets error → defer
+		// close(ch). audioChan = nil here so future ReadPackets ignore it.
+		r.audioChan = nil
+	}
+	if r.audioSub != nil {
+		r.bufSvc.Unsubscribe(r.audioBufID, r.audioSub)
+		r.audioSub = nil
+	}
+}
+
+// Close stops all sources + pumps. Idempotent.
 func (r *MixerReader) Close() error {
 	if r.closed.Swap(true) {
 		return nil
 	}
-	if r.videoSub != nil {
-		r.bufSvc.Unsubscribe(r.videoBufID, r.videoSub)
+	if r.pumpStop != nil {
+		r.pumpStop()
 	}
-	if r.audioSub != nil {
-		r.bufSvc.Unsubscribe(r.audioBufID, r.audioSub)
-	}
+	r.closeVideoSource()
+	r.closeAudioSource()
+	r.pumpWg.Wait()
 	return nil
 }

@@ -43,14 +43,18 @@ func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
 	rt.Status = h.coordinator.StreamStatus(s.Code)
 	rt.PipelineActive = registered
 
-	// ABR-copy streams bypass the manager entirely (their pipeline is N
-	// in-process taps, not an ingest worker), so the manager has no record
-	// to report. Substitute the coordinator's synthetic snapshot so the UI
-	// can show input status / activity instead of "UNKNOWN".
+	// ABR-copy / ABR-mixer streams bypass the manager entirely (their
+	// pipeline is N in-process taps, not an ingest worker), so the manager
+	// has no record to report. Substitute the coordinator's synthetic
+	// snapshot so the UI can show input status / activity instead of
+	// "UNKNOWN".
 	if !registered {
 		if abrRT, ok := h.coordinator.ABRCopyRuntimeStatus(s.Code); ok {
-			abrRT.Status = rt.Status // preserve coordinator-level status set above
+			abrRT.Status = rt.Status
 			rt = abrRT
+		} else if mxRT, ok := h.coordinator.ABRMixerRuntimeStatus(s.Code); ok {
+			mxRT.Status = rt.Status
+			rt = mxRT
 		}
 	}
 

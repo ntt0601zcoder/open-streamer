@@ -60,20 +60,28 @@ func TestNewMixerReader_RejectsMissingAudioUpstream(t *testing.T) {
 	require.Contains(t, err.Error(), "audio upstream")
 }
 
-func TestNewMixerReader_RejectsABRVideoUpstream(t *testing.T) {
+// ABR upstream is now ACCEPTED for both video and audio: the reader picks
+// the best rendition buffer and demuxes TS bytes back into AVPackets.
+func TestNewMixerReader_AcceptsABRUpstreams(t *testing.T) {
 	t.Parallel()
 	bs := buffer.NewServiceForTesting(8)
 	abr := &domain.Stream{
 		Code: "camABR",
 		Transcoder: &domain.TranscoderConfig{
-			Video: domain.VideoTranscodeConfig{Profiles: []domain.VideoProfile{{Width: 1920, Bitrate: 4500}}},
+			Video: domain.VideoTranscodeConfig{Profiles: []domain.VideoProfile{
+				{Width: 1920, Height: 1080, Bitrate: 4500},
+				{Width: 1280, Height: 720, Bitrate: 2500},
+			}},
 		},
 	}
 	radio := &domain.Stream{Code: "radio"}
-	_, err := NewMixerReader(domain.Input{URL: "mixer://camABR,radio"}, bs, mkLookup(abr, radio))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "video upstream")
-	require.Contains(t, err.Error(), "ABR")
+	r, err := NewMixerReader(domain.Input{URL: "mixer://camABR,radio"}, bs, mkLookup(abr, radio))
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	// Best rendition (track_1 = 1080p) selected for the video source.
+	require.Equal(t, buffer.RenditionBufferID("camABR", buffer.VideoTrackSlug(0)), r.videoBufID)
+	require.NotNil(t, r.videoInner, "ABR video must wrap a TS demuxer")
+	require.Nil(t, r.audioInner, "single-stream audio must use direct subscription")
 }
 
 // ─── data flow: codec routing ────────────────────────────────────────────────

@@ -48,18 +48,28 @@ type abrCopyEntry struct {
 	lastPacketAtNanos atomic.Int64
 }
 
-// detectABRCopy reports whether `s` is an ABR-copy candidate. Returns the
-// upstream stream when:
+// detectABRCopy reports whether `s` should run on the ABR-copy mirror path
+// (N tap goroutines, one per upstream rung, no transcoder). Returns the
+// upstream stream when ALL of the following hold:
 //   - the first input is `copy://X` and parses cleanly
 //   - X exists in the lookup
 //   - X has an ABR ladder (≥1 video profile, video.copy=false)
+//   - downstream has NO transcoder configured
 //
-// Otherwise returns nil — the caller falls back to the normal pipeline.
+// Otherwise returns nil — the caller falls back to the normal pipeline,
+// which (when upstream is ABR + downstream has transcoder) will single-tap
+// the best rendition of the upstream and feed it into downstream's encoder.
 //
 // The first input is sufficient to detect because ValidateCopyShape rejects
 // ABR-copy + fallback inputs at write time.
 func (c *Coordinator) detectABRCopy(s *domain.Stream) *domain.Stream {
 	if c.upstreamLookup == nil || s == nil || len(s.Inputs) == 0 {
+		return nil
+	}
+	if s.Transcoder != nil {
+		// Downstream has its own encoder → we don't mirror the ladder; the
+		// normal ingestor pipeline (CopyReader picking best rendition) feeds
+		// the encoder, which produces a fresh ladder per downstream config.
 		return nil
 	}
 	first := s.Inputs[0]

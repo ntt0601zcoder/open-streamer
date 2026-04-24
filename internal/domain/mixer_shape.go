@@ -50,11 +50,15 @@ func IsMixerShapeError(err error) bool {
 //  2. mixer:// must be the SOLE input — fallback inputs are not supported in
 //     v1 (failure semantics differ from regular failover; mixing across two
 //     unrelated mixer specs is undefined).
-//  3. Both upstreams must be single-stream (no ABR ladder) — mixing per-rung
-//     pairs is not supported in v1.
-//  4. Downstream must NOT have its own transcoder configured — output of
-//     mixer is the elementary streams of the two upstreams as-is. Adding a
-//     re-encode layer would defeat the cost saving and complicate sync.
+//
+// ABR upstreams ARE allowed:
+//   - When the video upstream has an ABR ladder AND the downstream has no
+//     own transcoder, the runtime mirrors the video ladder (N rungs out,
+//     audio fanned-out across them). When the downstream HAS its own
+//     transcoder, the runtime taps only the best rendition of each upstream
+//     and feeds the encoder.
+//   - Either upstream's audio is always single-source — the best rendition
+//     of the audio upstream when it's ABR.
 //
 // `lookup` resolves upstream streams. Missing upstream is treated as
 // "shape unknown" — the rule it enables is skipped, never failed. The
@@ -99,33 +103,11 @@ func ValidateMixerShape(s *Stream, lookup StreamLookup) error {
 		}
 	}
 
-	// Rule 4: own transcoder forbidden.
-	if s.Transcoder != nil {
-		return &MixerShapeError{
-			StreamCode: s.Code,
-			Reason:     "mixer:// downstream must not configure its own transcoder (output is upstream ES as-is)",
-		}
-	}
-
-	// Rule 3: upstreams must be single-stream when resolvable.
-	if upV, ok := lookup(video); ok && streamHasRenditions(upV) {
-		return &MixerShapeError{
-			StreamCode: s.Code,
-			Reason: fmt.Sprintf(
-				"video upstream %q has an ABR ladder — mixer:// requires single-stream upstreams in v1",
-				video,
-			),
-		}
-	}
-	if upA, ok := lookup(audio); ok && streamHasRenditions(upA) {
-		return &MixerShapeError{
-			StreamCode: s.Code,
-			Reason: fmt.Sprintf(
-				"audio upstream %q has an ABR ladder — mixer:// requires single-stream upstreams in v1",
-				audio,
-			),
-		}
-	}
+	// Rules 3 (no ABR upstream) and 4 (no downstream transcoder) were
+	// removed: ABR upstreams are now supported (mirror video ladder when
+	// no downstream transcoder, single-tap-best when there is one), and a
+	// downstream transcoder is now allowed (tap best video + best audio,
+	// feed the encoder).
 
 	return nil
 }

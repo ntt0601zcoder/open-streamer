@@ -62,9 +62,10 @@ func TestValidateCopyShape_RejectsABRCopyWithFallback(t *testing.T) {
 	require.Contains(t, err.Error(), "3 rungs")
 }
 
-// ABR-copy + downstream transcoder is ambiguous (which ladder wins?).
-// Forbid early so users don't get surprising re-encode behaviour.
-func TestValidateCopyShape_RejectsABRCopyWithLocalTranscoder(t *testing.T) {
+// ABR upstream + downstream transcoder is now allowed: runtime taps only
+// the best rendition of the upstream and feeds the downstream transcoder,
+// which builds its own ladder. (Replaces the former v1 reject rule 2(b).)
+func TestValidateCopyShape_AllowsABRCopyWithLocalTranscoder(t *testing.T) {
 	t.Parallel()
 	upstream := mkABRStream("up", 2)
 	downstream := &Stream{
@@ -72,9 +73,7 @@ func TestValidateCopyShape_RejectsABRCopyWithLocalTranscoder(t *testing.T) {
 		Inputs:     []Input{{URL: "copy://up"}},
 		Transcoder: &TranscoderConfig{Video: VideoTranscodeConfig{Profiles: []VideoProfile{{Width: 640, Height: 360}}}},
 	}
-	err := ValidateCopyShape(downstream, mkLookup(upstream, downstream))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "must not configure its own transcoder")
+	require.NoError(t, ValidateCopyShape(downstream, mkLookup(upstream, downstream)))
 }
 
 // ABR-copy as sole input with no local transcoder — the supported v1 case.
