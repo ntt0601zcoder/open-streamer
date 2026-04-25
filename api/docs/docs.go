@@ -2916,10 +2916,59 @@ const docTemplate = `{
                 "status": {
                     "$ref": "#/definitions/domain.StreamStatus"
                 },
+                "switches": {
+                    "description": "Switches is the rolling history of active-input changes (newest at\nindex 0, capped at maxSwitchHistory). Stream-level — switches happen\nBETWEEN inputs, so this lives next to Inputs rather than inside one.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/manager.SwitchEvent"
+                    }
+                },
                 "transcoder": {
                     "$ref": "#/definitions/transcoder.RuntimeStatus"
                 }
             }
+        },
+        "manager.SwitchEvent": {
+            "type": "object",
+            "properties": {
+                "at": {
+                    "type": "string"
+                },
+                "detail": {
+                    "description": "Detail is human-readable extra context (error message, timeout\nduration, …). Empty for reasons that have no extra context (manual,\nfailback, input_added, input_removed).",
+                    "type": "string"
+                },
+                "from": {
+                    "type": "integer"
+                },
+                "reason": {
+                    "$ref": "#/definitions/manager.SwitchReason"
+                },
+                "to": {
+                    "type": "integer"
+                }
+            }
+        },
+        "manager.SwitchReason": {
+            "type": "string",
+            "enum": [
+                "error",
+                "timeout",
+                "manual",
+                "failback",
+                "recovery",
+                "input_added",
+                "input_removed"
+            ],
+            "x-enum-varnames": [
+                "SwitchReasonError",
+                "SwitchReasonTimeout",
+                "SwitchReasonManual",
+                "SwitchReasonFailback",
+                "SwitchReasonRecovery",
+                "SwitchReasonInputAdded",
+                "SwitchReasonInputRemoved"
+            ]
         },
         "publisher.PushSnapshot": {
             "type": "object",

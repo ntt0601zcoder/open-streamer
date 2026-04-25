@@ -280,7 +280,8 @@ func TestCollectProbeIfNeeded_SkipsIfAlreadyProbing(t *testing.T) {
 
 // helper: exported wrapper so tests in the same package can call unexported functions.
 func collectTimeoutIfNeeded(state *streamState, h *InputHealth, priority int, now time.Time, timeout time.Duration, timedOut *int) {
-	(&Service{}).collectTimeoutIfNeeded(state, h, priority, now, timeout, timedOut)
+	var detail string
+	(&Service{}).collectTimeoutIfNeeded(state, h, priority, now, timeout, timedOut, &detail)
 }
 
 func collectProbeIfNeeded(state *streamState, h *InputHealth, priority int, now time.Time, tasks *[]probeTask) {

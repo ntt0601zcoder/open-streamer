@@ -1246,9 +1246,52 @@ definitions:
         $ref: '#/definitions/publisher.RuntimeStatus'
       status:
         $ref: '#/definitions/domain.StreamStatus'
+      switches:
+        description: |-
+          Switches is the rolling history of active-input changes (newest at
+          index 0, capped at maxSwitchHistory). Stream-level — switches happen
+          BETWEEN inputs, so this lives next to Inputs rather than inside one.
+        items:
+          $ref: '#/definitions/manager.SwitchEvent'
+        type: array
       transcoder:
         $ref: '#/definitions/transcoder.RuntimeStatus'
     type: object
+  manager.SwitchEvent:
+    properties:
+      at:
+        type: string
+      detail:
+        description: |-
+          Detail is human-readable extra context (error message, timeout
+          duration, …). Empty for reasons that have no extra context (manual,
+          failback, input_added, input_removed).
+        type: string
+      from:
+        type: integer
+      reason:
+        $ref: '#/definitions/manager.SwitchReason'
+      to:
+        type: integer
+    type: object
+  manager.SwitchReason:
+    enum:
+    - error
+    - timeout
+    - manual
+    - failback
+    - recovery
+    - input_added
+    - input_removed
+    type: string
+    x-enum-varnames:
+    - SwitchReasonError
+    - SwitchReasonTimeout
+    - SwitchReasonManual
+    - SwitchReasonFailback
+    - SwitchReasonRecovery
+    - SwitchReasonInputAdded
+    - SwitchReasonInputRemoved
   publisher.PushSnapshot:
     properties:
       attempt:

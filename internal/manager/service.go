@@ -76,6 +76,67 @@ func recordInputError(h *InputHealth, msg string, at time.Time) {
 	h.Errors = append([]domain.ErrorEntry{e}, h.Errors...)
 }
 
+// SwitchReason names why the active input changed. The set is closed —
+// every callsite of tryFailover must pick one so the rolling history is
+// always interpretable in the UI.
+type SwitchReason string
+
+// SwitchReason values. Add a new constant before introducing a new
+// trigger path so the UI legend and frontend filter dropdowns can stay
+// in sync (currently maintained manually).
+const (
+	// SwitchReasonError — ingestor reported a non-recoverable error on
+	// the active input (RTMP disconnect, HLS playlist 404, SRT broken …).
+	SwitchReasonError SwitchReason = "error"
+	// SwitchReasonTimeout — no packet from the active input for the full
+	// packet-timeout window (default 30s).
+	SwitchReasonTimeout SwitchReason = "timeout"
+	// SwitchReasonManual — operator forced the switch via the
+	// /streams/{code}/inputs/switch API.
+	SwitchReasonManual SwitchReason = "manual"
+	// SwitchReasonFailback — a higher-priority input recovered after
+	// having been degraded; manager switched back to honour priority.
+	SwitchReasonFailback SwitchReason = "failback"
+	// SwitchReasonRecovery — every input had degraded (exhausted state)
+	// and one probed clean; pipeline restarted on it. May land on the
+	// same priority as before in the single-input case.
+	SwitchReasonRecovery SwitchReason = "recovery"
+	// SwitchReasonInputAdded — UpdateInputs added an input with a
+	// priority lower (= higher precedence) than the current active one.
+	SwitchReasonInputAdded SwitchReason = "input_added"
+	// SwitchReasonInputRemoved — UpdateInputs removed the active input;
+	// manager promoted the next-best candidate.
+	SwitchReasonInputRemoved SwitchReason = "input_removed"
+)
+
+// SwitchEvent records one active-input switch for the rolling history.
+// From = -1 is reserved for "no previous active" (only the very first
+// activation in Register would qualify, but Register intentionally does
+// not record one — history shows real switches only).
+type SwitchEvent struct {
+	At     time.Time    `json:"at"`
+	From   int          `json:"from"`
+	To     int          `json:"to"`
+	Reason SwitchReason `json:"reason"`
+	// Detail is human-readable extra context (error message, timeout
+	// duration, …). Empty for reasons that have no extra context (manual,
+	// failback, input_added, input_removed).
+	Detail string `json:"detail,omitempty"`
+}
+
+const maxSwitchHistory = 5
+
+// recordSwitch prepends an entry, capped at maxSwitchHistory.
+// Caller must hold the parent streamState.mu.
+func recordSwitch(state *streamState, e SwitchEvent) {
+	if len(state.switchHistory) >= maxSwitchHistory {
+		copy(state.switchHistory[1:], state.switchHistory[:maxSwitchHistory-1])
+		state.switchHistory[0] = e
+		return
+	}
+	state.switchHistory = append([]SwitchEvent{e}, state.switchHistory...)
+}
+
 // streamState holds all monitoring data for a single stream.
 // Lock order: Service.mu (read or write) → state.mu — never in reverse.
 type streamState struct {
@@ -87,6 +148,10 @@ type streamState struct {
 	degradedAt    map[int]time.Time // when each input was last marked degraded
 	probing       map[int]bool      // true while a probe goroutine is in-flight for that priority
 	lastSwitchAt  time.Time         // time of the most recent active-input switch
+	// switchHistory is a bounded rolling log of active-input switches
+	// (newest at index 0, max maxSwitchHistory). Persists for the lifetime
+	// of the manager registration; cleared only on Unregister.
+	switchHistory []SwitchEvent
 
 	// overridePriority is set by a manual SwitchInput call.
 	// selectBest treats this input as highest-priority (always wins if healthy).
@@ -121,14 +186,18 @@ type streamState struct {
 // Exhausted is true when every input has degraded and no failover candidate
 // remains — the stream is effectively offline at the source.
 type RuntimeStatus struct {
-	Status                domain.StreamStatus       `json:"status"`
-	PipelineActive        bool                      `json:"pipeline_active"`
-	ActiveInputPriority   int                       `json:"active_input_priority"`
-	OverrideInputPriority *int                      `json:"override_input_priority,omitempty"`
-	Exhausted             bool                      `json:"exhausted"`
-	Inputs                []InputHealthSnapshot     `json:"inputs"`
-	Transcoder            *transcoder.RuntimeStatus `json:"transcoder,omitempty"`
-	Publisher             *publisher.RuntimeStatus  `json:"publisher,omitempty"`
+	Status                domain.StreamStatus   `json:"status"`
+	PipelineActive        bool                  `json:"pipeline_active"`
+	ActiveInputPriority   int                   `json:"active_input_priority"`
+	OverrideInputPriority *int                  `json:"override_input_priority,omitempty"`
+	Exhausted             bool                  `json:"exhausted"`
+	Inputs                []InputHealthSnapshot `json:"inputs"`
+	// Switches is the rolling history of active-input changes (newest at
+	// index 0, capped at maxSwitchHistory). Stream-level — switches happen
+	// BETWEEN inputs, so this lives next to Inputs rather than inside one.
+	Switches   []SwitchEvent             `json:"switches,omitempty"`
+	Transcoder *transcoder.RuntimeStatus `json:"transcoder,omitempty"`
+	Publisher  *publisher.RuntimeStatus  `json:"publisher,omitempty"`
 }
 
 // InputHealthSnapshot is a serialisable copy of one input's health.
@@ -346,6 +415,11 @@ func (s *Service) RuntimeStatus(streamID domain.StreamCode) (RuntimeStatus, bool
 		Exhausted:             state.exhausted,
 		Inputs:                make([]InputHealthSnapshot, 0, len(state.inputs)),
 	}
+	if len(state.switchHistory) > 0 {
+		// Defensive copy — caller must not see future mutations under state.mu.
+		out.Switches = make([]SwitchEvent, len(state.switchHistory))
+		copy(out.Switches, state.switchHistory)
+	}
 	for _, h := range state.inputs {
 		snap := InputHealthSnapshot{
 			InputPriority: h.Input.Priority,
@@ -435,7 +509,7 @@ func (s *Service) ReportInputError(streamID domain.StreamCode, inputPriority int
 		StreamCode: streamID,
 		Payload:    map[string]any{"input_priority": inputPriority, "reason": err.Error()},
 	})
-	s.tryFailover(streamID, state)
+	s.tryFailover(streamID, state, SwitchReasonError, err.Error())
 }
 
 func (s *Service) monitor(ctx context.Context, streamID domain.StreamCode) {
@@ -464,12 +538,13 @@ func (s *Service) checkHealth(streamID domain.StreamCode) {
 	now := time.Now()
 	timeout := s.packetTimeout
 	timedOutPriority := -1
+	timedOutDetail := ""
 	var probeTasks []probeTask
 
 	state.mu.Lock()
 	if !state.dead {
 		for priority, h := range state.inputs {
-			s.collectTimeoutIfNeeded(state, h, priority, now, timeout, &timedOutPriority)
+			s.collectTimeoutIfNeeded(state, h, priority, now, timeout, &timedOutPriority, &timedOutDetail)
 			s.collectProbeIfNeeded(state, h, priority, now, &probeTasks)
 		}
 	}
@@ -486,7 +561,7 @@ func (s *Service) checkHealth(streamID domain.StreamCode) {
 			StreamCode: streamID,
 			Payload:    map[string]any{"input_priority": timedOutPriority},
 		})
-		s.tryFailover(streamID, state)
+		s.tryFailover(streamID, state, SwitchReasonTimeout, timedOutDetail)
 	}
 	for _, task := range probeTasks {
 		go s.runProbe(streamID, state, task) //nolint:contextcheck // probe uses state.monCtx internally
@@ -502,6 +577,7 @@ func (s *Service) collectTimeoutIfNeeded(
 	now time.Time,
 	timeout time.Duration,
 	timedOut *int,
+	timedOutDetail *string,
 ) {
 	if priority != state.active {
 		return
@@ -512,10 +588,12 @@ func (s *Service) collectTimeoutIfNeeded(
 	if now.Sub(h.LastPacketAt) <= timeout {
 		return
 	}
+	msg := fmt.Sprintf("no packet for %s (timeout %s)", now.Sub(h.LastPacketAt).Truncate(time.Second), timeout)
 	h.Status = domain.StatusDegraded
-	recordInputError(h, fmt.Sprintf("no packet for %s (timeout %s)", now.Sub(h.LastPacketAt).Truncate(time.Second), timeout), now)
+	recordInputError(h, msg, now)
 	state.degradedAt[priority] = now
 	*timedOut = priority
+	*timedOutDetail = msg
 }
 
 // collectProbeIfNeeded queues a probe task for a degraded input past its cooldown.
@@ -550,7 +628,12 @@ func (s *Service) collectProbeIfNeeded(
 
 // tryFailover picks the best healthy input and seamlessly switches to it.
 // It is safe to call concurrently; concurrent calls are idempotent.
-func (s *Service) tryFailover(streamID domain.StreamCode, state *streamState) {
+//
+// reason / detail are recorded in the switch history when the failover
+// actually commits (caller's intent — what triggered this attempt). Every
+// callsite must supply a reason; the closed SwitchReason enum makes
+// "forgot to label" a compile error.
+func (s *Service) tryFailover(streamID domain.StreamCode, state *streamState, reason SwitchReason, detail string) {
 	state.mu.Lock()
 	if state.dead {
 		state.mu.Unlock()
@@ -581,6 +664,7 @@ func (s *Service) tryFailover(streamID domain.StreamCode, state *streamState) {
 		"stream_code", streamID,
 		"from", prevPriority,
 		"to", bestInput.Priority,
+		"reason", reason,
 	)
 
 	if err := s.ingestor.Start(ctx, streamID, bestInput, bufID); err != nil {
@@ -592,13 +676,13 @@ func (s *Service) tryFailover(streamID domain.StreamCode, state *streamState) {
 		return
 	}
 
-	commitSwitch(state, prevPriority, bestInput)
+	commitSwitch(state, prevPriority, bestInput, reason, detail)
 
 	s.m.ManagerFailoversTotal.WithLabelValues(string(streamID)).Inc()
 	s.bus.Publish(ctx, domain.Event{
 		Type:       domain.EventInputFailover,
 		StreamCode: streamID,
-		Payload:    map[string]any{"from": prevPriority, "to": bestInput.Priority},
+		Payload:    map[string]any{"from": prevPriority, "to": bestInput.Priority, "reason": string(reason)},
 	})
 	s.notifyRestored(wasExhausted, streamID)
 }
@@ -623,7 +707,9 @@ func (s *Service) handleExhausted(streamID domain.StreamCode, state *streamState
 }
 
 // commitSwitch atomically updates streamState after a successful ingestor start.
-func commitSwitch(state *streamState, prevPriority int, bestInput domain.Input) {
+// Records the switch in the rolling history with the caller-supplied reason
+// (re-checked under the lock to avoid stale state).
+func commitSwitch(state *streamState, prevPriority int, bestInput domain.Input, reason SwitchReason, detail string) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.dead || state.active != prevPriority {
@@ -642,6 +728,13 @@ func commitSwitch(state *streamState, prevPriority int, bestInput domain.Input) 
 	if newH := state.inputs[bestInput.Priority]; newH != nil {
 		newH.LastPacketAt = now
 	}
+	recordSwitch(state, SwitchEvent{
+		At:     now,
+		From:   prevPriority,
+		To:     bestInput.Priority,
+		Reason: reason,
+		Detail: detail,
+	})
 }
 
 // notifyRestored fires the onRestored callback when the stream recovers from exhaustion.
@@ -715,8 +808,11 @@ func (s *Service) runProbe(streamID domain.StreamCode, state *streamState, task 
 	//      priority that was active before).
 	//   2. Failback — recovered input has higher priority than the fallback
 	//      we're currently running on; switch back when cooldown elapsed.
-	if wasExhausted || (task.priority < currentActive && sinceSwitch >= failbackSwitchCooldown) {
-		s.tryFailover(streamID, state)
+	switch {
+	case wasExhausted:
+		s.tryFailover(streamID, state, SwitchReasonRecovery, "")
+	case task.priority < currentActive && sinceSwitch >= failbackSwitchCooldown:
+		s.tryFailover(streamID, state, SwitchReasonFailback, "")
 	}
 }
 
@@ -753,7 +849,7 @@ func (s *Service) SwitchInput(streamID domain.StreamCode, priority int) error {
 		"stream_code", streamID,
 		"priority", priority,
 	)
-	s.tryFailover(streamID, state)
+	s.tryFailover(streamID, state, SwitchReasonManual, "")
 	return nil
 }
 
@@ -772,7 +868,11 @@ func (s *Service) UpdateInputs(
 		return
 	}
 
-	var needFailover bool
+	// failoverReason captures WHY a failover is needed so the switch
+	// history shows the right cause. Input removal of the active source
+	// takes precedence over a higher-priority addition because the
+	// removal alone would force a switch even if no add had happened.
+	var failoverReason SwitchReason
 	var restartInput *domain.Input
 
 	state.mu.Lock()
@@ -786,7 +886,7 @@ func (s *Service) UpdateInputs(
 		delete(state.degradedAt, inp.Priority)
 		delete(state.probing, inp.Priority)
 		if inp.Priority == state.active {
-			needFailover = true
+			failoverReason = SwitchReasonInputRemoved
 		}
 		slog.Info("manager: input removed", "stream_code", streamID, "priority", inp.Priority)
 	}
@@ -796,8 +896,8 @@ func (s *Service) UpdateInputs(
 			Input:  inp,
 			Status: domain.StatusIdle,
 		}
-		if inp.Priority < state.active {
-			needFailover = true
+		if inp.Priority < state.active && failoverReason == "" {
+			failoverReason = SwitchReasonInputAdded
 		}
 		slog.Info("manager: input added", "stream_code", streamID, "priority", inp.Priority)
 	}
@@ -816,8 +916,8 @@ func (s *Service) UpdateInputs(
 	ctx := state.monCtx
 	state.mu.Unlock()
 
-	if needFailover {
-		s.tryFailover(streamID, state)
+	if failoverReason != "" {
+		s.tryFailover(streamID, state, failoverReason, "")
 	} else if restartInput != nil {
 		if err := s.ingestor.Start(ctx, streamID, *restartInput, bufID); err != nil {
 			slog.Error("manager: restart active input failed",
