@@ -455,6 +455,22 @@ definitions:
     properties:
       ffmpeg_path:
         type: string
+      multi_output:
+        description: |-
+          MultiOutput, when true, runs ONE FFmpeg process per stream that emits
+          every profile via its own output pipe (single decode, multi encode).
+          When false (default), spawns one FFmpeg per profile (legacy mode).
+
+          Multi-output cuts process count and decode work in half for ABR
+          streams (2 profiles → 1 process instead of 2; 5 profiles → 1 instead
+          of 5), saving ~40% RAM per stream and ~50% NVDEC sessions. Trade-off:
+          a single input glitch (corrupt frame, source restart) brings down all
+          profiles together for ~2-3 s instead of just one rendition. For
+          stable upstreams the win is decisive; for flaky upstreams operators
+          may prefer the per-profile isolation of legacy mode.
+
+          Single-profile streams behave identically in both modes.
+        type: boolean
     type: object
   domain.AudioCodec:
     enum:

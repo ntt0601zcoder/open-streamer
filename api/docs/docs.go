@@ -1987,6 +1987,10 @@ const docTemplate = `{
             "properties": {
                 "ffmpeg_path": {
                     "type": "string"
+                },
+                "multi_output": {
+                    "description": "MultiOutput, when true, runs ONE FFmpeg process per stream that emits\nevery profile via its own output pipe (single decode, multi encode).\nWhen false (default), spawns one FFmpeg per profile (legacy mode).\n\nMulti-output cuts process count and decode work in half for ABR\nstreams (2 profiles → 1 process instead of 2; 5 profiles → 1 instead\nof 5), saving ~40% RAM per stream and ~50% NVDEC sessions. Trade-off:\na single input glitch (corrupt frame, source restart) brings down all\nprofiles together for ~2-3 s instead of just one rendition. For\nstable upstreams the win is decisive; for flaky upstreams operators\nmay prefer the per-profile isolation of legacy mode.\n\nSingle-profile streams behave identically in both modes.",
+                    "type": "boolean"
                 }
             }
         },

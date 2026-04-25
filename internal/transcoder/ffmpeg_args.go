@@ -100,6 +100,131 @@ func buildFFmpegArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]string,
 	return args, nil
 }
 
+// buildMultiOutputArgs builds one FFmpeg invocation that decodes the input
+// once and emits N video profiles, each to its own output pipe (fd 3, 4, …).
+// Audio is muxed into every output (encoded once per output — same cost as
+// the legacy per-profile mode, no savings here, but no regression either).
+//
+// The first output goes to pipe:3 (NOT pipe:1) because stdout is reserved
+// for FFmpeg's own diagnostics under multi-output mode and we use ExtraFiles
+// to pass extra pipe fds. Caller wires `os.Pipe()` × N → cmd.ExtraFiles.
+//
+// Returns args ready for exec.Command. Returns error if profiles is empty
+// or if any profile is video.copy=true (copy mode bypasses the shared
+// decode and would force a separate pass — not supported in multi-output).
+func buildMultiOutputArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]string, error) {
+	if tc == nil {
+		tc = &domain.TranscoderConfig{}
+	}
+	if len(profiles) == 0 {
+		return nil, fmt.Errorf("transcoder: multi-output: no video profiles")
+	}
+	if tc.Video.Copy {
+		// video.copy=true means "no decode, no encode" — defeats the
+		// purpose of multi-output (which exists to share the decode).
+		// Caller should fall back to legacy single-output mode.
+		return nil, fmt.Errorf("transcoder: multi-output: incompatible with video.copy=true")
+	}
+
+	// Encoder for the FIRST profile decides hwaccel input flags. All
+	// profiles share the same decode → same hwaccel pipeline, so
+	// per-profile encoder choice must use the same HW family. (Mixed
+	// codec ladders e.g. profile 0 = nvenc h264, profile 1 = libx264
+	// are intentionally unsupported in multi-output mode — fall back
+	// to legacy.)
+	firstEnc := normalizeVideoEncoder(profiles[0].Codec, tc.Global.HW)
+
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "warning",
+		"-fflags", "+genpts+discardcorrupt",
+		"-analyzeduration", "15000000",
+		"-probesize", "33554432",
+	}
+	args = append(args, hwInputArgs(tc.Global.HW, firstEnc)...)
+	args = append(args,
+		"-f", "mpegts",
+		"-i", "pipe:0",
+	)
+
+	// One output per profile. Each output is a complete MPEG-TS containing
+	// the video for that rendition + the audio (encoded per output — FFmpeg
+	// has no zero-copy way to share an encoded audio stream across mpegts
+	// muxers; the cost matches the legacy per-profile mode).
+	for i, p := range profiles {
+		// Video mapping for this output.
+		args = append(args, "-map", "0:v:0?")
+		videoEnc := normalizeVideoEncoder(p.Codec, tc.Global.HW)
+		vf := buildVideoFilter(p, tc, videoEnc)
+		if vf != "" {
+			args = append(args, "-vf:v:0", vf)
+		}
+		args = append(args, "-c:v:0", videoEnc)
+		if p.Preset != "" {
+			args = append(args, "-preset:v:0", p.Preset)
+		}
+		if p.CodecProfile != "" {
+			args = append(args, "-profile:v:0", p.CodecProfile)
+		}
+		if p.CodecLevel != "" {
+			args = append(args, "-level:v:0", p.CodecLevel)
+		}
+		args = append(args, "-b:v:0", p.Bitrate)
+		if p.MaxBitrate > 0 {
+			args = append(args,
+				"-maxrate:v:0", strconv.Itoa(p.MaxBitrate)+"k",
+				"-bufsize:v:0", strconv.Itoa(p.MaxBitrate*2)+"k",
+			)
+		}
+		gop := gopFrames(tc, p)
+		if gop > 0 {
+			km := max(1, gop/2)
+			args = append(args, "-g:v:0", strconv.Itoa(gop), "-keyint_min:v:0", strconv.Itoa(km))
+		}
+		if p.Framerate > 0 {
+			args = append(args, "-r:v:0", formatFloat(p.Framerate))
+		} else if tc.Global.FPS > 0 {
+			args = append(args, "-r:v:0", strconv.Itoa(tc.Global.FPS))
+		}
+		// bframes flags don't have per-output stream specifiers like -bf:v:0
+		// because -bf is a codec-level option; FFmpeg applies the latest
+		// occurrence to the output being defined. Emit it inline before
+		// the output target.
+		args = append(args, bframesArgs(p.Bframes, videoEnc)...)
+		if p.Refs != nil && *p.Refs > 0 {
+			args = append(args, "-refs:v:0", strconv.Itoa(*p.Refs))
+		}
+
+		// Audio mapping for this output.
+		args = append(args, "-map", "0:a:0?")
+		if tc.Audio.Copy {
+			args = append(args, "-c:a:0", "copy")
+		} else {
+			// audioEncodeArgs emits -c:a / -b:a / -ar / -ac / -af. For
+			// multi-output we want them per-output too — FFmpeg accepts
+			// the un-suffixed form and applies it to the next-defined
+			// output. Order is: per-video flags above → per-audio flags
+			// here → output target → next iteration.
+			args = append(args, audioEncodeArgs(tc)...)
+		}
+
+		if len(tc.ExtraArgs) > 0 {
+			args = append(args, tc.ExtraArgs...)
+		}
+
+		// Output target: pipe:3 for first profile, pipe:4 for second, …
+		// Caller wires these fds via cmd.ExtraFiles.
+		args = append(args, "-f", "mpegts", fmt.Sprintf("pipe:%d", multiOutputBaseFD+i))
+	}
+
+	return args, nil
+}
+
+// multiOutputBaseFD is the file descriptor the FIRST extra output pipe
+// occupies in the FFmpeg child process. fd 0/1/2 are stdin/stdout/stderr;
+// the first ExtraFile becomes fd 3.
+const multiOutputBaseFD = 3
+
 // hwInputArgs returns the `-hwaccel` flags to put before `-i` so the decoder
 // produces frames already in GPU memory. Only emitted when the resolved
 // encoder is a HW encoder of the same family — otherwise the encoder cannot

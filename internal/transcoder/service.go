@@ -173,7 +173,10 @@ func New(i do.Injector) (*Service, error) {
 	}, nil
 }
 
-// Start launches one FFmpeg encoder per RenditionTarget (same raw ingest, different output buffers).
+// Start launches the transcoder pipeline for a stream. By default it spawns
+// one FFmpeg per RenditionTarget (legacy mode). When config.MultiOutput is
+// true, spawns ONE FFmpeg per stream that emits all renditions via separate
+// output pipes — see multi_output_run.go for rationale and trade-offs.
 func (s *Service) Start(
 	ctx context.Context,
 	logStreamCode domain.StreamCode,
@@ -202,10 +205,16 @@ func (s *Service) Start(
 	}
 	s.workers[logStreamCode] = sw
 
+	mode := "per_profile"
+	if s.cfg.MultiOutput {
+		mode = "multi_output"
+	}
+
 	slog.Info("transcoder: stream job started",
 		"stream_code", logStreamCode,
 		"profiles", len(targets),
 		"read_from", rawIngestID,
+		"mode", mode,
 	)
 
 	s.m.TranscoderWorkersActive.WithLabelValues(string(logStreamCode)).Set(float64(len(targets)))
@@ -213,14 +222,49 @@ func (s *Service) Start(
 	s.bus.Publish(ctx, domain.Event{
 		Type:       domain.EventTranscoderStarted,
 		StreamCode: logStreamCode,
-		Payload:    map[string]any{"profiles": len(targets), "raw_ingest_id": string(rawIngestID)},
+		Payload: map[string]any{
+			"profiles":      len(targets),
+			"raw_ingest_id": string(rawIngestID),
+			"mode":          mode,
+		},
 	})
+
+	if s.cfg.MultiOutput {
+		// One goroutine, one FFmpeg, all profiles. Track as a synthetic
+		// "profile 0" entry so Stop / status APIs see a non-empty
+		// profiles map and behave consistently.
+		//nolint:contextcheck // spawnMultiOutput derives its context from sw.baseCtx; by design
+		s.spawnMultiOutput(logStreamCode, sw, targets)
+		return nil
+	}
 
 	for i, t := range targets {
 		//nolint:contextcheck // spawnProfile derives its context from sw.baseCtx; by design
 		s.spawnProfile(logStreamCode, sw, i, t)
 	}
 	return nil
+}
+
+// spawnMultiOutput launches the single multi-output encoder goroutine. The
+// goroutine is tracked under profile index 0 in the streamWorker map so the
+// existing Stop / Update / status code paths (which iterate over profiles)
+// continue to work without per-mode branches. StartProfile/StopProfile
+// granularity is intentionally lost in multi-output mode — caller must
+// fall back to a full Stop+Start to add/remove profiles.
+func (s *Service) spawnMultiOutput(streamID domain.StreamCode, sw *streamWorker, targets []RenditionTarget) {
+	pCtx, pCancel := context.WithCancel(sw.baseCtx)
+	pw := &profileWorker{
+		cancel: pCancel,
+		done:   make(chan struct{}),
+	}
+	sw.mu.Lock()
+	sw.profiles[0] = pw
+	sw.mu.Unlock()
+
+	go func() {
+		defer close(pw.done)
+		s.runStreamEncoder(pCtx, streamID, sw.rawIngest, sw.tc, targets)
+	}()
 }
 
 // Stop cancels all FFmpeg encoders for a stream and waits for them to exit.
