@@ -1,0 +1,27 @@
+{
+  "code": "{{CODE}}",
+  "name": "bench passthrough {{CODE}}",
+  "tags": ["bench", "passthrough"],
+  "stream_key": "{{CODE}}",
+  "disabled": false,
+  "inputs": [
+    {
+      "url": "rtmp://0.0.0.0:1935/live/{{CODE}}",
+      "priority": 0,
+      "net": {
+        "reconnect": true,
+        "read_timeout_sec": 15,
+        "reconnect_delay_sec": 2,
+        "reconnect_max_delay_sec": 10
+      }
+    }
+  ],
+  "protocols": {
+    "hls": true,
+    "dash": false,
+    "rtsp": false,
+    "rtmp": false,
+    "srt": false
+  },
+  "push": []
+}

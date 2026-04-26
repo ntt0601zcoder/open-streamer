@@ -1,0 +1,6 @@
+# Local-only working data — kept on the benchmarking host, not in git.
+assets/      # generated test media (regenerate with prepare.sh)
+results/     # raw per-run artifacts (CSV, JSON snapshots, ffmpeg logs)
+.run/        # live state from source.sh
+
+# bench/reports/ IS tracked — committable report.md + per-run summaries
