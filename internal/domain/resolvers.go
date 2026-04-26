@@ -1,0 +1,77 @@
+package domain
+
+import "strings"
+
+// Resolve* helpers map user-facing config aliases to the values FFmpeg
+// (or downstream services) will actually use. They live here so the
+// transcoder package can call them without importing FFmpeg-specific
+// internals — the same lookup tables stay testable in pure Go.
+
+// ResolveVideoEncoder maps a user-facing codec string + global HW backend
+// to the FFmpeg encoder name that buildFFmpegArgs will emit.
+//
+// Routing highlights:
+//   - "" / "h264" / "avc" + HW=nvenc → "h264_nvenc"; else "libx264"
+//   - "h265" / "hevc"     + HW=nvenc → "hevc_nvenc"; else "libx265"
+//   - VAAPI / QSV / VideoToolbox: no implicit routing — caller must spell
+//     the full encoder name (e.g. "h264_vaapi"); empty stays "libx264".
+func ResolveVideoEncoder(codec VideoCodec, hw HWAccel) string {
+	c := strings.TrimSpace(strings.ToLower(string(codec)))
+	switch c {
+	case "", "h264", "avc":
+		if hw == HWAccelNVENC {
+			return "h264_nvenc"
+		}
+		return "libx264"
+	case "h265", "hevc":
+		if hw == HWAccelNVENC {
+			return "hevc_nvenc"
+		}
+		return "libx265"
+	case "vp9":
+		return "libvpx-vp9"
+	case "av1":
+		return "libsvtav1"
+	}
+	if strings.Contains(c, "nvenc") || strings.Contains(c, "qsv") || strings.Contains(c, "videotoolbox") {
+		return string(codec)
+	}
+	if strings.Contains(c, "264") || strings.Contains(c, "265") || strings.Contains(c, "hevc") {
+		return string(codec)
+	}
+	return "libx264"
+}
+
+// ResolveAudioEncoder maps a user-facing codec to FFmpeg's encoder name.
+// Empty / "copy" → AAC default (since copy is decided separately via
+// AudioTranscodeConfig.Copy).
+func ResolveAudioEncoder(codec AudioCodec) string {
+	c := strings.TrimSpace(strings.ToLower(string(codec)))
+	switch c {
+	case "", string(AudioCodecCopy), string(AudioCodecAAC):
+		return "aac"
+	case string(AudioCodecMP3):
+		return "libmp3lame"
+	case string(AudioCodecOpus):
+		return "libopus"
+	case string(AudioCodecAC3):
+		return "ac3"
+	}
+	return "aac"
+}
+
+// ResolveResizeMode normalizes a free-form resize mode to the canonical
+// constant. Empty / unknown → ResizeModePad.
+func ResolveResizeMode(m ResizeMode) ResizeMode {
+	switch ResizeMode(strings.ToLower(strings.TrimSpace(string(m)))) {
+	case ResizeModeCrop:
+		return ResizeModeCrop
+	case ResizeModeStretch:
+		return ResizeModeStretch
+	case ResizeModeFit:
+		return ResizeModeFit
+	case ResizeModePad:
+		return ResizeModePad
+	}
+	return ResizeModePad
+}

@@ -77,6 +77,7 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	r.Handle("/metrics", promhttp.Handler())
 	r.Get("/config", s.configH.GetConfig)
 	r.Post("/config", s.configH.UpdateConfig)
+	r.Get("/config/defaults", s.configH.GetConfigDefaults)
 	r.Get("/config/yaml", s.configH.GetConfigYAML)
 	r.Put("/config/yaml", s.configH.ReplaceConfigYAML)
 

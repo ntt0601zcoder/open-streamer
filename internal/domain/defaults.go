@@ -4,7 +4,7 @@ package domain
 // configuration field is left zero / empty by the user. They are the SINGLE
 // SOURCE OF TRUTH for implicit defaults — every consumer (handler, packager,
 // transcoder, validator) must reference these instead of inlining its own
-// literal so the API's "effective" view stays accurate.
+// literal so behaviour stays consistent across services.
 //
 // When changing a default here, audit references with:
 //
@@ -34,18 +34,6 @@ const (
 	// leave the live window — 0 = drop immediately after sliding out.
 	DefaultLiveHistory = 0
 
-	// DefaultRTMPPort is the IANA-assigned RTMP listener port used when an
-	// RTMP listener is enabled with no explicit port.
-	DefaultRTMPPort = 1935
-	// DefaultRTSPPort is the IANA-assigned RTSP listener port.
-	DefaultRTSPPort = 554
-	// DefaultRTSPTransport is the underlying transport when RTSPListenerConfig
-	// leaves Transport empty — "tcp" interleaves RTP into the control channel
-	// and is firewall-friendly.
-	DefaultRTSPTransport = "tcp"
-	// DefaultSRTPort is the conventional SRT listener port.
-	DefaultSRTPort = 9999
-
 	// DefaultDVRSegmentDuration is the DVR segment length in seconds when
 	// StreamDVRConfig.SegmentDuration is zero.
 	DefaultDVRSegmentDuration = 4
@@ -71,20 +59,9 @@ const (
 	// when a profile leaves Bitrate=0.
 	DefaultVideoBitrateK = 2500
 
-	// DefaultVideoResizeMode is the fallback for VideoProfile.ResizeMode.
-	DefaultVideoResizeMode = ResizeModePad
-
-	// DefaultAudioCodec is the audio codec emitted when the user leaves
-	// AudioTranscodeConfig.Codec empty (or set to "copy" while
-	// Audio.Copy=false, which is meaningless and treated the same).
-	DefaultAudioCodec AudioCodec = AudioCodecAAC
 	// DefaultAudioBitrateK is the audio bitrate (kbps) when
 	// AudioTranscodeConfig.Bitrate is zero.
 	DefaultAudioBitrateK = 128
-
-	// DefaultHWAccel is the fallback when TranscoderGlobalConfig.HW is
-	// empty — CPU-only encoding via libx264.
-	DefaultHWAccel HWAccel = HWAccelNone
 
 	// DefaultHLSPlaylistTimeoutSec is the upstream HLS pull playlist GET
 	// timeout (seconds) when InputNetConfig.ConnectTimeoutSec is zero.
