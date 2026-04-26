@@ -40,13 +40,13 @@ func (s *Service) RunSRTPlayServer(ctx context.Context) error {
 	}
 	host := srtCfg.ListenHost
 	if host == "" {
-		host = "0.0.0.0"
+		host = domain.DefaultListenHost
 	}
 	addr := fmt.Sprintf("%s:%d", host, srtCfg.Port)
 
 	latency := time.Duration(srtCfg.LatencyMS) * time.Millisecond
 	if latency <= 0 {
-		latency = 120 * time.Millisecond
+		latency = time.Duration(domain.DefaultSRTLatencyMS) * time.Millisecond
 	}
 	cfg := srt.DefaultConfig()
 	cfg.ReceiverLatency = latency

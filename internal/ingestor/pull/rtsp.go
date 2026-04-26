@@ -87,7 +87,7 @@ func (r *RTSPReader) Open(ctx context.Context) error {
 
 	connectTimeout := time.Duration(r.input.Net.ConnectTimeoutSec) * time.Second
 	if connectTimeout == 0 {
-		connectTimeout = 10 * time.Second
+		connectTimeout = time.Duration(domain.DefaultRTSPConnectTimeoutSec) * time.Second
 	}
 
 	c := &gortsplib.Client{

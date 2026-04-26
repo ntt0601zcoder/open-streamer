@@ -70,4 +70,29 @@ const (
 	// floor — segments can be many MB so this is held above the playlist
 	// timeout.
 	DefaultHLSSegmentTimeoutSec = 60
+	// DefaultHLSMaxSegmentBuffer caps pre-fetched HLS segments held in
+	// memory per stream when IngestorConfig.HLSMaxSegmentBuffer is zero.
+	DefaultHLSMaxSegmentBuffer = 8
+
+	// DefaultSRTLatencyMS is the SRT ARQ latency window (milliseconds) when
+	// SRTListenerConfig.LatencyMS is zero. 120ms matches Haivision's
+	// reference for low-latency contribution links.
+	DefaultSRTLatencyMS = 120
+
+	// DefaultFFmpegPath is the executable name resolved against $PATH when
+	// TranscoderConfig.FFmpegPath is empty. Operators on bespoke layouts
+	// (e.g. /opt/ffmpeg/bin/ffmpeg) must set the full path explicitly.
+	DefaultFFmpegPath = "ffmpeg"
+
+	// DefaultListenHost is the bind address used for RTMP / RTSP / SRT
+	// listeners when ListenHost is empty. "0.0.0.0" listens on all
+	// interfaces — the standard server behaviour.
+	DefaultListenHost = "0.0.0.0"
+
+	// DefaultRTMPConnectTimeoutSec is the dial timeout (seconds) for RTMP
+	// pull when InputNetConfig.ConnectTimeoutSec is zero.
+	DefaultRTMPConnectTimeoutSec = 10
+	// DefaultRTSPConnectTimeoutSec is the dial / read timeout (seconds)
+	// for RTSP pull when InputNetConfig.ConnectTimeoutSec is zero.
+	DefaultRTSPConnectTimeoutSec = 10
 )

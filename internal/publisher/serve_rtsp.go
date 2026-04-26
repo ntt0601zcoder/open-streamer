@@ -63,7 +63,7 @@ func (s *Service) RunRTSPPlayServer(ctx context.Context) error {
 	}
 	host := rtsp.ListenHost
 	if host == "" {
-		host = "0.0.0.0"
+		host = domain.DefaultListenHost
 	}
 	addr := fmt.Sprintf("%s:%d", host, rtsp.Port)
 

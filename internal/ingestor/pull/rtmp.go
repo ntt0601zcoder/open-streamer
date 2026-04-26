@@ -75,7 +75,7 @@ func (r *RTMPReader) Open(ctx context.Context) error {
 
 	connectTimeout := time.Duration(r.input.Net.ConnectTimeoutSec) * time.Second
 	if connectTimeout == 0 {
-		connectTimeout = 10 * time.Second
+		connectTimeout = time.Duration(domain.DefaultRTMPConnectTimeoutSec) * time.Second
 	}
 
 	conn, err := joyrtmp.DialTimeout(r.input.URL, connectTimeout)

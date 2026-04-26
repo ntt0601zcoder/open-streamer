@@ -113,7 +113,7 @@ func New(i do.Injector) (*Service, error) {
 
 	ffmpegPath := tc.FFmpegPath
 	if ffmpegPath == "" {
-		ffmpegPath = "ffmpeg"
+		ffmpegPath = domain.DefaultFFmpegPath
 	}
 
 	svc := &Service{

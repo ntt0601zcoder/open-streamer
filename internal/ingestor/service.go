@@ -161,7 +161,7 @@ func (s *Service) Run(ctx context.Context) error {
 func rtmpListenAddr(cfg config.RTMPListenerConfig) string {
 	host := cfg.ListenHost
 	if host == "" {
-		host = "0.0.0.0"
+		host = domain.DefaultListenHost
 	}
 	return fmt.Sprintf("%s:%d", host, cfg.Port)
 }

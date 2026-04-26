@@ -17,6 +17,19 @@ import (
 // so frontend can do `defaults.transcoder.audio.bitrate_k` without
 // remapping. Field names are snake_case to match the existing config
 // JSON tags.
+//
+// Fields intentionally NOT included:
+//   - Encoder-internal defaults (preset, profile, level, gop, framerate)
+//     where empty → no flag → encoder picks. Frontend should render
+//     "encoder default" placeholder for these.
+//   - Source pass-through fields (audio.channels, audio.sample_rate, fps)
+//     where 0 = match source. Frontend renders "match source".
+//   - Sentinel zeros (dvr.retention_sec=forever, push.limit=unlimited)
+//     where the zero itself carries semantic meaning.
+//   - Required fields (publisher.{hls,dash}.dir, hooks.worker_count) that
+//     have no default — server rejects empty.
+//   - Dead config fields (input.net.read_timeout_sec, reconnect_*) that
+//     are declared in domain but not consumed by any service.
 type configDefaultsResponse struct {
 	Buffer struct {
 		Capacity int `json:"capacity"`
@@ -50,44 +63,105 @@ type configDefaultsResponse struct {
 	} `json:"dvr"`
 
 	Transcoder struct {
-		Video struct {
+		FFmpegPath  string `json:"ffmpeg_path"`
+		MultiOutput bool   `json:"multi_output"`
+		Video       struct {
 			BitrateK   int               `json:"bitrate_k"`
 			ResizeMode domain.ResizeMode `json:"resize_mode"`
+			// DefaultCodec is the codec family used when the user leaves
+			// VideoProfile.Codec empty. EncoderByCodecHW resolves it (or
+			// any explicit codec) to the actual FFmpeg encoder name based
+			// on the stream's Global.HW selection — frontend looks up
+			// `EncoderByCodecHW[codec][hw]` to render the placeholder.
+			DefaultCodec     string                       `json:"default_codec"`
+			EncoderByCodecHW map[string]map[string]string `json:"encoder_by_codec_hw"`
 		} `json:"video"`
 		Audio struct {
 			Codec    domain.AudioCodec `json:"codec"`
 			BitrateK int               `json:"bitrate_k"`
 		} `json:"audio"`
 		Global struct {
-			HW domain.HWAccel `json:"hw"`
+			HW       domain.HWAccel `json:"hw"`
+			DeviceID int            `json:"deviceid"`
 		} `json:"global"`
 	} `json:"transcoder"`
 
 	Listeners struct {
 		RTMP listenerDefaults     `json:"rtmp"`
 		RTSP rtspListenerDefaults `json:"rtsp"`
-		SRT  listenerDefaults     `json:"srt"`
+		SRT  srtListenerDefaults  `json:"srt"`
 	} `json:"listeners"`
 
 	Ingestor struct {
 		HLSPlaylistTimeoutSec int `json:"hls_playlist_timeout_sec"`
 		HLSSegmentTimeoutSec  int `json:"hls_segment_timeout_sec"`
+		HLSMaxSegmentBuffer   int `json:"hls_max_segment_buffer"`
+		// Per-protocol pull dial timeouts (HLS uses HLSPlaylistTimeoutSec).
+		RTMPConnectTimeoutSec int `json:"rtmp_connect_timeout_sec"`
+		RTSPConnectTimeoutSec int `json:"rtsp_connect_timeout_sec"`
 	} `json:"ingestor"`
 }
 
 type liveSegmentDefaults struct {
-	LiveSegmentSec int `json:"live_segment_sec"`
-	LiveWindow     int `json:"live_window"`
-	LiveHistory    int `json:"live_history"`
+	LiveSegmentSec int  `json:"live_segment_sec"`
+	LiveWindow     int  `json:"live_window"`
+	LiveHistory    int  `json:"live_history"`
+	LiveEphemeral  bool `json:"live_ephemeral"`
 }
 
 type listenerDefaults struct {
-	Port int `json:"port"`
+	Port       int    `json:"port"`
+	ListenHost string `json:"listen_host"`
 }
 
 type rtspListenerDefaults struct {
-	Port      int    `json:"port"`
-	Transport string `json:"transport"`
+	Port       int    `json:"port"`
+	ListenHost string `json:"listen_host"`
+	Transport  string `json:"transport"`
+}
+
+type srtListenerDefaults struct {
+	Port       int    `json:"port"`
+	ListenHost string `json:"listen_host"`
+	LatencyMS  int    `json:"latency_ms"`
+}
+
+// supportedHWAccels lists the hwaccel values the codec routing table is
+// built for. Order is fixed so the JSON output is deterministic across
+// runs (Go map iteration is random — without this the response would
+// flap and break frontend caching).
+var supportedHWAccels = []domain.HWAccel{
+	domain.HWAccelNone,
+	domain.HWAccelNVENC,
+	domain.HWAccelVAAPI,
+	domain.HWAccelQSV,
+	domain.HWAccelVideoToolbox,
+}
+
+// supportedCodecFamilies is the input axis of the routing table. Each
+// family maps to a fully-resolved encoder name per HW backend.
+var supportedCodecFamilies = []domain.VideoCodec{
+	domain.VideoCodecH264,
+	domain.VideoCodecH265,
+	domain.VideoCodecVP9,
+	domain.VideoCodecAV1,
+}
+
+// buildEncoderByCodecHW computes the codec×HW → FFmpeg encoder name
+// mapping using domain.ResolveVideoEncoder as the single source of truth.
+// Frontend reads the result to render the codec placeholder per stream:
+//
+//	encoder := defaults.video.encoder_by_codec_hw[codec || default_codec][hw]
+func buildEncoderByCodecHW() map[string]map[string]string {
+	out := make(map[string]map[string]string, len(supportedCodecFamilies))
+	for _, codec := range supportedCodecFamilies {
+		row := make(map[string]string, len(supportedHWAccels))
+		for _, hw := range supportedHWAccels {
+			row[string(hw)] = domain.ResolveVideoEncoder(codec, hw)
+		}
+		out[string(codec)] = row
+	}
+	return out
 }
 
 // buildConfigDefaults constructs the response from the constants in
@@ -117,11 +191,13 @@ func buildConfigDefaults() configDefaultsResponse {
 		LiveSegmentSec: domain.DefaultLiveSegmentSec,
 		LiveWindow:     domain.DefaultLiveWindow,
 		LiveHistory:    domain.DefaultLiveHistory,
+		LiveEphemeral:  false,
 	}
 	resp.Publisher.DASH = liveSegmentDefaults{
 		LiveSegmentSec: domain.DefaultLiveSegmentSec,
 		LiveWindow:     domain.DefaultLiveWindow,
 		LiveHistory:    domain.DefaultLiveHistory,
+		LiveEphemeral:  false,
 	}
 
 	resp.Hook.MaxRetries = domain.DefaultHookMaxRetries
@@ -133,18 +209,37 @@ func buildConfigDefaults() configDefaultsResponse {
 	resp.DVR.SegmentDuration = domain.DefaultDVRSegmentDuration
 	resp.DVR.StoragePathTemplate = domain.DefaultDVRRoot + "/{streamCode}"
 
+	resp.Transcoder.FFmpegPath = domain.DefaultFFmpegPath
+	resp.Transcoder.MultiOutput = false
 	resp.Transcoder.Video.BitrateK = domain.DefaultVideoBitrateK
 	resp.Transcoder.Video.ResizeMode = domain.ResizeModePad
+	resp.Transcoder.Video.DefaultCodec = string(domain.VideoCodecH264)
+	resp.Transcoder.Video.EncoderByCodecHW = buildEncoderByCodecHW()
 	resp.Transcoder.Audio.Codec = domain.AudioCodecAAC
 	resp.Transcoder.Audio.BitrateK = domain.DefaultAudioBitrateK
 	resp.Transcoder.Global.HW = domain.HWAccelNone
+	resp.Transcoder.Global.DeviceID = 0
 
-	resp.Listeners.RTMP = listenerDefaults{Port: rtmpPort}
-	resp.Listeners.RTSP = rtspListenerDefaults{Port: rtspPort, Transport: rtspTransport}
-	resp.Listeners.SRT = listenerDefaults{Port: srtPort}
+	resp.Listeners.RTMP = listenerDefaults{
+		Port:       rtmpPort,
+		ListenHost: domain.DefaultListenHost,
+	}
+	resp.Listeners.RTSP = rtspListenerDefaults{
+		Port:       rtspPort,
+		ListenHost: domain.DefaultListenHost,
+		Transport:  rtspTransport,
+	}
+	resp.Listeners.SRT = srtListenerDefaults{
+		Port:       srtPort,
+		ListenHost: domain.DefaultListenHost,
+		LatencyMS:  domain.DefaultSRTLatencyMS,
+	}
 
 	resp.Ingestor.HLSPlaylistTimeoutSec = domain.DefaultHLSPlaylistTimeoutSec
 	resp.Ingestor.HLSSegmentTimeoutSec = domain.DefaultHLSSegmentTimeoutSec
+	resp.Ingestor.HLSMaxSegmentBuffer = domain.DefaultHLSMaxSegmentBuffer
+	resp.Ingestor.RTMPConnectTimeoutSec = domain.DefaultRTMPConnectTimeoutSec
+	resp.Ingestor.RTSPConnectTimeoutSec = domain.DefaultRTSPConnectTimeoutSec
 
 	return resp
 }

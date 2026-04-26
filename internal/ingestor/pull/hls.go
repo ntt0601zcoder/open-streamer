@@ -177,7 +177,7 @@ type HLSReader struct {
 func NewHLSReader(input domain.Input, cfg config.IngestorConfig) *HLSReader {
 	maxBuf := cfg.HLSMaxSegmentBuffer
 	if maxBuf <= 0 {
-		maxBuf = 8
+		maxBuf = domain.DefaultHLSMaxSegmentBuffer
 	}
 	return &HLSReader{
 		input:  input,
