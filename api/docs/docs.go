@@ -2912,10 +2912,20 @@ const docTemplate = `{
                 "ingestor": {
                     "type": "object",
                     "properties": {
+                        "hls_max_segment_buffer": {
+                            "type": "integer"
+                        },
                         "hls_playlist_timeout_sec": {
                             "type": "integer"
                         },
                         "hls_segment_timeout_sec": {
+                            "type": "integer"
+                        },
+                        "rtmp_connect_timeout_sec": {
+                            "description": "Per-protocol pull dial timeouts (HLS uses HLSPlaylistTimeoutSec).",
+                            "type": "integer"
+                        },
+                        "rtsp_connect_timeout_sec": {
                             "type": "integer"
                         }
                     }
@@ -2930,7 +2940,7 @@ const docTemplate = `{
                             "$ref": "#/definitions/handler.rtspListenerDefaults"
                         },
                         "srt": {
-                            "$ref": "#/definitions/handler.listenerDefaults"
+                            "$ref": "#/definitions/handler.srtListenerDefaults"
                         }
                     }
                 },
@@ -2978,19 +2988,41 @@ const docTemplate = `{
                                 }
                             }
                         },
+                        "ffmpeg_path": {
+                            "type": "string"
+                        },
                         "global": {
                             "type": "object",
                             "properties": {
+                                "deviceid": {
+                                    "type": "integer"
+                                },
                                 "hw": {
                                     "$ref": "#/definitions/domain.HWAccel"
                                 }
                             }
+                        },
+                        "multi_output": {
+                            "type": "boolean"
                         },
                         "video": {
                             "type": "object",
                             "properties": {
                                 "bitrate_k": {
                                     "type": "integer"
+                                },
+                                "default_codec": {
+                                    "description": "DefaultCodec is the codec family used when the user leaves\nVideoProfile.Codec empty. EncoderByCodecHW resolves it (or\nany explicit codec) to the actual FFmpeg encoder name based\non the stream's Global.HW selection — frontend looks up\n` + "`" + `EncoderByCodecHW[codec][hw]` + "`" + ` to render the placeholder.",
+                                    "type": "string"
+                                },
+                                "encoder_by_codec_hw": {
+                                    "type": "object",
+                                    "additionalProperties": {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "string"
+                                        }
+                                    }
                                 },
                                 "resize_mode": {
                                     "$ref": "#/definitions/domain.ResizeMode"
@@ -3004,6 +3036,9 @@ const docTemplate = `{
         "handler.listenerDefaults": {
             "type": "object",
             "properties": {
+                "listen_host": {
+                    "type": "string"
+                },
                 "port": {
                     "type": "integer"
                 }
@@ -3012,6 +3047,9 @@ const docTemplate = `{
         "handler.liveSegmentDefaults": {
             "type": "object",
             "properties": {
+                "live_ephemeral": {
+                    "type": "boolean"
+                },
                 "live_history": {
                     "type": "integer"
                 },
@@ -3026,11 +3064,28 @@ const docTemplate = `{
         "handler.rtspListenerDefaults": {
             "type": "object",
             "properties": {
+                "listen_host": {
+                    "type": "string"
+                },
                 "port": {
                     "type": "integer"
                 },
                 "transport": {
                     "type": "string"
+                }
+            }
+        },
+        "handler.srtListenerDefaults": {
+            "type": "object",
+            "properties": {
+                "latency_ms": {
+                    "type": "integer"
+                },
+                "listen_host": {
+                    "type": "string"
+                },
+                "port": {
+                    "type": "integer"
                 }
             }
         },

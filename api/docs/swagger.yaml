@@ -1229,9 +1229,16 @@ definitions:
         type: object
       ingestor:
         properties:
+          hls_max_segment_buffer:
+            type: integer
           hls_playlist_timeout_sec:
             type: integer
           hls_segment_timeout_sec:
+            type: integer
+          rtmp_connect_timeout_sec:
+            description: Per-protocol pull dial timeouts (HLS uses HLSPlaylistTimeoutSec).
+            type: integer
+          rtsp_connect_timeout_sec:
             type: integer
         type: object
       listeners:
@@ -1241,7 +1248,7 @@ definitions:
           rtsp:
             $ref: '#/definitions/handler.rtspListenerDefaults'
           srt:
-            $ref: '#/definitions/handler.listenerDefaults'
+            $ref: '#/definitions/handler.srtListenerDefaults'
         type: object
       manager:
         properties:
@@ -1271,15 +1278,35 @@ definitions:
               codec:
                 $ref: '#/definitions/domain.AudioCodec'
             type: object
+          ffmpeg_path:
+            type: string
           global:
             properties:
+              deviceid:
+                type: integer
               hw:
                 $ref: '#/definitions/domain.HWAccel'
             type: object
+          multi_output:
+            type: boolean
           video:
             properties:
               bitrate_k:
                 type: integer
+              default_codec:
+                description: |-
+                  DefaultCodec is the codec family used when the user leaves
+                  VideoProfile.Codec empty. EncoderByCodecHW resolves it (or
+                  any explicit codec) to the actual FFmpeg encoder name based
+                  on the stream's Global.HW selection — frontend looks up
+                  `EncoderByCodecHW[codec][hw]` to render the placeholder.
+                type: string
+              encoder_by_codec_hw:
+                additionalProperties:
+                  additionalProperties:
+                    type: string
+                  type: object
+                type: object
               resize_mode:
                 $ref: '#/definitions/domain.ResizeMode'
             type: object
@@ -1287,11 +1314,15 @@ definitions:
     type: object
   handler.listenerDefaults:
     properties:
+      listen_host:
+        type: string
       port:
         type: integer
     type: object
   handler.liveSegmentDefaults:
     properties:
+      live_ephemeral:
+        type: boolean
       live_history:
         type: integer
       live_segment_sec:
@@ -1301,10 +1332,21 @@ definitions:
     type: object
   handler.rtspListenerDefaults:
     properties:
+      listen_host:
+        type: string
       port:
         type: integer
       transport:
         type: string
+    type: object
+  handler.srtListenerDefaults:
+    properties:
+      latency_ms:
+        type: integer
+      listen_host:
+        type: string
+      port:
+        type: integer
     type: object
   manager.InputHealthSnapshot:
     properties:
