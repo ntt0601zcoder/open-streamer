@@ -11,10 +11,10 @@
 #   rss_mb            sum of RSS across open-streamer + ffmpeg children
 #   rss_pct           rss_mb expressed as % of host total RAM (0..100)
 #   procs             number of running ffmpeg children
-#   gpu_pct           overall GPU util %
-#   enc_pct           NVENC util %
-#   dec_pct           NVDEC util %
-#   vram_mb           VRAM used (MiB)
+#   gpu_pct           SM utilization summed across open-streamer's PIDs (%)
+#   enc_pct           NVENC utilization summed across open-streamer's PIDs (%)
+#   dec_pct           NVDEC utilization summed across open-streamer's PIDs (%)
+#   vram_mb           VRAM allocated by open-streamer's PIDs (MiB)
 #   net_rx_mbps       Mbit/s received on $NIC
 #   net_tx_mbps       Mbit/s transmitted on $NIC
 #   restarts_total    counter from /metrics — TranscoderRestartsTotal (if present)
@@ -38,8 +38,21 @@ TOTAL_RAM_MB=$(awk '/^MemTotal:/ {printf "%.0f", $2/1024; exit}' /proc/meminfo 2
 
 mkdir -p "$(dirname "$OUT")"
 
+# Build the PID list we account for: the open-streamer process itself plus
+# every direct child it spawned (these are the transcoder ffmpeg workers).
+# This intentionally EXCLUDES bench-side ffmpeg publishers (parent = bash) and
+# any other ffmpeg processes on the host that are not driven by open-streamer.
 read_pids() {
-  pgrep -d, -x "open-streamer|streamer|ffmpeg" 2>/dev/null || true
+  local osp
+  osp=$(pgrep -x open-streamer 2>/dev/null | head -1)
+  [[ -z "$osp" ]] && { echo ""; return; }
+  local children
+  children=$(pgrep -P "$osp" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+  if [[ -n "$children" ]]; then
+    echo "${osp},${children}"
+  else
+    echo "$osp"
+  fi
 }
 
 read_proc_cpu_mem() {
@@ -56,12 +69,33 @@ read_proc_cpu_mem() {
 }
 
 read_gpu() {
-  if command -v nvidia-smi >/dev/null; then
-    nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,memory.used \
-      --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
-  else
-    echo "0,0,0,0"
+  local pids=$1
+  command -v nvidia-smi >/dev/null || { echo "0,0,0,0"; return; }
+  if [[ -z "$pids" ]]; then
+    echo "0,0,0,0"; return
   fi
+
+  # Build alternation regex: "1234,5678" → "1234|5678"
+  local pid_re
+  pid_re=$(echo "$pids" | tr ',' '|')
+
+  # Per-PID utilization from `nvidia-smi pmon -s u`. Columns:
+  #   gpu pid type sm% mem% enc% dec% command
+  # We sum sm/enc/dec across our tracked PIDs (others on the host are ignored).
+  local util
+  util=$(nvidia-smi pmon -c 1 -s u 2>/dev/null \
+    | awk -v re="^($pid_re)\$" '
+        $2 ~ re && $4 != "-" {sm+=$4; enc+=$6; dec+=$7}
+        END {printf "%d,%d,%d", sm+0, enc+0, dec+0}') || util="0,0,0"
+
+  # Per-PID VRAM via compute-apps query.
+  local vram
+  vram=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F, -v re="^[[:space:]]*($pid_re)[[:space:]]*\$" '
+        $1 ~ re {sum += $2+0}
+        END {printf "%d", sum+0}') || vram=0
+
+  echo "${util:-0,0,0},${vram:-0}"
 }
 
 # /proc/net/dev counters → Mbit/s using bench delta
@@ -88,7 +122,7 @@ while [[ $(date +%s) -lt $end ]]; do
   ts=$(date +%s)
   pids=$(read_pids)
   proc_line=$(read_proc_cpu_mem "$pids")
-  gpu_line=$(read_gpu)
+  gpu_line=$(read_gpu "$pids")
 
   if [[ -n "${NIC:-}" ]]; then
     read cur_rx cur_tx < <(read_net_bytes)
