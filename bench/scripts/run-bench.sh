@@ -14,8 +14,8 @@
 #
 # Examples:
 #   bench/scripts/run-bench.sh A2  10 passthrough
-#   bench/scripts/run-bench.sh B3  4  abr3-legacy 300 60
-#   bench/scripts/run-bench.sh C3  4  abr3-multi
+#   bench/scripts/run-bench.sh B3  4  abr2-legacy 300 60
+#   bench/scripts/run-bench.sh C3  4  abr2-multi
 #
 set -euo pipefail
 

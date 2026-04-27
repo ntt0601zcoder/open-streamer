@@ -118,27 +118,34 @@ PROFILE=$( { grep -oE 'payloads/[a-z0-9-]+\.json' "$DIR/create.log" 2>/dev/null 
 # Map profile name to a human-readable ladder string for the master report row.
 case "$PROFILE" in
   passthrough)         LADDER="copy" ;;
-  abr3-legacy)         LADDER="1080p+720p+480p (legacy)" ;;
-  abr3-multi)          LADDER="1080p+720p+480p (multi)" ;;
-  abr3-multi-hlsdash)  LADDER="1080p+720p+480p (multi, HLS+DASH)" ;;
-  abr3-x264)           LADDER="1080p+720p+480p (libx264)" ;;
-  abr2-*)              LADDER="720p+480p" ;;
+  abr2-legacy)         LADDER="1080p+720p (legacy)" ;;
+  abr2-multi)          LADDER="1080p+720p (multi)" ;;
+  abr2-multi-hlsdash)  LADDER="1080p+720p (multi, HLS+DASH)" ;;
+  abr2-x264)           LADDER="1080p+720p (libx264)" ;;
   *)                   LADDER="<unknown>" ;;
 esac
 
-# Suggest verdict — use awk for portable float comparison (no bc dependency)
+# Verdict semantics:
+#   PASS       — bench ran cleanly, every metric within thresholds
+#   SATURATED  — bench ran cleanly but the system hit a resource ceiling
+#                (CPU p95 > 90%, stream(s) ended Degraded, transcoder restarts).
+#                This is the EXPECTED outcome of capacity testing — not a bug.
+#   FAIL       — bench infrastructure error (no metrics captured, etc.).
+#                summarize.sh proper only emits PASS/SATURATED here; FAIL is
+#                set by run-failover.sh when a behavior test didn't behave,
+#                or by run-all.sh when summary.md is missing entirely.
 gt() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 > b+0)}'; }
 
 VERDICT="PASS"
 VERDICT_REASON=""
 if gt "$CPU_P95" 90; then
-  VERDICT="FAIL"; VERDICT_REASON="$VERDICT_REASON CPU p95=${CPU_P95}% > 90%;"
+  VERDICT="SATURATED"; VERDICT_REASON="$VERDICT_REASON CPU p95=${CPU_P95}% > 90%;"
 fi
 if gt "$RESTART_DELTA" 0; then
-  VERDICT="FAIL"; VERDICT_REASON="$VERDICT_REASON transcoder restarts=${RESTART_DELTA};"
+  VERDICT="SATURATED"; VERDICT_REASON="$VERDICT_REASON transcoder restarts=${RESTART_DELTA};"
 fi
 if gt "$DEGRADED_COUNT" 0; then
-  VERDICT="FAIL"; VERDICT_REASON="$VERDICT_REASON ${DEGRADED_COUNT} streams ended Degraded;"
+  VERDICT="SATURATED"; VERDICT_REASON="$VERDICT_REASON ${DEGRADED_COUNT} streams ended Degraded;"
 fi
 [[ -z "$VERDICT_REASON" ]] && VERDICT_REASON="all stop conditions clear"
 

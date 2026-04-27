@@ -1,12 +1,12 @@
 {
   "code": "{{CODE}}",
-  "name": "bench abr3 multi-output {{CODE}}",
-  "tags": ["bench", "abr3", "multi-output"],
+  "name": "bench abr2 multi-output {{CODE}}",
+  "tags": ["bench", "abr2", "multi-output"],
   "stream_key": "{{CODE}}",
   "disabled": false,
   "inputs": [
     {
-      "url": "rtmp://0.0.0.0:1935/live/{{CODE}}",
+      "url": "rtmp://0.0.0.0:{{RTMP_PORT}}/live/{{CODE}}",
       "priority": 0,
       "net": {
         "reconnect": true,
@@ -40,13 +40,6 @@
           "framerate": 30, "keyframe_interval": 2,
           "codec": "h264", "preset": "p4",
           "profile": "high", "level": "4.0"
-        },
-        {
-          "width": 854, "height": 480,
-          "bitrate": 1200, "max_bitrate": 1500,
-          "framerate": 30, "keyframe_interval": 2,
-          "codec": "h264", "preset": "p4",
-          "profile": "main", "level": "3.1"
         }
       ]
     },

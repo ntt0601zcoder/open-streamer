@@ -1,7 +1,7 @@
 {
   "code": "{{CODE}}",
-  "name": "bench abr3 x264 {{CODE}}",
-  "tags": ["bench", "abr3", "x264", "cpu"],
+  "name": "bench abr2 x264 {{CODE}}",
+  "tags": ["bench", "abr2", "x264", "cpu"],
   "stream_key": "{{CODE}}",
   "disabled": false,
   "inputs": [
@@ -39,13 +39,6 @@
           "framerate": 30, "keyframe_interval": 2,
           "codec": "h264", "preset": "veryfast",
           "profile": "high", "level": "4.0"
-        },
-        {
-          "width": 854, "height": 480,
-          "bitrate": 1200, "max_bitrate": 1500,
-          "framerate": 30, "keyframe_interval": 2,
-          "codec": "h264", "preset": "veryfast",
-          "profile": "main", "level": "3.1"
         }
       ]
     },

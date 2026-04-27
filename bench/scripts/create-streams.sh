@@ -4,8 +4,8 @@
 #
 # Usage:
 #   bench/scripts/create-streams.sh 10 passthrough
-#   bench/scripts/create-streams.sh 4  abr3-legacy
-#   bench/scripts/create-streams.sh 4  abr3-multi
+#   bench/scripts/create-streams.sh 4  abr2-legacy
+#   bench/scripts/create-streams.sh 4  abr2-multi
 #
 # Cleanup:
 #   bench/scripts/create-streams.sh delete 10
@@ -19,7 +19,7 @@ PREFIX=${PREFIX:-bench}
 RTMP_PORT=${RTMP_PORT:-1935}
 
 usage() {
-  echo "Usage: $0 <N> <profile>           # profile: passthrough | abr3-legacy | abr3-multi"
+  echo "Usage: $0 <N> <profile>           # profile: passthrough | abr2-legacy | abr2-multi"
   echo "       $0 delete <N>"
   echo "       $0 delete-all              # removes every stream whose code starts with $PREFIX"
   exit 1

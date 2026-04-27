@@ -68,10 +68,12 @@ delete_stream() {
 }
 
 push_source() {
-  # spawn one RTMP publisher; echo PID
+  # spawn one RTMP publisher; echo PID.
+  # loglevel=warning so connect/handshake errors land in the logfile (the
+  # default loglevel=error misses many transient RTMP issues).
   local key=$1
   local logfile=$2
-  ffmpeg -hide_banner -loglevel error -nostdin \
+  ffmpeg -hide_banner -loglevel warning -nostdin \
     -re -stream_loop -1 -i "$INPUT" \
     -c copy -f flv "$RTMP_LOCAL/$key" \
     </dev/null >"$logfile" 2>&1 &
@@ -186,8 +188,13 @@ case_d1() {
     "protocols": {"hls": true}
   }' "$code" || { echo "[d1] create failed"; return 1; }
 
+  # Stagger publisher spawns: input[0] slot registers before input[1] in the
+  # pipeline. Without this delay the backup publisher races the registration
+  # and ffmpeg's RTMP push gets "Reject connect stream" → ffmpeg exits silently
+  # (no retry on flv push failures).
   note "spawn primary publisher"
   PRIMARY_PID=$(push_source "${code}_pri" "$DIR/src-primary.log")
+  sleep 3
   note "spawn backup publisher"
   BACKUP_PID=$(push_source "${code}_bak" "$DIR/src-backup.log")
 
@@ -200,6 +207,20 @@ case_d1() {
   local before
   before=$(switches_count "$code" "$DIR/runtime-pre.json")
   note "switches_count before kill = $before"
+
+  # Verify both inputs are healthy — otherwise switch can't possibly happen
+  local pri_status bak_status
+  pri_status=$(jq -r --arg c "$code" '.data[]? | select(.code == $c) | .runtime.inputs[] | select(.input_priority == 0) | .status' "$DIR/runtime-pre.json" 2>/dev/null || echo "?")
+  bak_status=$(jq -r --arg c "$code" '.data[]? | select(.code == $c) | .runtime.inputs[] | select(.input_priority == 1) | .status' "$DIR/runtime-pre.json" 2>/dev/null || echo "?")
+  note "input statuses: primary=$pri_status backup=$bak_status"
+  if [[ "$bak_status" != "active" && "$bak_status" != "idle" ]]; then
+    note "ABORT: backup input not healthy ($bak_status) — switch cannot happen"
+    kill "$PRIMARY_PID" "$BACKUP_PID" 2>/dev/null || true
+    delete_stream "$code"
+    trap - RETURN
+    emit_summary D1 "2 inputs, kill primary" "switch latency (ms)" "backup never connected ($bak_status)" "FAIL"
+    return 1
+  fi
 
   local kill_ts
   kill_ts=$(ms)
@@ -247,7 +268,8 @@ case_d2() {
   delete_stream "$code"
   # Use existing ABR legacy payload but rename the code
   local payload
-  payload=$(sed "s/{{CODE}}/$code/g" "$BENCH_ROOT/payloads/abr3-legacy.json")
+  payload=$(sed -e "s/{{CODE}}/$code/g" -e "s/{{RTMP_PORT}}/$RTMP_PORT/g" \
+                "$BENCH_ROOT/payloads/abr2-legacy.json")
   create_stream "$payload" "$code" || { echo "[d2] create failed"; return 1; }
 
   note "spawn publisher"

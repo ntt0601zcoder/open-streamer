@@ -224,29 +224,42 @@ cat <<EOF
 
 ---
 
-## 6. Issues & Failures
+## 6. Issues, Saturation & Failures
 
-| Severity | Phase / Run | Description | Per-run summary | Issue filed? |
-| --- | --- | --- | --- | --- |
+Verdict legend:
+
+- **PASS** — bench ran cleanly, every metric within thresholds
+- **SATURATED** — bench ran cleanly but the system hit a resource ceiling (CPU p95 > 90%, stream(s) ended Degraded, transcoder restarts). This is the EXPECTED outcome of capacity testing.
+- **FAIL** — real bench infrastructure / behavior failure. The sweep aborts on the first FAIL.
+
+| Verdict | Severity | Phase / Run | Description | Per-run summary | Issue filed? |
+| --- | --- | --- | --- | --- | --- |
 EOF
 
-# Auto-emit any FAIL-marked runs.
-# A/B/C summary format: line `**FAIL** — <reason>`
-# Phase D summary format: table row `| Verdict | **FAIL** |` plus a separate
-#                          `| Result | **<result>** |` line we surface as reason.
+# Auto-emit any non-PASS runs. SATURATED rows are EXPECTED for capacity tests
+# (the whole point is finding the ceiling) — they appear here for visibility
+# but should generally not need an issue filed.
+# FAIL rows indicate a real bench-infrastructure or behavior failure.
 for r in "${RUNS_FOUND[@]}"; do
   sum=$RESULTS/$r/summary.md
   [[ ! -f "$sum" ]] && continue
-  reason=""
+  verdict="" reason=""
+
   if grep -q '^\*\*FAIL\*\*' "$sum" 2>/dev/null; then
-    reason=$(grep '^\*\*FAIL\*\*' "$sum" | head -1 | sed 's/^\*\*FAIL\*\* — //')
+    verdict="FAIL"
+    reason=$(grep '^\*\*FAIL\*\*' "$sum" | head -1 | sed 's/^\*\*FAIL\*\* — //; s/;$//')
+  elif grep -q '^\*\*SATURATED\*\*' "$sum" 2>/dev/null; then
+    verdict="SATURATED"
+    reason=$(grep '^\*\*SATURATED\*\*' "$sum" | head -1 | sed 's/^\*\*SATURATED\*\* — //; s/;$//')
   elif grep -qE '\| Verdict \| \*\*FAIL\*\* \|' "$sum" 2>/dev/null; then
+    verdict="FAIL"
     reason=$(grep -E '\| Result \| \*\*' "$sum" | head -1 \
       | sed -E 's/.*\| \*\*([^*]+)\*\* \|.*/\1/')
     [[ -z "$reason" ]] && reason="(see runs/$r.md)"
   fi
-  [[ -n "$reason" ]] && \
-    echo "| <TODO> | $r | $reason | [runs/$r.md](runs/$r.md) | <TODO> |"
+
+  [[ -n "$verdict" ]] && \
+    echo "| $verdict | <TODO> | $r | $reason | [runs/$r.md](runs/$r.md) | <TODO> |"
 done
 
 cat <<EOF

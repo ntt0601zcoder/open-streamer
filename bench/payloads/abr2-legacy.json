@@ -1,7 +1,7 @@
 {
   "code": "{{CODE}}",
-  "name": "bench abr3 multi-output HLS+DASH {{CODE}}",
-  "tags": ["bench", "abr3", "multi-output", "hls", "dash"],
+  "name": "bench abr2 legacy {{CODE}}",
+  "tags": ["bench", "abr2", "legacy"],
   "stream_key": "{{CODE}}",
   "disabled": false,
   "inputs": [
@@ -40,13 +40,6 @@
           "framerate": 30, "keyframe_interval": 2,
           "codec": "h264", "preset": "p4",
           "profile": "high", "level": "4.0"
-        },
-        {
-          "width": 854, "height": 480,
-          "bitrate": 1200, "max_bitrate": 1500,
-          "framerate": 30, "keyframe_interval": 2,
-          "codec": "h264", "preset": "p4",
-          "profile": "main", "level": "3.1"
         }
       ]
     },
@@ -60,7 +53,7 @@
   },
   "protocols": {
     "hls": true,
-    "dash": true,
+    "dash": false,
     "rtsp": false,
     "rtmp": false,
     "srt": false

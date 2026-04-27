@@ -23,10 +23,10 @@ bench/
 │   └── push-report.sh    ← push reports/<sweep>/ to a dedicated GitHub branch
 ├── payloads/             ← stream JSON templates ({{CODE}} placeholder)
 │   ├── passthrough.json          ← copy, no transcode
-│   ├── abr3-legacy.json          ← NVENC, 1 ffmpeg per rendition
-│   ├── abr3-multi.json           ← NVENC, 1 ffmpeg per stream (multi-output)
-│   ├── abr3-x264.json            ← libx264 CPU fallback
-│   └── abr3-multi-hlsdash.json   ← multi-output + HLS+DASH outputs
+│   ├── abr2-legacy.json          ← NVENC, 1 ffmpeg per rendition
+│   ├── abr2-multi.json           ← NVENC, 1 ffmpeg per stream (multi-output)
+│   ├── abr2-x264.json            ← libx264 CPU fallback
+│   └── abr2-multi-hlsdash.json   ← multi-output + HLS+DASH outputs
 ├── reports/              ← TRACKED — committable reports
 │   └── <sweep>/
 │       ├── report.md     ← master report (auto-generated)
@@ -102,9 +102,19 @@ Plan + auto-stop behavior:
 | H | NVENC multi-output + HLS+DASH | 1, 4, 8, 12 | **yes** |
 | D | failover scenarios | 1 each (4 cases) | no — every case is independent |
 
-For load phases (B/C/F/H), once a run fails the verdict, every later entry
-in the same phase is skipped (Telegram emits ⏭️ for each skipped run).
-Worst case the sweep runs every entry; best case it stops early per phase.
+### Verdict semantics
+
+Each run produces one of three verdicts:
+
+| Verdict | Meaning | Effect on sweep |
+| --- | --- | --- |
+| **✅ PASS** | bench ran cleanly, every metric within thresholds | continues |
+| **📈 SATURATED** | system hit a resource ceiling (CPU p95 > 90%, stream(s) Degraded, transcoder restarts) — **expected** outcome of capacity testing | skips remaining runs in the SAME phase only |
+| **❌ FAIL** | real bench infrastructure / behavior error (script crashed, no summary, behavior didn't work) | **aborts the entire sweep immediately** |
+
+For load phases (B/C/F/H), once a run hits SATURATED, every later entry
+in the same phase is skipped (Telegram emits ⏭️). Worst case the sweep
+runs every entry; best case it stops early per phase.
 
 Knobs:
 
@@ -194,13 +204,13 @@ The master report has every metric table auto-filled. You only fill the
 bench/scripts/run-bench.sh A2 10 passthrough
 
 # Phase B3 — 4 ABR streams, legacy mode
-bench/scripts/run-bench.sh B3 4 abr3-legacy
+bench/scripts/run-bench.sh B3 4 abr2-legacy
 
 # Phase C3 — same load, multi-output mode (toggle global config first!)
 curl -X POST http://127.0.0.1:8080/config \
   -H 'Content-Type: application/json' \
   -d '{"transcoder":{"multi_output":true}}'
-bench/scripts/run-bench.sh C3 4 abr3-multi
+bench/scripts/run-bench.sh C3 4 abr2-multi
 ```
 
 `run-bench.sh` automatically tears down streams and source publishers on exit
@@ -209,7 +219,7 @@ bench/scripts/run-bench.sh C3 4 abr3-multi
 ## Run one phase (manual, for D1–D4 failover scenarios)
 
 ```bash
-bench/scripts/create-streams.sh 1 abr3-legacy
+bench/scripts/create-streams.sh 1 abr2-legacy
 bench/scripts/source.sh 1
 sleep 60                                              # warm-up
 bench/scripts/sample.sh 300 bench/results/D2/sample.csv &
@@ -227,8 +237,8 @@ bench/scripts/create-streams.sh delete 1
 | Phase | What | Script invocation |
 | --- | --- | --- |
 | A | Passthrough load test | `run-bench.sh A<n> <N> passthrough` |
-| B | ABR transcoding (legacy mode) | `run-bench.sh B<n> <N> abr3-legacy` |
-| C | ABR transcoding (multi-output) | toggle config + `run-bench.sh C<n> <N> abr3-multi` |
+| B | ABR transcoding (legacy mode) | `run-bench.sh B<n> <N> abr2-legacy` |
+| C | ABR transcoding (multi-output) | toggle config + `run-bench.sh C<n> <N> abr2-multi` |
 | D | Failover / hot-reload | `run-failover.sh {d1\|d2\|d3\|d4\|all}` |
 | E | DVR I/O (set `dvr` in payload first) | manual + `iostat -x 2` log |
 
