@@ -18,5 +18,6 @@ type GlobalConfig struct {
 	Manager    *config.ManagerConfig    `json:"manager,omitempty" yaml:"manager,omitempty"`
 	Hooks      *config.HooksConfig      `json:"hooks,omitempty" yaml:"hooks,omitempty"`
 	Sessions   *config.SessionsConfig   `json:"sessions,omitempty" yaml:"sessions,omitempty"`
+	Watermarks *config.WatermarksConfig `json:"watermarks,omitempty" yaml:"watermarks,omitempty"`
 	Log        *config.LogConfig        `json:"log,omitempty" yaml:"log,omitempty"`
 }

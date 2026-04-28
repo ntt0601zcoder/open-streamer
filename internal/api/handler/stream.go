@@ -427,6 +427,9 @@ func decodeStreamBody(
 	if err := base.ValidateUniqueInputs(); err != nil {
 		return nil, &putValidationError{code: "DUPLICATE_INPUT", message: err.Error()}
 	}
+	if err := base.Watermark.Validate(); err != nil {
+		return nil, &putValidationError{code: "INVALID_WATERMARK", message: err.Error()}
+	}
 	return &base, nil
 }
 

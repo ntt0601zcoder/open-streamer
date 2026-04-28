@@ -297,6 +297,22 @@ definitions:
       total:
         type: integer
     type: object
+  apidocs.WatermarkAssetData:
+    properties:
+      data:
+        $ref: '#/definitions/domain.WatermarkAsset'
+    type: object
+  apidocs.WatermarkAssetList:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/domain.WatermarkAsset'
+        type: array
+      dir:
+        type: string
+      total:
+        type: integer
+    type: object
   config.BufferConfig:
     properties:
       capacity:
@@ -520,6 +536,15 @@ definitions:
           Single-profile streams behave identically in both modes.
         type: boolean
     type: object
+  config.WatermarksConfig:
+    properties:
+      dir:
+        description: |-
+          Dir is the assets directory. Must be writable by the open-streamer
+          process. Defaults to "./watermarks" when empty (matches the layout
+          install scripts use under /var/lib/open-streamer/watermarks).
+        type: string
+    type: object
   domain.AudioCodec:
     enum:
     - aac
@@ -672,6 +697,8 @@ definitions:
         $ref: '#/definitions/config.SessionsConfig'
       transcoder:
         $ref: '#/definitions/config.TranscoderConfig'
+      watermarks:
+        $ref: '#/definitions/config.WatermarksConfig'
     type: object
   domain.HWAccel:
     enum:
@@ -1342,8 +1369,43 @@ definitions:
           $ref: '#/definitions/domain.VideoProfile'
         type: array
     type: object
+  domain.WatermarkAsset:
+    properties:
+      content_type:
+        description: |-
+          ContentType is the MIME type sniffed at upload time
+          (e.g. "image/png", "image/jpeg"). Used for Content-Type on /raw GET.
+        type: string
+      file_name:
+        description: |-
+          FileName is the original filename at upload time, preserved for
+          audit / download responses. Includes extension (e.g. "logo.png").
+        type: string
+      id:
+        description: ID is the immutable filesystem-safe identifier (also the on-disk
+          basename).
+        type: string
+      name:
+        description: |-
+          Name is the human display label shown in UIs. Defaults to the upload's
+          original filename when the operator doesn't override.
+        type: string
+      size_bytes:
+        description: SizeBytes is the on-disk size of the image. Sidecar JSON is excluded.
+        type: integer
+      uploaded_at:
+        description: UploadedAt is the wall-clock UTC time the asset was first stored.
+        type: string
+    type: object
   domain.WatermarkConfig:
     properties:
+      asset_id:
+        description: |-
+          AssetID, when set, references a WatermarkAsset uploaded via the
+          /watermarks API. Coordinator resolves it to an on-disk file path
+          before passing the config to the transcoder. Takes precedence over
+          ImagePath when both are set.
+        type: string
       enabled:
         type: boolean
       font_color:
@@ -1358,12 +1420,15 @@ definitions:
         description: 'FontSize in pixels. Default: 24.'
         type: integer
       image_path:
-        description: ImagePath is the path to the watermark image (PNG with alpha
-          recommended).
+        description: |-
+          ImagePath is the absolute path to a watermark image (PNG with alpha
+          recommended). Use this for assets pre-staged on the host outside the
+          /watermarks library. Mutually exclusive with AssetID.
         type: string
       offset_x:
-        description: OffsetX and OffsetY are pixel offsets from the chosen position
-          edge.
+        description: |-
+          OffsetX and OffsetY are pixel offsets from the chosen position edge.
+          Ignored when Position == custom.
         type: integer
       offset_y:
         type: integer
@@ -1374,7 +1439,14 @@ definitions:
       position:
         allOf:
         - $ref: '#/definitions/domain.WatermarkPosition'
-        description: Position is the corner/center anchor for the watermark.
+        description: |-
+          Position selects how the (X, Y) of the overlay are computed:
+            - top_left/top_right/bottom_left/bottom_right/center: convenience
+              anchors. OffsetX/Y act as inward padding from the chosen edge
+              (Center ignores offsets).
+            - custom: X / Y below are used as raw FFmpeg expressions —
+              pixel ints ("100"), expressions ("main_w-overlay_w-50"), or
+              time-aware fades ("if(gt(t,5),10,-100)") all work.
       text:
         description: |-
           Text is the string to render. Supports strftime directives for live timestamps.
@@ -1382,6 +1454,16 @@ definitions:
         type: string
       type:
         $ref: '#/definitions/domain.WatermarkType'
+      x:
+        description: |-
+          X / Y are raw FFmpeg coordinate expressions used only when Position
+          == custom. Empty string defaults to "0". The exact variables exposed
+          depend on the filter:
+            - drawtext (text watermark): w/h = frame size, tw/th = text size
+            - overlay (image watermark):  W/H = main video size, w/h = overlay size
+        type: string
+      "y":
+        type: string
     type: object
   domain.WatermarkPosition:
     enum:
@@ -1390,6 +1472,8 @@ definitions:
     - bottom_left
     - bottom_right
     - center
+    - custom
+    - bottom_right
     type: string
     x-enum-varnames:
     - WatermarkTopLeft
@@ -1397,6 +1481,8 @@ definitions:
     - WatermarkBottomLeft
     - WatermarkBottomRight
     - WatermarkCenter
+    - WatermarkCustom
+    - defaultWatermarkPosition
   domain.WatermarkType:
     enum:
     - text
@@ -2773,4 +2859,132 @@ paths:
       summary: Stream a VOD file over HTTP
       tags:
       - vod
+  /watermarks:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/apidocs.WatermarkAssetList'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: List watermark assets
+      tags:
+      - watermarks
+    post:
+      consumes:
+      - multipart/form-data
+      parameters:
+      - description: Image file (PNG / JPG / GIF, ≤ 8 MiB)
+        in: formData
+        name: file
+        required: true
+        type: file
+      - description: Display name (defaults to filename)
+        in: query
+        name: name
+        type: string
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/apidocs.WatermarkAssetData'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "413":
+          description: Request Entity Too Large
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "415":
+          description: Unsupported Media Type
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Upload a watermark image
+      tags:
+      - watermarks
+  /watermarks/{id}:
+    delete:
+      parameters:
+      - description: Asset ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Delete a watermark asset
+      tags:
+      - watermarks
+    get:
+      parameters:
+      - description: Asset ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/apidocs.WatermarkAssetData'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Get watermark metadata
+      tags:
+      - watermarks
+  /watermarks/{id}/raw:
+    get:
+      parameters:
+      - description: Asset ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - image/png
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Download watermark image
+      tags:
+      - watermarks
 swagger: "2.0"

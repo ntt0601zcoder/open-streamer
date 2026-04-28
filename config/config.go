@@ -178,6 +178,16 @@ type SRTListenerConfig struct {
 	LatencyMS int `mapstructure:"latency_ms" json:"latency_ms" yaml:"latency_ms"`
 }
 
+// WatermarksConfig controls the on-disk library of uploadable watermark
+// images. Operators upload PNG/JPG/GIF logos via /watermarks; the service
+// stores them in Dir alongside JSON sidecar metadata.
+type WatermarksConfig struct {
+	// Dir is the assets directory. Must be writable by the open-streamer
+	// process. Defaults to "./watermarks" when empty (matches the layout
+	// install scripts use under /var/lib/open-streamer/watermarks).
+	Dir string `mapstructure:"dir" json:"dir" yaml:"dir"`
+}
+
 // SessionsConfig controls the play-sessions tracker.
 //
 // Sessions are kept in memory only; restart loses every active record.

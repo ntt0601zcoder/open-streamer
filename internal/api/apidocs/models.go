@@ -137,6 +137,18 @@ type HookList struct {
 	Total int            `json:"total"`
 }
 
+// WatermarkAssetList wraps the watermark library list response.
+type WatermarkAssetList struct {
+	Data  []*domain.WatermarkAsset `json:"data"`
+	Total int                      `json:"total"`
+	Dir   string                   `json:"dir"`
+}
+
+// WatermarkAssetData wraps a single watermark asset response.
+type WatermarkAssetData struct {
+	Data *domain.WatermarkAsset `json:"data"`
+}
+
 // SessionList wraps the play-sessions list response.
 // Mirrors the JSON shape emitted by handler.SessionHandler.List /
 // ListByStream so swag can resolve {object} apidocs.SessionList.

@@ -1546,6 +1546,202 @@
                     }
                 }
             }
+        },
+        "/watermarks": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "watermarks"
+                ],
+                "summary": "List watermark assets",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.WatermarkAssetList"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "consumes": [
+                    "multipart/form-data"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "watermarks"
+                ],
+                "summary": "Upload a watermark image",
+                "parameters": [
+                    {
+                        "type": "file",
+                        "description": "Image file (PNG / JPG / GIF, ≤ 8 MiB)",
+                        "name": "file",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Display name (defaults to filename)",
+                        "name": "name",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.WatermarkAssetData"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "413": {
+                        "description": "Request Entity Too Large",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "415": {
+                        "description": "Unsupported Media Type",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
+        "/watermarks/{id}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "watermarks"
+                ],
+                "summary": "Get watermark metadata",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Asset ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.WatermarkAssetData"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "tags": [
+                    "watermarks"
+                ],
+                "summary": "Delete a watermark asset",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Asset ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
+        "/watermarks/{id}/raw": {
+            "get": {
+                "produces": [
+                    "image/png"
+                ],
+                "tags": [
+                    "watermarks"
+                ],
+                "summary": "Download watermark image",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Asset ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "file"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {
@@ -1994,6 +2190,31 @@
                 }
             }
         },
+        "apidocs.WatermarkAssetData": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "$ref": "#/definitions/domain.WatermarkAsset"
+                }
+            }
+        },
+        "apidocs.WatermarkAssetList": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.WatermarkAsset"
+                    }
+                },
+                "dir": {
+                    "type": "string"
+                },
+                "total": {
+                    "type": "integer"
+                }
+            }
+        },
         "config.BufferConfig": {
             "type": "object",
             "properties": {
@@ -2262,6 +2483,15 @@
                 }
             }
         },
+        "config.WatermarksConfig": {
+            "type": "object",
+            "properties": {
+                "dir": {
+                    "description": "Dir is the assets directory. Must be writable by the open-streamer\nprocess. Defaults to \"./watermarks\" when empty (matches the layout\ninstall scripts use under /var/lib/open-streamer/watermarks).",
+                    "type": "string"
+                }
+            }
+        },
         "domain.AudioCodec": {
             "type": "string",
             "enum": [
@@ -2447,6 +2677,9 @@
                 },
                 "transcoder": {
                     "$ref": "#/definitions/config.TranscoderConfig"
+                },
+                "watermarks": {
+                    "$ref": "#/definitions/config.WatermarksConfig"
                 }
             }
         },
@@ -3213,9 +3446,42 @@
                 }
             }
         },
+        "domain.WatermarkAsset": {
+            "type": "object",
+            "properties": {
+                "content_type": {
+                    "description": "ContentType is the MIME type sniffed at upload time\n(e.g. \"image/png\", \"image/jpeg\"). Used for Content-Type on /raw GET.",
+                    "type": "string"
+                },
+                "file_name": {
+                    "description": "FileName is the original filename at upload time, preserved for\naudit / download responses. Includes extension (e.g. \"logo.png\").",
+                    "type": "string"
+                },
+                "id": {
+                    "description": "ID is the immutable filesystem-safe identifier (also the on-disk basename).",
+                    "type": "string"
+                },
+                "name": {
+                    "description": "Name is the human display label shown in UIs. Defaults to the upload's\noriginal filename when the operator doesn't override.",
+                    "type": "string"
+                },
+                "size_bytes": {
+                    "description": "SizeBytes is the on-disk size of the image. Sidecar JSON is excluded.",
+                    "type": "integer"
+                },
+                "uploaded_at": {
+                    "description": "UploadedAt is the wall-clock UTC time the asset was first stored.",
+                    "type": "string"
+                }
+            }
+        },
         "domain.WatermarkConfig": {
             "type": "object",
             "properties": {
+                "asset_id": {
+                    "description": "AssetID, when set, references a WatermarkAsset uploaded via the\n/watermarks API. Coordinator resolves it to an on-disk file path\nbefore passing the config to the transcoder. Takes precedence over\nImagePath when both are set.",
+                    "type": "string"
+                },
                 "enabled": {
                     "type": "boolean"
                 },
@@ -3232,11 +3498,11 @@
                     "type": "integer"
                 },
                 "image_path": {
-                    "description": "ImagePath is the path to the watermark image (PNG with alpha recommended).",
+                    "description": "ImagePath is the absolute path to a watermark image (PNG with alpha\nrecommended). Use this for assets pre-staged on the host outside the\n/watermarks library. Mutually exclusive with AssetID.",
                     "type": "string"
                 },
                 "offset_x": {
-                    "description": "OffsetX and OffsetY are pixel offsets from the chosen position edge.",
+                    "description": "OffsetX and OffsetY are pixel offsets from the chosen position edge.\nIgnored when Position == custom.",
                     "type": "integer"
                 },
                 "offset_y": {
@@ -3247,7 +3513,7 @@
                     "type": "number"
                 },
                 "position": {
-                    "description": "Position is the corner/center anchor for the watermark.",
+                    "description": "Position selects how the (X, Y) of the overlay are computed:\n  - top_left/top_right/bottom_left/bottom_right/center: convenience\n    anchors. OffsetX/Y act as inward padding from the chosen edge\n    (Center ignores offsets).\n  - custom: X / Y below are used as raw FFmpeg expressions —\n    pixel ints (\"100\"), expressions (\"main_w-overlay_w-50\"), or\n    time-aware fades (\"if(gt(t,5),10,-100)\") all work.",
                     "allOf": [
                         {
                             "$ref": "#/definitions/domain.WatermarkPosition"
@@ -3260,6 +3526,13 @@
                 },
                 "type": {
                     "$ref": "#/definitions/domain.WatermarkType"
+                },
+                "x": {
+                    "description": "X / Y are raw FFmpeg coordinate expressions used only when Position\n== custom. Empty string defaults to \"0\". The exact variables exposed\ndepend on the filter:\n  - drawtext (text watermark): w/h = frame size, tw/th = text size\n  - overlay (image watermark):  W/H = main video size, w/h = overlay size",
+                    "type": "string"
+                },
+                "y": {
+                    "type": "string"
                 }
             }
         },
@@ -3270,14 +3543,18 @@
                 "top_right",
                 "bottom_left",
                 "bottom_right",
-                "center"
+                "center",
+                "custom",
+                "bottom_right"
             ],
             "x-enum-varnames": [
                 "WatermarkTopLeft",
                 "WatermarkTopRight",
                 "WatermarkBottomLeft",
                 "WatermarkBottomRight",
-                "WatermarkCenter"
+                "WatermarkCenter",
+                "WatermarkCustom",
+                "defaultWatermarkPosition"
             ]
         },
         "domain.WatermarkType": {

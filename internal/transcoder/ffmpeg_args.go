@@ -260,9 +260,13 @@ func hwInputArgs(hw domain.HWAccel, encoder string) []string {
 }
 
 // buildVideoFilter composes the full -vf chain in pipeline order:
-// deinterlace → resize/pad/crop → setsar. Skipped if all parts are no-ops.
-// Each filter is GPU- or CPU-flavored to match the active hwaccel; pad and
-// crop on GPU pipelines round-trip through CPU (no cuda primitives are used).
+// deinterlace → resize/pad/crop → setsar → watermark. Skipped if all
+// parts are no-ops. Each filter is GPU- or CPU-flavored to match the
+// active hwaccel; pad and crop on GPU pipelines round-trip through CPU
+// (no cuda primitives are used). Watermark is applied last — drawtext /
+// overlay always run on CPU frames (drawtext is CPU-only and overlay_cuda
+// isn't shipped with stock distro builds), so on GPU pipelines we wrap the
+// watermark with hwdownload / hwupload_cuda.
 func buildVideoFilter(p Profile, tc *domain.TranscoderConfig, encoder string) string {
 	hw := tc.Global.HW
 	_, onGPU := gpuScaleFilterName(hw, encoder)
@@ -277,7 +281,8 @@ func buildVideoFilter(p Profile, tc *domain.TranscoderConfig, encoder string) st
 	if p.SAR != "" {
 		chain = append(chain, "setsar="+p.SAR)
 	}
-	return strings.Join(chain, ",")
+	base := strings.Join(chain, ",")
+	return applyWatermark(base, tc.Watermark, onGPU)
 }
 
 // buildScaleFilter remains the simple resize entry point. Defaults to ResizeModePad.

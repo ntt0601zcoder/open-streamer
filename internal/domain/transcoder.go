@@ -204,4 +204,10 @@ type TranscoderConfig struct {
 	// ExtraArgs are raw FFmpeg arguments appended after the generated command.
 	// Use with caution — may conflict with generated arguments.
 	ExtraArgs []string `json:"extra_args,omitempty" yaml:"extra_args,omitempty"`
+
+	// Watermark is a runtime-only field populated by the coordinator from
+	// Stream.Watermark before each transcoder.Start. Not persisted on the
+	// transcoder section (json/yaml "-") so the API surface keeps
+	// Stream.Watermark as the single source of truth.
+	Watermark *WatermarkConfig `json:"-" yaml:"-"`
 }

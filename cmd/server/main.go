@@ -36,6 +36,7 @@ import (
 	yamlstore "github.com/ntt0601zcoder/open-streamer/internal/store/yaml"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/ntt0601zcoder/open-streamer/internal/vod"
+	"github.com/ntt0601zcoder/open-streamer/internal/watermarks"
 	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 	"github.com/q191201771/naza/pkg/nazalog"
 	"github.com/samber/do/v2"
@@ -210,6 +211,7 @@ func provideSubConfigs(i *do.RootScope, gcfg *domain.GlobalConfig) {
 	do.ProvideValue(i, deref(gcfg.Manager))
 	do.ProvideValue(i, deref(gcfg.Hooks))
 	do.ProvideValue(i, deref(gcfg.Sessions))
+	do.ProvideValue(i, deref(gcfg.Watermarks))
 	do.ProvideValue(i, deref(gcfg.Log))
 }
 
@@ -240,6 +242,7 @@ func wireServices(i *do.RootScope) {
 	do.Provide(i, dvr.New)
 	do.Provide(i, hooks.New)
 	do.Provide(i, sessions.New)
+	do.Provide(i, watermarks.New)
 	do.Provide(i, metrics.New)
 	do.Provide(i, coordinator.New)
 
@@ -250,6 +253,7 @@ func wireServices(i *do.RootScope) {
 	do.Provide(i, handler.NewConfigHandler)
 	do.Provide(i, handler.NewVODHandler)
 	do.Provide(i, handler.NewSessionHandler)
+	do.Provide(i, handler.NewWatermarkHandler)
 	do.Provide(i, api.New)
 }
 

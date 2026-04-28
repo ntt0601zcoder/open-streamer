@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
+	"github.com/ntt0601zcoder/open-streamer/internal/watermarks"
 	"github.com/samber/do/v2"
 )
 
@@ -38,6 +40,12 @@ type Coordinator struct {
 	// which pipeline branch to wire. Nil in unit tests that don't exercise
 	// ABR copy — detectABRCopy short-circuits to the normal path.
 	upstreamLookup func(domain.StreamCode) (*domain.Stream, bool)
+
+	// wmAssets resolves Stream.Watermark.AssetID into an absolute on-disk
+	// path before each transcoder.Start. Optional — nil disables asset
+	// resolution and only Stream.Watermark.ImagePath is honoured. Wired
+	// from DI in main.go.
+	wmAssets *watermarks.Service
 
 	rendMu     sync.Mutex
 	renditions map[domain.StreamCode][]string // ABR rendition slugs per stream (for buffer teardown)
@@ -94,6 +102,11 @@ func New(i do.Injector) (*Coordinator, error) {
 		abrCopies:   make(map[domain.StreamCode]*abrCopyEntry),
 		abrMixers:   make(map[domain.StreamCode]*abrMixerEntry),
 		degradation: make(map[domain.StreamCode]*streamDegradation),
+	}
+	// Watermarks library is optional — coordinator runs fine without it
+	// (only direct ImagePath watermarks resolve). Tolerate "no provider".
+	if w, err := do.Invoke[*watermarks.Service](i); err == nil {
+		c.wmAssets = w
 	}
 	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
 	c.mgr.SetRestoredCallback(c.handleInputRestored)
@@ -267,7 +280,8 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 
 	if len(transcoderTargets) > 0 {
 		rawID := buffer.RawIngestBufferID(stream.Code)
-		if err := c.tc.Start(ctx, stream.Code, rawID, stream.Transcoder, transcoderTargets); err != nil {
+		tcRT := c.transcoderConfigWithWatermark(stream)
+		if err := c.tc.Start(ctx, stream.Code, rawID, tcRT, transcoderTargets); err != nil {
 			for _, slug := range renditionSlugs {
 				c.buf.Delete(buffer.RenditionBufferID(stream.Code, slug))
 			}
@@ -565,7 +579,8 @@ func (c *Coordinator) reloadTranscoderFull(ctx context.Context, old, new *domain
 	c.mgr.UpdateBufferWriteID(new.Code, newIngestID)
 
 	if len(transcoderTargets) > 0 {
-		if err := c.tc.Start(ctx, new.Code, newIngestID, new.Transcoder, transcoderTargets); err != nil {
+		tcRT := c.transcoderConfigWithWatermark(new)
+		if err := c.tc.Start(ctx, new.Code, newIngestID, tcRT, transcoderTargets); err != nil {
 			return fmt.Errorf("transcoder start: %w", err)
 		}
 		c.rendMu.Lock()
@@ -785,6 +800,50 @@ func BootstrapPersistedStreams(ctx context.Context, log *slog.Logger, repo store
 		}
 		log.Info("bootstrap: stream pipeline started", "stream_code", st.Code)
 	}
+}
+
+// transcoderConfigWithWatermark returns a shallow clone of stream.Transcoder
+// with the runtime-only Watermark field populated from stream.Watermark.
+//
+// We clone instead of mutating in place because stream.Transcoder is a
+// pointer into the persisted Stream record — overwriting the Watermark
+// field on it would surface the runtime overlay on subsequent GET responses
+// and break the API contract that says watermark lives at Stream.Watermark.
+//
+// When the watermark references an uploaded asset (AssetID != ""), the
+// coordinator resolves it into ImagePath here before handing the config
+// to the transcoder, so the FFmpeg layer never sees AssetID and stays
+// agnostic of the asset library.
+func (c *Coordinator) transcoderConfigWithWatermark(stream *domain.Stream) *domain.TranscoderConfig {
+	if stream == nil || stream.Transcoder == nil {
+		return nil
+	}
+	clone := *stream.Transcoder
+	clone.Watermark = c.resolvedWatermark(stream.Watermark, stream.Code)
+	return &clone
+}
+
+// resolvedWatermark expands an asset reference into a concrete on-disk path.
+// On any resolution error it logs and returns nil — a missing asset must
+// not crash the start path. The transcoder treats nil as "watermark
+// disabled" and the rest of the pipeline keeps running.
+func (c *Coordinator) resolvedWatermark(wm *domain.WatermarkConfig, code domain.StreamCode) *domain.WatermarkConfig {
+	if wm == nil || c.wmAssets == nil {
+		return wm
+	}
+	if strings.TrimSpace(string(wm.AssetID)) == "" {
+		return wm
+	}
+	clone := *wm
+	path, err := c.wmAssets.ResolvePath(wm.AssetID)
+	if err != nil {
+		slog.Warn("coordinator: watermark asset resolve failed",
+			"stream_code", code, "asset_id", wm.AssetID, "err", err)
+		return nil
+	}
+	clone.ImagePath = path
+	clone.AssetID = ""
+	return &clone
 }
 
 func shouldRunTranscoder(stream *domain.Stream) bool {
