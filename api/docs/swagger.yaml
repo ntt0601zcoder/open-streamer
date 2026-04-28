@@ -359,14 +359,6 @@ definitions:
     type: object
   config.HooksConfig:
     properties:
-      kafka_brokers:
-        description: |-
-          KafkaBrokers is the list of Kafka broker addresses used by all Kafka-type hooks.
-          Example: ["localhost:9092", "broker2:9092"].
-          Empty = Kafka hooks are not available.
-        items:
-          type: string
-        type: array
       worker_count:
         description: WorkerCount is the number of concurrent hook delivery goroutines.
         type: integer
@@ -612,8 +604,6 @@ definitions:
     type: object
   domain.EventType:
     enum:
-    - session.opened
-    - session.closed
     - stream.created
     - stream.started
     - stream.stopped
@@ -630,6 +620,8 @@ definitions:
     - transcoder.started
     - transcoder.stopped
     - transcoder.error
+    - session.opened
+    - session.closed
     type: string
     x-enum-comments:
       EventInputConnected: source connected successfully
@@ -638,8 +630,6 @@ definitions:
       EventInputFailover: switched to lower-priority input
       EventInputReconnecting: transient error, retrying
     x-enum-descriptions:
-    - ""
-    - ""
     - ""
     - ""
     - ""
@@ -656,9 +646,9 @@ definitions:
     - ""
     - ""
     - ""
+    - ""
+    - ""
     x-enum-varnames:
-    - EventSessionOpened
-    - EventSessionClosed
     - EventStreamCreated
     - EventStreamStarted
     - EventStreamStopped
@@ -675,6 +665,8 @@ definitions:
     - EventTranscoderStarted
     - EventTranscoderStopped
     - EventTranscoderError
+    - EventSessionOpened
+    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:
@@ -764,7 +756,7 @@ definitions:
           Only and Except are mutually exclusive; Only takes precedence when both are set.
           Omitting the field (nil) means all streams are included.
       target:
-        description: HTTP URL or Kafka topic
+        description: HTTP(S) URL or absolute file path
         type: string
       timeout_sec:
         description: |-
@@ -777,11 +769,11 @@ definitions:
   domain.HookType:
     enum:
     - http
-    - kafka
+    - file
     type: string
     x-enum-varnames:
     - HookTypeHTTP
-    - HookTypeKafka
+    - HookTypeFile
   domain.Input:
     properties:
       headers:

@@ -42,7 +42,7 @@ Legend:
 | REST API — `PUT /streams/{code}` hot-reload | Complete | Diff-based; only changed components restart |
 | REST API — input switch | Complete | `POST /streams/{code}/inputs/switch` forces active priority |
 | REST API — recordings | Complete | CRUD + playlist.m3u8 + timeshift.m3u8 + segment serve + info |
-| REST API — hooks CRUD + test (HTTP & Kafka) | Complete | `DeliverTestEvent` routes per hook type |
+| REST API — hooks CRUD + test (HTTP & File) | Complete | `DeliverTestEvent` routes per hook type |
 | REST API — config GET/POST | Complete | `/config` static enums + GlobalConfig; POST hot-applies |
 | REST API — config defaults | Complete | `GET /config/defaults` returns implicit values for UI placeholders (incl. encoder routing table per HW) |
 | REST API — config YAML editor | Complete | `GET/PUT /config/yaml` round-trips entire system state |
@@ -203,12 +203,12 @@ Legend:
 |---|---|---|
 | In-process event bus | Complete | Typed events, bounded queue (512), worker pool |
 | HTTP webhook delivery | Complete | Retries, timeout, optional HMAC `X-OpenStreamer-Signature` |
-| Kafka delivery | Complete | Lazy writer per topic; `hooks.kafka_brokers` |
+| File delivery | Complete | Appends one JSON line per event to an absolute target path; per-target mutex serialises concurrent writes; line-atomic at filesystem level via O_APPEND |
 | Per-hook event filter | Complete | `event_types[]` whitelist |
 | Per-hook stream filter | Complete | `stream_codes.only[]` / `.except[]` |
 | Per-hook metadata injection | Complete | Merged into payload as `metadata.*` |
 | Per-hook MaxRetries / TimeoutSec | Complete | Defaults: 3 retries, 10s timeout (from `domain.Default*`) |
-| Test endpoint (HTTP + Kafka) | Complete | `POST /hooks/{id}/test` |
+| Test endpoint (HTTP + File) | Complete | `POST /hooks/{id}/test` |
 | Event documentation | Complete | See [APP_FLOW.md](./APP_FLOW.md#events-reference) |
 
 ---

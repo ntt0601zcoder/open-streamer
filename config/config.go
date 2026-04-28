@@ -215,16 +215,11 @@ type SessionsConfig struct {
 }
 
 // HooksConfig controls the hook dispatcher worker pool.
-// Per-hook settings (max retries, timeout, secret, event filter) are
+// Per-hook settings (max retries, timeout, secret, target, event filter) are
 // configured on each Hook via the API.
 type HooksConfig struct {
 	// WorkerCount is the number of concurrent hook delivery goroutines.
 	WorkerCount int `mapstructure:"worker_count" json:"worker_count" yaml:"worker_count"`
-
-	// KafkaBrokers is the list of Kafka broker addresses used by all Kafka-type hooks.
-	// Example: ["localhost:9092", "broker2:9092"].
-	// Empty = Kafka hooks are not available.
-	KafkaBrokers []string `mapstructure:"kafka_brokers" json:"kafka_brokers,omitempty" yaml:"kafka_brokers,omitempty"`
 }
 
 // LogConfig controls structured logging output.

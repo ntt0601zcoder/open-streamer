@@ -33,7 +33,7 @@ flowchart LR
         D1["HLS / DASH"]
         D2["RTMP / RTSP / SRT"]
         D3["Push out — RTMP / RTMPS"]
-        D4["Webhooks / Kafka<br/>HMAC signed"]
+        D4["Webhooks (HMAC)<br/>or file sink"]
     end
 
     S1 --> Hub
@@ -156,8 +156,10 @@ regenerate from annotations).
   SRT / RTSP. Fingerprint dedup for pull protocols, UUID for
   connection-bound. Idle reaper, kick API, hot-reload config,
   `session.opened`/`closed` events on the bus.
-- **Webhooks + Kafka** — domain events with HMAC signing, retries,
-  per-hook event/stream filters, metadata injection.
+- **Webhooks + file sink** — domain events delivered via HTTP (HMAC
+  signed) or appended as JSON-lines to a local log file (drop-in for
+  Filebeat / Vector / Promtail). Per-hook retries, event/stream filters,
+  metadata injection.
 - **FFmpeg compatibility probe** — boot + on-demand check for
   required/optional encoders/muxers; UI sees a checklist before
   saving the path.
@@ -200,7 +202,7 @@ internal/
   publisher/          # HLS/DASH segmenters + serve listeners + push out
   dvr/                # recording + retention + timeshift
   events/             # in-process event bus
-  hooks/              # webhook + Kafka delivery
+  hooks/              # webhook (HTTP) + file sink delivery
   sessions/           # play-session tracker (HLS/DASH/RTMP/SRT/RTSP viewers)
   watermarks/         # asset library backing /watermarks REST API
   domain/             # types + defaults + resolvers (single source of truth)

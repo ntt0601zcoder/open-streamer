@@ -884,13 +884,19 @@ explicitly to filter it out:
 - Retries: up to `max_retries` (default 3) with backoff 1s / 5s / 30s
 - Timeout: per-hook `timeout_sec` (default 10)
 
-### Kafka hooks
+### File hooks
 
-- Topic: hook's `target` field
-- Message key: `stream_code`
-- Message value: JSON event envelope
-- Brokers: `hooks.kafka_brokers` (shared by all Kafka hooks)
-- Writer: lazy-initialized per topic, reused across deliveries
+- Path: hook's `target` field — must be an absolute filesystem path the
+  open-streamer process can write
+- Format: one JSON-encoded event per line (NDJSON), terminated by `\n`
+- Concurrency: per-target mutex serialises writes from this process; the
+  underlying `O_APPEND` flag keeps lines atomic across processes too
+- File mode: `0644`, created on first delivery; parent directory must
+  exist
+- Retries: same as HTTP — up to `max_retries` with 1s / 5s / 30s backoff
+- No fsync per write — operators wanting durability should use a tail-and-
+  ship agent (Filebeat / Vector / Promtail) and accept that a hard crash
+  may lose the last few buffered lines
 
 ### Filter examples
 

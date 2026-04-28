@@ -2279,13 +2279,6 @@ const docTemplate = `{
         "config.HooksConfig": {
             "type": "object",
             "properties": {
-                "kafka_brokers": {
-                    "description": "KafkaBrokers is the list of Kafka broker addresses used by all Kafka-type hooks.\nExample: [\"localhost:9092\", \"broker2:9092\"].\nEmpty = Kafka hooks are not available.",
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
-                },
                 "worker_count": {
                     "description": "WorkerCount is the number of concurrent hook delivery goroutines.",
                     "type": "integer"
@@ -2585,8 +2578,6 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
-                "session.opened",
-                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2602,7 +2593,9 @@ const docTemplate = `{
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error"
+                "transcoder.error",
+                "session.opened",
+                "session.closed"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2612,8 +2605,6 @@ const docTemplate = `{
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
-                "",
-                "",
                 "",
                 "",
                 "",
@@ -2629,11 +2620,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
-                "EventSessionOpened",
-                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2649,7 +2640,9 @@ const docTemplate = `{
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError"
+                "EventTranscoderError",
+                "EventSessionOpened",
+                "EventSessionClosed"
             ]
         },
         "domain.GlobalConfig": {
@@ -2764,7 +2757,7 @@ const docTemplate = `{
                     ]
                 },
                 "target": {
-                    "description": "HTTP URL or Kafka topic",
+                    "description": "HTTP(S) URL or absolute file path",
                     "type": "string"
                 },
                 "timeout_sec": {
@@ -2780,11 +2773,11 @@ const docTemplate = `{
             "type": "string",
             "enum": [
                 "http",
-                "kafka"
+                "file"
             ],
             "x-enum-varnames": [
                 "HookTypeHTTP",
-                "HookTypeKafka"
+                "HookTypeFile"
             ]
         },
         "domain.Input": {

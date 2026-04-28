@@ -57,7 +57,7 @@ global_config:
   listeners: ...     # Network listeners (RTMP / RTSP / SRT)
   ingestor: ...      # Server-wide ingest settings
   transcoder: ...    # FFmpeg path + multi-output toggle
-  hooks: ...         # Worker pool + Kafka brokers
+  hooks: ...         # Worker pool
   sessions: ...      # Play-sessions tracker (HLS/DASH/RTMP/SRT/RTSP viewers)
   watermarks: ...    # Watermark asset library directory
   log: ...           # Level + format
@@ -168,13 +168,20 @@ Toggling this hot-restarts every running stream's transcoder (~2-3s downtime per
 
 ```yaml
 hooks:
-  worker_count:  4                          # Concurrent delivery goroutines.
-  kafka_brokers: ["broker1:9092", "broker2:9092"]
+  worker_count:  4    # Concurrent delivery goroutines.
 ```
 
-`worker_count` validation: must be > 0 if hooks section is set. `kafka_brokers` empty → Kafka hooks unavailable (HTTP hooks still work).
+`worker_count` validation: must be > 0 if hooks section is set.
 
-Per-hook `max_retries` (default 3) and `timeout_sec` (default 10) live on each Hook record, not GlobalConfig.
+Per-hook `type` / `target` / `max_retries` (default 3) / `timeout_sec`
+(default 10) live on each Hook record, not GlobalConfig. Two delivery
+backends are supported:
+
+- **HTTP** webhook (`type: http`, `target: https://…`) with optional HMAC
+  signing.
+- **File** sink (`type: file`, `target: /var/log/open-streamer/events.log`)
+  appends one JSON event per line — drop-in for Filebeat / Vector / Promtail
+  tail-and-ship pipelines, or just an audit log.
 
 ### 2.9 sessions
 
@@ -451,8 +458,9 @@ VAAPI / VideoToolbox don't have `-preset` — value dropped silently (encoder us
 ```yaml
 id:           "ops-pager"           # Required. Unique hook ID.
 name:         "Pager for ops"
-type:         "http"                # http | kafka
-target:       "https://ops/events"  # HTTP URL OR Kafka topic
+type:         "http"                # http | file
+target:       "https://ops/events"  # http(s)://… URL OR absolute file path
+                                    # (e.g. /var/log/open-streamer/events.log)
 secret:       "shared-secret"       # HMAC-SHA256 signing for HTTP. Empty = no signing.
 event_types:  ["stream.stopped", "transcoder.error", "input.failover"]
                                     # [] = all events

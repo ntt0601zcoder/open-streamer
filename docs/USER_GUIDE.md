@@ -280,9 +280,9 @@ curl -XDELETE http://localhost:8080/api/v1/streams/news
 
 ---
 
-## 6. Hooks (webhooks + Kafka)
+## 6. Hooks (webhooks + file sink)
 
-Subscribe to lifecycle events:
+Subscribe to lifecycle events with one of two delivery backends:
 
 ```bash
 # HTTP webhook with HMAC signing.
@@ -296,15 +296,23 @@ curl -XPOST http://localhost:8080/api/v1/hooks -d '{
   "timeout_sec": 10
 }'
 
-# Kafka
+# File sink — appends one JSON event per line. Pair with Filebeat / Vector /
+# Promtail / your favourite tail-and-ship agent for downstream pipelines.
 curl -XPOST http://localhost:8080/api/v1/hooks -d '{
-  "id":      "kafka-events",
-  "type":    "kafka",
-  "target":  "stream-events-topic",
+  "id":      "audit-log",
+  "type":    "file",
+  "target":  "/var/log/open-streamer/events.log",
   "enabled": true,
   "event_types": ["stream.started", "stream.stopped", "input.failover"]
 }'
 ```
+
+The file backend creates the target on first delivery (mode 0644). The
+parent directory must already exist and be writable by the open-streamer
+process. Concurrent deliveries on the same path are serialised by a
+per-target mutex; different paths run in parallel. Each line is one
+complete JSON event followed by `\n` — the same envelope the HTTP backend
+posts.
 
 Filter by event type or stream code:
 
@@ -321,7 +329,7 @@ Test delivery:
 curl -XPOST http://localhost:8080/api/v1/hooks/log-everything/test
 ```
 
-Hook server-wide settings (Kafka brokers, worker pool size) are at
+Hook server-wide settings (worker pool size) are at
 `global_config.hooks` — see [CONFIG.md](./CONFIG.md). Per-hook
 defaults: 3 retries, 10s timeout (overridden via Hook fields above).
 
@@ -575,13 +583,13 @@ organic disconnects.
 ```bash
 curl -XPOST http://localhost:8080/api/v1/hooks -d '{
   "id":     "viewer-analytics",
-  "type":   "kafka",
-  "target": "stream-sessions-topic",
+  "type":   "file",
+  "target": "/var/log/open-streamer/sessions.log",
   "event_types": ["session.opened", "session.closed"]
 }'
 ```
 
-The bus carries an event for every open/close — feed Kafka, ClickHouse,
+The bus carries an event for every open/close — feed Loki, ClickHouse,
 or your analytics pipeline. The sessions package stays in-memory; long-
 term persistence is the hook's responsibility.
 

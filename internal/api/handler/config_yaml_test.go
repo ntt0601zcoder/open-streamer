@@ -19,12 +19,12 @@ import (
 )
 
 const (
-	yamlPath        = "/config/yaml"
-	codeAlpha       = "alpha"
-	codeBeta        = "beta"
-	hookKafkaTarget = "events"
-	hookHTTPTarget  = "https://x.test"
-	srcRTMPURL      = "rtmp://src/a"
+	yamlPath       = "/config/yaml"
+	codeAlpha      = "alpha"
+	codeBeta       = "beta"
+	hookFileTarget = "/var/log/open-streamer/events.log"
+	hookHTTPTarget = "https://x.test"
+	srcRTMPURL     = "rtmp://src/a"
 )
 
 // --- in-memory test doubles ----------------------------------------------------
@@ -708,7 +708,7 @@ func TestValidateStreamsNullEntry(t *testing.T) {
 func TestValidateHooksDuplicateID(t *testing.T) {
 	errs := validateHooks([]*domain.Hook{
 		{ID: "h1", Type: domain.HookTypeHTTP, Target: hookHTTPTarget},
-		{ID: "h1", Type: domain.HookTypeKafka, Target: hookKafkaTarget},
+		{ID: "h1", Type: domain.HookTypeFile, Target: hookFileTarget},
 	})
 	found := false
 	for _, e := range errs {

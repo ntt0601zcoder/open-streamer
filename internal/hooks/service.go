@@ -1,6 +1,6 @@
 // Package hooks implements the Hook dispatcher.
 // It subscribes to the Event Bus and delivers events to registered external hooks
-// via HTTP webhook or Kafka — asynchronously and with retry logic.
+// via HTTP webhook or local JSON-lines file — asynchronously and with retry logic.
 package hooks
 
 import (
@@ -15,30 +15,36 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	kafka "github.com/segmentio/kafka-go"
+	"github.com/samber/do/v2"
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
-	"github.com/samber/do/v2"
 )
 
 // ErrHookTestUnsupported is returned when the hook type cannot receive a synthetic test delivery.
 var ErrHookTestUnsupported = errors.New("hooks: test delivery not supported for this hook type")
 
 // Service subscribes to the event bus and dispatches events to registered hooks.
+//
+// File hooks share a process-wide lock map keyed by the absolute target path
+// so concurrent deliveries against the same file serialise without
+// interleaving partial JSON lines. Different paths run in parallel.
 type Service struct {
-	cfg            config.HooksConfig
-	hookRepo       store.HookRepository
-	bus            events.Bus
-	client         *http.Client
-	kafkaWritersMu sync.Mutex
-	kafkaWriters   map[string]*kafka.Writer // topic → writer, lazy-initialized
+	cfg      config.HooksConfig
+	hookRepo store.HookRepository
+	bus      events.Bus
+	client   *http.Client
+
+	fileMu    sync.Mutex
+	fileLocks map[string]*sync.Mutex // absolute target path → write mutex
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -48,13 +54,13 @@ func New(i do.Injector) (*Service, error) {
 	bus := do.MustInvoke[events.Bus](i)
 
 	svc := &Service{
-		cfg:          cfg,
-		hookRepo:     hookRepo,
-		bus:          bus,
-		kafkaWriters: make(map[string]*kafka.Writer),
+		cfg:      cfg,
+		hookRepo: hookRepo,
+		bus:      bus,
 		// No client-level timeout — each delivery applies its own per-hook timeout
 		// via context.WithTimeout in deliverHTTP.
-		client: &http.Client{},
+		client:    &http.Client{},
+		fileLocks: make(map[string]*sync.Mutex),
 	}
 	return svc, nil
 }
@@ -73,7 +79,7 @@ func (s *Service) DeliverTestEvent(ctx context.Context, id domain.HookID) error 
 		Payload:    map[string]any{"test": true, "hook_id": string(h.ID)},
 	}
 	switch h.Type {
-	case domain.HookTypeHTTP, domain.HookTypeKafka:
+	case domain.HookTypeHTTP, domain.HookTypeFile:
 		return s.deliver(ctx, h, ev)
 	default:
 		return fmt.Errorf("%w: %s", ErrHookTestUnsupported, h.Type)
@@ -93,11 +99,11 @@ func (s *Service) Start(ctx context.Context) error {
 		domain.EventSegmentWritten,
 		domain.EventTranscoderStarted, domain.EventTranscoderStopped,
 		domain.EventTranscoderError,
+		domain.EventSessionOpened, domain.EventSessionClosed,
 	}
 
 	unsubs := make([]func(), 0, len(allEvents))
 	for _, et := range allEvents {
-		et := et
 		unsub := s.bus.Subscribe(et, func(ctx context.Context, event domain.Event) error {
 			return s.dispatch(ctx, event)
 		})
@@ -108,13 +114,6 @@ func (s *Service) Start(ctx context.Context) error {
 
 	for _, unsub := range unsubs {
 		unsub()
-	}
-
-	// Close any open Kafka writers.
-	s.kafkaWritersMu.Lock()
-	defer s.kafkaWritersMu.Unlock()
-	for _, w := range s.kafkaWriters {
-		_ = w.Close()
 	}
 	return nil
 }
@@ -214,38 +213,71 @@ func (s *Service) deliver(ctx context.Context, h *domain.Hook, event domain.Even
 	switch h.Type {
 	case domain.HookTypeHTTP:
 		return s.deliverHTTP(ctx, h, event)
-	case domain.HookTypeKafka:
-		return s.deliverKafka(ctx, h, event)
+	case domain.HookTypeFile:
+		return s.deliverFile(ctx, h, event)
 	default:
 		return fmt.Errorf("unknown hook type: %s", h.Type)
 	}
 }
 
-func (s *Service) deliverKafka(ctx context.Context, h *domain.Hook, event domain.Event) error {
-	if len(s.cfg.KafkaBrokers) == 0 {
-		return fmt.Errorf("kafka delivery: no brokers configured")
+// deliverFile appends one JSON-encoded event followed by a newline to the
+// file at h.Target. Each call is atomic on POSIX filesystems thanks to
+// O_APPEND — concurrent deliveries from different processes interleave at
+// line boundaries. We additionally hold a per-target mutex so different
+// goroutines in THIS process don't race the open/write/close cycle.
+//
+// Failure modes the caller should know about:
+//   - parent dir missing: returned as-is; operator should pre-create the dir
+//   - target is a directory: returned as a clear error
+//   - permission denied: bubbled up unchanged
+//
+// We do NOT fsync per write — the file is meant for downstream tail+ship
+// (Filebeat, Vector). Crashing the server may lose the last 1-2 buffered
+// lines, which matches the "best effort, retry on failure" hook contract.
+func (s *Service) deliverFile(_ context.Context, h *domain.Hook, event domain.Event) error {
+	target := strings.TrimSpace(h.Target)
+	if target == "" {
+		return errors.New("file delivery: empty target path")
 	}
+	if !filepath.IsAbs(target) {
+		return fmt.Errorf("file delivery: target must be an absolute path, got %q", target)
+	}
+
 	body, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)
 	}
+	body = append(body, '\n')
 
-	s.kafkaWritersMu.Lock()
-	w, ok := s.kafkaWriters[h.Target]
-	if !ok {
-		w = &kafka.Writer{
-			Addr:     kafka.TCP(s.cfg.KafkaBrokers...),
-			Topic:    h.Target,
-			Balancer: &kafka.LeastBytes{},
-		}
-		s.kafkaWriters[h.Target] = w
+	mu := s.lockForFile(target)
+	mu.Lock()
+	defer mu.Unlock()
+
+	f, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("file delivery: open %s: %w", target, err)
 	}
-	s.kafkaWritersMu.Unlock()
+	defer func() { _ = f.Close() }()
 
-	return w.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(event.StreamCode),
-		Value: body,
-	})
+	if _, err := f.Write(body); err != nil {
+		return fmt.Errorf("file delivery: write %s: %w", target, err)
+	}
+	return nil
+}
+
+// lockForFile returns the per-target mutex, lazy-creating one on first use.
+// Mutexes are never deleted — paths are cheap to cache and operators rarely
+// rotate hook targets in volume. Bounded by the number of distinct file
+// hooks the operator has configured.
+func (s *Service) lockForFile(target string) *sync.Mutex {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	mu, ok := s.fileLocks[target]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.fileLocks[target] = mu
+	}
+	return mu
 }
 
 func (s *Service) deliverHTTP(ctx context.Context, h *domain.Hook, event domain.Event) error {

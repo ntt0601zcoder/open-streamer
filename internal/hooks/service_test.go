@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -10,12 +11,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -71,11 +72,11 @@ func (r *fakeHookRepo) Delete(_ context.Context, id domain.HookID) error {
 
 func newSvc(repo *fakeHookRepo) *Service {
 	return &Service{
-		cfg:          config.HooksConfig{},
-		hookRepo:     repo,
-		bus:          events.New(1, 16),
-		client:       &http.Client{Timeout: 5 * time.Second},
-		kafkaWriters: make(map[string]*kafka.Writer),
+		cfg:       config.HooksConfig{},
+		hookRepo:  repo,
+		bus:       events.New(1, 16),
+		client:    &http.Client{Timeout: 5 * time.Second},
+		fileLocks: make(map[string]*sync.Mutex),
 	}
 }
 
@@ -196,12 +197,101 @@ func TestDeliverUnknownTypeFails(t *testing.T) {
 	}
 }
 
-func TestDeliverKafkaWithoutBrokers(t *testing.T) {
+func TestDeliverFileAppendsJSONLines(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "events.log")
+
 	svc := newSvc(newFakeHookRepo())
-	hook := &domain.Hook{ID: "h", Type: domain.HookTypeKafka, Target: "topic"}
-	err := svc.deliver(context.Background(), hook, domain.Event{Type: domain.EventStreamCreated})
+	hook := &domain.Hook{ID: "h", Type: domain.HookTypeFile, Target: target}
+
+	for i := range 3 {
+		ev := domain.Event{
+			ID:         "e" + string(rune('1'+i)),
+			Type:       domain.EventStreamStarted,
+			StreamCode: "live",
+		}
+		if err := svc.deliver(context.Background(), hook, ev); err != nil {
+			t.Fatalf("deliver %d: %v", i, err)
+		}
+	}
+
+	f, err := os.Open(target)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	count := 0
+	for scanner.Scan() {
+		var ev domain.Event
+		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+			t.Errorf("line %d not JSON: %v\n%s", count, err, scanner.Text())
+		}
+		count++
+	}
+	if count != 3 {
+		t.Errorf("got %d lines, want 3", count)
+	}
+}
+
+func TestDeliverFileRequiresAbsolutePath(t *testing.T) {
+	svc := newSvc(newFakeHookRepo())
+	hook := &domain.Hook{ID: "h", Type: domain.HookTypeFile, Target: "relative/events.log"}
+	err := svc.deliver(context.Background(), hook, domain.Event{Type: domain.EventStreamStarted})
 	if err == nil {
-		t.Fatal("expected error when no brokers configured")
+		t.Fatal("expected error for relative path")
+	}
+}
+
+func TestDeliverFileEmptyTargetFails(t *testing.T) {
+	svc := newSvc(newFakeHookRepo())
+	hook := &domain.Hook{ID: "h", Type: domain.HookTypeFile, Target: ""}
+	if err := svc.deliver(context.Background(), hook, domain.Event{}); err == nil {
+		t.Fatal("expected error for empty target")
+	}
+}
+
+func TestDeliverFileConcurrentSerialised(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "concurrent.log")
+
+	svc := newSvc(newFakeHookRepo())
+	hook := &domain.Hook{ID: "h", Type: domain.HookTypeFile, Target: target}
+
+	const writers, perWriter = 8, 50
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for w := range writers {
+		go func(w int) {
+			defer wg.Done()
+			for i := range perWriter {
+				ev := domain.Event{
+					ID:   "w-" + string(rune('A'+w)) + "-" + string(rune('0'+i%10)),
+					Type: domain.EventStreamStarted,
+				}
+				_ = svc.deliver(context.Background(), hook, ev)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// Every line must be valid JSON — interleaving would corrupt at least one.
+	f, err := os.Open(target)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	count := 0
+	for scanner.Scan() {
+		var ev domain.Event
+		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+			t.Errorf("corrupt line %d: %v\n%s", count, err, scanner.Text())
+		}
+		count++
+	}
+	if count != writers*perWriter {
+		t.Errorf("got %d lines, want %d", count, writers*perWriter)
 	}
 }
 

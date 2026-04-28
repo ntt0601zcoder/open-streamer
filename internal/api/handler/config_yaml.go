@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -604,19 +605,21 @@ func validateHookID(hk *domain.Hook, i int, base string, seen map[domain.HookID]
 }
 
 func validateHookTypeTarget(hk *domain.Hook) error {
-	if strings.TrimSpace(hk.Target) == "" {
+	target := strings.TrimSpace(hk.Target)
+	if target == "" {
 		return errors.New("required")
 	}
 	switch hk.Type {
 	case domain.HookTypeHTTP:
-		if !strings.HasPrefix(hk.Target, "http://") && !strings.HasPrefix(hk.Target, "https://") {
+		if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
 			return errors.New("http hook target must be an http(s):// URL")
 		}
-	case domain.HookTypeKafka:
-		// Kafka topic — any non-empty string is acceptable here; broker config
-		// lives elsewhere. Just enforce the trim above.
+	case domain.HookTypeFile:
+		if !filepath.IsAbs(target) {
+			return errors.New("file hook target must be an absolute path")
+		}
 	default:
-		return fmt.Errorf("unsupported hook type %q (use http|kafka)", hk.Type)
+		return fmt.Errorf("unsupported hook type %q (use http|file)", hk.Type)
 	}
 	return nil
 }

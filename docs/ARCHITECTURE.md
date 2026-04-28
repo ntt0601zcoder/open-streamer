@@ -424,7 +424,9 @@ type Event struct {
 
 Hooks subscribe via API. Per-hook filters (event types, stream codes
 only/except). Per-hook delivery config (max retries, timeout, HMAC
-signing for HTTP). Kafka delivery uses lazy per-topic writers.
+signing for HTTP). File delivery appends one JSON-encoded event per
+line to an absolute target path; concurrent deliveries serialise via
+a per-target mutex while different paths run in parallel.
 
 ### API Server (`internal/api`)
 

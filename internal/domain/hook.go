@@ -8,8 +8,12 @@ type HookType string
 
 // HookType values name supported hook transports.
 const (
-	HookTypeHTTP  HookType = "http"
-	HookTypeKafka HookType = "kafka"
+	HookTypeHTTP HookType = "http"
+	// HookTypeFile appends each event as a single JSON line to the path
+	// in Hook.Target. Useful for downstream log shippers (Filebeat,
+	// Vector, Promtail) and for ops-friendly local audit trails without
+	// running an HTTP receiver.
+	HookTypeFile HookType = "file"
 )
 
 // StreamCodeFilter defines include/exclude rules for stream code matching.
@@ -47,7 +51,7 @@ type Hook struct {
 	ID     HookID   `json:"id" yaml:"id"`
 	Name   string   `json:"name" yaml:"name"`
 	Type   HookType `json:"type" yaml:"type"`
-	Target string   `json:"target" yaml:"target"` // HTTP URL or Kafka topic
+	Target string   `json:"target" yaml:"target"` // HTTP(S) URL or absolute file path
 	Secret string   `json:"secret" yaml:"secret"` // HMAC-SHA256 signing secret (HTTP only)
 
 	// EventTypes filters which events trigger delivery. Empty = all events.
