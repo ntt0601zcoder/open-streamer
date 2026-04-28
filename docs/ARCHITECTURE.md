@@ -64,9 +64,11 @@ flowchart TB
 
     Hub(("Buffer Hub<br/>ring buffer / stream<br/>write never blocks")):::data
 
-    Tx["Transcoder<br/>(FFmpeg pool)"]:::svc
+    Tx["Transcoder<br/>(FFmpeg pool<br/>+ watermark filter)"]:::svc
     DVR["DVR<br/>(TS segmenter + retention)"]:::svc
     Pub["Publisher<br/>(HLS · DASH · RTSP<br/>RTMP · SRT · Push)"]:::svc
+    WM["Watermarks<br/>(asset library)"]:::svc
+    Sess["Sessions<br/>(play tracker)"]:::svc
 
     API -->|CRUD / start / stop / reload| Coord
     Coord --> Mgr
@@ -81,6 +83,8 @@ flowchart TB
     Hub -.fan-out.-> DVR
     Hub -.fan-out.-> Pub
     Tx -->|per-rendition packets| Hub
+    WM -.resolve asset_id.-> Coord
+    Pub -.session events.-> Sess
 
     classDef infra fill:#1f3a5f,stroke:#5b8def,color:#fff
     classDef svc   fill:#2d4a3e,stroke:#5fc88f,color:#fff
@@ -439,9 +443,145 @@ signing for HTTP). Kafka delivery uses lazy per-topic writers.
 /api/v1/config/transcoder/probe        — FFmpeg capability check
 /api/v1/config/yaml                    — full system state YAML editor
 /api/v1/vod                            — on-disk VOD browse
+/api/v1/watermarks                     — watermark asset library (upload / list / get / raw / delete)
+/api/v1/sessions                       — play session list + kick
+/api/v1/streams/{code}/sessions        — sessions scoped to one stream
 /healthz, /readyz, /metrics, /swagger  — ops
-/{code}/index.m3u8, /{code}/index.mpd  — static delivery
+/{code}/index.m3u8, /{code}/index.mpd  — static delivery (wrapped with sessions middleware when tracker enabled)
 ```
+
+### Play Sessions (`internal/sessions`)
+
+Tracks every active player so operators can answer "who is watching this
+stream?". State is in-memory only — restart loses records, viewers
+reconnect into fresh sessions.
+
+```mermaid
+flowchart LR
+    subgraph HTTPpath["HLS / DASH"]
+        H["GET /{code}/seg.ts"] --> MW["sessions.HTTPMiddleware<br/>wraps mediaserve.Mount"]
+        MW --> SH["mediaserve handler"]
+        MW -->|"after handler exits"| Track["Tracker.TrackHTTP"]
+    end
+    subgraph ConnPath["RTMP / SRT / RTSP"]
+        Conn["TCP connect"] --> Open["Tracker.OpenConn"]
+        Open --> Stream["serve loop<br/>writes bytes"]
+        Stream --> Closer["Closer.Close on disconnect"]
+    end
+    Track --> Map[("in-memory map<br/>id → PlaySession")]
+    Open --> Map
+    Closer --> Map
+    Reaper["idle reaper<br/>min(5s, idleDur/3) tick"] -.scan.-> Map
+    Map --> List["List / Get / Kick<br/>(REST handlers)"]
+    Map -.publish.-> Bus["EventBus<br/>session.opened / closed"]
+
+    classDef data fill:#5a3a1f,stroke:#e0a060,color:#fff
+    class Map data
+```
+
+Two flavours of session ID:
+
+- **Fingerprint (HLS / DASH)** — `sha256(stream + ip + ua + token)[0..16]`
+  so consecutive segment GETs from the same viewer collapse onto one
+  record while the idle window is open. NAT-shared viewers without a
+  token field merge into one session — that's a known limitation of
+  pull protocols and matches what every other origin server reports.
+- **UUID (RTMP / SRT / RTSP)** — generated on TCP handshake; closed
+  exactly when the transport ends. The reaper still runs as a safety
+  net for missed close paths (panics, ctx race).
+
+**Hot-reload**: an `atomic.Pointer[runtimeConfig]` holds enabled flag /
+idle duration / max-lifetime cap. The config-diff path calls
+`Service.UpdateConfig` which swaps the pointer; the reaper and tracker
+hot paths read the pointer fresh each tick. No restart, no loss of
+in-flight session state.
+
+**Bytes accuracy** per protocol:
+
+| Protocol | Source | Accuracy |
+|---|---|---|
+| HLS / DASH | wrapped `ResponseWriter.Write` byte counter | exact |
+| RTMP | `len(data)` per `writeFrame` payload | approximate (skips RTMP chunk header) |
+| SRT | `n` from successful `conn.Write` | exact |
+| RTSP | n/a | always 0 (gortsplib mux is internal — no per-subscriber hook) |
+
+Open / close events publish on the bus so analytics hooks can persist
+history without coupling to the sessions package. The HTTP middleware
+parses the stream code from the path's first segment (NOT
+`chi.URLParam("code")` — chi populates URL params after middleware
+fires; the middleware sees an empty value).
+
+### Watermarks (`internal/watermarks` + `internal/transcoder/watermark.go`)
+
+```mermaid
+flowchart LR
+    UI["POST /watermarks<br/>multipart upload"] --> Sniff["http.DetectContentType<br/>(first 512 bytes)"]
+    Sniff -->|image/png|jpeg|gif| Save["watermarks.Service.Save"]
+    Save --> Disk[("&lt;dir&gt;/&lt;id&gt;.png<br/>&lt;dir&gt;/&lt;id&gt;.json")]
+    Disk -.boot rebuild.-> Cache[("in-memory cache")]
+    Stream["Stream.Watermark.AssetID"] --> Resolve["coordinator.transcoderConfigWithWatermark"]
+    Cache --> Resolve
+    Resolve -->|"clones tc, sets ImagePath"| TC["transcoder.Service.Start"]
+    TC --> Filter["buildVideoFilter<br/>+ applyWatermark"]
+    Filter --> FFmpeg["ffmpeg -vf"]
+
+    classDef data fill:#5a3a1f,stroke:#e0a060,color:#fff
+    class Disk,Cache data
+```
+
+Two-file storage layout per asset (no separate database):
+
+```
+<watermarks.dir>/
+  ├── 8a3f1c0e2b9d.png       ← image bytes (basename = asset ID)
+  ├── 8a3f1c0e2b9d.json      ← domain.WatermarkAsset metadata sidecar
+  ├── ce47b2d1f099.jpg
+  └── ce47b2d1f099.json
+```
+
+`os.ReadDir` rebuilds the registry after restart — sidecar JSON is the
+source of truth and a corrupt sidecar skips that asset (other entries
+keep loading).
+
+**Resolution flow** at transcode start:
+
+1. Stream record has `Watermark.AssetID = "8a3f…"` (ImagePath empty).
+2. Coordinator calls `transcoderConfigWithWatermark(stream)` — clones
+   `stream.Transcoder` (so the persisted record stays unchanged) and
+   asks `watermarks.Service.ResolvePath(AssetID)` for the on-disk path.
+3. Sets `clone.Watermark.ImagePath` to the resolved absolute path,
+   clears `AssetID`. Transcoder layer never sees the AssetID.
+4. `buildVideoFilter` calls `applyWatermark(base, wm, onGPU)`.
+
+**Filter graph shapes** the transcoder emits (all single `-vf` chains
+so the multi-output args builder works without restructuring):
+
+| Type | HW | Filter chain |
+|---|---|---|
+| Text | CPU | `<base>,drawtext=text=…:fontsize=…:fontcolor=…@α:x=…:y=…` |
+| Text | NVENC | `<base>,hwdownload,format=nv12,drawtext=…,hwupload_cuda` |
+| Image | CPU | `<base>[mid];movie=<path>,format=rgba,colorchannelmixer=aa=α[wm];[mid][wm]overlay=x=…:y=…` |
+| Image | NVENC | `<base>,hwdownload,format=nv12[mid];movie=…[wm];[mid][wm]overlay=…,hwupload_cuda` |
+
+`movie=` source filter is used instead of an extra `-i` input so the
+multi-output args builder doesn't need filter_complex restructuring.
+The GPU round-trip pays ~5% CPU per FFmpeg process at 1080p25 in
+exchange for portability — `overlay_cuda` requires
+`--enable-cuda-nvcc` which Ubuntu apt builds skip.
+
+**Position model**:
+
+- 5 named anchors (`top_left` / `top_right` / `bottom_left` /
+  `bottom_right` / `center`) — `offset_x` / `offset_y` are inward edge
+  padding (Center ignores them).
+- `position=custom` — `x` / `y` are raw FFmpeg expressions: pixel ints
+  ("100"), expressions ("main_w-overlay_w-50"), or time-aware fades
+  ("if(gt(t,5),10,-100)"). All FFmpeg overlay/drawtext variables are
+  available.
+
+Validation at the API boundary rejects mutually-exclusive `image_path`
++ `asset_id`, opacity outside `[0,1]`, custom-position with empty x/y,
+non-readable image / font files, and invalid asset id charsets.
 
 ### Storage Layer (`internal/store/`)
 
@@ -561,6 +701,8 @@ Circular deps are broken via post-construction setters
 | All state changes emit events | Coordinator + Manager + Transcoder + Publisher | Hooks must see consistent timeline |
 | Pipeline never tears down on crash | Transcoder retry-forever loop | Streams self-heal — no manual ops needed |
 | Stream status reflects all degradation sources | `streamDegradation` reconciliation | UI green badge must mean "actually working" |
+| Sessions tracker survives config edits | `atomic.Pointer[runtimeConfig]` + `UpdateConfig` | Toggling `enabled` / `idle_timeout` must not lose in-flight session state |
+| Watermark assets are coordinator-resolved | `transcoderConfigWithWatermark` clones tc | Persisted Stream.Watermark stays untouched; transcoder never sees AssetID |
 
 ---
 

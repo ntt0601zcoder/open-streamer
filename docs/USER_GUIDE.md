@@ -379,7 +379,230 @@ Both streams must already exist; mixer:// validates at save time
 
 ---
 
-## 8. Operations
+## 8. Watermarks
+
+Apply text or image overlays to the encoded video. Two-step workflow
+for image watermarks: upload to the asset library, then reference by
+asset ID from a stream.
+
+### 8.1 Upload an image asset
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/watermarks?name=ChannelLogo \
+     -F "file=@channel-logo.png"
+# 201 Created
+# {
+#   "data": {
+#     "id":          "8a3f1c0e2b9d",
+#     "name":        "ChannelLogo",
+#     "file_name":   "channel-logo.png",
+#     "content_type":"image/png",
+#     "size_bytes":  4521,
+#     "uploaded_at": "2026-04-28T15:00:00Z"
+#   }
+# }
+```
+
+PNG / JPG / GIF supported. Cap: 8 MiB per asset. Library stays under
+`watermarks.dir` (default `./watermarks`).
+
+```bash
+curl http://localhost:8080/api/v1/watermarks | jq .         # list
+curl http://localhost:8080/api/v1/watermarks/8a3f1c0e2b9d/raw -o /tmp/preview.png
+curl -XDELETE http://localhost:8080/api/v1/watermarks/8a3f1c0e2b9d
+```
+
+### 8.2 Apply to a stream
+
+**Image watermark** referencing the uploaded asset:
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+  "watermark": {
+    "enabled":   true,
+    "type":      "image",
+    "asset_id":  "8a3f1c0e2b9d",
+    "position":  "top_right",
+    "offset_x":  30, "offset_y": 30,
+    "opacity":   0.85
+  }
+}'
+```
+
+**Text watermark** with a live clock:
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+  "watermark": {
+    "enabled":    true,
+    "type":       "text",
+    "text":       "LIVE %{localtime\\:%H\\:%M}",
+    "font_size":  28,
+    "font_color": "white",
+    "opacity":    0.9,
+    "position":   "bottom_right",
+    "offset_x":   20, "offset_y": 20
+  }
+}'
+```
+
+**Custom position** (raw FFmpeg expression — full power):
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+  "watermark": {
+    "enabled":  true,
+    "type":     "image",
+    "asset_id": "8a3f1c0e2b9d",
+    "position": "custom",
+    "x":        "main_w-overlay_w-50",
+    "y":        "if(gt(t,5),10,-100)"
+  }
+}'
+```
+
+The `y` example slides the watermark in from above the frame after 5
+seconds — useful for animated brand intros without an external editor.
+
+### 8.3 Position presets
+
+| Position | Where | offset_x / offset_y mean |
+|---|---|---|
+| `top_left` | upper-left corner | inward padding from edge |
+| `top_right` | upper-right corner | inward padding |
+| `bottom_left` | lower-left corner | inward padding |
+| `bottom_right` | lower-right corner (default) | inward padding |
+| `center` | exact frame centre | offsets ignored |
+| `custom` | wherever your `x` / `y` expression evaluates | offsets ignored |
+
+GPU pipelines (NVENC) automatically round-trip via CPU for the
+watermark filter — costs ~5% CPU per FFmpeg process; no operator
+action needed. Multi-output mode applies the watermark per rendition
+independently.
+
+### 8.4 Updating watermark on a running stream
+
+Changing any watermark field on a stream that is currently transcoding
+**restarts the transcoder pipeline** (~2-3s downtime per stream — same
+shape as toggling `transcoder.multi_output`):
+
+- Buffer hub keeps running; rendition buffers are recreated on the new
+  start path
+- HLS / DASH / RTMP / SRT / RTSP viewers see one
+  `#EXT-X-DISCONTINUITY` (HLS) or equivalent gap, then resume
+- DVR pauses for the gap and adds a `DVRGap` entry
+
+This is necessary because the FFmpeg `-vf` filter chain is baked into
+the encoder's argv at spawn time — there's no way to live-swap it
+without restarting the process. The diff engine routes any
+watermark-related field change through the topology-reload path so
+both legacy and multi-output modes pick up the new filter graph
+uniformly.
+
+**Watermark on a passthrough stream** (no transcoder) is silently
+ignored — no FFmpeg is running so the filter graph never exists.
+Enable transcoding to get a server-side watermark; otherwise overlay
+client-side in your player.
+
+---
+
+## 9. Play sessions — who's watching?
+
+Open Streamer tracks every active player across all delivery
+protocols (HLS / DASH / RTMP / SRT / RTSP). State is in-memory only —
+restart loses records, viewers reconnect into fresh sessions.
+
+### 9.1 Enable
+
+Sessions tracking is **opt-in** — POST a `sessions` config section:
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/config -d '{
+  "sessions": { "enabled": true, "idle_timeout_sec": 30 }
+}'
+```
+
+Hot-reloadable: toggling `enabled` or changing `idle_timeout_sec`
+takes effect on the next reaper tick (≤ 5s) without restart.
+
+### 9.2 Inspect
+
+```bash
+# All active sessions
+curl http://localhost:8080/api/v1/sessions | jq .
+
+# Per-stream
+curl http://localhost:8080/api/v1/streams/news/sessions | jq .data
+
+# Filter by protocol
+curl 'http://localhost:8080/api/v1/sessions?proto=hls' | jq .data
+```
+
+Each session record includes:
+
+```json
+{
+  "id":          "abc123…",                       // fingerprint or UUID
+  "stream_code": "news",
+  "proto":       "hls",                           // hls|dash|rtmp|srt|rtsp
+  "ip":          "203.0.113.42",
+  "user_agent":  "Mozilla/5.0 …",
+  "country":     "VN",                            // when GeoIP wired
+  "bytes":       1481726,
+  "opened_at":   "2026-04-28T15:01:00Z",
+  "updated_at":  "2026-04-28T15:04:13Z",
+  "duration_sec": 193
+}
+```
+
+The list response also includes aggregate `stats` (active /
+opened_total / closed_total / idle_closed_total / kicked_total).
+
+### 9.3 Kick a viewer
+
+```bash
+curl -XDELETE http://localhost:8080/api/v1/sessions/abc123…
+# 204 No Content
+```
+
+Idempotent — calling delete on an already-closed session returns 404.
+Emits `EventSessionClosed` with `reason=kicked` on the event bus —
+hooks subscribed to the event see the kick in the same channel as
+organic disconnects.
+
+### 9.4 Subscribe to session events
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/hooks -d '{
+  "id":     "viewer-analytics",
+  "type":   "kafka",
+  "target": "stream-sessions-topic",
+  "event_types": ["session.opened", "session.closed"]
+}'
+```
+
+The bus carries an event for every open/close — feed Kafka, ClickHouse,
+or your analytics pipeline. The sessions package stays in-memory; long-
+term persistence is the hook's responsibility.
+
+### 9.5 Notes & caveats
+
+- **Fingerprint sessions** (HLS / DASH) collapse repeated GETs from one
+  viewer onto one record while the idle window is open. Two viewers
+  behind shared NAT without a `?token=…` will merge into one session —
+  add a token query param to disambiguate (the tracker stores it as
+  the user_name and `named_by="token"`).
+- **RTMP / SRT / RTSP** are connection-bound — one TCP/UDP session per
+  record, closed exactly when the transport ends.
+- **RTSP bytes** are always 0: gortsplib's mux is internal and there's
+  no per-subscriber hook today. Other counters are accurate.
+- **GeoIP** field is empty unless an operator wires a custom resolver —
+  the default `NullGeoIP` always returns `""`. The `geoip_db_path`
+  config field is reserved for the future MaxMind integration.
+
+---
+
+## 10. Operations
 
 ### Health checks
 
@@ -441,7 +664,7 @@ journalctl -u open-streamer | grep -E '(failover|crashed|degraded)'
 
 ---
 
-## 9. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
@@ -452,6 +675,9 @@ journalctl -u open-streamer | grep -E '(failover|crashed|degraded)'
 | GPU encoder near 100% saturation | NVENC chip overloaded — reduce profile count / framerate, set `bframes=0`, or enable `transcoder.multi_output` | `nvidia-smi` or Grafana GPU dashboard |
 | `copy://X` save rejected | `X` doesn't exist, OR cycle detected, OR shape constraint violated | API error message details which check failed |
 | Boot fails with "ffmpeg incompatible" | A required encoder/muxer is missing from the FFmpeg build | Probe response under `errors[]`; rebuild ffmpeg with `--enable-libx264` etc. |
+| `/sessions` returns empty after enabling | Tracker config not persisted (UI didn't save) OR sub-section absent before restart | `curl /api/v1/config \| jq .sessions` to verify; restart once after first enabling |
+| Watermark POST returns `INVALID_WATERMARK` | `image_path` and `asset_id` both set, OR custom position with empty x/y, OR opacity outside [0,1] | API error message names the rule; fix the config JSON |
+| Watermark image not appearing on output | Asset deleted while stream running, OR `image_path` not absolute / unreadable by the open-streamer user | Server logs (`coordinator: watermark asset resolve failed`); chown the asset / re-upload |
 
 For deeper troubleshooting see [APP_FLOW.md](./APP_FLOW.md) — covers
 exact event sequences, status reconciliation logic, and what each error
@@ -459,7 +685,7 @@ in the runtime snapshot means.
 
 ---
 
-## 10. Production checklist
+## 12. Production checklist
 
 - [ ] FFmpeg installed with required encoders (boot probe will catch this)
 - [ ] HLS + DASH dirs are different (when both enabled)
@@ -473,7 +699,7 @@ in the runtime snapshot means.
 
 ---
 
-## 11. Updating
+## 13. Updating
 
 ```bash
 # Use the provided installer for atomic upgrades on systemd hosts:

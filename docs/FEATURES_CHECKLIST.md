@@ -47,8 +47,10 @@ Legend:
 | REST API — config defaults | Complete | `GET /config/defaults` returns implicit values for UI placeholders (incl. encoder routing table per HW) |
 | REST API — config YAML editor | Complete | `GET/PUT /config/yaml` round-trips entire system state |
 | REST API — VOD mounts | Complete | Browse on-disk recordings outside DVR scope |
+| REST API — Watermark assets | Complete | `/watermarks` library: list / upload / get / raw / delete (mirrors VOD UX) |
+| REST API — Play sessions | Complete | `/sessions`, `/streams/{code}/sessions`, `/sessions/{id}` (kick), filters by proto / status / limit |
 | OpenAPI / Swagger | Complete | Spec served at `/swagger/`; `make swagger` regenerates |
-| Static delivery — HLS / DASH | Complete | `/{code}/index.m3u8`, `/{code}/index.mpd`, `/{code}/*` |
+| Static delivery — HLS / DASH | Complete | `/{code}/index.m3u8`, `/{code}/index.mpd`, `/{code}/*` (wrapped with sessions middleware when tracker enabled) |
 | Health probes | Complete | `/healthz`, `/readyz` |
 | CORS | Complete | Configurable origins/methods/headers/credentials |
 
@@ -122,7 +124,9 @@ Legend:
 | Hardware acceleration | Complete | NVENC, VAAPI, VideoToolbox, QSV; full-GPU pipeline (decode→scale_cuda→encode) when HW matches encoder family |
 | Resize modes (pure GPU) | Complete | `pad`, `crop`, `stretch`, `fit` — all stay on GPU (no CPU round-trip via hwdownload) for NVENC; `pad`/`crop` degrade to aspect-preserving fit on GPU |
 | Deinterlace | Complete | yadif (CPU) / yadif_cuda (GPU); auto-detect parity or operator-specified tff/bff |
-| Watermark | Schema only | Domain fields exist; not yet applied in filter graph |
+| Watermark — text overlay | Complete | drawtext-based; per-position presets + custom (raw FFmpeg expressions for X/Y); strftime fields supported in text |
+| Watermark — image overlay | Complete | `movie=`-source overlay (no second `-i` needed → uniform with multi-output); PNG / JPG / GIF; opacity; CPU + GPU pipelines (GPU round-trip via hwdownload/hwupload_cuda) |
+| Watermark asset library | Complete | `/watermarks` REST API + on-disk store under `watermarks.dir`; ID-keyed files + JSON sidecar; resolved by coordinator before transcoder.Start |
 | Thumbnail | Schema only | Domain fields exist; not yet generated |
 | Extra FFmpeg args passthrough | Complete | `extra_args` per stream |
 | FFmpeg crash auto-restart | Complete | Per-profile exponential backoff: 2s → 30s cap; retries forever |
@@ -246,17 +250,64 @@ Single source of truth: [internal/domain/defaults.go](../internal/domain/default
 
 ---
 
+## Play Sessions (`internal/sessions`)
+
+Tracks every active player so operators can answer "who is watching
+this stream right now?". State is in-memory only — restart loses
+records, viewers reconnect into fresh sessions.
+
+| Feature | Status | Notes |
+|---|---|---|
+| HLS / DASH session tracking | Complete | `mediaserve.Mount` wrapped with `sessions.HTTPMiddleware`; each segment GET extends the session record; bytes counted from the `ResponseWriter` |
+| RTMP session tracking | Complete | `push.PlayFunc` extended with `PlayInfo{RemoteAddr, FlashVer}`; bytes counted by wrapping `writeFrame` |
+| SRT session tracking | Complete | `srtHandleSubscribe` opens a tracker session; bytes accumulated on every successful `conn.Write` |
+| RTSP session tracking | Complete | gortsplib `OnPlay` / `OnSessionClose` hooks; bytes default to 0 (gortsplib mux is internal) |
+| Fingerprint session ID (HLS / DASH) | Complete | `sha256(stream + ip + ua + token)[0..16]` so repeated segment GETs collapse onto one record within the idle window |
+| UUID session ID (RTMP / SRT / RTSP) | Complete | Connection-bound, generated at handshake; closed on TCP teardown |
+| Idle reaper | Complete | Default 30s without activity → close + emit `EventSessionClosed`; tunable via `sessions.idle_timeout_sec` |
+| Max-lifetime cap | Complete | Optional `sessions.max_lifetime_sec` hard-closes any session older than the cap |
+| Hot-reload config | Complete | `sessions.UpdateConfig` swaps an `atomic.Pointer[runtimeConfig]` — toggling `enabled` / changing `idle_timeout_sec` takes effect on the next reaper tick without restart |
+| Kick (force-close) | Complete | `DELETE /sessions/{id}` → reason=`kicked`; idempotent (404 on already-closed) |
+| Filter / list | Complete | `GET /sessions?proto=…&status=…&limit=…` + per-stream `/streams/{code}/sessions` |
+| Stats counters | Complete | `active`, `opened_total`, `closed_total`, `idle_closed_total`, `kicked_total` exposed in every list response |
+| Event bus emit | Complete | `EventSessionOpened` / `EventSessionClosed` published — hooks can persist analytics or notify ops |
+| GeoIP resolver interface | Schema only | `GeoIPResolver` interface + `NullGeoIP` default; `geoip_db_path` config field reserved. MaxMind / IP2Location reader not wired. |
+
+---
+
+## Watermarks (`internal/watermarks` + transcoder filter graph)
+
+| Feature | Status | Notes |
+|---|---|---|
+| Text overlay (drawtext) | Complete | `text` supports `%{localtime}` and friends; opacity folded into `fontcolor=…@α` |
+| Image overlay (overlay+movie) | Complete | `movie=` source filter avoids second `-i`; opacity via `colorchannelmixer=aa` |
+| GPU round-trip on NVENC | Complete | `hwdownload,format=nv12 → drawtext/overlay → hwupload_cuda`; portable across distros without `--enable-cuda-nvcc` |
+| Multi-output mode support | Complete | Same filter chain emitted on every `-vf:v:0` so each rendition draws the watermark independently |
+| Position presets | Complete | `top_left` / `top_right` / `bottom_left` / `bottom_right` / `center`; `offset_x` / `offset_y` act as edge padding |
+| Custom position | Complete | `position=custom` + raw FFmpeg expressions in `x` / `y` ("100", "main_w-overlay_w-50", "if(gt(t,5),10,-100)") |
+| Asset library upload | Complete | `POST /watermarks` multipart; PNG / JPG / GIF sniffed via `http.DetectContentType`; cap 8 MiB image / 16 MiB request |
+| Asset library list / get / raw / delete | Complete | Mirrors VOD UX; `/raw` serves with `Cache-Control: immutable` |
+| Sidecar metadata | Complete | One `<id>.json` per asset → `os.ReadDir` rebuilds registry on restart, no DB |
+| Asset-id reference from streams | Complete | `Stream.Watermark.AssetID` resolved by coordinator into `ImagePath` before each `tc.Start` (transcoder stays asset-agnostic) |
+| Validation at API boundary | Complete | mutually exclusive `image_path` / `asset_id`; opacity 0..1; position-custom requires non-empty x/y; image / font path absoluteness + readability |
+
+---
+
 ## Pending / Planned
 
 Tracking what is intentionally NOT done. Each row is a deliberate scope decision.
 
 | Priority | Feature | Status | Notes |
 |---|---|---|---|
-| Mid | Watermark | Schema only | Needs FFmpeg `overlay`/`drawtext` injection in `buildVideoFilter` + asset upload endpoint |
 | Mid | Thumbnail | Schema only | Periodic JPEG snapshot from main buffer; needs ffmpeg `select=eq(pict_type\\,I)` chain |
+| Mid | GeoIP MaxMind reader | Schema only | Interface + `NullGeoIP` default exist; concrete MaxMind/IP2Location reader not wired. `sessions.geoip_db_path` config field reserved |
+| Mid | Sessions persistence (history beyond active set) | Not started | In-memory only — closed sessions disappear after the event is published. Hooks can persist downstream |
 | Mid | Local-packager error tracking (HLS/DASH) | Not started | Currently slog-only; analogous to push state pattern but per-stream-per-format |
 | Low | Per-input net config (read_timeout, reconnect_*, max_reconnects) | Schema only | Declared in domain.InputNetConfig, not consumed; either implement or remove |
 | Low | HLS / DASH push out | Not started | Only RTMP/RTMPS push exists |
+| Low | RTSP per-session bytes accuracy | Schema only | gortsplib mux is internal; current `bytes=0` for RTSP. Would need a custom `WritePacketRTP` wrapper or fork |
+| Low | RTMP `flashVer` capture | Schema only | gomedia doesn't expose `flashVer` from the connect command publicly; left empty in `PlayInfo.FlashVer` |
+| Low | Sessions token-based auth | Not started | Token field reserved on PlaySession; no resolver / signed-URL verifier wired yet |
 | Low | WebRTC publish / play | Not started | Pion-based subsystem; large surface (SDP, ICE, DTLS-SRTP) |
 
 ### Decided NOT (locked)
@@ -286,12 +337,33 @@ Tracking what is intentionally NOT done. Each row is a deliberate scope decision
 | Unit tests — runtime status snapshots (defensive copy, sort order) | Complete | |
 | Unit tests — FFmpeg probe (parsers, integration on PATH, missing binary, non-FFmpeg) | Complete | |
 | Unit tests — config defaults endpoint (shape, codec routing table, determinism) | Complete | |
+| Unit tests — sessions tracker (HTTP + conn paths, idle reaper, kick, filter, hot-reload) | Complete | |
+| Unit tests — sessions HTTP middleware (proto detection, byte counting, error path) | Complete | |
+| Unit tests — sessions handler (list / get / kick / filter validation) | Complete | |
+| Unit tests — watermark filter graph (text + image, CPU + GPU, custom position, position presets, escaping) | Complete | |
+| Unit tests — watermark domain validation (mutual-exclusion, asset-id charset, opacity range, custom requires X/Y) | Complete | |
+| Unit tests — watermarks asset service (save/list/get/delete, content-type sniff, rebuild from disk) | Complete | |
 | Integration tests — coordinator.Update routing | Complete | 14 cases, spy implementations of all service interfaces |
 | Integration tests — ffmpeg filter chain | Complete | Build-tagged; spawns real ffmpeg with generated `-vf` |
 | CI (GitHub Actions) | Complete | `mod-tidy`, `test` (matrix Go 1.25.9 + stable), `lint` (allow-fail), `govulncheck` |
 | Pre-commit hook (auto-regen swagger) | Complete | `make hooks-install` symlinks `scripts/git-hooks/pre-commit` |
 | golangci-lint | Complete | 0 issues |
 | gofumpt formatting | Complete | Enforced via lint |
+
+### Benchmarking (`bench/`)
+
+Operator-facing capacity tooling — runs sweeps across passthrough,
+ABR, multi-output, libx264 and HLS+DASH multi-protocol phases. See
+[`bench/README.md`](../bench/README.md) for the full sweep plan.
+
+| Tool | Purpose |
+|---|---|
+| `bench/scripts/sample.sh` | 2s-cadence CSV of CPU% (jiffies-based, intersection of PID set across ticks) + RSS / GPU enc/dec / VRAM / network for the open-streamer process tree |
+| `bench/scripts/run-bench.sh` | One-case driver: spin up N FFmpeg publishers → wait warmup → sample steady window → tear down |
+| `bench/scripts/run-all.sh` | Full sweep — Phases A/B/C/F/H/D, auto-stops a phase on first SATURATED, full-stop on first FAIL |
+| `bench/scripts/summarize.sh` | Per-run `summary.md` + auto-classify `PASS` / `SATURATED` / `FAIL` against thresholds |
+| `bench/scripts/aggregate.sh` | Master report at `bench/reports/<sweep>/report.md` |
+| `bench/scripts/notify.sh` | Optional Telegram webhook integration |
 
 ---
 

@@ -541,7 +541,51 @@ streams restart in parallel (one goroutine each).
 
 ---
 
-## 7. DVR segment write
+## 7. Watermark asset resolution at transcoder.Start
+
+Stream config references an uploaded watermark by `asset_id`. The
+coordinator translates the reference into an absolute on-disk path
+**before** calling `transcoder.Start`, so the FFmpeg layer never sees
+the asset id and stays library-agnostic.
+
+```mermaid
+sequenceDiagram
+    participant API   as POST /streams/{code}
+    participant Coord as Coordinator
+    participant WM    as watermarks.Service
+    participant TC    as transcoder.Service
+    participant FF    as FFmpeg
+
+    API->>Coord: stream.Watermark = { asset_id: "8a3f…" }
+    Coord->>Coord: transcoderConfigWithWatermark(stream)
+    Note over Coord: 1) Clone *stream.Transcoder (don't mutate persisted struct)<br/>2) Lookup wmAssets.ResolvePath("8a3f…")
+    Coord->>WM: ResolvePath("8a3f…")
+    WM-->>Coord: "/var/lib/open-streamer/watermarks/8a3f….png"
+    Note over Coord: 3) clone.Watermark.ImagePath = resolved path<br/>4) clone.Watermark.AssetID = "" (cleared)
+    Coord->>TC: Start(ctx, code, rawID, &clone, targets)
+    TC->>TC: buildVideoFilter → applyWatermark
+    TC->>FF: ffmpeg -vf "...,movie='/var/.../8a3f….png'[wm];[mid][wm]overlay=..."
+```
+
+Failure modes the coordinator handles inline:
+
+- **AssetID points to a deleted asset** → `wmAssets.ResolvePath`
+  returns `ErrNotFound`. `resolvedWatermark` logs a warning and returns
+  `nil` (watermark disabled for this start). Stream still comes up.
+- **`watermarks.Service` not wired in DI** (e.g. test harness) →
+  `coordinator.wmAssets` is nil. Asset references are ignored;
+  `image_path`-style watermarks still resolve.
+- **Both `asset_id` and `image_path` set** → API rejects at save time
+  with `INVALID_WATERMARK`. Never reaches the coordinator.
+
+The clone in step 1 is critical: directly mutating `stream.Transcoder`
+would surface the resolved path on subsequent `GET /streams` responses,
+breaking the API contract that says watermark lives at `Stream.Watermark`
+(transcoder section is encoder config, not asset config).
+
+---
+
+## 8. DVR segment write
 
 ```mermaid
 flowchart TD
@@ -592,7 +636,7 @@ DVR.StartRecording (existing recording detected via index.json):
 
 ---
 
-## 8. Push to remote (RTMP/RTMPS)
+## 9. Push to remote (RTMP/RTMPS)
 
 Per-destination state machine:
 
@@ -661,7 +705,7 @@ failures resolved. On transition Active→Reconnecting/Failed,
 
 ---
 
-## 9. Status reconciliation
+## 10. Status reconciliation
 
 `runtime.status` is derived dynamically from two flags + pipeline state:
 
@@ -709,7 +753,7 @@ stale degraded state from prior runs.
 
 ---
 
-## 10. Events reference
+## 11. Events reference
 
 All events flow through `internal/events.Bus` and are delivered to
 hooks matching the event type filter.
@@ -790,6 +834,20 @@ Published by DVR service.
 | `recording.failed` | Segment write failed (disk full, permission, etc.). Recording loop continues | `recording_id`, `segment`, `error` |
 | `segment.written` | TS segment flushed to disk. **HIGH-FREQUENCY** — one per cut (~4s default) | `recording_id`, `segment`, `duration_sec`, `size_bytes`, `wall_time`, `discontinuity` |
 
+### Play sessions
+
+Published by `internal/sessions.Service` once per session lifecycle —
+not per request. The HLS / DASH HTTP middleware extends an existing
+session's `updated_at` silently; only the first hit (or first hit
+after the idle window) emits `session.opened`.
+
+| Type | When | Payload |
+|---|---|---|
+| `session.opened` | New PlaySession created — first segment GET (HLS/DASH) or TCP handshake (RTMP/SRT/RTSP) | `session_id`, `proto`, `ip`, `user_agent`, `country`, `user_name` |
+| `session.closed` | Session ended — TCP disconnect (live protocols), idle timeout (HLS/DASH), `DELETE /sessions/{id}` (kick), or shutdown sweep | `session_id`, `proto`, `ip`, `bytes`, `duration_sec`, `reason` |
+
+`reason` is one of `idle`, `client_gone`, `kicked`, `shutdown`.
+
 ### Volume guide
 
 | Event | Typical frequency |
@@ -800,6 +858,7 @@ Published by DVR service.
 | `input.reconnecting` / `degraded` / `failover` | Low — only on signal problems |
 | `recording.started` / `stopped` / `failed` | Low |
 | `transcoder.started` / `stopped` / `error` | Low (error suppressed after threshold) |
+| `session.opened` / `closed` | **MEDIUM-HIGH** — scales with viewer count, NOT request count. ~2 events per viewer per stream session |
 | `segment.written` | **HIGH** — one per segment cut (~4s) |
 
 Hooks that don't want segment.written should set `event_types`
@@ -815,7 +874,7 @@ explicitly to filter it out:
 
 ---
 
-## 11. Hook delivery
+## 12. Hook delivery
 
 ### HTTP hooks
 

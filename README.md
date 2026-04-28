@@ -147,6 +147,15 @@ regenerate from annotations).
 - **DVR + Timeshift** — persistent recording per stream; resume across
   restarts; absolute / relative timeshift VOD endpoints; size + time
   retention.
+- **Watermarks** — text (drawtext + strftime) or image (overlay) per
+  stream. Position presets + raw FFmpeg expressions for full
+  flexibility (animated, time-aware). Image asset library with REST
+  upload (`POST /watermarks`). Pure-GPU pipeline auto-bridges via
+  hwdownload/hwupload_cuda for portability.
+- **Play sessions** — track every viewer across HLS / DASH / RTMP /
+  SRT / RTSP. Fingerprint dedup for pull protocols, UUID for
+  connection-bound. Idle reaper, kick API, hot-reload config,
+  `session.opened`/`closed` events on the bus.
 - **Webhooks + Kafka** — domain events with HMAC signing, retries,
   per-hook event/stream filters, metadata injection.
 - **FFmpeg compatibility probe** — boot + on-demand check for
@@ -182,21 +191,24 @@ Repository layout:
 cmd/server/           # main entrypoint
 internal/
   api/                # chi router + handlers
+  api/handler/        # HTTP handlers
   buffer/             # ring buffer + fan-out
   coordinator/        # pipeline lifecycle + diff engine
   ingestor/           # pull workers (RTMP/RTSP/SRT/HLS/...) + push servers
   manager/            # input failover state machine
-  transcoder/         # FFmpeg worker pool + multi-output
+  transcoder/         # FFmpeg worker pool + multi-output + watermark filter graph
   publisher/          # HLS/DASH segmenters + serve listeners + push out
   dvr/                # recording + retention + timeshift
   events/             # in-process event bus
   hooks/              # webhook + Kafka delivery
+  sessions/           # play-session tracker (HLS/DASH/RTMP/SRT/RTSP viewers)
+  watermarks/         # asset library backing /watermarks REST API
   domain/             # types + defaults + resolvers (single source of truth)
   store/              # repository pattern (json / yaml backends)
   runtime/            # service lifecycle wrapper
-  api/handler/        # HTTP handlers
 config/               # bootstrap config (storage backend selection)
 build/                # systemd unit + installer
+bench/                # capacity sweep tooling (sample.sh / run-all.sh / aggregate.sh)
 docs/                 # → see Documentation table above
 ```
 

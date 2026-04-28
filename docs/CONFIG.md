@@ -58,6 +58,8 @@ global_config:
   ingestor: ...      # Server-wide ingest settings
   transcoder: ...    # FFmpeg path + multi-output toggle
   hooks: ...         # Worker pool + Kafka brokers
+  sessions: ...      # Play-sessions tracker (HLS/DASH/RTMP/SRT/RTSP viewers)
+  watermarks: ...    # Watermark asset library directory
   log: ...           # Level + format
 ```
 
@@ -174,7 +176,47 @@ hooks:
 
 Per-hook `max_retries` (default 3) and `timeout_sec` (default 10) live on each Hook record, not GlobalConfig.
 
-### 2.9 log
+### 2.9 sessions
+
+```yaml
+sessions:
+  enabled:           true     # Default false. Disabled = tracker is no-op, /sessions returns empty.
+  idle_timeout_sec:  30       # Default. HLS/DASH have no TCP "left" signal; reaper closes after this gap.
+  max_lifetime_sec:  0        # 0 = no cap. Hard-close any session older than this even if still active.
+  geoip_db_path:     ""       # Reserved for future MaxMind/IP2Location integration. Default no-op resolver returns Country="".
+```
+
+Hot-reloadable: `enabled` toggle and timeouts apply on the next reaper
+tick (≤ 5s) without restart. In-flight session state is preserved.
+
+When the section is **null / absent** the tracker doesn't run at all
+and `/sessions` endpoints return empty payloads — handy for hosts where
+operators don't care about per-viewer attribution.
+
+### 2.10 watermarks
+
+```yaml
+watermarks:
+  dir: /var/lib/open-streamer/watermarks   # Default "./watermarks". Must be writable.
+```
+
+Backing store for the `/watermarks` REST API. Each upload writes two
+files into this directory:
+
+```text
+<dir>/<id>.<ext>      # image bytes (PNG / JPG / GIF)
+<dir>/<id>.json       # domain.WatermarkAsset metadata sidecar
+```
+
+`os.ReadDir` rebuilds the in-memory registry after restart so the
+library is restart-safe with no external database. A corrupt sidecar
+skips just that asset (others keep loading) — see logs for `watermarks: rebuild cache`.
+
+Per-asset cap: 8 MiB image / 16 MiB request body (multipart
+overhead). Operators wanting a different cap should fork — values are
+constants in `domain` to keep the upload path simple.
+
+### 2.11 log
 
 ```yaml
 log:
@@ -270,7 +312,25 @@ dvr:                             # null = no DVR.
   storage_path:     ""           # "" = default ./out/dvr/{streamCode}.
   max_size_gb:      0            # 0 = no limit.
 
-watermark: null                  # Schema only — not applied yet.
+watermark:                       # Optional text or image overlay applied before encoding.
+  enabled: true
+  type:    "text"                # text | image
+  # --- text ---
+  text:       "LIVE %{localtime\\:%H\\:%M}"   # strftime supported (escape FFmpeg delimiters)
+  font_file:  ""                              # absolute path to .ttf/.otf, or "" for FFmpeg default
+  font_size:  24                              # px. 0 → 24
+  font_color: "white"                         # FFmpeg color syntax
+  # --- image ---
+  asset_id:   ""                              # references /watermarks library (resolved by coordinator)
+  image_path: ""                              # absolute path; mutually exclusive with asset_id
+  # --- common ---
+  opacity:    1.0                             # 0..1
+  position:   "bottom_right"                  # top_left|top_right|bottom_left|bottom_right|center|custom
+  offset_x:   10                              # padding from anchor edge (presets only)
+  offset_y:   10
+  x:          ""                              # raw FFmpeg expression — only used when position=custom
+  y:          ""                              # e.g. "main_w-overlay_w-50", "if(gt(t,5),10,-100)"
+
 thumbnail: null                  # Schema only — not applied yet.
 ```
 
@@ -311,7 +371,63 @@ For VAAPI/QSV/VT operators must spell the full encoder name explicitly (`h264_va
 
 The full routing table is in `GET /api/v1/config/defaults` for frontend lookup.
 
-### 3.3 Preset translation
+### 3.3 Watermark — text vs image, asset_id vs image_path
+
+Two ways to reference an image watermark:
+
+| Field | Source | Lifecycle |
+|---|---|---|
+| `asset_id` | uploaded via `POST /watermarks` and stored under `watermarks.dir` | managed via REST; resolves to absolute path at `tc.Start` |
+| `image_path` | absolute path to a file the open-streamer process can read | operator stages on host out-of-band |
+
+The two are **mutually exclusive** — set one, leave the other empty.
+The API rejects configs that set both with `INVALID_WATERMARK`.
+
+**Position presets** treat `offset_x` / `offset_y` as inward edge
+padding. Center ignores offsets:
+
+```text
+top_left     → x=offset_x,            y=offset_y
+top_right    → x=W-w-offset_x,        y=offset_y
+bottom_left  → x=offset_x,            y=H-h-offset_y
+bottom_right → x=W-w-offset_x,        y=H-h-offset_y
+center       → x=(W-w)/2,             y=(H-h)/2
+```
+
+**Custom position** (`position=custom`) hands raw FFmpeg expressions
+to drawtext / overlay — full power, no preset clipping:
+
+```yaml
+position: "custom"
+x: "main_w-overlay_w-50"      # 50 px in from right
+y: "if(gt(t,5),10,-100)"      # off-screen for first 5s, then 10px from top
+```
+
+Variables exposed (per FFmpeg docs):
+
+- drawtext (text): `w`/`h` = frame size, `tw`/`th` = rendered text size, `t` = clock time
+- overlay (image): `W`/`H` = main video size, `w`/`h` = overlay image size, `t` = clock time
+
+**Opacity** is folded into the filter:
+
+- text → `fontcolor=<color>@<opacity>` (FFmpeg native)
+- image → `colorchannelmixer=aa=<opacity>` after the `movie=` source
+
+**GPU pipeline** (NVENC) automatically wraps the watermark with
+`hwdownload,format=nv12` ↔ `hwupload_cuda` because `drawtext` is
+CPU-only and `overlay_cuda` requires `--enable-cuda-nvcc` (Ubuntu apt
+ffmpeg skips it). Cost: ~5% of one CPU core per FFmpeg process at
+1080p25. Multi-output mode applies the same chain per `-vf:v:0`.
+
+**Hot-reload behaviour**: editing any watermark field on a running
+stream forces a transcoder topology reload (~2-3s downtime per stream)
+because the FFmpeg `-vf` chain is baked into the encoder argv at spawn
+time. The diff engine routes any `Stream.Watermark` change through
+`reloadTranscoderFull` so the new filter graph applies cleanly across
+both legacy and multi-output modes. Watermark on a passthrough stream
+(no transcoder) is silently inert — no FFmpeg ever runs.
+
+### 3.4 Preset translation
 
 Cross-family preset names are auto-translated so the value works on whichever encoder the codec/HW selection resolves to:
 
@@ -396,6 +512,14 @@ Single source of truth: [internal/domain/defaults.go](../internal/domain/default
 | `push.limit` | — | **0 = unlimited retries** |
 | `hook.max_retries` | 3 | 0 = use default |
 | `hook.timeout_sec` | 10 | 0 = use default |
+| `sessions.idle_timeout_sec` | 30 | 0 = use default |
+| `sessions.max_lifetime_sec` | — | **0 = no cap** |
+| `watermarks.dir` | `./watermarks` | empty = `./watermarks` |
+| `watermark.font_size` | 24 | 0 = 24 |
+| `watermark.font_color` | `white` | empty = white |
+| `watermark.opacity` | 1.0 | 0 = 1.0 |
+| `watermark.position` | `bottom_right` | empty = bottom_right |
+| `watermark.offset_x/_y` (presets) | 10 | 0 = 10 (Center keeps 0) |
 
 ---
 
