@@ -12,94 +12,109 @@ import (
 // diff rather than via duplicated literals.
 const testBaseChain = "scale=1280:720"
 
-// TestApplyImageWatermarkResize verifies the scale2ref chain is injected
-// only when Resize=true, that the width references main_w (not the
-// watermark's own iw — that mistake would produce wrong sizing), and
-// crucially that the scale2ref outputs use DISTINCT labels from its inputs
-// — some libavfilter builds silently drop the overlay when scale2ref
-// reuses [wm][mid] for both consumption and production.
-func TestApplyImageWatermarkResize(t *testing.T) {
+// noResizeScale is the frameScale value the legacy tests pass when they
+// don't care about the reference-frame model — equivalent to "this profile
+// IS the reference (largest) profile". With Resize=false anywhere in the
+// config the scale value is ignored anyway.
+const noResizeScale = 1.0
+
+// Test fixtures shared across cases so the same literal can't drift.
+const (
+	testTmpLogo        = "/tmp/logo.png"
+	testImgLogo        = "/img/logo.png"
+	testScaleIWFactor  = "scale=iw*"
+	test720pScaleChain = "scale=iw*0.6667:ih*0.6667"
+)
+
+// TestApplyImageWatermarkResizeBelowReference verifies that a smaller
+// profile (frameScale<1) gets a `scale=iw*f:ih*f` filter inserted into the
+// movie chain — that's the per-rendition shrink the reference-frame sizing
+// model relies on.
+func TestApplyImageWatermarkResizeBelowReference(t *testing.T) {
 	base := testBaseChain + ",setsar=1"
 	wm := &domain.WatermarkConfig{
 		Enabled:   true,
 		Type:      domain.WatermarkTypeImage,
-		ImagePath: "/tmp/logo.png",
+		ImagePath: testTmpLogo,
 		Position:  domain.WatermarkTopRight,
 		Resize:    true,
 	}
-	got := applyWatermark(base, wm.Resolved(), false)
+	got := applyWatermark(base, wm.Resolved(), false, 0.6667) // 720p relative to 1080p
 
-	for _, frag := range []string{
-		"scale2ref=w=main_w*",
-		":h=main_w*",
-		"*ih/iw",              // aspect-preserving height using only input variables
-		"[wms]",               // distinct scaled-watermark label
-		"[mids]",              // distinct passthrough-main label
-		"[mids][wms]overlay=", // overlay consumes the post-scale labels
-	} {
-		if !strings.Contains(got, frag) {
-			t.Fatalf("expected %q in resize chain, got: %s", frag, got)
-		}
-	}
-
-	// Must NOT regress to label-reuse pattern.
-	if strings.Contains(got, "scale2ref=") && strings.Contains(got, "[wm][mid]scale2ref") &&
-		strings.Contains(got, "scale2ref=") && strings.HasSuffix(got[strings.Index(got, "scale2ref"):],
-		"[wm][mid]") {
-		t.Fatalf("scale2ref must not reuse [wm][mid] as outputs: %s", got)
-	}
-
-	// Resize=false → scale2ref must NOT appear.
-	wm.Resize = false
-	got = applyWatermark(base, wm.Resolved(), false)
-	if strings.Contains(got, "scale2ref") {
-		t.Fatalf("scale2ref should be absent when Resize=false: %s", got)
+	if !strings.Contains(got, test720pScaleChain) {
+		t.Fatalf("expected scale=iw*0.6667:ih*0.6667 in movie chain, got: %s", got)
 	}
 }
 
-// TestApplyImageWatermarkResizeRatioOverride verifies a per-stream
-// ResizeRatio overrides the package default in the scale2ref expression.
-func TestApplyImageWatermarkResizeRatioOverride(t *testing.T) {
+// TestApplyImageWatermarkResizeReferenceProfile asserts that the largest
+// profile (frameScale=1.0) skips the scale filter entirely — its watermark
+// renders at the asset's native pixel size.
+func TestApplyImageWatermarkResizeReferenceProfile(t *testing.T) {
 	base := testBaseChain
 	wm := &domain.WatermarkConfig{
-		Enabled:     true,
-		Type:        domain.WatermarkTypeImage,
-		ImagePath:   "/tmp/logo.png",
-		Position:    domain.WatermarkTopRight,
-		Resize:      true,
-		ResizeRatio: 0.20, // 20% banner-sized
+		Enabled:   true,
+		Type:      domain.WatermarkTypeImage,
+		ImagePath: testTmpLogo,
+		Position:  domain.WatermarkTopRight,
+		Resize:    true,
 	}
-	got := applyWatermark(base, wm.Resolved(), false)
-	if !strings.Contains(got, "main_w*0.2000") {
-		t.Fatalf("expected main_w*0.2000 (20%% override), got: %s", got)
-	}
-	if strings.Contains(got, "main_w*0.0800") {
-		t.Fatalf("default 0.08 should not leak when ResizeRatio is set: %s", got)
+	got := applyWatermark(base, wm.Resolved(), false, 1.0)
+
+	if strings.Contains(got, testScaleIWFactor) {
+		t.Fatalf("largest profile (frameScale=1.0) must skip movie-chain scale, got: %s", got)
 	}
 }
 
-// TestApplyTextWatermarkResizeRatioOverride mirrors the image override test
-// for the drawtext fontsize=h*ratio path.
-func TestApplyTextWatermarkResizeRatioOverride(t *testing.T) {
+// TestApplyImageWatermarkResizeDisabled confirms Resize=false leaves the
+// movie chain untouched even on smaller profiles — operators who want a
+// fixed-pixel watermark across the ladder keep that behaviour.
+func TestApplyImageWatermarkResizeDisabled(t *testing.T) {
 	base := testBaseChain
 	wm := &domain.WatermarkConfig{
-		Enabled:     true,
-		Type:        domain.WatermarkTypeText,
-		Text:        "LIVE",
-		FontSize:    24,
-		Position:    domain.WatermarkTopRight,
-		Resize:      true,
-		ResizeRatio: 0.12,
+		Enabled:   true,
+		Type:      domain.WatermarkTypeImage,
+		ImagePath: testTmpLogo,
+		Position:  domain.WatermarkTopRight,
+		Resize:    false,
 	}
-	got := applyWatermark(base, wm.Resolved(), false)
-	if !strings.Contains(got, "fontsize='h*0.1200'") {
-		t.Fatalf("expected fontsize=h*0.1200, got: %s", got)
+	got := applyWatermark(base, wm.Resolved(), false, 0.5)
+
+	if strings.Contains(got, testScaleIWFactor) {
+		t.Fatalf("Resize=false must skip movie-chain scale regardless of frameScale, got: %s", got)
 	}
 }
 
-// TestApplyTextWatermarkResize verifies fontsize switches from a fixed
-// pixel value to a frame-height fraction expression when Resize=true.
-func TestApplyTextWatermarkResize(t *testing.T) {
+// TestApplyTextWatermarkResizeScalesFontAndOffsets — text path: FontSize
+// and offsets shrink by frameScale; relative on-screen ratio stays put.
+func TestApplyTextWatermarkResizeScalesFontAndOffsets(t *testing.T) {
+	base := testBaseChain
+	wm := &domain.WatermarkConfig{
+		Enabled:  true,
+		Type:     domain.WatermarkTypeText,
+		Text:     "LIVE",
+		FontSize: 48,
+		Position: domain.WatermarkTopRight,
+		OffsetX:  20,
+		OffsetY:  30,
+		Resize:   true,
+	}
+	// 720p (frameScale ≈ 0.667) should produce fontsize=32, offset_x=13, offset_y=20.
+	got := applyWatermark(base, wm.Resolved(), false, 0.6667)
+
+	if !strings.Contains(got, "fontsize=32") {
+		t.Fatalf("FontSize 48*0.6667 ≈ 32, got: %s", got)
+	}
+	if !strings.Contains(got, "x='w-tw-13'") {
+		t.Fatalf("OffsetX 20*0.6667 ≈ 13, got: %s", got)
+	}
+	if !strings.Contains(got, "y='20'") {
+		t.Fatalf("OffsetY 30*0.6667 ≈ 20, got: %s", got)
+	}
+}
+
+// TestApplyTextWatermarkResizeReferenceProfile — frameScale=1.0 keeps the
+// operator's chosen FontSize and offsets verbatim.
+func TestApplyTextWatermarkResizeReferenceProfile(t *testing.T) {
 	base := testBaseChain
 	wm := &domain.WatermarkConfig{
 		Enabled:  true,
@@ -107,21 +122,16 @@ func TestApplyTextWatermarkResize(t *testing.T) {
 		Text:     "LIVE",
 		FontSize: 24,
 		Position: domain.WatermarkTopRight,
+		OffsetX:  10,
+		OffsetY:  10,
 		Resize:   true,
 	}
-	got := applyWatermark(base, wm.Resolved(), false)
-	if !strings.Contains(got, "fontsize='h*") {
-		t.Fatalf("expected fontsize=h*ratio when Resize=true, got: %s", got)
-	}
-	if strings.Contains(got, "fontsize=24") {
-		t.Fatalf("fixed fontsize=24 should not be present when Resize=true: %s", got)
-	}
-
-	// Resize=false → static FontSize.
-	wm.Resize = false
-	got = applyWatermark(base, wm.Resolved(), false)
+	got := applyWatermark(base, wm.Resolved(), false, 1.0)
 	if !strings.Contains(got, "fontsize=24") {
-		t.Fatalf("expected fixed fontsize=24 when Resize=false, got: %s", got)
+		t.Fatalf("reference profile keeps native FontSize, got: %s", got)
+	}
+	if !strings.Contains(got, "x='w-tw-10'") {
+		t.Fatalf("reference profile keeps native OffsetX, got: %s", got)
 	}
 }
 
@@ -133,7 +143,7 @@ func TestApplyWatermarkInactivePassthrough(t *testing.T) {
 		{Enabled: true, Type: domain.WatermarkTypeText, Text: "  "},
 	}
 	for i, wm := range cases {
-		got := applyWatermark(base, wm, false)
+		got := applyWatermark(base, wm, false, noResizeScale)
 		if got != base {
 			t.Errorf("case %d: chain mutated when watermark inactive: %s", i, got)
 		}
@@ -152,7 +162,7 @@ func TestApplyTextWatermarkCPU(t *testing.T) {
 		Position:  domain.WatermarkTopRight,
 		OffsetX:   20, OffsetY: 30,
 	}
-	got := applyWatermark(base, wm, false)
+	got := applyWatermark(base, wm, false, noResizeScale)
 
 	for _, frag := range []string{
 		"scale=1920:1080,",
@@ -176,7 +186,7 @@ func TestApplyTextWatermarkGPU(t *testing.T) {
 	wm := &domain.WatermarkConfig{
 		Enabled: true, Type: domain.WatermarkTypeText, Text: "LIVE",
 	}
-	got := applyWatermark(base, wm, true)
+	got := applyWatermark(base, wm, true, noResizeScale)
 
 	for _, frag := range []string{
 		"scale_cuda=1280:720,",
@@ -208,7 +218,7 @@ func TestApplyImageWatermarkCPU(t *testing.T) {
 		Position:  domain.WatermarkBottomLeft,
 		OffsetX:   25, OffsetY: 25,
 	}
-	got := applyWatermark(base, wm, false)
+	got := applyWatermark(base, wm, false, noResizeScale)
 
 	// Three-segment graph: <base>[mid]; movie=...,format=rgba,colorchannelmixer[wm]; [mid][wm]overlay=...
 	segs := strings.Split(got, ";")
@@ -234,9 +244,9 @@ func TestApplyImageWatermarkGPU(t *testing.T) {
 	base := "scale_cuda=1920:1080"
 	wm := &domain.WatermarkConfig{
 		Enabled: true, Type: domain.WatermarkTypeImage,
-		ImagePath: "/img/logo.png", Opacity: 1.0, Position: domain.WatermarkCenter,
+		ImagePath: testImgLogo, Opacity: 1.0, Position: domain.WatermarkCenter,
 	}
-	got := applyWatermark(base, wm, true)
+	got := applyWatermark(base, wm, true, noResizeScale)
 
 	// hwdownload joins seg0 (before [mid]), hwupload_cuda joins seg2 (after overlay).
 	if !strings.Contains(got, "hwdownload,format=nv12[mid]") {
@@ -261,7 +271,7 @@ func TestApplyTextWatermarkCustomPosition(t *testing.T) {
 		Position: domain.WatermarkCustom,
 		X:        "main_w-overlay_w-50", Y: "if(gt(t,5),10,-100)",
 	}
-	got := applyWatermark(testBaseChain, wm, false)
+	got := applyWatermark(testBaseChain, wm, false, noResizeScale)
 	if !strings.Contains(got, "x='main_w-overlay_w-50'") {
 		t.Errorf("custom x not forwarded: %q", got)
 	}
@@ -272,10 +282,10 @@ func TestApplyTextWatermarkCustomPosition(t *testing.T) {
 
 func TestApplyImageWatermarkCustomPosition(t *testing.T) {
 	wm := &domain.WatermarkConfig{
-		Enabled: true, Type: domain.WatermarkTypeImage, ImagePath: "/img/logo.png",
+		Enabled: true, Type: domain.WatermarkTypeImage, ImagePath: testImgLogo,
 		Position: domain.WatermarkCustom, X: "100", Y: "200", Opacity: 1,
 	}
-	got := applyWatermark("scale=1920:1080", wm, false)
+	got := applyWatermark("scale=1920:1080", wm, false, noResizeScale)
 	if !strings.Contains(got, "x='100'") || !strings.Contains(got, "y='200'") {
 		t.Errorf("custom coords not in overlay: %q", got)
 	}
@@ -287,7 +297,7 @@ func TestDefaultExprFallbackToZero(t *testing.T) {
 		Position: domain.WatermarkCustom,
 		X:        "  ", // blank → "0"
 	}
-	got := applyWatermark("", wm, false)
+	got := applyWatermark("", wm, false, noResizeScale)
 	if !strings.Contains(got, "x='0'") {
 		t.Errorf("blank custom x should default to 0: %q", got)
 	}
@@ -327,9 +337,54 @@ func TestApplyWatermarkEmptyBase(t *testing.T) {
 	wm := &domain.WatermarkConfig{
 		Enabled: true, Type: domain.WatermarkTypeText, Text: "TAG",
 	}
-	got := applyWatermark("", wm, false)
+	got := applyWatermark("", wm, false, noResizeScale)
 	if !strings.HasPrefix(got, "drawtext=") {
 		t.Errorf("empty base should start with drawtext, got %q", got)
+	}
+}
+
+// TestComputeWatermarkFrameScale covers reference-profile detection across
+// the ladder: largest profile gets 1.0, smaller profiles get their proportional
+// shrink, and degenerate cases (single profile, zero widths) fall back to 1.0.
+func TestComputeWatermarkFrameScale(t *testing.T) {
+	ladder := []domain.VideoProfile{
+		{Width: 1920, Height: 1080},
+		{Width: 1280, Height: 720},
+		{Width: 854, Height: 480},
+	}
+	cases := map[string]struct {
+		profileWidth int
+		want         float64
+	}{
+		"largest":      {1920, 1.0},
+		"720p ratio":   {1280, 1280.0 / 1920.0},
+		"480p ratio":   {854, 854.0 / 1920.0},
+		"unknown size": {0, 1.0},
+	}
+	for name, c := range cases {
+		got := computeWatermarkFrameScale(c.profileWidth, ladder)
+		if got != c.want {
+			t.Errorf("%s: got %v, want %v", name, got, c.want)
+		}
+	}
+}
+
+// TestComputeWatermarkFrameScaleDegenerateLadders covers the edge cases
+// where a sensible reference can't be picked.
+func TestComputeWatermarkFrameScaleDegenerateLadders(t *testing.T) {
+	cases := map[string]struct {
+		ladder []domain.VideoProfile
+		want   float64
+	}{
+		"empty":      {nil, 1.0},
+		"all zero":   {[]domain.VideoProfile{{}, {}}, 1.0},
+		"single fix": {[]domain.VideoProfile{{Width: 1280}}, 1.0},
+	}
+	for name, c := range cases {
+		got := computeWatermarkFrameScale(1280, c.ladder)
+		if got != c.want {
+			t.Errorf("%s: got %v, want %v", name, got, c.want)
+		}
 	}
 }
 
@@ -378,6 +433,86 @@ func TestBuildMultiOutputArgsAppliesWatermarkPerOutput(t *testing.T) {
 	}
 	if count != 2 {
 		t.Errorf("expected watermark on 2 outputs, got %d", count)
+	}
+}
+
+// TestBuildMultiOutputArgsResizesPerOutput verifies the reference-frame
+// model wires correctly through both transcode modes: in multi-output mode,
+// the smaller profile's -vf:v:0 chain must include scale=iw*<f>:ih*<f> while
+// the largest profile's chain must NOT (it's the reference).
+func TestBuildMultiOutputArgsResizesPerOutput(t *testing.T) {
+	tc := &domain.TranscoderConfig{
+		Watermark: &domain.WatermarkConfig{
+			Enabled: true, Type: domain.WatermarkTypeImage,
+			ImagePath: testImgLogo, Position: domain.WatermarkTopRight, Resize: true,
+		},
+		Video: domain.VideoTranscodeConfig{
+			Profiles: []domain.VideoProfile{
+				{Width: 1920, Height: 1080},
+				{Width: 1280, Height: 720},
+			},
+		},
+	}
+	args, err := buildMultiOutputArgs([]Profile{
+		{Width: 1920, Height: 1080, Bitrate: "4500k"},
+		{Width: 1280, Height: 720, Bitrate: "2500k"},
+	}, tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var refChain, smallerChain string
+	seen := 0
+	for i, a := range args {
+		if a == "-vf:v:0" && i+1 < len(args) {
+			if seen == 0 {
+				refChain = args[i+1]
+			} else {
+				smallerChain = args[i+1]
+			}
+			seen++
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("expected 2 -vf:v:0 chains, got %d", seen)
+	}
+
+	if strings.Contains(refChain, testScaleIWFactor) {
+		t.Errorf("reference profile (1080p) must NOT carry movie-chain scale: %s", refChain)
+	}
+	if !strings.Contains(smallerChain, test720pScaleChain) {
+		t.Errorf("smaller profile (720p) should carry scale=iw*0.6667:ih*0.6667, got: %s", smallerChain)
+	}
+}
+
+// TestBuildFFmpegArgsResizesAgainstLadder mirrors the multi-output test
+// but for legacy single-output mode: each ffmpeg subprocess gets a single
+// profile but the frame-scale calculation should still consult the full
+// ladder (tc.Video.Profiles) so the smaller profile shrinks correctly.
+func TestBuildFFmpegArgsResizesAgainstLadder(t *testing.T) {
+	tc := &domain.TranscoderConfig{
+		Watermark: &domain.WatermarkConfig{
+			Enabled: true, Type: domain.WatermarkTypeImage,
+			ImagePath: testImgLogo, Position: domain.WatermarkTopRight, Resize: true,
+		},
+		Video: domain.VideoTranscodeConfig{
+			Profiles: []domain.VideoProfile{
+				{Width: 1920, Height: 1080},
+				{Width: 1280, Height: 720},
+			},
+		},
+	}
+	// Building args for the SMALLER profile (single-output ffmpeg per profile).
+	args, err := buildFFmpegArgs([]Profile{{Width: 1280, Height: 720, Bitrate: "2500k"}}, tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vf, ok := readFlagValue(args, "-vf")
+	if !ok {
+		t.Fatal("no -vf in args")
+	}
+	if !strings.Contains(vf, test720pScaleChain) {
+		t.Errorf("legacy mode smaller profile should carry scale=iw*0.6667:ih*0.6667, got: %s", vf)
 	}
 }
 

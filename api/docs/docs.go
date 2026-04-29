@@ -3579,12 +3579,8 @@ const docTemplate = `{
                     ]
                 },
                 "resize": {
-                    "description": "Resize, when true, scales the watermark proportionally to each output\nrendition's frame dimensions so a single asset looks visually consistent\nacross an ABR ladder (e.g. 720p and 480p outputs render the watermark at\nthe same on-screen ratio). When false (default), the watermark uses its\nnative pixel size — drawtext FontSize as-is, image asset at file\ndimensions — which makes it appear larger on lower-resolution profiles.\n\nImage: applied via scale2ref so the overlay scales relative to main\n       frame width (ResizeRatio fraction of frame width).\nText:  fontsize replaced with h*ResizeRatio so glyphs scale with frame height.",
+                    "description": "Resize, when true, makes the watermark render at a consistent on-screen\nratio across every rendition in an ABR ladder. The largest profile\nrenders the asset at its NATIVE pixel size (operators design at the top\nrendition); smaller profiles shrink the asset by the ratio of their\nwidth to the largest profile's width. Pixel-scale fields (FontSize for\ntext, OffsetX/OffsetY for both) shrink with the same factor so corner\npadding and glyph height stay visually proportional.\n\nWhen false (default), the watermark uses native pixel dimensions and\nfixed offsets on every profile — appearing larger on lower-resolution\nrenditions because they cover fewer pixels of frame.",
                     "type": "boolean"
-                },
-                "resize_ratio": {
-                    "description": "ResizeRatio sets the watermark size as a fraction of the frame's\nreference dimension when Resize=true. Image uses frame width as\nreference, text uses frame height. Range (0, 1]; 0 = inherit the\nper-server default (DefaultWatermarkResizeRatio). Ignored when\nResize=false.\n\nPer-stream — each WatermarkConfig may pick its own ratio so a station\nlogo (~5%) and a sponsor banner (~20%) on different streams coexist\nwithout a global setting.",
-                    "type": "number"
                 },
                 "text": {
                     "description": "Text is the string to render. Supports strftime directives for live timestamps.\nE.g. \"LIVE %{localtime:%H:%M:%S}\"",
@@ -3798,15 +3794,6 @@ const docTemplate = `{
                                     "$ref": "#/definitions/domain.ResizeMode"
                                 }
                             }
-                        }
-                    }
-                },
-                "watermark": {
-                    "description": "Watermark surfaces the per-server defaults the transcoder applies\nwhen a stream's WatermarkConfig leaves a field empty / zero. UI\nreads ResizeRatio to render the \"server default\" placeholder on the\nresize_ratio input — falling back to this value when the operator\nleaves the field blank.",
-                    "type": "object",
-                    "properties": {
-                        "resize_ratio": {
-                            "type": "number"
                         }
                     }
                 }

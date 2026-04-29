@@ -1510,29 +1510,18 @@ definitions:
               time-aware fades ("if(gt(t,5),10,-100)") all work.
       resize:
         description: |-
-          Resize, when true, scales the watermark proportionally to each output
-          rendition's frame dimensions so a single asset looks visually consistent
-          across an ABR ladder (e.g. 720p and 480p outputs render the watermark at
-          the same on-screen ratio). When false (default), the watermark uses its
-          native pixel size — drawtext FontSize as-is, image asset at file
-          dimensions — which makes it appear larger on lower-resolution profiles.
+          Resize, when true, makes the watermark render at a consistent on-screen
+          ratio across every rendition in an ABR ladder. The largest profile
+          renders the asset at its NATIVE pixel size (operators design at the top
+          rendition); smaller profiles shrink the asset by the ratio of their
+          width to the largest profile's width. Pixel-scale fields (FontSize for
+          text, OffsetX/OffsetY for both) shrink with the same factor so corner
+          padding and glyph height stay visually proportional.
 
-          Image: applied via scale2ref so the overlay scales relative to main
-                 frame width (ResizeRatio fraction of frame width).
-          Text:  fontsize replaced with h*ResizeRatio so glyphs scale with frame height.
+          When false (default), the watermark uses native pixel dimensions and
+          fixed offsets on every profile — appearing larger on lower-resolution
+          renditions because they cover fewer pixels of frame.
         type: boolean
-      resize_ratio:
-        description: |-
-          ResizeRatio sets the watermark size as a fraction of the frame's
-          reference dimension when Resize=true. Image uses frame width as
-          reference, text uses frame height. Range (0, 1]; 0 = inherit the
-          per-server default (DefaultWatermarkResizeRatio). Ignored when
-          Resize=false.
-
-          Per-stream — each WatermarkConfig may pick its own ratio so a station
-          logo (~5%) and a sponsor banner (~20%) on different streams coexist
-          without a global setting.
-        type: number
       text:
         description: |-
           Text is the string to render. Supports strftime directives for live timestamps.
@@ -1696,17 +1685,6 @@ definitions:
               resize_mode:
                 $ref: '#/definitions/domain.ResizeMode'
             type: object
-        type: object
-      watermark:
-        description: |-
-          Watermark surfaces the per-server defaults the transcoder applies
-          when a stream's WatermarkConfig leaves a field empty / zero. UI
-          reads ResizeRatio to render the "server default" placeholder on the
-          resize_ratio input — falling back to this value when the operator
-          leaves the field blank.
-        properties:
-          resize_ratio:
-            type: number
         type: object
     type: object
   handler.listenerDefaults:

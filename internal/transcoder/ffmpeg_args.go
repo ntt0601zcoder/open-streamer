@@ -282,7 +282,36 @@ func buildVideoFilter(p Profile, tc *domain.TranscoderConfig, encoder string) st
 		chain = append(chain, "setsar="+p.SAR)
 	}
 	base := strings.Join(chain, ",")
-	return applyWatermark(base, tc.Watermark, onGPU)
+
+	// frameScale is the watermark sizing factor for this profile relative to
+	// the largest profile in the ladder. The largest profile gets factor=1.0
+	// (watermark renders at native pixel size — operators design at the top
+	// rendition); smaller profiles shrink everything proportionally so the
+	// logo lands at the same on-screen ratio regardless of which rendition
+	// the viewer plays. Returns 1.0 when sizing can't be determined (single
+	// profile, or all widths zero) — callers fall through to native size.
+	frameScale := computeWatermarkFrameScale(p.Width, tc.Video.Profiles)
+	return applyWatermark(base, tc.Watermark, onGPU, frameScale)
+}
+
+// computeWatermarkFrameScale returns this profile's width as a fraction of
+// the widest profile's width. Profiles with Width<=0 (source-matched) are
+// excluded from the reference comparison because their effective dimensions
+// aren't known at filter-graph build time.
+func computeWatermarkFrameScale(profileWidth int, ladder []domain.VideoProfile) float64 {
+	if profileWidth <= 0 {
+		return 1.0
+	}
+	maxWidth := 0
+	for _, p := range ladder {
+		if p.Width > maxWidth {
+			maxWidth = p.Width
+		}
+	}
+	if maxWidth <= 0 || maxWidth == profileWidth {
+		return 1.0
+	}
+	return float64(profileWidth) / float64(maxWidth)
 }
 
 // buildScaleFilter remains the simple resize entry point. Defaults to ResizeModePad.
