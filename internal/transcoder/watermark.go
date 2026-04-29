@@ -129,34 +129,45 @@ func appendImageWatermark(base string, r *domain.WatermarkConfig, onGPU bool) st
 	srcChain := strings.Join(srcParts, ",") + "[wm]"
 
 	x, y := resolveImageCoords(r)
-	overlay := fmt.Sprintf("[mid][wm]overlay=x=%s:y=%s", ffmpegQuote(x), ffmpegQuote(y))
+
+	// Resize=false: overlay consumes original [mid] + [wm] from leading and
+	// movie chains directly. No scale step in between.
+	if !r.Resize {
+		overlay := fmt.Sprintf("[mid][wm]overlay=x=%s:y=%s", ffmpegQuote(x), ffmpegQuote(y))
+		if onGPU {
+			overlay += ",hwupload_cuda"
+		}
+		return leading + ";" + srcChain + ";" + overlay
+	}
+
+	// Resize=true: insert a scale2ref chain that resizes the watermark
+	// proportionally to the main frame width before overlay.
+	//
+	// scale2ref takes [scale_target][reference] and emits two outputs:
+	// the scaled target plus an unchanged passthrough of the reference.
+	// We use DISTINCT output labels [wms]/[mids] (rather than reusing
+	// [wm]/[mid]) — some libavfilter builds reject "label defined twice"
+	// when the same name appears as both the consumer of one chain and
+	// the producer of the next, which manifests as the overlay silently
+	// dropping the watermark image.
+	//
+	// Width: `main_w*ratio` — FFmpeg exposes main_w as the reference
+	// (second input) width inside scale2ref expressions.
+	// Height: `main_w*ratio*ih/iw` — preserves watermark aspect ratio.
+	// We deliberately AVOID `ow/iw*ih` because `ow` is the just-computed
+	// output width and its availability inside the height expression
+	// varies across FFmpeg versions; the form below uses only inputs
+	// (main_w from the reference, iw/ih from the watermark) which every
+	// libavfilter build evaluates reliably.
+	wExpr := fmt.Sprintf("main_w*%.4f", r.ResizeRatio)
+	hExpr := fmt.Sprintf("main_w*%.4f*ih/iw", r.ResizeRatio)
+	scaleChain := fmt.Sprintf("[wm][mid]scale2ref=w=%s:h=%s[wms][mids]", wExpr, hExpr)
+
+	overlay := fmt.Sprintf("[mids][wms]overlay=x=%s:y=%s", ffmpegQuote(x), ffmpegQuote(y))
 	if onGPU {
 		overlay += ",hwupload_cuda"
 	}
-
-	// Two-chain default; insert a scale2ref chain between source and overlay
-	// when proportional resize is on.
-	//
-	// scale2ref takes [scale_target][reference] and emits [scaled][reference].
-	// We pass [wm][mid] so the watermark gets scaled while [mid] passes
-	// through unchanged, then feed both into the overlay below.
-	//
-	// Width expression `main_w*ratio` reads main video width from the
-	// reference (FFmpeg exposes main_w / main_h inside scale2ref expressions).
-	// Height `ow/iw*ih` keeps the watermark's original aspect ratio: target
-	// height = (target_width / source_width) * source_height — using `ow`/`iw`
-	// avoids a divide-by-zero edge that `-1` triggers on some libavfilter
-	// builds when the source is non-square-pixel.
-	if r.Resize {
-		scaleChain := fmt.Sprintf(
-			"[wm][mid]scale2ref=%s:%s[wm][mid]",
-			ffmpegQuote(fmt.Sprintf("main_w*%.4f", r.ResizeRatio)),
-			ffmpegQuote("ow/iw*ih"),
-		)
-		return leading + ";" + srcChain + ";" + scaleChain + ";" + overlay
-	}
-
-	return leading + ";" + srcChain + ";" + overlay
+	return leading + ";" + srcChain + ";" + scaleChain + ";" + overlay
 }
 
 // resolveTextCoords picks the drawtext coordinate expressions for the given

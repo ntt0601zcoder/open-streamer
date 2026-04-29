@@ -13,8 +13,11 @@ import (
 const testBaseChain = "scale=1280:720"
 
 // TestApplyImageWatermarkResize verifies the scale2ref chain is injected
-// only when Resize=true, and that the width expression references main_w
-// (not the watermark's own iw — that bug would produce wrong sizing).
+// only when Resize=true, that the width references main_w (not the
+// watermark's own iw — that mistake would produce wrong sizing), and
+// crucially that the scale2ref outputs use DISTINCT labels from its inputs
+// — some libavfilter builds silently drop the overlay when scale2ref
+// reuses [wm][mid] for both consumption and production.
 func TestApplyImageWatermarkResize(t *testing.T) {
 	base := testBaseChain + ",setsar=1"
 	wm := &domain.WatermarkConfig{
@@ -27,14 +30,23 @@ func TestApplyImageWatermarkResize(t *testing.T) {
 	got := applyWatermark(base, wm.Resolved(), false)
 
 	for _, frag := range []string{
-		"scale2ref=",
-		"main_w*",
-		"ow/iw*ih",
-		"[wm][mid]",
+		"scale2ref=w=main_w*",
+		":h=main_w*",
+		"*ih/iw",              // aspect-preserving height using only input variables
+		"[wms]",               // distinct scaled-watermark label
+		"[mids]",              // distinct passthrough-main label
+		"[mids][wms]overlay=", // overlay consumes the post-scale labels
 	} {
 		if !strings.Contains(got, frag) {
 			t.Fatalf("expected %q in resize chain, got: %s", frag, got)
 		}
+	}
+
+	// Must NOT regress to label-reuse pattern.
+	if strings.Contains(got, "scale2ref=") && strings.Contains(got, "[wm][mid]scale2ref") &&
+		strings.Contains(got, "scale2ref=") && strings.HasSuffix(got[strings.Index(got, "scale2ref"):],
+		"[wm][mid]") {
+		t.Fatalf("scale2ref must not reuse [wm][mid] as outputs: %s", got)
 	}
 
 	// Resize=false → scale2ref must NOT appear.
