@@ -2590,6 +2590,8 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
+                "session.opened",
+                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2605,9 +2607,7 @@ const docTemplate = `{
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error",
-                "session.opened",
-                "session.closed"
+                "transcoder.error"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2617,6 +2617,8 @@ const docTemplate = `{
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
+                "",
+                "",
                 "",
                 "",
                 "",
@@ -2632,11 +2634,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
-                "",
-                "",
                 ""
             ],
             "x-enum-varnames": [
+                "EventSessionOpened",
+                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2652,9 +2654,7 @@ const docTemplate = `{
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError",
-                "EventSessionOpened",
-                "EventSessionClosed"
+                "EventTranscoderError"
             ]
         },
         "domain.GlobalConfig": {
@@ -2897,6 +2897,40 @@ const docTemplate = `{
                 "InterlaceTopField",
                 "InterlaceBottomField",
                 "InterlaceProgressive"
+            ]
+        },
+        "domain.MediaTrackInfo": {
+            "type": "object",
+            "properties": {
+                "bitrate_kbps": {
+                    "type": "integer"
+                },
+                "codec": {
+                    "description": "\"h264\" | \"h265\" | \"aac\"",
+                    "type": "string"
+                },
+                "height": {
+                    "description": "video only",
+                    "type": "integer"
+                },
+                "kind": {
+                    "$ref": "#/definitions/domain.MediaTrackKind"
+                },
+                "width": {
+                    "description": "video only",
+                    "type": "integer"
+                }
+            }
+        },
+        "domain.MediaTrackKind": {
+            "type": "string",
+            "enum": [
+                "video",
+                "audio"
+            ],
+            "x-enum-varnames": [
+                "MediaTrackVideo",
+                "MediaTrackAudio"
             ]
         },
         "domain.OutputProtocols": {
@@ -3829,7 +3863,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "bitrate_kbps": {
-                    "type": "number"
+                    "type": "integer"
                 },
                 "errors": {
                     "type": "array",
@@ -3848,6 +3882,35 @@ const docTemplate = `{
                 },
                 "status": {
                     "$ref": "#/definitions/domain.StreamStatus"
+                },
+                "tracks": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.MediaTrackInfo"
+                    }
+                }
+            }
+        },
+        "manager.MediaSummary": {
+            "type": "object",
+            "properties": {
+                "input_bitrate_kbps": {
+                    "type": "integer"
+                },
+                "inputs": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.MediaTrackInfo"
+                    }
+                },
+                "output_bitrate_kbps": {
+                    "type": "integer"
+                },
+                "outputs": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.MediaTrackInfo"
+                    }
                 }
             }
         },
@@ -3865,6 +3928,14 @@ const docTemplate = `{
                     "items": {
                         "$ref": "#/definitions/manager.InputHealthSnapshot"
                     }
+                },
+                "media": {
+                    "description": "Media is the UI-friendly summary of the current input → output track\nshape (what the dashboard renders as \"Input media info / Output media\ninfo / 954kbit/s -\u003e 2577kbit/s\"). Populated by the API handler — the\nmanager doesn't know the output config.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/manager.MediaSummary"
+                        }
+                    ]
                 },
                 "override_input_priority": {
                     "type": "integer"

@@ -104,6 +104,12 @@ func (f *fakeIngestor) SetInputErrorObserver(fn func(domain.StreamCode, int, err
 	f.onErr.Store(&fn)
 }
 
+// SetMediaPacketObserver is satisfied for the ingestorDep interface but
+// unused by manager unit tests (no media packets are synthesized).
+func (f *fakeIngestor) SetMediaPacketObserver(_ func(domain.StreamCode, int, *domain.AVPacket)) {
+	// no-op: see method comment.
+}
+
 // startCallsCopy returns a snapshot of recorded Start calls; safe for
 // concurrent reads while the manager continues to mutate state.
 func (f *fakeIngestor) startCallsCopy() []startCall {

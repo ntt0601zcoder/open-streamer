@@ -49,13 +49,18 @@ const (
 )
 
 // InputHealth tracks the runtime health of one input source.
-// All mutable fields are protected by the parent streamState.mu.
+// All mutable fields are protected by the parent streamState.mu, EXCEPT
+// `tracks` which has its own internal mutex so the per-packet hot path can
+// update without contending on the broader state lock.
 type InputHealth struct {
 	Input        domain.Input
 	LastPacketAt time.Time
-	Bitrate      float64 // kbps (reserved for future bitrate estimator)
 	PacketLoss   float64 // percent (reserved)
 	Status       domain.StreamStatus
+	// tracks accumulates per-codec byte / SPS info for the runtime "input
+	// media info" panel. Snapshot via tracks.snapshot() / totalBitrateKbps()
+	// — it has its own mutex so packet observers stay off state.mu.
+	tracks *inputTrackStats
 	// Errors is a bounded rolling history (newest at index 0, max maxInputErrorHistory).
 	// Persists for the lifetime of the manager registration — cleared only when
 	// the stream pipeline is stopped/restarted (Unregister drops the whole state).
@@ -202,6 +207,22 @@ type RuntimeStatus struct {
 	Switches   []SwitchEvent             `json:"switches,omitempty"`
 	Transcoder *transcoder.RuntimeStatus `json:"transcoder,omitempty"`
 	Publisher  *publisher.RuntimeStatus  `json:"publisher,omitempty"`
+
+	// Media is the UI-friendly summary of the current input → output track
+	// shape (what the dashboard renders as "Input media info / Output media
+	// info / 954kbit/s -> 2577kbit/s"). Populated by the API handler — the
+	// manager doesn't know the output config.
+	Media *MediaSummary `json:"media,omitempty"`
+}
+
+// MediaSummary aggregates the input + output media-track info for one stream.
+// Numbers are convenience aggregates over Inputs/Outputs and may be
+// recomputed by clients if they want different rounding.
+type MediaSummary struct {
+	InputBitrateKbps  int                     `json:"input_bitrate_kbps"`
+	OutputBitrateKbps int                     `json:"output_bitrate_kbps"`
+	Inputs            []domain.MediaTrackInfo `json:"inputs,omitempty"`
+	Outputs           []domain.MediaTrackInfo `json:"outputs,omitempty"`
 }
 
 // InputHealthSnapshot is a serialisable copy of one input's health.
@@ -210,13 +231,18 @@ type RuntimeStatus struct {
 // History persists for the lifetime of the manager registration and is only
 // cleared when the stream pipeline is stopped. Frontend should treat each
 // message as a diagnostic string, not a code.
+//
+// BitrateKbps is the aggregate input bitrate (sum of per-codec track bitrates).
+// Tracks lists each detected elementary stream (codec, resolution, kbps) and is
+// nil/empty until the first AVPackets arrive.
 type InputHealthSnapshot struct {
-	InputPriority int                 `json:"input_priority"`
-	LastPacketAt  time.Time           `json:"last_packet_at"`
-	BitrateKbps   float64             `json:"bitrate_kbps"`
-	PacketLoss    float64             `json:"packet_loss"`
-	Status        domain.StreamStatus `json:"status"`
-	Errors        []domain.ErrorEntry `json:"errors,omitempty"`
+	InputPriority int                     `json:"input_priority"`
+	LastPacketAt  time.Time               `json:"last_packet_at"`
+	BitrateKbps   int                     `json:"bitrate_kbps"`
+	PacketLoss    float64                 `json:"packet_loss"`
+	Status        domain.StreamStatus     `json:"status"`
+	Tracks        []domain.MediaTrackInfo `json:"tracks,omitempty"`
+	Errors        []domain.ErrorEntry     `json:"errors,omitempty"`
 }
 
 // probeTask carries the arguments for a background probe goroutine.
@@ -236,6 +262,7 @@ type ingestorDep interface {
 	Probe(ctx context.Context, input domain.Input) error
 	SetPacketObserver(fn func(streamID domain.StreamCode, inputPriority int))
 	SetInputErrorObserver(fn func(streamID domain.StreamCode, inputPriority int, err error))
+	SetMediaPacketObserver(fn func(streamID domain.StreamCode, inputPriority int, p *domain.AVPacket))
 	Stop(streamID domain.StreamCode)
 }
 
@@ -286,6 +313,7 @@ func NewForTesting(bus events.Bus, ing ingestorDep, m *metrics.Metrics, packetTi
 	}
 	ing.SetPacketObserver(svc.RecordPacket)
 	ing.SetInputErrorObserver(svc.ReportInputError)
+	ing.SetMediaPacketObserver(svc.RecordMediaPacket)
 	return svc
 }
 
@@ -308,6 +336,7 @@ func New(i do.Injector) (*Service, error) {
 	}
 	ing.SetPacketObserver(svc.RecordPacket)
 	ing.SetInputErrorObserver(svc.ReportInputError)
+	ing.SetMediaPacketObserver(svc.RecordMediaPacket)
 	return svc, nil
 }
 
@@ -332,6 +361,7 @@ func (s *Service) Register(ctx context.Context, stream *domain.Stream, bufferWri
 		state.inputs[inp.Priority] = &InputHealth{
 			Input:  inp,
 			Status: domain.StatusIdle,
+			tracks: newInputTrackStats(),
 		}
 	}
 
@@ -440,9 +470,14 @@ func (s *Service) RuntimeStatus(streamID domain.StreamCode) (RuntimeStatus, bool
 		snap := InputHealthSnapshot{
 			InputPriority: h.Input.Priority,
 			LastPacketAt:  h.LastPacketAt,
-			BitrateKbps:   h.Bitrate,
 			PacketLoss:    h.PacketLoss,
 			Status:        h.Status,
+		}
+		if h.tracks != nil {
+			// Snapshot is taken under tracks.mu; safe to release state.mu
+			// — tracks struct has its own lifetime tied to the InputHealth.
+			snap.Tracks = h.tracks.snapshot()
+			snap.BitrateKbps = h.tracks.totalBitrateKbps()
 		}
 		if len(h.Errors) > 0 {
 			// Defensive copy — caller must not see future mutations under state.mu.
@@ -452,6 +487,34 @@ func (s *Service) RuntimeStatus(streamID domain.StreamCode) (RuntimeStatus, bool
 		out.Inputs = append(out.Inputs, snap)
 	}
 	return out, true
+}
+
+// RecordMediaPacket folds one decoded AVPacket into the per-input track
+// stats (codec-bucketed bitrate, SPS-derived resolution). Hot path: one
+// map lookup + one int add per packet, plus an SPS parse on the first
+// keyframe of each codec.
+//
+// Skips silently when the stream is unknown (typical on race between
+// teardown and a still-flushing reader). Does NOT update LastPacketAt /
+// Status — those live in RecordPacket which the ingestor already calls
+// per packet.
+func (s *Service) RecordMediaPacket(streamID domain.StreamCode, inputPriority int, p *domain.AVPacket) {
+	if p == nil {
+		return
+	}
+	s.mu.RLock()
+	state, ok := s.streams[streamID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	state.mu.Lock()
+	h, found := state.inputs[inputPriority]
+	state.mu.Unlock()
+	if !found || h.tracks == nil {
+		return
+	}
+	h.tracks.observe(p, time.Now())
 }
 
 // RecordPacket updates the last-seen timestamp for an input.
@@ -958,6 +1021,7 @@ func (s *Service) UpdateInputs(
 		state.inputs[inp.Priority] = &InputHealth{
 			Input:  inp,
 			Status: domain.StatusIdle,
+			tracks: newInputTrackStats(),
 		}
 		if inp.Priority < state.active && failoverReason == "" {
 			failoverReason = SwitchReasonInputAdded

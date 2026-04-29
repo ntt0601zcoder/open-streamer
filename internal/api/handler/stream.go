@@ -74,7 +74,52 @@ func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
 		// stable for clients regardless of pipeline state.
 		rt.Inputs = []manager.InputHealthSnapshot{}
 	}
+	rt.Media = buildMediaSummary(s, rt.Inputs, rt.ActiveInputPriority)
 	return streamResponse{Stream: s, Runtime: rt}
+}
+
+// buildMediaSummary derives the runtime media envelope (UI panel data) from
+// the stream config + observed input snapshots. Output tracks come from the
+// persisted transcoder config; when the stream isn't transcoding (Transcoder
+// == nil), output mirrors input — that's the actual on-wire shape because
+// the publisher just re-muxes the active input's elementary streams.
+func buildMediaSummary(
+	s *domain.Stream,
+	inputs []manager.InputHealthSnapshot,
+	activePriority int,
+) *manager.MediaSummary {
+	out := &manager.MediaSummary{}
+
+	// Input tracks come from the currently-active input. Falls back to the
+	// first available snapshot when the active priority isn't yet set
+	// (StatusIdle, just after Register).
+	var active *manager.InputHealthSnapshot
+	for i := range inputs {
+		if inputs[i].InputPriority == activePriority {
+			active = &inputs[i]
+			break
+		}
+	}
+	if active == nil && len(inputs) > 0 {
+		active = &inputs[0]
+	}
+	if active != nil {
+		out.Inputs = active.Tracks
+		out.InputBitrateKbps = active.BitrateKbps
+	}
+
+	// Output tracks come from the persisted transcoder config. No transcode
+	// → output is whatever the publisher re-muxes, which is exactly the
+	// active input's tracks (single video PID + single audio PID — see
+	// tsmux.FromAV semantics).
+	if s.Transcoder != nil {
+		out.Outputs = domain.OutputTracks(s.Transcoder)
+		out.OutputBitrateKbps = domain.AggregateBitrateKbps(out.Outputs)
+	} else {
+		out.Outputs = out.Inputs
+		out.OutputBitrateKbps = out.InputBitrateKbps
+	}
+	return out
 }
 
 // NewStreamHandler creates a StreamHandler and registers it with the DI injector.

@@ -627,6 +627,8 @@ definitions:
     type: object
   domain.EventType:
     enum:
+    - session.opened
+    - session.closed
     - stream.created
     - stream.started
     - stream.stopped
@@ -643,8 +645,6 @@ definitions:
     - transcoder.started
     - transcoder.stopped
     - transcoder.error
-    - session.opened
-    - session.closed
     type: string
     x-enum-comments:
       EventInputConnected: source connected successfully
@@ -653,6 +653,8 @@ definitions:
       EventInputFailover: switched to lower-priority input
       EventInputReconnecting: transient error, retrying
     x-enum-descriptions:
+    - ""
+    - ""
     - ""
     - ""
     - ""
@@ -669,9 +671,9 @@ definitions:
     - ""
     - ""
     - ""
-    - ""
-    - ""
     x-enum-varnames:
+    - EventSessionOpened
+    - EventSessionClosed
     - EventStreamCreated
     - EventStreamStarted
     - EventStreamStopped
@@ -688,8 +690,6 @@ definitions:
     - EventTranscoderStarted
     - EventTranscoderStopped
     - EventTranscoderError
-    - EventSessionOpened
-    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:
@@ -913,6 +913,30 @@ definitions:
     - InterlaceTopField
     - InterlaceBottomField
     - InterlaceProgressive
+  domain.MediaTrackInfo:
+    properties:
+      bitrate_kbps:
+        type: integer
+      codec:
+        description: '"h264" | "h265" | "aac"'
+        type: string
+      height:
+        description: video only
+        type: integer
+      kind:
+        $ref: '#/definitions/domain.MediaTrackKind'
+      width:
+        description: video only
+        type: integer
+    type: object
+  domain.MediaTrackKind:
+    enum:
+    - video
+    - audio
+    type: string
+    x-enum-varnames:
+    - MediaTrackVideo
+    - MediaTrackAudio
   domain.OutputProtocols:
     properties:
       dash:
@@ -1693,7 +1717,7 @@ definitions:
   manager.InputHealthSnapshot:
     properties:
       bitrate_kbps:
-        type: number
+        type: integer
       errors:
         items:
           $ref: '#/definitions/domain.ErrorEntry'
@@ -1706,6 +1730,25 @@ definitions:
         type: number
       status:
         $ref: '#/definitions/domain.StreamStatus'
+      tracks:
+        items:
+          $ref: '#/definitions/domain.MediaTrackInfo'
+        type: array
+    type: object
+  manager.MediaSummary:
+    properties:
+      input_bitrate_kbps:
+        type: integer
+      inputs:
+        items:
+          $ref: '#/definitions/domain.MediaTrackInfo'
+        type: array
+      output_bitrate_kbps:
+        type: integer
+      outputs:
+        items:
+          $ref: '#/definitions/domain.MediaTrackInfo'
+        type: array
     type: object
   manager.RuntimeStatus:
     properties:
@@ -1717,6 +1760,14 @@ definitions:
         items:
           $ref: '#/definitions/manager.InputHealthSnapshot'
         type: array
+      media:
+        allOf:
+        - $ref: '#/definitions/manager.MediaSummary'
+        description: |-
+          Media is the UI-friendly summary of the current input → output track
+          shape (what the dashboard renders as "Input media info / Output media
+          info / 954kbit/s -> 2577kbit/s"). Populated by the API handler — the
+          manager doesn't know the output config.
       override_input_priority:
         type: integer
       pipeline_active:

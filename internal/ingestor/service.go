@@ -52,6 +52,7 @@ type Service struct {
 	vods         *vod.Registry
 	onPacket     func(streamID domain.StreamCode, inputPriority int)
 	onInputError func(streamID domain.StreamCode, inputPriority int, err error)
+	onMedia      func(streamID domain.StreamCode, inputPriority int, p *domain.AVPacket)
 	// streamLookup resolves an upstream stream by code; used by the
 	// `copy://` reader to find the upstream's main buffer ID. Set via
 	// SetStreamLookup after the store is wired in main.go (avoids a
@@ -97,6 +98,16 @@ func (s *Service) SetInputErrorObserver(fn func(streamID domain.StreamCode, inpu
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onInputError = fn
+}
+
+// SetMediaPacketObserver configures a callback invoked once per AVPacket
+// (after demux). Used by the manager to track per-track codec, bitrate and
+// resolution for the runtime "input media info" panel. Hot path — the
+// callback should be allocation-free; avoid retaining p.Data across calls.
+func (s *Service) SetMediaPacketObserver(fn func(streamID domain.StreamCode, inputPriority int, p *domain.AVPacket)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onMedia = fn
 }
 
 // SetStreamLookup wires the upstream-stream resolver used by `copy://`
@@ -265,6 +276,7 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 		cb := pullWorkerCallbacks{
 			onPacket:     s.onPacket,
 			onInputError: s.onInputError,
+			onMedia:      s.onMedia,
 			onConnect: func(id domain.StreamCode, priority int) { //nolint:contextcheck // workerCtx is cancelled on stop; publish must outlive it
 				s.bus.Publish(context.Background(), domain.Event{
 					Type:       domain.EventInputConnected,

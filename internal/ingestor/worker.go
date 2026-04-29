@@ -30,6 +30,7 @@ type pullWorkerCallbacks struct {
 	onConnect     func(streamID domain.StreamCode, inputPriority int)
 	onReconnect   func(streamID domain.StreamCode, inputPriority int, err error)
 	onPacketBytes func(streamID domain.StreamCode, inputPriority, bytes int)
+	onMedia       func(streamID domain.StreamCode, inputPriority int, p *domain.AVPacket)
 	// onHandoff is called exactly once, after the very first successful Open.
 	// It is used by startPullWorker to cancel the previous source worker only after
 	// the new source has connected — eliminating the buffer gap during source transitions.
@@ -213,6 +214,13 @@ func readLoop(
 			}
 			if cb != nil && cb.onPacketBytes != nil {
 				cb.onPacketBytes(streamID, input.Priority, len(p.Data))
+			}
+			if cb != nil && cb.onMedia != nil {
+				// Pass the local p (post-clone-into-buffer) — observer must
+				// not retain p.Data; if it needs persisted bytes (e.g. SPS
+				// extracted on a keyframe) it should copy them out itself.
+				pCopy := p
+				cb.onMedia(streamID, input.Priority, &pCopy)
 			}
 		}
 	}
