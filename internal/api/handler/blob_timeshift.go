@@ -9,9 +9,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/samber/do/v2"
 
-	"github.com/datvietvac-techhub/open-streamer/internal/domain"
-	"github.com/datvietvac-techhub/open-streamer/internal/dvr/blob"
-	"github.com/datvietvac-techhub/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/dvr/blob"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
 )
 
 // BlobTimeshiftHandler serves CMAF blob-archive timeshift: the multivariant

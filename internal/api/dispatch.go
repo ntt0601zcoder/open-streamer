@@ -6,9 +6,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/datvietvac-techhub/open-streamer/internal/domain"
-	"github.com/datvietvac-techhub/open-streamer/internal/dvr/blob"
-	"github.com/datvietvac-techhub/open-streamer/internal/mediaserve"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/dvr/blob"
+	"github.com/ntt0601zcoder/open-streamer/internal/mediaserve"
 )
 
 // dispatchStreamsSubpath handles every URL under /streams/<...>. The chi
