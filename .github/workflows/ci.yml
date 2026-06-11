@@ -12,8 +12,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main, master]
+  # PR-only: correctness is gated on pull requests into main/master.
+  # Pushes to main don't re-run CI (the PR already validated the commit);
+  # main is reserved for tag-triggered Release builds.
   pull_request:
     branches: [main, master]
 
