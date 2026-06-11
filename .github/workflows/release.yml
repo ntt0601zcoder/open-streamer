@@ -83,7 +83,9 @@ jobs:
         run: |
           mkdir -p stage/${{ steps.version.outputs.stage }}/bin
           BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          VPKG=github.com/datvietvac-techhub/open-streamer/pkg/version
+          # ldflags -X target = module import path (go.mod) + /pkg/version,
+          # so a fork stamps versions without editing this workflow.
+          VPKG=$(go list -m)/pkg/version
           go build \
             -trimpath \
             -ldflags="-s -w \

@@ -59,7 +59,9 @@ fi
 
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-VPKG="github.com/datvietvac-techhub/open-streamer/pkg/version"
+# ldflags -X target = module import path (from go.mod) + /pkg/version, so a
+# fork stamps versions without editing this script.
+VPKG="$(go list -m)/pkg/version"
 
 # Mark dirty trees so a binary built with uncommitted changes is identifiable.
 if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
