@@ -41,7 +41,13 @@ all: tidy vet build test ## tidy, vet, build, test (race)
 # Injected into pkg/version at build time. CI workflows can override
 # VERSION (e.g. VERSION=v0.0.7 make build) to stamp release tags;
 # local builds default to `git describe` + short SHA fallback.
-VERSION_PKG := github.com/datvietvac-techhub/open-streamer/pkg/version
+#
+# VERSION_PKG is the ldflags -X target, which MUST equal the Go module
+# import path (NOT the repo URL) + /pkg/version. Derived from go.mod so a
+# fork keeps version stamping working without edits — go list -m, with a
+# dependency-free go.mod parse fallback.
+MODULE      := $(shell go list -m 2>/dev/null || awk 'NR==1{print $$2}' go.mod)
+VERSION_PKG := $(MODULE)/pkg/version
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILT_AT    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)

@@ -7,11 +7,11 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/datvietvac-techhub/open-streamer/internal/autopublish"
-	"github.com/datvietvac-techhub/open-streamer/internal/coordinator"
-	"github.com/datvietvac-techhub/open-streamer/internal/domain"
-	"github.com/datvietvac-techhub/open-streamer/internal/events"
-	"github.com/datvietvac-techhub/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/autopublish"
+	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/samber/do/v2"
 )

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/datvietvac-techhub/open-streamer/internal/publisher/dash"
+	"github.com/ntt0601zcoder/open-streamer/internal/publisher/dash"
 )
 
 // Default codec / bandwidth strings used when the catalog profile doesn't carry

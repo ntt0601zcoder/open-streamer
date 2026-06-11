@@ -9,9 +9,9 @@ import (
 
 	"github.com/Eyevinn/mp4ff/aac"
 
-	"github.com/datvietvac-techhub/open-streamer/internal/buffer"
-	"github.com/datvietvac-techhub/open-streamer/internal/domain"
-	"github.com/datvietvac-techhub/open-streamer/internal/publisher/dash"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/publisher/dash"
 )
 
 const (

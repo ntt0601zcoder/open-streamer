@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/datvietvac-techhub/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // gibPerHour is the placeholder size each test hour reports (1 GiB).

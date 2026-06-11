@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/datvietvac-techhub/open-streamer/internal/buffer"
-	"github.com/datvietvac-techhub/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // Real-world H.264 1080p Main@4.0 SPS/PPS (so mp4ff.ParseSPSNALUnit succeeds in

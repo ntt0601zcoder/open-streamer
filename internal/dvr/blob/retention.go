@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/datvietvac-techhub/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // retentionInterval is how often a recording's retention pass runs.

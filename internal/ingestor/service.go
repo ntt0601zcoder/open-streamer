@@ -20,16 +20,16 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/datvietvac-techhub/open-streamer/config"
-	"github.com/datvietvac-techhub/open-streamer/internal/buffer"
-	"github.com/datvietvac-techhub/open-streamer/internal/domain"
-	"github.com/datvietvac-techhub/open-streamer/internal/events"
-	"github.com/datvietvac-techhub/open-streamer/internal/ingestor/pull"
-	"github.com/datvietvac-techhub/open-streamer/internal/ingestor/push"
-	"github.com/datvietvac-techhub/open-streamer/internal/metrics"
-	"github.com/datvietvac-techhub/open-streamer/internal/timeline"
-	"github.com/datvietvac-techhub/open-streamer/internal/vod"
-	"github.com/datvietvac-techhub/open-streamer/pkg/protocol"
+	"github.com/ntt0601zcoder/open-streamer/config"
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/push"
+	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
+	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
+	"github.com/ntt0601zcoder/open-streamer/internal/vod"
+	"github.com/ntt0601zcoder/open-streamer/pkg/protocol"
 	"github.com/samber/do/v2"
 )
 

@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/datvietvac-techhub/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
 )
 
 func TestWriteJSONStatusAndBody(t *testing.T) {
