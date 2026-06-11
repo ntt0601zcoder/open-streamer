@@ -1,5 +1,6 @@
 # Open Streamer
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/ntt0601zcoder/open-streamer.svg)](https://pkg.go.dev/github.com/ntt0601zcoder/open-streamer)
 [![CI](https://github.com/ntt0601zcoder/open-streamer/actions/workflows/ci.yml/badge.svg)](https://github.com/ntt0601zcoder/open-streamer/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ntt0601zcoder/open-streamer)](https://goreportcard.com/report/github.com/ntt0601zcoder/open-streamer)
 [![Coverage](https://codecov.io/gh/ntt0601zcoder/open-streamer/branch/main/graph/badge.svg)](https://codecov.io/gh/ntt0601zcoder/open-streamer)
