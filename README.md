@@ -1,8 +1,7 @@
 # Open Streamer
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/datvietvac-techhub/open-streamer.svg)](https://pkg.go.dev/github.com/datvietvac-techhub/open-streamer)
 [![CI](https://github.com/ntt0601zcoder/open-streamer/actions/workflows/ci.yml/badge.svg)](https://github.com/ntt0601zcoder/open-streamer/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/datvietvac-techhub/open-streamer)](https://goreportcard.com/report/github.com/datvietvac-techhub/open-streamer)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ntt0601zcoder/open-streamer)](https://goreportcard.com/report/github.com/ntt0601zcoder/open-streamer)
 [![Coverage](https://codecov.io/gh/ntt0601zcoder/open-streamer/branch/main/graph/badge.svg)](https://codecov.io/gh/ntt0601zcoder/open-streamer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
