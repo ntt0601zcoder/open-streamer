@@ -64,3 +64,14 @@ protoc -I internal/transcoder/native/proto \
   internal/transcoder/native/proto/transcoder.proto
 
 echo "namespace: regenerated protobuf -> github.com/${TO}/open-streamer"
+
+# 3. Re-sort imports. Shortening/lengthening the module token moves the
+#    internal imports relative to third-party ones, so the import blocks
+#    need re-grouping or gofumpt (the lint formatter) fails.
+if command -v gofumpt >/dev/null 2>&1; then
+  gofumpt -w .
+  echo "namespace: gofumpt -w (re-sorted imports)"
+else
+  gofmt -w .
+  echo "namespace: gofmt -w (install gofumpt for the lint-exact format)"
+fi
