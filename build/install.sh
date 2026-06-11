@@ -31,7 +31,7 @@
 set -euo pipefail
 
 # ── Config ───────────────────────────────────────────────────────────────────
-REPO="${OPEN_STREAMER_REPO:-datvietvac-techhub/open-streamer}"
+REPO="${OPEN_STREAMER_REPO:-ntt0601zcoder/open-streamer}"
 GITHUB="https://github.com/${REPO}"
 API="https://api.github.com/repos/${REPO}"
 
