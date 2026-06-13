@@ -234,6 +234,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### B-1 (HIGH) — Transcoding an AV-path source drops all audio and feeds AAC into the H.264 decoder
+> ✅ **FIXED** in `fix/av-path-transcode` — `InputPacket` now carries `codec`/`pts_ms`/`dts_ms`; the supervisor forwards them and drops non-AAC audio, and the AV-path `ProcessPacket` routes AAC to the audio path instead of the H.264 decoder. Regression test `TestProcessPacket_AVPathAudioNotFedToDecoder`.
+
 **Files:** `internal/transcoder/native/stream_pipeline.go:670-686` (Annex-B branch, no audio handling); `internal/ingestor/pull/rtsp.go:431-437` (RTSP always emits AAC); `internal/transcoder/supervisor.go:300-303` (forwards all packets); `coordinator.go:1067-1073` (`shouldRunTranscoder` no input-type restriction).
 
 **Trigger:** Transcode a stream whose active input is RTSP or RTMP (any AV-path source reaching the raw-ingest buffer as `domain.AVPacket`). The subprocess probes the first packet as non-TS, so `tsInput` stays nil and ProcessPacket takes the Annex-B branch.
@@ -245,6 +247,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### B-2 (HIGH) — AV-path transcode output PTS collapses to 1 ms/frame (~1000 fps)
+> ✅ **FIXED** in `fix/av-path-transcode` — the supervisor forwards `pkt.AV.PTSms/DTSms` and `server.dispatch` passes them to `ProcessPacket`/`dec.Decode`, so `encodeOne` sees the real source PTS. Defense-in-depth: the `srcPTS<=0` fallback now advances by `videoFrameDurMs` (nominal frame duration), not a 1 ms frame counter.
+
 **Files:** `internal/transcoder/native/server.go:108` (`ProcessPacket(pkt.GetData(), 0, 0)`); `decoder.go:178-179` (stamps pts=dts=0); `stream_pipeline.go:1165-1167` (srcPTS≤0 fallback → `NextPTS`); `encoder.go:333-337` (bare frame counter), `:131` (fixed 1/1000 timebase).
 
 **Trigger:** Transcode any Annex-B AV-path source. The InputPacket has no PTS field, so the normalised `pkt.AV.PTSms` is dropped; the decoder sees pts=0 for every packet, so `f.Pts()==0` and `encodeOne` falls back to a 0,1,2,… frame counter at 1 ms spacing.
