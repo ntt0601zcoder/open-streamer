@@ -282,6 +282,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 
 **Fix:** Remove the pointless pairing wait for `!PackAudio` shards (`audioReady := videoReady` so all shards cut at the same source IDR — collapses skew to ≤~150 ms). Share one ladder-wide AST via `ABRMaster` set once on first flush. Do **not** rebase per-shard `StartTicks` (timelines are already media-aligned).
 
+> ✅ **FIXED** in `fix/dash-abr-ast` — both parts, no `StartTicks` rebase. (1) `tryCut` now computes `audioReady := !p.cfg.PackAudio || (haveAudio && queue.AudioLen()>0)`, so a non-audio ABR shard pairs on video alone and cuts at the first IDR instead of waiting out the pairing window — collapsing the per-shard `availStart` skew to the inter-shard IDR jitter (≤~150 ms). (2) New `ABRMaster.SharedAST(candidate)` returns one ladder-wide AST, set once by whichever shard flushes first; at its first flush each shard sets `p.availStart = ABRMaster.SharedAST(now)` (single-rendition streams have no master and keep their own `now`). All shards now anchor tfdt + `behindPrevSegEnd` pacing to the SAME origin and the published dynamic-MPD AST is correct for every rendition and never changes mid-stream regardless of flush order. Tests `TestABRMaster_SharedAST` (set-once / zero-candidate) and `TestPackager_NonAudioShardEmitsBeforePairingDeadline` (non-audio shard emits well within a 30 s pairing window). Existing DASH table tests pass unchanged (no `StartTicks`/timeline regression).
+
 ---
 
 #### B-5 (HIGH) — Streams that inherit Inputs from a template never auto-start
