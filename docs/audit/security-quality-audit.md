@@ -402,6 +402,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### A-5 (HIGH) — `manager.Register` swallows initial `ingestor.Start` failure → permanent zombie stream reported Active
+> ✅ **FIXED** in `fix/lifecycle-self-heal` — `Register`'s synchronous start-failure branch now routes through `ReportInputError`, so the input degrades, error history is recorded, and failover / exhausted-handling engage (multi-input promotes a backup; single-input flips to Degraded + probe loop). `Register` also refuses a duplicate registration (no monitor-goroutine leak). Tests `TestRegister_StartFailureDrivesExhausted`, `TestRegister_RefusesDuplicate`. (The connects-but-no-packets Idle blind spot is a noted follow-up.)
+
 **Files:** `internal/manager/service.go:415-421` (error only logged, `Register` returns nil), `:816` (`collectTimeoutIfNeeded` needs StatusActive), `:846/849` (`collectProbeIfNeeded` needs StatusDegraded); `coordinator.go:189-199` (StreamStatus = Active when registered + no degradation), `:964-966` (reconciler skips IsRunning).
 
 **Trigger:** `mgr.Register` → `s.ingestor.Start` fails synchronously — `NewPacketReader` error for `KindUnknown` schemes (including extension-less http(s) HLS URLs the API never validates), `file://` with an unresolvable VOD mount, or `copy://`/`mixer://` whose upstream vanished before bootstrap. `Register` returns nil; the coordinator records the stream started, `IsRunning==true`.
@@ -413,6 +415,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### A-6 (HIGH) — `reloadTranscoderFull` partial failure strands the stream with no publisher/DVR while IsRunning stays true
+> ✅ **FIXED** in `fix/lifecycle-self-heal` — any error after teardown in `reloadTranscoderFull` now routes through `reloadFailed`, which does a clean full `Stop` (idempotent against the partial state) so `IsRunning` flips false and the reconciler restarts the stream from the persisted config within one tick — a permanent invisible outage becomes a ≤10 s self-heal. Test `TestUpdate_ReloadFailureFullStops`.
+
 **Files:** `internal/coordinator/coordinator.go:585-652` — teardown `:588-591` (stopDVR/pub.Stop/tc.Stop), early returns at `:638-640` (tc.Start fails → publisher never restarted) and `:646-648` (pub.Start fails → DVR never restarted).
 
 **Trigger:** `PUT /streams/{code}` with a transcoder topology change (nil↔non-nil, video.copy flip, watermark change per `diff.go:123-170`) while `tc.Start` fails — realistic: transcoder binary missing after a bad deploy (`transcoder/service.go:312-316` probes the binary at Start), NVENC/GPU error. The reload has already torn down DVR + publisher + old transcoder; the early return leaves ingest running with zero outputs. Manager registration is never dropped, so `IsRunning==true` and `reconcileOnce` skips it forever. Template hot-reload routes every dependent through the same `Update`, so one broken-binary template edit can strand many streams at once.
@@ -450,6 +454,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### C-1 (HIGH) — No per-stream serialisation of coordinator Start/Stop/Update; manager.Register overwrites state and leaks the monitor goroutine
+> ✅ **FIXED** in `fix/lifecycle-self-heal` — a per-stream lifecycle mutex (`lockStream`) now wraps the full body of `Start`/`Stop`/`Update` (via `startLocked`/`stopLocked`/`updateLocked` so re-entrant internal calls don't deadlock); a racing op re-checks `IsRunning` under the lock and no-ops. `manager.Register` refuses a duplicate registration instead of overwriting (no monitor-goroutine/ticker leak). Test `TestLifecycle_ConcurrentStartStopSerialised` (-race).
+
 **Files:** `internal/coordinator/coordinator.go:271` (unlocked `IsRunning` TOCTOU), `:330-340` (loser's `pub.Start`-failure rollback runs `mgr.Unregister` + `buf.Delete` on the **winner**'s resources, keyed only by stream code); `internal/manager/service.go:401-403` (`s.streams[code]=state` overwrites unconditionally, prior cancel unreachable), `:405` (second monitor goroutine spawned), `:698-709` (orphaned monitor exits only on ctx.Done).
 
 **Trigger:** Two operations on the same code race the multi-step wiring — most reachably two concurrent `/restart`, or a `DELETE`/template-reload `Stop` racing a reconciler/handler `Start`. `Coordinator.Stop` can land anywhere inside `Start`'s wiring (including the slow `tc.Start` subprocess spawn). **Corrections:** the "bootstrap vs reconciler" sub-trigger is wrong (`BootstrapPersistedStreams` completes before `RunReconciler` is spawned); the pure double-Start window on the normal path is microseconds — the practically wide trigger is the unguarded Stop-interleaves-Start variant.
