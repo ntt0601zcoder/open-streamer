@@ -444,6 +444,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 
 **Fix:** Wrap the body in `io.LimitReader` with a configurable max (e.g. 64 MB) and treat over-limit as a failed/skipped segment; cap the playlist body size and parsed-segment count.
 
+> ✅ **FIXED** in `fix/hls-segment-cap` — `fetchSegmentOnce` now reads via `readCapped(resp.Body, hlsMaxSegmentBytes)` (64 MiB default), which reads at most `cap+1` bytes through an `io.LimitReader` and returns `errBodyTooLarge` if exceeded — so an oversized body is rejected WITHOUT allocating it, and `fetchSegmentWithRetry` treats it as a failed (then skipped) segment rather than killing the stream. `parseM3U8` wraps its body in `io.LimitReader(body, hlsMaxPlaylistBytes)` (8 MiB), which bounds the scanner input and transitively the parsed segment/variant slice. Both caps are package vars so ops can tune and tests can shrink them. Tests `TestReadCapped` (under/at/over cap + proves ≤ cap+1 bytes read via a counting reader), `TestFetchSegmentOnce_RejectsOversizedSegment` (httptest, shrunk cap), `TestParseM3U8_PlaylistBodyCapped`.
+
 ---
 
 #### A-8 (HIGH) — DASH output freezes permanently when either track dies mid-session (audio-coupled cut hold has no timeout)
