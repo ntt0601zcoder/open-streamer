@@ -279,6 +279,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### B-5 (HIGH) — Streams that inherit Inputs from a template never auto-start
+> ✅ **FIXED** in `fix/template-resolution` — `BootstrapPersistedStreams`, `reconcileOnce`, and the `Put` handler now resolve the template BEFORE the input-eligibility gate (`freshlyCreated` is computed from the resolved inputs). Regression test `TestReconcileOnceStartsTemplateInheritedInputs`.
+
 **Files:** `internal/coordinator/coordinator.go:893-896` (`BootstrapPersistedStreams` skips `len(st.Inputs)==0` **before** `resolveTemplate` at `:897`), `:961-968` (`reconcileOnce` same raw check before resolution); `internal/api/handler/stream.go:400` (`freshlyCreated` tests `len(body.Inputs)>0` on the raw body).
 **Merges:** two reported findings (identical root cause).
 
@@ -291,6 +293,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### B-6 (HIGH) — copy:// / mixer:// upstream-shape lookups never resolve templates → silent blackout + ABR-validation bypass
+> ✅ **FIXED** in `fix/template-resolution` — `wireCopyLookup`, the coordinator `upstreamLookup`, and the copy/mixer validation wrappers now resolve the template so copy:// / mixer:// classify upstreams by their inherited Inputs/Transcoder. Regression test `TestValidateCopyConfig_ResolvesTemplateUpstream`.
+
 **Files:** `cmd/server/main.go:295-305` (`wireCopyLookup` = plain `repo.FindByCode`); `internal/coordinator/coordinator.go:106-112` (`upstreamLookup` raw lookup; resolving helper `resolveTemplate` exists at `:136-145` but unused here); `internal/api/handler/stream.go:531-545` (`ValidateCopyShape` lookup); consumers `internal/ingestor/pull/copy.go:86-106/153-157`, `mixer.go:112-156`, `internal/domain/copy_shape.go:181-192`.
 
 **Trigger:** Upstream `A = {code:"a", template:"T"}` where `T` supplies the Transcoder (ABR) and/or raw-TS Inputs. Downstream `B` has input `copy://a` (or `mixer://a,x`). The lookup returns A's raw record (Transcoder=nil, Inputs=[]), so `streamHasRenditions`/`StreamMainBufferIsTS` misclassify A as single-stream direct-AV. But A's main buffer carries TS chunks (or, for ABR, nothing the copy subscribes to), so every packet hits the `pkt.AV==nil → return nil,nil` drop (`copy.go:153-157`).
@@ -302,6 +306,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### B-7 (HIGH) — `domain.inputSourceIsRawTS` misclassifies HTTP-TS (`.ts` / `/mpegts`) and `.m3u` upstreams
+> ✅ **FIXED** in `fix/template-resolution` — `inputSourceIsRawTS` now delegates to `protocol.Detect` (handles `.ts`, `/mpegts`, `.m3u`, uppercase); `looksLikeHLS` deleted. Table test `TestInputSourceIsRawTS`.
+
 **Files:** `internal/domain/copy_shape.go:200-216` (`inputSourceIsRawTS`), `:220-227` (`looksLikeHLS`, case-sensitive `.m3u8` substring scan) vs `pkg/protocol/protocol.go:66-78` (lowercases, classifies `.ts`/`/mpegts` as KindHTTPTS, `.m3u` as HLS).
 
 **Trigger:** Upstream `A` input `http://relay/chan/mpegts` or `http://cdn/live.ts` → `protocol.Detect`=KindHTTPTS → A's main buffer holds raw TS chunks. `B = copy://a`: `StreamMainBufferIsTS(A)` calls `inputSourceIsRawTS`, which for http(s) returns true only when `.m3u8` appears — `.ts`, `/mpegts`, `.m3u`, and uppercase variants return false. CopyReader takes direct-AV mode and drops every TS-only packet.
