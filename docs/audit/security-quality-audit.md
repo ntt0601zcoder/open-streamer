@@ -327,6 +327,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### D-1 (HIGH) — DVR catalog wiped on every recording restart → orphaned blobs, retention defeated, unbounded disk growth
+> ✅ **FIXED** in `fix/dvr-data-loss` — `StartRecording` now `LoadCatalog`s the prior catalog and `mergePriorCoverage` carries its `Hours`/`Available`/`Gaps` (and profiles only in the old catalog) into the fresh one, so `pruneOnce` sees and prunes pre-restart hours (retention is wall/size-anchored → correct regardless of origin). The new run anchors its own media origin so recent timeshift keeps working; playing back **across** a restart boundary needs a per-hour reader anchor (noted follow-up). Test `TestMergePriorCoverage`.
+
 **Files:** `internal/dvr/blob/service.go:96/100` (`newCatalog` + `Save`, `:251-274`); `LoadCatalog` only at `reader.go:48`; retention `retention.go:48-93`; `recovery.go:50-70` (`RepairStream` only seals `.open`-sentinel crash-dirty hours); trigger `coordinator.go:360/745-748`.
 **Merges:** two reported findings (identical root cause).
 
@@ -339,6 +341,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### D-2 (HIGH) — Raw-TS / passthrough streams record ZERO bytes while `recording_status` reports "recording"
+> ✅ **FIXED (fail-loud)** in `fix/dvr-data-loss` — `blobProfiles` now refuses a DVR lane for a non-transcoded raw-TS source (`StreamMainBufferIsTS`), so no catalog or Recording row is created and the status no longer lies. Making raw-TS DVR actually record (wire `pkt.TS` demux → AVPacket → `ingestAV`) is a deliberate follow-up. Test `TestBlobProfiles_RefusesRawTSSource`.
+
 **Files:** `internal/dvr/blob/writer.go:102-120` (`Ingest` handles only `pkt.AV`; `pkt.TS` is an explicit unimplemented stub at `:117-118`); `service.go:100-113` (catalog + Recording row saved unconditionally); `coordinator.go:780-784` (`blobProfiles` single `p0` lane on `stream.Code`); status `blob_timeshift.go:45-48`.
 
 **Trigger:** Enable DVR on any non-transcoded stream whose ingest writes raw MPEG-TS into the buffer hub: UDP multicast, HLS-pull, HTTP-TS, SRT, or file. `profileWriter.Ingest` discards `pkt.TS` silently (returns nil), so no blob/fragment is ever written.
