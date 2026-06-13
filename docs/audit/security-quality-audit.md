@@ -268,6 +268,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 
 **Fix:** Make the unsupported input *visible*: after N consecutive gated drops with no H.264 IDR, return a terminal error ("non-H.264 AV input not supported") so the supervisor marks unhealthy; or reject at configure time using the ingest `AVPacket.Codec`. Full HEVC support requires a codec-aware keyframe detector + a decoder-codec proto field + `hevc/hevc_cuvid` selection.
 
+> ✅ **FIXED** by `fix/decoder-codec-aware` (A-3) — rather than just making it visible, HEVC AV-path transcode now WORKS. The AV-path gate is `isVideoKeyframeAnnexB(codec, data)`, which routes HEVC to `gocodec.IsH265IDRFrame` (the H.264 mask no longer blocks HEVC IRAPs), and `ensureVideoDecoder` rebuilds the decoder to `hevc`/`hevc_cuvid` on the first H.265 frame. Codec is detected at runtime from the esFrame, so the proposed decoder-codec proto field was unnecessary. Covered by A-3's `TestIsVideoKeyframeAnnexB` (HEVC IRAP detection + dispatch divergence).
+
 ---
 
 #### B-4 (MEDIUM) — DASH ABR: shards anchor their own availabilityStartTime; root MPD publishes one AST
@@ -376,6 +378,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 **Impact:** O(total fragments × profiles) allocation + reads of every `.ranges` file — hundreds of MB per request for a multi-day/multi-profile archive; a few concurrent requests OOM the server.
 
 **Fix:** Clamp the resolved end to `fromMs + maxWindowMs` (configurable max timeshift depth) when `dur` is absent or oversized; clamp `from` to the catalog's earliest hour; thread `r.Context()` into `Query` and check `ctx.Err()` in the hour loop. Shared `candidateHours` overflow/bound issues (see L-list) belong to the same reader.
+
+> ✅ **FIXED** in `fix/dvr-timeshift-bound` — `Reader.Query` now resolves its window via `resolveWindowBounds`, which clamps the depth to `MaxTimeshiftWindow` (package var, default 24h) when `dur` is absent/≤0/oversized and pulls `from` UP to the archive's earliest hour (`earliestHourMs`), so a `?from=0` / `?ago=<huge>` request can no longer anchor at the epoch and admit every hour. The `1<<62` open-ended sentinel is gone — `endMs`/`endTicks` are always finite. `Query` now takes a `context.Context` and checks `ctx.Err()` at the top of the hour loop, so the server's 120 s timeout (and client disconnect) aborts the scan instead of reading every `.ranges` file. Both handler call sites (`ServeTimeshift`, `ServeMPD`'s per-profile loop) pass `r.Context()`. Tests `TestResolveWindowBounds` (clamp table) + `TestBlobReader_QueryClampsAndCancels` (from-clamp returns data + cancelled ctx aborts).
 
 ---
 
