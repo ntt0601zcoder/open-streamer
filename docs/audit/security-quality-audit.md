@@ -447,6 +447,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 
 **Fix:** Un-latch track presence based on arrival liveness rather than init existence: record `lastVideoFrameAt`/`lastAudioFrameAt`; once past `WaitingForPairing`, compute `haveX := initX != nil && (queueLen>0 || now-lastXFrameAt < trackLossTimeout)` with `trackLossTimeout ≈ 6 s` (the existing safety-net deadline). Audio death → `haveAudio=false` → coupling skipped → video cuts resume; video death → `haveVideo=false` → `cutAudioOnly` engages. On a declared-dead track's first resumed frame, re-anchor its next segment tfdt to wallclock so the outage gap isn't baked in as permanent A/V desync.
 
+> ✅ **FIXED** in `fix/dash-track-death` — `tryCut` now derives `haveVideo`/`haveAudio` from a new `liveTrackPresence(now)` instead of the latched `videoInit`/`audioInit` pointers. `handleH264`/`handleAAC` stamp `lastVideoFrameAt`/`lastAudioFrameAt` on every accepted frame; once the stream is `StateLive` (only — `WaitingForPairing`/`SessionBoundary` keep init-presence so the pairing handshake and post-reset stale timestamps aren't disturbed), a track with an empty queue and no arrival within `trackLossTimeout` (6 s, a package var so tests can shrink it) is declared dead. Audio death → coupling skipped (`buildCutDecision` audio block gates on `haveAudio`) → video cuts resume; video death → `cutAudioOnly`. The flag flips back automatically when the track resumes (re-stamp), and the wallclock-anchored tfdt lands the resumed segment at the live edge with no extra re-anchoring needed. Test `TestLiveTrackPresence_TrackDeath` (audio-dead, video-dead, draining-queue, recent-frames, pairing-no-downgrade, single-track cases).
+
 ---
 
 ### 2.5 Concurrency
