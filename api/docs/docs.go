@@ -1941,6 +1941,10 @@ const docTemplate = `{
                 "name": {
                     "type": "string"
                 },
+                "playback_auth": {
+                    "description": "PlaybackAuth overrides the global media-auth default policy for this\nstream: \"public\" (no token) or \"token\" (signed token required). Empty\ninherits auth.media.default_policy. Static rules (IP/country/UA/domains)\nremain global. See internal/mediaauth.",
+                    "type": "string"
+                },
                 "protocols": {
                     "description": "Protocols defines which delivery protocols are opened for this stream.\nnil means the field is unset and ResolveStream inherits the template's\nProtocols (or leaves the resolved value nil when no template applies —\npublisher treats nil as \"no protocols enabled\"). An explicit non-nil\npointer — including the zero value \u0026OutputProtocols{} — is an\noperator-asserted override and beats template inheritance.",
                     "allOf": [
@@ -2104,6 +2108,9 @@ const docTemplate = `{
             "properties": {
                 "api": {
                     "$ref": "#/definitions/config.APIAuthConfig"
+                },
+                "media": {
+                    "$ref": "#/definitions/config.MediaAuthConfig"
                 }
             }
         },
@@ -2224,6 +2231,65 @@ const docTemplate = `{
                 "input_packet_timeout_sec": {
                     "description": "InputPacketTimeoutSec is the maximum gap without a successful read on the\nactive input before it is marked failed. Pull protocols that deliver in\nbursts (e.g. HLS: one segment per Read) need this at least as large as the\ntypical interval between reads (segment duration + playlist poll), or a\nhealthy primary will be falsely failed over to a lower priority.",
                     "type": "integer"
+                }
+            }
+        },
+        "config.MediaAuthConfig": {
+            "type": "object",
+            "properties": {
+                "allow_countries": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "allow_ips": {
+                    "description": "Static allow/deny chain. IPs accept exact addresses or CIDR ranges;\nCountries are ISO 3166-1 alpha-2 codes (need a GeoIP DB — see\nSessionsConfig.GeoIPDBPath); UserAgents match case-insensitive substring;\nAllowedDomains match the Referer host (exact or parent domain).",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "allow_user_agents": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "allowed_domains": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "default_policy": {
+                    "description": "DefaultPolicy is \"public\" (no token needed) or \"token\" (signed token\nrequired) for streams that don't set their own. Empty = public.",
+                    "type": "string"
+                },
+                "deny_countries": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "deny_ips": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "deny_user_agents": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "token_secret": {
+                    "description": "TokenSecret is the HMAC-SHA256 key the server uses to VERIFY playback\ntokens. Clients (your app) mint tokens with the same secret — the server\nnever issues them. Required when any stream's effective policy is \"token\".\nSee internal/mediaauth.SignToken for the canonical token format.",
+                    "type": "string"
                 }
             }
         },
@@ -3240,6 +3306,10 @@ const docTemplate = `{
                 },
                 "name": {
                     "description": "Name and Description are template-level metadata. Name surfaces in\nthe API for human-readable lists; Description carries the rationale\nbehind the template's settings. Streams inheriting this template\nkeep their own Name / Description fields — the template metadata is\nfor operator-facing tooling, not for downstream consumers.",
+                    "type": "string"
+                },
+                "playback_auth": {
+                    "description": "PlaybackAuth is the media-auth policy (\"public\"/\"token\") inherited by\nstreams referencing this template. Empty = inherit global default.",
                     "type": "string"
                 },
                 "prefixes": {

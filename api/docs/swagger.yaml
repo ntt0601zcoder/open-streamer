@@ -213,6 +213,13 @@ definitions:
         type: array
       name:
         type: string
+      playback_auth:
+        description: |-
+          PlaybackAuth overrides the global media-auth default policy for this
+          stream: "public" (no token) or "token" (signed token required). Empty
+          inherits auth.media.default_policy. Static rules (IP/country/UA/domains)
+          remain global. See internal/mediaauth.
+        type: string
       protocols:
         allOf:
         - $ref: '#/definitions/domain.OutputProtocols'
@@ -331,6 +338,8 @@ definitions:
     properties:
       api:
         $ref: '#/definitions/config.APIAuthConfig'
+      media:
+        $ref: '#/definitions/config.MediaAuthConfig'
     type: object
   config.BufferConfig:
     properties:
@@ -441,6 +450,56 @@ definitions:
           typical interval between reads (segment duration + playlist poll), or a
           healthy primary will be falsely failed over to a lower priority.
         type: integer
+    type: object
+  config.MediaAuthConfig:
+    properties:
+      allow_countries:
+        items:
+          type: string
+        type: array
+      allow_ips:
+        description: |-
+          Static allow/deny chain. IPs accept exact addresses or CIDR ranges;
+          Countries are ISO 3166-1 alpha-2 codes (need a GeoIP DB — see
+          SessionsConfig.GeoIPDBPath); UserAgents match case-insensitive substring;
+          AllowedDomains match the Referer host (exact or parent domain).
+        items:
+          type: string
+        type: array
+      allow_user_agents:
+        items:
+          type: string
+        type: array
+      allowed_domains:
+        items:
+          type: string
+        type: array
+      default_policy:
+        description: |-
+          DefaultPolicy is "public" (no token needed) or "token" (signed token
+          required) for streams that don't set their own. Empty = public.
+        type: string
+      deny_countries:
+        items:
+          type: string
+        type: array
+      deny_ips:
+        items:
+          type: string
+        type: array
+      deny_user_agents:
+        items:
+          type: string
+        type: array
+      enabled:
+        type: boolean
+      token_secret:
+        description: |-
+          TokenSecret is the HMAC-SHA256 key the server uses to VERIFY playback
+          tokens. Clients (your app) mint tokens with the same secret — the server
+          never issues them. Required when any stream's effective policy is "token".
+          See internal/mediaauth.SignToken for the canonical token format.
+        type: string
     type: object
   config.PublisherConfig:
     properties:
@@ -1404,6 +1463,11 @@ definitions:
           behind the template's settings. Streams inheriting this template
           keep their own Name / Description fields — the template metadata is
           for operator-facing tooling, not for downstream consumers.
+        type: string
+      playback_auth:
+        description: |-
+          PlaybackAuth is the media-auth policy ("public"/"token") inherited by
+          streams referencing this template. Empty = inherit global default.
         type: string
       prefixes:
         description: |-
