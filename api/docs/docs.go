@@ -2071,6 +2071,42 @@ const docTemplate = `{
                 }
             }
         },
+        "config.APIAuthConfig": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
+                "users": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/config.APIUser"
+                    }
+                }
+            }
+        },
+        "config.APIUser": {
+            "type": "object",
+            "properties": {
+                "password_hash": {
+                    "type": "string"
+                },
+                "role": {
+                    "type": "string"
+                },
+                "username": {
+                    "type": "string"
+                }
+            }
+        },
+        "config.AuthConfig": {
+            "type": "object",
+            "properties": {
+                "api": {
+                    "$ref": "#/definitions/config.APIAuthConfig"
+                }
+            }
+        },
         "config.BufferConfig": {
             "type": "object",
             "properties": {
@@ -2442,6 +2478,8 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
+                "session.opened",
+                "session.closed",
                 "stream.created",
                 "stream.updated",
                 "stream.started",
@@ -2475,9 +2513,7 @@ const docTemplate = `{
                 "template.updated",
                 "template.deleted",
                 "stream.runtime_created",
-                "stream.runtime_expired",
-                "session.opened",
-                "session.closed"
+                "stream.runtime_expired"
             ],
             "x-enum-comments": {
                 "EventDVRSegmentPruned": "retention loop deleted an aged-out segment",
@@ -2494,6 +2530,8 @@ const docTemplate = `{
                 "EventStreamUpdated": "PUT /streams/{code} on existing record"
             },
             "x-enum-descriptions": [
+                "",
+                "",
                 "",
                 "PUT /streams/{code} on existing record",
                 "",
@@ -2527,11 +2565,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
-                "",
-                "",
                 ""
             ],
             "x-enum-varnames": [
+                "EventSessionOpened",
+                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamUpdated",
                 "EventStreamStarted",
@@ -2565,14 +2603,15 @@ const docTemplate = `{
                 "EventTemplateUpdated",
                 "EventTemplateDeleted",
                 "EventStreamRuntimeCreated",
-                "EventStreamRuntimeExpired",
-                "EventSessionOpened",
-                "EventSessionClosed"
+                "EventStreamRuntimeExpired"
             ]
         },
         "domain.GlobalConfig": {
             "type": "object",
             "properties": {
+                "auth": {
+                    "$ref": "#/definitions/config.AuthConfig"
+                },
                 "buffer": {
                     "$ref": "#/definitions/config.BufferConfig"
                 },
