@@ -391,6 +391,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### A-4 (HIGH) — tsnorm demux goroutine death permanently disables TS normalisation, silently switches to raw passthrough
+> ✅ **FIXED** in `fix/tsnorm-restart` — `runDemux` now rebuilds the astits demuxer on a parse error and resyncs (capped at `maxDemuxRestarts=8`, mirroring `pull.TSDemuxPacketReader`) instead of dying; and `Process` resets `n.started` when it observes `demuxDone`, so a goroutine that does give up is relaunched lazily on the next call. A transient corruption now costs at most one passthrough chunk, not permanent un-normalised output. Test `TestProcess_RecoversFromParseError`.
+
 **Files:** `internal/ingestor/tsnorm/tsnorm.go:391-417` (`runDemux` exits on any non-EOF `NextData` error; `n.started` never reset), `:262-290` (`Process` returns io.EOF forever); `internal/ingestor/worker.go:553-574` (`writeRawTSChunk` falls back to raw passthrough per chunk).
 
 **Trigger:** Any astits parse error on a raw-TS source — e.g. one truncated UDP datagram (UDP default read buffer is exactly 1316 bytes / 188×7; larger datagrams truncate → permanent misalignment) or a corrupted adaptation field on a noisy multicast feed. `runDemux` logs at Debug and returns; every later `Process()` returns io.EOF; `writeRawTSChunk` then writes the **raw upstream chunk** for every chunk, forever.
