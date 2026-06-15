@@ -265,6 +265,32 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 		}
 	}
 
+	// IngestorConfig hot-swap (allow_private_targets etc.). Stored atomically so
+	// the next reader built on a stream start / failover switch observes the new
+	// value. The diffService("ingestor", …) call below ALSO restarts the service
+	// when ingestor config changes (for the RTMP listener), but the atomic store
+	// here is what lets a freshly-switched input pick up the new SSRF policy even
+	// on a stream that doesn't trigger a service restart.
+	if configChanged(old.Ingestor, new.Ingestor) && m.deps.Ingestor != nil {
+		ingCfg := config.IngestorConfig{}
+		if new.Ingestor != nil {
+			ingCfg = *new.Ingestor
+		}
+		m.deps.Ingestor.SetConfig(ingCfg)
+	}
+
+	// HooksConfig hot-swap (file_root_dir etc.). Hooks have no listener to
+	// restart, so the atomic store is the whole mechanism — the next hook
+	// create/update validates against the new root and the next file delivery
+	// writes under it without a reboot.
+	if configChanged(old.Hooks, new.Hooks) && m.deps.HooksSvc != nil {
+		hookCfg := config.HooksConfig{}
+		if new.Hooks != nil {
+			hookCfg = *new.Hooks
+		}
+		m.deps.HooksSvc.SetConfig(hookCfg)
+	}
+
 	// Ingestor — owns the shared RTMP listener. Restart on changes to either
 	// IngestorConfig or listeners.RTMP, and treat the listener being enabled
 	// as sufficient reason to keep the service running even when IngestorConfig

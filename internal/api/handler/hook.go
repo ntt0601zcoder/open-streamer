@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/hooks"
@@ -16,11 +15,15 @@ import (
 	"github.com/samber/do/v2"
 )
 
-// hookTester narrows *hooks.Service to the test-delivery method this
-// handler uses, so tests can stub out the hooks service without standing
-// up the full delivery pipeline. *hooks.Service satisfies implicitly.
+// hookTester narrows *hooks.Service to the methods this handler uses, so tests
+// can stub out the hooks service without standing up the full delivery
+// pipeline. DeliverTestEvent drives the /test endpoint; FileRootDir is read
+// live on every Create/Update so a runtime hooks.file_root_dir change applies
+// without a reboot (the value is no longer cached on the handler). *hooks.Service
+// satisfies both implicitly.
 type hookTester interface {
 	DeliverTestEvent(ctx context.Context, id domain.HookID) error
+	FileRootDir() string
 }
 
 // HookHandler handles webhook and hook management REST endpoints.
@@ -28,18 +31,14 @@ type HookHandler struct {
 	hookRepo store.HookRepository
 	hooks    hookTester
 	bus      events.Bus
-	// fileRootDir confines file-hook targets (S-2); mirrors hooks.file_root_dir.
-	fileRootDir string
 }
 
 // NewHookHandler creates a HookHandler and registers it with the DI injector.
 func NewHookHandler(i do.Injector) (*HookHandler, error) {
-	cfg, _ := do.Invoke[config.HooksConfig](i)
 	return &HookHandler{
-		hookRepo:    do.MustInvoke[store.HookRepository](i),
-		hooks:       do.MustInvoke[*hooks.Service](i),
-		bus:         do.MustInvoke[events.Bus](i),
-		fileRootDir: cfg.FileRootDir,
+		hookRepo: do.MustInvoke[store.HookRepository](i),
+		hooks:    do.MustInvoke[*hooks.Service](i),
+		bus:      do.MustInvoke[events.Bus](i),
 	}, nil
 }
 
@@ -93,8 +92,9 @@ func (h *HookHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// S-2: REST Create used to persist a hook with zero validation. Apply the
-	// same type/target + file-containment check as the YAML path.
-	if err := hook.Validate(h.fileRootDir); err != nil {
+	// same type/target + file-containment check as the YAML path. Root read
+	// live so a runtime hooks.file_root_dir change takes effect immediately.
+	if err := hook.Validate(h.hooks.FileRootDir()); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_HOOK", err.Error())
 		return
 	}
@@ -149,7 +149,7 @@ func (h *HookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hook.ID = hid
-	if err := hook.Validate(h.fileRootDir); err != nil {
+	if err := hook.Validate(h.hooks.FileRootDir()); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_HOOK", err.Error())
 		return
 	}

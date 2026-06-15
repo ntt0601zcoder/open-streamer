@@ -19,12 +19,15 @@ import (
 
 // stubHookTester is a controllable hookTester for the Test() handler tests.
 type stubHookTester struct {
-	err error
+	err      error
+	fileRoot string
 }
 
 func (s *stubHookTester) DeliverTestEvent(_ context.Context, _ domain.HookID) error {
 	return s.err
 }
+
+func (s *stubHookTester) FileRootDir() string { return s.fileRoot }
 
 const (
 	hooksPath  = "/hooks"
@@ -110,7 +113,7 @@ func newReq(t *testing.T, method, path string, body []byte) *http.Request {
 }
 
 func newHookHandler(repo *fakeHookRepo) *HookHandler {
-	return &HookHandler{hookRepo: repo}
+	return &HookHandler{hookRepo: repo, hooks: &stubHookTester{}}
 }
 
 func TestHookListReturnsTotal(t *testing.T) {
@@ -159,6 +162,37 @@ func TestHookCreatePersistsHook(t *testing.T) {
 	}
 	if _, ok := repo.hooks["new"]; !ok {
 		t.Error("hook not persisted")
+	}
+}
+
+func TestHookCreateRejectsFileTargetOutsideRoot(t *testing.T) {
+	repo := newFakeHookRepo()
+	// Live root read from the hooks service (B2 hot-reload): a file hook whose
+	// target escapes the configured root must be rejected at Create time.
+	h := &HookHandler{hookRepo: repo, hooks: &stubHookTester{fileRoot: "/var/lib/open-streamer/hooks"}}
+
+	body, _ := json.Marshal(domain.Hook{ID: "bad", Type: domain.HookTypeFile, Target: "/etc/passwd"})
+	req := newReq(t, http.MethodPost, hooksPath, body)
+	w := httptest.NewRecorder()
+	h.Create(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for out-of-root file target, got %d body=%s", w.Code, w.Body.String())
+	}
+	if _, ok := repo.hooks["bad"]; ok {
+		t.Error("out-of-root hook must not be persisted")
+	}
+}
+
+func TestHookCreateAllowsFileTargetInsideRoot(t *testing.T) {
+	repo := newFakeHookRepo()
+	h := &HookHandler{hookRepo: repo, hooks: &stubHookTester{fileRoot: "/var/lib/open-streamer/hooks"}}
+
+	body, _ := json.Marshal(domain.Hook{ID: "ok", Type: domain.HookTypeFile, Target: "/var/lib/open-streamer/hooks/events.jsonl"})
+	req := newReq(t, http.MethodPost, hooksPath, body)
+	w := httptest.NewRecorder()
+	h.Create(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for in-root file target, got %d body=%s", w.Code, w.Body.String())
 	}
 }
 
