@@ -69,6 +69,10 @@ type Template struct {
 	// stream may set its own (or none).
 	StreamKey string `json:"stream_key,omitempty" yaml:"stream_key,omitempty"`
 
+	// PlaybackAuth is the media-auth policy ("public"/"token") inherited by
+	// streams referencing this template. Empty = inherit global default.
+	PlaybackAuth string `json:"playback_auth,omitempty" yaml:"playback_auth,omitempty"`
+
 	// Prefixes is the list of URL-path prefixes that trigger auto-publish.
 	// When an encoder pushes to a path whose first segment(s) match any
 	// prefix here AND this template has at least one publish:// input, a
@@ -235,6 +239,9 @@ func ResolveStream(s *Stream, tpl *Template) *Stream {
 	}
 	if out.StreamKey == "" && tpl.StreamKey != "" {
 		out.StreamKey = tpl.StreamKey
+	}
+	if out.PlaybackAuth == "" && tpl.PlaybackAuth != "" {
+		out.PlaybackAuth = tpl.PlaybackAuth
 	}
 	if len(out.Inputs) == 0 && len(tpl.Inputs) > 0 {
 		out.Inputs = tpl.Inputs

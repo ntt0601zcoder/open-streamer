@@ -30,6 +30,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/hooks"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor"
 	"github.com/ntt0601zcoder/open-streamer/internal/manager"
+	"github.com/ntt0601zcoder/open-streamer/internal/mediaauth"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/runtime"
@@ -133,6 +134,11 @@ func run() error {
 	// 5. Wire all services.
 	wireServices(injector)
 
+	// 5b. Wire the media-plane playback authorizer (token / IP / country / UA /
+	// referer) into the publisher + API server. Returns the shared authorizer
+	// so the runtime config-reload path can hot-swap its rules.
+	mediaAuthz := wireMediaAuth(injector, gcfg)
+
 	// 6. Assemble RuntimeManager deps from DI.
 	rtm := runtime.New(ctx, runtime.Deps{
 		Ingestor:         do.MustInvoke[*ingestor.Service](injector),
@@ -144,6 +150,7 @@ func run() error {
 		SessionsSvc:      do.MustInvoke[*sessions.Service](injector),
 		AutoPublish:      do.MustInvoke[*autopublish.Service](injector),
 		APISrv:           do.MustInvoke[*api.Server](injector),
+		MediaAuth:        mediaAuthz,
 		Bus:              do.MustInvoke[events.Bus](injector),
 		StreamRepo:       do.MustInvoke[store.StreamRepository](injector),
 		GlobalConfigRepo: gcRepo,
@@ -330,6 +337,48 @@ func wireServices(i *do.RootScope) {
 // happens at packet-read time, long after the original request that created
 // the worker has been served. The repo's FindByCode is fast (in-memory or
 // indexed), so blocking briefly here is acceptable.
+// wireMediaAuth builds the shared media-plane playback authorizer and injects
+// it into the publisher (RTMP/SRT/RTSP play) and API server (HLS/DASH/MPEGTS).
+// The country backend reuses the sessions GeoIP resolver; the per-stream policy
+// is resolved from the publisher's in-memory stream table (O(1), no store hit).
+func wireMediaAuth(i do.Injector, gcfg *domain.GlobalConfig) *mediaauth.Authorizer {
+	pub := do.MustInvoke[*publisher.Service](i)
+	apiSrv := do.MustInvoke[*api.Server](i)
+	geoIP := do.MustInvoke[*sessions.SwappableGeoIP](i)
+	streamRepo := do.MustInvoke[store.StreamRepository](i)
+	templateRepo := do.MustInvoke[store.TemplateRepository](i)
+
+	// policyFor resolves a stream's effective playback policy. Live streams hit
+	// the publisher's in-memory table (O(1), no store read on the hot path). A
+	// STOPPED stream — whose DVR archive is still served — falls back to the
+	// store + template so its per-stream `token` policy isn't silently
+	// downgraded to the global default.
+	policyFor := func(code domain.StreamCode) string {
+		if policy, running := pub.PlaybackPolicy(code); running {
+			return policy
+		}
+		s, err := streamRepo.FindByCode(context.Background(), code)
+		if err != nil {
+			return ""
+		}
+		if s.Template != nil {
+			if tpl, terr := templateRepo.FindByCode(context.Background(), *s.Template); terr == nil {
+				s = domain.ResolveStream(s, tpl)
+			}
+		}
+		return s.PlaybackAuth
+	}
+
+	cfg := config.AuthConfig{}
+	if gcfg.Auth != nil {
+		cfg = *gcfg.Auth
+	}
+	authz := mediaauth.New(cfg.Media, geoIP.Country, policyFor)
+	pub.SetMediaAuthorizer(authz)
+	apiSrv.SetMediaAuthorizer(authz)
+	return authz
+}
+
 func wireCopyLookup(i do.Injector) {
 	ing := do.MustInvoke[*ingestor.Service](i)
 	repo := do.MustInvoke[store.StreamRepository](i)

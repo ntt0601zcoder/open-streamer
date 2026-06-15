@@ -19,6 +19,7 @@ import (
 	_ "github.com/ntt0601zcoder/open-streamer/api/docs" // swag Register(SwaggerInfo)
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api/handler"
+	"github.com/ntt0601zcoder/open-streamer/internal/mediaauth"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
@@ -60,9 +61,17 @@ type Server struct {
 	// Never nil (a disabled authenticator is a pass-through).
 	apiAuth *Auth
 
+	// mediaAuth authorizes HTTP playback (HLS/DASH/MPEGTS) — token / IP /
+	// country / UA / referer. nil = allow all. Set via SetMediaAuthorizer.
+	mediaAuth *mediaauth.Authorizer
+
 	router *chi.Mux
 	http   *http.Server
 }
+
+// SetMediaAuthorizer wires the playback authorizer for HTTP media routes (B /
+// S-13). Called from the runtime wiring after the publisher is constructed.
+func (s *Server) SetMediaAuthorizer(a *mediaauth.Authorizer) { s.mediaAuth = a }
 
 // New creates a Server and registers it with the DI injector.
 // The server is constructed but not started — call StartWithConfig to begin accepting connections.

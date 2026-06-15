@@ -246,10 +246,47 @@ type HooksConfig struct {
 	BatchMaxQueueItems int `mapstructure:"batch_max_queue_items" json:"batch_max_queue_items,omitempty" yaml:"batch_max_queue_items,omitempty"`
 }
 
-// AuthConfig holds authentication settings. Today it covers only the
-// control-plane HTTP API (admin); media/playback auth is a separate plane.
+// AuthConfig holds authentication settings: the control-plane HTTP API (admin)
+// and the media/playback plane (who may watch a stream).
 type AuthConfig struct {
-	API APIAuthConfig `mapstructure:"api" json:"api" yaml:"api"`
+	API   APIAuthConfig   `mapstructure:"api" json:"api" yaml:"api"`
+	Media MediaAuthConfig `mapstructure:"media" json:"media" yaml:"media"`
+}
+
+// MediaAuthConfig configures playback (media-plane) authorization: who may
+// watch a stream over HLS/DASH/HTTP-MPEGTS/RTMP/SRT/RTSP. Disabled by default
+// (Enabled=false → every request is allowed, preserving prior behaviour).
+//
+// Evaluation per request (a chain; deny wins, allow-lists restrict, then the
+// policy gate): a value on any Deny* list → reject; for any non-empty Allow*
+// list the request's value MUST appear on it or it is rejected; finally if the
+// effective policy (per-stream override, else DefaultPolicy) is "token" a valid
+// signed token is required. AllowedDomains gates the HTTP Referer for embeds.
+// Static rules are global; per-stream config overrides only the policy today.
+type MediaAuthConfig struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+
+	// DefaultPolicy is "public" (no token needed) or "token" (signed token
+	// required) for streams that don't set their own. Empty = public.
+	DefaultPolicy string `mapstructure:"default_policy" json:"default_policy,omitempty" yaml:"default_policy,omitempty"`
+
+	// TokenSecret is the HMAC-SHA256 key the server uses to VERIFY playback
+	// tokens. Clients (your app) mint tokens with the same secret — the server
+	// never issues them. Required when any stream's effective policy is "token".
+	// See internal/mediaauth.SignToken for the canonical token format.
+	TokenSecret string `mapstructure:"token_secret" json:"token_secret,omitempty" yaml:"token_secret,omitempty"`
+
+	// Static allow/deny chain. IPs accept exact addresses or CIDR ranges;
+	// Countries are ISO 3166-1 alpha-2 codes (need a GeoIP DB — see
+	// SessionsConfig.GeoIPDBPath); UserAgents match case-insensitive substring;
+	// AllowedDomains match the Referer host (exact or parent domain).
+	AllowIPs        []string `mapstructure:"allow_ips" json:"allow_ips,omitempty" yaml:"allow_ips,omitempty"`
+	DenyIPs         []string `mapstructure:"deny_ips" json:"deny_ips,omitempty" yaml:"deny_ips,omitempty"`
+	AllowCountries  []string `mapstructure:"allow_countries" json:"allow_countries,omitempty" yaml:"allow_countries,omitempty"`
+	DenyCountries   []string `mapstructure:"deny_countries" json:"deny_countries,omitempty" yaml:"deny_countries,omitempty"`
+	AllowUserAgents []string `mapstructure:"allow_user_agents" json:"allow_user_agents,omitempty" yaml:"allow_user_agents,omitempty"`
+	DenyUserAgents  []string `mapstructure:"deny_user_agents" json:"deny_user_agents,omitempty" yaml:"deny_user_agents,omitempty"`
+	AllowedDomains  []string `mapstructure:"allowed_domains" json:"allowed_domains,omitempty" yaml:"allowed_domains,omitempty"`
 }
 
 // APIAuthConfig configures HTTP Basic auth on the management API. When
