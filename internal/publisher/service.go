@@ -82,10 +82,11 @@ type streamState struct {
 	// config changes (Update path).
 	mpegtsEnabled bool
 
-	// playbackAuth is the stream's media-auth policy override ("public"/"token"/
-	// "" inherit). Mirrored here so PlaybackPolicy answers the authorizer with
-	// an O(1) in-memory lookup instead of a store read per request.
-	playbackAuth string
+	// playbackPolicy is the code of the media-auth Policy this stream binds to
+	// ("" = no policy → public). Mirrored here so PlaybackPolicy answers the
+	// authorizer with an O(1) in-memory lookup instead of a store read per
+	// request.
+	playbackPolicy domain.PolicyCode
 }
 
 // Service manages all output workers for active streams.
@@ -278,13 +279,13 @@ func (s *Service) Start(ctx context.Context, stream *domain.Stream) error {
 
 	baseCtx, baseCancel := context.WithCancel(ctx)
 	ss := &streamState{
-		baseCtx:       baseCtx,
-		baseCancel:    baseCancel,
-		code:          stream.Code,
-		mediaBuf:      buffer.PlaybackBufferID(stream.Code, stream.Transcoder),
-		protocols:     make(map[string]context.CancelFunc),
-		mpegtsEnabled: p.MPEGTS,
-		playbackAuth:  stream.PlaybackAuth,
+		baseCtx:        baseCtx,
+		baseCancel:     baseCancel,
+		code:           stream.Code,
+		mediaBuf:       buffer.PlaybackBufferID(stream.Code, stream.Transcoder),
+		protocols:      make(map[string]context.CancelFunc),
+		mpegtsEnabled:  p.MPEGTS,
+		playbackPolicy: stream.PlaybackPolicy,
 	}
 	s.streams[stream.Code] = ss
 	s.mediaBuffer[stream.Code] = ss.mediaBuf
@@ -452,7 +453,7 @@ func (s *Service) UpdateProtocols(ctx context.Context, old, new *domain.Stream) 
 			s.mediaBuffer[new.Code] = newBuf
 		}
 		ss.mpegtsEnabled = np.MPEGTS
-		ss.playbackAuth = new.PlaybackAuth
+		ss.playbackPolicy = new.PlaybackPolicy
 	}
 	s.mu.Unlock()
 	if !ok {
