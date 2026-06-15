@@ -83,14 +83,6 @@ type IngestorConfig struct {
 	// HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.
 	// This is a server-wide memory guard, not a per-stream policy.
 	HLSMaxSegmentBuffer int `mapstructure:"hls_max_segment_buffer" json:"hls_max_segment_buffer" yaml:"hls_max_segment_buffer"` // default 8
-
-	// AllowPrivateTargets permits HTTP/HLS ingest URLs (and their redirects /
-	// playlist-chosen targets) to reach RFC1918 / IPv6-ULA / RFC6598 addresses.
-	// Default false → private targets are blocked at dial time (S-4). Loopback,
-	// link-local, and cloud-metadata (169.254.0.0/16) are ALWAYS blocked
-	// regardless of this flag. Enable only on a trusted network with on-prem
-	// sources (LAN cameras, internal CDNs).
-	AllowPrivateTargets bool `mapstructure:"allow_private_targets" json:"allow_private_targets,omitempty" yaml:"allow_private_targets,omitempty"`
 }
 
 // BufferConfig controls the in-memory ring buffer.

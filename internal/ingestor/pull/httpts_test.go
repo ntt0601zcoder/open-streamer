@@ -11,15 +11,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
-// newTestHTTPTSReader builds a reader that allows private/loopback targets so
-// the httptest servers (127.0.0.1) used below are reachable through the SSRF
-// dial guard. Production callers pass the configured value (default: blocked).
+// newTestHTTPTSReader builds a reader for the httptest servers (127.0.0.1)
+// used below. Ingest no longer carries an SSRF dial guard, so any target is
+// reachable.
 func newTestHTTPTSReader(in domain.Input) *HTTPTSReader {
-	return NewHTTPTSReader(in, config.IngestorConfig{AllowPrivateTargets: true})
+	return NewHTTPTSReader(in)
 }
 
 // HTTPTSReader streams whatever the server sends, in order, with no

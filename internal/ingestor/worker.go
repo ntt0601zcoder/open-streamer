@@ -622,12 +622,7 @@ func shouldFailoverImmediately(err error) bool {
 	// every few seconds without surfacing as an input error).
 	if strings.Contains(msg, "x509:") ||
 		strings.Contains(msg, "tls:") ||
-		strings.Contains(msg, "no such host") ||
-		// SSRF egress guard rejected the destination (private/loopback/metadata
-		// with allow_private_targets off). A policy block never recovers by
-		// reconnecting, so surface it as an input error → immediate failover
-		// instead of spinning the reconnect loop forever.
-		strings.Contains(msg, "netguard:") {
+		strings.Contains(msg, "no such host") {
 		return true
 	}
 	m := httpStatusPattern.FindStringSubmatch(msg)

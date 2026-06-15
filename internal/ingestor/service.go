@@ -55,10 +55,9 @@ type pullWorkerEntry struct {
 //   - Push inputs: stream key is registered in the push server routing table;
 //     the next encoder connection for that key is accepted and routed here.
 type Service struct {
-	// cfgPtr holds the latest IngestorConfig, stored atomically so SetConfig can
-	// hot-swap it (e.g. allow_private_targets) and the next reader built on a
-	// stream start / failover switch observes the new value without a reboot.
-	cfgPtr atomic.Pointer[config.IngestorConfig]
+	// cfg holds the server-level ingestor config (e.g. HLSMaxSegmentBuffer),
+	// captured at construction and read when a reader is built.
+	cfg config.IngestorConfig
 	// listenersPtr holds the latest ListenersConfig. Stored atomically so
 	// SetListeners can hot-swap the value while Run reads it once at
 	// startup. Runtime.diff calls SetListeners THEN restarts the service
@@ -102,6 +101,7 @@ func New(i do.Injector) (*Service, error) {
 	vods := do.MustInvoke[*vod.Registry](i)
 
 	svc := &Service{
+		cfg:      cfg,
 		buf:      buf,
 		bus:      bus,
 		m:        m,
@@ -109,27 +109,8 @@ func New(i do.Injector) (*Service, error) {
 		registry: NewRegistry(),
 		workers:  make(map[domain.StreamCode]*pullWorkerEntry),
 	}
-	svc.cfgPtr.Store(&cfg)
 	svc.listenersPtr.Store(&listeners)
 	return svc, nil
-}
-
-// SetConfig hot-swaps the IngestorConfig. The next reader built on a stream
-// start or failover switch reads the new value (e.g. allow_private_targets) via
-// currentCfg — no reboot needed. Already-running readers keep their value until
-// they reconnect/switch.
-func (s *Service) SetConfig(cfg config.IngestorConfig) {
-	cp := cfg
-	s.cfgPtr.Store(&cp)
-}
-
-// currentCfg returns the latest IngestorConfig snapshot. Always non-nil after
-// construction.
-func (s *Service) currentCfg() config.IngestorConfig {
-	if p := s.cfgPtr.Load(); p != nil {
-		return *p
-	}
-	return config.IngestorConfig{}
 }
 
 // SetListeners hot-swaps the shared listeners config. The next invocation
@@ -359,7 +340,7 @@ func (s *Service) Probe(ctx context.Context, input domain.Input) error {
 	if protocol.IsPushListen(input.URL) {
 		return fmt.Errorf("ingestor: probe unsupported for push-listen input %q", input.URL)
 	}
-	reader, err := NewPacketReader(input, s.currentCfg(), s.vods, s.buf, s.streamLookup)
+	reader, err := NewPacketReader(input, s.cfg, s.vods, s.buf, s.streamLookup)
 	if err != nil {
 		return err
 	}
@@ -405,7 +386,7 @@ func (s *Service) Stop(streamID domain.StreamCode) {
 // ---- private ----
 
 func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCode, input domain.Input, bufferWriteID domain.StreamCode) error {
-	reader, err := NewPacketReader(input, s.currentCfg(), s.vods, s.buf, s.streamLookup)
+	reader, err := NewPacketReader(input, s.cfg, s.vods, s.buf, s.streamLookup)
 	if err != nil {
 		return fmt.Errorf("ingestor: create packet reader: %w", err)
 	}

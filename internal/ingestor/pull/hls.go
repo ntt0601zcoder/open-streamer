@@ -36,7 +36,6 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
-	"github.com/ntt0601zcoder/open-streamer/internal/netguard"
 	"github.com/ntt0601zcoder/open-streamer/pkg/version"
 )
 
@@ -162,7 +161,6 @@ type hlsVariant struct {
 // deferred close does not affect the new one.
 type HLSReader struct {
 	input  domain.Input
-	cfg    config.IngestorConfig
 	maxBuf int
 
 	// plClient: short-timeout client for playlist GETs.
@@ -183,7 +181,6 @@ func NewHLSReader(input domain.Input, cfg config.IngestorConfig) *HLSReader {
 	}
 	return &HLSReader{
 		input:  input,
-		cfg:    cfg,
 		maxBuf: maxBuf,
 	}
 }
@@ -204,22 +201,15 @@ func (r *HLSReader) Open(ctx context.Context) error {
 	// Build a shared transport so playlist + segment clients pick up the
 	// same TLS policy. Default uses Go's secure defaults; the operator can
 	// opt out via input.net.insecure_tls = true (e.g. self-signed source on
-	// a trusted private network — Vietnamese TV CDN often expired certs).
+	// a trusted private network — broadcast CDNs often serve expired certs).
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if r.input.Net.InsecureTLS {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // operator-opted-in for sources on trusted networks
 		slog.Warn("hls reader: TLS verification disabled per input.net.insecure_tls",
 			"url", r.input.URL)
 	}
-	// SSRF dial guard (S-4): reject loopback / link-local / cloud-metadata
-	// always, and RFC1918/ULA unless allow_private_targets. This covers BOTH
-	// playlist + segment fetches and — because the guard runs on every dial —
-	// the attacker-chosen targets inside a remote playlist and any redirect.
-	// CheckRedirect caps the chain and strips credential headers on host change.
-	netguard.ApplyToTransport(transport, netguard.IngestPolicy(r.cfg.AllowPrivateTargets))
-	redirect := netguard.CheckRedirect()
-	r.plClient = &http.Client{Timeout: plTimeout, Transport: transport, CheckRedirect: redirect}
-	r.segClient = &http.Client{Timeout: segTimeout, Transport: transport, CheckRedirect: redirect}
+	r.plClient = &http.Client{Timeout: plTimeout, Transport: transport}
+	r.segClient = &http.Client{Timeout: segTimeout, Transport: transport}
 
 	// Fresh channel and once per Open() call so the previous poll goroutine's
 	// deferred close(out) cannot race with this new goroutine's close.

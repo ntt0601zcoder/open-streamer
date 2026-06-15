@@ -423,15 +423,6 @@ definitions:
     type: object
   config.IngestorConfig:
     properties:
-      allow_private_targets:
-        description: |-
-          AllowPrivateTargets permits HTTP/HLS ingest URLs (and their redirects /
-          playlist-chosen targets) to reach RFC1918 / IPv6-ULA / RFC6598 addresses.
-          Default false → private targets are blocked at dial time (S-4). Loopback,
-          link-local, and cloud-metadata (169.254.0.0/16) are ALWAYS blocked
-          regardless of this flag. Enable only on a trusted network with on-prem
-          sources (LAN cameras, internal CDNs).
-        type: boolean
       hls_max_segment_buffer:
         description: |-
           HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.
