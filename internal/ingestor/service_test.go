@@ -47,12 +47,13 @@ func (b *capturingBus) Subscribe(_ domain.EventType, _ events.HandlerFunc) func(
 func newTestService() *Service {
 	buf := buffer.NewServiceForTesting(8)
 	svc := &Service{
-		cfg:      config.IngestorConfig{},
 		buf:      buf,
 		bus:      &capturingBus{},
 		registry: NewRegistry(),
 		workers:  make(map[domain.StreamCode]*pullWorkerEntry),
 	}
+	ingCfg := config.IngestorConfig{}
+	svc.cfgPtr.Store(&ingCfg)
 	cp := config.ListenersConfig{}
 	svc.listenersPtr.Store(&cp)
 	return svc
@@ -119,6 +120,26 @@ func TestService_CurrentListenersZeroValueWhenUnset(t *testing.T) {
 	svc := &Service{}
 	got := svc.currentListeners()
 	assert.False(t, got.RTMP.Enabled)
+}
+
+// ─── SetConfig / currentCfg ──────────────────────────────────────────────────
+
+func TestService_SetConfigHotSwaps(t *testing.T) {
+	t.Parallel()
+	svc := newTestService()
+	// Default is the zero value (allow_private_targets off).
+	assert.False(t, svc.currentCfg().AllowPrivateTargets)
+
+	svc.SetConfig(config.IngestorConfig{AllowPrivateTargets: true})
+	assert.True(t, svc.currentCfg().AllowPrivateTargets,
+		"SetConfig must make the new allow_private_targets visible to the next reader")
+}
+
+func TestService_CurrentCfgZeroValueWhenUnset(t *testing.T) {
+	t.Parallel()
+	// cfgPtr never populated → fall back to zero value, never nil-deref.
+	svc := &Service{}
+	assert.False(t, svc.currentCfg().AllowPrivateTargets)
 }
 
 // ─── observer setters ────────────────────────────────────────────────────────
@@ -276,6 +297,7 @@ func TestShouldFailoverImmediately(t *testing.T) {
 		{"TLS handshake failure", errors.New("tls: handshake failure"), true},
 		{"x509 cert untrusted", errors.New("x509: certificate signed by unknown authority"), true},
 		{"DNS resolution failure", errors.New("dial tcp: lookup foo: no such host"), true},
+		{"SSRF guard block", errors.New("hls: GET ...: dial tcp 10.0.0.1:80: 10.0.0.1: netguard: destination blocked: private/shared address"), true},
 		{"HTTP 401", errors.New("hls: fetch failed http 401 unauthorized"), true},
 		{"HTTP 403", errors.New("hls: http 403"), true},
 		{"HTTP 404", errors.New("hls: http 404 not found"), true},
