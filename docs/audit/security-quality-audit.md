@@ -50,7 +50,7 @@
 ---
 
 #### S-2 (CRITICAL) — Unauthenticated arbitrary host-file create/append (and blind SSRF) via hooks
-> ✅ **FIXED** in `fix/security-critical-high` — REST `Create`/`Update` now run `domain.Hook.Validate(fileRoot)` (shared with the YAML path, replacing `validateHookTypeTarget`), closing the zero-validation gap. File hooks are confined to `hooks.file_root_dir` (`pathInside` after `Clean`, rejecting `..`) — enforced at the REST/YAML boundary AND re-checked in `deliverFile` at delivery time. The hooks `http.Client` now uses `internal/netguard` so loopback + link-local/cloud-metadata (169.254.169.254) are blocked at dial time (a hook can't pivot to the local admin API or IMDS); internal RFC1918 webhooks stay allowed. Tests: `TestHookValidate`, hook handler tests. **Residual (noted):** file containment is opt-in (`file_root_dir` empty = legacy absolute-path-only); a symlink planted *inside* the configured root is still followed by the `O_APPEND|O_CREATE` write — keep the root symlink-free. **Hot-reload added** (`fix/security-critical-high`): `hooks.file_root_dir` is now read live — `hooks.Service` holds it in an `atomic.Pointer` (`SetConfig`/`FileRootDir()`), the REST handler reads `h.hooks.FileRootDir()` per request instead of caching at boot, and `runtime.Manager.diff` calls `HooksSvc.SetConfig` on a hooks-config change, so setting the root takes effect without a restart.
+> ✅ **FIXED** in `fix/security-critical-high` — REST `Create`/`Update` now run `domain.Hook.Validate(fileRoot)` (shared with the YAML path, replacing `validateHookTypeTarget`), closing the zero-validation gap. File hooks are confined to `hooks.file_root_dir` (`pathInside` after `Clean`, rejecting `..`) — enforced at the REST/YAML boundary AND re-checked in `deliverFile` at delivery time. Tests: `TestHookValidate`, hook handler tests. (The HTTP-hook half — an egress dial guard on the webhook client — was added then **removed** by operator decision; see S-6.) **Residual (noted):** file containment is opt-in (`file_root_dir` empty = legacy absolute-path-only); a symlink planted *inside* the configured root is still followed by the `O_APPEND|O_CREATE` write — keep the root symlink-free. **Hot-reload added** (`fix/security-critical-high`): `hooks.file_root_dir` is now read live — `hooks.Service` holds it in an `atomic.Pointer` (`SetConfig`/`FileRootDir()`), the REST handler reads `h.hooks.FileRootDir()` per request instead of caching at boot, and `runtime.Manager.diff` calls `HooksSvc.SetConfig` on a hooks-config change, so setting the root takes effect without a restart.
 
 **Files:** `internal/api/handler/hook.go:84` (Create) / `:128` (Update); file sink `internal/hooks/service.go:337-365` (`deliverFile`, only guard `filepath.IsAbs` at `:342`, `O_APPEND|O_CREATE|O_WRONLY 0o644` at `:356`); HTTP sink `internal/hooks/batcher.go:414-446` (`postOnce`); store `internal/store/json/store.go:328-333`.
 **Merges:** "file-type hook arbitrary write", "hook create/update skip validation".
@@ -84,7 +84,7 @@
 ---
 
 #### S-4 (HIGH) — SSRF via unvalidated ingest/pull input URLs (content- and redirect-chosen targets)
-> 🚫 **WON'T FIX / RISK ACCEPTED (operator decision)** in `fix/remove-ingest-ssrf-guard` — the ingest SSRF guard was **removed**. Rationale: this server's primary role is pulling from **internal / LAN sources** (on-prem origins, internal CDNs, LAN cameras, multicast), so blocking private/RFC1918 targets is counterproductive and operationally fragile — the default-off guard caused a real production failover freeze (an internal HLS input was blocked at dial, the worker reconnect-looped, no error surfaced). The guard also only ever covered the HTTP-family pulls (HLS / HTTP-TS); RTSP/RTMP/SRT/UDP were never guarded, so it never provided complete coverage. The decisive compensating control is **S-1 (control-plane Basic auth)**: the admin API that made this SSRF remotely reachable is now authenticated, removing the unauthenticated-remote exploitation angle that made it High. Removed: `netguard.ApplyToTransport` + `CheckRedirect` on the HLS/HTTP-TS clients, the save-time `netguard.ValidateInputURL` speed-bump in `decodeStreamBody`, the `ingestor.allow_private_targets` config flag, and the `netguard:` fail-fast clause in the ingest worker. **Kept:** the `internal/netguard` package itself and its use by the **webhook HTTP client** (S-2 — a hook must never reach the local admin API / IMDS); that loopback+metadata guard stays. `IngestPolicy` / `ValidateInputURL` remain as unused helpers.
+> 🚫 **WON'T FIX / RISK ACCEPTED (operator decision)** in `fix/remove-ingest-ssrf-guard` — the ingest SSRF guard was **removed**. Rationale: this server's primary role is pulling from **internal / LAN sources** (on-prem origins, internal CDNs, LAN cameras, multicast), so blocking private/RFC1918 targets is counterproductive and operationally fragile — the default-off guard caused a real production failover freeze (an internal HLS input was blocked at dial, the worker reconnect-looped, no error surfaced). The guard also only ever covered the HTTP-family pulls (HLS / HTTP-TS); RTSP/RTMP/SRT/UDP were never guarded, so it never provided complete coverage. The decisive compensating control is **S-1 (control-plane Basic auth)**: the admin API that made this SSRF remotely reachable is now authenticated, removing the unauthenticated-remote exploitation angle that made it High. Removed: `netguard.ApplyToTransport` + `CheckRedirect` on the HLS/HTTP-TS clients, the save-time `netguard.ValidateInputURL` speed-bump in `decodeStreamBody`, the `ingestor.allow_private_targets` config flag, and the `netguard:` fail-fast clause in the ingest worker. The `internal/netguard` package was initially kept for the webhook client, but that guard was later removed too (operator decision — webhooks legitimately target private/local endpoints; see S-6) and the **package was deleted**. No egress IP guard remains in the codebase.
 >
 > 🔕 **Follow-up bug IGNORED (won't fix)** — a later investigation found the ingest guard (a) only covered HLS/HTTP-TS, leaving RTSP/RTMP/SRT internal inputs unguarded, and (b) wasn't retroactive to already-running readers when `allow_private_targets` was toggled. Both are moot now that the guard is removed; marked ignore per operator decision.
 
@@ -118,11 +118,15 @@
 ---
 
 #### S-6 (MEDIUM) — Blind SSRF via HTTP hook target
-Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any operator-supplied URL with no host allowlist; downgraded from High by verification because delivery is blind (`DeliverTestEvent` returns nil immediately, `service.go:128-132`) and POST-only (weakens IMDS GET credential-theft). Fix: the `DialContext` guard described in S-2.
+> 🚫 **WON'T FIX / RISK ACCEPTED (operator decision)** — the webhook egress dial guard (`internal/netguard`, added in the S-2 batch) was **removed** and the package deleted; the hooks client is a plain `&http.Client{}` again. Rationale: (1) delivery is **POST + blind** (`DeliverTestEvent` returns nil immediately) with a **body the caller does not control** (the event JSON) — no response/oracle, and IMDS credential theft needs GET/PUT so POST can't reach it; (2) configuring a hook URL now requires admin auth (**S-1**), so this is no longer an unauthenticated primitive — pointing a webhook at an arbitrary URL is the intended feature; (3) operators legitimately need to push webhooks to **private and local** endpoints (sidecar log collectors, internal services on loopback), which the guard blocked. Residual is negligible: a blind POST with a fixed-shape body to an internal host, gated behind admin auth.
+
+`batcher.go:414-446` POSTs to any operator-supplied URL with no host allowlist; downgraded from High at audit time because delivery is blind and POST-only.
 
 ---
 
 #### S-7 (MEDIUM) — Secrets in logs: SRT passphrase and credentialed pull URLs logged in cleartext
+> 🚫 **ACCEPTED (operator decision)** — single-tenant host with restricted log / journald access; only URL-embedded secrets are affected (passphrases supplied via `input.params` are not logged). The URL in logs is operationally useful for diagnosing ingest; the local-disclosure risk is accepted. Revisit if logs are shipped to a broader audience.
+
 **Files:** `internal/ingestor/pull/srt.go:76-81` (`slog.Info(... "url", r.input.URL)` on every connect) + `:66` (URL in error); `internal/ingestor/worker.go:103-107` (connect) / `:254-260` (`handleOpenFailure`, repeated during backoff); `hls.go:210-211/308/382/387`; `httpts.go:78/87/93` (these are `fmt.Errorf` wraps, not slog — minor locator correction, but the wrapped URL still reaches the log via `handleOpenFailure`'s `"err"` field); also `rtsp.go` at 12 sites (`:120,135,150,204,231,309,333,405,420,449`) and `rtmp.go:164`.
 
 **Trigger:** Any SRT input `srt://host?...&passphrase=secret` or credentialed pull URL (`http://user:pass@host`, `?token=...`, RTSP `user:pass@`) is logged at Info on connect/reconnect/open-failure. A passphrase supplied via `input.Params` (not the URL) is *not* logged — only URL-embedded secrets leak.
@@ -136,6 +140,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### S-8 (MEDIUM) — Push ingest has no authentication; auto-publish lets any client materialise streams
+> ✅ **FIXED** in `fix/push-ingest-auth` — push ingest now enforces the per-stream `StreamKey` that was previously defined-but-unwired. An RTMP publisher supplies the secret as `?key=<secret>` on the publish URL (`rtmp://host/<path>?key=…`); lal strips the query from the stream name so routing (`rtmpRouteKey`) is unaffected. The RTMP server resolves the stream's configured `StreamKey` via a resolver (publisher in-memory table for live + auto-publish runtime streams → store+template fallback for configured streams, mirroring the media-auth `PolicyResolver`) and constant-time-compares it before claiming the registry slot, so a mismatch is rejected before any slot/pipeline state changes. An empty `StreamKey` opts the stream out (unauthenticated, backward-compatible). Auto-publish enforces the matching template's `StreamKey` inside `ResolveOrCreate` **before** materialising the runtime stream, so an unauthorised push never spins a pipeline. Tests: `TestPushKeyOK`, `TestPushSecretFromQuery`, `TestResolveOrCreate_StreamKeyEnforced`. **Residual (noted):** the concurrent-runtime-stream cap + per-source-IP rate-limit from the original recommendation are not implemented (DoS hardening, orthogonal to the auth gap); SRT push has no server in the codebase, so there is nothing to gate there.
+
 **Files:** `internal/ingestor/push/rtmp_server.go:350-402` (`OnNewRtmpPubSession`, target from `rtmpRouteKey` only — no secret read), `:232-257` (`acquireOrAutoPublish`); `internal/ingestor/registry.go:76-89` (`Acquire` checks only registered + not-active); `internal/ingestor/service.go:607-617` (`pushStreamKey` = stream code); `internal/autopublish/service.go:143-204` (`ResolveOrCreate` — prefix match + code-shape validation only).
 
 **Trigger:** Any client that can TCP-connect to the RTMP push port and knows/guesses a registered stream code can publish into an **idle** `publish://` slot (the full path is the only credential). With an `AutoPublishResolver` wired, a push to any path matching a template prefix synthesises a runtime stream and starts a pipeline.
@@ -147,6 +153,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### S-9 (MEDIUM) — Hook HMAC secrets disclosed via GET /hooks and GET /config/yaml
+> 🚫 **ACCEPTED (operator decision)** — the control plane is now behind Basic-auth (S-1), so only authenticated admins read hook config, and an admin managing hooks legitimately needs the secret (it is the round-trip source for `PUT /config/yaml`). No unauthenticated exposure remains. Risk accepted.
+
 **Files:** `internal/domain/hook.go:55` (`Secret` with `json:"secret" yaml:"secret"`, no redaction); `internal/api/handler/hook.go:65-72` (List), `:106-114` (Get), `:95/:146` (Create/Update echo); `internal/api/handler/config_yaml.go:60-101` (`GetConfigYAML` marshals `Hooks`), `:207/227` (PUT success returns `hooksAfter`). Secret is the HMAC-SHA256 key (`internal/hooks/batcher.go:413-427`, sets `X-OpenStreamer-Signature`).
 
 **Trigger:** `GET /config/yaml` or `GET /hooks` returns every hook's signing secret verbatim. Reachable unauthenticated (S-1); transits plaintext (no TLS).
@@ -160,6 +168,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### S-10 (MEDIUM) — Push destination URLs (stream keys/credentials) exposed via logs, /metrics, and RuntimeStatus
+> 🚫 **ACCEPTED (operator decision)** — same trust model as S-7: single-tenant host, admin API + `/metrics` access controlled. Redaction is hardening, not a remote vulnerability. Risk accepted.
+
 **Files:** logs `internal/publisher/push_rtmp.go:166,174,217,254,385,407,415,425,433,438,462` (Info/Warn `"url"` on every lifecycle event, fires on every retry); metrics `internal/metrics/metrics.go:290/371/409` (`dest_url` label) ← `internal/publisher/service.go:678/688`, `internal/publisher/runtime.go:112/126`; API `internal/publisher/runtime.go:214-244` (`PushSnapshot.URL` unredacted) → `internal/api/handler/stream.go:132-133`; event payload `runtime.go:154`.
 **Merges:** "push URL logged + RuntimeStatus" (low) and "push URL on /metrics" (medium, two reports).
 
@@ -172,6 +182,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### S-11 (MEDIUM) — Secrets persisted in world-readable store files
+> 🚫 **ACCEPTED (operator decision)** — strictly local, single-tenant host, mitigated by the deployment umask; a CWE-276 hardening defect with no remote angle. Risk accepted (file mode could be tightened to 0600 cheaply later if desired).
+
 **Files:** `internal/store/json/store.go:52` (`MkdirAll 0o755`), `:118` (`WriteFile 0o644`) + `:121` rename; identical `internal/store/yaml/store.go:53/119`. No `os.Chmod`/`0o600` anywhere in `internal/store/`. Secrets serialized: `Hook.Secret`, `Stream.StreamKey`, `Input.Headers`/`Input.Params` (Authorization headers / SRT passphrases / S3 keys).
 
 **Trigger:** Any local user/process that can traverse to the data dir reads `<dataDir>/open_streamer.json` (mode 0644, umask-masked). Default driver `json`, default dir wired in `cmd/server/main.go:153/165`.
@@ -183,6 +195,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### S-12 (LOW) — HLS timeshift master-playlist injection via unvalidated `from/dur/delay/ago`
+> 🚫 **ACCEPTED (operator decision)** — LOW; impact is bounded to the requesting client's own generated playlist (no cross-user / server effect) — a crafted-param nuisance, not a privilege or data boundary. Risk accepted.
+
 **Files:** `internal/api/handler/blob_timeshift.go:106-108` (master branch renders **before** the numeric validation at `:110-119`), `:238-246` (`timeshiftParams` rebuilds `k+"="+v` raw); `internal/dvr/blob/hls.go:20-21/43` (`Fprintf` into the manifest).
 **Merges:** two reported timeshift-injection findings.
 
@@ -208,6 +222,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### S-14 (LOW) — Subprocess gRPC unix socket is unauthenticated
+> 🚫 **ACCEPTED (operator decision)** — the gRPC unix socket is a filesystem object scoped to the local host / service user (a per-stream child process); local-only, no network exposure. Risk accepted.
+
 **Files:** `cmd/open-streamer-transcoder/main.go:64-94` (`lc.Listen("unix", ...)` no chmod, plain `grpc.NewServer()` no peer check); `internal/transcoder/supervisor.go:534-539` (`pickSocketPath` under `os.TempDir()`).
 **Verdict:** partially-confirmed.
 
@@ -220,6 +236,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### S-15 (LOW) — Client IP / session fingerprint spoofable via X-Forwarded-For / X-Real-IP
+> 🚫 **ACCEPTED (operator decision)** — IP / country playback rules are only relied upon behind a header-overwriting trusted proxy (documented residual); they are not a security boundary in this deployment. Risk accepted.
+
 **Files:** `internal/sessions/tracker.go:160-177` (`clientIP` reads XFF/X-Real-IP directly) → `fingerprintID` `:295`, GeoIP `:346`, event payload `:622/646`; `internal/api/server.go:163` (`middleware.RealIP` mutates `r.RemoteAddr`).
 
 **Trigger:** Send `X-Forwarded-For: <arbitrary>` on any HLS/DASH GET. The IP feeds the session fingerprint, GeoIP country, and attribution.
@@ -231,6 +249,8 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 ---
 
 #### S-16 (LOW) — pprof listener: unauthenticated heap/goroutine dumps + always-on block/mutex profiling
+> 🚫 **ACCEPTED (operator decision)** — operational profiling endpoint; bound to localhost / an ops-only network at deploy time. Risk accepted as an ops tool.
+
 **Files:** `internal/api/server.go:393-436` (`startPprofListener`), `:414-415` (`SetBlockProfileRate(10ms)`/`SetMutexProfileFraction(100)` unconditional, never reset), `:398-407` (mux, no auth), `:418` (addr used verbatim, no loopback enforcement). `config/config.go:39` — no default, opt-in.
 
 **Trigger:** Operator sets `pprof_addr`. Serves `/debug/pprof/*` (heap/goroutine/cmdline/profile/trace) unauthenticated and forces process-wide contention profiling on. A config reload clearing `pprof_addr` stops the listener but leaves the profilers enabled (slightly worse than reported).
@@ -436,7 +456,7 @@ Covered as the HTTP-sink half of **S-2**. `batcher.go:414-446` POSTs to any oper
 #### A-5 (HIGH) — `manager.Register` swallows initial `ingestor.Start` failure → permanent zombie stream reported Active
 > ✅ **FIXED** in `fix/lifecycle-self-heal` — `Register`'s synchronous start-failure branch now routes through `ReportInputError`, so the input degrades, error history is recorded, and failover / exhausted-handling engage (multi-input promotes a backup; single-input flips to Degraded + probe loop). `Register` also refuses a duplicate registration (no monitor-goroutine leak). Tests `TestRegister_StartFailureDrivesExhausted`, `TestRegister_RefusesDuplicate`. (The connects-but-no-packets Idle blind spot is a noted follow-up.)
 >
-> ✅ **FOLLOW-UP FIXED** in `fix/security-critical-high` — the connects-but-no-packets / never-first-packet blind spot is closed. `collectTimeoutIfNeeded` no longer gates on `StatusActive`: it now fires for the **active** input whenever `now − LastPacketAt > timeout` regardless of status (Idle/Degraded excluded only while a failover is already in flight). `Register` stamps `LastPacketAt = now` on each input so the timeout window measures connect-to-first-packet time as a grace period. A switched-to input (manual `/switch` or auto-failover) that connects but never delivers a packet now times out and fails over to the next priority instead of freezing forever. Complement: the ingest worker (`shouldFailoverImmediately`) now classifies `netguard:`-blocked dials as fail-immediately, so an SSRF-rejected input reports the error and triggers failover instantly rather than reconnect-looping silently. Tests `TestCollectTimeoutIfNeeded_NeverActiveTimesOut`, `TestCollectTimeoutIfNeeded_IdleWithinGrace`, and the `shouldFailoverImmediately` SSRF case.
+> ✅ **FOLLOW-UP FIXED** in `fix/security-critical-high` — the connects-but-no-packets / never-first-packet blind spot is closed. `collectTimeoutIfNeeded` no longer gates on `StatusActive`: it now fires for the **active** input whenever `now − LastPacketAt > timeout` regardless of status (Idle/Degraded excluded only while a failover is already in flight). `Register` stamps `LastPacketAt = now` on each input so the timeout window measures connect-to-first-packet time as a grace period. A switched-to input (manual `/switch` or auto-failover) that connects but never delivers a packet now times out and fails over to the next priority instead of freezing forever. Tests `TestCollectTimeoutIfNeeded_NeverActiveTimesOut`, `TestCollectTimeoutIfNeeded_IdleWithinGrace`.
 
 **Files:** `internal/manager/service.go:415-421` (error only logged, `Register` returns nil), `:816` (`collectTimeoutIfNeeded` needs StatusActive), `:846/849` (`collectProbeIfNeeded` needs StatusDegraded); `coordinator.go:189-199` (StreamStatus = Active when registered + no degradation), `:964-966` (reconciler skips IsRunning).
 
