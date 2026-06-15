@@ -11,8 +11,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
+
+// newTestHTTPTSReader builds a reader that allows private/loopback targets so
+// the httptest servers (127.0.0.1) used below are reachable through the SSRF
+// dial guard. Production callers pass the configured value (default: blocked).
+func newTestHTTPTSReader(in domain.Input) *HTTPTSReader {
+	return NewHTTPTSReader(in, config.IngestorConfig{AllowPrivateTargets: true})
+}
 
 // HTTPTSReader streams whatever the server sends, in order, with no
 // reframing. The test serves three TS-like packets back-to-back and verifies
@@ -39,7 +47,7 @@ func TestHTTPTSReader_StreamsBodyBytes(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := NewHTTPTSReader(domain.Input{URL: srv.URL + "/streams/test/mpegts"})
+	r := newTestHTTPTSReader(domain.Input{URL: srv.URL + "/streams/test/mpegts"})
 	require.NoError(t, r.Open(context.Background()))
 	defer r.Close()
 
@@ -71,7 +79,7 @@ func TestHTTPTSReader_OpenReturnsHTTPStatusError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := NewHTTPTSReader(domain.Input{URL: srv.URL + "/streams/missing/mpegts"})
+	r := newTestHTTPTSReader(domain.Input{URL: srv.URL + "/streams/missing/mpegts"})
 	err := r.Open(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "404", "error must surface the HTTP status code")
@@ -81,7 +89,7 @@ func TestHTTPTSReader_OpenReturnsHTTPStatusError(t *testing.T) {
 // Close() pattern).
 func TestHTTPTSReader_CloseWithoutOpen(t *testing.T) {
 	t.Parallel()
-	r := NewHTTPTSReader(domain.Input{URL: "http://example.invalid/"})
+	r := newTestHTTPTSReader(domain.Input{URL: "http://example.invalid/"})
 	assert.NoError(t, r.Close())
 }
 
@@ -96,7 +104,7 @@ func TestHTTPTSReader_ForwardsCustomHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := NewHTTPTSReader(domain.Input{
+	r := newTestHTTPTSReader(domain.Input{
 		URL:     srv.URL + "/streams/test/mpegts",
 		Headers: map[string]string{"Authorization": "Bearer abc123"},
 	})
@@ -122,7 +130,7 @@ func TestHTTPTSReader_ReadAfterCloseDoesNotPanic(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := NewHTTPTSReader(domain.Input{URL: srv.URL + "/streams/test/mpegts"})
+	r := newTestHTTPTSReader(domain.Input{URL: srv.URL + "/streams/test/mpegts"})
 	require.NoError(t, r.Open(context.Background()))
 	require.NoError(t, r.Close())
 

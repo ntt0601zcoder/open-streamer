@@ -50,6 +50,8 @@
 ---
 
 #### S-2 (CRITICAL) — Unauthenticated arbitrary host-file create/append (and blind SSRF) via hooks
+> ✅ **FIXED** in `fix/security-critical-high` — REST `Create`/`Update` now run `domain.Hook.Validate(fileRoot)` (shared with the YAML path, replacing `validateHookTypeTarget`), closing the zero-validation gap. File hooks are confined to `hooks.file_root_dir` (`pathInside` after `Clean`, rejecting `..`) — enforced at the REST/YAML boundary AND re-checked in `deliverFile` at delivery time. The hooks `http.Client` now uses `internal/netguard` so loopback + link-local/cloud-metadata (169.254.169.254) are blocked at dial time (a hook can't pivot to the local admin API or IMDS); internal RFC1918 webhooks stay allowed. Tests: `TestHookValidate`, hook handler tests. **Residual (noted):** file containment is opt-in (`file_root_dir` empty = legacy absolute-path-only); a symlink planted *inside* the configured root is still followed by the `O_APPEND|O_CREATE` write — keep the root symlink-free.
+
 **Files:** `internal/api/handler/hook.go:84` (Create) / `:128` (Update); file sink `internal/hooks/service.go:337-365` (`deliverFile`, only guard `filepath.IsAbs` at `:342`, `O_APPEND|O_CREATE|O_WRONLY 0o644` at `:356`); HTTP sink `internal/hooks/batcher.go:414-446` (`postOnce`); store `internal/store/json/store.go:328-333`.
 **Merges:** "file-type hook arbitrary write", "hook create/update skip validation".
 
@@ -66,6 +68,8 @@
 ---
 
 #### S-3 (HIGH) — Lavfi filtergraph injection via unescaped watermark `font_color`
+> ✅ **FIXED** in `fix/security-critical-high` — `domain.WatermarkConfig.Validate` now rejects any `FontColor` that isn't a plain color literal (named / `#RRGGBB[AA]` / `0xRRGGBB[AA]`, optional `@<0..1>`) via `ValidateFontColor`, so injection metacharacters (`:`, `,`, `'`, `[`) never pass save-time. Defense-in-depth in the filtergraph: `buildTextFilter` single-quotes the fontcolor, and `escapeLavfiArg` now also escapes single-quote (`'\''`) — which additionally closes the secondary `fontfile`/`movie` single-quote breakout. Tests: `TestValidateFontColor`, watermark filter tests.
+
 **Files:** `internal/transcoder/native/watermark.go:239` (`buildTextFilter`, `"fontcolor="+fontColor`), `:305` (`escapeLavfiArg`); `internal/domain/watermark.go:152`/`stream.go:674` (`Validate` never checks `FontColor`); `internal/transcoder/supervisor.go:617` (verbatim copy); `internal/transcoder/native/server.go:293` (proto→config).
 **Merges:** two reported font_color findings (identical root cause).
 
@@ -80,6 +84,8 @@
 ---
 
 #### S-4 (HIGH) — SSRF via unvalidated ingest/pull input URLs (content- and redirect-chosen targets)
+> ✅ **FIXED** in `fix/security-critical-high` — new `internal/netguard` installs a dial-time guard (`net.Dialer.Control` on the RESOLVED IP) on the HTTP-TS and HLS pull clients (playlist + segment), so loopback / link-local / cloud-metadata are rejected at connect time and private/RFC1918 unless `ingestor.allow_private_targets` (default off). Because the guard runs on every dial it covers DNS-rebind, redirect chains, AND the attacker-chosen targets inside a remote HLS playlist. `CheckRedirect` caps the chain (10) and strips `Authorization`/`Cookie` on cross-host redirect (no credential-header leak). `decodeStreamBody` adds a save-time speed-bump (`netguard.ValidateInputURL`) for the always-blocked set. Tests: `internal/netguard` suite. **Residual (noted):** RTSP/RTMP/SRT/UDP dials aren't yet IP-guarded at dial time (lower-value — no body channel; the HTTP body-exfil + cloud-metadata vectors are covered).
+
 **Files:** `internal/api/handler/stream.go:660-679` (`decodeStreamBody` validates code/priority/uniqueness/watermark only — never URL host); `internal/manager/service.go:416/901/1021/1187/1227` (forwards raw `Input.URL` to ingestor on register/failover/probe/switch); pull readers `internal/ingestor/pull/httpts.go:76-85`, `hls.go:417-439/465-484`; `resolveHLSURL hls.go:659-671`; clients at `hls.go:213-214` are bare `&http.Client{}` with **no `CheckRedirect`**.
 **Merges:** three reported SSRF findings (HLS playlist-content SSRF, manager-forwarded SSRF, domain-input SSRF).
 
@@ -94,6 +100,8 @@
 ---
 
 #### S-5 (HIGH) — Unauthenticated arbitrary host-file read via VOD `/raw`
+> ✅ **FIXED** in `fix/security-critical-high` — the `Raw` handler now rejects `!vod.IsVideoFile(abs)` with 404 (the video allowlist `ListFiles`/`UploadFile` already enforced), so a JSON store / `config.yaml` / secret co-located in a mount is no longer served. Defense-in-depth: `ResolvePath` now `EvalSymlinks` and re-checks the mount boundary (defeats symlink escape), and `domain.VODMount.ValidateStorage` refuses mounting sensitive system dirs (`/etc`, `/proc`, `/sys`, `/root`, `/dev`, `/boot`, `/run`). Tests: `TestRegistry_ResolvePathRejectsSymlinkEscape`, `TestValidateStorageRejectsSensitive`.
+
 **Files:** `internal/api/handler/vod.go:265-299` (`Raw`, `http.ServeFile` with no extension policy), `:89` (`Create`), `:482-494` (`ensureMountStorageWritable`); `internal/vod/registry.go:137-152` (`ResolvePath`, lexical `pathInside` only, `:169-170` deliberately no symlink resolution); `internal/domain/vod.go:52-61` (`ValidateStorage` requires only absolute path).
 **Merges:** two reported VOD findings.
 

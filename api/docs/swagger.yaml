@@ -404,6 +404,14 @@ definitions:
           queue cap. Per-hook overrides win; code default is
           DefaultHookBatchMaxQueueItems.
         type: integer
+      file_root_dir:
+        description: |-
+          FileRootDir confines file-type hooks to this directory (S-2). When set,
+          a file hook's target must resolve inside it — preventing arbitrary
+          host-file create/append (e.g. clobbering the store, filling disk). Empty
+          keeps the legacy "any absolute path" behaviour for backward compatibility;
+          operators are encouraged to set it (e.g. /var/log/open-streamer/hooks).
+        type: string
       worker_count:
         description: |-
           WorkerCount sizes the events.Bus worker pool that fans events out
@@ -415,6 +423,15 @@ definitions:
     type: object
   config.IngestorConfig:
     properties:
+      allow_private_targets:
+        description: |-
+          AllowPrivateTargets permits HTTP/HLS ingest URLs (and their redirects /
+          playlist-chosen targets) to reach RFC1918 / IPv6-ULA / RFC6598 addresses.
+          Default false → private targets are blocked at dial time (S-4). Loopback,
+          link-local, and cloud-metadata (169.254.0.0/16) are ALWAYS blocked
+          regardless of this flag. Enable only on a trusted network with on-prem
+          sources (LAN cameras, internal CDNs).
+        type: boolean
       hls_max_segment_buffer:
         description: |-
           HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.

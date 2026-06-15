@@ -26,7 +26,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/netguard"
 	"github.com/ntt0601zcoder/open-streamer/pkg/version"
 )
 
@@ -50,22 +52,27 @@ type HTTPTSReader struct {
 }
 
 // NewHTTPTSReader constructs a reader for the given input. Connection is
-// deferred to Open so the constructor never blocks.
-func NewHTTPTSReader(input domain.Input) *HTTPTSReader {
+// deferred to Open so the constructor never blocks. The transport carries the
+// SSRF dial guard (S-4): loopback / link-local / cloud-metadata are always
+// blocked; RFC1918/ULA are blocked unless cfg.AllowPrivateTargets is set.
+func NewHTTPTSReader(input domain.Input, cfg config.IngestorConfig) *HTTPTSReader {
+	transport := &http.Transport{
+		// Keep-alives off: every Open is a fresh stream so pooled
+		// connections don't help and may surface stale TCP state.
+		DisableKeepAlives: true,
+		// Force the response to be streamed rather than buffered, so
+		// our Read sees bytes as soon as they arrive on the wire.
+		DisableCompression:    true,
+		ResponseHeaderTimeout: timeoutOr(input.Net.TimeoutSec, httpTSDefaultDialTimeout),
+	}
+	netguard.ApplyToTransport(transport, netguard.IngestPolicy(cfg.AllowPrivateTargets))
 	return &HTTPTSReader{
 		input: input,
 		client: &http.Client{
 			// Per-request dial / TLS / headers timeout. Body is unbounded.
-			Timeout: 0,
-			Transport: &http.Transport{
-				// Keep-alives off: every Open is a fresh stream so pooled
-				// connections don't help and may surface stale TCP state.
-				DisableKeepAlives: true,
-				// Force the response to be streamed rather than buffered, so
-				// our Read sees bytes as soon as they arrive on the wire.
-				DisableCompression:    true,
-				ResponseHeaderTimeout: timeoutOr(input.Net.TimeoutSec, httpTSDefaultDialTimeout),
-			},
+			Timeout:       0,
+			Transport:     transport,
+			CheckRedirect: netguard.CheckRedirect(),
 		},
 	}
 }

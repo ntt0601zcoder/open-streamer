@@ -178,7 +178,7 @@ func TestHookCreateSaveError(t *testing.T) {
 	repo.saveErr = errors.New("disk full")
 	h := newHookHandler(repo)
 
-	body, _ := json.Marshal(domain.Hook{ID: hookIDX})
+	body, _ := json.Marshal(domain.Hook{ID: hookIDX, Type: domain.HookTypeHTTP, Target: "https://example.test/hook"})
 	req := newReq(t, http.MethodPost, hooksPath, body)
 	w := httptest.NewRecorder()
 	h.Create(w, req)
@@ -222,7 +222,7 @@ func TestHookUpdatePreservesID(t *testing.T) {
 	repo.hooks[hookIDX] = &domain.Hook{ID: hookIDX, Name: "old"}
 	h := newHookHandler(repo)
 
-	body, _ := json.Marshal(domain.Hook{ID: "wrong", Name: "new"})
+	body, _ := json.Marshal(domain.Hook{ID: "wrong", Name: "new", Type: domain.HookTypeHTTP, Target: "https://example.test/hook"})
 	req := withHookID(newReq(t, http.MethodPut, hookXPath, body), hookIDX)
 	w := httptest.NewRecorder()
 	h.Update(w, req)

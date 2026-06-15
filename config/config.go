@@ -83,6 +83,14 @@ type IngestorConfig struct {
 	// HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.
 	// This is a server-wide memory guard, not a per-stream policy.
 	HLSMaxSegmentBuffer int `mapstructure:"hls_max_segment_buffer" json:"hls_max_segment_buffer" yaml:"hls_max_segment_buffer"` // default 8
+
+	// AllowPrivateTargets permits HTTP/HLS ingest URLs (and their redirects /
+	// playlist-chosen targets) to reach RFC1918 / IPv6-ULA / RFC6598 addresses.
+	// Default false → private targets are blocked at dial time (S-4). Loopback,
+	// link-local, and cloud-metadata (169.254.0.0/16) are ALWAYS blocked
+	// regardless of this flag. Enable only on a trusted network with on-prem
+	// sources (LAN cameras, internal CDNs).
+	AllowPrivateTargets bool `mapstructure:"allow_private_targets" json:"allow_private_targets,omitempty" yaml:"allow_private_targets,omitempty"`
 }
 
 // BufferConfig controls the in-memory ring buffer.
@@ -244,6 +252,13 @@ type HooksConfig struct {
 	// queue cap. Per-hook overrides win; code default is
 	// DefaultHookBatchMaxQueueItems.
 	BatchMaxQueueItems int `mapstructure:"batch_max_queue_items" json:"batch_max_queue_items,omitempty" yaml:"batch_max_queue_items,omitempty"`
+
+	// FileRootDir confines file-type hooks to this directory (S-2). When set,
+	// a file hook's target must resolve inside it — preventing arbitrary
+	// host-file create/append (e.g. clobbering the store, filling disk). Empty
+	// keeps the legacy "any absolute path" behaviour for backward compatibility;
+	// operators are encouraged to set it (e.g. /var/log/open-streamer/hooks).
+	FileRootDir string `mapstructure:"file_root_dir" json:"file_root_dir,omitempty" yaml:"file_root_dir,omitempty"`
 }
 
 // AuthConfig holds authentication settings for the control-plane HTTP API

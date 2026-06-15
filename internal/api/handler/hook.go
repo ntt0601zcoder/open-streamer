@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/hooks"
@@ -27,14 +28,18 @@ type HookHandler struct {
 	hookRepo store.HookRepository
 	hooks    hookTester
 	bus      events.Bus
+	// fileRootDir confines file-hook targets (S-2); mirrors hooks.file_root_dir.
+	fileRootDir string
 }
 
 // NewHookHandler creates a HookHandler and registers it with the DI injector.
 func NewHookHandler(i do.Injector) (*HookHandler, error) {
+	cfg, _ := do.Invoke[config.HooksConfig](i)
 	return &HookHandler{
-		hookRepo: do.MustInvoke[store.HookRepository](i),
-		hooks:    do.MustInvoke[*hooks.Service](i),
-		bus:      do.MustInvoke[events.Bus](i),
+		hookRepo:    do.MustInvoke[store.HookRepository](i),
+		hooks:       do.MustInvoke[*hooks.Service](i),
+		bus:         do.MustInvoke[events.Bus](i),
+		fileRootDir: cfg.FileRootDir,
 	}, nil
 }
 
@@ -85,6 +90,12 @@ func (h *HookHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var hook domain.Hook
 	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_BODY", err.Error())
+		return
+	}
+	// S-2: REST Create used to persist a hook with zero validation. Apply the
+	// same type/target + file-containment check as the YAML path.
+	if err := hook.Validate(h.fileRootDir); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_HOOK", err.Error())
 		return
 	}
 	if err := h.hookRepo.Save(r.Context(), &hook); err != nil {
@@ -138,6 +149,10 @@ func (h *HookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hook.ID = hid
+	if err := hook.Validate(h.fileRootDir); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_HOOK", err.Error())
+		return
+	}
 	if err := h.hookRepo.Save(r.Context(), &hook); err != nil {
 		serverError(w, r, "SAVE_FAILED", "update hook", err)
 		return

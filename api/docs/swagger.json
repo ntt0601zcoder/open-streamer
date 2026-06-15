@@ -2333,6 +2333,10 @@
                     "description": "BatchMaxQueueItems is the global default for the per-hook in-memory\nqueue cap. Per-hook overrides win; code default is\nDefaultHookBatchMaxQueueItems.",
                     "type": "integer"
                 },
+                "file_root_dir": {
+                    "description": "FileRootDir confines file-type hooks to this directory (S-2). When set,\na file hook's target must resolve inside it — preventing arbitrary\nhost-file create/append (e.g. clobbering the store, filling disk). Empty\nkeeps the legacy \"any absolute path\" behaviour for backward compatibility;\noperators are encouraged to set it (e.g. /var/log/open-streamer/hooks).",
+                    "type": "string"
+                },
                 "worker_count": {
                     "description": "WorkerCount sizes the events.Bus worker pool that fans events out\nto subscribers. Each worker invokes the registered handler for an\nincoming event; with the batched HTTP delivery, the hook handler\njust enqueues into a per-hook batcher (~µs) so this number rarely\nneeds tuning. 1-4 covers nearly every workload. 0 = use 4.",
                     "type": "integer"
@@ -2342,6 +2346,10 @@
         "config.IngestorConfig": {
             "type": "object",
             "properties": {
+                "allow_private_targets": {
+                    "description": "AllowPrivateTargets permits HTTP/HLS ingest URLs (and their redirects /\nplaylist-chosen targets) to reach RFC1918 / IPv6-ULA / RFC6598 addresses.\nDefault false → private targets are blocked at dial time (S-4). Loopback,\nlink-local, and cloud-metadata (169.254.0.0/16) are ALWAYS blocked\nregardless of this flag. Enable only on a trusted network with on-prem\nsources (LAN cameras, internal CDNs).",
+                    "type": "boolean"
+                },
                 "hls_max_segment_buffer": {
                     "description": "HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.\nThis is a server-wide memory guard, not a per-stream policy.",
                     "type": "integer"
