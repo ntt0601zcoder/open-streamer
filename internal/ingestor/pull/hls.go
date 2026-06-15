@@ -36,6 +36,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/netguard"
 	"github.com/ntt0601zcoder/open-streamer/pkg/version"
 )
 
@@ -210,8 +211,15 @@ func (r *HLSReader) Open(ctx context.Context) error {
 		slog.Warn("hls reader: TLS verification disabled per input.net.insecure_tls",
 			"url", r.input.URL)
 	}
-	r.plClient = &http.Client{Timeout: plTimeout, Transport: transport}
-	r.segClient = &http.Client{Timeout: segTimeout, Transport: transport}
+	// SSRF dial guard (S-4): reject loopback / link-local / cloud-metadata
+	// always, and RFC1918/ULA unless allow_private_targets. This covers BOTH
+	// playlist + segment fetches and — because the guard runs on every dial —
+	// the attacker-chosen targets inside a remote playlist and any redirect.
+	// CheckRedirect caps the chain and strips credential headers on host change.
+	netguard.ApplyToTransport(transport, netguard.IngestPolicy(r.cfg.AllowPrivateTargets))
+	redirect := netguard.CheckRedirect()
+	r.plClient = &http.Client{Timeout: plTimeout, Transport: transport, CheckRedirect: redirect}
+	r.segClient = &http.Client{Timeout: segTimeout, Transport: transport, CheckRedirect: redirect}
 
 	// Fresh channel and once per Open() call so the previous poll goroutine's
 	// deferred close(out) cannot race with this new goroutine's close.

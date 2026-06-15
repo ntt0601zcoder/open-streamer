@@ -112,7 +112,7 @@ func NewPacketReader(
 		// Raw MPEG-TS over chunked HTTP — the low-latency relay path.
 		// Counterpart to publisher/serve_mpegts.go on the source side.
 		// Same passthrough handling as UDP / HLS so PCR / PIDs survive intact.
-		return pull.NewTSPassthroughPacketReader(pull.NewHTTPTSReader(input)), nil
+		return pull.NewTSPassthroughPacketReader(pull.NewHTTPTSReader(input, cfg)), nil
 	case protocol.KindFile:
 		if vods == nil {
 			return nil, fmt.Errorf("ingestor: cannot resolve %q — no VOD resolver configured", input.URL)

@@ -21,7 +21,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +32,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
+	"github.com/ntt0601zcoder/open-streamer/internal/netguard"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 )
 
@@ -83,8 +83,12 @@ func New(i do.Injector) (*Service, error) {
 		hookRepo: hookRepo,
 		bus:      bus,
 		// No client-level timeout — each delivery applies its own per-hook
-		// timeout via context.WithTimeout in postOnce / deliverFile.
-		client:    &http.Client{},
+		// timeout via context.WithTimeout in postOnce / deliverFile. The client
+		// carries the SSRF dial guard (S-2): loopback / link-local /
+		// cloud-metadata (169.254.169.254) are blocked so a webhook target can't
+		// pivot to the local admin API or instance metadata. Private RFC1918 is
+		// permitted because internal webhooks are a legitimate use.
+		client:    netguard.NewClient(netguard.Policy{AllowPrivate: true}, 0),
 		batchers:  make(map[domain.HookID]*httpBatcher),
 		fileLocks: make(map[string]*sync.Mutex),
 	}
@@ -335,13 +339,13 @@ func (s *Service) matches(h *domain.Hook, event domain.Event) bool {
 // either need a custom delimiter (breaking the JSON-lines contract) or
 // chunked writes (defeating the per-line atomicity).
 func (s *Service) deliverFile(h *domain.Hook, event domain.Event) error {
+	// Re-validate at delivery time (S-2): the same containment the REST/YAML
+	// paths enforce, applied here too so a hook loaded straight from the store
+	// (or pre-dating the validation) can't write outside the configured root.
+	if err := h.Validate(s.cfg.FileRootDir); err != nil {
+		return fmt.Errorf("file delivery: %w", err)
+	}
 	target := strings.TrimSpace(h.Target)
-	if target == "" {
-		return errors.New("file delivery: empty target path")
-	}
-	if !filepath.IsAbs(target) {
-		return fmt.Errorf("file delivery: target must be an absolute path, got %q", target)
-	}
 
 	body, err := json.Marshal(event)
 	if err != nil {

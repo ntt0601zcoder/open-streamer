@@ -15,6 +15,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/manager"
+	"github.com/ntt0601zcoder/open-streamer/internal/netguard"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
@@ -690,6 +691,18 @@ func decodeStreamBody(
 	}
 	if err := base.Watermark.Validate(); err != nil {
 		return nil, &putValidationError{code: "INVALID_WATERMARK", message: err.Error()}
+	}
+	// SSRF speed-bump (S-4): reject inputs whose host is an always-blocked
+	// literal (loopback / link-local / cloud-metadata). The authoritative gate
+	// is the dial-time guard on the ingest clients (which also covers hostnames,
+	// redirects, and playlist-chosen targets); this is fast operator feedback.
+	for i, in := range base.Inputs {
+		if err := netguard.ValidateInputURL(in.URL); err != nil {
+			return nil, &putValidationError{
+				code:    "INVALID_INPUT_URL",
+				message: fmt.Sprintf("inputs[%d]: %s", i, err.Error()),
+			}
+		}
 	}
 	// Transcoder.Mode validation removed alongside the Mode field in the
 	// native-transcoder migration — there is only one topology now.
