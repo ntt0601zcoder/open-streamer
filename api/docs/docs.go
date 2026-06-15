@@ -2353,10 +2353,6 @@ const docTemplate = `{
         "config.IngestorConfig": {
             "type": "object",
             "properties": {
-                "allow_private_targets": {
-                    "description": "AllowPrivateTargets permits HTTP/HLS ingest URLs (and their redirects /\nplaylist-chosen targets) to reach RFC1918 / IPv6-ULA / RFC6598 addresses.\nDefault false → private targets are blocked at dial time (S-4). Loopback,\nlink-local, and cloud-metadata (169.254.0.0/16) are ALWAYS blocked\nregardless of this flag. Enable only on a trusted network with on-prem\nsources (LAN cameras, internal CDNs).",
-                    "type": "boolean"
-                },
                 "hls_max_segment_buffer": {
                     "description": "HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.\nThis is a server-wide memory guard, not a per-stream policy.",
                     "type": "integer"

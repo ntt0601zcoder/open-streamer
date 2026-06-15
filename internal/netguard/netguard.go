@@ -1,6 +1,5 @@
-// Package netguard provides SSRF egress guards shared by every component that
-// makes outbound requests to operator- or content-supplied URLs (the ingest
-// pull clients and the webhook HTTP client).
+// Package netguard provides an SSRF egress guard for the webhook HTTP client,
+// which makes outbound requests to operator-supplied URLs.
 //
 // The core is a dial-time IP filter installed via net.Dialer.Control. Control
 // runs with the RESOLVED ip:port for each connection attempt, so it sees the
@@ -12,10 +11,14 @@
 // address are rejected UNCONDITIONALLY. Loopback and private (RFC1918 / IPv6-ULA
 // / RFC6598) are each gated by the caller's Policy:
 //
-//   - Ingest pull: both gated by ingestor.allow_private_targets (default off →
-//     all internal blocked; on → trusted-network opt-in allows LAN + local).
 //   - Webhooks: AllowPrivate (internal webhooks are legitimate) but NOT loopback
 //     (a hook must never reach the local admin API).
+//
+// NOTE: ingest pull clients (HLS / HTTP-TS) historically applied this guard via
+// IngestPolicy + ingestor.allow_private_targets, but ingest SSRF guarding was
+// removed by operator decision — the server's primary role is pulling from
+// internal/LAN sources, so blocking private targets was counterproductive (see
+// the security audit, S-4). IngestPolicy / ValidateInputURL remain as helpers.
 package netguard
 
 import (
