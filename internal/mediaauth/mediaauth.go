@@ -3,20 +3,26 @@
 // counterpart to the control-plane (admin) auth in internal/api: that gates
 // who can CONFIGURE the server; this gates who can WATCH a stream.
 //
+// Authorization is policy-based. A stream references at most one named Policy
+// (domain.Policy) via Stream.PlaybackPolicy; a stream with NO policy is public
+// (allow-all). Each policy is fully self-contained — it carries its OWN token
+// secret and its OWN static allow/deny chain. There is no global media-auth
+// config.
+//
 // One Authorizer is shared by all protocol handlers. Each handler builds an
-// AuthRequest from its connection and calls Authorize before allocating any
-// streaming state. Evaluation is a Flussonic-style chain — deny wins, allow
-// lists restrict, then a per-stream token-policy gate:
+// AuthRequest and calls Authorize before allocating any streaming state. The
+// chain (deny wins, allow-lists restrict, then a token gate) runs against the
+// stream's resolved policy:
 //
-//  1. ClientIP / Country / User-Agent on a Deny* list      → DENY
-//  2. any non-empty Allow* list the request value misses    → DENY
-//  3. AllowedDomains set and the Referer host isn't covered → DENY
-//  4. effective policy == "token" and the signed token is missing/invalid → DENY
-//  5. otherwise                                             → ALLOW
+//  1. stream has no policy                                  → ALLOW
+//  2. stream references an unknown policy                   → DENY (fail-closed)
+//  3. ClientIP / Country / User-Agent on a Deny* list       → DENY
+//  4. any non-empty Allow* list the request value misses    → DENY
+//  5. AllowedDomains set and the Referer host isn't covered → DENY
+//  6. policy requires a token and it is missing/invalid     → DENY
+//  7. otherwise                                             → ALLOW
 //
-// Disabled (Enabled=false, the default) short-circuits to ALLOW so existing
-// deployments are unaffected until an operator turns it on. Config is swapped
-// atomically for hot-reload.
+// The compiled policy set is swapped atomically for hot-reload (SetPolicies).
 package mediaauth
 
 import (
@@ -31,18 +37,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
-// Policy values for a stream's effective playback policy.
-const (
-	PolicyPublic = "public" // no token required
-	PolicyToken  = "token"  // a valid signed token is required
-
-	// clockSkew tolerates small clock differences when checking token expiry.
-	clockSkew = 60 * time.Second
-)
+// clockSkew tolerates small clock differences when checking token expiry.
+const clockSkew = 60 * time.Second
 
 // AuthRequest is the per-request context a protocol handler hands to Authorize.
 type AuthRequest struct {
@@ -67,23 +66,23 @@ func deny(reason string) Decision { return Decision{Allow: false, Reason: reason
 // unknown / unavailable. Backed by the sessions GeoIP database.
 type GeoResolver func(net.IP) string
 
-// PolicyResolver returns a stream's own playback policy ("public"/"token") or
-// "" to inherit the global default. Backed by the publisher's in-memory stream
-// table so it costs an O(1) map lookup, not a store read per segment.
-type PolicyResolver func(domain.StreamCode) string
+// PolicyResolver returns the code of the Policy a stream is bound to, or "" when
+// the stream has no policy (→ public). Backed by the publisher's in-memory
+// stream table for live streams (O(1), no store read per segment) with a
+// store+template fallback for stopped streams whose DVR archive is still served.
+type PolicyResolver func(domain.StreamCode) domain.PolicyCode
 
-// Authorizer evaluates the chain. Safe for concurrent use.
+// Authorizer evaluates the policy chain. Safe for concurrent use.
 type Authorizer struct {
-	state  atomic.Pointer[state]
-	geo    GeoResolver
-	policy PolicyResolver
+	policies atomic.Pointer[map[domain.PolicyCode]*policy]
+	geo      GeoResolver
+	resolve  PolicyResolver
 }
 
-// state is an immutable, pre-parsed snapshot of MediaAuthConfig.
-type state struct {
-	enabled       bool
-	defaultPolicy string
-	secret        []byte
+// policy is an immutable, pre-parsed snapshot of one domain.Policy.
+type policy struct {
+	requireToken bool
+	secret       []byte
 
 	allowNets, denyNets []*net.IPNet
 	allowIPs, denyIPs   map[string]struct{} // exact IPs (canonical string)
@@ -97,34 +96,40 @@ type state struct {
 	hasDomainAllow      bool
 }
 
-// New builds an Authorizer. geo and policy may be nil (country rules then never
-// match an allow-list, and every stream uses the global default policy).
-func New(cfg config.MediaAuthConfig, geo GeoResolver, policy PolicyResolver) *Authorizer {
-	a := &Authorizer{geo: geo, policy: policy}
-	a.SetConfig(cfg)
+// New builds an Authorizer with an empty policy set. geo and resolve may be nil
+// (country rules then never match an allow-list, and every stream resolves to no
+// policy → allow-all). Call SetPolicies to load the compiled rule set.
+func New(geo GeoResolver, resolve PolicyResolver) *Authorizer {
+	a := &Authorizer{geo: geo, resolve: resolve}
+	a.SetPolicies(nil)
 	return a
 }
 
-// SetConfig swaps in a freshly-parsed snapshot (config hot-reload).
-func (a *Authorizer) SetConfig(cfg config.MediaAuthConfig) {
-	a.state.Store(buildState(cfg))
+// SetPolicies compiles and atomically swaps in a fresh policy set (hot-reload).
+// Safe to call concurrently with Authorize.
+func (a *Authorizer) SetPolicies(ps []*domain.Policy) {
+	m := make(map[domain.PolicyCode]*policy, len(ps))
+	for _, p := range ps {
+		if p == nil {
+			continue
+		}
+		m[p.Code] = compilePolicy(p)
+	}
+	a.policies.Store(&m)
 }
 
-func buildState(cfg config.MediaAuthConfig) *state {
-	st := &state{
-		enabled:        cfg.Enabled,
-		defaultPolicy:  strings.ToLower(strings.TrimSpace(cfg.DefaultPolicy)),
-		secret:         []byte(cfg.TokenSecret),
-		allowIPs:       map[string]struct{}{},
-		denyIPs:        map[string]struct{}{},
-		allowCountries: upperSet(cfg.AllowCountries),
-		denyCountries:  upperSet(cfg.DenyCountries),
-		allowUAs:       lowerList(cfg.AllowUserAgents),
-		denyUAs:        lowerList(cfg.DenyUserAgents),
-		allowedDomains: lowerList(cfg.AllowedDomains),
+func compilePolicy(p *domain.Policy) *policy {
+	st := &policy{
+		requireToken:   p.RequireToken,
+		secret:         []byte(p.TokenSecret),
+		allowCountries: upperSet(p.AllowCountries),
+		denyCountries:  upperSet(p.DenyCountries),
+		allowUAs:       lowerList(p.AllowUserAgents),
+		denyUAs:        lowerList(p.DenyUserAgents),
+		allowedDomains: lowerList(p.AllowedDomains),
 	}
-	st.allowNets, st.allowIPs = parseIPRules(cfg.AllowIPs)
-	st.denyNets, st.denyIPs = parseIPRules(cfg.DenyIPs)
+	st.allowNets, st.allowIPs = parseIPRules(p.AllowIPs)
+	st.denyNets, st.denyIPs = parseIPRules(p.DenyIPs)
 	st.hasIPAllow = len(st.allowNets) > 0 || len(st.allowIPs) > 0
 	st.hasCountryAllow = len(st.allowCountries) > 0
 	st.hasUAAllow = len(st.allowUAs) > 0
@@ -132,75 +137,99 @@ func buildState(cfg config.MediaAuthConfig) *state {
 	return st
 }
 
-// Authorize runs the chain and returns the decision.
+// Authorize resolves the stream's policy and runs its chain. A stream with no
+// policy is public; a reference to an unknown policy fails closed.
 func (a *Authorizer) Authorize(req AuthRequest) Decision {
-	st := a.state.Load()
-	if st == nil || !st.enabled {
-		return allow()
+	var code domain.PolicyCode
+	if a.resolve != nil {
+		code = a.resolve(req.Code)
 	}
+	if code == "" {
+		return allow() // no policy → public
+	}
+	m := a.policies.Load()
+	var pol *policy
+	if m != nil {
+		pol = (*m)[code]
+	}
+	if pol == nil {
+		// Stream references a policy that no longer exists — fail closed.
+		// The policy delete handler refuses to remove a referenced policy, so
+		// this only happens after a direct store edit; denying is the safe call.
+		return deny("unknown policy")
+	}
+	return pol.evaluate(req, a.geo)
+}
 
-	// 1. Deny lists (hard block, evaluated first).
-	if ipInRules(req.ClientIP, st.denyNets, st.denyIPs) {
+// evaluate runs the deny → allow → token chain for one policy.
+func (p *policy) evaluate(req AuthRequest, geo GeoResolver) Decision {
+	// Country is resolved at most once, only when a rule needs it.
+	country := ""
+	if (len(p.denyCountries) > 0 || p.hasCountryAllow) && geo != nil {
+		country = strings.ToUpper(geo(req.ClientIP))
+	}
+	if d := p.checkDeny(req, country); !d.Allow {
+		return d
+	}
+	if d := p.checkAllow(req, country); !d.Allow {
+		return d
+	}
+	return p.checkToken(req)
+}
+
+// checkDeny applies the hard-block deny lists (evaluated first).
+func (p *policy) checkDeny(req AuthRequest, country string) Decision {
+	if ipInRules(req.ClientIP, p.denyNets, p.denyIPs) {
 		return deny("ip on deny list")
 	}
-	// Resolve country only when a rule needs it.
-	country := ""
-	if (len(st.denyCountries) > 0 || st.hasCountryAllow) && a.geo != nil {
-		country = strings.ToUpper(a.geo(req.ClientIP))
-	}
 	if country != "" {
-		if _, bad := st.denyCountries[country]; bad {
+		if _, bad := p.denyCountries[country]; bad {
 			return deny("country on deny list")
 		}
 	}
-	if uaMatches(req.UserAgent, st.denyUAs) {
+	if uaMatches(req.UserAgent, p.denyUAs) {
 		return deny("user-agent on deny list")
-	}
-
-	// 2. Allow gates: each configured list must be satisfied.
-	if st.hasIPAllow && !ipInRules(req.ClientIP, st.allowNets, st.allowIPs) {
-		return deny("ip not on allow list")
-	}
-	if st.hasCountryAllow {
-		if _, ok := st.allowCountries[country]; !ok || country == "" {
-			return deny("country not on allow list")
-		}
-	}
-	if st.hasUAAllow && !uaMatches(req.UserAgent, st.allowUAs) {
-		return deny("user-agent not on allow list")
-	}
-	if st.hasDomainAllow && !domainAllowed(req.Referer, st.allowedDomains) {
-		return deny("referer domain not allowed")
-	}
-
-	// 3. Policy gate: per-stream override, else global default.
-	policy := st.defaultPolicy
-	if a.policy != nil {
-		if p := strings.ToLower(strings.TrimSpace(a.policy(req.Code))); p != "" {
-			policy = p
-		}
-	}
-	if policy == PolicyToken {
-		if len(st.secret) == 0 {
-			return deny("token policy but no secret configured")
-		}
-		if !st.verify(req.Code, req.Token) {
-			return deny("missing or invalid token")
-		}
 	}
 	return allow()
 }
 
-// Enabled reports whether media auth is on (for handlers / status).
-func (a *Authorizer) Enabled() bool {
-	st := a.state.Load()
-	return st != nil && st.enabled
+// checkAllow applies the allow gates: each configured list must be satisfied.
+func (p *policy) checkAllow(req AuthRequest, country string) Decision {
+	if p.hasIPAllow && !ipInRules(req.ClientIP, p.allowNets, p.allowIPs) {
+		return deny("ip not on allow list")
+	}
+	if p.hasCountryAllow {
+		if _, ok := p.allowCountries[country]; !ok || country == "" {
+			return deny("country not on allow list")
+		}
+	}
+	if p.hasUAAllow && !uaMatches(req.UserAgent, p.allowUAs) {
+		return deny("user-agent not on allow list")
+	}
+	if p.hasDomainAllow && !domainAllowed(req.Referer, p.allowedDomains) {
+		return deny("referer domain not allowed")
+	}
+	return allow()
+}
+
+// checkToken applies the token gate when the policy requires a signed token.
+func (p *policy) checkToken(req AuthRequest) Decision {
+	if !p.requireToken {
+		return allow()
+	}
+	if len(p.secret) == 0 {
+		return deny("token required but policy has no secret")
+	}
+	if !verify(p.secret, req.Code, req.Token) {
+		return deny("missing or invalid token")
+	}
+	return allow()
 }
 
 // ── playback token ──
 
 // SignToken is the Go reference implementation of the playback-token format.
-// The server only VERIFIES tokens; clients mint them with the shared secret —
+// The server only VERIFIES tokens; clients mint them with the policy's secret —
 // reproduce this in any language:
 //
 //	exp   = future expiry, unix seconds (decimal string)
@@ -212,7 +241,7 @@ func SignToken(secret []byte, code domain.StreamCode, exp int64) string {
 	return strconv.FormatInt(exp, 10) + "." + base64.RawURLEncoding.EncodeToString(tokenMAC(secret, code, exp))
 }
 
-func (st *state) verify(code domain.StreamCode, token string) bool {
+func verify(secret []byte, code domain.StreamCode, token string) bool {
 	dot := strings.IndexByte(token, '.')
 	if dot <= 0 {
 		return false
@@ -228,7 +257,7 @@ func (st *state) verify(code domain.StreamCode, token string) bool {
 	if err != nil {
 		return false
 	}
-	want := tokenMAC(st.secret, code, exp)
+	want := tokenMAC(secret, code, exp)
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 

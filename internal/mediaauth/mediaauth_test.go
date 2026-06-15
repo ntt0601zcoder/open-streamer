@@ -5,56 +5,66 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
-const testCode = domain.StreamCode("ch1")
+const (
+	testCode   = domain.StreamCode("ch1")
+	testPolicy = domain.PolicyCode("p1")
+)
 
 func ip(s string) net.IP { return net.ParseIP(s) }
+
+// authzAll binds EVERY stream code to policy p and loads p as the only policy.
+// Use for single-policy chain tests where the request's stream code is
+// irrelevant beyond selecting the policy.
+func authzAll(geo GeoResolver, p *domain.Policy) *Authorizer {
+	a := New(geo, func(domain.StreamCode) domain.PolicyCode { return p.Code })
+	a.SetPolicies([]*domain.Policy{p})
+	return a
+}
 
 // ── token sign/verify ──
 
 func TestToken_SignVerifyRoundTrip(t *testing.T) {
 	t.Parallel()
-	st := buildState(config.MediaAuthConfig{Enabled: true, TokenSecret: "sekret"})
+	secret := []byte("sekret")
 	exp := time.Now().Add(time.Hour).Unix()
-	tok := SignToken(st.secret, testCode, exp)
-	if !st.verify(testCode, tok) {
+	tok := SignToken(secret, testCode, exp)
+	if !verify(secret, testCode, tok) {
 		t.Fatal("valid token failed to verify")
 	}
 }
 
 func TestToken_Rejects(t *testing.T) {
 	t.Parallel()
-	st := buildState(config.MediaAuthConfig{Enabled: true, TokenSecret: "sekret"})
-	valid := SignToken(st.secret, testCode, time.Now().Add(time.Hour).Unix())
+	secret := []byte("sekret")
+	valid := SignToken(secret, testCode, time.Now().Add(time.Hour).Unix())
 
 	t.Run("expired", func(t *testing.T) {
-		old := SignToken(st.secret, testCode, time.Now().Add(-2*time.Hour).Unix())
-		if st.verify(testCode, old) {
+		old := SignToken(secret, testCode, time.Now().Add(-2*time.Hour).Unix())
+		if verify(secret, testCode, old) {
 			t.Error("expired token verified")
 		}
 	})
 	t.Run("wrong_stream_code", func(t *testing.T) {
-		if st.verify("other", valid) {
+		if verify(secret, "other", valid) {
 			t.Error("token for ch1 verified against 'other'")
 		}
 	})
 	t.Run("tampered_sig", func(t *testing.T) {
-		if st.verify(testCode, valid+"x") {
+		if verify(secret, testCode, valid+"x") {
 			t.Error("tampered token verified")
 		}
 	})
 	t.Run("different_secret", func(t *testing.T) {
-		other := buildState(config.MediaAuthConfig{Enabled: true, TokenSecret: "other"})
-		if other.verify(testCode, valid) {
+		if verify([]byte("other"), testCode, valid) {
 			t.Error("token verified under a different secret")
 		}
 	})
 	t.Run("malformed", func(t *testing.T) {
 		for _, bad := range []string{"", "noexp", "abc.def", ".sig", "999"} {
-			if st.verify(testCode, bad) {
+			if verify(secret, testCode, bad) {
 				t.Errorf("malformed token %q verified", bad)
 			}
 		}
@@ -63,26 +73,37 @@ func TestToken_Rejects(t *testing.T) {
 
 // ── chain ──
 
-func newAuthz(t *testing.T, cfg config.MediaAuthConfig, geo GeoResolver, pol PolicyResolver) *Authorizer {
-	t.Helper()
-	return New(cfg, geo, pol)
+func TestAuthorize_NoPolicyAllowsAll(t *testing.T) {
+	t.Parallel()
+	// nil resolver → no policy for any stream → public.
+	a := New(nil, nil)
+	if d := a.Authorize(AuthRequest{Code: testCode, ClientIP: ip("8.8.8.8")}); !d.Allow {
+		t.Fatalf("no resolver must allow, got deny: %s", d.Reason)
+	}
+	// resolver returning "" → no policy → public.
+	b := New(nil, func(domain.StreamCode) domain.PolicyCode { return "" })
+	if d := b.Authorize(AuthRequest{Code: testCode}); !d.Allow {
+		t.Fatalf("empty policy code must allow, got deny: %s", d.Reason)
+	}
 }
 
-func TestAuthorize_DisabledAllowsAll(t *testing.T) {
+func TestAuthorize_UnknownPolicyFailsClosed(t *testing.T) {
 	t.Parallel()
-	a := newAuthz(t, config.MediaAuthConfig{Enabled: false, DefaultPolicy: PolicyToken}, nil, nil)
-	if d := a.Authorize(AuthRequest{Code: testCode}); !d.Allow {
-		t.Fatalf("disabled must allow, got deny: %s", d.Reason)
+	// Stream references a policy that is not in the loaded set → deny.
+	a := New(nil, func(domain.StreamCode) domain.PolicyCode { return "ghost" })
+	a.SetPolicies([]*domain.Policy{{Code: "real"}})
+	if d := a.Authorize(AuthRequest{Code: testCode}); d.Allow {
+		t.Error("reference to an unknown policy must fail closed")
 	}
 }
 
 func TestAuthorize_IPRules(t *testing.T) {
 	t.Parallel()
-	a := newAuthz(t, config.MediaAuthConfig{
-		Enabled:  true,
+	a := authzAll(nil, &domain.Policy{
+		Code:     testPolicy,
 		DenyIPs:  []string{"8.8.8.8", "10.0.0.0/8"},
 		AllowIPs: []string{"1.2.3.4", "192.168.0.0/16"},
-	}, nil, nil)
+	})
 
 	cases := []struct {
 		ip   string
@@ -112,11 +133,11 @@ func TestAuthorize_CountryRules(t *testing.T) {
 		}
 		return "" // unknown
 	}
-	a := newAuthz(t, config.MediaAuthConfig{
-		Enabled:        true,
+	a := authzAll(geo, &domain.Policy{
+		Code:           testPolicy,
 		AllowCountries: []string{"VN", "US"},
 		DenyCountries:  []string{"RU"},
-	}, geo, nil)
+	})
 
 	if d := a.Authorize(AuthRequest{Code: testCode, ClientIP: ip("1.1.1.1")}); !d.Allow {
 		t.Errorf("VN must be allowed: %s", d.Reason)
@@ -131,10 +152,7 @@ func TestAuthorize_CountryRules(t *testing.T) {
 
 func TestAuthorize_UserAgentRules(t *testing.T) {
 	t.Parallel()
-	a := newAuthz(t, config.MediaAuthConfig{
-		Enabled:        true,
-		DenyUserAgents: []string{"badbot"},
-	}, nil, nil)
+	a := authzAll(nil, &domain.Policy{Code: testPolicy, DenyUserAgents: []string{"badbot"}})
 	if d := a.Authorize(AuthRequest{Code: testCode, UserAgent: "Mozilla BadBot/1.0"}); d.Allow {
 		t.Error("denied UA substring must block")
 	}
@@ -142,7 +160,7 @@ func TestAuthorize_UserAgentRules(t *testing.T) {
 		t.Errorf("allowed UA must pass: %s", d.Reason)
 	}
 
-	b := newAuthz(t, config.MediaAuthConfig{Enabled: true, AllowUserAgents: []string{"exoplayer"}}, nil, nil)
+	b := authzAll(nil, &domain.Policy{Code: testPolicy, AllowUserAgents: []string{"exoplayer"}})
 	if d := b.Authorize(AuthRequest{Code: testCode, UserAgent: "ExoPlayerLib/2.1"}); !d.Allow {
 		t.Errorf("UA on allow list must pass: %s", d.Reason)
 	}
@@ -153,7 +171,7 @@ func TestAuthorize_UserAgentRules(t *testing.T) {
 
 func TestAuthorize_AllowedDomains(t *testing.T) {
 	t.Parallel()
-	a := newAuthz(t, config.MediaAuthConfig{Enabled: true, AllowedDomains: []string{"example.com"}}, nil, nil)
+	a := authzAll(nil, &domain.Policy{Code: testPolicy, AllowedDomains: []string{"example.com"}})
 	cases := []struct {
 		ref  string
 		want bool
@@ -172,7 +190,7 @@ func TestAuthorize_AllowedDomains(t *testing.T) {
 
 func TestAuthorize_TokenPolicy(t *testing.T) {
 	t.Parallel()
-	a := newAuthz(t, config.MediaAuthConfig{Enabled: true, DefaultPolicy: PolicyToken, TokenSecret: "sk"}, nil, nil)
+	a := authzAll(nil, &domain.Policy{Code: testPolicy, RequireToken: true, TokenSecret: "sk"})
 	good := SignToken([]byte("sk"), testCode, time.Now().Add(time.Hour).Unix())
 	if d := a.Authorize(AuthRequest{Code: testCode, Token: good}); !d.Allow {
 		t.Errorf("valid token must pass: %s", d.Reason)
@@ -183,7 +201,8 @@ func TestAuthorize_TokenPolicy(t *testing.T) {
 	if d := a.Authorize(AuthRequest{Code: testCode, Token: "bogus.sig"}); d.Allow {
 		t.Error("bogus token must deny")
 	}
-	// A token minted for ch1 must not work for another stream.
+	// authzAll binds ch2 to the same token policy; a token minted for ch1 must
+	// not authorize ch2 (the MAC is bound to the stream code).
 	if d := a.Authorize(AuthRequest{Code: "ch2", Token: good}); d.Allow {
 		t.Error("token bound to ch1 must not authorize ch2")
 	}
@@ -191,51 +210,53 @@ func TestAuthorize_TokenPolicy(t *testing.T) {
 
 func TestAuthorize_TokenPolicyNoSecretFailsClosed(t *testing.T) {
 	t.Parallel()
-	a := newAuthz(t, config.MediaAuthConfig{Enabled: true, DefaultPolicy: PolicyToken}, nil, nil) // no secret
+	// Defensive: domain.Validate rejects this, but the authorizer must still
+	// fail closed if a secret-less token policy ever reaches it.
+	a := authzAll(nil, &domain.Policy{Code: testPolicy, RequireToken: true})
 	if d := a.Authorize(AuthRequest{Code: testCode, Token: "x.y"}); d.Allow {
 		t.Error("token policy without a secret must fail closed")
 	}
 }
 
-func TestAuthorize_PerStreamPolicyOverride(t *testing.T) {
+func TestAuthorize_PerStreamPolicySelection(t *testing.T) {
 	t.Parallel()
-	// Global default = token, but ch1 is explicitly public → allowed w/o token.
-	pol := func(c domain.StreamCode) string {
-		if c == "public1" {
-			return PolicyPublic
+	open := &domain.Policy{Code: "open"} // no token, no lists → public
+	tok := &domain.Policy{Code: "tok", RequireToken: true, TokenSecret: "sk"}
+	resolve := func(c domain.StreamCode) domain.PolicyCode {
+		switch c {
+		case "public1":
+			return "open"
+		case "token1":
+			return "tok"
 		}
-		if c == "token1" {
-			return PolicyToken
-		}
-		return ""
+		return "" // no policy → public
 	}
-	a := newAuthz(t, config.MediaAuthConfig{Enabled: true, DefaultPolicy: PolicyToken, TokenSecret: "sk"}, nil, pol)
+	a := New(nil, resolve)
+	a.SetPolicies([]*domain.Policy{open, tok})
 
 	if d := a.Authorize(AuthRequest{Code: "public1"}); !d.Allow {
-		t.Errorf("per-stream public override must allow without token: %s", d.Reason)
+		t.Errorf("stream bound to an open policy must allow without token: %s", d.Reason)
 	}
-	if d := a.Authorize(AuthRequest{Code: "inherits"}); d.Allow {
-		t.Error("stream inheriting global token policy must require a token")
+	if d := a.Authorize(AuthRequest{Code: "token1"}); d.Allow {
+		t.Error("stream bound to a token policy must require a token")
 	}
-
-	// Global default = public, but token1 explicitly requires a token.
-	b := newAuthz(t, config.MediaAuthConfig{Enabled: true, DefaultPolicy: PolicyPublic, TokenSecret: "sk"}, nil, pol)
-	if d := b.Authorize(AuthRequest{Code: "token1"}); d.Allow {
-		t.Error("per-stream token override must require a token even when global is public")
+	good := SignToken([]byte("sk"), "token1", time.Now().Add(time.Hour).Unix())
+	if d := a.Authorize(AuthRequest{Code: "token1", Token: good}); !d.Allow {
+		t.Errorf("valid token for token1 must allow: %s", d.Reason)
 	}
-	if d := b.Authorize(AuthRequest{Code: "other"}); !d.Allow {
-		t.Errorf("public-default stream must allow: %s", d.Reason)
+	if d := a.Authorize(AuthRequest{Code: "nopolicy"}); !d.Allow {
+		t.Errorf("stream with no policy must allow: %s", d.Reason)
 	}
 }
 
 func TestAuthorize_DenyBeatsAllow(t *testing.T) {
 	t.Parallel()
 	// IP is on both lists — deny must win.
-	a := newAuthz(t, config.MediaAuthConfig{
-		Enabled:  true,
+	a := authzAll(nil, &domain.Policy{
+		Code:     testPolicy,
 		AllowIPs: []string{"1.2.3.4"},
 		DenyIPs:  []string{"1.2.3.4"},
-	}, nil, nil)
+	})
 	if d := a.Authorize(AuthRequest{Code: testCode, ClientIP: ip("1.2.3.4")}); d.Allow {
 		t.Error("deny must take precedence over allow")
 	}
@@ -243,11 +264,12 @@ func TestAuthorize_DenyBeatsAllow(t *testing.T) {
 
 func TestAuthorize_HotReload(t *testing.T) {
 	t.Parallel()
-	a := newAuthz(t, config.MediaAuthConfig{Enabled: false}, nil, nil)
+	a := New(nil, func(domain.StreamCode) domain.PolicyCode { return testPolicy })
+	a.SetPolicies([]*domain.Policy{{Code: testPolicy}}) // empty policy → allow all
 	if d := a.Authorize(AuthRequest{Code: testCode, ClientIP: ip("8.8.8.8")}); !d.Allow {
-		t.Fatal("disabled should allow")
+		t.Fatalf("empty policy should allow: %s", d.Reason)
 	}
-	a.SetConfig(config.MediaAuthConfig{Enabled: true, DenyIPs: []string{"8.8.8.8"}})
+	a.SetPolicies([]*domain.Policy{{Code: testPolicy, DenyIPs: []string{"8.8.8.8"}}})
 	if d := a.Authorize(AuthRequest{Code: testCode, ClientIP: ip("8.8.8.8")}); d.Allow {
 		t.Error("after reload, denied IP must be blocked")
 	}

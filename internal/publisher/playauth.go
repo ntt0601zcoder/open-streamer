@@ -16,18 +16,17 @@ import (
 // (every playback request is allowed) — the default.
 func (s *Service) SetMediaAuthorizer(a *mediaauth.Authorizer) { s.mediaAuth = a }
 
-// PlaybackPolicy returns a RUNNING stream's per-stream media-auth policy
-// override ("public" / "token" / "" = inherit global) and whether the stream is
-// currently running. O(1) in-memory lookup, used as the first tier of the
-// authorizer's PolicyResolver so the live hot path never reads the store. The
-// `running` flag lets the caller fall back to the store for a STOPPED stream
-// (whose DVR archive is still served) instead of mistaking its empty in-memory
-// policy for "inherit global".
-func (s *Service) PlaybackPolicy(code domain.StreamCode) (policy string, running bool) {
+// PlaybackPolicy returns a RUNNING stream's bound media-auth Policy code ("" =
+// no policy → public) and whether the stream is currently running. O(1)
+// in-memory lookup, used as the first tier of the authorizer's PolicyResolver so
+// the live hot path never reads the store. The `running` flag lets the caller
+// fall back to the store for a STOPPED stream (whose DVR archive is still
+// served) instead of mistaking its empty in-memory binding for "no policy".
+func (s *Service) PlaybackPolicy(code domain.StreamCode) (policy domain.PolicyCode, running bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if ss, ok := s.streams[code]; ok {
-		return ss.playbackAuth, true
+		return ss.playbackPolicy, true
 	}
 	return "", false
 }

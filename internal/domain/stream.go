@@ -70,11 +70,12 @@ type Stream struct {
 	// StreamKey is used to authenticate RTMP/SRT push ingest.
 	StreamKey string `json:"stream_key" yaml:"stream_key"`
 
-	// PlaybackAuth overrides the global media-auth default policy for this
-	// stream: "public" (no token) or "token" (signed token required). Empty
-	// inherits auth.media.default_policy. Static rules (IP/country/UA/domains)
-	// remain global. See internal/mediaauth.
-	PlaybackAuth string `json:"playback_auth,omitempty" yaml:"playback_auth,omitempty"`
+	// PlaybackPolicy binds this stream to a named media-auth Policy by its
+	// code (see domain.Policy). Empty means no policy — the stream is public
+	// (allow-all). The referenced policy carries the full rule set (token
+	// requirement + secret, IP/country/UA/domain allow-deny lists). See
+	// internal/mediaauth.
+	PlaybackPolicy PolicyCode `json:"playback_policy,omitempty" yaml:"playback_policy,omitempty"`
 
 	// Status is the runtime lifecycle state.
 	// It is never persisted — always computed from the coordinator's in-memory

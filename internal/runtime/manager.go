@@ -20,7 +20,6 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/hooks"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor"
 	"github.com/ntt0601zcoder/open-streamer/internal/manager"
-	"github.com/ntt0601zcoder/open-streamer/internal/mediaauth"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
@@ -46,7 +45,6 @@ type Deps struct {
 	SessionsSvc      *sessions.Service
 	AutoPublish      *autopublish.Service
 	APISrv           *api.Server
-	MediaAuth        *mediaauth.Authorizer
 	Bus              events.Bus
 	StreamRepo       store.StreamRepository
 	GlobalConfigRepo store.GlobalConfigRepository
@@ -244,15 +242,9 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 		m.deps.APISrv.SetAuthConfig(new.Auth)
 	}
 
-	// Media-plane auth: hot-swap playback rules (token/IP/country/UA/referer)
-	// on the shared authorizer used by both the publisher and the API server.
-	if m.deps.MediaAuth != nil && configChanged(old.Auth, new.Auth) {
-		media := config.MediaAuthConfig{}
-		if new.Auth != nil {
-			media = new.Auth.Media
-		}
-		m.deps.MediaAuth.SetConfig(media)
-	}
+	// Media-plane (playback) auth is policy-based and store-driven — its
+	// compiled rule set is hot-reloaded by the policy handler on CRUD, not from
+	// this config diff. See cmd/server.wireMediaAuth + handler.PolicyHandler.
 
 	// Push the new listeners snapshot to ingestor + publisher BEFORE
 	// diffService can decide to restart them — each Run() reads the cached

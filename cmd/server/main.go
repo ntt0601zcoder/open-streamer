@@ -134,10 +134,11 @@ func run() error {
 	// 5. Wire all services.
 	wireServices(injector)
 
-	// 5b. Wire the media-plane playback authorizer (token / IP / country / UA /
-	// referer) into the publisher + API server. Returns the shared authorizer
-	// so the runtime config-reload path can hot-swap its rules.
-	mediaAuthz := wireMediaAuth(injector, gcfg)
+	// 5b. Wire the policy-based media-plane playback authorizer (token / IP /
+	// country / UA / referer) into the publisher + API server. The authorizer
+	// loads its policy set from the store and is hot-reloaded by the policy
+	// handler on CRUD — no config-reload hook needed.
+	wireMediaAuth(injector, gcfg)
 
 	// 6. Assemble RuntimeManager deps from DI.
 	rtm := runtime.New(ctx, runtime.Deps{
@@ -150,7 +151,6 @@ func run() error {
 		SessionsSvc:      do.MustInvoke[*sessions.Service](injector),
 		AutoPublish:      do.MustInvoke[*autopublish.Service](injector),
 		APISrv:           do.MustInvoke[*api.Server](injector),
-		MediaAuth:        mediaAuthz,
 		Bus:              do.MustInvoke[events.Bus](injector),
 		StreamRepo:       do.MustInvoke[store.StreamRepository](injector),
 		GlobalConfigRepo: gcRepo,
@@ -200,6 +200,7 @@ func wireStorage(i *do.RootScope, cfg config.StorageConfig) error {
 		}
 		do.ProvideValue(i, s.Streams())
 		do.ProvideValue(i, s.Templates())
+		do.ProvideValue(i, s.Policies())
 		do.ProvideValue(i, s.Recordings())
 		do.ProvideValue(i, s.Hooks())
 		do.ProvideValue(i, s.GlobalConfig())
@@ -212,6 +213,7 @@ func wireStorage(i *do.RootScope, cfg config.StorageConfig) error {
 		}
 		do.ProvideValue(i, s.Streams())
 		do.ProvideValue(i, s.Templates())
+		do.ProvideValue(i, s.Policies())
 		do.ProvideValue(i, s.Recordings())
 		do.ProvideValue(i, s.Hooks())
 		do.ProvideValue(i, s.GlobalConfig())
@@ -320,6 +322,7 @@ func wireServices(i *do.RootScope) {
 	// API handlers
 	do.Provide(i, handler.NewStreamHandler)
 	do.Provide(i, handler.NewTemplateHandler)
+	do.Provide(i, handler.NewPolicyHandler)
 	do.Provide(i, handler.NewBlobTimeshiftHandler)
 	do.Provide(i, handler.NewHookHandler)
 	do.Provide(i, handler.NewConfigHandler)
@@ -339,23 +342,27 @@ func wireServices(i *do.RootScope) {
 // indexed), so blocking briefly here is acceptable.
 // wireMediaAuth builds the shared media-plane playback authorizer and injects
 // it into the publisher (RTMP/SRT/RTSP play) and API server (HLS/DASH/MPEGTS).
-// The country backend reuses the sessions GeoIP resolver; the per-stream policy
-// is resolved from the publisher's in-memory stream table (O(1), no store hit).
-func wireMediaAuth(i do.Injector, gcfg *domain.GlobalConfig) *mediaauth.Authorizer {
+// Authorization is policy-based: each stream binds to at most one named Policy
+// (Stream.PlaybackPolicy); a stream with no policy is public. The country
+// backend reuses the sessions GeoIP resolver; the per-stream policy CODE is
+// resolved from the publisher's in-memory table (O(1)) with a store+template
+// fallback for stopped (DVR) streams. Policies are loaded from the store and
+// hot-reloaded by the policy handler on CRUD.
+func wireMediaAuth(i do.Injector, _ *domain.GlobalConfig) *mediaauth.Authorizer {
 	pub := do.MustInvoke[*publisher.Service](i)
 	apiSrv := do.MustInvoke[*api.Server](i)
 	geoIP := do.MustInvoke[*sessions.SwappableGeoIP](i)
 	streamRepo := do.MustInvoke[store.StreamRepository](i)
 	templateRepo := do.MustInvoke[store.TemplateRepository](i)
+	policyRepo := do.MustInvoke[store.PolicyRepository](i)
 
-	// policyFor resolves a stream's effective playback policy. Live streams hit
-	// the publisher's in-memory table (O(1), no store read on the hot path). A
+	// resolvePolicy returns the policy CODE a stream is bound to. Live streams
+	// hit the publisher's in-memory table (no store read on the hot path). A
 	// STOPPED stream — whose DVR archive is still served — falls back to the
-	// store + template so its per-stream `token` policy isn't silently
-	// downgraded to the global default.
-	policyFor := func(code domain.StreamCode) string {
-		if policy, running := pub.PlaybackPolicy(code); running {
-			return policy
+	// store + template so its policy binding survives across restarts.
+	resolvePolicy := func(code domain.StreamCode) domain.PolicyCode {
+		if pc, running := pub.PlaybackPolicy(code); running {
+			return pc
 		}
 		s, err := streamRepo.FindByCode(context.Background(), code)
 		if err != nil {
@@ -366,16 +373,21 @@ func wireMediaAuth(i do.Injector, gcfg *domain.GlobalConfig) *mediaauth.Authoriz
 				s = domain.ResolveStream(s, tpl)
 			}
 		}
-		return s.PlaybackAuth
+		return s.PlaybackPolicy
 	}
 
-	cfg := config.AuthConfig{}
-	if gcfg.Auth != nil {
-		cfg = *gcfg.Auth
+	authz := mediaauth.New(geoIP.Country, resolvePolicy)
+	// Load the persisted policy set so rules are live from boot.
+	if ps, err := policyRepo.List(context.Background()); err != nil {
+		slog.Warn("media-auth: failed to load policies at startup; all playback is public until reload", "err", err)
+	} else {
+		authz.SetPolicies(ps)
 	}
-	authz := mediaauth.New(cfg.Media, geoIP.Country, policyFor)
+
 	pub.SetMediaAuthorizer(authz)
 	apiSrv.SetMediaAuthorizer(authz)
+	// Let the policy handler hot-reload the compiled set on CRUD.
+	do.MustInvoke[*handler.PolicyHandler](i).SetAuthorizer(authz)
 	return authz
 }
 
