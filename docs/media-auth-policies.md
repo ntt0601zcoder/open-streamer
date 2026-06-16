@@ -174,9 +174,9 @@ exactly when IP is — on all protocols.
 | Protocol | Gate call (file:line) |
 |---|---|
 | HLS / DASH / HTTP-MPEGTS | `mediaAllowed(r, code)` — [dispatch.go:164](../internal/api/dispatch.go#L164) (one gate for all three, before file routing) |
-| RTMP | `playAllowed(code, "rtmp", addr, token, "", "")` — token from the play-URL query — [serve_rtmp.go](../internal/publisher/serve_rtmp.go) |
-| SRT | `playAllowed(code, "srt", addr, srtTok, "", "")` — [serve_srt.go:129](../internal/publisher/serve_srt.go#L129) |
-| RTSP | `playAllowed(code, "rtsp", remote, TokenFromQuery, ua, "")` — [serve_rtsp.go:253](../internal/publisher/serve_rtsp.go#L253) |
+| RTMP | `playAllowed(code, "rtmp", addr, token, "")` — token from the play-URL query — [serve_rtmp.go](../internal/publisher/serve_rtmp.go) |
+| SRT | `playAllowed(code, "srt", addr, srtTok, "")` — [serve_srt.go:129](../internal/publisher/serve_srt.go#L129) |
+| RTSP | `playAllowed(code, "rtsp", remote, TokenFromQuery, ua)` — [serve_rtsp.go:253](../internal/publisher/serve_rtsp.go#L253) |
 
 ---
 

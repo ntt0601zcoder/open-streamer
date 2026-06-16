@@ -62,7 +62,7 @@ func (s *Service) HandleRTMPPlay(
 	// handshake, so those rules stay inert — IP/country/token/policy apply
 	// (B / S-13).
 	token := sessions.TokenFromQuery(info.RawQuery)
-	if !s.playAllowed(code, "rtmp", info.RemoteAddr, token, "", "") {
+	if !s.playAllowed(code, "rtmp", info.RemoteAddr, token, "") {
 		return fmt.Errorf("stream %q: playback not authorized", key)
 	}
 

@@ -44,7 +44,7 @@ func TestRTMPPlay_TokenPolicy(t *testing.T) {
 	// play mirrors HandleRTMPPlay's auth step: rawQuery -> token -> playAllowed.
 	play := func(rawQuery string) bool {
 		tok := sessions.TokenFromQuery(rawQuery)
-		return svc.playAllowed(code, "rtmp", "203.0.113.5:5555", tok, "", "")
+		return svc.playAllowed(code, "rtmp", "203.0.113.5:5555", tok, "")
 	}
 
 	cases := []struct {
@@ -76,14 +76,14 @@ func TestRTMPPlay_NoPolicyIsPublic(t *testing.T) {
 	svc := &Service{}
 	svc.SetMediaAuthorizer(authz)
 
-	if !svc.playAllowed(code, "rtmp", "203.0.113.9:1", "", "", "") {
+	if !svc.playAllowed(code, "rtmp", "203.0.113.9:1", "", "") {
 		t.Fatal("stream with no policy must be public over RTMP")
 	}
 }
 
 func TestRTMPPlay_NilAuthorizerAllows(t *testing.T) {
 	svc := &Service{} // no authorizer wired → media auth disabled
-	if !svc.playAllowed("any", "rtmp", "203.0.113.9:1", "", "", "") {
+	if !svc.playAllowed("any", "rtmp", "203.0.113.9:1", "", "") {
 		t.Fatal("nil authorizer must allow playback")
 	}
 }
