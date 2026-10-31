@@ -1,6 +1,6 @@
 // Package blob implements the CMAF blob-archive DVR: per-hour container files
 // of concatenated fMP4 fragments, a per-hour binary range index, and a
-// per-stream catalog. See docs/todo/dvr-blob-archive.md for the full design.
+// per-stream catalog.
 //
 // This file defines the on-disk ".ranges" index format: a 64-byte header
 // followed by fixed-width 40-byte fragment records. The format is append-only
