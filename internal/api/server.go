@@ -192,8 +192,8 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	// spoofing — it mutates r.RemoteAddr from untrusted headers). Kept for now
 	// because this deployment runs behind a trusted reverse proxy that sets the
 	// forwarded headers. The safe migration to middleware.ClientIPFrom* +
-	// GetClientIP (which never mutate r.RemoteAddr) is tracked in docs/todo.
-	r.Use(middleware.RealIP) //nolint:staticcheck // trusted-proxy deploy; migration tracked in docs/todo
+	// GetClientIP (which never mutate r.RemoteAddr) is a pending migration.
+	r.Use(middleware.RealIP) //nolint:staticcheck // trusted-proxy deploy
 	if serverCfg.CORS.Enabled {
 		r.Use(cors.Handler(corsOptions(serverCfg.CORS)))
 	}
