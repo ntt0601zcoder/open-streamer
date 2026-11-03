@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	pb "github.com/ntt0601zcoder/open-streamer/internal/transcoder/native/proto"
 )
 
@@ -348,7 +349,13 @@ func isNVENCEncoder(name string) bool {
 // EncoderConfig defaults). P5 will fold per-backend H.265 + AV1 in.
 func encoderCodecForBackend(hw pb.HWBackend, explicit string) string {
 	if explicit != "" {
-		return explicit
+		// Explicit codecs may be user-facing aliases ("h264", "hevc") that
+		// libavcodec has no encoder for; resolve them per backend.
+		accel := domain.HWAccelNone
+		if hw == pb.HWBackend_HW_BACKEND_NVENC {
+			accel = domain.HWAccelNVENC
+		}
+		return domain.ResolveVideoEncoder(domain.VideoCodec(explicit), accel)
 	}
 	switch hw {
 	case pb.HWBackend_HW_BACKEND_NVENC:
