@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 
 	pb "github.com/ntt0601zcoder/open-streamer/internal/transcoder/native/proto"
 )
@@ -344,26 +345,38 @@ func isNVENCEncoder(name string) bool {
 }
 
 // encoderCodecForBackend resolves the per-backend libavcodec encoder
-// name. P4 falls back to libx264 when explicit codec is empty (matches
-// EncoderConfig defaults). P5 will fold per-backend H.265 + AV1 in.
+// name. An empty codec means H.264 on the backend (libx264 on CPU). User
+// facing aliases (h264, avc, h265, hevc, av1) are routed to the backend's
+// encoder; any other explicit value is assumed to be a full encoder name
+// and is kept as is.
 func encoderCodecForBackend(hw pb.HWBackend, explicit string) string {
-	if explicit != "" {
-		return explicit
-	}
+	var family string // encoder-name suffix for the backend; "" = CPU
 	switch hw {
 	case pb.HWBackend_HW_BACKEND_NVENC:
-		return "h264_nvenc"
+		family = "nvenc"
 	case pb.HWBackend_HW_BACKEND_VAAPI:
-		return "h264_vaapi"
+		family = "vaapi"
 	case pb.HWBackend_HW_BACKEND_VIDEOTOOLBOX:
-		return "h264_videotoolbox"
+		family = "videotoolbox"
 	case pb.HWBackend_HW_BACKEND_QSV:
-		return "h264_qsv"
+		family = "qsv"
 	case pb.HWBackend_HW_BACKEND_CPU, pb.HWBackend_HW_BACKEND_UNSPECIFIED:
-		fallthrough
-	default:
-		return "libx264"
 	}
+	var base, cpu string
+	switch strings.ToLower(strings.TrimSpace(explicit)) {
+	case "", "h264", "avc":
+		base, cpu = "h264", "libx264"
+	case "h265", "hevc":
+		base, cpu = "hevc", "libx265"
+	case "av1":
+		base, cpu = "av1", "libsvtav1"
+	default:
+		return explicit
+	}
+	if family == "" {
+		return cpu
+	}
+	return base + "_" + family
 }
 
 // decoderCodecForBackend picks the video DECODER name for the backend.
