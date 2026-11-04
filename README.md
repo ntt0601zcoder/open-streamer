@@ -206,7 +206,7 @@ make hooks-install  # install pre-commit hook (auto-regen swagger)
 
 Single test: `go test -run TestName ./internal/<pkg>/...`
 
-Requires Go 1.25.x+. Transcoding links libavcodec (FFmpeg's libraries) into
+Requires Go 1.26.10+. Transcoding links libavcodec (FFmpeg's libraries) into
 the `open-streamer-transcoder` binary — the builder image and release
 bundles provide them; the boot probe catches missing required encoders.
 
