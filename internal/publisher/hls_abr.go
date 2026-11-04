@@ -37,6 +37,9 @@ type hlsABRRep struct {
 	height   int
 	hasAudio bool // segments contain an audio track — drives the audio entry in CODECS
 	hasData  bool // at least one segment has been flushed
+	// videoCodec is the video codec string read from the real SPS; empty means
+	// "not seen yet" and the resolution-based guess is used instead.
+	videoCodec string
 }
 
 // hlsABRMaster coordinates writing the root master HLS playlist.
@@ -72,7 +75,7 @@ func newHLSABRMaster(rootPath string, streamID domain.StreamCode) *hlsABRMaster 
 // drop the audio track even though the .ts segment contains it. Safari's
 // native HLS demuxer is more forgiving but still benefits from an accurate
 // declaration.
-func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int, hasAudio bool) {
+func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int, hasAudio bool, videoCodec string) {
 	// Apply external override when present (persists across segment flushes).
 	if v, ok := m.overrides.Load(slug); ok {
 		ov := v.(*hlsABRRep)
@@ -95,6 +98,9 @@ func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int, has
 	r.width = width
 	r.height = height
 	r.hasAudio = hasAudio
+	if videoCodec != "" {
+		r.videoCodec = videoCodec
+	}
 	r.hasData = true
 
 	if m.debounce != nil {
@@ -161,6 +167,9 @@ func writeHLSMasterPlaylist(path string, reps []hlsABRRep) error {
 
 	for _, r := range reps {
 		codec := hlsCodecString(r.width, r.height, r.hasAudio)
+		if r.videoCodec != "" {
+			codec = hlsCodecList(r.videoCodec, r.hasAudio)
+		}
 		res := ""
 		if r.width > 0 && r.height > 0 {
 			res = fmt.Sprintf(",RESOLUTION=%dx%d", r.width, r.height)
