@@ -47,6 +47,8 @@ func hwEncoder(base string, hw HWAccel, cpu string) string {
 	switch hw {
 	case HWAccelNVENC, HWAccelVAAPI, HWAccelQSV, HWAccelVideoToolbox:
 		return base + "_" + string(hw)
+	case HWAccelNone:
+		return cpu
 	default:
 		return cpu
 	}

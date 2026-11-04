@@ -363,6 +363,8 @@ func hwAccelFor(hw pb.HWBackend) domain.HWAccel {
 		return domain.HWAccelQSV
 	case pb.HWBackend_HW_BACKEND_VIDEOTOOLBOX:
 		return domain.HWAccelVideoToolbox
+	case pb.HWBackend_HW_BACKEND_CPU, pb.HWBackend_HW_BACKEND_UNSPECIFIED:
+		return domain.HWAccelNone
 	default:
 		return domain.HWAccelNone
 	}
