@@ -6,10 +6,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// ResolveVideoEncoder must mirror transcoder.normalizeVideoEncoder
-// exactly — any divergence makes FFmpeg use a different encoder than the
-// transcoder's own logging / preview shows. Cases below pin every routing
-// branch.
+// ResolveVideoEncoder is what the native transcoder encodes with and what
+// the API's defaults table shows; cases pin every routing branch.
 func TestResolveVideoEncoder(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -20,7 +18,15 @@ func TestResolveVideoEncoder(t *testing.T) {
 	}{
 		{"empty + nvenc → h264_nvenc", "", HWAccelNVENC, "h264_nvenc"},
 		{"empty + cpu → libx264", "", HWAccelNone, "libx264"},
-		{"empty + vaapi → libx264 (no implicit routing)", "", HWAccelVAAPI, "libx264"},
+		{"empty + vaapi → h264_vaapi", "", HWAccelVAAPI, "h264_vaapi"},
+		{"h264 + qsv → h264_qsv", "h264", HWAccelQSV, "h264_qsv"},
+		{"avc + videotoolbox → h264_videotoolbox", "avc", HWAccelVideoToolbox, "h264_videotoolbox"},
+		{"hevc + vaapi → hevc_vaapi", "hevc", HWAccelVAAPI, "hevc_vaapi"},
+		{"h265 + qsv → hevc_qsv", "h265", HWAccelQSV, "hevc_qsv"},
+		{"hevc + videotoolbox → hevc_videotoolbox", "hevc", HWAccelVideoToolbox, "hevc_videotoolbox"},
+		{"av1 + nvenc stays libsvtav1", "av1", HWAccelNVENC, "libsvtav1"},
+		{"explicit av1_qsv preserved", "av1_qsv", HWAccelNone, "av1_qsv"},
+		{"explicit libsvtav1 preserved", "libsvtav1", HWAccelNVENC, "libsvtav1"},
 		{"h264 + nvenc → h264_nvenc", "h264", HWAccelNVENC, "h264_nvenc"},
 		{"avc + cpu → libx264", "avc", HWAccelNone, "libx264"},
 		{"h265 + nvenc → hevc_nvenc", "h265", HWAccelNVENC, "hevc_nvenc"},

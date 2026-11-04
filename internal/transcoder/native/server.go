@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	pb "github.com/ntt0601zcoder/open-streamer/internal/transcoder/native/proto"
 )
 
@@ -344,39 +344,28 @@ func isNVENCEncoder(name string) bool {
 	return false
 }
 
-// encoderCodecForBackend resolves the per-backend libavcodec encoder
-// name. An empty codec means H.264 on the backend (libx264 on CPU). User
-// facing aliases (h264, avc, h265, hevc, av1) are routed to the backend's
-// encoder; any other explicit value is assumed to be a full encoder name
-// and is kept as is.
+// encoderCodecForBackend resolves the per-backend libavcodec encoder name
+// through domain.ResolveVideoEncoder, the same table the API serves: user
+// facing aliases (h264, avc, h265, hevc, …) go to the backend's encoder,
+// explicit encoder names are kept.
 func encoderCodecForBackend(hw pb.HWBackend, explicit string) string {
-	var family string // encoder-name suffix for the backend; "" = CPU
+	return domain.ResolveVideoEncoder(domain.VideoCodec(explicit), hwAccelFor(hw))
+}
+
+// hwAccelFor maps the proto backend to the domain one.
+func hwAccelFor(hw pb.HWBackend) domain.HWAccel {
 	switch hw {
 	case pb.HWBackend_HW_BACKEND_NVENC:
-		family = "nvenc"
+		return domain.HWAccelNVENC
 	case pb.HWBackend_HW_BACKEND_VAAPI:
-		family = "vaapi"
-	case pb.HWBackend_HW_BACKEND_VIDEOTOOLBOX:
-		family = "videotoolbox"
+		return domain.HWAccelVAAPI
 	case pb.HWBackend_HW_BACKEND_QSV:
-		family = "qsv"
-	case pb.HWBackend_HW_BACKEND_CPU, pb.HWBackend_HW_BACKEND_UNSPECIFIED:
-	}
-	var base, cpu string
-	switch strings.ToLower(strings.TrimSpace(explicit)) {
-	case "", "h264", "avc":
-		base, cpu = "h264", "libx264"
-	case "h265", "hevc":
-		base, cpu = "hevc", "libx265"
-	case "av1":
-		base, cpu = "av1", "libsvtav1"
+		return domain.HWAccelQSV
+	case pb.HWBackend_HW_BACKEND_VIDEOTOOLBOX:
+		return domain.HWAccelVideoToolbox
 	default:
-		return explicit
+		return domain.HWAccelNone
 	}
-	if family == "" {
-		return cpu
-	}
-	return base + "_" + family
 }
 
 // decoderCodecForBackend picks the video DECODER name for the backend.
