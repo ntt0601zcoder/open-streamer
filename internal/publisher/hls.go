@@ -226,6 +226,11 @@ type hlsSegmenter struct {
 	// (scanner == nil); raw-TS path uses tryFlushAtIDRLocked which always
 	// splits at a keyframe.
 	discardUntilIDR bool
+
+	// segVideoPkts counts video AV packets recorded since the last flush.
+	// Lets maybeFlushAtKeyframe tell an audio-only buffer (left after a
+	// force-flush while video is discarded) from one that holds video.
+	segVideoPkts int
 }
 
 func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
@@ -402,6 +407,9 @@ func (p *hlsSegmenter) recordMediaTime(av *domain.AVPacket) {
 		p.hasMediaStart = true
 	}
 	p.lastMediaPTS = av.PTSms
+	if av.Codec.IsVideo() {
+		p.segVideoPkts++
+	}
 }
 
 // maybeFlushAtKeyframe lands a fresh segment boundary on every IDR once
@@ -427,7 +435,15 @@ func (p *hlsSegmenter) maybeFlushAtKeyframe(av *domain.AVPacket, segDur time.Dur
 	if av.PTSms-p.segStartMediaPTS < segDurMs {
 		return
 	}
+	// recordMediaTime already counted this keyframe. If it is the only video
+	// packet in the buffer, the buffer is audio-only (video was discarded
+	// after a force-flush): cutting would publish a segment with no IDR/SPS.
+	// Keep the audio and let the segment continue from this IDR instead.
+	if av.Codec.IsVideo() && p.segVideoPkts <= 1 {
+		return
+	}
 	p.flushLocked()
+	p.segVideoPkts = 1
 	p.segStartMediaPTS = av.PTSms
 	p.lastMediaPTS = av.PTSms
 	p.hasMediaStart = true
@@ -554,6 +570,7 @@ func (p *hlsSegmenter) flushLocked() {
 	p.segBuf = p.segBuf[:0]
 	p.segStart = time.Time{}
 	p.hasMediaStart = false
+	p.segVideoPkts = 0
 	p.segStartMediaPTS = 0
 	p.lastMediaPTS = 0
 	// Re-anchor the segBuf-to-scanner offset mapping. The scanner has been
