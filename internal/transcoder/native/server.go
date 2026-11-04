@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	pb "github.com/ntt0601zcoder/open-streamer/internal/transcoder/native/proto"
 )
 
@@ -343,26 +344,29 @@ func isNVENCEncoder(name string) bool {
 	return false
 }
 
-// encoderCodecForBackend resolves the per-backend libavcodec encoder
-// name. P4 falls back to libx264 when explicit codec is empty (matches
-// EncoderConfig defaults). P5 will fold per-backend H.265 + AV1 in.
+// encoderCodecForBackend resolves the per-backend libavcodec encoder name
+// through domain.ResolveVideoEncoder, the same table the API serves: user
+// facing aliases (h264, avc, h265, hevc, …) go to the backend's encoder,
+// explicit encoder names are kept.
 func encoderCodecForBackend(hw pb.HWBackend, explicit string) string {
-	if explicit != "" {
-		return explicit
-	}
+	return domain.ResolveVideoEncoder(domain.VideoCodec(explicit), hwAccelFor(hw))
+}
+
+// hwAccelFor maps the proto backend to the domain one.
+func hwAccelFor(hw pb.HWBackend) domain.HWAccel {
 	switch hw {
 	case pb.HWBackend_HW_BACKEND_NVENC:
-		return "h264_nvenc"
+		return domain.HWAccelNVENC
 	case pb.HWBackend_HW_BACKEND_VAAPI:
-		return "h264_vaapi"
-	case pb.HWBackend_HW_BACKEND_VIDEOTOOLBOX:
-		return "h264_videotoolbox"
+		return domain.HWAccelVAAPI
 	case pb.HWBackend_HW_BACKEND_QSV:
-		return "h264_qsv"
+		return domain.HWAccelQSV
+	case pb.HWBackend_HW_BACKEND_VIDEOTOOLBOX:
+		return domain.HWAccelVideoToolbox
 	case pb.HWBackend_HW_BACKEND_CPU, pb.HWBackend_HW_BACKEND_UNSPECIFIED:
-		fallthrough
+		return domain.HWAccelNone
 	default:
-		return "libx264"
+		return domain.HWAccelNone
 	}
 }
 

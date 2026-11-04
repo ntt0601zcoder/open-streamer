@@ -8,26 +8,25 @@ import "strings"
 // internals — the same lookup tables stay testable in pure Go.
 
 // ResolveVideoEncoder maps a user-facing codec string + global HW backend
-// to the FFmpeg encoder name that buildFFmpegArgs will emit.
+// to the libavcodec encoder name. It is the single source of truth for both
+// the native transcoder and the API's codec×HW defaults table.
 //
-// Routing highlights:
-//   - "" / "h264" / "avc" + HW=nvenc → "h264_nvenc"; else "libx264"
-//   - "h265" / "hevc"     + HW=nvenc → "hevc_nvenc"; else "libx265"
-//   - VAAPI / QSV / VideoToolbox: no implicit routing — caller must spell
-//     the full encoder name (e.g. "h264_vaapi"); empty stays "libx264".
+// Routing:
+//   - "" / "h264" / "avc"  → h264_<hw> (h264_nvenc, h264_vaapi, h264_qsv,
+//     h264_videotoolbox); libx264 on CPU
+//   - "h265" / "hevc"      → hevc_<hw>; libx265 on CPU
+//   - "av1"                → libsvtav1 on every backend (hardware AV1 needs
+//     recent GPUs; spell av1_nvenc / av1_vaapi / av1_qsv to opt in)
+//   - "mp2v" / "mpeg2video" → mpeg2video on every backend
+//   - an explicit encoder name (h264_nvenc, libx264, av1_qsv, …) is kept
+//   - anything else falls back to libx264
 func ResolveVideoEncoder(codec VideoCodec, hw HWAccel) string {
 	c := strings.TrimSpace(strings.ToLower(string(codec)))
 	switch c {
 	case "", "h264", "avc":
-		if hw == HWAccelNVENC {
-			return "h264_nvenc"
-		}
-		return "libx264"
+		return hwEncoder("h264", hw, "libx264")
 	case "h265", "hevc":
-		if hw == HWAccelNVENC {
-			return "hevc_nvenc"
-		}
-		return "libx265"
+		return hwEncoder("hevc", hw, "libx265")
 	case "av1":
 		return "libsvtav1"
 	case "mp2v", "mpeg2video":
@@ -36,13 +35,35 @@ func ResolveVideoEncoder(codec VideoCodec, hw HWAccel) string {
 		// legacy headend system that consumes MPEG-2 input.
 		return "mpeg2video"
 	}
-	if strings.Contains(c, "nvenc") || strings.Contains(c, "qsv") || strings.Contains(c, "videotoolbox") {
-		return string(codec)
-	}
-	if strings.Contains(c, "264") || strings.Contains(c, "265") || strings.Contains(c, "hevc") {
+	if isEncoderName(c) {
 		return string(codec)
 	}
 	return "libx264"
+}
+
+// hwEncoder is base_<backend> (h264_nvenc, hevc_vaapi, …), or cpu when the
+// backend is none or unknown.
+func hwEncoder(base string, hw HWAccel, cpu string) string {
+	switch hw {
+	case HWAccelNVENC, HWAccelVAAPI, HWAccelQSV, HWAccelVideoToolbox:
+		return base + "_" + string(hw)
+	case HWAccelNone:
+		return cpu
+	default:
+		return cpu
+	}
+}
+
+// isEncoderName reports whether c already names a libavcodec encoder
+// (lower-cased): a hardware encoder (<codec>_<backend>), a lib* software
+// encoder, or an H.264/H.265 name.
+func isEncoderName(c string) bool {
+	for _, hw := range []string{"_nvenc", "_vaapi", "_qsv", "_videotoolbox"} {
+		if strings.HasSuffix(c, hw) {
+			return true
+		}
+	}
+	return strings.HasPrefix(c, "lib") || strings.Contains(c, "264") || strings.Contains(c, "265") || strings.Contains(c, "hevc")
 }
 
 // ResolveAudioEncoder maps a user-facing codec to FFmpeg's encoder name.

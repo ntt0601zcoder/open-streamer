@@ -97,12 +97,13 @@ func TestGetConfigDefaults_CodecRoutingTable(t *testing.T) {
 	// Pin every cell of the h264/h265 rows that frontend will touch most.
 	assert.Equal(t, "libx264", table["h264"]["none"])
 	assert.Equal(t, "h264_nvenc", table["h264"]["nvenc"])
-	assert.Equal(t, "libx264", table["h264"]["vaapi"], "no implicit vaapi routing for empty/h264")
-	assert.Equal(t, "libx264", table["h264"]["qsv"])
-	assert.Equal(t, "libx264", table["h264"]["videotoolbox"])
+	assert.Equal(t, "h264_vaapi", table["h264"]["vaapi"], "same routing as the native transcoder")
+	assert.Equal(t, "h264_qsv", table["h264"]["qsv"])
+	assert.Equal(t, "h264_videotoolbox", table["h264"]["videotoolbox"])
 
 	assert.Equal(t, "libx265", table["h265"]["none"])
 	assert.Equal(t, "hevc_nvenc", table["h265"]["nvenc"])
+	assert.Equal(t, "hevc_vaapi", table["h265"]["vaapi"])
 
 	// AV1 / MPEG-2 ignore HW backend (CPU-only encoder paths).
 	for _, hw := range []string{"none", "nvenc", "vaapi", "qsv", "videotoolbox"} {
