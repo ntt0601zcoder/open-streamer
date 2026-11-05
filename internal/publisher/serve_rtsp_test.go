@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/bluenviron/gortsplib/v5"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpmpeg4audio"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -234,6 +236,31 @@ func TestPaceReanchorsOnBackwardsDTS(t *testing.T) {
 	require.Less(t, time.Since(start), 5*time.Millisecond,
 		"backwards dts must re-anchor without sleeping")
 	require.Equal(t, uint64(4900), sess.paceMedia)
+}
+
+// Audio and video DTS come from independent timelines, so an audio packet
+// whose DTS is far ahead of (or behind) the video DTS must not be paced
+// against the video anchor: that would stall the ring-buffer consumer.
+func TestPaceAudioIndependentOfVideoAnchor(t *testing.T) {
+	for _, audioDTS := range []uint64{3000, 0} {
+		sess := &rtspSession{
+			ctx:        context.Background(),
+			audioMedia: &description.Media{},
+			audioEnc:   &rtpmpeg4audio.Encoder{},
+			aacCfg:     &mpeg4audio.AudioSpecificConfig{SampleRate: 48000},
+		}
+		sess.pace(1000) // video anchors the shared clock
+		videoBase := sess.paceBase
+
+		start := time.Now()
+		// Undecodable ADTS: pacing runs first, then the frame is dropped
+		// before any RTP write, so no server stream is needed.
+		sess.writeAudioRTP([]byte{0, 1, 2}, audioDTS)
+		require.Less(t, time.Since(start), 300*time.Millisecond,
+			"audio pacing must not block on the video anchor (audio dts %d)", audioDTS)
+		require.Equal(t, videoBase, sess.paceBase, "audio must not move the video anchor")
+		require.Equal(t, uint64(1000), sess.paceMedia, "audio must not move the video anchor")
+	}
 }
 
 // Context cancellation aborts the in-flight sleep so stream teardown is
