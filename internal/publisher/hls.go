@@ -202,6 +202,10 @@ type hlsSegmenter struct {
 	width     int
 	height    int
 	hasAudio  bool // set at construction from hlsRunOpts
+	// videoCodec is the RFC 6381 video codec string taken from the SPS the
+	// encoder actually emitted; "" until one has been seen, in which case the
+	// master playlist falls back to the resolution heuristic.
+	videoCodec string
 
 	// Pre-bound segment-write counter; nil-safe.
 	segCount prometheus.Counter
@@ -308,6 +312,7 @@ func (p *hlsSegmenter) handleIncoming(
 			return
 		}
 		p.recordMediaTime(pkt.AV)
+		p.noteVideoCodec(pkt.AV)
 		p.maybeFlushAtKeyframe(pkt.AV, segDur)
 	}
 	rawTS := len(pkt.TS) > 0 && pkt.AV == nil
@@ -366,7 +371,25 @@ func (p *hlsSegmenter) appendSegment188(pkt188 []byte, rawTS bool) {
 			p.scanner = newTSKeyframeScanner()
 		}
 		p.scanner.Feed(pkt188)
+		if c := p.scanner.h264Codec; c != "" {
+			p.videoCodec = c
+		}
 	}
+}
+
+// noteVideoCodec records the H.264 profile/level from an AV-path keyframe that
+// carries an SPS.
+func (p *hlsSegmenter) noteVideoCodec(av *domain.AVPacket) {
+	if !av.KeyFrame || av.Codec != domain.AVCodecH264 {
+		return
+	}
+	c := h264CodecFromAnnexB(av.Data)
+	if c == "" {
+		return
+	}
+	p.mu.Lock()
+	p.videoCodec = c
+	p.mu.Unlock()
 }
 
 // onSessionBoundary is invoked at the top of handleIncoming whenever a
@@ -686,7 +709,7 @@ func (p *hlsSegmenter) writeManifestLocked() error {
 
 	if p.abrMaster != nil {
 		// Notify the ABR master so it can refresh the root master playlist.
-		p.abrMaster.onShardUpdated(p.abrSlug, p.bwBps, p.width, p.height, p.hasAudio)
+		p.abrMaster.onShardUpdated(p.abrSlug, p.bwBps, p.width, p.height, p.hasAudio, p.videoCodec)
 	}
 
 	if p.manifestPath != "" {
@@ -715,6 +738,9 @@ func windowTailEntries(entries []hlsSegEntry, n int) []hlsSegEntry {
 // video-only codec list and silently drop audio even though the .ts segments
 // carry it — which is why "plays in the Open-Streamer console but not in the
 // browser" is a recurring symptom on transcoded ABR streams.
+//
+// This is only the fallback used before the rendition's real SPS has been seen;
+// see h264CodecFromAnnexB for the authoritative value.
 func hlsCodecString(width, height int, hasAudio bool) string {
 	pixels := width * height
 	var video string
@@ -726,8 +752,30 @@ func hlsCodecString(width, height int, hasAudio bool) string {
 	default:
 		video = "avc1.42e01e" // Baseline@L3.0
 	}
+	return hlsCodecList(video, hasAudio)
+}
+
+// hlsCodecList appends the AAC-LC entry to a video codec string when needed.
+func hlsCodecList(video string, hasAudio bool) string {
 	if hasAudio {
 		return video + ",mp4a.40.2"
 	}
 	return video
+}
+
+// h264CodecFromAnnexB returns the RFC 6381 "avc1.PPCCLL" string built from the
+// first SPS (profile_idc, constraint flags, level_idc) found in an Annex-B
+// buffer, or "" when the buffer holds no complete SPS.
+func h264CodecFromAnnexB(es []byte) string {
+	for i := 0; i+3 < len(es); i++ {
+		if es[i] != 0 || es[i+1] != 0 || es[i+2] != 1 {
+			continue
+		}
+		// NAL header at i+3, then profile_idc, constraint flags, level_idc.
+		if es[i+3]&0x1F == 7 && i+6 < len(es) {
+			return fmt.Sprintf("avc1.%02x%02x%02x", es[i+4], es[i+5], es[i+6])
+		}
+		i += 2
+	}
+	return ""
 }

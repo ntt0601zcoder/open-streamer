@@ -69,6 +69,10 @@ type tsKeyframeScanner struct {
 	// itself. The segmenter splits there so the new segment opens with the
 	// natural PAT → PMT → IDR sequence the source emits. -1 = none yet.
 	LastIDROffset int64
+
+	// h264Codec is the "avc1.PPCCLL" string from the most recent H.264 SPS
+	// seen in the video PES stream; "" until one is found.
+	h264Codec string
 }
 
 func newTSKeyframeScanner() *tsKeyframeScanner {
@@ -124,6 +128,11 @@ func (s *tsKeyframeScanner) process188(pkt []byte) {
 // pesScanCap).
 func (s *tsKeyframeScanner) processVideoPacket(pkt []byte, pusi bool) {
 	if pusi {
+		if len(s.pesBuf) > 0 && s.videoCodec == domain.AVCodecH264 {
+			if c := h264CodecFromAnnexB(stripPESHeader(s.pesBuf)); c != "" {
+				s.h264Codec = c
+			}
+		}
 		if len(s.pesBuf) > 0 && s.isIDR(s.pesBuf) {
 			// Prefer splitting at the PAT immediately preceding the IDR, so
 			// the next segment starts with the natural PAT → PMT → IDR
