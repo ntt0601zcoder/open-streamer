@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -235,6 +236,12 @@ type hlsSegmenter struct {
 	// Lets maybeFlushAtKeyframe tell an audio-only buffer (left after a
 	// force-flush while video is discarded) from one that holds video.
 	segVideoPkts int
+
+	// heldAudio, maxVideoPTS and hasVideoPTS back holdAudioForVideo. Only the
+	// run goroutine touches them.
+	heldAudio   []*domain.AVPacket
+	maxVideoPTS uint64
+	hasVideoPTS bool
 }
 
 func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
@@ -302,8 +309,94 @@ func (p *hlsSegmenter) handleIncoming(
 	tsCarry *[]byte,
 ) {
 	if pkt.SessionStart {
+		// Held audio belongs to the old session: write it before the cut.
+		p.releaseHeldAudio(ctx, math.MaxUint64, segDur, avMux, tsCarry)
+		p.hasVideoPTS = false
 		p.onSessionBoundary(avMux, tsCarry)
 	}
+	if p.holdAudioForVideo(ctx, pkt, segDur, avMux, tsCarry) {
+		return
+	}
+	p.processIncoming(ctx, pkt, segDur, avMux, tsCarry)
+}
+
+// maxAudioLeadMs bounds how far ahead of the video the segmenter will hold
+// audio waiting for the video timeline to catch up. Beyond it the streams are
+// considered unrelated (video stalled) and audio is passed through.
+const maxAudioLeadMs = 1000
+
+// maxHeldAudio caps the number of audio packets held back.
+const maxHeldAudio = 512
+
+// holdAudioForVideo orders audio against video by PTS rather than by arrival.
+// Transcoder output can deliver audio ahead of the video it belongs with;
+// written in arrival order, audio whose PTS is at or after an IDR would land in
+// the segment before that IDR, so the next segment starts with video and its
+// first audio comes late. Audio ahead of the newest video PTS is therefore held
+// until a video packet reaches its PTS. Before each video packet is processed,
+// held audio with an earlier PTS is released, so audio at or after an IDR is
+// written after the cut. It returns true when pkt was consumed (held).
+// Only the run goroutine calls it.
+func (p *hlsSegmenter) holdAudioForVideo(
+	ctx context.Context,
+	pkt buffer.Packet,
+	segDur time.Duration,
+	avMux **tsmux.FromAV,
+	tsCarry *[]byte,
+) bool {
+	av := pkt.AV
+	if av == nil || len(pkt.TS) > 0 {
+		return false
+	}
+	if av.Codec.IsVideo() {
+		p.releaseHeldAudio(ctx, av.PTSms, segDur, avMux, tsCarry)
+		if !p.hasVideoPTS || av.PTSms > p.maxVideoPTS {
+			p.maxVideoPTS = av.PTSms
+		}
+		p.hasVideoPTS = true
+		return false
+	}
+	if p.hasVideoPTS && av.PTSms > p.maxVideoPTS &&
+		av.PTSms-p.maxVideoPTS <= maxAudioLeadMs && len(p.heldAudio) < maxHeldAudio {
+		p.heldAudio = append(p.heldAudio, av)
+		return true
+	}
+	// Not ahead of the video (or hold limits hit): keep order, drain first.
+	p.releaseHeldAudio(ctx, math.MaxUint64, segDur, avMux, tsCarry)
+	return false
+}
+
+// releaseHeldAudio processes held audio packets with PTS strictly below
+// beforePTS, in arrival order.
+func (p *hlsSegmenter) releaseHeldAudio(
+	ctx context.Context,
+	beforePTS uint64,
+	segDur time.Duration,
+	avMux **tsmux.FromAV,
+	tsCarry *[]byte,
+) {
+	n := 0
+	for n < len(p.heldAudio) && p.heldAudio[n].PTSms < beforePTS {
+		n++
+	}
+	if n == 0 {
+		return
+	}
+	released := p.heldAudio[:n]
+	p.heldAudio = append([]*domain.AVPacket(nil), p.heldAudio[n:]...)
+	for _, av := range released {
+		p.processIncoming(ctx, buffer.Packet{AV: av}, segDur, avMux, tsCarry)
+	}
+}
+
+// processIncoming runs one packet through segment-cut bookkeeping and the muxer.
+func (p *hlsSegmenter) processIncoming(
+	ctx context.Context,
+	pkt buffer.Packet,
+	segDur time.Duration,
+	avMux **tsmux.FromAV,
+	tsCarry *[]byte,
+) {
 	if pkt.AV != nil {
 		// After a non-keyframe-aligned force-flush, drop AV packets until
 		// the next IDR so the next segment starts at a clean keyframe.
