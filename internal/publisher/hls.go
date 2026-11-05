@@ -440,6 +440,14 @@ func (p *hlsSegmenter) shouldDropAVPacket(av *domain.AVPacket) bool {
 	}
 	if av.KeyFrame {
 		p.discardUntilIDR = false
+		// Audio kept flowing during the discard window, so segBuf may hold
+		// an audio-only prefix that anchored segStart/segStartMediaPTS.
+		// Publish it as its own segment (no audio lost); recordMediaTime
+		// then anchors the next segment at this IDR. The IDR's own bytes
+		// are not in segBuf yet and lastMediaPTS is still the last audio.
+		if len(p.segBuf) > 0 && p.segVideoPkts == 0 {
+			p.flushLocked()
+		}
 		slog.Info("publisher: HLS resumed at IDR after force-flush",
 			"stream_code", p.streamID)
 		return false
