@@ -723,6 +723,128 @@ func TestReanchorPreservesAVSync(t *testing.T) {
 	}
 }
 
+// seededOffsetRun joint-seeds a pair where the video source DTS is seedDelta ms
+// later than audio (negative: earlier), then feeds 10 s of paired 40 ms
+// packets at wallclock rate. It returns the normaliser and the next step index.
+func seededOffsetRun(t *testing.T, seedDelta int64) (*Normaliser, int64) {
+	t.Helper()
+	n := New(jointSeedConfig(1000))
+	n.Apply(aPkt(1_000_000, 1_000_000), startWall)
+	n.Apply(vPkt(uint64(1_000_000+seedDelta), uint64(1_000_000+seedDelta)), startWall)
+	for i := int64(1); i <= 250; i++ {
+		at := startWall.Add(time.Duration(i*40) * time.Millisecond)
+		n.Apply(aPkt(uint64(1_000_000+i*40), uint64(1_000_000+i*40)), at)
+		n.Apply(vPkt(uint64(1_000_000+seedDelta+i*40), uint64(1_000_000+seedDelta+i*40)), at)
+	}
+	return n, 251
+}
+
+// TestSeededOffsetSurvivesTrackGap follows the incident: joint seed with a
+// real source delta, a steady run, then one track's input stops for 3 s while
+// the partner continues and the gapped track resumes with its natural source
+// timestamps. The gapped track is still consistent with the seeded offset, so
+// no per-track re-anchor may collapse that offset.
+func TestSeededOffsetSurvivesTrackGap(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		seedDelta  int64
+		gapIsVideo bool
+	}{
+		{"video_ahead_video_gap", 4800, true},
+		{"audio_ahead_audio_gap", -4800, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n, i := seededOffsetRun(t, tc.seedDelta)
+			var lastV, lastA int64
+			// Gap: 75 steps (3 s) where only the other track delivers.
+			for ; i <= 325; i++ {
+				at := startWall.Add(time.Duration(i*40) * time.Millisecond)
+				if tc.gapIsVideo {
+					a := aPkt(uint64(1_000_000+i*40), uint64(1_000_000+i*40))
+					n.Apply(a, at)
+					lastA = int64(a.DTSms)
+				} else {
+					v := vPkt(uint64(1_000_000+tc.seedDelta+i*40), uint64(1_000_000+tc.seedDelta+i*40))
+					n.Apply(v, at)
+					lastV = int64(v.DTSms)
+				}
+			}
+			var a *domain.AVPacket
+			var v *domain.AVPacket
+			for ; i <= 400; i++ {
+				at := startWall.Add(time.Duration(i*40) * time.Millisecond)
+				a = aPkt(uint64(1_000_000+i*40), uint64(1_000_000+i*40))
+				v = vPkt(uint64(1_000_000+tc.seedDelta+i*40), uint64(1_000_000+tc.seedDelta+i*40))
+				n.Apply(a, at)
+				n.Apply(v, at)
+				if tc.gapIsVideo && int64(v.DTSms) < lastV || !tc.gapIsVideo && int64(a.DTSms) < lastA {
+					t.Fatalf("i=%d: output DTS regressed", i)
+				}
+			}
+			if n.totalReanch != 0 {
+				t.Fatalf("expected no re-anchors, got %d", n.totalReanch)
+			}
+			if got := int64(v.DTSms) - int64(a.DTSms); got != tc.seedDelta {
+				t.Fatalf("A/V offset = %d ms, want seeded %d ms", got, tc.seedDelta)
+			}
+		})
+	}
+}
+
+// TestOneTrackDiscontinuityStillReanchors: a video source timestamp jump that
+// is NOT consistent with the seeded offset (video moves 5 s away from where
+// the audio says it should be) is a genuine discontinuity and is still
+// re-anchored, and so is a jump beyond the bound of seed offset + threshold.
+func TestOneTrackDiscontinuityStillReanchors(t *testing.T) {
+	for _, jump := range []int64{5000, 9000} {
+		n, i := seededOffsetRun(t, 4800)
+		at := startWall.Add(time.Duration(i*40) * time.Millisecond)
+		n.Apply(aPkt(uint64(1_000_000+i*40), uint64(1_000_000+i*40)), at)
+		vd := uint64(1_000_000 + 4800 + i*40 + jump)
+		n.Apply(vPkt(vd, vd), at)
+		if n.totalReanch == 0 {
+			t.Fatalf("jump %d: expected a re-anchor for a genuine discontinuity", jump)
+		}
+	}
+}
+
+// TestBothTracksJumpAheadReanchors: both tracks' inputs jump ahead together;
+// re-anchoring still happens and output stays monotonic.
+func TestBothTracksJumpAheadReanchors(t *testing.T) {
+	n, i := seededOffsetRun(t, 4800)
+	var lastA, lastV int64
+	for ; i <= 300; i++ {
+		at := startWall.Add(time.Duration(i*40) * time.Millisecond)
+		a := aPkt(uint64(1_000_000+i*40+6000), uint64(1_000_000+i*40+6000))
+		v := vPkt(uint64(1_000_000+4800+i*40+6000), uint64(1_000_000+4800+i*40+6000))
+		n.Apply(a, at)
+		n.Apply(v, at)
+		if int64(a.DTSms) < lastA || int64(v.DTSms) < lastV {
+			t.Fatalf("i=%d: output DTS regressed", i)
+		}
+		lastA, lastV = int64(a.DTSms), int64(v.DTSms)
+	}
+	if n.totalReanch == 0 {
+		t.Fatal("expected re-anchors when both tracks jump ahead")
+	}
+}
+
+// TestNoJointSeedKeepsReanchor: without a joint-seed offset there is nothing to
+// compare against, so a video gap re-anchors as before.
+func TestNoJointSeedKeepsReanchor(t *testing.T) {
+	n := New(DefaultConfig())
+	n.Apply(aPkt(0, 0), startWall)
+	n.Apply(vPkt(0, 0), startWall)
+	for i := int64(1); i <= 250; i++ {
+		at := startWall.Add(time.Duration(i*40) * time.Millisecond)
+		n.Apply(aPkt(uint64(i*40), uint64(i*40)), at)
+		n.Apply(vPkt(uint64(i*40+5000), uint64(i*40+5000)), at)
+	}
+	if n.totalReanch == 0 {
+		t.Fatal("expected re-anchor without a recorded seed offset")
+	}
+}
+
 // TestJointSeedVideoLeadsAudio — symmetric to TestJointSeedAudioLeadsVideo
 // but with the source emitting video first in source-DTS terms (the
 // normal case). Joint-seed must anchor video at 0 and audio at +delta.
