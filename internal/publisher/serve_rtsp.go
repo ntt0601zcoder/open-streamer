@@ -569,12 +569,15 @@ type rtspSession struct {
 	firstVideo   bool
 
 	// pacing — anchor (paceBase wallclock, paceMedia DTSms) so each packet
-	// can be held until its target wallclock arrives. Shared between video
-	// and audio so a single timeline drives both tracks; whichever track
-	// ticks first sets the anchor.
+	// can be held until its target wallclock arrives. Video and audio keep
+	// separate anchors because their DTS timelines are independent.
 	paceBase  time.Time
 	paceMedia uint64
 	paceSet   bool
+
+	paceAudioBase  time.Time
+	paceAudioMedia uint64
+	paceAudioSet   bool
 }
 
 type rtspPendingVideo struct {
@@ -596,6 +599,7 @@ type rtspPendingAudio struct {
 func (sess *rtspSession) onSessionBoundary() {
 	sess.firstVideo = true
 	sess.paceSet = false
+	sess.paceAudioSet = false
 }
 
 // handleAVPacket dispatches a buffer-hub AVPacket directly into the RTP
@@ -891,10 +895,9 @@ func (sess *rtspSession) writeAudioRTP(frame []byte, dts uint64) {
 		return
 	}
 
-	// Wallclock pacing — see writeVideoRTP. Shared anchor across both
-	// tracks so audio and video stay in sync regardless of which one
-	// established the pacer.
-	sess.pace(dts)
+	// Wallclock pacing — see writeVideoRTP. Audio has its own anchor: its
+	// DTS timeline is independent of video's.
+	sess.paceAudio(dts)
 
 	// gomedia's TSDemuxer hands us DTS in milliseconds (see comment in
 	// writeVideoRTP). AAC RTP runs at the audio sample rate (48 kHz
@@ -993,37 +996,48 @@ func (sess *rtspSession) computeAudioRTP(dts uint64) uint32 {
 // Sleep aborts on sess.ctx cancellation so stream teardown is not held up
 // by an in-flight pace wait.
 func (sess *rtspSession) pace(dts uint64) {
-	if !sess.paceSet {
-		sess.paceBase = time.Now()
-		sess.paceMedia = dts
-		sess.paceSet = true
+	sess.paceTrack(&sess.paceBase, &sess.paceMedia, &sess.paceSet, dts)
+}
+
+// paceAudio is pace for the audio track, using its own anchor. Audio and
+// video DTS come from independent timelines, so sharing one anchor turns the
+// offset between them into long sleeps (or constant re-anchoring).
+func (sess *rtspSession) paceAudio(dts uint64) {
+	sess.paceTrack(&sess.paceAudioBase, &sess.paceAudioMedia, &sess.paceAudioSet, dts)
+}
+
+func (sess *rtspSession) paceTrack(paceBase *time.Time, paceMedia *uint64, paceSet *bool, dts uint64) {
+	if !*paceSet {
+		*paceBase = time.Now()
+		*paceMedia = dts
+		*paceSet = true
 		return
 	}
 	// Signed math: source DTS can dip slightly below the anchor (small
 	// reorder / jitter) without crossing a session boundary. Treat any
 	// negative delta as a re-anchor rather than under-flowing into a
 	// giant positive duration.
-	deltaMs := int64(dts) - int64(sess.paceMedia)
+	deltaMs := int64(dts) - int64(*paceMedia)
 	if deltaMs < 0 {
-		sess.paceBase = time.Now()
-		sess.paceMedia = dts
+		*paceBase = time.Now()
+		*paceMedia = dts
 		return
 	}
-	target := sess.paceBase.Add(time.Duration(deltaMs) * time.Millisecond)
+	target := paceBase.Add(time.Duration(deltaMs) * time.Millisecond)
 	delay := time.Until(target)
 	if delay > rtspPaceMaxSleep {
 		// PTS jumped far ahead of wallclock — re-anchor instead of
 		// sleeping a long time on a stale mapping.
-		sess.paceBase = time.Now()
-		sess.paceMedia = dts
+		*paceBase = time.Now()
+		*paceMedia = dts
 		return
 	}
 	if delay < -rtspPaceMaxLag {
 		// We have fallen more than rtspPaceMaxLag behind realtime;
 		// re-anchor at "now" so future packets pace from a fresh
 		// reference instead of perpetually chasing the old one.
-		sess.paceBase = time.Now()
-		sess.paceMedia = dts
+		*paceBase = time.Now()
+		*paceMedia = dts
 		return
 	}
 	if delay <= 0 {
