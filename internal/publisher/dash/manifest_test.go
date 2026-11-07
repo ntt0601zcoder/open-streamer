@@ -2,6 +2,7 @@ package dash
 
 import (
 	"encoding/xml"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -225,7 +226,10 @@ func TestBuildManifest_DurationsISO(t *testing.T) {
 // segmenter's safety-net cut emitted a giant segment), MinBuffer and
 // MaxSegmentDuration grow to match so the MPD's announced timing
 // matches what the player actually has to fetch. SuggestedPresentation
-// Delay stays at 3× segDur — that's a separate live-edge knob.
+// Delay follows the observed segments too, but must keep the suggested
+// live point inside the advertised time-shift window: here the window
+// stays at 6 × 2 s = 12 s (the retention-safe bound of the listed
+// segments is below that), so the delay is capped at 12 − 10 = 2 s.
 func TestBuildManifest_DurationsAdaptToObserved(t *testing.T) {
 	in := sampleManifestInput()
 	in.SegDur = 2 * time.Second
@@ -239,11 +243,21 @@ func TestBuildManifest_DurationsAdaptToObserved(t *testing.T) {
 	for _, want := range []string{
 		`minBufferTime="PT10S"`,             // = max(2×2, 10) = 10
 		`maxSegmentDuration="PT10S"`,        // = max(3×2, 10) = 10
-		`suggestedPresentationDelay="PT6S"`, // unchanged at 3 × segDur
+		`suggestedPresentationDelay="PT2S"`, // = timeShiftBufferDepth − longest = 12 − 10
+		`timeShiftBufferDepth="PT12S"`,      // = 6 × 2, retention bound (4 s) is lower
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("missing adapted duration attr %q in:\n%s", want, s)
 		}
+	}
+	var parsed mpdRoot
+	if err := xml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	delay := parseISOSeconds(t, "suggestedPresentationDelay", parsed.SuggestedPresentationDelay)
+	depth := parseISOSeconds(t, "timeShiftBufferDepth", parsed.BufferDepth)
+	if delay+10 > depth {
+		t.Errorf("suggestedPresentationDelay %.3f s + longest segment 10 s > timeShiftBufferDepth %.3f s", delay, depth)
 	}
 }
 
@@ -342,6 +356,228 @@ func TestBuildManifest_LivePTOOmitted(t *testing.T) {
 	if !strings.Contains(s, `type="dynamic"`) || !strings.Contains(s, "isoff-live") {
 		t.Errorf("live manifest must stay dynamic/isoff-live\n%s", s)
 	}
+}
+
+// trackWithDurs builds a track of contiguous segments with the given
+// durations (in timescale ticks), the first starting at startTicks.
+func trackWithDurs(repID string, timescale uint32, startTicks uint64, durs []uint64) TrackManifest {
+	segs := make([]SegmentEntry, 0, len(durs))
+	at := startTicks
+	for _, d := range durs {
+		segs = append(segs, SegmentEntry{StartTicks: at, DurTicks: d})
+		at += d
+	}
+	return TrackManifest{
+		RepID:        repID,
+		Codec:        "avc1.4D4028",
+		Bandwidth:    5_000_000,
+		Width:        1920,
+		Height:       1080,
+		SampleRate:   int(timescale),
+		Timescale:    timescale,
+		InitFile:     repID + "/init.mp4",
+		MediaPattern: repID + "/seg_$Number%05d$.m4s",
+		StartNumber:  100,
+		Segments:     segs,
+	}
+}
+
+// repeatDur returns n copies of d.
+func repeatDur(d uint64, n int) []uint64 {
+	out := make([]uint64, n)
+	for i := range out {
+		out[i] = d
+	}
+	return out
+}
+
+// parseISOSeconds parses the PT<seconds>S form emitted by the manifest.
+func parseISOSeconds(t *testing.T, attr, s string) float64 {
+	t.Helper()
+	if !strings.HasPrefix(s, "PT") || !strings.HasSuffix(s, "S") {
+		t.Fatalf("%s = %q: not a PT..S duration", attr, s)
+	}
+	v, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimPrefix(s, "PT"), "S"), 64)
+	if err != nil {
+		t.Fatalf("%s = %q: %v", attr, s, err)
+	}
+	return v
+}
+
+// TestBuildManifest_LiveTimingFollowsObservedSegments — the live-edge attrs
+// of a dynamic MPD must describe the segments the MPD actually lists, not
+// only the configured SegDur. GOP-bounded segments can be much longer than
+// SegDur (4.167 s against a 2 s config), and the pacing gate lists each
+// segment as soon as wallclock reaches its START, so its end is up to one
+// segment duration in the future at publishTime. With a delay of 3×SegDur
+// (6 s) the player targets less than 1.5 real segments behind the listed
+// edge and stalls waiting for the next one.
+//
+// For every layout it asserts:
+//   - suggestedPresentationDelay ≥ minDelaySegs × the longest listed segment;
+//   - suggestedPresentationDelay + longest listed segment ≤
+//     timeShiftBufferDepth (the suggested live point lies inside the
+//     advertised window);
+//   - timeShiftBufferDepth ≤ the sum of the listed durations except the
+//     oldest, for every track (with History = 0 the oldest listed segment
+//     is deleted once the next one is written, i.e. at the newest listed
+//     segment's end; depth must not advertise it past that);
+//   - minimumUpdatePeriod ≥ the longest listed segment (the real flush
+//     cadence);
+//   - the UTCTiming direct clock equals PublishTime to the millisecond.
+func TestBuildManifest_LiveTimingFollowsObservedSegments(t *testing.T) {
+	const (
+		vTS   = 90000
+		vDur  = 375_030 // 4.167 s at 90 kHz
+		aTS   = 48000
+		aDur  = 200_704 // 4.181 s at 48 kHz
+		v2s   = 180_000 // 2 s at 90 kHz
+		v10s  = 900_000 // 10 s at 90 kHz
+		a2s   = 96_000  // 2 s at 48 kHz
+		a10s  = 480_000 // 10 s at 48 kHz
+		vBase = 600_000_000
+		aBase = 320_000_000
+	)
+	ast := time.Date(2026, 5, 11, 8, 52, 5, 0, time.UTC)
+
+	long12V := repeatDur(vDur, 12)
+	long12A := repeatDur(aDur, 12)
+	// One 10 s safety-net segment in the middle of a 2 s window; audio is
+	// cut together with video so it mirrors the durations.
+	burstV := repeatDur(v2s, 12)
+	burstV[6] = v10s
+	burstA := repeatDur(a2s, 12)
+	burstA[6] = a10s
+
+	video := func(id string, durs []uint64) TrackManifest { return trackWithDurs(id, vTS, vBase, durs) }
+	audio := func(durs []uint64) *TrackManifest {
+		a := trackWithDurs("a0", aTS, aBase, durs)
+		return &a
+	}
+
+	cases := []struct {
+		name         string
+		window       int
+		video        []TrackManifest
+		audio        *TrackManifest
+		minDelaySegs float64
+	}{
+		{"video_and_audio", 12, []TrackManifest{video("v0", long12V)}, audio(long12A), 3},
+		{"abr_ladder", 12, []TrackManifest{video("v0", long12V), video("v1", long12V), video("v2", long12V)}, audio(long12A), 3},
+		{"video_only", 12, []TrackManifest{video("v0", long12V)}, nil, 3},
+		{"audio_only", 12, nil, audio(long12A), 3},
+		// 6 × 2 s = PT12S would hold neither 3 × 4.167 s of delay nor
+		// delay + one segment; depth must grow (within retention).
+		{"window6_4167ms_segments", 6, []TrackManifest{video("v0", long12V[:6])}, audio(long12A[:6]), 3},
+		// A 10 s segment: 3 × 10 + 10 s exceeds what is retained (30 s),
+		// so depth stops at the retention bound and the delay is capped
+		// to keep the live point inside it — still two such segments.
+		{"window12_one_10s_segment", 12, []TrackManifest{video("v0", burstV)}, audio(burstA), 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var maxSegSec float64
+			retention := -1.0
+			var lastStart time.Duration
+			scan := func(tr *TrackManifest) {
+				var sum float64
+				for i, s := range tr.Segments {
+					d := float64(s.DurTicks) / float64(tr.Timescale)
+					if d > maxSegSec {
+						maxSegSec = d
+					}
+					if i > 0 {
+						sum += d
+					}
+				}
+				if retention < 0 || sum < retention {
+					retention = sum
+				}
+				last := tr.Segments[len(tr.Segments)-1]
+				st := time.Duration(last.StartTicks * uint64(time.Second) / uint64(tr.Timescale))
+				if st > lastStart {
+					lastStart = st
+				}
+			}
+			for i := range tc.video {
+				scan(&tc.video[i])
+			}
+			if tc.audio != nil {
+				scan(tc.audio)
+			}
+			// The pacing gate publishes the newest segment when wallclock
+			// reaches its start.
+			publish := ast.Add(lastStart)
+
+			in := &ManifestInput{
+				AvailabilityStart: ast,
+				PublishTime:       publish,
+				SegDur:            2 * time.Second,
+				Window:            tc.window,
+				Video:             tc.video,
+				Audio:             tc.audio,
+			}
+			data, err := BuildManifest(in)
+			if err != nil {
+				t.Fatalf("BuildManifest: %v", err)
+			}
+			var parsed mpdRoot
+			if err := xml.Unmarshal(data, &parsed); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+
+			delay := parseISOSeconds(t, "suggestedPresentationDelay", parsed.SuggestedPresentationDelay)
+			if want := tc.minDelaySegs * maxSegSec; delay < want {
+				t.Errorf("suggestedPresentationDelay = %q (%.3f s), want >= %.3f s (%.0f × longest listed segment %.3f s)",
+					parsed.SuggestedPresentationDelay, delay, want, tc.minDelaySegs, maxSegSec)
+			}
+			depth := parseISOSeconds(t, "timeShiftBufferDepth", parsed.BufferDepth)
+			if delay+maxSegSec > depth+1e-9 {
+				t.Errorf("suggestedPresentationDelay %q + longest segment %.3f s = %.3f s > timeShiftBufferDepth %q: "+
+					"live point outside the advertised window",
+					parsed.SuggestedPresentationDelay, maxSegSec, delay+maxSegSec, parsed.BufferDepth)
+			}
+			if depth > retention+1e-9 {
+				t.Errorf("timeShiftBufferDepth = %q (%.3f s) outlives on-disk retention %.3f s "+
+					"(listed durations except the oldest, History = 0)",
+					parsed.BufferDepth, depth, retention)
+			}
+			minUpd := parseISOSeconds(t, "minimumUpdatePeriod", parsed.MinUpdate)
+			if minUpd < maxSegSec {
+				t.Errorf("minimumUpdatePeriod = %q (%.3f s), want >= %.3f s (longest listed segment)",
+					parsed.MinUpdate, minUpd, maxSegSec)
+			}
+			if parsed.UTCTiming == nil {
+				t.Fatal("missing UTCTiming")
+			}
+			clock, err := time.Parse(time.RFC3339Nano, parsed.UTCTiming.Value)
+			if err != nil {
+				t.Fatalf("UTCTiming value %q: %v", parsed.UTCTiming.Value, err)
+			}
+			if diff := publish.Sub(clock); diff < 0 || diff >= time.Millisecond {
+				t.Errorf("UTCTiming value = %q, want %s to the millisecond (got %v off)",
+					parsed.UTCTiming.Value, publish.Format(time.RFC3339Nano), diff)
+			}
+		})
+	}
+
+	// Control: segments no longer than SegDur keep the configured values.
+	t.Run("short_segments_keep_configured_timing", func(t *testing.T) {
+		data, err := BuildManifest(sampleManifestInput()) // 2 s segments, SegDur 2 s, Window 6
+		if err != nil {
+			t.Fatalf("BuildManifest: %v", err)
+		}
+		s := string(data)
+		for _, want := range []string{
+			`suggestedPresentationDelay="PT6S"`,
+			`minimumUpdatePeriod="PT2S"`,
+			`timeShiftBufferDepth="PT12S"`,
+		} {
+			if !strings.Contains(s, want) {
+				t.Errorf("missing %q in:\n%s", want, s)
+			}
+		}
+	})
 }
 
 func sampleManifestInput() *ManifestInput {
