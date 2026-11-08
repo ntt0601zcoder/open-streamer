@@ -150,8 +150,8 @@ func TestHLSSegmenter_WriteManifest_MediaSequence(t *testing.T) {
 	require.NoError(t, p.writeManifestLocked())
 	data, err := os.ReadFile(filepath.Join(dir, "index.m3u8"))
 	require.NoError(t, err)
-	// segN=10, window=3 → mediaSeq=7
-	assert.Contains(t, string(data), "#EXT-X-MEDIA-SEQUENCE:7")
+	// segN=10, window=3 → first listed segment is 8 → mediaSeq=8
+	assert.Contains(t, string(data), "#EXT-X-MEDIA-SEQUENCE:8")
 }
 
 func TestHLSSegmenter_WriteManifest_NoPathNoABR(t *testing.T) {
