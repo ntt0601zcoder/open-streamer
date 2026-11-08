@@ -222,10 +222,11 @@ type Normaliser struct {
 	pendingFirstArrival time.Time
 	hasPending          bool
 
-	// A/V offset (video output anchor minus audio output anchor) recorded by
-	// the joint seed; seedOffsetSet is false until a joint seed completes.
-	// Used to tell a track that is merely ahead of wallclock because of the
-	// seeded offset from one that really jumped.
+	// V/A output relationship (video output minus audio output at the same
+	// moment) recorded when the second track seeds: by the joint seed, or by
+	// the lazy / timeout-drain seed of the second track. seedOffsetSet is false
+	// until both tracks are seeded. Used to tell a track that is merely ahead
+	// of wallclock together with its partner from one that really jumped.
 	seedOffsetSet bool
 	seedOffsetMs  int64
 }
@@ -508,7 +509,7 @@ func (n *Normaliser) applySeededLocked(
 	drift := expectedDts - effActualNow
 
 	tooFarAhead := absInt64(drift) > n.cfg.JumpThresholdMs
-	if tooFarAhead && drift > 0 && n.consistentWithSeedOffsetLocked(tk, expectedDts, actualNowMs) {
+	if tooFarAhead && drift > 0 && n.consistentWithPartnerLocked(tk, expectedDts) {
 		tooFarAhead = false
 	}
 	regressed := expectedDts < track.lastOutputDts
@@ -550,34 +551,29 @@ func (n *Normaliser) applySeededLocked(
 	return []*domain.AVPacket{p}
 }
 
-// consistentWithSeedOffsetLocked reports whether a track that is more than the
-// jump threshold ahead of its floor is merely carrying the A/V offset recorded
-// at joint seed (e.g. after its own input gap), rather than having jumped.
-// A backward re-anchor of one track would collapse that offset permanently, so
-// it is suppressed while BOTH hold:
-//   - expectedDts sits where the seeded offset puts it relative to the
-//     partner's last output (within the jump threshold), and
-//   - expectedDts is no further ahead of wallclock than the seeded lead plus
-//     the jump threshold (bounded, so a sustained fast clock still re-anchors).
+// consistentWithPartnerLocked reports whether a track that is more than the
+// jump threshold ahead of its floor is still where the recorded V/A
+// relationship puts it relative to the partner's last output (within the jump
+// threshold), for any sign of that relationship including 0. Such a track is
+// carrying a lead it shares with the partner (the seeded offset, or the lead
+// both tracks took from a mirrored forward re-anchor, e.g. after its own input
+// gap), not jumping. A pull-back cannot be mirrored onto the partner without
+// regressing the partner's emitted output, so re-anchoring this track alone
+// would change the V/A relationship permanently; it is suppressed instead.
 //
-// A jump inconsistent with the partner, a partner not yet seeded, or no joint
-// seed at all leaves the normal re-anchor in force.
-func (n *Normaliser) consistentWithSeedOffsetLocked(tk trackKey, expectedDts, actualNowMs int64) bool {
+// A jump inconsistent with the partner, or a partner not yet seeded, leaves the
+// normal re-anchor in force; a jump of both tracks is inconsistent for
+// whichever track moves first, so both still re-anchor.
+func (n *Normaliser) consistentWithPartnerLocked(tk trackKey, expectedDts int64) bool {
 	partner := &n.tracks[numTracks-1-tk]
 	if !n.seedOffsetSet || !partner.seeded {
 		return false
 	}
-	lead := n.seedOffsetMs // this track's seeded lead over the partner
+	lead := n.seedOffsetMs // this track's recorded lead over the partner
 	if tk == trackAudio {
 		lead = -lead
 	}
-	if lead <= 0 {
-		return false
-	}
-	if absInt64(expectedDts-partner.lastOutputDts-lead) > n.cfg.JumpThresholdMs {
-		return false
-	}
-	return expectedDts-actualNowMs <= lead+n.cfg.JumpThresholdMs
+	return absInt64(expectedDts-partner.lastOutputDts-lead) <= n.cfg.JumpThresholdMs
 }
 
 // reanchorContext bundles the inputs hardReanchorLocked needs so the
@@ -867,6 +863,18 @@ func (n *Normaliser) seedTrackLocked(
 	track.lastOutputDts = anchor
 	track.lastInputDts = inDts
 	assignTimes(p, anchor, cto)
+
+	// Second track seeded (lazy seed, or after a joint-seed timeout drain):
+	// record the V/A output relationship against the partner's live edge, as
+	// completeJointSeedLocked does, so later re-anchor decisions preserve it.
+	if otherTrack.seeded {
+		rel := anchor - otherTrack.lastOutputDts // this track's lead
+		if tk == trackAudio {
+			rel = -rel
+		}
+		n.seedOffsetSet = true
+		n.seedOffsetMs = rel
+	}
 
 	// Operator-visible seed log so a deploy can be verified by reading
 	// the journal: same source moment ⇒ V and A should land at the same
