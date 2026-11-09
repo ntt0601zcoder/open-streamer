@@ -320,6 +320,14 @@ as the early-warning rule) see [ARCHITECTURE.md § Buffer Hub](./ARCHITECTURE.md
 
 ## 12. Common dashboards
 
+A ready-made Grafana dashboard is in
+[examples/grafana/open-streamer.json](../examples/grafana/open-streamer.json).
+It needs only a Prometheus datasource scraping `/metrics` (see
+[examples/prometheus.yml](../examples/prometheus.yml)). Import it from
+**Dashboards → New → Import** or provision the file, then pick the datasource,
+job, instance and stream at the top of the page. The expressions below are
+building blocks for custom panels.
+
 ### Top-line health
 
 ```promql
