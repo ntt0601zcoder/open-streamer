@@ -36,13 +36,6 @@ make run            # run without persisting binary
 
 Requires Go 1.25.x+. Transcoding is built on libavcodec (see § 2).
 
-### Docker
-
-```bash
-make docker-build   # → open-streamer:local
-make compose-up     # docker compose up
-```
-
 ---
 
 ## 2. Transcoding

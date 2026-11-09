@@ -170,7 +170,7 @@ Single unification of the three legacy PTS rebasers (`ingestor/ptsrebaser`, `ing
 | Per-stream lifecycle | Complete | New `Normaliser` per `readLoop` invocation; reconnect builds a fresh anchor against the new wallclock |
 | Wired in pull worker + RTMP push server | Complete | `worker.writeOnePacket` and `push/rtmp_server.OnReadRtmpAvMsg` both call `Apply` and skip the buffer write on `Apply == false` |
 
-**Scope**: AV-path codecs (RTSP / RTMP pull, RTMP push, `copy://`, `mixer://`) write through `timeline.Normaliser` directly; raw-TS sources (UDP / HLS-pull / HTTP-TS / SRT / file) are demuxed → run through the Normaliser per-PES → remuxed via the [internal/ingestor/tsnorm](../internal/ingestor/tsnorm/tsnorm.go) wrapper. Residual quality-of-service items tracked in [docs/DASH_OUTSTANDING_BUGS.md](./DASH_OUTSTANDING_BUGS.md).
+**Scope**: AV-path codecs (RTSP / RTMP pull, RTMP push, `copy://`, `mixer://`) write through `timeline.Normaliser` directly; raw-TS sources (UDP / HLS-pull / HTTP-TS / SRT / file) are demuxed → run through the Normaliser per-PES → remuxed via the [internal/ingestor/tsnorm](../internal/ingestor/tsnorm/tsnorm.go) wrapper.
 
 ---
 
@@ -464,4 +464,4 @@ ABR (NVENC / libx264) and HLS+DASH multi-protocol phases. See
 - **ABR-copy / ABR-mixer streams without a downstream transcoder report empty `runtime.media`** — these paths bypass the manager (their pipeline is N in-process taps, not an ingest worker), so the per-input track tracker that fills "Input Media" / "Output Media" / "Input throughput" panels is not exercised. Enable a downstream transcoder if you need those metrics — that routes the stream through the normal ingest+transcode pipeline where tracking is wired (input tracks observed by the ingestor, output tracks derived from the transcoder ladder config).
 - **`mixer://` A/V drift with clock-independent sources** — combining two upstreams that don't share a sample/frame clock (e.g. live HLS video + file-paced audio) accumulates A/V drift mid-stream. The PTS Anchoring Layer's cross-track snap aligns V and A at startup, but the bursty source's GOP-by-GOP delivery keeps producing micro-drift after both tracks are seeded. Symptom: HLS player loads slowly (10–15 s waiting for V/A buffer alignment) but eventually plays smoothly. NOT a regression — production mixer usage should pair clock-coherent sources (e.g. two RTMP feeds from the same encoder).
 - **Build version** stamped at compile time (`make build` runs `git describe --tags --always --dirty`); exposed via `GET /config.version`.
-- **`build/reinstall.sh <tag>`** downloads + verifies + uninstalls + reinstalls a tagged release on Linux/systemd hosts. Data dir preserved.
+- **`build/install.sh <tag>`** downloads + verifies + installs a tagged release on Linux/systemd hosts; re-running it upgrades in place. Data dir preserved.

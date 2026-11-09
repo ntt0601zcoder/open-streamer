@@ -89,9 +89,6 @@ sudo bash <(curl -sL https://raw.githubusercontent.com/ntt0601zcoder/open-stream
 git clone https://github.com/ntt0601zcoder/open-streamer.git
 cd open-streamer
 make build && ./bin/open-streamer
-
-# 3. Or Docker
-make compose-up
 ```
 
 Then create a stream:

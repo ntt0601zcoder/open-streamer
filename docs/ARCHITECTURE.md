@@ -319,8 +319,7 @@ re-stream) dispatch on `SessionStart=true` instead of multi-source
 `mixer://`). Raw-TS sources (UDP / HLS-pull / HTTP-TS / SRT / file) are
 demuxed → run through the Normaliser per-PES → remuxed via the
 `internal/ingestor/tsnorm` wrapper, then ride the raw-TS chunk path
-through the buffer hub. Residual quality-of-service items tracked in
-`docs/DASH_OUTSTANDING_BUGS.md`.
+through the buffer hub.
 
 **Known limitation**: `mixer://` combining two clock-independent sources
 (e.g. live HLS video + file-paced audio) accumulates A/V drift mid-stream
@@ -526,9 +525,9 @@ Reads from Buffer Hub subscriber, segments into output formats:
   pacing gate enforces `wallclock ≥ prev_end`, so emits never overlap
   but may have small (≤ tick granularity 50 ms) gaps in MPD `<S t=...>`
   for paced sources. Sequential-vs-wallclock tfdt is a known
-  trade-off — see `docs/DASH_OUTSTANDING_BUGS.md` for the in-progress
-  smoothness fix.
-- **RTMP / SRT** ([listen.go](../internal/publisher/listen.go)):
+  trade-off.
+- **RTMP / SRT** ([serve_rtmp.go](../internal/publisher/serve_rtmp.go),
+  [serve_srt.go](../internal/publisher/serve_srt.go)):
   shared listeners; per-client subscribes to the playback buffer.
   RTMP play out
   ([serve_rtmp.go](../internal/publisher/serve_rtmp.go) →
@@ -708,7 +707,7 @@ parses the stream code from the path's first segment (NOT
 `chi.URLParam("code")` — chi populates URL params after middleware
 fires; the middleware sees an empty value).
 
-### Watermarks (`internal/watermarks` + `internal/transcoder/watermark.go`)
+### Watermarks (`internal/watermarks` + `internal/transcoder/native/watermark.go`)
 
 ```mermaid
 flowchart LR
@@ -749,7 +748,7 @@ keep loading).
 3. Sets `clone.Watermark.ImagePath` to the resolved absolute path,
    clears `AssetID`. Transcoder layer never sees the AssetID.
 4. The subprocess folds the watermark into each rendition's libavfilter
-   graph (`internal/transcoder/watermark.go`, `BuildWatermarkFilter`).
+   graph (`internal/transcoder/native/watermark.go`, `BuildWatermarkFilter`).
 
 **Filter graph shapes** the transcoder builds (libavfilter, in the
 subprocess):
