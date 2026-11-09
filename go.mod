@@ -15,6 +15,8 @@ require (
 	github.com/oschwald/geoip2-golang v1.13.0
 	github.com/pion/rtp v1.10.2
 	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/client_model v0.6.2
+	github.com/prometheus/procfs v0.16.1
 	github.com/q191201771/lal v0.37.4
 	github.com/q191201771/naza v0.30.51
 	github.com/samber/do/v2 v2.0.0
@@ -93,9 +95,7 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
-	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/sagikazarmark/locafero v0.11.0 // indirect
 	github.com/samber/go-type-to-string v1.8.0 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.2 // indirect

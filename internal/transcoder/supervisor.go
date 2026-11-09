@@ -50,6 +50,10 @@ const (
 	// delay after a fast crash. Linear-doubling.
 	restartBackoffStart = 1 * time.Second
 	restartBackoffMax   = 30 * time.Second
+
+	// broadcastFramesProfile is the profile label for frames sent to every
+	// rendition (the shared audio track). Counted once, not once per rendition.
+	broadcastFramesProfile = "all"
 )
 
 // supervisor owns one stream's transcoder subprocess and the gRPC
@@ -164,6 +168,11 @@ func (sv *supervisor) runOnce(ctx context.Context) error {
 		"socket", socketPath,
 		"pid", cmd.Process.Pid,
 	)
+	samplerDone := sv.startProcessSampler(subCtx, cmd.Process.Pid)
+	defer func() {
+		cancelSub()
+		<-samplerDone
+	}()
 
 	if err := waitForSocket(subCtx, socketPath, socketWaitTimeout); err != nil {
 		_ = cmd.Process.Kill()
@@ -434,6 +443,7 @@ func (sv *supervisor) writeOutputPacket(pkt *pb.OutputPacket) error {
 				return fmt.Errorf("broadcast buffer write target %d: %w", i, err)
 			}
 		}
+		sv.countOutputFrame(broadcastFramesProfile, avCodec)
 		return nil
 	}
 
@@ -446,7 +456,23 @@ func (sv *supervisor) writeOutputPacket(pkt *pb.OutputPacket) error {
 	if err := sv.svc.buf.Write(target.BufferID, bufPkt); err != nil {
 		return fmt.Errorf("buffer write target %d: %w", idx, err)
 	}
+	sv.countOutputFrame(buffer.VideoTrackSlug(int(idx)), avCodec)
 	return nil
+}
+
+// countOutputFrame records one frame delivered by the subprocess. Counting
+// here, rather than in a publisher, keeps the metric independent of which
+// output protocols the stream has enabled.
+func (sv *supervisor) countOutputFrame(profile string, codec domain.AVCodec) {
+	m := sv.svc.m
+	if m == nil || m.TranscoderFramesTotal == nil {
+		return
+	}
+	kind := "audio"
+	if codec.IsVideo() {
+		kind = "video"
+	}
+	m.TranscoderFramesTotal.WithLabelValues(string(sv.streamID), profile, kind).Inc()
 }
 
 // avCodecFromProto narrows the wire-level Codec enum to the
@@ -473,6 +499,9 @@ func (sv *supervisor) handleSubprocessError(e *pb.Error) error {
 		"terminal", e.GetTerminal(),
 		"msg", e.GetMessage(),
 	)
+	if m := sv.svc.m; m != nil && m.TranscoderErrorsTotal != nil {
+		m.TranscoderErrorsTotal.WithLabelValues(string(sv.streamID), classifyTranscoderError(e.GetMessage())).Inc()
+	}
 	if e.GetTerminal() {
 		return errors.New(e.GetMessage())
 	}
