@@ -200,6 +200,38 @@ as the early-warning rule) see [ARCHITECTURE.md § Buffer Hub](./ARCHITECTURE.md
 - **Updated by**: the supervisor on every error event from the subprocess. A process that dies without reporting one only shows in `restarts_total`
 - **Alert**: `increase(open_streamer_transcoder_errors_total[5m]) > 0` → read the logs for that stream and stage
 
+The metrics below come from Health events the subprocess sends every 5s and when it stops.
+
+### `open_streamer_transcoder_decoded_frames_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`
+- **Panel**: `rate(open_streamer_transcoder_decoded_frames_total[1m])` → source FPS actually decoded
+
+### `open_streamer_transcoder_encoder_input_frames_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`, `profile`
+- **Why**: compare with `frames_total{kind="video"}`; a growing gap means frames are held or lost inside the encoder
+
+### `open_streamer_transcoder_encode_seconds_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`, `profile`
+- **Panel**: `rate(open_streamer_transcoder_encode_seconds_total[1m]) / rate(open_streamer_transcoder_encoder_input_frames_total[1m])` → time per frame. With libx264, above the frame interval the encoder cannot keep up. With NVENC this is only the time to submit a frame to the GPU, so it says little about GPU load
+
+### `open_streamer_transcoder_dropped_frames_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`, `kind` (video|audio), `reason` (pre_keyframe|input_switch)
+- **Why**: `pre_keyframe` is normal right after a start or input switch; a sustained rate means the source sends no usable keyframes
+
+### `open_streamer_transcoder_queue_depth`
+
+- **Type**: gauge
+- **Labels**: `stream_code`, `queue` (pending_audio|demux)
+- **Why**: `pending_audio` is audio held for A/V alignment; `demux` is raw-TS chunks waiting to be parsed. The backlog before the subprocess shows as `buffer_capacity_used` on the `$raw$<code>` buffer
+
 ---
 
 ## 7. Publisher
