@@ -142,7 +142,7 @@ changed or disturbed during the run.
 | 3 | I3 RTSP pull | T5 | AV path with HEVC |
 | 4 | I8 HLS pull | T0 | Long-running playlist polling |
 | 5 | I7 UDP | T0 | Raw TS passthrough |
-| 6 | I9 HTTP-TS | T2 | Audio re-encode with video copy |
+| 6 | I9 HTTP-TS | T1 | HTTP-TS input (T2 is blocked by issue #52) |
 | 7 | I10 File | T1 | Loop boundaries |
 | 8 | I4 `copy://` | T0 | In-process subscription |
 | 9 | I5 `mixer://` | T0 | A/V drift |

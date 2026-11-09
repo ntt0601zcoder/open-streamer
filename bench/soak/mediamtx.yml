@@ -1,0 +1,33 @@
+# Listens on docker0 only, so nothing is exposed beyond this host. Not loopback:
+# Open Streamer treats rtmp:// and srt:// URLs on a loopback address as "listen
+# for a push". RTMP moves off 1935, which Open Streamer uses.
+logLevel: info
+
+api: yes
+apiAddress: 127.0.0.1:9997
+metrics: yes
+metricsAddress: 127.0.0.1:9998
+
+rtsp: yes
+rtspTransports: [tcp]
+rtspAddress: 172.17.0.1:8554
+
+rtmp: yes
+rtmpAddress: 172.17.0.1:1936
+
+srt: yes
+srtAddress: 172.17.0.1:8890
+
+hls: yes
+hlsAddress: 172.17.0.1:8888
+# Open Streamer's HLS reader expects MPEG-TS segments.
+hlsVariant: mpegts
+hlsAlwaysRemux: yes
+hlsSegmentCount: 7
+hlsSegmentDuration: 2s
+
+webrtc: no
+moq: no
+
+paths:
+  all_others:
