@@ -155,7 +155,7 @@ When the higher-priority input recovers (background probe succeeds), the
 manager fails back automatically. Override manually:
 
 ```bash
-curl -XPOST http://localhost:8080/streams/news/inputs/switch \
+curl -XPOST http://localhost:8080/streams/news/switch \
      -d '{ "priority": 0 }'
 ```
 
@@ -228,18 +228,22 @@ downtime).
 
 VOD playback — full recording:
 ```
-GET /recordings/news/playlist.m3u8
+GET /news/index.m3u8?from=0
 ```
 
 Timeshift — last 30 minutes:
 ```
-GET /recordings/news/timeshift.m3u8?offset_sec=-1800&duration=1800
+GET /news/index.m3u8?ago=1800&dur=1800
 ```
 
-Timeshift — absolute window:
+Timeshift — absolute window (`from` is in Unix seconds):
 ```
-GET /recordings/news/timeshift.m3u8?from=2026-04-26T10:00:00Z&duration=3600
+GET /news/index.m3u8?from=1777197600&dur=3600
 ```
+
+Use `index.mpd` with the same parameters for DASH.
+`GET /news/recording_status.json` returns the recording's status, available
+range, size and gaps.
 
 ---
 
@@ -742,10 +746,10 @@ takes effect on the next reaper tick (≤ 5s) without restart.
 curl http://localhost:8080/sessions | jq .
 
 # Per-stream
-curl http://localhost:8080/streams/news/sessions | jq .data
+curl 'http://localhost:8080/sessions?stream=news' | jq .sessions
 
 # Filter by protocol
-curl 'http://localhost:8080/sessions?proto=hls' | jq .data
+curl 'http://localhost:8080/sessions?proto=hls' | jq .sessions
 ```
 
 Each session record includes:

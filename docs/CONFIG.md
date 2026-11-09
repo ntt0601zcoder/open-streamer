@@ -671,7 +671,7 @@ protocols: { hls: true }
 
 Force priority 1 manually:
 ```bash
-curl -XPOST /streams/redundant_feed/inputs/switch -d '{"priority": 1}'
+curl -XPOST /streams/redundant_feed/switch -d '{"priority": 1}'
 ```
 
 The manager records this as `runtime.switches[0]={ reason: "manual", to: 1 }`.

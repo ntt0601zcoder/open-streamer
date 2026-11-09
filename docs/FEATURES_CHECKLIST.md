@@ -42,15 +42,15 @@ Legend:
 | REST API — streams CRUD + start/stop/restart | Complete | `chi/v5` router under `/streams`. Stream codes may contain `/` (namespacing) — the dispatcher uses chi's catch-all and splits the trailing `/restart` / `/switch` action off the code |
 | REST API — templates CRUD | Complete | `/templates` list + `/templates/{code}` get/post(upsert)/delete. `Put` validates prefix uniqueness across templates (409 `PREFIX_OVERLAP`) and hot-reloads every running stream referencing the template via `coordinator.Update`. `Delete` refuses (409 `TEMPLATE_IN_USE`) when any stream still references it |
 | REST API — `PUT /streams/{code}` hot-reload | Complete | Diff-based; only changed components restart. Validates `Stream.Template` references exist (400 `TEMPLATE_NOT_FOUND`) so orphan references can't be persisted |
-| REST API — input switch | Complete | `POST /streams/{code}/inputs/switch` forces active priority |
-| REST API — recordings | Complete | CRUD + unified `/{file}` dispatch (playlist.m3u8 vs timeshift via `?from=` / `?offset_sec=` query) + segment serve + info |
+| REST API — input switch | Complete | `POST /streams/{code}/switch` forces active priority |
+| REST API — DVR | Complete | `/{code}/index.m3u8` and `/{code}/index.mpd` serve timeshift when `?from=` / `?delay=` / `?ago=` / `?dur=` is present; `/{code}/recording_status.json` returns status and range |
 | REST API — hooks CRUD + test (HTTP & File) | Complete | `DeliverTestEvent` routes per hook type |
 | REST API — config GET/POST | Complete | `/config` static enums + GlobalConfig; POST hot-applies |
 | REST API — config defaults | Complete | `GET /config/defaults` returns implicit values for UI placeholders (incl. encoder routing table per HW) |
 | REST API — config YAML editor | Complete | `GET/PUT /config/yaml` round-trips entire system state |
 | REST API — VOD mounts | Complete | Browse on-disk recordings outside DVR scope |
 | REST API — Watermark assets | Complete | `/watermarks` library: list / upload / get / raw / delete (mirrors VOD UX) |
-| REST API — Play sessions | Complete | `/sessions`, `/streams/{code}/sessions`, `/sessions/{id}` (kick), filters by proto / status / limit |
+| REST API — Play sessions | Complete | `/sessions`, `/sessions/{id}` (kick), filters by stream / proto / status / limit |
 | OpenAPI / Swagger | Complete | Spec served at `/swagger/`; `make swagger` regenerates |
 | Static delivery — HLS / DASH | Complete | `/{code}/index.m3u8`, `/{code}/index.mpd`, `/{code}/*` (wrapped with sessions middleware when tracker enabled) |
 | Health probes | Complete | `/healthz`, `/readyz` |
@@ -186,7 +186,7 @@ Single unification of the three legacy PTS rebasers (`ingestor/ptsrebaser`, `ing
 | Per-input error history (last 5) | Complete | `runtime.inputs[].errors[]` — degradation reasons + timestamps |
 | Live input update (`UpdateInputs`) | Complete | Add/remove/update without pipeline stop; active removal triggers failover with `input_removed` reason |
 | Live buffer write-target update | Complete | `UpdateBufferWriteID` — restart active ingestor with new target |
-| Manual switch API | Complete | `POST /streams/{code}/inputs/switch { priority }` records `manual` reason |
+| Manual switch API | Complete | `POST /streams/{code}/switch { priority }` records `manual` reason |
 | Exhausted callback → coordinator | Complete | `setStatus(degraded)`; auto-recover via probe success |
 
 ---
@@ -279,8 +279,8 @@ Single unification of the three legacy PTS rebasers (`ingestor/ptsrebaser`, `ing
 | Resume after restart | Complete | Playlist parsing rebuilds in-memory segment list |
 | `#EXT-X-PROGRAM-DATE-TIME` | Complete | Written before first segment + after every discontinuity |
 | Retention by time + size | Complete | Both `retention_sec` (0=forever) and `max_size_gb` (0=unlimited) |
-| VOD playlist + timeshift + segments | Complete | Unified `GET /recordings/{rid}/{file}` — `.m3u8` serves `playlist.m3u8` from disk by default, dispatches to dynamic timeshift slice when `?from=RFC3339` / `?offset_sec=N` (+ optional `?duration=N`) is present; `.ts` serves segment as-is. Path traversal sanitised |
-| Info endpoint | Complete | `GET /recordings/{rid}/info` — range, gaps, count, total bytes |
+| VOD playlist + timeshift + segments | Complete | `GET /{code}/index.m3u8` or `index.mpd` serves a timeshift slice from the CMAF archive when `?from=<unix seconds>` / `?delay=N` / `?ago=N` (+ optional `?dur=N`) is present, otherwise the live playlist. Path traversal sanitised |
+| Info endpoint | Complete | `GET /{code}/recording_status.json` — status, range, gaps, size |
 | Configurable storage path | Complete | Per-stream `storage_path` overrides `./out/dvr/{streamCode}` default |
 
 ---
@@ -358,7 +358,7 @@ records, viewers reconnect into fresh sessions.
 | Max-lifetime cap | Complete | Optional `sessions.max_lifetime_sec` hard-closes any session older than the cap |
 | Hot-reload config | Complete | `sessions.UpdateConfig` swaps an `atomic.Pointer[runtimeConfig]` — toggling `enabled` / changing `idle_timeout_sec` takes effect on the next reaper tick without restart |
 | Kick (force-close) | Complete | `DELETE /sessions/{id}` → reason=`kicked`; idempotent (404 on already-closed) |
-| Filter / list | Complete | `GET /sessions?proto=…&status=…&limit=…` + per-stream `/streams/{code}/sessions` |
+| Filter / list | Complete | `GET /sessions?stream=…&proto=…&status=…&limit=…` |
 | Stats counters | Complete | `active`, `opened_total`, `closed_total`, `idle_closed_total`, `kicked_total` exposed in every list response |
 | Event bus emit | Complete | `EventSessionOpened` / `EventSessionClosed` published — hooks can persist analytics or notify ops |
 | GeoIP resolver (MaxMind .mmdb) | Complete | `GeoIPResolver` interface + `NullGeoIP` default. When `sessions.geoip_db_path` points to a MaxMind .mmdb (GeoLite2-Country / GeoLite2-City / commercial GeoIP2), `cmd/server/main.go` opens it via `sessions.NewMaxMindGeoIP` and registers as the resolver — `PlaySession.Country` then carries the ISO 3166-1 alpha-2 code. Empty path or open failure falls back to NullGeoIP (warn-logged); never blocks boot. Operators can swap in a custom resolver (IP2Location, in-house service) by replacing the DI binding. |

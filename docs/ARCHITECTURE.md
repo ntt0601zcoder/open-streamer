@@ -376,7 +376,7 @@ Failover commit:
 | `initial` | Register's first activation (`from=-1`) |
 | `error` | `ReportInputError` from ingestor |
 | `timeout` | Packet timeout in checkHealth |
-| `manual` | Operator's `POST /inputs/switch` |
+| `manual` | Operator's `POST /streams/{code}/switch` |
 | `failback` | Higher-priority input recovered via probe |
 | `recovery` | Exhausted state cleared (active died → probe / packet flow brought it back) |
 | `input_added` | UpdateInputs added higher-priority entry |
@@ -583,8 +583,8 @@ Retention: by time (`retention_sec`) + by size (`max_size_gb`). Older
 segments pruned + corresponding gap entries removed.
 
 Timeshift VOD: dynamic playlist generated from segment list filtered by
-absolute time (`from=RFC3339&duration=N`) or relative offset
-(`offset_sec=N`).
+absolute time (`from=<unix seconds>&dur=N`) or relative offset
+(`ago=N` / `delay=N`).
 
 ### Event Bus & Hooks (`internal/events`, `internal/hooks`)
 
@@ -628,7 +628,7 @@ longer the place HTTP latency lives.
 
 ```
 /streams/{code}                 — CRUD + start/stop/restart
-/streams/{code}/inputs/switch   — manual failover
+/streams/{code}/switch          — manual failover
 /{code}/index.m3u8?from=…       — DVR timeshift from the CMAF archive (from / delay / dur / ago)
 /{code}/recording_status.json   — DVR status, range, size and gaps
 /hooks/{id}                     — webhook CRUD
@@ -640,7 +640,7 @@ longer the place HTTP latency lives.
 /vod                            — on-disk VOD browse
 /watermarks                     — watermark asset library (upload / list / get / raw / delete)
 /sessions                       — play session list + kick
-/streams/{code}/sessions        — sessions scoped to one stream
+/sessions?stream={code}         — sessions scoped to one stream
 /healthz, /readyz, /metrics, /swagger  — ops
 /{code}/index.m3u8, /{code}/index.mpd  — static delivery (wrapped with sessions middleware when tracker enabled)
 ```
