@@ -23,10 +23,16 @@ import (
 // invocation with no syscall machinery.
 func dialBufconn(t *testing.T) (pb.TranscoderClient, func()) {
 	t.Helper()
+	return dialServer(t, NewServer())
+}
+
+// dialServer is dialBufconn for a specific Server configuration.
+func dialServer(t *testing.T, handler *Server) (pb.TranscoderClient, func()) {
+	t.Helper()
 	const bufSize = 1024 * 1024
 	lis := bufconn.Listen(bufSize)
 	srv := grpc.NewServer()
-	pb.RegisterTranscoderServer(srv, NewServer())
+	pb.RegisterTranscoderServer(srv, handler)
 	go func() {
 		if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			t.Errorf("bufconn Serve: %v", err)

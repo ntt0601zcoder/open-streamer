@@ -5,12 +5,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
+	pb "github.com/ntt0601zcoder/open-streamer/internal/transcoder/native/proto"
 )
 
-// processSampleInterval is how often a subprocess's CPU and memory are read.
-// Shorter than a typical Prometheus scrape so every scrape sees a fresh value.
-const processSampleInterval = 5 * time.Second
+const (
+	// processSampleInterval is how often a subprocess's CPU and memory are read.
+	// Shorter than a typical Prometheus scrape so every scrape sees a fresh value.
+	processSampleInterval = 5 * time.Second
+
+	// Values of the queue label on TranscoderQueueDepth.
+	queuePendingAudio = "pending_audio"
+	queueDemux        = "demux"
+)
 
 // processStats is one reading of a subprocess's resource usage. cpuSeconds is
 // cumulative since the process started.
@@ -84,6 +92,76 @@ func (sv *supervisor) startProcessSampler(ctx context.Context, pid int) <-chan s
 		})
 	}()
 	return done
+}
+
+// healthTracker turns the subprocess's cumulative Health reports into metrics.
+// One tracker lives for one subprocess, so totals restarting at zero after a
+// respawn add to the Prometheus counters instead of being lost. A nil tracker
+// ignores reports.
+type healthTracker struct {
+	m        *metrics.Metrics
+	stream   string
+	prev     *pb.Health
+	profiles map[int32]*pb.Health_Profile
+}
+
+func newHealthTracker(m *metrics.Metrics, stream string) *healthTracker {
+	return &healthTracker{m: m, stream: stream, prev: &pb.Health{}, profiles: map[int32]*pb.Health_Profile{}}
+}
+
+// counterGrowth returns how far a cumulative total advanced.
+func counterGrowth(cur, prev uint64) float64 {
+	if cur < prev {
+		return 0
+	}
+	return float64(cur - prev)
+}
+
+func (h *healthTracker) observe(cur *pb.Health) {
+	if h == nil {
+		return
+	}
+	h.m.TranscoderDecodedFramesTotal.WithLabelValues(h.stream).
+		Add(counterGrowth(cur.GetFramesDecoded(), h.prev.GetFramesDecoded()))
+	dropped := h.m.TranscoderDroppedFramesTotal
+	dropped.WithLabelValues(h.stream, "video", "pre_keyframe").
+		Add(counterGrowth(cur.GetDroppedVideoPreKeyframe(), h.prev.GetDroppedVideoPreKeyframe()))
+	dropped.WithLabelValues(h.stream, "audio", "pre_keyframe").
+		Add(counterGrowth(cur.GetDroppedAudioPreKeyframe(), h.prev.GetDroppedAudioPreKeyframe()))
+	dropped.WithLabelValues(h.stream, "audio", "input_switch").
+		Add(counterGrowth(cur.GetDroppedAudioSwitch(), h.prev.GetDroppedAudioSwitch()))
+	h.m.TranscoderQueueDepth.WithLabelValues(h.stream, queuePendingAudio).Set(float64(cur.GetPendingAudioFrames()))
+	h.m.TranscoderQueueDepth.WithLabelValues(h.stream, queueDemux).Set(float64(cur.GetDemuxQueueChunks()))
+
+	for _, p := range cur.GetProfiles() {
+		profile := buffer.VideoTrackSlug(int(p.GetIndex()))
+		last := h.profiles[p.GetIndex()]
+		h.m.TranscoderEncoderInputFramesTotal.WithLabelValues(h.stream, profile).
+			Add(counterGrowth(p.GetFramesIn(), last.GetFramesIn()))
+		h.m.TranscoderEncodeSecondsTotal.WithLabelValues(h.stream, profile).
+			Add(counterGrowth(p.GetEncodeNanos(), last.GetEncodeNanos()) / float64(time.Second))
+		h.profiles[p.GetIndex()] = p
+	}
+	h.prev = cur
+}
+
+// clear drops the queue gauges so a dead subprocess doesn't keep reporting
+// its last depths.
+func (h *healthTracker) clear() {
+	if h == nil {
+		return
+	}
+	h.m.TranscoderQueueDepth.DeleteLabelValues(h.stream, queuePendingAudio)
+	h.m.TranscoderQueueDepth.DeleteLabelValues(h.stream, queueDemux)
+}
+
+// newHealthTracker returns the tracker for one subprocess run, or nil when
+// metrics are not wired.
+func (sv *supervisor) newHealthTracker() *healthTracker {
+	if sv.svc.m == nil {
+		return nil
+	}
+	return newHealthTracker(sv.svc.m, string(sv.streamID))
 }
 
 // transcoderErrorStages maps text from the subprocess's error chain to a stage

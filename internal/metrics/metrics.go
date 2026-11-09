@@ -56,6 +56,21 @@ type Metrics struct {
 	// pipeline stage: init, switch, flush, demux, audio, watermark, scale,
 	// encode, decode or other.
 	TranscoderErrorsTotal *prometheus.CounterVec
+	// TranscoderDecodedFramesTotal counts source video frames decoded.
+	TranscoderDecodedFramesTotal *prometheus.CounterVec
+	// TranscoderEncoderInputFramesTotal counts frames handed to each
+	// rendition's encoder. Compare with TranscoderFramesTotal to see frames
+	// held or lost inside the encoder.
+	TranscoderEncoderInputFramesTotal *prometheus.CounterVec
+	// TranscoderEncodeSecondsTotal is time spent in each rendition's encode
+	// calls. Divide its rate by the input-frame rate for time per frame.
+	TranscoderEncodeSecondsTotal *prometheus.CounterVec
+	// TranscoderDroppedFramesTotal counts frames discarded before decoding.
+	// kind is video or audio; reason is pre_keyframe or input_switch.
+	TranscoderDroppedFramesTotal *prometheus.CounterVec
+	// TranscoderQueueDepth is the current depth of the subprocess's internal
+	// queues. queue is pending_audio or demux.
+	TranscoderQueueDepth *prometheus.GaugeVec
 
 	// ── DVR ───────────────────────────────────────────────────────────────────
 	// DVRSegmentsWrittenTotal counts TS segments flushed to disk per stream.
@@ -282,6 +297,26 @@ func New(i do.Injector) (*Metrics, error) {
 			Name: "open_streamer_transcoder_errors_total",
 			Help: "Errors reported by the transcoder subprocess, by pipeline stage.",
 		}, []string{"stream_code", "stage"}),
+		TranscoderDecodedFramesTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_transcoder_decoded_frames_total",
+			Help: "Source video frames decoded by the transcoder subprocess.",
+		}, []string{"stream_code"}),
+		TranscoderEncoderInputFramesTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_transcoder_encoder_input_frames_total",
+			Help: "Frames handed to each rendition's encoder.",
+		}, []string{"stream_code", "profile"}),
+		TranscoderEncodeSecondsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_transcoder_encode_seconds_total",
+			Help: "Time spent in each rendition's encode calls.",
+		}, []string{"stream_code", "profile"}),
+		TranscoderDroppedFramesTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_transcoder_dropped_frames_total",
+			Help: "Frames discarded by the transcoder before decoding, by kind and reason.",
+		}, []string{"stream_code", "kind", "reason"}),
+		TranscoderQueueDepth: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "open_streamer_transcoder_queue_depth",
+			Help: "Current depth of the transcoder subprocess's internal queues.",
+		}, []string{"stream_code", "queue"}),
 		TranscoderQualitiesActive: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "open_streamer_transcoder_qualities_active",
 			Help: "Number of active ABR rendition profiles per stream.",

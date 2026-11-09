@@ -162,6 +162,124 @@ func TestSupervisor_HandleSubprocessError_CountsByStage(t *testing.T) {
 	}
 }
 
+func newHealthMetrics() *metrics.Metrics {
+	return &metrics.Metrics{
+		TranscoderDecodedFramesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "decoded_test"},
+			[]string{"stream_code"}),
+		TranscoderEncoderInputFramesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "input_test"},
+			[]string{"stream_code", "profile"}),
+		TranscoderEncodeSecondsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "encode_test"},
+			[]string{"stream_code", "profile"}),
+		TranscoderDroppedFramesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "dropped_test"},
+			[]string{"stream_code", "kind", "reason"}),
+		TranscoderQueueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "queue_test"},
+			[]string{"stream_code", "queue"}),
+	}
+}
+
+// TestHealthTracker_TurnsCumulativeReportsIntoCounterGrowth: reports carry
+// running totals, so adding each report whole would inflate every counter.
+func TestHealthTracker_TurnsCumulativeReportsIntoCounterGrowth(t *testing.T) {
+	t.Parallel()
+	m := newHealthMetrics()
+	tr := newHealthTracker(m, "s1")
+
+	tr.observe(&pb.Health{
+		FramesDecoded: 100, DroppedVideoPreKeyframe: 5, DroppedAudioPreKeyframe: 3, DroppedAudioSwitch: 2,
+		PendingAudioFrames: 7, DemuxQueueChunks: 4,
+		Profiles: []*pb.Health_Profile{
+			{Index: 0, FramesIn: 100, EncodeNanos: 1_000_000_000},
+			{Index: 1, FramesIn: 90, EncodeNanos: 500_000_000},
+		},
+	})
+	tr.observe(&pb.Health{
+		FramesDecoded: 150, DroppedVideoPreKeyframe: 5, DroppedAudioPreKeyframe: 4, DroppedAudioSwitch: 2,
+		PendingAudioFrames: 1,
+		Profiles: []*pb.Health_Profile{
+			{Index: 0, FramesIn: 150, EncodeNanos: 1_500_000_000},
+			{Index: 1, FramesIn: 140, EncodeNanos: 750_000_000},
+		},
+	})
+
+	for _, tc := range []struct {
+		name string
+		got  prometheus.Counter
+		want float64
+	}{
+		{"decoded", m.TranscoderDecodedFramesTotal.WithLabelValues("s1"), 150},
+		{"input track_1", m.TranscoderEncoderInputFramesTotal.WithLabelValues("s1", "track_1"), 150},
+		{"input track_2", m.TranscoderEncoderInputFramesTotal.WithLabelValues("s1", "track_2"), 140},
+		{"encode track_1", m.TranscoderEncodeSecondsTotal.WithLabelValues("s1", "track_1"), 1.5},
+		{"encode track_2", m.TranscoderEncodeSecondsTotal.WithLabelValues("s1", "track_2"), 0.75},
+		{"video pre_keyframe", m.TranscoderDroppedFramesTotal.WithLabelValues("s1", "video", "pre_keyframe"), 5},
+		{"audio pre_keyframe", m.TranscoderDroppedFramesTotal.WithLabelValues("s1", "audio", "pre_keyframe"), 4},
+		{"audio input_switch", m.TranscoderDroppedFramesTotal.WithLabelValues("s1", "audio", "input_switch"), 2},
+	} {
+		if v := counterValue(t, tc.got); v != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, v, tc.want)
+		}
+	}
+	if v := gaugeValue(t, m.TranscoderQueueDepth.WithLabelValues("s1", "pending_audio")); v != 1 {
+		t.Errorf("pending_audio = %v, want 1", v)
+	}
+	if v := gaugeValue(t, m.TranscoderQueueDepth.WithLabelValues("s1", "demux")); v != 0 {
+		t.Errorf("demux = %v, want 0", v)
+	}
+}
+
+// TestHealthTracker_KeepsCountingAcrossRespawn: a new subprocess restarts its
+// totals at zero, and the Prometheus counters must keep rising across that.
+func TestHealthTracker_KeepsCountingAcrossRespawn(t *testing.T) {
+	t.Parallel()
+	m := newHealthMetrics()
+	newHealthTracker(m, "s1").observe(&pb.Health{FramesDecoded: 100})
+	newHealthTracker(m, "s1").observe(&pb.Health{FramesDecoded: 10})
+
+	if v := counterValue(t, m.TranscoderDecodedFramesTotal.WithLabelValues("s1")); v != 110 {
+		t.Errorf("decoded = %v, want 110", v)
+	}
+}
+
+func TestHealthTracker_ClearRemovesQueueDepth(t *testing.T) {
+	t.Parallel()
+	m := newHealthMetrics()
+	tr := newHealthTracker(m, "s1")
+	tr.observe(&pb.Health{PendingAudioFrames: 3, DemuxQueueChunks: 2})
+
+	tr.clear()
+
+	if n := seriesCount(t, m.TranscoderQueueDepth); n != 0 {
+		t.Errorf("queue series after clear = %d, want 0", n)
+	}
+}
+
+// TestSupervisor_DispatchEvent_RoutesHealthToTracker covers the path from the
+// gRPC event to the metrics.
+func TestSupervisor_DispatchEvent_RoutesHealthToTracker(t *testing.T) {
+	t.Parallel()
+	m := newHealthMetrics()
+	sv := &supervisor{svc: &Service{m: m}, streamID: "s1"}
+	tr := newHealthTracker(m, "s1")
+
+	err := sv.dispatchEvent(&pb.Event{Body: &pb.Event_Health{Health: &pb.Health{FramesDecoded: 7}}}, tr)
+	if err != nil {
+		t.Fatalf("dispatchEvent: %v", err)
+	}
+
+	if v := counterValue(t, m.TranscoderDecodedFramesTotal.WithLabelValues("s1")); v != 7 {
+		t.Errorf("decoded = %v, want 7", v)
+	}
+}
+
+func TestSupervisor_DispatchEvent_HealthWithoutMetricsIsIgnored(t *testing.T) {
+	t.Parallel()
+	sv := &supervisor{svc: &Service{}, streamID: "s1"}
+	var tr *healthTracker
+	if err := sv.dispatchEvent(&pb.Event{Body: &pb.Event_Health{Health: &pb.Health{FramesDecoded: 7}}}, tr); err != nil {
+		t.Fatalf("dispatchEvent: %v", err)
+	}
+}
+
 func newFramesVec() *prometheus.CounterVec {
 	return prometheus.NewCounterVec(prometheus.CounterOpts{Name: "frames_test"},
 		[]string{"stream_code", "profile", "kind"})

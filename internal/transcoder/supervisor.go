@@ -223,7 +223,19 @@ func (sv *supervisor) runOnce(ctx context.Context) error {
 	// the run.
 	pumpErrCh := make(chan error, 2)
 	go func() { pumpErrCh <- sv.inputPump(subCtx, sub, stream) }()
-	go func() { pumpErrCh <- sv.outputDrain(subCtx, stream) }()
+	tracker := sv.newHealthTracker()
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		pumpErrCh <- sv.outputDrain(subCtx, stream, tracker)
+	}()
+	// Runs once the drain can no longer observe a report, so a late one
+	// can't recreate the queue gauges after they are cleared.
+	defer func() {
+		cancelSub()
+		<-drainDone
+		tracker.clear()
+	}()
 
 	// Watchdog for subprocess exit so a SIGSEGV in libavcodec
 	// doesn't deadlock the pumps on stream.Send / Recv.
@@ -367,8 +379,8 @@ func (sv *supervisor) sendSwitch(stream pb.Transcoder_RunClient, newRawID domain
 
 // outputDrain consumes the gRPC Event stream and writes OutputPacket
 // payloads into the matching rendition buffer (by TargetIndex). Logs
-// Error events at warn level and Health events at debug.
-func (sv *supervisor) outputDrain(ctx context.Context, stream pb.Transcoder_RunClient) error {
+// Error events at warn level and turns Health events into metrics.
+func (sv *supervisor) outputDrain(ctx context.Context, stream pb.Transcoder_RunClient, tracker *healthTracker) error {
 	for {
 		if ctx.Err() != nil {
 			return nil //nolint:nilerr // shutdown path; ctx error is the signal, not a fault
@@ -384,7 +396,7 @@ func (sv *supervisor) outputDrain(ctx context.Context, stream pb.Transcoder_RunC
 			}
 			return fmt.Errorf("recv event: %w", err)
 		}
-		if err := sv.dispatchEvent(ev); err != nil {
+		if err := sv.dispatchEvent(ev, tracker); err != nil {
 			return err
 		}
 	}
@@ -394,20 +406,14 @@ func (sv *supervisor) outputDrain(ctx context.Context, stream pb.Transcoder_RunC
 // non-fatal events (data writes that succeeded, health pings, non-
 // terminal errors) and a wrapped error for fatal cases that should
 // tear the run down so the supervisor respawns.
-func (sv *supervisor) dispatchEvent(ev *pb.Event) error {
+func (sv *supervisor) dispatchEvent(ev *pb.Event, tracker *healthTracker) error {
 	switch {
 	case ev.GetPacket() != nil:
 		return sv.writeOutputPacket(ev.GetPacket())
 	case ev.GetError() != nil:
 		return sv.handleSubprocessError(ev.GetError())
 	case ev.GetHealth() != nil:
-		// The subprocess can report health per rendition over gRPC;
-		// today the supervisor's own crash counter is the only signal
-		// we act on (subprocess-level).
-		slog.Debug("transcoder: subprocess health event",
-			"stream_code", sv.streamID,
-			"profiles", len(ev.GetHealth().GetProfiles()),
-		)
+		tracker.observe(ev.GetHealth())
 	}
 	return nil
 }
