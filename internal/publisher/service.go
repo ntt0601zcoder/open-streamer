@@ -669,25 +669,6 @@ func (s *Service) dashSegCounter(streamID domain.StreamCode, profile string) pro
 	return s.m.PublisherSegmentsTotal.WithLabelValues(string(streamID), "dash", profile)
 }
 
-// dashFrameCounter pre-binds the per-(stream, profile, kind) transcoder
-// frame counter observed at the DASH packager's per-frame ingress. Nil-safe.
-func (s *Service) dashFrameCounter(code domain.StreamCode, profile, kind string) prometheus.Counter {
-	if s.m == nil || s.m.TranscoderFramesTotal == nil {
-		return nil
-	}
-	return s.m.TranscoderFramesTotal.WithLabelValues(string(code), profile, kind)
-}
-
-// dashAudioFrameCounter returns the audio frame counter only for the shard
-// that packs audio (exactly one per ABR ladder); nil otherwise so non-audio
-// shards don't expose a permanently-zero audio series.
-func (s *Service) dashAudioFrameCounter(code domain.StreamCode, profile string, packAudio bool) prometheus.Counter {
-	if !packAudio {
-		return nil
-	}
-	return s.dashFrameCounter(code, profile, "audio")
-}
-
 // segWriteErrCounter pre-binds the per-(stream, format, profile) segment
 // write-error counter. Used by both HLS and DASH on a failed segment write.
 // Nil-safe.

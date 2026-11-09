@@ -32,21 +32,30 @@ type Metrics struct {
 	TranscoderRestartsTotal *prometheus.CounterVec
 	// TranscoderQualitiesActive is the number of active ABR renditions per stream.
 	TranscoderQualitiesActive *prometheus.GaugeVec
-	// TranscoderFramesTotal counts encoded frames emitted by the
-	// transcoder, observed downstream at the publisher's per-frame
-	// ingress (DASH packager handleH264 / handleAAC). Use
-	// `rate(transcoder_frames_total[1m])` to chart per-stream FPS;
-	// dips below the source frame rate signal the transcoder is
-	// dropping or queueing frames. Mirrors the operator-tooling
-	// "Output frames count" panel shape.
+	// TranscoderFramesTotal counts encoded frames delivered by the transcoder
+	// subprocess, observed by its supervisor so it works whichever output
+	// protocols are enabled. Use `rate(transcoder_frames_total[1m])` to chart
+	// per-stream FPS; dips below the source frame rate signal the transcoder
+	// is dropping or queueing frames. Passthrough streams have no series.
 	//
 	// Labels:
 	//   - stream_code: the parent stream
-	//   - profile: rendition slug ("track_1", "track_2") for ABR
-	//     shards; "v0" for single-rendition streams. Matches the
-	//     Representation id emitted in the MPD.
+	//   - profile: rendition slug ("track_1", "track_2"), or "all" for the
+	//     audio track shared by every rendition
 	//   - kind: "video" | "audio"
 	TranscoderFramesTotal *prometheus.CounterVec
+	// TranscoderProcessCPUSeconds is CPU time used by the stream's transcoder
+	// subprocess (Linux only). Accumulates across respawns.
+	TranscoderProcessCPUSeconds *prometheus.CounterVec
+	// TranscoderProcessResidentMemory is the subprocess's resident memory,
+	// including libav allocations the Go heap metrics can't see (Linux only).
+	TranscoderProcessResidentMemory *prometheus.GaugeVec
+	// TranscoderProcessThreads is the subprocess's thread count (Linux only).
+	TranscoderProcessThreads *prometheus.GaugeVec
+	// TranscoderErrorsTotal counts errors reported by the subprocess by
+	// pipeline stage: init, switch, flush, demux, audio, watermark, scale,
+	// encode, decode or other.
+	TranscoderErrorsTotal *prometheus.CounterVec
 
 	// ── DVR ───────────────────────────────────────────────────────────────────
 	// DVRSegmentsWrittenTotal counts TS segments flushed to disk per stream.
@@ -255,8 +264,24 @@ func New(i do.Injector) (*Metrics, error) {
 
 		TranscoderFramesTotal: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "open_streamer_transcoder_frames_total",
-			Help: "Total encoded frames observed at the publisher's per-frame ingress. Diff vs source FPS = transcoder dropping or queueing.",
+			Help: "Total encoded frames delivered by the transcoder subprocess. Diff vs source FPS = transcoder dropping or queueing.",
 		}, []string{"stream_code", "profile", "kind"}),
+		TranscoderProcessCPUSeconds: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_transcoder_process_cpu_seconds_total",
+			Help: "CPU time used by the stream's open-streamer-transcoder subprocess (Linux only).",
+		}, []string{"stream_code"}),
+		TranscoderProcessResidentMemory: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "open_streamer_transcoder_process_resident_memory_bytes",
+			Help: "Resident memory of the stream's open-streamer-transcoder subprocess (Linux only).",
+		}, []string{"stream_code"}),
+		TranscoderProcessThreads: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "open_streamer_transcoder_process_threads",
+			Help: "Thread count of the stream's open-streamer-transcoder subprocess (Linux only).",
+		}, []string{"stream_code"}),
+		TranscoderErrorsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_transcoder_errors_total",
+			Help: "Errors reported by the transcoder subprocess, by pipeline stage.",
+		}, []string{"stream_code", "stage"}),
 		TranscoderQualitiesActive: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "open_streamer_transcoder_qualities_active",
 			Help: "Number of active ABR rendition profiles per stream.",

@@ -122,12 +122,9 @@ type Config struct {
 
 	// Metrics (all optional / nil-safe). Pre-bound by publisher.Service so the
 	// dash package stays agnostic of the Prometheus registry.
-	//   VideoFrames / AudioFrames — open_streamer_transcoder_frames_total per kind.
-	//   SegCounter                — open_streamer_publisher_segments_total{format="dash"}.
-	//   SegWriteDur               — open_streamer_publisher_segment_write_duration_seconds{format="dash"}.
-	//   SegWriteErr               — open_streamer_publisher_segment_write_errors_total{format="dash"}.
-	VideoFrames prometheus.Counter
-	AudioFrames prometheus.Counter
+	//   SegCounter  — open_streamer_publisher_segments_total{format="dash"}.
+	//   SegWriteDur — open_streamer_publisher_segment_write_duration_seconds{format="dash"}.
+	//   SegWriteErr — open_streamer_publisher_segment_write_errors_total{format="dash"}.
 	SegCounter  prometheus.Counter
 	SegWriteDur prometheus.Observer
 	SegWriteErr prometheus.Counter
@@ -390,11 +387,6 @@ func (p *Packager) handleH264(av *domain.AVPacket) {
 		}
 		p.firstIDRSeen = true
 	}
-	// Count accepted video frames at ingress (post IDR-gate) — drives
-	// open_streamer_transcoder_frames_total{kind="video"}.
-	if p.cfg.VideoFrames != nil {
-		p.cfg.VideoFrames.Inc()
-	}
 	p.pushVideoWithDiag(VideoFrame{
 		AnnexB: cloneBytes(av.Data),
 		PTSms:  av.PTSms,
@@ -490,10 +482,6 @@ func (p *Packager) handleAAC(av *domain.AVPacket) {
 // the overflow + OOO diagnostic counters. Extracted from handleAAC so
 // the parent stays under the cognitive-complexity ceiling.
 func (p *Packager) pushAudioWithDiag(f AudioFrame) {
-	// Count each split AAC access unit — open_streamer_transcoder_frames_total{kind="audio"}.
-	if p.cfg.AudioFrames != nil {
-		p.cfg.AudioFrames.Inc()
-	}
 	dropped, ooo := p.queue.PushAudio(f)
 	if dropped > 0 {
 		p.audioOverflowDropCount += dropped
