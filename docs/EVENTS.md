@@ -69,13 +69,18 @@ from the operator-configured per-hook fields — useful for routing keys.
 
 ### 2.4 DVR / Recordings
 
+> **Not currently emitted.** These event types are still declared in
+> [`internal/domain/event.go`](../internal/domain/event.go), but the CMAF DVR
+> ([`internal/dvr/blob`](../internal/dvr/blob/)) does not publish them, so
+> subscribed hooks won't receive them. The table describes the intended contract.
+
 | Type | Emitter | Triggers when | Payload |
 |---|---|---|---|
-| `recording.started` | DVR ([service.go:197](../internal/dvr/service.go)) | A recording subscription begins (operator enables DVR or pipeline starts with `dvr.enabled=true`) | `recording_id: string` |
-| `recording.stopped` | DVR ([service.go:236](../internal/dvr/service.go)) | Recording subscription ends gracefully | `recording_id: string` |
-| `recording.failed` | DVR ([service.go:443](../internal/dvr/service.go)) | Segment write or rotation hits a non-recoverable error | `recording_id: string`, `err: string` |
-| `segment.written` | DVR ([service.go:483](../internal/dvr/service.go)) | One TS segment flushed to disk + manifest updated | `recording_id: string`, `index: int`, `size_bytes: int64`, `duration_sec: float`, `discontinuity: bool` |
-| `dvr.segment_pruned` | DVR ([service.go:`applyRetention`](../internal/dvr/service.go)) | Retention loop deleted an aged-out segment | `recording_id: string`, `segment_index: int`, `size_bytes: int64`, `reason: "age" \| "size"` |
+| `recording.started` | DVR | A recording subscription begins (operator enables DVR or pipeline starts with `dvr.enabled=true`) | `recording_id: string` |
+| `recording.stopped` | DVR | Recording subscription ends gracefully | `recording_id: string` |
+| `recording.failed` | DVR | Segment write or rotation hits a non-recoverable error | `recording_id: string`, `err: string` |
+| `segment.written` | DVR | One TS segment flushed to disk + manifest updated | `recording_id: string`, `index: int`, `size_bytes: int64`, `duration_sec: float`, `discontinuity: bool` |
+| `dvr.segment_pruned` | DVR | Retention loop deleted an aged-out segment | `recording_id: string`, `segment_index: int`, `size_bytes: int64`, `reason: "age" \| "size"` |
 
 ### 2.5 Push out (RTMP / RTMPS)
 

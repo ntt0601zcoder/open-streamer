@@ -86,8 +86,7 @@ const (
 	// with that video segment are NEVER counted (they've been dropped
 	// off the front of the audio queue under cap pressure). Result: 5/9
 	// production streams emitted exactly 1–2 audio segments at startup
-	// then no more for 11 hours — root cause documented in
-	// docs/DASH_INVESTIGATION_2026-05-13.md.
+	// then no more for 11 hours.
 	//
 	// 30 s is the smallest value that comfortably exceeds typical
 	// segDur×live_window (4 s × 6 = 24 s) plus headroom for the

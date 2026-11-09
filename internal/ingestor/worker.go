@@ -449,8 +449,7 @@ type writeContext struct {
 	// TS bytes. Without it, raw-TS-path sources (UDP / HLS-pull /
 	// SRT / file / copy:// / mixer://) propagate upstream clock drift,
 	// burst delivery, and PTS jumps straight to consumers — root cause
-	// of MPD overlap, audio under-emit, player freezes (see
-	// docs/DASH_OUTSTANDING_BUGS.md).
+	// of MPD overlap, audio under-emit, player freezes.
 	tsNormaliser *tsnorm.Normaliser
 	// lastWriteAt is bumped on every successful buffer write so the
 	// stall watchdog (started alongside readLoop) can detect "source

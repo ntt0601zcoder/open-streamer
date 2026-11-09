@@ -89,15 +89,12 @@ sudo bash <(curl -sL https://raw.githubusercontent.com/ntt0601zcoder/open-stream
 git clone https://github.com/ntt0601zcoder/open-streamer.git
 cd open-streamer
 make build && ./bin/open-streamer
-
-# 3. Or Docker
-make compose-up
 ```
 
 Then create a stream:
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "inputs":   [{ "url": "https://upstream/playlist.m3u8", "priority": 0 }],
   "protocols": { "hls": true }
 }'

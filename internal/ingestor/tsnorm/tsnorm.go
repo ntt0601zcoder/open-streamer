@@ -15,8 +15,7 @@
 // composition, occasional 0-second stalls. All of that propagated
 // directly into downstream timeline math — root cause of MPD overlap,
 // audio under-emit, large segment durs, "DASH live edge ahead of
-// publishTime", and player freezes documented in
-// docs/DASH_OUTSTANDING_BUGS.md.
+// publishTime", and player freezes.
 //
 // # Pipeline
 //

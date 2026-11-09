@@ -12,7 +12,7 @@ Companion to [USER_GUIDE.md](./USER_GUIDE.md) (workflows) and
 >
 > Defaults are the SINGLE SOURCE OF TRUTH at
 > [internal/domain/defaults.go](../internal/domain/defaults.go) and
-> reachable live via `GET /api/v1/config/defaults`.
+> reachable live via `GET /config/defaults`.
 
 ---
 
@@ -44,7 +44,7 @@ export OPEN_STREAMER_STORAGE_YAML_DIR=/var/lib/open-streamer
 
 ## 2. GlobalConfig
 
-Edit at runtime via `POST /api/v1/config { ... }` (partial merge — only present fields update). Or wholesale via `PUT /api/v1/config/yaml`.
+Edit at runtime via `POST /config { ... }` (partial merge — only present fields update). Or wholesale via `PUT /config/yaml`.
 
 A section being **`null` / absent** means the corresponding subsystem is **disabled**. Setting a section enables it — the runtime manager hot-starts services to match.
 
@@ -246,7 +246,7 @@ Hot-applied — change without restart.
 
 ## 3. Stream config
 
-Stored per-stream. Edit via `POST /api/v1/streams/{code}` (partial merge).
+Stored per-stream. Edit via `POST /streams/{code}` (partial merge).
 
 ```yaml
 code:        news                # Required. [A-Za-z0-9_/-]+, max 128 chars.
@@ -389,7 +389,7 @@ The user-facing `codec` field is encoder-agnostic — server routes to the right
 
 For VAAPI/QSV/VT operators must spell the full encoder name explicitly (`h264_vaapi`, `h264_qsv`, `h264_videotoolbox`) — empty codec defaults to libx264 on those backends.
 
-The full routing table is in `GET /api/v1/config/defaults` for frontend lookup.
+The full routing table is in `GET /config/defaults` for frontend lookup.
 
 ### 3.3 Watermark — text vs image, asset_id vs image_path
 
@@ -466,7 +466,7 @@ VAAPI / VideoToolbox don't have `-preset` — value dropped silently (encoder us
 
 ## 4. Template config
 
-Stored separately from streams (`/api/v1/templates` endpoint, top-level
+Stored separately from streams (`/templates` endpoint, top-level
 `templates` key in JSON / YAML store). A template bundles config-like
 stream fields; streams reference one via `Stream.template` and inherit
 every field they leave at the zero value. Template code is
@@ -671,7 +671,7 @@ protocols: { hls: true }
 
 Force priority 1 manually:
 ```bash
-curl -XPOST /api/v1/streams/redundant_feed/inputs/switch -d '{"priority": 1}'
+curl -XPOST /streams/redundant_feed/switch -d '{"priority": 1}'
 ```
 
 The manager records this as `runtime.switches[0]={ reason: "manual", to: 1 }`.
@@ -704,7 +704,7 @@ subscription — zero extra encode cost.
 # Original config: 1080p + 720p
 # Add 480p to the ladder.
 
-curl -XPOST /api/v1/streams/news -d '{
+curl -XPOST /streams/news -d '{
   "transcoder": {
     "video": {
       "profiles": [

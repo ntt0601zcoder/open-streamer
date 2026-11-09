@@ -31,7 +31,6 @@ go.work.sum
 # .idea/
 # .vscode/
 .cursor
-CLAUDE.md
 .claude
 
 # Data
