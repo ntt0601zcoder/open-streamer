@@ -71,6 +71,8 @@ func renditionPipeline(t *testing.T, fps int) *StreamPipeline {
 // multiRenditionPipeline returns a 3-rendition (1080p/720p/480p) ABR
 // pipeline used by P7 tests to exercise the per-rendition encode
 // loop and the OutputFrame.TargetIndex routing.
+//
+//nolint:unparam // see buildSourceEncoder; fps reserved for P5.
 func multiRenditionPipeline(t *testing.T, fps int) *StreamPipeline {
 	t.Helper()
 	mk := func(w, h, kbps int) RenditionConfig {

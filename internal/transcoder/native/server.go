@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	pb "github.com/ntt0601zcoder/open-streamer/internal/transcoder/native/proto"
@@ -22,14 +23,18 @@ import (
 // the Run method's local pipeline.
 type Server struct {
 	pb.UnimplementedTranscoderServer
+
+	// healthInterval is the minimum time between periodic Health events.
+	healthInterval time.Duration
 }
 
-// NewServer returns a ready-to-register gRPC handler. Kept as a
-// constructor (instead of zero-value &Server{}) so future server-
-// wide fields (metrics, logger) can be wired without changing call
-// sites.
+// healthReportInterval is shorter than a typical Prometheus scrape so every
+// scrape sees fresh transcoder counters.
+const healthReportInterval = 5 * time.Second
+
+// NewServer returns a ready-to-register gRPC handler.
 func NewServer() *Server {
-	return &Server{}
+	return &Server{healthInterval: healthReportInterval}
 }
 
 // Run is the bidi entry point. Lifecycle:
@@ -72,6 +77,7 @@ func (s *Server) Run(stream pb.Transcoder_RunServer) error {
 		"hw_backend", cfg.GetHwBackend().String(),
 	)
 
+	lastHealth := time.Now()
 	for {
 		req, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -90,6 +96,14 @@ func (s *Server) Run(stream pb.Transcoder_RunServer) error {
 		// Stop body ends the stream cleanly after flushing.
 		if req.GetStop() != nil {
 			return nil
+		}
+		// Sent from this loop because a gRPC stream allows only one
+		// concurrent sender.
+		if time.Since(lastHealth) >= s.healthInterval {
+			if err := stream.Send(healthEvent(pipeline.Stats())); err != nil {
+				return fmt.Errorf("native server: send health: %w", err)
+			}
+			lastHealth = time.Now()
 		}
 	}
 }
@@ -141,7 +155,34 @@ func (s *Server) flushAndSend(stream pb.Transcoder_RunServer, p *StreamPipeline)
 	if err != nil {
 		return fmt.Errorf("flush: %w", err)
 	}
-	return s.sendOutputs(stream, tail)
+	if err := s.sendOutputs(stream, tail); err != nil {
+		return err
+	}
+	// Final report, so frames since the last periodic one are not lost.
+	if err := stream.Send(healthEvent(p.Stats())); err != nil {
+		return fmt.Errorf("send final health: %w", err)
+	}
+	return nil
+}
+
+// healthEvent converts a pipeline snapshot to its wire form.
+func healthEvent(st PipelineStats) *pb.Event {
+	h := &pb.Health{
+		FramesDecoded:           st.FramesDecoded,
+		DroppedVideoPreKeyframe: st.DroppedVideoPreKeyframe,
+		DroppedAudioPreKeyframe: st.DroppedAudioPreKeyframe,
+		DroppedAudioSwitch:      st.DroppedAudioSwitch,
+		PendingAudioFrames:      uint32(st.PendingAudioFrames), //nolint:gosec // a queue length is small and non-negative
+		DemuxQueueChunks:        uint32(st.DemuxQueueChunks),   //nolint:gosec // a queue length is small and non-negative
+	}
+	for i, r := range st.Renditions {
+		h.Profiles = append(h.Profiles, &pb.Health_Profile{
+			Index:       int32(i), //nolint:gosec // i bounded by len(renditions)
+			FramesIn:    r.FramesIn,
+			EncodeNanos: r.EncodeNanos,
+		})
+	}
+	return &pb.Event{Body: &pb.Event_Health{Health: h}}
 }
 
 // sendOutputs wraps each pipeline OutputFrame in an Event_Packet and

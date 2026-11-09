@@ -1137,10 +1137,18 @@ func (x *Stop) GetReason() string {
 }
 
 type Health struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Profiles      []*Health_Profile      `protobuf:"bytes,1,rep,name=profiles,proto3" json:"profiles,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Profiles []*Health_Profile      `protobuf:"bytes,1,rep,name=profiles,proto3" json:"profiles,omitempty"`
+	// Counters below are cumulative for this subprocess lifetime.
+	FramesDecoded           uint64 `protobuf:"varint,2,opt,name=frames_decoded,json=framesDecoded,proto3" json:"frames_decoded,omitempty"`
+	DroppedVideoPreKeyframe uint64 `protobuf:"varint,3,opt,name=dropped_video_pre_keyframe,json=droppedVideoPreKeyframe,proto3" json:"dropped_video_pre_keyframe,omitempty"` // video waiting for the first IDR
+	DroppedAudioPreKeyframe uint64 `protobuf:"varint,4,opt,name=dropped_audio_pre_keyframe,json=droppedAudioPreKeyframe,proto3" json:"dropped_audio_pre_keyframe,omitempty"` // audio waiting for the first video IDR
+	DroppedAudioSwitch      uint64 `protobuf:"varint,5,opt,name=dropped_audio_switch,json=droppedAudioSwitch,proto3" json:"dropped_audio_switch,omitempty"`                  // held audio discarded by an input switch
+	// Current queue depths.
+	PendingAudioFrames uint32 `protobuf:"varint,6,opt,name=pending_audio_frames,json=pendingAudioFrames,proto3" json:"pending_audio_frames,omitempty"` // audio held for A/V alignment
+	DemuxQueueChunks   uint32 `protobuf:"varint,7,opt,name=demux_queue_chunks,json=demuxQueueChunks,proto3" json:"demux_queue_chunks,omitempty"`       // raw-TS chunks waiting for the demuxer
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *Health) Reset() {
@@ -1178,6 +1186,48 @@ func (x *Health) GetProfiles() []*Health_Profile {
 		return x.Profiles
 	}
 	return nil
+}
+
+func (x *Health) GetFramesDecoded() uint64 {
+	if x != nil {
+		return x.FramesDecoded
+	}
+	return 0
+}
+
+func (x *Health) GetDroppedVideoPreKeyframe() uint64 {
+	if x != nil {
+		return x.DroppedVideoPreKeyframe
+	}
+	return 0
+}
+
+func (x *Health) GetDroppedAudioPreKeyframe() uint64 {
+	if x != nil {
+		return x.DroppedAudioPreKeyframe
+	}
+	return 0
+}
+
+func (x *Health) GetDroppedAudioSwitch() uint64 {
+	if x != nil {
+		return x.DroppedAudioSwitch
+	}
+	return 0
+}
+
+func (x *Health) GetPendingAudioFrames() uint32 {
+	if x != nil {
+		return x.PendingAudioFrames
+	}
+	return 0
+}
+
+func (x *Health) GetDemuxQueueChunks() uint32 {
+	if x != nil {
+		return x.DemuxQueueChunks
+	}
+	return 0
 }
 
 type Error struct {
@@ -1243,10 +1293,13 @@ func (x *Error) GetTerminal() bool {
 // Cumulative restart counter per profile so the supervisor can mirror
 // it into transcoder.RuntimeStatus without state of its own.
 type Health_Profile struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Index         int32                  `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
-	RestartCount  int32                  `protobuf:"varint,2,opt,name=restart_count,json=restartCount,proto3" json:"restart_count,omitempty"`
-	Unhealthy     bool                   `protobuf:"varint,3,opt,name=unhealthy,proto3" json:"unhealthy,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Index        int32                  `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
+	RestartCount int32                  `protobuf:"varint,2,opt,name=restart_count,json=restartCount,proto3" json:"restart_count,omitempty"`
+	Unhealthy    bool                   `protobuf:"varint,3,opt,name=unhealthy,proto3" json:"unhealthy,omitempty"`
+	// Cumulative for this subprocess lifetime.
+	FramesIn      uint64 `protobuf:"varint,4,opt,name=frames_in,json=framesIn,proto3" json:"frames_in,omitempty"`          // frames handed to this rendition's encoder
+	EncodeNanos   uint64 `protobuf:"varint,5,opt,name=encode_nanos,json=encodeNanos,proto3" json:"encode_nanos,omitempty"` // time spent in this rendition's encode calls
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1300,6 +1353,20 @@ func (x *Health_Profile) GetUnhealthy() bool {
 		return x.Unhealthy
 	}
 	return false
+}
+
+func (x *Health_Profile) GetFramesIn() uint64 {
+	if x != nil {
+		return x.FramesIn
+	}
+	return 0
+}
+
+func (x *Health_Profile) GetEncodeNanos() uint64 {
+	if x != nil {
+		return x.EncodeNanos
+	}
+	return 0
 }
 
 var File_transcoder_proto protoreflect.FileDescriptor
@@ -1394,13 +1461,21 @@ const file_transcoder_proto_rawDesc = "" +
 	"\vSwitchInput\x120\n" +
 	"\x15new_raw_ingest_buf_id\x18\x01 \x01(\tR\x11newRawIngestBufId\"\x1e\n" +
 	"\x04Stop\x12\x16\n" +
-	"\x06reason\x18\x01 \x01(\tR\x06reason\"\xa7\x01\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason\"\x9b\x04\n" +
 	"\x06Health\x129\n" +
-	"\bprofiles\x18\x01 \x03(\v2\x1d.transcoder.v1.Health.ProfileR\bprofiles\x1ab\n" +
+	"\bprofiles\x18\x01 \x03(\v2\x1d.transcoder.v1.Health.ProfileR\bprofiles\x12%\n" +
+	"\x0eframes_decoded\x18\x02 \x01(\x04R\rframesDecoded\x12;\n" +
+	"\x1adropped_video_pre_keyframe\x18\x03 \x01(\x04R\x17droppedVideoPreKeyframe\x12;\n" +
+	"\x1adropped_audio_pre_keyframe\x18\x04 \x01(\x04R\x17droppedAudioPreKeyframe\x120\n" +
+	"\x14dropped_audio_switch\x18\x05 \x01(\x04R\x12droppedAudioSwitch\x120\n" +
+	"\x14pending_audio_frames\x18\x06 \x01(\rR\x12pendingAudioFrames\x12,\n" +
+	"\x12demux_queue_chunks\x18\a \x01(\rR\x10demuxQueueChunks\x1a\xa2\x01\n" +
 	"\aProfile\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\x05R\x05index\x12#\n" +
 	"\rrestart_count\x18\x02 \x01(\x05R\frestartCount\x12\x1c\n" +
-	"\tunhealthy\x18\x03 \x01(\bR\tunhealthy\"`\n" +
+	"\tunhealthy\x18\x03 \x01(\bR\tunhealthy\x12\x1b\n" +
+	"\tframes_in\x18\x04 \x01(\x04R\bframesIn\x12!\n" +
+	"\fencode_nanos\x18\x05 \x01(\x04R\vencodeNanos\"`\n" +
 	"\x05Error\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage\x12!\n" +
 	"\ftarget_index\x18\x02 \x01(\x05R\vtargetIndex\x12\x1a\n" +

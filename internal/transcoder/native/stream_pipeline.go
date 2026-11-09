@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/asticode/go-astiav"
 	gocodec "github.com/yapingcat/gomedia/go-codec"
@@ -244,6 +245,10 @@ type StreamPipeline struct {
 	// would otherwise outrun video by seconds, baking a permanent lip-sync
 	// offset into the output. PTS-ordered (rebaseAudioPTS is monotonic).
 	pendingAudio []OutputFrame
+
+	// stats holds the running totals behind Stats. Only touched by the
+	// goroutine driving the pipeline.
+	stats PipelineStats
 }
 
 const (
@@ -384,6 +389,7 @@ func NewStreamPipeline(cfg PipelineConfig) (*StreamPipeline, error) {
 		pendingRebase:   true, // first-ever frame anchors the output clock
 		videoFrameDurMs: videoFrameDurationMs(cfg.Renditions[0].Encoder.Framerate),
 		audioReenc:      audioReenc,
+		stats:           PipelineStats{Renditions: make([]RenditionStats, len(cfg.Renditions))},
 	}, nil
 }
 
@@ -432,6 +438,7 @@ func buildAudioReencoder(cfg AudioConfig) (*audioReencoder, error) {
 // offset cleanly.
 func (p *StreamPipeline) handleAudio(frames []esFrame) ([]OutputFrame, error) {
 	if !p.sawKeyframe {
+		p.stats.DroppedAudioPreKeyframe += uint64(len(frames))
 		return nil, nil
 	}
 	if len(frames) > 0 {
@@ -830,6 +837,7 @@ func (p *StreamPipeline) ProcessPacket(data []byte, codec esFrameCodec, pts, dts
 
 	if !p.sawKeyframe {
 		if !isVideoKeyframeAnnexB(codec, data) {
+			p.stats.DroppedVideoPreKeyframe++
 			return rebuilt, nil
 		}
 		p.sawKeyframe = true
@@ -870,6 +878,7 @@ func (p *StreamPipeline) decodeAndEncodeESFrames(frames []esFrame) ([]OutputFram
 
 		if !p.sawKeyframe {
 			if !f.keyframe {
+				p.stats.DroppedVideoPreKeyframe++
 				continue
 			}
 			p.sawKeyframe = true
@@ -1017,7 +1026,7 @@ func (p *StreamPipeline) SwitchInput(newCfg DecoderConfig) ([]OutputFrame, error
 	p.sawKeyframe = false
 	p.pendingForceKeyframe = true
 	p.pendingRebase = true
-	p.pendingAudio = nil                           // drop the old input's held audio; new input re-anchors
+	p.dropHeldAudioOnSwitch()                      // new input re-anchors
 	p.hasVideoSrc, p.videoSrcIntervalMs = false, 0 // relearn the new source's frame interval
 	p.hasAudioSrc = false                          // new source = new audio clock for the regress guard
 	// EXT-X-DISCONTINUITY is only needed when the OUTPUT stream's shape
@@ -1095,7 +1104,7 @@ func (p *StreamPipeline) switchInputGPU() ([]OutputFrame, error) {
 	p.sawKeyframe = false
 	p.pendingForceKeyframe = true
 	p.pendingRebase = true
-	p.pendingAudio = nil                           // drop the old input's held audio; new input re-anchors
+	p.dropHeldAudioOnSwitch()                      // new input re-anchors
 	p.hasVideoSrc, p.videoSrcIntervalMs = false, 0 // relearn the new source's frame interval
 	p.hasAudioSrc = false                          // new source = new audio clock for the regress guard
 	if p.audioReenc != nil {
@@ -1297,6 +1306,7 @@ func (p *StreamPipeline) EncoderPTS() int64 {
 func (p *StreamPipeline) runFramesThroughEncoder(frames []*astiav.Frame) ([]OutputFrame, error) {
 	var out []OutputFrame
 	for i, f := range frames {
+		p.stats.FramesDecoded++
 		pkts, err := p.encodeOne(f)
 		f.Free()
 		if err != nil {
@@ -1420,7 +1430,10 @@ func (p *StreamPipeline) encodeOneRendition(i int, f *astiav.Frame, pts int64, f
 		toEncode.SetFlags(toEncode.Flags().Add(astiav.FrameFlagKey))
 	}
 
+	encodeStart := time.Now()
 	pkts, err := p.encoders[i].Encode(toEncode)
+	p.stats.Renditions[i].FramesIn++
+	p.stats.Renditions[i].EncodeNanos += uint64(time.Since(encodeStart)) //nolint:gosec // an elapsed duration is never negative
 	toEncode.Free()
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: rendition %d encode: %w", i, err)

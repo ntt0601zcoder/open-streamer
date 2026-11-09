@@ -126,6 +126,11 @@ func (t *tsInput) Feed(chunk []byte) error {
 	}
 }
 
+// QueuedChunks reports how many fed chunks are waiting for the demuxer.
+func (t *tsInput) QueuedChunks() int {
+	return len(t.chunks)
+}
+
 // DrainReady pops every video ES frame currently buffered without
 // blocking. Called by the pipeline after each Feed; missed frames
 // from the just-fed chunk land in the queue and get drained on the

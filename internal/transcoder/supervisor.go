@@ -50,6 +50,10 @@ const (
 	// delay after a fast crash. Linear-doubling.
 	restartBackoffStart = 1 * time.Second
 	restartBackoffMax   = 30 * time.Second
+
+	// broadcastFramesProfile is the profile label for frames sent to every
+	// rendition (the shared audio track). Counted once, not once per rendition.
+	broadcastFramesProfile = "all"
 )
 
 // supervisor owns one stream's transcoder subprocess and the gRPC
@@ -164,6 +168,11 @@ func (sv *supervisor) runOnce(ctx context.Context) error {
 		"socket", socketPath,
 		"pid", cmd.Process.Pid,
 	)
+	samplerDone := sv.startProcessSampler(subCtx, cmd.Process.Pid)
+	defer func() {
+		cancelSub()
+		<-samplerDone
+	}()
 
 	if err := waitForSocket(subCtx, socketPath, socketWaitTimeout); err != nil {
 		_ = cmd.Process.Kill()
@@ -214,7 +223,19 @@ func (sv *supervisor) runOnce(ctx context.Context) error {
 	// the run.
 	pumpErrCh := make(chan error, 2)
 	go func() { pumpErrCh <- sv.inputPump(subCtx, sub, stream) }()
-	go func() { pumpErrCh <- sv.outputDrain(subCtx, stream) }()
+	tracker := sv.newHealthTracker()
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		pumpErrCh <- sv.outputDrain(subCtx, stream, tracker)
+	}()
+	// Runs once the drain can no longer observe a report, so a late one
+	// can't recreate the queue gauges after they are cleared.
+	defer func() {
+		cancelSub()
+		<-drainDone
+		tracker.clear()
+	}()
 
 	// Watchdog for subprocess exit so a SIGSEGV in libavcodec
 	// doesn't deadlock the pumps on stream.Send / Recv.
@@ -358,8 +379,8 @@ func (sv *supervisor) sendSwitch(stream pb.Transcoder_RunClient, newRawID domain
 
 // outputDrain consumes the gRPC Event stream and writes OutputPacket
 // payloads into the matching rendition buffer (by TargetIndex). Logs
-// Error events at warn level and Health events at debug.
-func (sv *supervisor) outputDrain(ctx context.Context, stream pb.Transcoder_RunClient) error {
+// Error events at warn level and turns Health events into metrics.
+func (sv *supervisor) outputDrain(ctx context.Context, stream pb.Transcoder_RunClient, tracker *healthTracker) error {
 	for {
 		if ctx.Err() != nil {
 			return nil //nolint:nilerr // shutdown path; ctx error is the signal, not a fault
@@ -375,7 +396,7 @@ func (sv *supervisor) outputDrain(ctx context.Context, stream pb.Transcoder_RunC
 			}
 			return fmt.Errorf("recv event: %w", err)
 		}
-		if err := sv.dispatchEvent(ev); err != nil {
+		if err := sv.dispatchEvent(ev, tracker); err != nil {
 			return err
 		}
 	}
@@ -385,20 +406,14 @@ func (sv *supervisor) outputDrain(ctx context.Context, stream pb.Transcoder_RunC
 // non-fatal events (data writes that succeeded, health pings, non-
 // terminal errors) and a wrapped error for fatal cases that should
 // tear the run down so the supervisor respawns.
-func (sv *supervisor) dispatchEvent(ev *pb.Event) error {
+func (sv *supervisor) dispatchEvent(ev *pb.Event, tracker *healthTracker) error {
 	switch {
 	case ev.GetPacket() != nil:
 		return sv.writeOutputPacket(ev.GetPacket())
 	case ev.GetError() != nil:
 		return sv.handleSubprocessError(ev.GetError())
 	case ev.GetHealth() != nil:
-		// The subprocess can report health per rendition over gRPC;
-		// today the supervisor's own crash counter is the only signal
-		// we act on (subprocess-level).
-		slog.Debug("transcoder: subprocess health event",
-			"stream_code", sv.streamID,
-			"profiles", len(ev.GetHealth().GetProfiles()),
-		)
+		tracker.observe(ev.GetHealth())
 	}
 	return nil
 }
@@ -434,6 +449,7 @@ func (sv *supervisor) writeOutputPacket(pkt *pb.OutputPacket) error {
 				return fmt.Errorf("broadcast buffer write target %d: %w", i, err)
 			}
 		}
+		sv.countOutputFrame(broadcastFramesProfile, avCodec)
 		return nil
 	}
 
@@ -446,7 +462,23 @@ func (sv *supervisor) writeOutputPacket(pkt *pb.OutputPacket) error {
 	if err := sv.svc.buf.Write(target.BufferID, bufPkt); err != nil {
 		return fmt.Errorf("buffer write target %d: %w", idx, err)
 	}
+	sv.countOutputFrame(buffer.VideoTrackSlug(int(idx)), avCodec)
 	return nil
+}
+
+// countOutputFrame records one frame delivered by the subprocess. Counting
+// here, rather than in a publisher, keeps the metric independent of which
+// output protocols the stream has enabled.
+func (sv *supervisor) countOutputFrame(profile string, codec domain.AVCodec) {
+	m := sv.svc.m
+	if m == nil || m.TranscoderFramesTotal == nil {
+		return
+	}
+	kind := "audio"
+	if codec.IsVideo() {
+		kind = "video"
+	}
+	m.TranscoderFramesTotal.WithLabelValues(string(sv.streamID), profile, kind).Inc()
 }
 
 // avCodecFromProto narrows the wire-level Codec enum to the
@@ -473,6 +505,9 @@ func (sv *supervisor) handleSubprocessError(e *pb.Error) error {
 		"terminal", e.GetTerminal(),
 		"msg", e.GetMessage(),
 	)
+	if m := sv.svc.m; m != nil && m.TranscoderErrorsTotal != nil {
+		m.TranscoderErrorsTotal.WithLabelValues(string(sv.streamID), classifyTranscoderError(e.GetMessage())).Inc()
+	}
 	if e.GetTerminal() {
 		return errors.New(e.GetMessage())
 	}

@@ -188,8 +188,21 @@ message Health {
     int32 index         = 1;
     int32 restart_count = 2;
     bool  unhealthy     = 3;
+    // Cumulative for this subprocess lifetime.
+    uint64 frames_in    = 4; // frames handed to this rendition's encoder
+    uint64 encode_nanos = 5; // time spent in this rendition's encode calls
   }
   repeated Profile profiles = 1;
+
+  // Counters below are cumulative for this subprocess lifetime.
+  uint64 frames_decoded             = 2;
+  uint64 dropped_video_pre_keyframe = 3; // video waiting for the first IDR
+  uint64 dropped_audio_pre_keyframe = 4; // audio waiting for the first video IDR
+  uint64 dropped_audio_switch       = 5; // held audio discarded by an input switch
+
+  // Current queue depths.
+  uint32 pending_audio_frames = 6; // audio held for A/V alignment
+  uint32 demux_queue_chunks   = 7; // raw-TS chunks waiting for the demuxer
 }
 
 message Error {

@@ -1710,7 +1710,7 @@
         "w": 6,
         "h": 8
       },
-      "description": "Counted at the DASH packager, so only streams with DASH enabled appear.",
+      "description": "Frames delivered by the transcoder, per rendition. Audio shared by all renditions has profile=all.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -1735,19 +1735,410 @@
     },
     {
       "id": 30,
+      "type": "timeseries",
+      "title": "Transcoder CPU (cores)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(open_streamer_transcoder_process_cpu_seconds_total{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}[$__rate_interval])",
+          "legendFormat": "{{stream_code}}"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 6,
+        "h": 8
+      },
+      "description": "CPU of the per-stream subprocess, excluding GPU work. Linux only.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Transcoder memory",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "open_streamer_transcoder_process_resident_memory_bytes{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}",
+          "legendFormat": "{{stream_code}}"
+        }
+      ],
+      "gridPos": {
+        "x": 6,
+        "y": 59,
+        "w": 6,
+        "h": 8
+      },
+      "description": "Resident memory of the per-stream subprocess, including libav. Linux only.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Transcoder threads",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "open_streamer_transcoder_process_threads{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}",
+          "legendFormat": "{{stream_code}}"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 59,
+        "w": 6,
+        "h": 8
+      },
+      "description": "Linux only.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Transcoder errors by stage",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (stream_code, stage) (increase(open_streamer_transcoder_errors_total{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}[$__rate_interval]))",
+          "legendFormat": "{{stream_code}} {{stage}}"
+        }
+      ],
+      "gridPos": {
+        "x": 18,
+        "y": 59,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Decoded vs encoder input frames/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (stream_code) (rate(open_streamer_transcoder_decoded_frames_total{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}[$__rate_interval]))",
+          "legendFormat": "decoded {{stream_code}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (stream_code, profile) (rate(open_streamer_transcoder_encoder_input_frames_total{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}[$__rate_interval]))",
+          "legendFormat": "encoder in {{stream_code}} {{profile}}"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 67,
+        "w": 6,
+        "h": 8
+      },
+      "description": "Compare with Encoded frames/s: a gap means frames are held or lost inside the encoder.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Encode time per frame",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (stream_code, profile) (rate(open_streamer_transcoder_encode_seconds_total{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}[$__rate_interval])) / sum by (stream_code, profile) (rate(open_streamer_transcoder_encoder_input_frames_total{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}[$__rate_interval]))",
+          "legendFormat": "{{stream_code}} {{profile}}"
+        }
+      ],
+      "gridPos": {
+        "x": 6,
+        "y": 67,
+        "w": 6,
+        "h": 8
+      },
+      "description": "Time inside encode calls. With libx264, above the frame interval (40 ms at 25 fps) the encoder cannot keep up. With NVENC this is only the time to submit a frame to the GPU; use GPU utilization to judge encoder load.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Frames dropped before decode",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (stream_code, kind, reason) (increase(open_streamer_transcoder_dropped_frames_total{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}[$__rate_interval]))",
+          "legendFormat": "{{stream_code}} {{kind}} {{reason}}"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 67,
+        "w": 6,
+        "h": 8
+      },
+      "description": "pre_keyframe is normal right after a start or input switch. A sustained rate is not.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Transcoder queue depth",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "open_streamer_transcoder_queue_depth{job=\"$job\",instance=~\"$instance\",stream_code=~\"$stream_code\"}",
+          "legendFormat": "{{stream_code}} {{queue}}"
+        }
+      ],
+      "gridPos": {
+        "x": 18,
+        "y": 67,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 38,
       "type": "row",
       "title": "Publisher",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 59,
+        "y": 75,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 31,
+      "id": 39,
       "type": "timeseries",
       "title": "Segments/s by format",
       "datasource": {
@@ -1767,7 +2158,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 60,
+        "y": 76,
         "w": 8,
         "h": 8
       },
@@ -1794,7 +2185,7 @@
       }
     },
     {
-      "id": 32,
+      "id": 40,
       "type": "timeseries",
       "title": "Segment write latency p99",
       "datasource": {
@@ -1814,7 +2205,7 @@
       ],
       "gridPos": {
         "x": 8,
-        "y": 60,
+        "y": 76,
         "w": 8,
         "h": 8
       },
@@ -1857,7 +2248,7 @@
       }
     },
     {
-      "id": 33,
+      "id": 41,
       "type": "timeseries",
       "title": "Segment write errors",
       "datasource": {
@@ -1877,7 +2268,7 @@
       ],
       "gridPos": {
         "x": 16,
-        "y": 60,
+        "y": 76,
         "w": 8,
         "h": 8
       },
@@ -1904,7 +2295,7 @@
       }
     },
     {
-      "id": 34,
+      "id": 42,
       "type": "state-timeline",
       "title": "Push state (worst destination)",
       "datasource": {
@@ -1924,7 +2315,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 68,
+        "y": 84,
         "w": 8,
         "h": 8
       },
@@ -1983,7 +2374,7 @@
       }
     },
     {
-      "id": 35,
+      "id": 43,
       "type": "timeseries",
       "title": "Push bitrate",
       "datasource": {
@@ -2003,7 +2394,7 @@
       ],
       "gridPos": {
         "x": 8,
-        "y": 68,
+        "y": 84,
         "w": 8,
         "h": 8
       },
@@ -2031,7 +2422,7 @@
       }
     },
     {
-      "id": 36,
+      "id": 44,
       "type": "timeseries",
       "title": "Push reconnects",
       "datasource": {
@@ -2051,7 +2442,7 @@
       ],
       "gridPos": {
         "x": 16,
-        "y": 68,
+        "y": 84,
         "w": 8,
         "h": 8
       },
@@ -2079,20 +2470,20 @@
       }
     },
     {
-      "id": 37,
+      "id": 45,
       "type": "row",
       "title": "Viewers",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 76,
+        "y": 92,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 38,
+      "id": 46,
       "type": "timeseries",
       "title": "Viewers by protocol",
       "datasource": {
@@ -2112,7 +2503,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 77,
+        "y": 93,
         "w": 6,
         "h": 8
       },
@@ -2142,7 +2533,7 @@
       }
     },
     {
-      "id": 39,
+      "id": 47,
       "type": "timeseries",
       "title": "Top 10 streams by viewers",
       "datasource": {
@@ -2162,7 +2553,7 @@
       ],
       "gridPos": {
         "x": 6,
-        "y": 77,
+        "y": 93,
         "w": 6,
         "h": 8
       },
@@ -2189,7 +2580,7 @@
       }
     },
     {
-      "id": 40,
+      "id": 48,
       "type": "timeseries",
       "title": "Sessions opened / closed",
       "datasource": {
@@ -2218,7 +2609,7 @@
       ],
       "gridPos": {
         "x": 12,
-        "y": 77,
+        "y": 93,
         "w": 6,
         "h": 8
       },
@@ -2245,7 +2636,7 @@
       }
     },
     {
-      "id": 41,
+      "id": 49,
       "type": "timeseries",
       "title": "Sessions closed by reason",
       "datasource": {
@@ -2265,7 +2656,7 @@
       ],
       "gridPos": {
         "x": 18,
-        "y": 77,
+        "y": 93,
         "w": 6,
         "h": 8
       },
@@ -2292,20 +2683,20 @@
       }
     },
     {
-      "id": 42,
+      "id": 50,
       "type": "row",
       "title": "Hooks, API and control plane",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 85,
+        "y": 101,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 43,
+      "id": 51,
       "type": "timeseries",
       "title": "Hook deliveries",
       "datasource": {
@@ -2325,7 +2716,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 86,
+        "y": 102,
         "w": 8,
         "h": 8
       },
@@ -2352,7 +2743,7 @@
       }
     },
     {
-      "id": 44,
+      "id": 52,
       "type": "timeseries",
       "title": "Hook queue depth / dropped",
       "datasource": {
@@ -2381,7 +2772,7 @@
       ],
       "gridPos": {
         "x": 8,
-        "y": 86,
+        "y": 102,
         "w": 8,
         "h": 8
       },
@@ -2408,7 +2799,7 @@
       }
     },
     {
-      "id": 45,
+      "id": 53,
       "type": "timeseries",
       "title": "Hook batch size p95",
       "datasource": {
@@ -2428,7 +2819,7 @@
       ],
       "gridPos": {
         "x": 16,
-        "y": 86,
+        "y": 102,
         "w": 8,
         "h": 8
       },
@@ -2455,7 +2846,7 @@
       }
     },
     {
-      "id": 46,
+      "id": 54,
       "type": "timeseries",
       "title": "API requests/s by status",
       "datasource": {
@@ -2475,7 +2866,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 94,
+        "y": 110,
         "w": 8,
         "h": 8
       },
@@ -2505,7 +2896,7 @@
       }
     },
     {
-      "id": 47,
+      "id": 55,
       "type": "timeseries",
       "title": "API latency p99 by route",
       "datasource": {
@@ -2525,7 +2916,7 @@
       ],
       "gridPos": {
         "x": 8,
-        "y": 94,
+        "y": 110,
         "w": 8,
         "h": 8
       },
@@ -2552,7 +2943,7 @@
       }
     },
     {
-      "id": 48,
+      "id": 56,
       "type": "timeseries",
       "title": "Seconds since last reconcile",
       "datasource": {
@@ -2572,7 +2963,7 @@
       ],
       "gridPos": {
         "x": 16,
-        "y": 94,
+        "y": 110,
         "w": 8,
         "h": 8
       },
@@ -2616,7 +3007,7 @@
       }
     },
     {
-      "id": 49,
+      "id": 57,
       "type": "timeseries",
       "title": "Auto-published streams",
       "datasource": {
@@ -2636,7 +3027,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 102,
+        "y": 118,
         "w": 12,
         "h": 8
       },
@@ -2663,7 +3054,7 @@
       }
     },
     {
-      "id": 50,
+      "id": 58,
       "type": "timeseries",
       "title": "Auto-publish created / reaped",
       "datasource": {
@@ -2692,7 +3083,7 @@
       ],
       "gridPos": {
         "x": 12,
-        "y": 102,
+        "y": 118,
         "w": 12,
         "h": 8
       },
@@ -2719,20 +3110,20 @@
       }
     },
     {
-      "id": 51,
+      "id": 59,
       "type": "row",
       "title": "Process",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 110,
+        "y": 126,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 52,
+      "id": 60,
       "type": "timeseries",
       "title": "CPU (cores)",
       "datasource": {
@@ -2752,7 +3143,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 111,
+        "y": 127,
         "w": 8,
         "h": 8
       },
@@ -2780,7 +3171,7 @@
       }
     },
     {
-      "id": 53,
+      "id": 61,
       "type": "timeseries",
       "title": "Memory",
       "datasource": {
@@ -2809,7 +3200,7 @@
       ],
       "gridPos": {
         "x": 8,
-        "y": 111,
+        "y": 127,
         "w": 8,
         "h": 8
       },
@@ -2836,7 +3227,7 @@
       }
     },
     {
-      "id": 54,
+      "id": 62,
       "type": "timeseries",
       "title": "Goroutines",
       "datasource": {
@@ -2856,7 +3247,7 @@
       ],
       "gridPos": {
         "x": 16,
-        "y": 111,
+        "y": 127,
         "w": 8,
         "h": 8
       },
@@ -2883,7 +3274,7 @@
       }
     },
     {
-      "id": 55,
+      "id": 63,
       "type": "timeseries",
       "title": "File descriptors used",
       "datasource": {
@@ -2903,7 +3294,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 119,
+        "y": 135,
         "w": 8,
         "h": 8
       },
@@ -2947,7 +3338,7 @@
       }
     },
     {
-      "id": 56,
+      "id": 64,
       "type": "timeseries",
       "title": "GC pause share",
       "datasource": {
@@ -2967,7 +3358,7 @@
       ],
       "gridPos": {
         "x": 8,
-        "y": 119,
+        "y": 135,
         "w": 8,
         "h": 8
       },
@@ -2994,7 +3385,7 @@
       }
     },
     {
-      "id": 57,
+      "id": 65,
       "type": "timeseries",
       "title": "Process uptime",
       "datasource": {
@@ -3014,7 +3405,7 @@
       ],
       "gridPos": {
         "x": 16,
-        "y": 119,
+        "y": 135,
         "w": 8,
         "h": 8
       },

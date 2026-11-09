@@ -166,6 +166,72 @@ as the early-warning rule) see [ARCHITECTURE.md § Buffer Hub](./ARCHITECTURE.md
 - **Updated by**: the supervisor's subprocess respawn loop on every retry
 - **Alert**: `rate(open_streamer_transcoder_restarts_total[10m]) > 0.1` → profile crashing repeatedly
 
+### `open_streamer_transcoder_frames_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`, `profile` (`track_N`, or `all` for the audio track shared by every rendition), `kind` (video|audio)
+- **Updated by**: the supervisor on every frame the subprocess delivers, whichever output protocols are enabled. Passthrough streams have no series
+- **Panel**: `rate(open_streamer_transcoder_frames_total{kind="video"}[1m])` → output FPS per rendition; below the source FPS means frames are being dropped or queued
+
+### `open_streamer_transcoder_process_cpu_seconds_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`
+- **Updated by**: the supervisor, sampling `/proc` every 5s (Linux only); accumulates across respawns
+- **Panel**: `rate(open_streamer_transcoder_process_cpu_seconds_total[1m])` → CPU cores used by one stream's transcoder. GPU work is not included
+
+### `open_streamer_transcoder_process_resident_memory_bytes`
+
+- **Type**: gauge
+- **Labels**: `stream_code`
+- **Updated by**: the same sampler (Linux only); the series is removed when the subprocess exits
+- **Why**: includes libav allocations that the Go heap metrics cannot see
+
+### `open_streamer_transcoder_process_threads`
+
+- **Type**: gauge
+- **Labels**: `stream_code`
+- **Updated by**: the same sampler (Linux only); the series is removed when the subprocess exits
+
+### `open_streamer_transcoder_errors_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`, `stage` (init|switch|flush|demux|audio|watermark|scale|encode|decode|other)
+- **Updated by**: the supervisor on every error event from the subprocess. A process that dies without reporting one only shows in `restarts_total`
+- **Alert**: `increase(open_streamer_transcoder_errors_total[5m]) > 0` → read the logs for that stream and stage
+
+The metrics below come from Health events the subprocess sends every 5s and when it stops.
+
+### `open_streamer_transcoder_decoded_frames_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`
+- **Panel**: `rate(open_streamer_transcoder_decoded_frames_total[1m])` → source FPS actually decoded
+
+### `open_streamer_transcoder_encoder_input_frames_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`, `profile`
+- **Why**: compare with `frames_total{kind="video"}`; a growing gap means frames are held or lost inside the encoder
+
+### `open_streamer_transcoder_encode_seconds_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`, `profile`
+- **Panel**: `rate(open_streamer_transcoder_encode_seconds_total[1m]) / rate(open_streamer_transcoder_encoder_input_frames_total[1m])` → time per frame. With libx264, above the frame interval the encoder cannot keep up. With NVENC this is only the time to submit a frame to the GPU, so it says little about GPU load
+
+### `open_streamer_transcoder_dropped_frames_total`
+
+- **Type**: counter
+- **Labels**: `stream_code`, `kind` (video|audio), `reason` (pre_keyframe|input_switch)
+- **Why**: `pre_keyframe` is normal right after a start or input switch; a sustained rate means the source sends no usable keyframes
+
+### `open_streamer_transcoder_queue_depth`
+
+- **Type**: gauge
+- **Labels**: `stream_code`, `queue` (pending_audio|demux)
+- **Why**: `pending_audio` is audio held for A/V alignment; `demux` is raw-TS chunks waiting to be parsed. The backlog before the subprocess shows as `buffer_capacity_used` on the `$raw$<code>` buffer
+
 ---
 
 ## 7. Publisher
