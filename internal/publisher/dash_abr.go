@@ -80,10 +80,7 @@ func (s *Service) serveDASHAdaptive(ctx context.Context, stream *domain.Stream) 
 			OverrideBandwidth: bw,
 			// Metrics use the bare stream code + rendition slug as profile
 			// (NOT cfg.StreamID = code+"/"+slug, which would double-count the
-			// slug into the stream_code label). Audio counts only on the
-			// audio-packing shard.
-			VideoFrames: s.dashFrameCounter(stream.Code, slug, "video"),
-			AudioFrames: s.dashAudioFrameCounter(stream.Code, slug, packAudio),
+			// slug into the stream_code label).
 			SegCounter:  s.dashSegCounter(stream.Code, slug),
 			SegWriteDur: s.segWriteDurObserver(stream.Code, "dash"),
 			SegWriteErr: s.segWriteErrCounter(stream.Code, "dash", slug),
