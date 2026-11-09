@@ -1,0 +1,12 @@
+# Independent media source for the soak test. Separate project on purpose, so
+# a deploy of any other stack cannot interrupt a multi-day run.
+name: open-streamer-soak
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.3
+    container_name: open-streamer-soak-mediamtx
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
