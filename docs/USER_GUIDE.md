@@ -52,7 +52,7 @@ bundles and the builder image (`Dockerfile.builder`) ship:
 - **GPU / extra**: `h264_nvenc` / `hevc_nvenc` (NVENC), `libx265`,
   `libsvtav1`, `libopus`, `libmp3lame`, `ac3`, HLS / DASH muxers
 
-The `POST /api/v1/config/transcoder/probe` endpoint (UI "Test" button) is a
+The `POST /config/transcoder/probe` endpoint (UI "Test" button) is a
 no-op that always reports ok.
 
 ---
@@ -73,7 +73,7 @@ Configure via the REST API or UI. To enable HTTP API, POST a server
 config:
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/config -d '{
+curl -XPOST http://localhost:8080/config -d '{
   "server":    { "http_addr": ":8080" },
   "buffer":    {},
   "manager":   {},
@@ -119,7 +119,7 @@ always use the raw code without `live/`.
 ### Minimum viable: pull HLS, publish HLS
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "name": "News Channel",
   "inputs": [
     { "url": "https://upstream.example.com/news/playlist.m3u8", "priority": 0 }
@@ -136,7 +136,7 @@ Stream is up at `http://localhost:8080/news/index.m3u8`. No transcoding
 Add backup sources sorted by priority (lower = preferred):
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "inputs": [
     { "url": "rtmp://primary.example.com/live/news",   "priority": 0 },
     { "url": "rtmp://backup.example.com/live/news",    "priority": 1 },
@@ -155,14 +155,14 @@ When the higher-priority input recovers (background probe succeeds), the
 manager fails back automatically. Override manually:
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news/inputs/switch \
+curl -XPOST http://localhost:8080/streams/news/inputs/switch \
      -d '{ "priority": 0 }'
 ```
 
 ### Add ABR transcoding
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "transcoder": {
     "global": { "hw": "nvenc" },
     "audio":  { "codec": "aac", "bitrate": 128 },
@@ -186,7 +186,7 @@ HLS master playlist auto-aggregates them at `/news/index.m3u8`. DASH MPD at
 ### Push to platforms
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "push": [
     {
       "url": "rtmp://rtmp.example.com/live2/STREAM_KEY",
@@ -211,7 +211,7 @@ counter, last 5 errors, connected_at timestamp.
 Per-stream opt-in:
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "dvr": {
     "enabled":           true,
     "segment_duration":  4,
@@ -259,7 +259,7 @@ Template code accepts `[A-Za-z0-9_-]+` — no `/` because templates live
 in a flat namespace.
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/templates/news_profile -d '{
+curl -XPOST http://localhost:8080/templates/news_profile -d '{
   "name": "News profile",
   "description": "1080p + 720p ABR ladder, HLS + DASH, DVR enabled",
   "transcoder": {
@@ -280,7 +280,7 @@ curl -XPOST http://localhost:8080/api/v1/templates/news_profile -d '{
 ### 5.2 Reference the template from a stream
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "name": "News Channel",
   "template": "news_profile",
   "inputs": [
@@ -295,7 +295,7 @@ The stream now inherits Transcoder, Protocols, and DVR from
 the inherited fields by fetching the template separately:
 
 ```bash
-curl http://localhost:8080/api/v1/templates/news_profile
+curl http://localhost:8080/templates/news_profile
 ```
 
 ### 5.3 Override individual fields
@@ -304,7 +304,7 @@ Any non-zero value on the stream wins. Example: same template but a
 stream that needs an extra 480p rung and disables DASH.
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/sports -d '{
+curl -XPOST http://localhost:8080/streams/sports -d '{
   "template": "news_profile",
   "inputs": [
     { "url": "rtmp://primary.example.com/live/sports", "priority": 0 }
@@ -338,7 +338,7 @@ skip the reload — the next start picks up the new template.
 ```bash
 # Add 480p to the template — every running stream that doesn't
 # already override `transcoder` picks up the new rung.
-curl -XPOST http://localhost:8080/api/v1/templates/news_profile -d '{
+curl -XPOST http://localhost:8080/templates/news_profile -d '{
   "transcoder": {
     "video": {
       "profiles": [
@@ -361,7 +361,7 @@ template has a `publish://` input, the server materialises a **runtime
 stream** on the fly — no `POST /streams/{code}` needed beforehand.
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/templates/auto_news -d '{
+curl -XPOST http://localhost:8080/templates/auto_news -d '{
   "name": "Auto-news template",
   "prefixes": ["live"],
   "inputs": [{ "url": "publish://" }],
@@ -377,7 +377,7 @@ persisted and disappear 30 s after the last packet reaches the buffer
 hub. Stop the encoder → the reaper tears down the pipeline.
 
 ```bash
-curl http://localhost:8080/api/v1/streams
+curl http://localhost:8080/streams
 # {
 #   "data": [
 #     { "code": "live/foo", "template": "auto_news",
@@ -405,12 +405,12 @@ any stream still references it. The response lists the dependent stream
 codes so the operator knows which to detach:
 
 ```bash
-curl -XDELETE http://localhost:8080/api/v1/templates/news_profile
+curl -XDELETE http://localhost:8080/templates/news_profile
 # 409 Conflict
 # { "error": "TEMPLATE_IN_USE", "streams": ["news", "sports"], ... }
 
 # Detach a stream by setting template: null, or pick another template
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{ "template": null, "transcoder": {...}, "protocols": {...} }'
+curl -XPOST http://localhost:8080/streams/news -d '{ "template": null, "transcoder": {...}, "protocols": {...} }'
 ```
 
 ### 5.7 Response shape note
@@ -429,7 +429,7 @@ come from the template.
 
 ```bash
 # Add 360p rung — restarts the stream's transcoder subprocess (renditions share one decode).
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "transcoder": {
     "video": {
       "profiles": [
@@ -449,13 +449,13 @@ The diff engine handles 5 categories independently — see
 To force a full pipeline restart (e.g. switch stream key):
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news/restart
+curl -XPOST http://localhost:8080/streams/news/restart
 ```
 
 To remove a stream entirely:
 
 ```bash
-curl -XDELETE http://localhost:8080/api/v1/streams/news
+curl -XDELETE http://localhost:8080/streams/news
 ```
 
 ---
@@ -467,7 +467,7 @@ Subscribe to lifecycle events with one of two delivery backends:
 ```bash
 # HTTP webhook — events ship as a JSON ARRAY (batched). HMAC signing
 # covers the entire array body when `secret` is set.
-curl -XPOST http://localhost:8080/api/v1/hooks -d '{
+curl -XPOST http://localhost:8080/hooks -d '{
   "id":        "log-everything",
   "type":      "http",
   "target":    "https://ops.example.com/streams/events",
@@ -485,7 +485,7 @@ curl -XPOST http://localhost:8080/api/v1/hooks -d '{
 # File sink — appends one JSON event per line. NOT batched (one event per
 # write) so log shippers (Filebeat / Vector / Promtail) tail-and-ship one
 # line at a time.
-curl -XPOST http://localhost:8080/api/v1/hooks -d '{
+curl -XPOST http://localhost:8080/hooks -d '{
   "id":      "audit-log",
   "type":    "file",
   "target":  "/var/log/open-streamer/events.log",
@@ -531,7 +531,7 @@ Filter by event type or stream code:
 Test delivery:
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/hooks/log-everything/test
+curl -XPOST http://localhost:8080/hooks/log-everything/test
 ```
 
 Hook server-wide settings (worker pool size) are at
@@ -601,7 +601,7 @@ asset ID from a stream.
 ### 8.1 Upload an image asset
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/watermarks?name=ChannelLogo \
+curl -XPOST http://localhost:8080/watermarks?name=ChannelLogo \
      -F "file=@channel-logo.png"
 # 201 Created
 # {
@@ -620,9 +620,9 @@ PNG / JPG / GIF supported. Cap: 8 MiB per asset. Library stays under
 `watermarks.dir` (default `./watermarks`).
 
 ```bash
-curl http://localhost:8080/api/v1/watermarks | jq .         # list
-curl http://localhost:8080/api/v1/watermarks/8a3f1c0e2b9d/raw -o /tmp/preview.png
-curl -XDELETE http://localhost:8080/api/v1/watermarks/8a3f1c0e2b9d
+curl http://localhost:8080/watermarks | jq .         # list
+curl http://localhost:8080/watermarks/8a3f1c0e2b9d/raw -o /tmp/preview.png
+curl -XDELETE http://localhost:8080/watermarks/8a3f1c0e2b9d
 ```
 
 ### 8.2 Apply to a stream
@@ -630,7 +630,7 @@ curl -XDELETE http://localhost:8080/api/v1/watermarks/8a3f1c0e2b9d
 **Image watermark** referencing the uploaded asset:
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "watermark": {
     "enabled":   true,
     "type":      "image",
@@ -645,7 +645,7 @@ curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
 **Text watermark** with a live clock:
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "watermark": {
     "enabled":    true,
     "type":       "text",
@@ -662,7 +662,7 @@ curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
 **Custom position** (raw libavfilter expression — full power):
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "watermark": {
     "enabled":  true,
     "type":     "image",
@@ -727,7 +727,7 @@ restart loses records, viewers reconnect into fresh sessions.
 Sessions tracking is **opt-in** — POST a `sessions` config section:
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/config -d '{
+curl -XPOST http://localhost:8080/config -d '{
   "sessions": { "enabled": true, "idle_timeout_sec": 30 }
 }'
 ```
@@ -739,13 +739,13 @@ takes effect on the next reaper tick (≤ 5s) without restart.
 
 ```bash
 # All active sessions
-curl http://localhost:8080/api/v1/sessions | jq .
+curl http://localhost:8080/sessions | jq .
 
 # Per-stream
-curl http://localhost:8080/api/v1/streams/news/sessions | jq .data
+curl http://localhost:8080/streams/news/sessions | jq .data
 
 # Filter by protocol
-curl 'http://localhost:8080/api/v1/sessions?proto=hls' | jq .data
+curl 'http://localhost:8080/sessions?proto=hls' | jq .data
 ```
 
 Each session record includes:
@@ -771,7 +771,7 @@ opened_total / closed_total / idle_closed_total / kicked_total).
 ### 9.3 Kick a viewer
 
 ```bash
-curl -XDELETE http://localhost:8080/api/v1/sessions/abc123…
+curl -XDELETE http://localhost:8080/sessions/abc123…
 # 204 No Content
 ```
 
@@ -783,7 +783,7 @@ organic disconnects.
 ### 9.4 Subscribe to session events
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/hooks -d '{
+curl -XPOST http://localhost:8080/hooks -d '{
   "id":     "viewer-analytics",
   "type":   "file",
   "target": "/var/log/open-streamer/sessions.log",
@@ -832,7 +832,7 @@ Prometheus scrape endpoint at `GET /metrics`:
 ### Per-stream runtime status
 
 ```bash
-curl http://localhost:8080/api/v1/streams/news | jq .data.runtime
+curl http://localhost:8080/streams/news | jq .data.runtime
 ```
 
 Returns:
@@ -853,9 +853,9 @@ A stream is `degraded` when EITHER:
 ### YAML editor (entire system state)
 
 ```bash
-curl http://localhost:8080/api/v1/config/yaml > backup.yaml
+curl http://localhost:8080/config/yaml > backup.yaml
 # edit backup.yaml...
-curl -XPUT http://localhost:8080/api/v1/config/yaml \
+curl -XPUT http://localhost:8080/config/yaml \
      -H "Content-Type: application/yaml" \
      --data-binary @backup.yaml
 ```
@@ -885,7 +885,7 @@ journalctl -u open-streamer | grep -E '(failover|crashed|degraded)'
 | GPU encoder near 100% saturation | NVENC chip overloaded — reduce profile count / framerate, or set `bframes=0` | `nvidia-smi` or Grafana GPU dashboard |
 | `copy://X` save rejected | `X` doesn't exist, OR cycle detected, OR shape constraint violated | API error message details which check failed |
 | Encoder unavailable at transcode start | The `open-streamer-transcoder` binary lacks that encoder (fixed at build time) | Server logs / `runtime.transcoder.profiles[].errors[]`; rebuild against a libav with the encoder (see `Dockerfile.builder`) |
-| `/sessions` returns empty after enabling | Tracker config not persisted (UI didn't save) OR sub-section absent before restart | `curl /api/v1/config \| jq .sessions` to verify; restart once after first enabling |
+| `/sessions` returns empty after enabling | Tracker config not persisted (UI didn't save) OR sub-section absent before restart | `curl /config \| jq .sessions` to verify; restart once after first enabling |
 | Watermark POST returns `INVALID_WATERMARK` | `image_path` and `asset_id` both set, OR custom position with empty x/y, OR opacity outside [0,1] | API error message names the rule; fix the config JSON |
 | Watermark image not appearing on output | Asset deleted while stream running, OR `image_path` not absolute / unreadable by the open-streamer user | Server logs (`coordinator: watermark asset resolve failed`); chown the asset / re-upload |
 

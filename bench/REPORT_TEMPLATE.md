@@ -79,7 +79,7 @@
 ### 2.1 Effective config snapshot
 
 ```yaml
-# paste: GET /api/v1/config (redact secrets)
+# paste: GET /config (redact secrets)
 ```
 
 ### 2.2 Stream payloads used
@@ -115,7 +115,7 @@
 | `ifstat -i <nic> 2` | network throughput |
 | `iostat -x 2` | disk util (phase E only) |
 | `ffprobe -i <hls>/index.m3u8` | output validation, segment duration |
-| `curl /api/v1/runtime` | switch count, restart count |
+| `curl /streams` | switch count, restart count |
 | `curl /metrics` | Prometheus snapshot |
 
 ---
@@ -222,8 +222,8 @@
 |---|---|
 | `sysinfo.txt` | output of the 6 hardware-check commands |
 | `config.json` | server config snapshot at run start |
-| `streams.json` | `GET /api/v1/streams` |
-| `runtime-{t0,warmup,mid,end}.json` | `GET /api/v1/runtime` snapshots |
+| `streams.json` | `GET /streams` |
+| `runtime-{t0,warmup,mid,end}.json` | `GET /streams` snapshots |
 | `sample.csv` | per-2s metrics from `bench/scripts/sample.sh` |
 | `nvidia-dmon.log` | raw `nvidia-smi dmon` output |
 | `pidstat.log` | per-process CPU/RAM |

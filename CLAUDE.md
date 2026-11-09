@@ -49,7 +49,7 @@ Lint rules that affect how code is written: `exhaustive` is set with `default-si
 Configuration is split in two:
 
 - **Bootstrap** (`config.LoadStorage`): only the storage driver and directory, from `OPEN_STREAMER_STORAGE_*` env vars or `config.yaml` in `.` or `/etc/open-streamer`. The default is the JSON driver in `./test_data`.
-- **Everything else** (`domain.GlobalConfig`): lives in the store and is edited through `/api/v1/config`. `internal/runtime` diffs old against new and cycles only the affected services.
+- **Everything else** (`domain.GlobalConfig`): lives in the store and is edited through `/config`. `internal/runtime` diffs old against new and cycles only the affected services.
 
 `.env.example` is mostly stale: apart from the storage vars and `OPEN_STREAMER_API_ADMIN_PASSWORD`, nothing reads those variables, and the `sql`/`mongo` drivers don't exist (only `json` and `yaml`).
 

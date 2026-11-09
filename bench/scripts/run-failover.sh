@@ -14,8 +14,8 @@
 #
 # Output (per case): bench/results/<id>/
 #   timeline.txt          chronological event log (epoch ms · note)
-#   runtime-pre.json      GET /api/v1/runtime before the disturbance
-#   runtime-post.json     GET /api/v1/runtime after the disturbance
+#   runtime-pre.json      GET /streams before the disturbance
+#   runtime-post.json     GET /streams after the disturbance
 #   summary.md            auto-filled, with the row aggregate.sh consumes
 #
 set -euo pipefail

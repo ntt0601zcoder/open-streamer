@@ -495,7 +495,7 @@ sequenceDiagram
 ```
 
 ```text
-1.  POST /api/v1/config { "sessions": { "idle_timeout_sec": 30 } }
+1.  POST /config { "sessions": { "idle_timeout_sec": 30 } }
 
 2.  ConfigHandler.UpdateConfig:
     ├── deep-copy current GlobalConfig

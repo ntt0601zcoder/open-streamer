@@ -94,7 +94,7 @@ make build && ./bin/open-streamer
 Then create a stream:
 
 ```bash
-curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+curl -XPOST http://localhost:8080/streams/news -d '{
   "inputs":   [{ "url": "https://upstream/playlist.m3u8", "priority": 0 }],
   "protocols": { "hls": true }
 }'

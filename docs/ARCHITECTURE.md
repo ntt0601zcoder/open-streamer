@@ -627,21 +627,20 @@ longer the place HTTP latency lives.
 `chi/v5` router. Routes by resource:
 
 ```
-/api/v1/streams/{code}                 — CRUD + start/stop/restart
-/api/v1/streams/{code}/inputs/switch   — manual failover
-/api/v1/recordings/{rid}               — DVR
-/api/v1/recordings/{rid}/playlist.m3u8 — VOD
-/api/v1/recordings/{rid}/timeshift.m3u8— time-window VOD
-/api/v1/hooks/{id}                     — webhook CRUD
-/api/v1/hooks/{id}/test                — synthetic event delivery
-/api/v1/config                         — GlobalConfig get/post
-/api/v1/config/defaults                — implicit values for UI
-/api/v1/config/transcoder/probe        — transcoder capability check
-/api/v1/config/yaml                    — full system state YAML editor
-/api/v1/vod                            — on-disk VOD browse
-/api/v1/watermarks                     — watermark asset library (upload / list / get / raw / delete)
-/api/v1/sessions                       — play session list + kick
-/api/v1/streams/{code}/sessions        — sessions scoped to one stream
+/streams/{code}                 — CRUD + start/stop/restart
+/streams/{code}/inputs/switch   — manual failover
+/{code}/index.m3u8?from=…       — DVR timeshift from the CMAF archive (from / delay / dur / ago)
+/{code}/recording_status.json   — DVR status, range, size and gaps
+/hooks/{id}                     — webhook CRUD
+/hooks/{id}/test                — synthetic event delivery
+/config                         — GlobalConfig get/post
+/config/defaults                — implicit values for UI
+/config/transcoder/probe        — transcoder capability check
+/config/yaml                    — full system state YAML editor
+/vod                            — on-disk VOD browse
+/watermarks                     — watermark asset library (upload / list / get / raw / delete)
+/sessions                       — play session list + kick
+/streams/{code}/sessions        — sessions scoped to one stream
 /healthz, /readyz, /metrics, /swagger  — ops
 /{code}/index.m3u8, /{code}/index.mpd  — static delivery (wrapped with sessions middleware when tracker enabled)
 ```
