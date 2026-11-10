@@ -19,6 +19,16 @@ const (
 	RuleRASL        = "no-rasl-after-start" // No RASL frame right after an epoch's first keyframe.
 	RuleStartOffset = "track-start-offset"  // Per epoch: each track's first PTS vs the earliest first PTS.
 	RuleOverlap     = "epoch-no-overlap"    // An epoch's smallest PTS is above the previous epoch's largest.
+
+	// RuleAudioKey: every audio frame has Key true and RASL false.
+	RuleAudioKey = "audio-key-not-rasl"
+	// RuleParamSets: video Data holds no VPS, SPS, PPS or AUD NAL unit (by
+	// the Config codec); parameter sets live only in the Config.
+	RuleParamSets = "no-param-sets-in-data"
+	// RuleConfigChange: a track's Config pointer changes only at that
+	// track's first frame of a new epoch. Raw demuxer output has no epochs,
+	// so checks on it skip this rule.
+	RuleConfigChange = "config-change-at-epoch"
 )
 
 // defaultMaxStartOffset is 40 ms in 90 kHz ticks.
@@ -44,9 +54,10 @@ type FrameOptions struct {
 }
 
 type trackState struct {
-	seen      bool
-	lastDTS   int64
-	lastEpoch uint32
+	seen       bool
+	lastDTS    int64
+	lastEpoch  uint32
+	lastConfig *media.TrackConfig
 }
 
 type trackEpoch struct {
@@ -64,6 +75,28 @@ type epochRange struct {
 	minPTS, maxPTS int64
 	firstIndex     int
 	firstTrack     int
+}
+
+// paramSetIn returns the type of the first VPS, SPS, PPS or AUD NAL unit in
+// the data of f, a video frame.
+func paramSetIn(f media.Frame) (uint8, bool) {
+	for _, n := range f.Data {
+		if len(n) == 0 {
+			continue
+		}
+		switch f.Config.Codec {
+		case media.CodecH264:
+			if typ := n[0] & 0x1f; typ >= 7 && typ <= 9 { // SPS, PPS, AUD
+				return typ, true
+			}
+		case media.CodecH265:
+			if typ := (n[0] >> 1) & 0x3f; typ >= 32 && typ <= 35 { // VPS, SPS, PPS, AUD
+				return typ, true
+			}
+		case media.CodecAAC:
+		}
+	}
+	return 0, false
 }
 
 // CheckFrames returns every rule violation found in frames, in input order.
@@ -104,8 +137,22 @@ func CheckFrames(frames []media.Frame, opt FrameOptions) []Violation {
 			if f.Epoch < ts.lastEpoch && on(RuleEpochOrder) {
 				add(RuleEpochOrder, f, i, "epoch %d is below previous epoch %d", f.Epoch, ts.lastEpoch)
 			}
+			if f.Config != ts.lastConfig && f.Epoch == ts.lastEpoch && on(RuleConfigChange) {
+				add(RuleConfigChange, f, i, "config pointer changed within epoch %d", f.Epoch)
+			}
 		}
-		ts.seen, ts.lastDTS, ts.lastEpoch = true, f.DTS, f.Epoch
+		ts.seen, ts.lastDTS, ts.lastEpoch, ts.lastConfig = true, f.DTS, f.Epoch, f.Config
+
+		switch kind {
+		case media.KindAudio:
+			if (!f.Key || f.RASL) && on(RuleAudioKey) {
+				add(RuleAudioKey, f, i, "audio frame has Key %v and RASL %v", f.Key, f.RASL)
+			}
+		case media.KindVideo:
+			if typ, ok := paramSetIn(f); ok && on(RuleParamSets) {
+				add(RuleParamSets, f, i, "%s data holds NAL unit type %d", f.Config.Codec, typ)
+			}
+		}
 
 		if f.PTS < f.DTS && on(RulePTS) {
 			add(RulePTS, f, i, "PTS %d is below DTS %d", f.PTS, f.DTS)
