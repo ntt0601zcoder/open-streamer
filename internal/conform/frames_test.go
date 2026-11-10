@@ -127,3 +127,69 @@ func TestCheckFramesSkip(t *testing.T) {
 	opt := FrameOptions{Skip: []string{RuleStartOffset}}
 	assert.Nil(t, CheckFrames(startOffsetFrames(10801), opt))
 }
+
+func TestCheckFramesAudioKey(t *testing.T) {
+	notKey := af(1, 7200)
+	notKey.Key = false
+	requireOne(t, CheckFrames([]media.Frame{vf(1, 0, 7200, true), notKey}, FrameOptions{}), RuleAudioKey, 1, 1)
+
+	raslAudio := af(1, 7200)
+	raslAudio.RASL = true
+	requireOne(t, CheckFrames([]media.Frame{vf(1, 0, 7200, true), raslAudio}, FrameOptions{}), RuleAudioKey, 1, 1)
+}
+
+func TestCheckFramesParamSetsInData(t *testing.T) {
+	h265 := &media.TrackConfig{Codec: media.CodecH265}
+	slice264 := []byte{0x65, 0x88}
+	slice265 := []byte{0x26, 0x01, 0xaf} // IDR_W_RADL
+	for _, tc := range []struct {
+		name  string
+		cfg   *media.TrackConfig
+		slice []byte
+		bad   []byte
+	}{
+		{"h264 sps", vcfg, slice264, []byte{0x67, 0x4d}},
+		{"h264 pps", vcfg, slice264, []byte{0x68, 0xee}},
+		{"h264 aud", vcfg, slice264, []byte{0x09, 0xf0}},
+		{"h265 vps", h265, slice265, []byte{0x40, 0x01, 0x0c}},
+		{"h265 sps", h265, slice265, []byte{0x42, 0x01, 0x01}},
+		{"h265 pps", h265, slice265, []byte{0x44, 0x01, 0xc1}},
+		{"h265 aud", h265, slice265, []byte{0x46, 0x01, 0x50}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clean := vf(1, 0, 0, true)
+			clean.Config, clean.Data = tc.cfg, [][]byte{tc.slice}
+			dirty := vf(1, 3600, 3600, false)
+			dirty.Config, dirty.Data = tc.cfg, [][]byte{tc.bad, tc.slice, tc.bad}
+			requireOne(t, CheckFrames([]media.Frame{clean, dirty}, FrameOptions{}), RuleParamSets, 0, 1)
+		})
+	}
+
+	// Audio data is not parsed as NAL units.
+	a := af(1, 0)
+	a.Data = [][]byte{{0x67, 0x68, 0x09}}
+	assert.Nil(t, CheckFrames([]media.Frame{a}, FrameOptions{}))
+}
+
+func TestCheckFramesConfigChange(t *testing.T) {
+	other := &media.TrackConfig{Codec: media.CodecH264}
+	changed := func(f media.Frame) media.Frame {
+		f.Config = other
+		return f
+	}
+
+	t.Run("mid-epoch", func(t *testing.T) {
+		frames := []media.Frame{vf(1, 0, 0, true), changed(vf(1, 3600, 3600, true))}
+		requireOne(t, CheckFrames(frames, FrameOptions{}), RuleConfigChange, 0, 1)
+	})
+
+	t.Run("at an epoch start", func(t *testing.T) {
+		frames := []media.Frame{vf(1, 0, 0, true), changed(vf(2, 3600, 3600, true)), changed(vf(2, 7200, 7200, false))}
+		assert.Nil(t, CheckFrames(frames, FrameOptions{}))
+	})
+
+	t.Run("skipped", func(t *testing.T) {
+		frames := []media.Frame{vf(0, 0, 0, true), changed(vf(0, 3600, 3600, true))}
+		assert.Nil(t, CheckFrames(frames, FrameOptions{Skip: []string{RuleConfigChange}}))
+	})
+}
