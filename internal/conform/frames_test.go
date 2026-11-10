@@ -84,6 +84,31 @@ func TestCheckFramesRASLAfterStart(t *testing.T) {
 	requireOne(t, CheckFrames(frames, FrameOptions{}), RuleRASL, 0, 1)
 }
 
+func rasl(dts int64) media.Frame {
+	f := vf(1, dts, dts, false)
+	f.RASL = true
+	return f
+}
+
+func TestCheckFramesRASLRun(t *testing.T) {
+	vs := CheckFrames([]media.Frame{vf(1, 0, 0, true), rasl(1), rasl(2), rasl(3)}, FrameOptions{})
+	require.Len(t, vs, 3)
+	for n, v := range vs {
+		assert.Equal(t, RuleRASL, v.Rule)
+		assert.Equal(t, n+1, v.Index)
+	}
+}
+
+func TestCheckFramesRASLAfterNonRASL(t *testing.T) {
+	frames := []media.Frame{vf(1, 0, 0, true), vf(1, 1, 1, false), rasl(2)}
+	requireOne(t, CheckFrames(frames, FrameOptions{}), RuleRASL, 0, 2)
+}
+
+func TestCheckFramesRASLAfterLaterKey(t *testing.T) {
+	frames := []media.Frame{vf(1, 0, 0, true), vf(1, 1, 1, true), rasl(2)}
+	assert.Nil(t, CheckFrames(frames, FrameOptions{}))
+}
+
 func startOffsetFrames(audioPTS int64) []media.Frame {
 	return []media.Frame{vf(1, 0, 7200, true), af(1, audioPTS)}
 }

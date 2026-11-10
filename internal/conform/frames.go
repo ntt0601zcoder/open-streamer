@@ -55,8 +55,7 @@ type trackEpoch struct {
 }
 
 type trackEpochState struct {
-	frames   int // Frames seen so far for this track in this epoch.
-	firstKey bool
+	inStart  bool // Between the epoch's first video keyframe and the next keyframe.
 	firstPTS int64
 	index    int
 }
@@ -115,16 +114,20 @@ func CheckFrames(frames []media.Frame, opt FrameOptions) []Violation {
 		key := trackEpoch{f.Track, f.Epoch}
 		st := te[key]
 		if st == nil {
-			st = &trackEpochState{firstKey: f.Key, firstPTS: f.PTS, index: i}
+			st = &trackEpochState{inStart: kind == media.KindVideo && f.Key, firstPTS: f.PTS, index: i}
 			te[key] = st
 			teOrder = append(teOrder, key)
 			if kind == media.KindVideo && !f.Key && on(RuleEpochKey) {
 				add(RuleEpochKey, f, i, "first video frame of epoch %d is not a keyframe", f.Epoch)
 			}
-		} else if st.frames == 1 && kind == media.KindVideo && st.firstKey && f.RASL && on(RuleRASL) {
-			add(RuleRASL, f, i, "RASL frame directly after epoch %d start keyframe", f.Epoch)
+		} else if kind == media.KindVideo {
+			switch {
+			case f.Key:
+				st.inStart = false
+			case f.RASL && st.inStart && on(RuleRASL):
+				add(RuleRASL, f, i, "RASL frame after epoch %d start keyframe", f.Epoch)
+			}
 		}
-		st.frames++
 
 		r := ranges[f.Epoch]
 		if r == nil {
