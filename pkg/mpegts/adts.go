@@ -2,6 +2,7 @@ package mpegts
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 
 	"github.com/Eyevinn/mp4ff/aac"
@@ -20,7 +21,8 @@ type ADTS struct {
 	ChannelConfig uint8
 	// SampleRate is the sampling frequency in Hz.
 	SampleRate int
-	// Payload is the raw AAC data without the ADTS header.
+	// Payload is the raw AAC data without the ADTS header. It aliases the
+	// input buffer passed to ParseADTS; its capacity is limited to its length.
 	Payload []byte
 }
 
@@ -40,8 +42,11 @@ func ParseADTS(buf []byte) ([]ADTS, error) {
 		if hdr.SamplingFrequencyIndex >= 13 {
 			return frames, fmt.Errorf("mpegts: adts: invalid sampling frequency index %d", hdr.SamplingFrequencyIndex)
 		}
+		if hdr.ChannelConfig == 0 {
+			return frames, errors.New("mpegts: adts: channel configuration 0 (PCE) is not supported")
+		}
 		if hdr.PayloadLength > maxADTSPayload {
-			return frames, fmt.Errorf("mpegts: adts: invalid frame length")
+			return frames, fmt.Errorf("mpegts: adts: invalid frame length (payload length %d)", hdr.PayloadLength)
 		}
 		hl, pl := int(hdr.HeaderLength), int(hdr.PayloadLength)
 		if len(buf) < hl+pl {
@@ -52,7 +57,7 @@ func ParseADTS(buf []byte) ([]ADTS, error) {
 			SampleRateIndex: hdr.SamplingFrequencyIndex,
 			ChannelConfig:   hdr.ChannelConfig,
 			SampleRate:      int(hdr.Frequency()),
-			Payload:         buf[hl : hl+pl],
+			Payload:         buf[hl : hl+pl : hl+pl],
 		})
 		buf = buf[hl+pl:]
 	}
