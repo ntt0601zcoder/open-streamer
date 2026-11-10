@@ -81,7 +81,7 @@ func TestHubDeliversInOrder(t *testing.T) {
 	h := New(Options{})
 	a := h.Subscribe("a", 0)
 	b := h.Subscribe("b", 0)
-	var want []media.Frame
+	want := make([]media.Frame, 0, 60)
 	var dts int64
 	for i := range 30 {
 		f := vid(0, dts, i%10 == 0)
