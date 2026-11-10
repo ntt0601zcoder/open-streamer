@@ -95,10 +95,15 @@ timestamps that are already unwrapped (33-bit TS PTS, 32-bit RTMP, RTP).
   neither decode nor presentation time overlaps across epochs.
 - **A jump** opens a new epoch. Jumps are judged against a stream-wide source
   high-water mark, not per track: one track going quiet while others continue
-  is a gap, not a jump. A small backwards step on one track drops that frame
-  and counts it.
+  is a gap, not a jump. A frame that continues its own track's timeline in the
+  current epoch is never a jump, so a constant skew between tracks (above the
+  2 s backward-jump limit) stays in one epoch; a real loop or jump breaks the
+  track's own continuity too. A small backwards step on one track drops that
+  frame and counts it.
 - **A configuration change** (new `TrackConfig` pointer) opens a new epoch, so
-  outputs get one signal for "new init segment or discontinuity".
+  outputs get one signal for "new init segment or discontinuity". When several
+  tracks change together (failover, PMT change), it is one epoch change and the
+  new input's first GOP is kept.
 - Each epoch records a wallclock anchor: the arrival time of its first frame.
   DASH and DVR use it to map stream time to wallclock, never letting a period
   start before the previous one ends, which matters for bursty sources such as
@@ -112,7 +117,8 @@ One per (stream, rendition). Writes never block.
   skip mode: each video track resumes at its own next keyframe, and audio
   resumes once every live video track has (any frame for audio-only
   streams), so it always resumes on whole GOPs.
-  RASL frames after a resume CRA are dropped too.
+  RASL frames after a resume CRA are dropped too, up to its first trailing
+  picture.
 - Each delivery carries `Lost`, the number of frames skipped before it. Outputs
   treat `Lost > 0` like an epoch change.
 - The hub keeps the current GOP. A new subscriber starts with it, so it starts
@@ -138,6 +144,10 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 - DASH maps stream time to wallclock through the epoch anchors, with one fixed
   `availabilityStartTime` for the life of the stream. A period starts at
   `max(anchor, previous period end)`.
+- **Epoch anchors reach outputs through the hub** (M3 design note): the
+  Clock's `Epoch` (ID, Start, Wall) is registered on the stream's hub before
+  that epoch's first frame is written, and outputs look anchors up by epoch
+  ID. DASH uses them as above.
 
 ### 3.5 Transcoder
 
@@ -149,7 +159,9 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 - Output PTS are the input frame's PTS, carried through the encoder. Output
   DTS come from the encoder (which reorders when B-frames are on) and are
   checked against the same conformance rules. Epochs pass through unchanged.
-- A respawn opens a new epoch on every rendition hub.
+- A respawn opens a new epoch on every rendition hub. Rendition epoch numbers
+  must never collide (M4): for example, a respawn epoch is the largest epoch
+  seen + 1, and later upstream epochs are remapped above it.
 
 ### 3.6 Control plane
 
@@ -237,7 +249,7 @@ before the code they check.
 | | Milestone | Depends on | Exit criteria |
 |---|---|---|---|
 | M1 | Media core: Frame, TS demuxer, Clock, hub, frame checks, fixtures | – | Every fixture goes demux → Clock → hub with no check violation, including the PTS-wrap and looped-source fixtures |
-| M2 | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change restarts the demuxer as one epoch change |
+| M2 | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change restarts the demuxer as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
 | M3 | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg, VLC-class clients and MediaMTX play every output; for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it |
 | M4 | Transcoder, watermark, thumbnails | M1, M3 | In CI (no GPU, builder image restored): a 3-rung software ladder and passthrough pass M3's scenarios. On the GPU host: the same with 3 NVENC rungs, run by a make target and recorded in the PR; a killed subprocess comes back as one new epoch; the watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
@@ -250,6 +262,22 @@ outputs that need no other protocol library of ours (segmenter, HLS, DASH,
 HTTP-TS, SRT). M2's HLS pull input comes after `pkg/hls`. M3's RTMP and RTSP
 outputs follow M2's `pkg/rtmp` and `pkg/rtsp`.
 
+### Carried from M1
+
+- **M2, H.264 open GOP:** an I-slice carrying a recovery point SEI is `Key`,
+  and the frames after it presented before it (PTS below its PTS) are marked
+  RASL-equivalent. Until then the M1 demuxer cannot start video on such
+  broadcast feeds.
+- **M2, readers:** pass `Kinds` to the Clock, and keep `Config` pointers
+  stable across repeated identical sequence headers.
+- **M2, tests:** failover tests assert both the epoch count and the frames
+  lost; frames lost to go-astits continuity-counter discontinuities are
+  counted; the one-PES-per-access-unit and PES-without-PTS assumptions get a
+  broadcast-style test.
+- **M2, Clock:** a track that joins an epoch after its `AlignWindow` release
+  can start later than the track-start offset allows; M2 closes this gap.
+- **M4, transcoder:** rendition epoch numbers never collide (§3.5).
+
 ### Conformance checks
 
 Written in M1 (frame level) and M3 (container level), used in every later
@@ -259,6 +287,8 @@ milestone and by `osconform`:
 - The first frame of each epoch per video track is a keyframe.
 - Track start offset within an epoch, measured on first PTS, under 40 ms *(initial)*.
 - No RASL frame directly after the first keyframe of an epoch. (After a hub gap the same rule is checked by the hub's own tests, because frame checks cannot see `Lost`.)
+- Audio frames are keyframes and never RASL; video data carries no VPS, SPS,
+  PPS or AUD; a track's `Config` changes only at its first frame of an epoch.
 - Every segment starts on a keyframe; EXTINF and MPD durations match media
   duration within one frame.
 - Codec strings match the content.

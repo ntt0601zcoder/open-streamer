@@ -236,6 +236,9 @@ const (
     RuleRASL        = "no-rasl-after-start" // no RASL frame right after an epoch's first keyframe
     RuleStartOffset = "track-start-offset"  // per epoch: each track's first PTS vs the earliest first PTS
     RuleOverlap     = "epoch-no-overlap"    // an epoch's smallest PTS is above the previous epoch's largest PTS
+    RuleAudioKey     = "audio-key-not-rasl"     // audio frames have Key true and RASL false
+    RuleParamSets    = "no-param-sets-in-data"  // video Data has no VPS, SPS, PPS or AUD NAL unit (by codec)
+    RuleConfigChange = "config-change-at-epoch" // a track's Config pointer changes only at its first frame of a new epoch
 )
 type Violation struct { Rule string; Track, Index int; Detail string }
 func (v Violation) String() string
@@ -253,6 +256,7 @@ func CheckFrames(frames []media.Frame, opt FrameOptions) []Violation
   - `TestCheckFramesStartOffset`: video first PTS 7200 with first DTS 0. Audio first PTS 10801 is reported; audio first PTS 10800 is not.
   - `TestCheckFramesEpochOverlap`: epoch 2's smallest PTS equal to epoch 1's largest PTS is reported.
   - `TestCheckFramesSkip`: the `TestCheckFramesStartOffset` sequence with `Skip: []string{RuleStartOffset}` returns `nil`.
+  - `TestCheckFramesAudioKey`, `TestCheckFramesParamSetsInData` (each parameter-set and AUD type of both codecs), `TestCheckFramesConfigChange` (a change mid-epoch is reported, one at an epoch start is not). Raw demuxer output has `Epoch` 0, so the Task 6 tests skip `RuleConfigChange`.
 
 - [ ] **Step 2: Run them to see them fail.** `go test ./internal/conform/`: FAIL.
 
@@ -349,7 +353,7 @@ Behaviour the tests pin:
 - **Timestamps.** One `mpegts.TimeDecoder` is shared by all tracks for PTS and DTS, fed the 90 kHz `Base` of go-astits' clock references. Its output is 0 for the first value fed and never wraps. Later values, including the first frames' DTS, can be negative. `Epoch` is 0.
 - **PES without DTS.** This is legal and means `DTS = PTS`.
 - **Access units.** PES payloads are split into NAL units with mp4ff `avc.ExtractNalusFromByteStream`; the split is the same for H.265.
-- **Parameter sets.** VPS, SPS, PPS and AUD are removed from `Data` and feed `Config`, keyed by `ParamSetID`. A new `*TrackConfig` is made only when a set with new bytes arrives. Frames before the first complete set (SPS and PPS, plus VPS for H.265) are dropped and counted.
+- **Parameter sets.** VPS, SPS, PPS and AUD are removed from `Data` and feed `Config`, keyed by `ParamSetID`. A new `*TrackConfig` is made only when a set with new bytes arrives, and a config rebuilt equal to the last valid one (after a bad set invalidated it) reuses that pointer. Frames before the first complete set (SPS and PPS, plus VPS for H.265) are dropped and counted.
 - **Keyframes.** `Key` is true when the access unit holds an H.264 IDR slice (type 5), or an H.265 BLA, IDR or CRA slice (types 16 to 21). `RASL` is true for H.265 types 8 and 9.
 - **AAC.** Frames come from `mpegts.ParseADTS`. When it returns frames together with an error, the frames are kept and `DecodeErrors` is incremented. The config comes from the ADTS header and is rebuilt only when it changes. Frame *i* of a PES gets `PTS = DTS = pesPTS + SampleTime(i*1024, sampleRate)`.
 
@@ -423,15 +427,15 @@ func (c *Clock) Stats() Stats
 Algorithm. The tests pin each rule.
 
 1. **Numbering.** Epochs number from 1. Epoch 1 starts at stream time 0 and is pending from the first frame.
-2. **Jumps.** `hw` is the largest source DTS accepted in the current epoch, across all tracks. A frame opens a pending epoch when `DTS > hw + MaxForward` or `DTS < hw − MaxBackJump`, unless rule 3 classifies it as old. Tracks interleaved up to `MaxBackJump` behind `hw` are normal, and one track's own gap never opens an epoch while `hw` keeps advancing.
+2. **Jumps.** `hw` is the largest source DTS accepted in the current epoch, across all tracks. A frame opens a pending epoch when `DTS > hw + MaxForward` or `DTS < hw − MaxBackJump`, unless rule 3 classifies it as old. Tracks interleaved up to `MaxBackJump` behind `hw` are normal, and one track's own gap never opens an epoch while `hw` keeps advancing. In the released epoch, a frame that continues its own track's timeline (rule 3's old test against that track's `lastSourceDTS` in the epoch) is never a jump, so a constant skew between tracks above `MaxBackJump` stays in one epoch; a loop or jump breaks the track's own continuity too and still opens one.
 3. **Old or new timeline.** Only when a released epoch exists (never for epoch 1): while a new epoch is pending after a jump or break, a frame of a track that has not joined it is *old* if `−MaxBackStep < DTS − lastSourceDTS(track) ≤ MaxForward`; otherwise it joins the pending epoch.
    - Before release, old frames are mapped with the old epoch and emitted at once.
    - After release, old frames are dropped (`DroppedStale`).
    - A frame of a not-yet-joined track that fails the old test after release joins the released epoch and is mapped by rule 7.
 4. **Steps back.** `lastSourceDTS(track)` is the track's previous frame in the same epoch, pending or released. A frame that is not a jump, whose `DTS − lastSourceDTS(track) ≤ 0`, is dropped (`DroppedBackStep`). The frame with which a track joins a new epoch is exempt.
-5. **Gating.** In every epoch, each video track is gated until it has passed its first keyframe and any RASL frames directly after it, whether its frames arrive before or after release. Gates run before rule 7, so a frame that passes them with source DTS below `base` is `DroppedLate`.
+5. **Gating.** In every epoch, each video track is gated until it has passed its first keyframe and that keyframe's leading pictures, whether its frames arrive before or after release. Gates run before rule 7, so a frame that passes them with source DTS below `base` is `DroppedLate`.
    - Video frames of a track are dropped until that track's first keyframe (`DroppedBeforeKey`).
-   - RASL frames that directly follow that keyframe are dropped (`DroppedRASL`).
+   - After that keyframe, RASL frames are dropped (`DroppedRASL`) until the track's first trailing picture: a non-RASL frame whose PTS is above the keyframe's. Leading pictures (RASL and RADL) are presented before their keyframe, so a RADL is kept and does not end the gate.
    - `keyPTS` is the smallest first-keyframe PTS among the video tracks that have one. Until the epoch's first audio frame is emitted, any audio frame whose PTS is below `keyPTS` is dropped (`DroppedEarlyAudio`). This applies to audio arriving before release, after release, and to audio already held when a keyframe arrives later. While video is expected but no keyframe has arrived, audio is held.
 6. **Release.** A pending epoch is released when the first of these happens:
    - each expected track has a held (gated) frame;
@@ -445,8 +449,8 @@ Algorithm. The tests pin each rule.
    - The held frames are released in arrival order.
 7. **Mapping.** Inside an epoch, `stream = source − base + Start` for PTS and DTS. A frame whose source DTS is below `base` after release is dropped (`DroppedLate`).
 8. **Forced breaks.**
-   - `Break()` opens a pending epoch that every track joins with its next frame. Calling it while an epoch is pending does nothing.
-   - A frame whose `Config` pointer differs from its track's previous frame does the same as `Break()`, and that frame is the first frame of the new epoch. If an epoch is already pending, it is restarted with this frame as its first frame, and the frames held so far are dropped (`DroppedStale`).
+   - `Break()` opens a pending epoch that every track joins with its next frame. Calling it while an epoch is pending restarts that epoch: the frames it holds came from before the break and are dropped (`DroppedStale`).
+   - A frame whose `Config` pointer differs from its track's previous frame opens a pending epoch like `Break()` when none is pending, and is its track's first frame in it. If an epoch is already pending, the frame joins it. The epoch is restarted first (frames held so far dropped, `DroppedStale`) only when that track has frames held under its old config, or the frame is a jump against the held frames. So a failover or PMT change that gives every track a new pointer is one epoch change and keeps the new input's first GOP.
    - A jump while an epoch is pending is measured against the pending epoch's own held frames: `DTS > maxHeldDTS + MaxForward` or `DTS < minHeldDTS − MaxBackJump`. It restarts the pending epoch, and frames already held are dropped (`DroppedStale`). A restart keeps the set of tracks that joined and each track's `lastSourceDTS`. A frame of a joined track that is a jump against the held frames only because it lags (it passes rule 3's old test against its own `lastSourceDTS`) is dropped as `DroppedStale` and does not restart anything.
 
 - [ ] **Step 1: Write the failing tests.**
@@ -459,13 +463,15 @@ Algorithm. The tests pin each rule.
   - `TestClockForwardJump`: a 4 s forward gap on all tracks stays in the epoch with a 360000-tick gap; a 6 s gap opens epoch 2.
   - `TestClockSingleTrackGap`: video pauses 8 s while audio continues, then video resumes. There is no new epoch, every frame is delivered, and the video stream gap is 8 s.
   - `TestClockSmallBackStep`: a 1000-tick step back on one track is dropped, `DroppedBackStep == 1`, and the epoch is unchanged.
-  - `TestClockBreak`: after `Break()`, continuous source frames are in epoch 2. A second `Break()` before release changes nothing.
+  - `TestClockBreak`: after `Break()`, continuous source frames are in epoch 2. A second `Break()` before release restarts epoch 2 and drops the held frame.
+  - `TestClockFailoverNewConfigs`: `Break()`, then a new input with new `Config` pointers on every track, video first or audio first: one epoch change, nothing dropped, the new input's first GOP delivered whole. Frames of the dead input held before a second `Break()` are dropped. `TestClockAllTracksNewConfigs`: the same without `Break()` on a continuous timeline.
+  - `TestClockConstantSkew`: audio 2.5 s ahead of video in source time for 120 s gives one epoch and no drops.
   - `TestClockConfigChangeOpensEpoch`: a new `Config` pointer on video with continuous timestamps puts that frame and all later frames in epoch 2. A second Config change on the same track while epoch 2 is pending restarts it.
   - `TestClockStaleDropped`: audio frames still on the old timeline after epoch 2's release are dropped and counted.
   - `TestClockLateTrackDropped`: with `Kinds: [video, video]`, track 0 releases by `AlignWindow`. Track 1's first keyframe then arrives with source DTS below `base`, and is dropped as `DroppedLate`.
   - `TestClockDropsUntilKey`: three non-key video frames before the first keyframe are dropped, `DroppedBeforeKey == 3`, and the first released video frame is `Key`.
   - `TestClockMidGOPStart`: audio arrives before the first video keyframe, and more audio arrives after release with PTS between the keyframe's DTS and its PTS (keyframe DTS 0, PTS 7200). All of that audio is dropped (`DroppedEarlyAudio > 0`). In the output, the first audio PTS minus the first video PTS is between 0 and one audio frame (1920 ticks).
-  - `TestClockDropsRASLAtEpochStart`: with `Kinds: [video, audio]`, a CRA followed by two RASL frames and then a normal frame at an epoch start releases the CRA and the normal frame, with `DroppedRASL == 2`. The same with `Kinds: [video]`, where the CRA alone releases the epoch, also gives `DroppedRASL == 2`.
+  - `TestClockDropsRASLAtEpochStart`: with `Kinds: [video, audio]`, a CRA followed by two RASL frames and then a normal frame at an epoch start releases the CRA and the normal frame, with `DroppedRASL == 2`. The same with `Kinds: [video]`, where the CRA alone releases the epoch, also gives `DroppedRASL == 2`. A CRA, RADL, RASL, trailing sequence keeps the RADL and the trailing picture and drops the RASL, held or released.
   - `TestClockEpochStartAfterPresentationEnd`: a video-only epoch 1 in decode order I (DTS 0, PTS 7200), P (DTS 3600, PTS 18000), B (DTS 7200, PTS 10800), B (DTS 10800, PTS 14400), then `Break()` and an epoch 2 without B-frames. Epoch 2's `Start` is 21600 (largest PTS 18000 + 3600), its first PTS is above 18000, and `conform.CheckFrames` on the output returns `nil`.
   - `TestClockJumpWhilePending`: a second jump before release, measured against the held frames, drops them (`DroppedStale`) and releases only the latest timeline. Audio still lagging on the first timeline is dropped as stale and does not restart the epoch again.
   - `TestClockWallAnchor`: with a `Now` that advances 1 s per call, `Epochs()[0].Wall` equals the time of the first frame's push.
@@ -509,13 +515,13 @@ Behaviour the tests pin:
 
 - **Sending.** `Write` sends with `select`/`default` under the hub mutex. A failed send puts that subscriber in skip mode.
 - **Resume point.** The hub tracks the set of video tracks it has seen; a track counts as ended when it has sent nothing for 10 s of stream time.
-  - In skip mode, the subscriber resumes per video track: frames of a video track are dropped until that track's next keyframe. RASL frames directly after that keyframe are dropped too.
+  - In skip mode, the subscriber resumes per video track: frames of a video track are dropped until that track's next keyframe. After it, RASL frames are dropped until the track's first trailing picture (a non-RASL frame with PTS above the keyframe's); a RADL before it is delivered.
   - Audio is dropped until every live video track has resumed. With no live video track, any frame resumes.
   - The first frame delivered after a skip carries `Lost`, equal to the frames dropped.
 - **Cache.**
   - With video, the hub caches frames from the last keyframe of the first video track, capped at `GOPCacheFrames`. An over-long GOP empties the cache until the next keyframe.
   - On audio-only streams, the cache holds the last `AudioCacheTicks` of frames.
-  - `Subscribe` replays the cache into the new queue when it fits. Replay applies the same per-track gate as a resume: the frames of any other video track are skipped until that track's own keyframe, and RASL frames right after a keyframe are skipped. After replay, any video track still gated stays gated for live writes, and audio waits for every live video track, exactly as in skip mode; frames skipped this way are not counted in `Lost`. If the cache does not fit, the new subscriber starts in skip mode.
+  - `Subscribe` replays the cache into the new queue when it fits. Replay applies the same per-track gate as a resume: the frames of any other video track are skipped until that track's own keyframe, and RASL frames after a keyframe are skipped until its first trailing picture. After replay, any video track still gated stays gated for live writes, and audio waits for every live video track, exactly as in skip mode; frames skipped this way are not counted in `Lost`. If the cache does not fit, the new subscriber starts in skip mode.
 - **Closing.** `Sub.Close` and `Hub.Close` close channels under the mutex. `Write` after `Close` does nothing.
 
 - [ ] **Step 1: Write the failing tests.**
@@ -525,6 +531,7 @@ Behaviour the tests pin:
     2. Drain the 4.
     3. Write GOP 2, reading one delivery after each write: the first is GOP 2's keyframe with `Lost == 6`, followed by its other 9 frames with `Lost == 0`.
   - `TestHubResumeDropsRASL`: a resume on a CRA followed by two RASL frames delivers the CRA and then the first non-RASL frame.
+  - `TestHubResumeLeadingPictures`: on a resume and on a late join, a CRA, RADL, RASL, trailing sequence delivers the CRA, the RADL and the trailing picture.
   - `TestHubTwoVideoTracks`: in skip mode, track 1's frames are delivered only after track 1's own keyframe, even when track 0 has already resumed. A late joiner whose replayed cache starts on track 0's keyframe gets no track 1 frame before track 1's keyframe.
   - `TestHubVideoTrackEnds`: when video stops for more than 10 s of stream time and audio continues, a skipping subscriber resumes on audio.
   - `TestHubWriteNeverBlocks`: with a subscriber that never reads, 100,000 writes return within the test timeout.
@@ -552,7 +559,7 @@ Behaviour the tests pin:
 - Consumes: `ts.NewDemuxer`, `clock.New`, `hub.New`, `conform.CheckFrames`, the fixtures.
 
 - [ ] **Step 1: Write the tests.** A helper runs a fixture through demux, a Clock with `Kinds: d.TrackKinds()`, and a hub with one subscriber whose queue holds the whole clip. It calls `Flush` at EOF and returns the delivered frames.
-  - `TestM1Fixtures`: `CheckFrames` returns `nil` on each of these fixtures:
+  - `TestM1Fixtures`: `CheckFrames` returns `nil`, and each track delivers an exact number of frames in each epoch, on each of these fixtures:
     - `h264_aac.ts`
     - `h265_aac51.ts`
     - `h264_aacmono_wrap.ts`
