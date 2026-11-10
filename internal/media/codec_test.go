@@ -15,7 +15,13 @@ func TestCodecKind(t *testing.T) {
 	assert.Equal(t, "aac", CodecAAC.String())
 }
 
+func TestUnknownCodec(t *testing.T) {
+	assert.Equal(t, Kind(0), Codec(0).Kind())
+	assert.Equal(t, "unknown", Codec(0).String())
+}
+
 func TestFrameKind(t *testing.T) {
 	assert.Equal(t, KindVideo, Frame{Config: &TrackConfig{Codec: CodecH264}}.Kind())
 	assert.Equal(t, KindAudio, Frame{Config: &TrackConfig{Codec: CodecAAC}}.Kind())
+	assert.Equal(t, Kind(0), Frame{}.Kind())
 }
