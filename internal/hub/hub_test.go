@@ -147,7 +147,7 @@ func TestHubResumeDropsRASL(t *testing.T) {
 	h.Write(hevc(6*vDur, false, false))
 	d = recv(t, s)
 	assert.Equal(t, int64(6*vDur), d.Frame.DTS)
-	assert.Equal(t, uint64(2), d.Lost, "the dropped RASL frames are lost frames")
+	assert.Zero(t, d.Lost, "the gap was signalled on the CRA, not mid-GOP")
 
 	// Once resumed, RASL frames after a CRA are decodable and delivered.
 	h.Write(hevc(7*vDur, true, false))
@@ -197,7 +197,7 @@ func TestHubTwoVideoTracks(t *testing.T) {
 		h.Write(vid(0, 3*vDur, false))
 		d = recv(t, s)
 		assert.Equal(t, 0, d.Frame.Track)
-		assert.Equal(t, uint64(2), d.Lost)
+		assert.Zero(t, d.Lost, "the gap was signalled on track 0's keyframe")
 
 		h.Write(vid(1, 3*vDur, true)) // track 1 resumes
 		d = recv(t, s)
@@ -245,6 +245,93 @@ func TestHubTwoVideoTracks(t *testing.T) {
 		assert.Equal(t, 2, got[1].Frame.Track)
 		assert.Zero(t, got[0].Lost+got[1].Lost)
 	})
+}
+
+func TestHubLostOnlyOnResumeCRA(t *testing.T) {
+	h := New(Options{})
+	s := h.Subscribe("s", 1)
+	var got []Delivery
+	write := func(f media.Frame) {
+		h.Write(f)
+		select {
+		case d := <-s.C():
+			got = append(got, d)
+		default:
+		}
+	}
+
+	h.Write(hevc(0, true, false))
+	h.Write(aud(1, 0)) // queue full: skip mode
+	recv(t, s)
+	write(hevc(vDur, false, false))  // dropped
+	write(aud(1, vDur))              // dropped
+	write(hevc(2*vDur, true, false)) // resume CRA
+	write(aud(1, 2*vDur))
+	write(hevc(3*vDur, false, true)) // RASL: dropped
+	write(aud(1, 3*vDur))
+	write(hevc(4*vDur, false, true)) // RASL: dropped
+	write(aud(1, 4*vDur))
+	write(hevc(5*vDur, false, false))
+	write(aud(1, 5*vDur))
+
+	require.Len(t, got, 6)
+	var withLost []Delivery
+	for _, d := range got {
+		if d.Lost > 0 {
+			withLost = append(withLost, d)
+		}
+	}
+	require.Len(t, withLost, 1)
+	assert.Equal(t, int64(2*vDur), withLost[0].Frame.DTS)
+	assert.True(t, withLost[0].Frame.Key)
+	assert.Equal(t, media.KindVideo, withLost[0].Frame.Kind())
+	assert.Equal(t, uint64(3), withLost[0].Lost) // the failed send and two gated frames
+	assert.Equal(t, []SubStats{{Name: "s", Delivered: 7, Dropped: 5}}, h.Stats())
+}
+
+func TestHubAllIntraGateOpens(t *testing.T) {
+	h := New(Options{})
+	s := h.Subscribe("s", 1)
+	h.Write(vid(0, 0, true))
+	h.Write(vid(0, vDur, true)) // queue full: skip mode
+	recv(t, s)
+	h.Write(vid(0, 2*vDur, true))
+	d := recv(t, s)
+	assert.Equal(t, uint64(1), d.Lost)
+	h.Write(vid(0, 3*vDur, true))
+	recv(t, s)
+	h.mu.Lock()
+	g := s.gates[0]
+	h.mu.Unlock()
+	assert.Equal(t, gateOpen, g, "a non-RASL keyframe opens the gate")
+
+	// A new video track starting on a non-key frame is gated, and so is
+	// audio, but the subscriber resumed long ago: nothing is lost.
+	h.Write(vid(1, 3*vDur, false))
+	h.Write(aud(2, 3*vDur))
+	requireEmpty(t, s)
+	h.Write(vid(1, 4*vDur, true))
+	d = recv(t, s)
+	assert.Equal(t, 1, d.Frame.Track)
+	assert.Zero(t, d.Lost)
+	h.Write(vid(0, 4*vDur, true))
+	d = recv(t, s)
+	assert.Zero(t, d.Lost)
+}
+
+func TestHubStreamTimeIsMaxDTS(t *testing.T) {
+	h := New(Options{})
+	s := h.Subscribe("s", 1)
+	h.Write(vid(1, 0, true)) // track 1 video, then silent
+	h.Write(vid(0, 0, true)) // queue full: skip mode, track 1 gated
+	recv(t, s)
+	h.Write(vid(0, 11*media.ClockRate, true)) // track 1 has ended
+	recv(t, s)
+	// A late frame with a small DTS does not pull stream time back, so
+	// track 1 stays ended and does not hold the audio back.
+	h.Write(aud(2, media.ClockRate))
+	d := recv(t, s)
+	assert.Equal(t, media.KindAudio, d.Frame.Kind())
 }
 
 func TestHubVideoTrackEnds(t *testing.T) {
