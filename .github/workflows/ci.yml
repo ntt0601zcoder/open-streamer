@@ -1,168 +1,68 @@
-# Continuous integration: build, test, lint, vulnerability scan.
-#
-# The native transcoder (internal/transcoder/native, cmd/open-streamer-transcoder)
-# is cgo against go-astiav → libav 8. FFmpeg 8 is not in any runner's apt, so
-# every job that COMPILES Go runs inside the prebuilt builder image
-# (ghcr.io/<owner>/open-streamer-builder:v1, published by builder-image.yml).
-# `go mod tidy` doesn't compile cgo, so it stays on a plain runner.
-#
-# Bootstrap note: the builder image must exist in GHCR before these jobs can
-# pull it — run the "Builder image" workflow once (it auto-runs when
-# Dockerfile.builder changes).
 name: CI
 
 on:
-  # PR-only: correctness is gated on pull requests into main/master.
-  # Pushes to main don't re-run CI (the PR already validated the commit);
-  # main is reserved for tag-triggered Release builds.
   pull_request:
-    branches: [main, master]
+    branches: [main, rebuild]
 
 permissions:
   contents: read
-  packages: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
-  mod-tidy:
-    name: go mod tidy
+  tidy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
-
-      - name: Ensure go.mod / go.sum are tidy
+      - name: go mod tidy drift check
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+
   test:
-    name: test
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/open-streamer-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-
-      # The job runs as root inside the builder container while the workspace
-      # was checked out by the runner user → git reports "dubious ownership"
-      # and `go build`'s VCS stamping dies with "error obtaining VCS status:
-      # exit status 128". Trust the workspace so stamping (and any git use)
-      # works.
-      - name: Trust workspace for git
-        run: git config --global --add safe.directory '*'
-
-      - name: Cache Go build + module cache
-        uses: actions/cache@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          path: |
-            /root/.cache/go-build
-            /root/go/pkg/mod
-          key: ${{ runner.os }}-gocgo-${{ hashFiles('go.sum') }}
-          restore-keys: ${{ runner.os }}-gocgo-
+          go-version-file: go.mod
+      - run: make test
 
-      - name: Toolchain stamp
-        run: |
-          go version
-          pkg-config --modversion libavcodec libavformat libavfilter libswscale libavutil
-
-      - name: Download modules
-        run: go mod download
-
-      - name: Verify modules
-        run: go mod verify
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Build
-        run: go build -o /dev/null ./...
-
-      - name: Test
-        run: go test -race -shuffle=on -count=1 -timeout=5m -coverprofile=coverage.out -covermode=atomic ./...
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
-        with:
-          files: coverage.out
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
-
-  lint:
-    name: golangci-lint
+  coverage:
     runs-on: ubuntu-latest
-    continue-on-error: true
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/open-streamer-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-
-      # The job runs as root inside the builder container while the workspace
-      # was checked out by the runner user → git reports "dubious ownership"
-      # and `go build`'s VCS stamping dies with "error obtaining VCS status:
-      # exit status 128". Trust the workspace so stamping (and any git use)
-      # works.
-      - name: Trust workspace for git
-        run: git config --global --add safe.directory '*'
-
-      - name: Cache Go build + module cache
-        uses: actions/cache@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          path: |
-            /root/.cache/go-build
-            /root/go/pkg/mod
-          key: ${{ runner.os }}-gocgo-${{ hashFiles('go.sum') }}
-          restore-keys: ${{ runner.os }}-gocgo-
-
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
-
-      - name: golangci-lint
-        run: golangci-lint run --timeout=5m ./...
+          go-version-file: go.mod
+      - run: make cover covercheck
 
   govulncheck:
-    name: govulncheck
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/open-streamer-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-
-      # The job runs as root inside the builder container while the workspace
-      # was checked out by the runner user → git reports "dubious ownership"
-      # and `go build`'s VCS stamping dies with "error obtaining VCS status:
-      # exit status 128". Trust the workspace so stamping (and any git use)
-      # works.
-      - name: Trust workspace for git
-        run: git config --global --add safe.directory '*'
-
-      - name: Cache Go build + module cache
-        uses: actions/cache@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          path: |
-            /root/.cache/go-build
-            /root/go/pkg/mod
-          key: ${{ runner.os }}-gocgo-${{ hashFiles('go.sum') }}
-          restore-keys: ${{ runner.os }}-gocgo-
+          go-version-file: go.mod
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
-      - name: Run govulncheck
-        run: govulncheck ./...
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.11.3
