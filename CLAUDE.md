@@ -14,7 +14,7 @@ make check        # tidy + vet + lint + test
 make cover        # writes coverage.out
 make covercheck   # enforce .testcoverage.yml (file 80, package 85, total 90)
 make fixtures     # sh testdata/fixtures/gen.sh
-make tools        # install golangci-lint v2.11.3
+make tools        # install golangci-lint v2.14.0
 ```
 
 ## v1 is reference only
