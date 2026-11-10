@@ -33,12 +33,15 @@ func audio(dts int64) media.Frame {
 	return media.Frame{Track: 1, Config: aac, PTS: dts, DTS: dts, Key: true}
 }
 
+// videoGOP is the keyframe interval of videoRun, in frames.
+const videoGOP = 25
+
 // videoRun returns n video frames from dts, with a keyframe every gop frames
 // starting at the first.
-func videoRun(from int64, n, gop int) []media.Frame {
+func videoRun(from int64, n int) []media.Frame {
 	out := make([]media.Frame, n)
 	for i := range out {
-		out[i] = video(from+int64(i)*vDur, i%gop == 0)
+		out[i] = video(from+int64(i)*vDur, i%videoGOP == 0)
 	}
 	return out
 }
@@ -81,7 +84,7 @@ func mux(lag int64, v, a []media.Frame) []media.Frame {
 }
 
 func push(c *Clock, frames ...media.Frame) []media.Frame {
-	var out []media.Frame
+	out := make([]media.Frame, 0, len(frames))
 	for _, f := range frames {
 		out = append(out, c.Push(f)...)
 	}
@@ -89,7 +92,7 @@ func push(c *Clock, frames ...media.Frame) []media.Frame {
 }
 
 func epochIDs(c *Clock) []uint32 {
-	var ids []uint32
+	ids := make([]uint32, 0, len(c.Epochs()))
 	for _, e := range c.Epochs() {
 		ids = append(ids, e.ID)
 	}
@@ -217,7 +220,7 @@ func TestClockVideoWait(t *testing.T) {
 
 func TestClockLaggingTrackNoFalseEpoch(t *testing.T) {
 	c := New(Options{Kinds: av})
-	frames := mux(72000, videoRun(0, 270, 25), audioRun(0, 469))
+	frames := mux(72000, videoRun(0, 270), audioRun(0, 469))
 	out := push(c, frames...)
 	out = append(out, c.Flush()...)
 	assert.Equal(t, []uint32{1}, epochIDs(c))
@@ -231,9 +234,9 @@ func TestClockBackwardJumpOpensEpoch(t *testing.T) {
 	const src, loop, lag = 1_000_000, 6 * media.ClockRate, 27000
 	// The same 6 s clip twice, audio muxed 0.3 s late, as a looped file.
 	var items []timed
-	items = arrive(items, 0, videoRun(src, 150, 25))
+	items = arrive(items, 0, videoRun(src, 150))
 	items = arrive(items, lag, audioRun(src, 281))
-	items = arrive(items, loop, videoRun(src, 150, 25))
+	items = arrive(items, loop, videoRun(src, 150))
 	items = arrive(items, loop+lag, audioRun(src, 281))
 	frames := arrange(items)
 
@@ -252,9 +255,9 @@ func TestClockForwardJump(t *testing.T) {
 	const total = 2 * (50 + 94)
 	run := func(gap int64) (*Clock, []media.Frame) {
 		c := New(Options{Kinds: av})
-		v := videoRun(0, 50, 25) // last DTS 176400
-		a := audioRun(0, 94)     // last DTS 178560
-		v = append(v, videoRun(176400+gap, 50, 25)...)
+		v := videoRun(0, 50) // last DTS 176400
+		a := audioRun(0, 94) // last DTS 178560
+		v = append(v, videoRun(176400+gap, 50)...)
 		a = append(a, audioRun(178560+gap, 94)...)
 		out := push(c, mux(0, v, a)...)
 		return c, append(out, c.Flush()...)
@@ -288,8 +291,8 @@ func TestClockForwardJump(t *testing.T) {
 
 func TestClockSingleTrackGap(t *testing.T) {
 	c := New(Options{Kinds: av})
-	v := videoRun(0, 50, 25) // last DTS 176400
-	v = append(v, videoRun(176400+8*media.ClockRate, 50, 25)...)
+	v := videoRun(0, 50) // last DTS 176400
+	v = append(v, videoRun(176400+8*media.ClockRate, 50)...)
 	frames := mux(0, v, audioRun(0, 562))
 	out := push(c, frames...)
 	out = append(out, c.Flush()...)
@@ -316,7 +319,7 @@ func TestClockSmallBackStep(t *testing.T) {
 
 func TestClockBreak(t *testing.T) {
 	c := New(Options{Kinds: av})
-	out := push(c, mux(0, videoRun(0, 10, 25), audioRun(0, 19))...) // to 32400 / 34560
+	out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...) // to 32400 / 34560
 	c.Break()
 	out = append(out, c.Push(video(36000, true))...)
 	c.Break() // already pending: nothing changes
@@ -338,7 +341,7 @@ func TestClockConfigChangeOpensEpoch(t *testing.T) {
 
 	t.Run("continuous timestamps", func(t *testing.T) {
 		c := New(Options{Kinds: av})
-		out := push(c, mux(0, videoRun(0, 10, 25), audioRun(0, 19))...)
+		out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...)
 		n := len(out)
 		changed := video(36000, true)
 		changed.Config = newH264()
@@ -357,7 +360,7 @@ func TestClockConfigChangeOpensEpoch(t *testing.T) {
 
 	t.Run("second change while pending restarts", func(t *testing.T) {
 		c := New(Options{Kinds: av})
-		out := push(c, mux(0, videoRun(0, 10, 25), audioRun(0, 19))...)
+		out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...)
 		first := video(36000, true)
 		first.Config = newH264()
 		second := video(39600, true)
@@ -375,9 +378,9 @@ func TestClockConfigChangeOpensEpoch(t *testing.T) {
 
 func TestClockStaleDropped(t *testing.T) {
 	c := New(Options{Kinds: av})
-	out := push(c, mux(0, videoRun(0, 251, 25), audioRun(0, 470))...) // to 900000 / 900480
+	out := push(c, mux(0, videoRun(0, 251), audioRun(0, 470))...) // to 900000 / 900480
 	// Video loops back to 0; epoch 2 releases by AlignWindow with video only.
-	out = append(out, push(c, videoRun(0, 26, 25)...)...)
+	out = append(out, push(c, videoRun(0, 26)...)...)
 	require.Equal(t, []uint32{1, 2}, epochIDs(c))
 	// Audio still on the old timeline after the release.
 	out = append(out, push(c, audio(902400), audio(904320), audio(906240))...)
@@ -397,7 +400,7 @@ func TestClockLateTrackDropped(t *testing.T) {
 	v1 := func(dts int64, key bool) media.Frame {
 		return media.Frame{Track: 1, Config: second, PTS: dts, DTS: dts, Key: key}
 	}
-	out := push(c, videoRun(100000, 25, 25)...) // to 186400
+	out := push(c, videoRun(100000, 25)...) // to 186400
 	require.Empty(t, out)
 	out = c.Push(video(190000, false)) // span from the keyframe reaches 90000
 	require.Len(t, out, 26)
@@ -511,7 +514,7 @@ func TestClockEpochStartAfterPresentationEnd(t *testing.T) {
 func TestClockJumpWhilePending(t *testing.T) {
 	const t1, t2 = 5_000_000, 9_000_000
 	c := New(Options{Kinds: av})
-	out := push(c, mux(0, videoRun(0, 50, 25), audioRun(0, 94))...) // to 176400 / 178560
+	out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...) // to 176400 / 178560
 	// First jump: audio leads onto t1 and is held; video on t1 has no keyframe yet.
 	out = append(out, push(c, audio(t1), audio(t1+1920), audio(t1+3840), video(t1, false), video(t1+3600, false))...)
 	assert.Equal(t, uint64(2), c.Stats().DroppedBeforeKey)
@@ -540,7 +543,7 @@ func TestClockJumpWhilePending(t *testing.T) {
 func TestClockRestartRejoinsBackward(t *testing.T) {
 	const t1, t2 = 5_000_000, 1_000_000
 	c := New(Options{Kinds: av})
-	out := push(c, mux(0, videoRun(0, 50, 25), audioRun(0, 94))...)
+	out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...)
 	out = append(out, push(c, audio(t1), audio(t1+1920), video(t1, false))...)
 	out = append(out, c.Push(video(t2, true))...) // jump back against the held audio
 	out = append(out, push(c, audio(t1+3840))...) // lagging on t1: stale
@@ -606,7 +609,7 @@ func TestClockConfigRestartKeepsContinuousAudio(t *testing.T) {
 
 	t.Run("after Break", func(t *testing.T) {
 		c := New(Options{Kinds: av})
-		out := push(c, mux(0, videoRun(0, 10, 25), audioRun(0, 19))...) // to 32400 / 34560
+		out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...) // to 32400 / 34560
 		c.Break()
 		out = append(out, c.Push(audio(36480))...) // joins epoch 2, held
 		changed := newH264(36000, true)            // restarts epoch 2
@@ -622,7 +625,7 @@ func TestClockConfigRestartKeepsContinuousAudio(t *testing.T) {
 	t.Run("after a jump", func(t *testing.T) {
 		const t1 = 5_000_000
 		c := New(Options{Kinds: av})
-		out := push(c, mux(0, videoRun(0, 50, 25), audioRun(0, 94))...)
+		out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...)
 		out = append(out, c.Push(audio(t1))...) // opens epoch 2, held
 		changed := newH264(t1, true)            // restarts epoch 2
 		out = append(out, c.Push(changed)...)
@@ -653,9 +656,9 @@ func TestClockRestartedTrackRejoinsAfterRelease(t *testing.T) {
 	t.Run("jump epoch", func(t *testing.T) {
 		const t1, t2 = 5_000_000, 1_000_000
 		c := New(Options{Kinds: av})
-		out := push(c, mux(0, videoRun(0, 50, 25), audioRun(0, 94))...)
+		out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...)
 		out = append(out, push(c, audio(t1), audio(t1+1920))...) // opens epoch 2, held
-		out = append(out, push(c, videoRun(t2, 26, 25)...)...)   // restarts it; video alone releases by AlignWindow
+		out = append(out, push(c, videoRun(t2, 26)...)...)       // restarts it; video alone releases by AlignWindow
 		require.Equal(t, []uint32{1, 2}, epochIDs(c))
 		out = append(out, c.Push(audio(t1+3840))...) // lagging on t1: stale
 		out = append(out, push(c, audioRun(t2+93600, 100)...)...)
@@ -669,8 +672,8 @@ func TestClockRestartedTrackRejoinsAfterRelease(t *testing.T) {
 
 	t.Run("epoch 1", func(t *testing.T) {
 		c := New(Options{Kinds: av})
-		out := push(c, audio(0), audio(1920))                         // held
-		out = append(out, push(c, videoRun(1_000_000, 26, 25)...)...) // restarts epoch 1; releases by AlignWindow
+		out := push(c, audio(0), audio(1920))                     // held
+		out = append(out, push(c, videoRun(1_000_000, 26)...)...) // restarts epoch 1; releases by AlignWindow
 		require.Equal(t, []uint32{1}, epochIDs(c))
 		out = append(out, c.Push(audio(3840))...) // lagging on the earlier timeline: stale, no new epoch
 		out = append(out, push(c, audioRun(1_093_600, 10)...)...)

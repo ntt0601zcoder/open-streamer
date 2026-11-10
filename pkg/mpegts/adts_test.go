@@ -48,8 +48,9 @@ func adtsFrame(n int) []byte {
 	h[3] = 0x80 | byte(fl>>11)
 	h[4] = byte(fl >> 3)
 	h[5] = byte(fl<<5) | 0x1F
-	out := append(h, bytes.Repeat([]byte{0xAB}, n)...)
-	return out
+	out := make([]byte, 0, len(h)+n)
+	out = append(out, h...)
+	return append(out, bytes.Repeat([]byte{0xAB}, n)...)
 }
 
 func TestParseADTS(t *testing.T) {
