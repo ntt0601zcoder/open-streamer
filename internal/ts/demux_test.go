@@ -254,8 +254,9 @@ func TestDemuxBadConfigDropsFrames(t *testing.T) {
 	assert.Len(t, d.queue, 1, "frame with unparsable SPS must not be emitted")
 	assert.Equal(t, uint64(1), d.stats.DroppedNoConfig)
 
-	// A repaired SPS restores output with a config matching the stream.
+	// A repaired SPS restores output with the same config pointer as before,
+	// so the Clock sees no configuration change.
 	d.handleVideo(tr, au(cfg.SPS[0]), 7200, 7200)
 	require.Len(t, d.queue, 2)
-	assert.True(t, good.Equal(d.queue[1].Config))
+	assert.Same(t, good, d.queue[1].Config)
 }
