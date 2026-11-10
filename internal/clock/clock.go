@@ -178,7 +178,7 @@ func (c *Clock) Push(f media.Frame) []media.Frame {
 
 	switch {
 	case changed:
-		c.configChange(f)
+		c.configChange(f, t)
 	case c.pend != nil:
 		c.pushPending(f, t)
 	default:
@@ -188,11 +188,15 @@ func (c *Clock) Push(f media.Frame) []media.Frame {
 }
 
 // Break makes the next frames open a new epoch that every track joins with
-// its next frame. It does nothing while an epoch is pending.
+// its next frame. While an epoch is pending, Break restarts it: the frames it
+// holds came from before the break and are dropped (Stats.DroppedStale).
 func (c *Clock) Break() {
 	if c.pend == nil {
 		c.openPending(false)
+		return
 	}
+	c.restart()
+	c.pend.jump = false
 }
 
 // Flush releases the frames held by a pending epoch.
@@ -258,12 +262,17 @@ func (c *Clock) heldSpan(audioOnly bool) (lo, hi int64, ok bool) {
 	return lo, hi, ok
 }
 
-// configChange applies rule 8: a new Config pointer acts like Break(), and
-// restarts an already pending epoch, with f as the first frame.
-func (c *Clock) configChange(f media.Frame) {
-	if c.pend == nil {
-		c.Break()
-	} else {
+// configChange applies rule 8: a new Config pointer opens a pending epoch
+// that f joins as its track's first frame. When an epoch is already pending,
+// f joins it, and the epoch restarts first only if f's track has frames held
+// under its old config, or f is a jump against the held frames. So a failover
+// or PMT change that gives every track a new pointer is one epoch change, and
+// the tracks that change later do not drop what the others hold.
+func (c *Clock) configChange(f media.Frame, t *track) {
+	switch {
+	case c.pend == nil:
+		c.openPending(false)
+	case t.pend.held > 0 || c.jumpsHeld(f.DTS):
 		c.restart()
 	}
 	c.join(f)

@@ -321,18 +321,110 @@ func TestClockBreak(t *testing.T) {
 	c := New(Options{Kinds: av})
 	out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...) // to 32400 / 34560
 	c.Break()
-	out = append(out, c.Push(video(36000, true))...)
-	c.Break() // already pending: nothing changes
-	out = append(out, push(c, audio(36480), video(39600, false), audio(38400))...)
+	require.Empty(t, c.Push(video(36000, true))) // held by epoch 2
+	c.Break()                                    // already pending: restarts it and drops the held keyframe
+	assert.Equal(t, uint64(1), c.Stats().DroppedStale)
+	out = append(out, push(c, video(39600, true), audio(39840), video(43200, false), audio(41760))...)
 
 	require.Equal(t, []uint32{1, 2}, epochIDs(c))
 	e1, e2 := inEpoch(out, 1), inEpoch(out, 2)
 	assert.Len(t, e1, 29)
 	require.Len(t, e2, 4)
+	assert.True(t, e2[0].Key)
 	assert.Equal(t, nextStart(e1), c.Epochs()[1].Start)
 	assert.Equal(t, int64(34560+1920), c.Epochs()[1].Start)
 	assert.Equal(t, c.Epochs()[1].Start, e2[0].DTS)
+	assert.Equal(t, Stats{DroppedStale: 1}, c.Stats())
+	requireConform(t, out)
+}
+
+// withConfig returns frames with Config set per track.
+func withConfig(frames []media.Frame, cfgs ...*media.TrackConfig) []media.Frame {
+	out := make([]media.Frame, len(frames))
+	for i, f := range frames {
+		f.Config = cfgs[f.Track]
+		out[i] = f
+	}
+	return out
+}
+
+// Failover: Break, then a new input whose tracks all carry new Config
+// pointers. No track has a frame held under its old config, so each track
+// joins epoch 2 with its first new frame and the new input's first GOP is
+// delivered whole.
+func TestClockFailoverNewConfigs(t *testing.T) {
+	const t1 = 9_000_000
+	run := func(t *testing.T, lag int64) {
+		t.Helper()
+		c := New(Options{Kinds: av})
+		out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...) // to 176400 / 178560
+		n := len(out)
+		c.Break()
+		v2 := &media.TrackConfig{Codec: media.CodecH264}
+		a2 := &media.TrackConfig{Codec: media.CodecAAC}
+		in := withConfig(mux(lag, videoRun(t1, 75), audioRun(t1, 141)), v2, a2)
+		out = append(out, push(c, in...)...)
+		out = append(out, c.Flush()...)
+
+		require.Equal(t, []uint32{1, 2}, epochIDs(c))
+		assert.Equal(t, Stats{}, c.Stats())
+		require.Len(t, out, n+len(in))
+		e2 := inEpoch(out[n:], 2)
+		v, a := onTrack(e2, 0), onTrack(e2, 1)
+		require.Len(t, v, 75)
+		require.Len(t, a, 141)
+		assert.True(t, v[0].Key)
+		assert.Same(t, v2, v[0].Config)
+		assert.Same(t, a2, a[0].Config)
+		assert.Equal(t, c.Epochs()[1].Start, v[0].DTS)
+		requireConform(t, out)
+	}
+	t.Run("video first", func(t *testing.T) { run(t, 0) })
+	t.Run("audio first", func(t *testing.T) { run(t, -7200) })
+
+	t.Run("dead input frames before the failover", func(t *testing.T) {
+		c := New(Options{Kinds: av})
+		out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...)
+		n := len(out)
+		c.Break()                                          // the input dies
+		out = append(out, push(c, video(180000, true))...) // a last frame of the dead input, held
+		c.Break()                                          // failover: the held frame must not mix with the new input
+		assert.Equal(t, uint64(1), c.Stats().DroppedStale)
+		v2 := &media.TrackConfig{Codec: media.CodecH264}
+		a2 := &media.TrackConfig{Codec: media.CodecAAC}
+		in := withConfig(mux(0, videoRun(t1, 75), audioRun(t1, 141)), v2, a2)
+		out = append(out, push(c, in...)...)
+		out = append(out, c.Flush()...)
+
+		require.Equal(t, []uint32{1, 2}, epochIDs(c))
+		assert.Equal(t, Stats{DroppedStale: 1}, c.Stats())
+		e2 := inEpoch(out[n:], 2)
+		assert.Len(t, onTrack(e2, 0), 75)
+		assert.Len(t, onTrack(e2, 1), 141)
+		for _, f := range onTrack(e2, 0) {
+			assert.Same(t, v2, f.Config)
+		}
+		requireConform(t, out)
+	})
+}
+
+// A PMT change without Break: every track gets a new pointer on a continuous
+// timeline. It is one epoch change and nothing is dropped.
+func TestClockAllTracksNewConfigs(t *testing.T) {
+	c := New(Options{Kinds: av})
+	out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...) // to 176400 / 178560
+	n := len(out)
+	v2 := &media.TrackConfig{Codec: media.CodecH264}
+	a2 := &media.TrackConfig{Codec: media.CodecAAC}
+	in := withConfig(mux(0, videoRun(50*vDur, 75), audioRun(94*aDur, 141)), v2, a2)
+	out = append(out, push(c, in...)...)
+	out = append(out, c.Flush()...)
+
+	require.Equal(t, []uint32{1, 2}, epochIDs(c))
 	assert.Equal(t, Stats{}, c.Stats())
+	e2 := inEpoch(out[n:], 2)
+	assert.Len(t, onTrack(e2, 0), 75)
+	assert.Len(t, onTrack(e2, 1), 141)
 	requireConform(t, out)
 }
 
@@ -372,6 +464,38 @@ func TestClockConfigChangeOpensEpoch(t *testing.T) {
 		e2 := inEpoch(out, 2)
 		require.Len(t, e2, 2)
 		assert.Same(t, second.Config, e2[0].Config)
+		requireConform(t, out)
+	})
+
+	t.Run("change on another track joins", func(t *testing.T) {
+		c := New(Options{Kinds: av})
+		out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...)
+		changed := video(36000, true)
+		changed.Config = newH264()
+		a2 := audio(36480)
+		a2.Config = &media.TrackConfig{Codec: media.CodecAAC}
+		out = append(out, push(c, changed, a2)...)
+
+		require.Equal(t, []uint32{1, 2}, epochIDs(c))
+		assert.Equal(t, Stats{}, c.Stats())
+		require.Len(t, inEpoch(out, 2), 2)
+		requireConform(t, out)
+	})
+
+	t.Run("change that jumps against held frames restarts", func(t *testing.T) {
+		c := New(Options{Kinds: av})
+		out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...)
+		c.Break()
+		out = append(out, c.Push(audio(36480))...) // held by epoch 2
+		changed := video(5_000_000, true)
+		changed.Config = newH264()
+		out = append(out, push(c, changed, audio(5_000_000))...)
+
+		require.Equal(t, []uint32{1, 2}, epochIDs(c))
+		assert.Equal(t, Stats{DroppedStale: 1}, c.Stats())
+		e2 := inEpoch(out, 2)
+		require.Len(t, e2, 2)
+		assert.Same(t, changed.Config, e2[0].Config)
 		requireConform(t, out)
 	})
 }
@@ -588,20 +712,38 @@ func TestClockWallAnchor(t *testing.T) {
 	assert.Equal(t, t0.Add(7*time.Second), c.Epochs()[1].Wall)
 }
 
-// A Config change with continuous timestamps restarts a pending epoch in which
-// audio had joined. Audio has nothing held when video alone releases, and its
-// continuous frames afterwards are not a jump, so none of them is stale.
+// A Config change with continuous timestamps, on a track that has a frame
+// held under its old config, restarts the pending epoch. Audio had joined it
+// but has nothing held when video alone releases, and its continuous frames
+// afterwards are not a jump, so none of them is stale.
 func TestClockConfigRestartKeepsContinuousAudio(t *testing.T) {
 	newH264 := func(dts int64, key bool) media.Frame {
 		f := video(dts, key)
 		f.Config = &media.TrackConfig{Codec: media.CodecH264}
 		return f
 	}
+	// restartAt pushes, into a pending epoch that audio joined at from: a
+	// keyframe under the old config presented after that audio (which it
+	// drops as early), then a keyframe with a new config at from+3600 that
+	// restarts the epoch, then video alone until AlignWindow releases it.
+	restartAt := func(c *Clock, from int64) []media.Frame {
+		old := video(from-480, true)
+		old.PTS = from + 7200
+		out := c.Push(old)
+		changed := newH264(from+3120, true)
+		out = append(out, c.Push(changed)...)
+		for i := int64(1); i <= 25; i++ {
+			f := video(from+3120+i*vDur, false)
+			f.Config = changed.Config
+			out = append(out, c.Push(f)...)
+		}
+		return out
+	}
 	run := func(t *testing.T, c *Clock, out []media.Frame, audioFrom int64) {
 		t.Helper()
 		require.Equal(t, []uint32{1, 2}, epochIDs(c))
 		out = append(out, push(c, audioRun(audioFrom, 400)...)...)
-		assert.Equal(t, uint64(1), c.Stats().DroppedStale) // the held audio frame only
+		assert.Equal(t, Stats{DroppedEarlyAudio: 1, DroppedStale: 1}, c.Stats()) // the held keyframe only
 		assert.Len(t, onTrack(inEpoch(out, 2), 1), 400)
 		assert.Equal(t, []uint32{1, 2}, epochIDs(c))
 		requireConform(t, out)
@@ -612,14 +754,8 @@ func TestClockConfigRestartKeepsContinuousAudio(t *testing.T) {
 		out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...) // to 32400 / 34560
 		c.Break()
 		out = append(out, c.Push(audio(36480))...) // joins epoch 2, held
-		changed := newH264(36000, true)            // restarts epoch 2
-		out = append(out, c.Push(changed)...)
-		for i := int64(1); i <= 25; i++ { // video alone releases by AlignWindow
-			f := video(36000+i*vDur, false)
-			f.Config = changed.Config
-			out = append(out, c.Push(f)...)
-		}
-		run(t, c, out, 38400)
+		out = append(out, restartAt(c, 36480)...)
+		run(t, c, out, 36480+2*aDur)
 	})
 
 	t.Run("after a jump", func(t *testing.T) {
@@ -627,14 +763,8 @@ func TestClockConfigRestartKeepsContinuousAudio(t *testing.T) {
 		c := New(Options{Kinds: av})
 		out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...)
 		out = append(out, c.Push(audio(t1))...) // opens epoch 2, held
-		changed := newH264(t1, true)            // restarts epoch 2
-		out = append(out, c.Push(changed)...)
-		for i := int64(1); i <= 25; i++ {
-			f := video(t1+i*vDur, false)
-			f.Config = changed.Config
-			out = append(out, c.Push(f)...)
-		}
-		run(t, c, out, t1+1920)
+		out = append(out, restartAt(c, t1)...)
+		run(t, c, out, t1+2*aDur)
 	})
 }
 
