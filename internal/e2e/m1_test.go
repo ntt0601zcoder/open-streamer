@@ -66,19 +66,50 @@ func epochs(frames []media.Frame) []uint32 {
 	return ids
 }
 
+// epochTrack names one track within one epoch.
+type epochTrack struct {
+	epoch uint32
+	track int
+}
+
+// counts returns the number of frames per epoch and track.
+func counts(frames []media.Frame) map[epochTrack]int {
+	out := map[epochTrack]int{}
+	for _, f := range frames {
+		out[epochTrack{f.Epoch, f.Track}]++
+	}
+	return out
+}
+
+// TestM1Fixtures checks every fixture and the exact number of frames each
+// track delivers in each epoch, so a missing track or a lost GOP fails.
+//
+// Where the counts fall short of the demuxed frames (track 0 is video,
+// track 1 audio):
+//   - One audio frame per clip start is presented before the first video
+//     keyframe and dropped by the Clock (rule 5).
+//   - The loop and then_640 fixtures demux one video frame fewer from the
+//     first clip: the continuity counter jumps at the concatenation point,
+//     and go-astits then discards the PES it was still assembling, the
+//     first clip's last video frame (M2 counts this loss).
+//   - midgop drops audio before the first keyframe.
 func TestM1Fixtures(t *testing.T) {
-	for _, name := range []string{
-		"h264_aac.ts",
-		"h265_aac51.ts",
-		"h264_aacmono_wrap.ts",
-		"h264_aac_loop.ts",
-		"h264_aac_then_640.ts",
-		"h264_aac_midgop.ts",
+	for _, tc := range []struct {
+		name string
+		want map[epochTrack]int
+	}{
+		{"h264_aac.ts", map[epochTrack]int{{1, 0}: 150, {1, 1}: 282}},
+		{"h265_aac51.ts", map[epochTrack]int{{1, 0}: 150, {1, 1}: 259}},
+		{"h264_aacmono_wrap.ts", map[epochTrack]int{{1, 0}: 150, {1, 1}: 259}},
+		{"h264_aac_loop.ts", map[epochTrack]int{{1, 0}: 149, {1, 1}: 282, {2, 0}: 150, {2, 1}: 282}},
+		{"h264_aac_then_640.ts", map[epochTrack]int{{1, 0}: 149, {1, 1}: 282, {2, 0}: 50}},
+		{"h264_aac_midgop.ts", map[epochTrack]int{{1, 0}: 75, {1, 1}: 141}},
 	} {
-		t.Run(name, func(t *testing.T) {
-			got := delivered(t, name)
+		t.Run(tc.name, func(t *testing.T) {
+			got := delivered(t, tc.name)
 			require.NotEmpty(t, got)
 			assert.Nil(t, conform.CheckFrames(got, conform.FrameOptions{}))
+			assert.Equal(t, tc.want, counts(got))
 		})
 	}
 }
