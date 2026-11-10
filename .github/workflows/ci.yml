@@ -17,8 +17,7 @@ jobs:
           go-version-file: go.mod
       - name: go mod tidy drift check
         run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
+          go mod tidy && git diff --exit-code -- go.mod go.sum
 
   vet:
     runs-on: ubuntu-latest

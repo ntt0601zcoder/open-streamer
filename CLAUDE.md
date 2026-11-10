@@ -26,7 +26,7 @@ The v1 code lives on `main`. Read it with `git show main:<path>`; never copy it 
 - Module path is `github.com/ntt0601zcoder/open-streamer`. No cgo in M1: `go build ./...`, `go vet ./...` and `go test ./...` work on a plain machine.
 - Libraries: only independent ones (go-astits, mp4ff, pion, gosrt, go-astiav, chi). Never `bluenviron/*` (mediacommon, gortsplib, gohlslib) or `q191201771/lal`, and do not copy code from them.
 - What no independent library provides goes into our own reusable package under `pkg/`, which never imports `internal/`.
-- Tools run with `go run <tool>@<version>` or `go install`, never added to `go.mod`.
+- Module dependencies allowed in M1: the Go standard library, `asticode/go-astits`, `Eyevinn/mp4ff`, `stretchr/testify`. Tools run with `go run <tool>@<version>` or `go install`, never added to `go.mod`.
 - Timestamps on `media.Frame` are `int64` in 90 kHz ticks (`media.ClockRate = 90000`). No `time.Duration` and no milliseconds on the media path.
 - `media`, `ts`, `clock`, `conform` and `hub` start no goroutines.
 - `hub.Write` never blocks, under any subscriber behaviour.
