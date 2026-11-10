@@ -35,8 +35,10 @@ type Options struct {
 	Now         func() time.Time // nil means time.Now
 }
 
-// Epoch is the anchor of one timeline: its first frame maps to stream time
-// Start, and arrived at wallclock Wall.
+// Epoch is the anchor of one timeline. Its smallest DTS maps to stream time
+// Start. Wall is the arrival time (Now() during its Push) of the first frame
+// the epoch released, that is, the earliest-arriving held frame that survived
+// the start gates and the early-audio drop.
 type Epoch struct {
 	ID    uint32
 	Start int64
@@ -46,6 +48,9 @@ type Epoch struct {
 // Stats counts dropped frames by reason.
 type Stats struct {
 	DroppedBackStep, DroppedBeforeKey, DroppedRASL, DroppedEarlyAudio, DroppedStale, DroppedLate uint64
+	// DroppedInvalid counts input frames with PTS below DTS, dropped on entry
+	// so that every output frame has PTS >= DTS.
+	DroppedInvalid uint64
 }
 
 // gate is a video track's start-of-epoch gate (rule 5).
@@ -98,12 +103,17 @@ type epoch struct {
 	audioOnly   bool // released by VideoWait: the first keyframe opens the next epoch
 }
 
+// heldFrame is a frame held by a pending epoch, in source time.
+type heldFrame struct {
+	f  media.Frame
+	at time.Time // arrival: Now() during its Push
+}
+
 // pending is an epoch that holds frames until it is released.
 type pending struct {
 	id        uint32
 	jump      bool
-	held      []media.Frame // source time, arrival order
-	wall      time.Time
+	held      []heldFrame // arrival order
 	hasKey    bool
 	keyPTS    int64 // smallest first-keyframe PTS among video tracks
 	hasAnchor bool
@@ -152,8 +162,13 @@ func orDefault(v, def int64) int64 {
 }
 
 // Push takes one frame in source time and returns the frames it releases, in
-// stream time and arrival order. f.Track must not be negative.
+// stream time and arrival order. f.Track must not be negative. A frame with
+// PTS below DTS is dropped and counted in Stats.DroppedInvalid.
 func (c *Clock) Push(f media.Frame) []media.Frame {
+	if f.PTS < f.DTS {
+		c.stats.DroppedInvalid++
+		return nil
+	}
 	for len(c.tracks) <= f.Track {
 		c.tracks = append(c.tracks, &track{})
 	}
@@ -230,15 +245,15 @@ func (c *Clock) jumpsHeld(dts int64) bool {
 // heldSpan returns the smallest and largest held DTS, of audio frames only
 // when audioOnly is set.
 func (c *Clock) heldSpan(audioOnly bool) (lo, hi int64, ok bool) {
-	for _, f := range c.pend.held {
-		if audioOnly && c.kindOf(f) != media.KindAudio {
+	for _, h := range c.pend.held {
+		if audioOnly && c.kindOf(h.f) != media.KindAudio {
 			continue
 		}
 		if !ok {
-			lo, hi, ok = f.DTS, f.DTS, true
+			lo, hi, ok = h.f.DTS, h.f.DTS, true
 			continue
 		}
-		lo, hi = min(lo, f.DTS), max(hi, f.DTS)
+		lo, hi = min(lo, h.f.DTS), max(hi, h.f.DTS)
 	}
 	return lo, hi, ok
 }
@@ -256,8 +271,10 @@ func (c *Clock) configChange(f media.Frame) {
 
 // pushReleased handles a frame while no epoch is pending.
 func (c *Clock) pushReleased(f media.Frame, t *track) {
-	if !t.cur.joined && c.cur.jump && t.cur.hasLast && c.isOld(f.DTS, t.cur.last) {
-		c.stats.DroppedStale++ // rule 3: old timeline after release
+	// Rule 3 after release, and rule 8's lag test for a track that was joined
+	// before a restart but had no frame held when the epoch was released.
+	if !t.cur.joined && (c.cur.jump || t.cur.fresh) && t.cur.hasLast && c.isOld(f.DTS, t.cur.last) {
+		c.stats.DroppedStale++
 		return
 	}
 	if c.isJump(f.DTS, c.hw) {
@@ -398,10 +415,7 @@ func (c *Clock) join(f media.Frame) {
 		}
 	}
 
-	if len(p.held) == 0 {
-		p.wall = c.opt.Now()
-	}
-	p.held = append(p.held, f)
+	p.held = append(p.held, heldFrame{f: f, at: c.opt.Now()})
 	te.held++
 	c.tryRelease()
 }
@@ -410,13 +424,13 @@ func (c *Clock) join(f media.Frame) {
 func (c *Clock) dropEarlyAudio() {
 	p := c.pend
 	kept := p.held[:0]
-	for _, f := range p.held {
-		if c.kindOf(f) == media.KindAudio && f.PTS < p.keyPTS {
+	for _, h := range p.held {
+		if c.kindOf(h.f) == media.KindAudio && h.f.PTS < p.keyPTS {
 			c.stats.DroppedEarlyAudio++
-			c.tracks[f.Track].pend.held--
+			c.tracks[h.f.Track].pend.held--
 			continue
 		}
-		kept = append(kept, f)
+		kept = append(kept, h)
 	}
 	clear(p.held[len(kept):])
 	p.held = kept
@@ -436,7 +450,7 @@ func (c *Clock) tryRelease() {
 			c.release(false)
 		}
 	case !c.expectVideo:
-		if hi-p.held[0].DTS >= c.opt.AlignWindow {
+		if hi-p.held[0].f.DTS >= c.opt.AlignWindow {
 			c.release(false)
 		}
 	default: // video expected, no keyframe yet
@@ -467,24 +481,30 @@ func (c *Clock) release(audioOnly bool) {
 		id: p.id, base: base, start: c.nextStart(p.id),
 		hasKey: p.hasKey, keyPTS: p.keyPTS, jump: p.jump, audioOnly: audioOnly,
 	}
-	c.record(Epoch{ID: ep.id, Start: ep.start, Wall: p.wall})
+	c.record(Epoch{ID: ep.id, Start: ep.start, Wall: p.held[0].at})
 	for _, t := range c.tracks {
-		if t.pend.joined {
+		switch {
+		case t.pend.fresh:
+			// Joined before a restart, nothing since: its next frame rejoins
+			// without the rule 4 check, after the lag test against the kept
+			// lastSourceDTS.
+			t.cur = trackEpoch{fresh: true, hasLast: true, last: t.pend.last}
+		case t.pend.joined:
 			t.cur = t.pend
 			t.cur.held = 0
-		} else {
+		default:
 			// Not joined: keep the previous lastSourceDTS for rule 3.
 			t.cur = trackEpoch{hasLast: t.cur.hasLast, last: t.cur.last}
 		}
 		t.pend = trackEpoch{}
 	}
 	c.cur, c.hw, c.pend = ep, p.hw, nil
-	for _, f := range p.held {
-		t := c.tracks[f.Track]
-		if c.kindOf(f) == media.KindAudio {
+	for _, h := range p.held {
+		t := c.tracks[h.f.Track]
+		if c.kindOf(h.f) == media.KindAudio {
 			t.cur.audioOut = true
 		}
-		c.emit(f, t, ep)
+		c.emit(h.f, t, ep)
 	}
 }
 
