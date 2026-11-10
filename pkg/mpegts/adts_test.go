@@ -125,3 +125,27 @@ func TestParseADTSInvalid(t *testing.T) {
 	assert.Contains(t, err.Error(), "mpegts: adts:")
 	assert.Len(t, frames, 1)
 }
+
+func TestParseADTSChannelConfigZero(t *testing.T) {
+	f := adtsFrame(4)
+	f[2] &^= 0x01
+	f[3] &^= 0xC0
+	frames, err := ParseADTS(f)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mpegts: adts:")
+	assert.Empty(t, frames)
+}
+
+func TestParseADTSFrameShorterThanCRCHeader(t *testing.T) {
+	// protection_absent = 0 (9-byte header) with frame length 8.
+	f := []byte{0xFF, 0xF0, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0, 0, 0xAA}
+	_, err := ParseADTS(f)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mpegts: adts:")
+}
+
+func TestParseADTSPayloadCapacityLimited(t *testing.T) {
+	frames, err := ParseADTS(append(adtsFrame(4), adtsFrame(4)...))
+	require.NoError(t, err)
+	assert.Equal(t, len(frames[0].Payload), cap(frames[0].Payload))
+}
