@@ -7,7 +7,7 @@
 //
 // # Live video tracks
 //
-// Stream time is the DTS of the most recently written frame. A video track is
+// Stream time is the largest DTS written so far. A video track is
 // live while stream time minus the DTS of that track's last frame is at most
 // LiveWindow (10 s). A track that has sent nothing for longer than that has
 // ended: it no longer holds audio back, and it no longer anchors the cache.
@@ -17,22 +17,27 @@
 //
 // Each subscriber gates each video track. A gated track drops frames until
 // its next keyframe; RASL frames directly after that keyframe are dropped
-// too, and the track opens at its first non-RASL frame. Frames that are not
-// video (audio, or frames without a config) are delivered only when every
-// live video track has had its keyframe delivered. A new subscriber starts
+// too, and the track opens at its first non-RASL frame (key or not). Frames
+// that are not video (audio, or frames without a config) are delivered only
+// when every live video track has had its keyframe delivered. A new subscriber starts
 // with every video track gated, including tracks the hub has not seen yet,
 // so it never gets a video frame before that track's keyframe.
 //
 // # Skip mode and Lost
 //
 // A failed send drops the frame, gates every video track again and puts the
-// subscriber in skip mode. While in skip mode, each frame the gates drop is
-// counted, and Delivery.Lost on the next delivery is the number of frames
-// dropped since the previous delivery. Skip mode ends on a delivery after
-// which every live video track is open. Frames gated outside skip mode (after
-// a subscribe or for a video track that appears or comes back on a non-key
-// frame) are not counted in Lost, because nothing the subscriber was
-// following went missing.
+// subscriber in skip mode. Skip mode ends at the next delivery, which carries
+// Delivery.Lost: the failed send plus every frame the gates dropped in
+// between. With a live video track that delivery is always a resume keyframe,
+// so the gap is signalled exactly once, at a point where outputs can start a
+// new epoch. Frames the gates drop after that delivery (RASL frames after the
+// resume CRA, a second video track still waiting for its keyframe, audio held
+// back for it) count in SubStats.Dropped but not in Lost, the same as frames
+// gated after a subscribe or for a video track that is new to the
+// subscriber; they never land mid-GOP as a spurious gap. A track that the
+// subscriber was following stays open across a pause, so a track that comes
+// back after ending is gated only for subscribers that skipped while it was
+// away.
 //
 // # Cache
 //
@@ -72,8 +77,9 @@ type Options struct {
 	AudioCacheTicks int64 // audio-only streams: cache span; 0 means 90000 (1 s)
 }
 
-// Delivery is one frame handed to a subscriber. Lost is the number of frames
-// dropped for this subscriber in skip mode since its previous delivery.
+// Delivery is one frame handed to a subscriber. Lost is non-zero only on the
+// first delivery after a failed send: the number of frames dropped for this
+// subscriber since its previous delivery.
 type Delivery struct {
 	Frame media.Frame
 	Lost  uint64
@@ -106,13 +112,14 @@ type Hub struct {
 	gopCacheFrames  int
 	audioCacheTicks int64
 
-	mu     sync.Mutex
-	closed bool
-	subs   []*Sub
-	video  map[int]*videoTrack
-	latest int64 // stream time: DTS of the most recently written frame
-	anchor int   // track the cache is anchored on, or -1 for the audio cache
-	cache  []media.Frame
+	mu      sync.Mutex
+	closed  bool
+	subs    []*Sub
+	video   map[int]*videoTrack
+	latest  int64 // stream time: the largest DTS written
+	started bool  // latest is set
+	anchor  int   // track the cache is anchored on, or -1 for the audio cache
+	cache   []media.Frame
 }
 
 // Sub is one subscriber. Its methods are safe for concurrent use.
@@ -155,7 +162,10 @@ func (h *Hub) Write(f media.Frame) {
 	if h.closed {
 		return
 	}
-	h.latest = f.DTS
+	if !h.started || f.DTS > h.latest {
+		h.latest = f.DTS
+		h.started = true
+	}
 	if f.Kind() == media.KindVideo {
 		vt := h.video[f.Track]
 		if vt == nil {
@@ -260,9 +270,7 @@ func (h *Hub) offer(s *Sub, f media.Frame) {
 	case s.ch <- Delivery{Frame: f, Lost: s.lost}:
 		s.delivered++
 		s.lost = 0
-		if s.skipping && h.resumed(s) {
-			s.skipping = false
-		}
+		s.skipping = false
 	default:
 		s.dropped++
 		s.lost++
@@ -286,9 +294,7 @@ func (h *Hub) admit(s *Sub, f media.Frame) bool {
 			if f.RASL {
 				return false
 			}
-			if !f.Key {
-				s.gates[f.Track] = gateOpen
-			}
+			s.gates[f.Track] = gateOpen
 		case gateOpen:
 		}
 		return true
@@ -304,17 +310,6 @@ func (h *Hub) admit(s *Sub, f media.Frame) bool {
 func (h *Hub) videoStarted(s *Sub) bool {
 	for id, vt := range h.video {
 		if h.live(vt) && s.gates[id] == gateKey {
-			return false
-		}
-	}
-	return true
-}
-
-// resumed reports whether every live video track is open for s. Called with
-// h.mu held.
-func (h *Hub) resumed(s *Sub) bool {
-	for id, vt := range h.video {
-		if h.live(vt) && s.gates[id] != gateOpen {
 			return false
 		}
 	}
