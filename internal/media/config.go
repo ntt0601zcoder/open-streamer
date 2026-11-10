@@ -184,7 +184,7 @@ func equalSets(a, b [][]byte) bool {
 }
 
 // ParamSetID returns the ID of a VPS, SPS or PPS NAL unit (with its NAL header).
-// The NAL type is not checked; the caller decides which kind of set nalu is.
+// It returns an error if the NAL type is not a parameter set of the codec.
 func ParamSetID(codec Codec, nalu []byte) (uint32, error) {
 	id, err := paramSetID(codec, nalu)
 	if err != nil {
