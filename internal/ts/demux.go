@@ -42,7 +42,8 @@ type track struct {
 	pid    uint16
 	kind   media.Kind
 	codec  media.Codec
-	config *media.TrackConfig
+	config *media.TrackConfig // nil while the parameter sets are invalid
+	good   *media.TrackConfig // the last valid video config, kept while config is nil
 
 	// Video parameter sets, one per ID (the newest wins), keyed by ID.
 	vps, sps, pps map[uint32][]byte
@@ -375,7 +376,11 @@ func (d *Demuxer) rebuildVideoConfig(t *track) {
 		t.config = nil
 		return
 	}
-	if !cfg.Equal(t.config) {
-		t.config = cfg
+	if cfg.Equal(t.good) {
+		// Unchanged, or repaired back to the last valid config: keep its
+		// pointer, since a new pointer means a configuration change.
+		t.config = t.good
+		return
 	}
+	t.config, t.good = cfg, cfg
 }
