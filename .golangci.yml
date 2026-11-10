@@ -7,10 +7,6 @@ linters:
       - path: _test\.go
         linters:
           - errcheck
-      # Allow TODO comments in handlers/stores during scaffolding
-      - text: "TODO"
-        linters:
-          - godot
   enable:
     - errcheck
     - govet
