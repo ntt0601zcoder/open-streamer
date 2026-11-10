@@ -13,7 +13,7 @@ sequences. An end-to-end test runs every fixture through all four.
 
 **Tech Stack:** Go (version from `go.mod`, currently `go 1.26.10`),
 `asticode/go-astits` v1.15.0, `Eyevinn/mp4ff` v0.52.0, `stretchr/testify`
-v1.11.1, ffmpeg for generating fixtures only. Tools: `golangci-lint` v2.11.3,
+v1.11.1, ffmpeg for generating fixtures only. Tools: `golangci-lint` v2.14.0,
 `go-test-coverage` v2.22.0.
 
 **Spec:** [docs/REBUILD_PLAN.md](../../REBUILD_PLAN.md), sections 3.1 to 3.3,
@@ -68,7 +68,7 @@ Each line below has a test in the owning task.
   - `Makefile`:
     - `test`: `go test -race -shuffle=on -count=1 -timeout=5m ./...`
     - `lint`: `golangci-lint run ./...`
-    - `tools`: `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3`
+    - `tools`: `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0`
     - `fmt`: gofumpt if installed, else gofmt
     - `tidy`, `vet`
     - `check`: tidy, vet, lint, test
@@ -82,7 +82,7 @@ Each line below has a test in the owning task.
     - `make test`
     - `make cover covercheck`
     - `govulncheck ./...` pinned to `golang.org/x/vuln/cmd/govulncheck@v1.1.4`
-    - `golangci-lint` v2.11.3
+    - `golangci-lint` v2.14.0
 
 - [ ] **Step 5: Verify.**
 

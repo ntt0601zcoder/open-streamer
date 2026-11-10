@@ -7,7 +7,7 @@ lint:
 	golangci-lint run ./...
 
 tools:
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
 fmt:
 	@if command -v gofumpt >/dev/null 2>&1; then gofumpt -l -w .; else gofmt -l -w .; fi
