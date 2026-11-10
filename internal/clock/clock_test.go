@@ -557,15 +557,79 @@ func TestClockRestartRejoinsBackward(t *testing.T) {
 
 func TestClockWallAnchor(t *testing.T) {
 	t0 := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
-	calls := 0
-	now := func() time.Time {
-		calls++
-		return t0.Add(time.Duration(calls-1) * time.Second)
+	clk := t0
+	c := New(Options{Kinds: av, Now: func() time.Time { return clk }})
+	at := func(sec int, f media.Frame) []media.Frame {
+		clk = t0.Add(time.Duration(sec) * time.Second)
+		return c.Push(f)
 	}
-	c := New(Options{Kinds: av, Now: now})
-	push(c, video(0, true), video(3600, false), audio(0))
+	key := video(0, true)
+	key.PTS = 7200
+
+	require.Empty(t, at(1, audio(-3840)))        // first push: held, then dropped as early audio
+	require.Empty(t, at(2, video(-3600, false))) // dropped before the keyframe: never held
+	require.Empty(t, at(3, audio(7680)))         // held and kept: the first frame released
+	out := at(4, key)                            // drops the early audio, then releases the epoch
+	require.Len(t, out, 2)
+	assert.Equal(t, []int{1, 0}, []int{out[0].Track, out[1].Track})
+	assert.Equal(t, uint64(1), c.Stats().DroppedEarlyAudio)
 	require.Len(t, c.Epochs(), 1)
-	assert.Equal(t, t0, c.Epochs()[0].Wall)
+	assert.Equal(t, t0.Add(3*time.Second), c.Epochs()[0].Wall) // not 1 s (first push) or 4 s (release)
+
+	// The next epoch anchors on its own first released frame.
+	c.Break()
+	require.Empty(t, at(6, video(14400, false))) // before the keyframe
+	require.Empty(t, at(7, video(18000, true)))
+	require.Len(t, at(8, audio(18000)), 2)
+	require.Len(t, c.Epochs(), 2)
+	assert.Equal(t, t0.Add(7*time.Second), c.Epochs()[1].Wall)
+}
+
+func TestClockDropsInvalid(t *testing.T) {
+	c := New(Options{Kinds: []media.Kind{media.KindVideo}})
+	bad := video(3600, false)
+	bad.PTS = 0
+	out := push(c, video(0, true), bad, video(7200, false))
+	require.Len(t, out, 2)
+	assert.Equal(t, uint64(1), c.Stats().DroppedInvalid)
+	assert.Equal(t, Stats{DroppedInvalid: 1}, c.Stats())
+	requireConform(t, out)
+}
+
+// A track that joined before a restart but had no frame held at release
+// rejoins the released epoch on its new timeline, and its frames still on the
+// earlier timeline are stale.
+func TestClockRestartedTrackRejoinsAfterRelease(t *testing.T) {
+	t.Run("jump epoch", func(t *testing.T) {
+		const t1, t2 = 5_000_000, 1_000_000
+		c := New(Options{Kinds: av})
+		out := push(c, mux(0, videoRun(0, 50, 25), audioRun(0, 94))...)
+		out = append(out, push(c, audio(t1), audio(t1+1920))...) // opens epoch 2, held
+		out = append(out, push(c, videoRun(t2, 26, 25)...)...)   // restarts it; video alone releases by AlignWindow
+		require.Equal(t, []uint32{1, 2}, epochIDs(c))
+		out = append(out, c.Push(audio(t1+3840))...) // lagging on t1: stale
+		out = append(out, push(c, audioRun(t2+93600, 100)...)...)
+
+		assert.Equal(t, uint64(0), c.Stats().DroppedBackStep)
+		assert.Equal(t, uint64(3), c.Stats().DroppedStale)
+		assert.Len(t, onTrack(inEpoch(out, 2), 1), 100)
+		assert.Equal(t, []uint32{1, 2}, epochIDs(c))
+		requireConform(t, out, conform.RuleStartOffset) // audio joins epoch 2 after release
+	})
+
+	t.Run("epoch 1", func(t *testing.T) {
+		c := New(Options{Kinds: av})
+		out := push(c, audio(0), audio(1920))                         // held
+		out = append(out, push(c, videoRun(1_000_000, 26, 25)...)...) // restarts epoch 1; releases by AlignWindow
+		require.Equal(t, []uint32{1}, epochIDs(c))
+		out = append(out, c.Push(audio(3840))...) // lagging on the earlier timeline: stale, no new epoch
+		out = append(out, push(c, audioRun(1_093_600, 10)...)...)
+
+		assert.Equal(t, uint64(3), c.Stats().DroppedStale)
+		assert.Equal(t, []uint32{1}, epochIDs(c))
+		assert.Len(t, onTrack(out, 1), 10)
+		requireConform(t, out, conform.RuleStartOffset)
+	})
 }
 
 func TestClockFlush(t *testing.T) {
