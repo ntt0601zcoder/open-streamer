@@ -81,7 +81,7 @@ Each line below has a test in the owning task.
     - `go vet ./...`
     - `make test`
     - `make cover covercheck`
-    - `govulncheck ./...` pinned to `golang.org/x/vuln/cmd/govulncheck@v1.1.4`
+    - `govulncheck ./...` pinned to `golang.org/x/vuln/cmd/govulncheck@v1.9.0` (v1.1.4 panics in `x/tools/go/ssa` on a Go 1.27 toolchain)
     - `golangci-lint` v2.14.0
 
 - [ ] **Step 5: Verify.**
