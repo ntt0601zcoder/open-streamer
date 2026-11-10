@@ -585,6 +585,56 @@ func TestClockWallAnchor(t *testing.T) {
 	assert.Equal(t, t0.Add(7*time.Second), c.Epochs()[1].Wall)
 }
 
+// A Config change with continuous timestamps restarts a pending epoch in which
+// audio had joined. Audio has nothing held when video alone releases, and its
+// continuous frames afterwards are not a jump, so none of them is stale.
+func TestClockConfigRestartKeepsContinuousAudio(t *testing.T) {
+	newH264 := func(dts int64, key bool) media.Frame {
+		f := video(dts, key)
+		f.Config = &media.TrackConfig{Codec: media.CodecH264}
+		return f
+	}
+	run := func(t *testing.T, c *Clock, out []media.Frame, audioFrom int64) {
+		t.Helper()
+		require.Equal(t, []uint32{1, 2}, epochIDs(c))
+		out = append(out, push(c, audioRun(audioFrom, 400)...)...)
+		assert.Equal(t, uint64(1), c.Stats().DroppedStale) // the held audio frame only
+		assert.Len(t, onTrack(inEpoch(out, 2), 1), 400)
+		assert.Equal(t, []uint32{1, 2}, epochIDs(c))
+		requireConform(t, out)
+	}
+
+	t.Run("after Break", func(t *testing.T) {
+		c := New(Options{Kinds: av})
+		out := push(c, mux(0, videoRun(0, 10, 25), audioRun(0, 19))...) // to 32400 / 34560
+		c.Break()
+		out = append(out, c.Push(audio(36480))...) // joins epoch 2, held
+		changed := newH264(36000, true)            // restarts epoch 2
+		out = append(out, c.Push(changed)...)
+		for i := int64(1); i <= 25; i++ { // video alone releases by AlignWindow
+			f := video(36000+i*vDur, false)
+			f.Config = changed.Config
+			out = append(out, c.Push(f)...)
+		}
+		run(t, c, out, 38400)
+	})
+
+	t.Run("after a jump", func(t *testing.T) {
+		const t1 = 5_000_000
+		c := New(Options{Kinds: av})
+		out := push(c, mux(0, videoRun(0, 50, 25), audioRun(0, 94))...)
+		out = append(out, c.Push(audio(t1))...) // opens epoch 2, held
+		changed := newH264(t1, true)            // restarts epoch 2
+		out = append(out, c.Push(changed)...)
+		for i := int64(1); i <= 25; i++ {
+			f := video(t1+i*vDur, false)
+			f.Config = changed.Config
+			out = append(out, c.Push(f)...)
+		}
+		run(t, c, out, t1+1920)
+	})
+}
+
 func TestClockDropsInvalid(t *testing.T) {
 	c := New(Options{Kinds: []media.Kind{media.KindVideo}})
 	bad := video(3600, false)
