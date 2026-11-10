@@ -229,6 +229,42 @@ func TestClockLaggingTrackNoFalseEpoch(t *testing.T) {
 	requireConform(t, out)
 }
 
+// A constant A/V skew above MaxBackJump: audio source time runs 2.5 s ahead
+// of video for 120 s, and frames arrive by wallclock. Each track continues
+// its own timeline, so the skew is not a jump against the stream-wide
+// high-water mark.
+func TestClockConstantSkew(t *testing.T) {
+	const skew = 225000
+	run := func(v, a []media.Frame) (*Clock, []media.Frame, []media.Frame) {
+		c := New(Options{Kinds: av})
+		frames := arrange(arrive(arrive(nil, -v[0].DTS, v), -a[0].DTS, a))
+		out := push(c, frames...)
+		return c, frames, append(out, c.Flush()...)
+	}
+
+	t.Run("audio ahead", func(t *testing.T) {
+		c, frames, out := run(videoRun(0, 3000), audioRun(skew, 5625))
+		assert.Equal(t, []uint32{1}, epochIDs(c))
+		assert.Equal(t, Stats{}, c.Stats())
+		assert.Len(t, out, len(frames))
+		requireConform(t, out, conform.RuleStartOffset) // the skew is in the source
+	})
+
+	t.Run("video ahead", func(t *testing.T) {
+		// Rule 5 drops the audio presented before the first keyframe, about
+		// 2.5 s of it, and the epoch start settles once; after that nothing
+		// is dropped.
+		c, frames, out := run(videoRun(skew, 3000), audioRun(0, 5625))
+		assert.Equal(t, []uint32{1}, epochIDs(c))
+		st := c.Stats()
+		assert.Zero(t, st.DroppedBackStep)
+		assert.Less(t, len(frames)-len(out), 200)
+		assert.Equal(t, uint64(len(frames)-len(out)),
+			st.DroppedBeforeKey+st.DroppedEarlyAudio+st.DroppedStale)
+		requireConform(t, out, conform.RuleStartOffset)
+	})
+}
+
 func TestClockBackwardJumpOpensEpoch(t *testing.T) {
 	c := New(Options{Kinds: av})
 	const src, loop, lag = 1_000_000, 6 * media.ClockRate, 27000
