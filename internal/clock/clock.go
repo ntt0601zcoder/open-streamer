@@ -271,9 +271,7 @@ func (c *Clock) configChange(f media.Frame) {
 
 // pushReleased handles a frame while no epoch is pending.
 func (c *Clock) pushReleased(f media.Frame, t *track) {
-	// Rule 3 after release, and rule 8's lag test for a track that was joined
-	// before a restart but had no frame held when the epoch was released.
-	if !t.cur.joined && (c.cur.jump || t.cur.fresh) && t.cur.hasLast && c.isOld(f.DTS, t.cur.last) {
+	if c.isStale(f, t) {
 		c.stats.DroppedStale++
 		return
 	}
@@ -283,6 +281,23 @@ func (c *Clock) pushReleased(f media.Frame, t *track) {
 		return
 	}
 	c.acceptReleased(f, t)
+}
+
+// isStale reports whether f, from a track that has not joined the released
+// epoch, is still on an earlier timeline. A track that joined before a restart
+// but had no frame held at release gets rule 8's lag test: a jump against the
+// epoch that continues its kept lastSourceDTS. Any other unjoined track gets
+// rule 3's old test, in a jump epoch only.
+func (c *Clock) isStale(f media.Frame, t *track) bool {
+	te := &t.cur
+	switch {
+	case te.joined || !te.hasLast:
+		return false
+	case te.fresh:
+		return c.isJump(f.DTS, c.hw) && c.isOld(f.DTS, te.last)
+	default:
+		return c.cur.jump && c.isOld(f.DTS, te.last)
+	}
 }
 
 // acceptReleased applies rule 4 in the released epoch, then gates and maps f.
