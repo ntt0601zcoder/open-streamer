@@ -27,6 +27,17 @@ type DemuxStats struct {
 	DecodeErrors uint64
 }
 
+type streamInfo struct {
+	kind  media.Kind
+	codec media.Codec
+}
+
+var supportedTypes = map[astits.StreamType]streamInfo{
+	astits.StreamTypeH264Video: {media.KindVideo, media.CodecH264},
+	astits.StreamTypeH265Video: {media.KindVideo, media.CodecH265},
+	astits.StreamTypeAACAudio:  {media.KindAudio, media.CodecAAC},
+}
+
 type track struct {
 	pid    uint16
 	kind   media.Kind
@@ -83,14 +94,9 @@ func isEOF(err error) bool {
 func (d *Demuxer) setupTracks(pmt *astits.PMTData) {
 	for _, es := range pmt.ElementaryStreams {
 		t := &track{pid: es.ElementaryPID}
-		switch es.StreamType {
-		case astits.StreamTypeH264Video:
-			t.kind, t.codec = media.KindVideo, media.CodecH264
-		case astits.StreamTypeH265Video:
-			t.kind, t.codec = media.KindVideo, media.CodecH265
-		case astits.StreamTypeAACAudio:
-			t.kind, t.codec = media.KindAudio, media.CodecAAC
-		default:
+		if info, ok := supportedTypes[es.StreamType]; ok {
+			t.kind, t.codec = info.kind, info.codec
+		} else {
 			name := "unsupported"
 			if es.StreamType == 0x03 || es.StreamType == 0x04 {
 				name = "mpeg audio"
@@ -283,6 +289,7 @@ func (d *Demuxer) handleVideo(t *track, payload []byte, pts, dts int64) {
 		key   bool
 		rasl  bool
 		dirty bool
+		bad   bool
 	)
 	for _, n := range nalus {
 		if len(n) == 0 || (t.codec == media.CodecH265 && len(n) < 2) {
@@ -295,12 +302,19 @@ func (d *Demuxer) handleVideo(t *track, payload []byte, pts, dts int64) {
 		if sets := t.paramSets(typ); sets != nil {
 			id, err := media.ParamSetID(t.codec, n)
 			if err != nil {
+				// The slices that follow may depend on this set, so the
+				// current config can no longer be trusted.
 				d.stats.DecodeErrors++
+				t.config = nil
+				bad = true
 				continue
 			}
 			if old, have := sets[id]; !have || !bytes.Equal(old, n) {
 				sets[id] = bytes.Clone(n)
 				dirty = true
+			}
+			if t.config == nil {
+				dirty = true // Retry the rebuild whenever a set arrives while invalid.
 			}
 			continue
 		}
@@ -312,7 +326,7 @@ func (d *Demuxer) handleVideo(t *track, payload []byte, pts, dts int64) {
 		}
 		data = append(data, n)
 	}
-	if dirty {
+	if dirty && !bad {
 		d.rebuildVideoConfig(t)
 	}
 	if len(data) == 0 {
@@ -355,7 +369,10 @@ func (d *Demuxer) rebuildVideoConfig(t *track) {
 		cfg, err = media.NewH264Config(collect(t.sps), collect(t.pps))
 	}
 	if err != nil {
+		// The stored sets no longer match the current config: drop frames
+		// until a parameter set arrives that rebuilds successfully.
 		d.stats.DecodeErrors++
+		t.config = nil
 		return
 	}
 	if !cfg.Equal(t.config) {

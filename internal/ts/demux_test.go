@@ -102,16 +102,23 @@ func TestDemuxH265AAC51(t *testing.T) {
 func TestDemuxH265RASL(t *testing.T) {
 	_, frames := demuxAll(t, fixture(t, "h265_aac51.ts"))
 	rasl := 0
-	lastKey := false
+	lastKeyCRA := false
+	seenKey := false
 	for _, f := range byTrack(frames, 0) {
 		if f.Key {
-			lastKey = true
+			seenKey = true
+			lastKeyCRA = false
+			for _, n := range f.Data {
+				if (n[0]>>1)&0x3f == 21 {
+					lastKeyCRA = true
+				}
+			}
 			assert.False(t, f.RASL)
 			continue
 		}
 		if f.RASL {
 			rasl++
-			assert.True(t, lastKey, "RASL frame without preceding keyframe")
+			assert.True(t, seenKey && lastKeyCRA, "RASL frame must follow a CRA keyframe")
 		}
 	}
 	assert.GreaterOrEqual(t, rasl, 1)
@@ -216,4 +223,37 @@ func TestDemuxEmpty(t *testing.T) {
 	assert.Error(t, err)
 	_, err = NewDemuxer(bytes.NewReader(fixture(t, "h264_aac.ts")[:100]))
 	assert.Error(t, err)
+}
+
+func TestDemuxBadConfigDropsFrames(t *testing.T) {
+	_, frames := demuxAll(t, fixture(t, "h264_aac.ts"))
+	cfg := frames[0].Config
+	require.Equal(t, media.CodecH264, cfg.Codec)
+	sc := []byte{0, 0, 0, 1}
+	au := func(sps []byte) []byte {
+		var b []byte
+		for _, n := range [][]byte{sps, cfg.PPS[0], {0x65, 0x88, 0x84, 0x00}} {
+			b = append(b, sc...)
+			b = append(b, n...)
+		}
+		return b
+	}
+	tr := &track{codec: media.CodecH264, kind: media.KindVideo,
+		vps: map[uint32][]byte{}, sps: map[uint32][]byte{}, pps: map[uint32][]byte{}}
+	d := &Demuxer{tracks: []*track{tr}, byPID: map[uint16]*track{}}
+
+	d.handleVideo(tr, au(cfg.SPS[0]), 0, 0)
+	require.Len(t, d.queue, 1)
+	good := d.queue[0].Config
+	require.NotNil(t, good)
+
+	// Truncated SPS: its ID cannot be read, so the config is invalidated.
+	d.handleVideo(tr, au(cfg.SPS[0][:5]), 3600, 3600)
+	assert.Len(t, d.queue, 1, "frame with unparsable SPS must not be emitted")
+	assert.Equal(t, uint64(1), d.stats.DroppedNoConfig)
+
+	// A repaired SPS restores output with a config matching the stream.
+	d.handleVideo(tr, au(cfg.SPS[0]), 7200, 7200)
+	require.Len(t, d.queue, 2)
+	assert.True(t, good.Equal(d.queue[1].Config))
 }
