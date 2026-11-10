@@ -164,7 +164,7 @@ func TestHubResumeDropsRASL(t *testing.T) {
 	h2.Write(hevc(0, true, false))
 	h2.Write(hevc(vDur, false, true))
 	h2.Write(hevc(2*vDur, false, false))
-	h2.Write(hevc(3*vDur, false, true)) // not directly after the keyframe
+	h2.Write(hevc(3*vDur, false, true)) // after the first trailing picture: delivered
 	late := h2.Subscribe("late", 0)
 	got := drain(t, late, 3)
 	assert.Equal(t, []int64{0, 2 * vDur, 3 * vDur},
@@ -172,6 +172,59 @@ func TestHubResumeDropsRASL(t *testing.T) {
 	for _, d := range got {
 		assert.Zero(t, d.Lost)
 	}
+}
+
+// Leading pictures are presented before their CRA. A RADL between RASL
+// frames is delivered but does not end the gate; the first trailing picture
+// (PTS above the CRA's) does.
+func TestHubResumeLeadingPictures(t *testing.T) {
+	frame := func(dts, pts int64, key, rasl bool) media.Frame {
+		return media.Frame{Track: 0, Config: h265, DTS: dts, PTS: pts, Key: key, RASL: rasl}
+	}
+	gop := func(base int64) []media.Frame {
+		return []media.Frame{
+			frame(base, base+4*vDur, true, false),         // CRA
+			frame(base+vDur, base+2*vDur, false, false),   // RADL
+			frame(base+2*vDur, base+3*vDur, false, true),  // RASL
+			frame(base+3*vDur, base+6*vDur, false, false), // TRAIL
+			frame(base+4*vDur, base+5*vDur, false, true),  // RASL-flagged after a trailing picture
+		}
+	}
+	want := func(base int64) []int64 { return []int64{base, base + vDur, base + 3*vDur, base + 4*vDur} }
+	dtsOf := func(ds []Delivery) []int64 {
+		out := make([]int64, len(ds))
+		for i, d := range ds {
+			out[i] = d.Frame.DTS
+		}
+		return out
+	}
+
+	t.Run("resume", func(t *testing.T) {
+		h := New(Options{})
+		s := h.Subscribe("s", 1)
+		h.Write(frame(0, 0, true, false))
+		h.Write(frame(vDur, vDur, false, false)) // queue full: skip mode
+		recv(t, s)
+		var got []Delivery
+		for _, f := range gop(10 * vDur) {
+			h.Write(f)
+			select {
+			case d := <-s.C():
+				got = append(got, d)
+			default:
+			}
+		}
+		assert.Equal(t, want(10*vDur), dtsOf(got))
+		assert.Equal(t, uint64(1), got[0].Lost)
+	})
+
+	t.Run("late joiner", func(t *testing.T) {
+		h := New(Options{})
+		for _, f := range gop(0) {
+			h.Write(f)
+		}
+		assert.Equal(t, want(0), dtsOf(drain(t, h.Subscribe("late", 0), 4)))
+	})
 }
 
 func TestHubTwoVideoTracks(t *testing.T) {
@@ -303,7 +356,7 @@ func TestHubAllIntraGateOpens(t *testing.T) {
 	h.mu.Lock()
 	g := s.gates[0]
 	h.mu.Unlock()
-	assert.Equal(t, gateOpen, g, "a non-RASL keyframe opens the gate")
+	assert.Equal(t, gateOpen, g.state, "a later keyframe is a trailing picture and opens the gate")
 
 	// A new video track starting on a non-key frame is gated, and so is
 	// audio, but the subscriber resumed long ago: nothing is lost.
