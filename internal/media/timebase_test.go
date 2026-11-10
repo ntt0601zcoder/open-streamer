@@ -27,3 +27,20 @@ func TestDurationConversions(t *testing.T) {
 	assert.Equal(t, int64(30000), FromDuration(time.Second/3))
 	assert.Equal(t, int64(-30000), FromDuration(-time.Second/3))
 }
+
+func TestLongTimestampsDoNotOverflow(t *testing.T) {
+	const day = 24 * 3600
+	ticks := int64(30 * day * ClockRate) // 30 days
+	d := 30 * 24 * time.Hour
+	assert.Equal(t, d, ToDuration(ticks))
+	assert.Equal(t, -d, ToDuration(-ticks))
+	assert.Equal(t, ticks, FromDuration(d))
+	assert.Equal(t, -ticks, FromDuration(-d))
+	// Rounding is preserved: 1 tick = 11111.11 ns, 2 ticks = 22222.22 ns.
+	assert.Equal(t, d+11111, ToDuration(ticks+1))
+	assert.Equal(t, -(d + 22222), ToDuration(-(ticks + 2)))
+	assert.Equal(t, ticks+30000, FromDuration(d+time.Second/3))
+	assert.Equal(t, -(ticks + 30000), FromDuration(-(d + time.Second/3)))
+	assert.Equal(t, int64(30*day*48000), Rescale(ticks, 48000))
+	assert.Equal(t, int64(30*day*ClockRate), SampleTime(30*day*44100, 44100))
+}
