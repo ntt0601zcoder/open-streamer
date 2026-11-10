@@ -85,8 +85,11 @@ timestamps that are already unwrapped (33-bit TS PTS, 32-bit RTMP, RTP).
   deltas between frames and between tracks are kept exactly.
 - **At an epoch start,** it drops video until each video track's first
   keyframe (and H.265 RASL frames after it), drops audio that would be
-  presented before that keyframe, then holds frames for up to 1 s of source
-  time, or until every known track has a usable frame. The epoch base is the
+  presented before that keyframe, then holds frames until every known track
+  has a usable frame, or for up to 1 s of source time counted from the
+  keyframe. If video is expected but no keyframe arrives within 5 s, it
+  releases audio alone; the first keyframe after that opens a new epoch, so
+  audio and video always start together within an epoch. The epoch base is the
   smallest DTS held. The new epoch starts after the latest *presentation* end
   of the previous one (largest PTS plus frame duration over all tracks), so
   neither decode nor presentation time overlaps across epochs.
@@ -106,8 +109,9 @@ timestamps that are already unwrapped (33-bit TS PTS, 32-bit RTMP, RTP).
 One per (stream, rendition). Writes never block.
 
 - Each subscriber has a bounded queue. When it is full, the subscriber enters
-  skip mode: video and audio are dropped until a keyframe on every video track
-  (any frame for audio-only streams), so it always resumes on a whole GOP.
+  skip mode: each video track resumes at its own next keyframe, and audio
+  resumes once every live video track has (any frame for audio-only
+  streams), so it always resumes on whole GOPs.
   RASL frames after a resume CRA are dropped too.
 - Each delivery carries `Lost`, the number of frames skipped before it. Outputs
   treat `Lost > 0` like an epoch change.
@@ -117,7 +121,7 @@ One per (stream, rendition). Writes never block.
 
 ### 3.4 Output kit
 
-Shared by every output, in `internal/mux` and `internal/segment`:
+Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer), `internal/segment`, and the protocol libraries `pkg/rtmp` and `pkg/rtsp`:
 
 - **Segmenter:** cuts the frame sequence into segments and parts on video
   keyframes, from stream time only. It decides timing once; HLS-TS, HLS-fMP4,
@@ -178,17 +182,20 @@ never as dependencies.
 | RTP packets and H.264/H.265 packetisers; SDP | `pion/rtp`, `pion/sdp` |
 | SRT | `datarhei/gosrt` (approved: a standalone library repository) |
 | Transcoding | `asticode/go-astiav` |
+| Transcoder protocol messages | `google.golang.org/protobuf` (M4) |
 | HTTP | `go-chi/chi/v5` |
 
 Our own libraries:
 
 | Package | Contents | Milestone |
 |---|---|---|
-| `pkg/mpegts` | 33-bit timestamp unwrapping; ADTS to AudioSpecificConfig | M1 |
-| `pkg/h26x` | DTS from picture order count, for sources that carry PTS only (RTP, some TS) | M2 |
+| `pkg/mpegts` | 33-bit timestamp unwrapping and ADTS parsing (M1); a resync reader that finds 0x47 alignment again after loss or garbage, which go-astits never does (M2) | M1, M2 |
+| `pkg/unwrap` | Timestamp unwrapping for any bit width: 32-bit RTMP milliseconds, 32-bit RTP | M2 |
+| `pkg/h26x` | DTS from picture order count, for RTP sources, which carry PTS only | M2 |
 | `pkg/rtmp` | Handshake, chunk stream, client and server sessions, FLV tags, enhanced RTMP | M2 (ingest), M3 (play, push) |
 | `pkg/rtsp` | RTSP client and server, TCP interleaved and UDP, RFC 3640 AAC | M2 (client), M3 (server) |
-| `pkg/hls` | Media and multivariant playlist parsing and writing | M2 (pull), M3 (output) |
+| `pkg/hls` | Media and multivariant playlist parsing and writing | M3 (first), used by M2's HLS pull |
+| `pkg/dash` | MPD writing (live, multi-period, SegmentTimeline) and parsing for `osconform` | M3 |
 
 Container conformance checks read output with ffprobe as the independent
 oracle, plus our own playlist parser for HLS and DASH timing, so that a writer
@@ -207,11 +214,12 @@ cmd/osconform/         conformance CLI: reads an output URL and runs the checks
 internal/media/        Frame, TrackConfig, codecs, timebase
 internal/clock/        Clock
 internal/hub/          Hub and subscribers
-internal/ts/           the only MPEG-TS demuxer and muxer
+internal/ts/           the only MPEG-TS demuxer and muxer, on go-astits
+internal/e2e/          end-to-end tests across packages (tests only)
 internal/conform/      property checks and container readers for tests and the CLI
 internal/ingest/...    readers, one package per protocol
 internal/segment/      segmenter
-internal/mux/...       fMP4, FLV, RTP building blocks
+internal/mux/...       fMP4 writer on mp4ff
 internal/output/...    one package per output protocol
 internal/transcode/    subprocess supervisor and protocol
 internal/stream/       supervisor and failover
@@ -229,15 +237,18 @@ before the code they check.
 | | Milestone | Depends on | Exit criteria |
 |---|---|---|---|
 | M1 | Media core: Frame, TS demuxer, Clock, hub, frame checks, fixtures | – | Every fixture goes demux → Clock → hub with no check violation, including the PTS-wrap and looped-source fixtures |
-| M2 | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client, `pkg/hls` parser; every input protocol to Frames; input failover | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change or an ADTS sample-rate change restarts the demuxer as one epoch change |
-| M3 | Outputs: segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg, VLC-class clients and MediaMTX play every output; for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it |
+| M2 | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change restarts the demuxer as one epoch change |
+| M3 | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg, VLC-class clients and MediaMTX play every output; for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it |
 | M4 | Transcoder, watermark, thumbnails | M1, M3 | In CI (no GPU, builder image restored): a 3-rung software ladder and passthrough pass M3's scenarios. On the GPU host: the same with 3 NVENC rungs, run by a make target and recorded in the PR; a killed subprocess comes back as one new epoch; the watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5 | Feature tests; DVR playback passes `osconform` |
 | M7 | Cutover | M1–M6 | The [soak plan](SOAK_TEST_PLAN.md) runs for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
 
-M2 and M3 can run in parallel after M1, since M3's tests feed synthetic and
-fixture frames.
+M3 starts after M1, in parallel with M2, with `pkg/hls` (parser and writer,
+which both `osconform` and M2's HLS pull need) and `pkg/dash`, then the
+outputs that need no other protocol library of ours (segmenter, HLS, DASH,
+HTTP-TS, SRT). M2's HLS pull input comes after `pkg/hls`. M3's RTMP and RTSP
+outputs follow M2's `pkg/rtmp` and `pkg/rtsp`.
 
 ### Conformance checks
 
@@ -247,7 +258,7 @@ milestone and by `osconform`:
 - DTS strictly increasing per track; PTS ≥ DTS.
 - The first frame of each epoch per video track is a keyframe.
 - Track start offset within an epoch, measured on first PTS, under 40 ms *(initial)*.
-- No RASL frame directly after the first keyframe of an epoch or after a gap.
+- No RASL frame directly after the first keyframe of an epoch. (After a hub gap the same rule is checked by the hub's own tests, because frame checks cannot see `Lost`.)
 - Every segment starts on a keyframe; EXTINF and MPD durations match media
   duration within one frame.
 - Codec strings match the content.
