@@ -284,12 +284,20 @@ func (c *Clock) pushReleased(f media.Frame, t *track) {
 		c.stats.DroppedStale++
 		return
 	}
-	if c.isJump(f.DTS, c.hw) {
+	if c.isJump(f.DTS, c.hw) && !c.continues(f, t) {
 		c.openPending(true)
 		c.join(f)
 		return
 	}
 	c.acceptReleased(f, t)
+}
+
+// continues reports whether f continues its track's own timeline in the
+// released epoch (rule 2): such a frame is never a jump, so a constant skew
+// between tracks above MaxBackJump does not open epochs. A real loop or jump
+// breaks the track's own continuity too.
+func (c *Clock) continues(f media.Frame, t *track) bool {
+	return t.cur.joined && c.isOld(f.DTS, t.cur.last)
 }
 
 // isStale reports whether f, from a track that has not joined the released
