@@ -58,7 +58,7 @@ type gate uint8
 
 const (
 	gateKey  gate = iota // dropping frames until the first keyframe
-	gateRASL             // dropping RASL frames directly after that keyframe
+	gateRASL             // dropping RASL frames until the first trailing picture
 	gateOpen
 )
 
@@ -69,8 +69,9 @@ type trackEpoch struct {
 	hasLast  bool  // last is set
 	last     int64 // lastSourceDTS: source DTS of the previous accepted frame
 	gate     gate
-	held     int  // frames of this track held by the pending epoch
-	audioOut bool // an audio frame of this track was emitted in this epoch
+	keyPTS   int64 // source PTS of the keyframe that passed gateKey
+	held     int   // frames of this track held by the pending epoch
+	audioOut bool  // an audio frame of this track was emitted in this epoch
 }
 
 type track struct {
@@ -347,16 +348,14 @@ func (c *Clock) acceptReleased(f media.Frame, t *track) {
 				c.stats.DroppedLate++ // the gate stays closed
 				return
 			}
-			te.gate = gateRASL
+			te.gate, te.keyPTS = gateRASL, f.PTS
 			if !ep.hasKey || f.PTS < ep.keyPTS {
 				ep.hasKey, ep.keyPTS = true, f.PTS
 			}
 		case gateRASL:
-			if f.RASL {
-				c.stats.DroppedRASL++
+			if c.dropRASL(f, te) {
 				return
 			}
-			te.gate = gateOpen
 		case gateOpen:
 		}
 	case media.KindAudio:
@@ -424,7 +423,7 @@ func (c *Clock) join(f media.Frame) {
 				c.stats.DroppedBeforeKey++
 				return
 			}
-			te.gate = gateRASL
+			te.gate, te.keyPTS = gateRASL, f.PTS
 			if !p.hasAnchor {
 				p.anchor, p.hasAnchor = f.DTS, true
 			}
@@ -433,11 +432,9 @@ func (c *Clock) join(f media.Frame) {
 				c.dropEarlyAudio()
 			}
 		case gateRASL:
-			if f.RASL {
-				c.stats.DroppedRASL++
+			if c.dropRASL(f, te) {
 				return
 			}
-			te.gate = gateOpen
 		case gateOpen:
 		}
 	case media.KindAudio:
@@ -450,6 +447,22 @@ func (c *Clock) join(f media.Frame) {
 	p.held = append(p.held, heldFrame{f: f, at: c.opt.Now()})
 	te.held++
 	c.tryRelease()
+}
+
+// dropRASL applies rule 5's RASL gate to f, a video frame after its track's
+// gating keyframe, and reports whether f is dropped. Leading pictures (RASL
+// and RADL) are presented before that keyframe, so the gate ends at the first
+// trailing picture: a non-RASL frame with PTS above the keyframe's. A RADL
+// before it is kept and leaves the gate in place.
+func (c *Clock) dropRASL(f media.Frame, te *trackEpoch) bool {
+	if f.RASL {
+		c.stats.DroppedRASL++
+		return true
+	}
+	if f.PTS > te.keyPTS {
+		te.gate = gateOpen
+	}
+	return false
 }
 
 // dropEarlyAudio removes held audio presented before keyPTS (rule 5).

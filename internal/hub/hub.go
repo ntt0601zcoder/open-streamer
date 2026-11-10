@@ -16,8 +16,10 @@
 // # Gates
 //
 // Each subscriber gates each video track. A gated track drops frames until
-// its next keyframe; RASL frames directly after that keyframe are dropped
-// too, and the track opens at its first non-RASL frame (key or not). Frames
+// its next keyframe; after it, RASL frames are dropped until the track's
+// first trailing picture: a non-RASL frame with PTS above the keyframe's,
+// which opens the gate. Leading pictures are presented before their
+// keyframe, so a RADL is delivered but leaves the gate in place. Frames
 // that are not video (audio, or frames without a config) are delivered only
 // when every live video track has had its keyframe delivered. A new subscriber starts
 // with every video track gated, including tracks the hub has not seen yet,
@@ -98,9 +100,16 @@ type gate uint8
 
 const (
 	gateKey  gate = iota // dropping frames until the next keyframe
-	gateRASL             // keyframe delivered; dropping RASL frames directly after it
+	gateRASL             // keyframe delivered; dropping RASL frames until the first trailing picture
 	gateOpen             // delivering every frame
 )
+
+// trackGate is one subscriber's gate for one video track, with the PTS of the
+// keyframe that passed gateKey.
+type trackGate struct {
+	state  gate
+	keyPTS int64
+}
 
 // videoTrack is the hub's view of one video track.
 type videoTrack struct {
@@ -130,7 +139,7 @@ type Sub struct {
 
 	// Guarded by h.mu.
 	closed    bool
-	gates     map[int]gate // video track → gate; a missing track is gateKey
+	gates     map[int]trackGate // video track → gate; a missing track is gateKey
 	skipping  bool
 	lost      uint64
 	delivered uint64
@@ -187,7 +196,7 @@ func (h *Hub) Subscribe(name string, queue int) *Sub {
 	if queue <= 0 {
 		queue = defaultQueue
 	}
-	s := &Sub{h: h, name: name, ch: make(chan Delivery, queue), gates: map[int]gate{}}
+	s := &Sub{h: h, name: name, ch: make(chan Delivery, queue), gates: map[int]trackGate{}}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
@@ -284,17 +293,20 @@ func (h *Hub) offer(s *Sub, f media.Frame) {
 func (h *Hub) admit(s *Sub, f media.Frame) bool {
 	switch f.Kind() {
 	case media.KindVideo:
-		switch s.gates[f.Track] {
+		g := s.gates[f.Track]
+		switch g.state {
 		case gateKey:
 			if !f.Key {
 				return false
 			}
-			s.gates[f.Track] = gateRASL
+			s.gates[f.Track] = trackGate{state: gateRASL, keyPTS: f.PTS}
 		case gateRASL:
 			if f.RASL {
 				return false
 			}
-			s.gates[f.Track] = gateOpen
+			if f.PTS > g.keyPTS {
+				s.gates[f.Track] = trackGate{state: gateOpen}
+			}
 		case gateOpen:
 		}
 		return true
@@ -309,7 +321,7 @@ func (h *Hub) admit(s *Sub, f media.Frame) bool {
 // delivered to s. Called with h.mu held.
 func (h *Hub) videoStarted(s *Sub) bool {
 	for id, vt := range h.video {
-		if h.live(vt) && s.gates[id] == gateKey {
+		if h.live(vt) && s.gates[id].state == gateKey {
 			return false
 		}
 	}

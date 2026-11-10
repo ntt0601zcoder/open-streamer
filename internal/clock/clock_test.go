@@ -646,6 +646,38 @@ func TestClockDropsRASLAtEpochStart(t *testing.T) {
 		assert.Equal(t, int64(10800), out[0].DTS)
 		assert.Equal(t, uint64(2), c.Stats().DroppedRASL)
 	})
+
+	// Leading pictures are presented before the CRA. A RADL between RASL
+	// frames is decodable and kept, but it does not end the gate: only the
+	// first trailing picture (PTS above the CRA's) does.
+	leading := []media.Frame{
+		frame(0, 14400, true, false),      // CRA
+		frame(3600, 7200, false, false),   // RADL
+		frame(7200, 10800, false, true),   // RASL
+		frame(10800, 21600, false, false), // TRAIL
+		frame(14400, 18000, false, false), // TRAIL (B)
+	}
+	wantDTS := []int64{0, 3600, 10800, 14400}
+
+	t.Run("RADL between RASL, held", func(t *testing.T) {
+		c := New(Options{Kinds: av})
+		require.Empty(t, push(c, leading...))
+		out := c.Push(audio(14400))
+		require.Len(t, out, 5)
+		assert.Equal(t, wantDTS, []int64{out[0].DTS, out[1].DTS, out[2].DTS, out[3].DTS})
+		assert.Equal(t, 1, out[4].Track)
+		assert.Equal(t, uint64(1), c.Stats().DroppedRASL)
+		requireConform(t, out)
+	})
+
+	t.Run("RADL between RASL, released", func(t *testing.T) {
+		c := New(Options{Kinds: []media.Kind{media.KindVideo}})
+		out := push(c, leading...)
+		require.Len(t, out, 4)
+		assert.Equal(t, wantDTS, []int64{out[0].DTS, out[1].DTS, out[2].DTS, out[3].DTS})
+		assert.Equal(t, uint64(1), c.Stats().DroppedRASL)
+		requireConform(t, out)
+	})
 }
 
 func TestClockEpochStartAfterPresentationEnd(t *testing.T) {
