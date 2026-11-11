@@ -90,6 +90,8 @@ func ParseMultivariant(b []byte) (MultivariantPlaylist, error) {
 			p.Version = v
 		case "#EXT-X-INDEPENDENT-SEGMENTS":
 			p.Independent = true
+		case "#EXTINF", "#EXT-X-TARGETDURATION":
+			return p, fmt.Errorf("hls: media playlist given to ParseMultivariant")
 		case "#EXT-X-MEDIA":
 			r, err := parseRendition(val)
 			if err != nil {

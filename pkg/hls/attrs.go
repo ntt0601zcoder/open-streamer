@@ -19,7 +19,7 @@ func parseAttrs(s string) (map[string]string, error) {
 		}
 		eq := strings.IndexByte(s[i:], '=')
 		if eq < 0 {
-			return nil, fmt.Errorf("hls: attribute without value in %q", s)
+			return nil, fmt.Errorf("attribute without value in %q", s)
 		}
 		key := strings.TrimSpace(s[i : i+eq])
 		i += eq + 1
@@ -27,12 +27,12 @@ func parseAttrs(s string) (map[string]string, error) {
 		if i < len(s) && s[i] == '"' {
 			end := strings.IndexByte(s[i+1:], '"')
 			if end < 0 {
-				return nil, fmt.Errorf("hls: unterminated quoted string in %q", s)
+				return nil, fmt.Errorf("unterminated quoted string in %q", s)
 			}
 			val = s[i+1 : i+1+end]
 			i += end + 2
 			if i < len(s) && s[i] != ',' && s[i] != ' ' {
-				return nil, fmt.Errorf("hls: junk after quoted string in %q", s)
+				return nil, fmt.Errorf("junk after quoted string in %q", s)
 			}
 		} else {
 			end := strings.IndexByte(s[i:], ',')

@@ -103,7 +103,7 @@ func ParseMedia(b []byte) (MediaPlaylist, error) {
 		case "#EXT-X-DISCONTINUITY":
 			cur.Discontinuity = true
 		case "#EXT-X-PROGRAM-DATE-TIME":
-			cur.ProgramDateTime, err = time.Parse(time.RFC3339Nano, val)
+			cur.ProgramDateTime, err = parseDateTime(val)
 		case "#EXT-X-MAP":
 			curMap, err = parseMapURI(val)
 		case "#EXTINF":
@@ -141,4 +141,17 @@ func parseExtinf(val string) (time.Duration, error) {
 		return 0, fmt.Errorf("negative duration %v", f)
 	}
 	return time.Duration(f*float64(time.Second) + 0.5), nil
+}
+
+// parseDateTime parses RFC 3339, falling back to offsets without a colon
+// (for example +0700) as written by ffmpeg.
+func parseDateTime(val string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339Nano, val)
+	if err == nil {
+		return t, nil
+	}
+	if t2, err2 := time.Parse("2006-01-02T15:04:05.999999999Z0700", val); err2 == nil {
+		return t2, nil
+	}
+	return time.Time{}, err
 }

@@ -69,18 +69,19 @@ func TestParseMediaHandWritten(t *testing.T) {
 
 func TestParseMediaErrors(t *testing.T) {
 	cases := map[string]string{
-		"empty":           "",
-		"no header":       "#EXT-X-VERSION:3\n",
-		"bad version":     "#EXTM3U\n#EXT-X-VERSION:x\n",
-		"bad target":      "#EXTM3U\n#EXT-X-TARGETDURATION:x\n",
-		"bad sequence":    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:-1\n",
-		"bad disc seq":    "#EXTM3U\n#EXT-X-DISCONTINUITY-SEQUENCE:x\n",
-		"bad extinf":      "#EXTM3U\n#EXTINF:abc,\na.ts\n",
-		"negative extinf": "#EXTM3U\n#EXTINF:-1,\na.ts\n",
-		"bad pdt":         "#EXTM3U\n#EXT-X-PROGRAM-DATE-TIME:nope\n#EXTINF:1,\na.ts\n",
-		"uri no extinf":   "#EXTM3U\na.ts\n",
-		"map no uri":      "#EXTM3U\n#EXT-X-MAP:BYTERANGE=\"1@2\"\n",
-		"multivariant":    "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n",
+		"empty":            "",
+		"no header":        "#EXT-X-VERSION:3\n",
+		"bad version":      "#EXTM3U\n#EXT-X-VERSION:x\n",
+		"bad target":       "#EXTM3U\n#EXT-X-TARGETDURATION:x\n",
+		"bad sequence":     "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:-1\n",
+		"bad disc seq":     "#EXTM3U\n#EXT-X-DISCONTINUITY-SEQUENCE:x\n",
+		"bad extinf":       "#EXTM3U\n#EXTINF:abc,\na.ts\n",
+		"negative extinf":  "#EXTM3U\n#EXTINF:-1,\na.ts\n",
+		"bad pdt":          "#EXTM3U\n#EXT-X-PROGRAM-DATE-TIME:nope\n#EXTINF:1,\na.ts\n",
+		"uri no extinf":    "#EXTM3U\na.ts\n",
+		"map no uri":       "#EXTM3U\n#EXT-X-MAP:BYTERANGE=\"1@2\"\n",
+		"unterminated map": "#EXTM3U\n#EXT-X-MAP:URI=\"x\n",
+		"multivariant":     "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n",
 	}
 	for name, src := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -150,6 +151,7 @@ func TestParseMultivariantErrors(t *testing.T) {
 		"no uri":         "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n",
 		"no uri 2":       "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n#EXT-X-STREAM-INF:BANDWIDTH=2\nv.m3u8\n",
 		"bad attr":       "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,NAME=\"x\n",
+		"media playlist": "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\na.ts\n",
 		"media no type":  "#EXTM3U\n#EXT-X-MEDIA:NAME=\"x\"\n",
 	}
 	for name, src := range cases {
@@ -170,4 +172,17 @@ func TestParseAttrs(t *testing.T) {
 	require.Error(t, err)
 	_, err = parseAttrs(`A="x"y`)
 	require.Error(t, err)
+}
+
+func TestParseMediaColonlessOffset(t *testing.T) {
+	p, err := ParseMedia([]byte("#EXTM3U\n#EXT-X-PROGRAM-DATE-TIME:2026-11-11T23:17:11.457+0700\n#EXTINF:2,\na.ts\n"))
+	require.NoError(t, err)
+	require.Len(t, p.Segments, 1)
+	assert.True(t, p.Segments[0].ProgramDateTime.Equal(time.Date(2026, 11, 11, 16, 17, 11, 457000000, time.UTC)))
+}
+
+func TestParseMediaMapErrorSinglePrefix(t *testing.T) {
+	_, err := ParseMedia([]byte("#EXTM3U\n#EXT-X-MAP:URI=\"x\n"))
+	require.Error(t, err)
+	assert.Equal(t, 1, strings.Count(err.Error(), "hls:"), err.Error())
 }
