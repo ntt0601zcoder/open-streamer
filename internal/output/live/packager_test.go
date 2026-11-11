@@ -320,7 +320,7 @@ func TestHandlerNotFound(t *testing.T) {
 		"/live/s/cmaf/init-0-4294967296.mp4",
 		"/live/s/cmaf/foo.mp4",
 		"/live/s/other/0.ts",
-		"/live/s/cmaf/index.mpd",
+		"/live/s/cmaf/other.mpd",
 	} {
 		code, _ := get(t, srv, path)
 		assert.Equal(t, http.StatusNotFound, code, path)
