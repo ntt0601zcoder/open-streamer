@@ -132,7 +132,7 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 - **Segmenter:** cuts the frame sequence into segments and parts on video
   keyframes, from stream time only. It decides timing once; HLS-TS, HLS-fMP4,
   DASH and DVR consume the same segments.
-- **TS muxer** (go-astits `Muxer`), **fMP4 writer** (mp4ff `mp4`), **FLV tag
+- **TS muxer** (our `pkg/mpegts` writer), **fMP4 writer** (mp4ff `mp4`), **FLV tag
   codec** with enhanced RTMP for H.265 (`pkg/rtmp`), **RTP** packetisers
   (pion/rtp for H.264 and H.265, our own RFC 3640 for AAC in `pkg/rtsp`).
 - **Epoch helper:** one function that tells an output what to do at an epoch
@@ -189,7 +189,6 @@ never as dependencies.
 
 | Concern | Library |
 |---|---|
-| MPEG-TS packets, PES, PSI | `asticode/go-astits` |
 | H.264, H.265, AAC parsing (SPS, PPS, VPS, ASC, ADTS); fMP4 boxes | `Eyevinn/mp4ff` |
 | RTP packets and H.264/H.265 packetisers; SDP | `pion/rtp`, `pion/sdp` |
 | SRT | `datarhei/gosrt` (approved: a standalone library repository) |
@@ -201,7 +200,7 @@ Our own libraries:
 
 | Package | Contents | Milestone |
 |---|---|---|
-| `pkg/mpegts` | 33-bit timestamp unwrapping and ADTS parsing (M1); a resync reader that finds 0x47 alignment again after loss or garbage, which go-astits never does (M2) | M1, M2 |
+| `pkg/mpegts` | 33-bit timestamp unwrapping and ADTS parsing (M1); TS packet reader that resynchronises after loss or garbage, PAT/PMT with CRC and versions, PES assembly, and a TS writer (M3a). It replaces go-astits, whose behaviour on lossy and non-seekable input needed a workaround per case | M1, M3a |
 | `pkg/unwrap` | Timestamp unwrapping for any bit width: 32-bit RTMP milliseconds, 32-bit RTP | M2 |
 | `pkg/h26x` | DTS from picture order count, for RTP sources, which carry PTS only | M2 |
 | `pkg/rtmp` | Handshake, chunk stream, client and server sessions, FLV tags, enhanced RTMP | M2 (ingest), M3 (play, push) |
@@ -226,7 +225,7 @@ cmd/osconform/         conformance CLI: reads an output URL and runs the checks
 internal/media/        Frame, TrackConfig, codecs, timebase
 internal/clock/        Clock
 internal/hub/          Hub and subscribers
-internal/ts/           the only MPEG-TS demuxer and muxer, on go-astits
+internal/ts/           the only MPEG-TS demuxer and muxer, on pkg/mpegts
 internal/e2e/          end-to-end tests across packages (tests only)
 internal/conform/      property checks and container readers for tests and the CLI
 internal/ingest/...    readers, one package per protocol
@@ -271,8 +270,8 @@ outputs follow M2's `pkg/rtmp` and `pkg/rtsp`.
 - **M2, readers:** pass `Kinds` to the Clock, and keep `Config` pointers
   stable across repeated identical sequence headers.
 - **M2, tests:** failover tests assert both the epoch count and the frames
-  lost; frames lost to go-astits continuity-counter discontinuities are
-  counted; the one-PES-per-access-unit and PES-without-PTS assumptions get a
+  lost; frames lost to continuity-counter discontinuities are
+  counted (`pkg/mpegts` reports them); the one-PES-per-access-unit and PES-without-PTS assumptions get a
   broadcast-style test.
 - **M2, Clock:** a track that joins an epoch after its `AlignWindow` release
   can start later than the track-start offset allows; M2 closes this gap.
