@@ -88,6 +88,10 @@ type Packager struct {
 	tsSeq   uint64                 // TSSeq of the next segment with TS bytes
 	tsGap   bool                   // a TS segment was dropped since the last good one
 
+	// TARGETDURATION per playlist; it never shrinks. Guarded by tdMu.
+	tdMu sync.Mutex
+	td   map[string]int
+
 	// Shared state. The writer changes it only while holding both work and
 	// mu, so it may read it holding work alone.
 	mu sync.Mutex

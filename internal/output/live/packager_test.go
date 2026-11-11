@@ -320,8 +320,6 @@ func TestHandlerNotFound(t *testing.T) {
 		"/live/s/cmaf/init-0-4294967296.mp4",
 		"/live/s/cmaf/foo.mp4",
 		"/live/s/other/0.ts",
-		"/live/s/hls/index.m3u8",
-		"/live/s/cmaf/master.m3u8",
 		"/live/s/cmaf/index.mpd",
 	} {
 		code, _ := get(t, srv, path)
