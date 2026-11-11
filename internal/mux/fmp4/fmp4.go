@@ -121,11 +121,11 @@ func Segment(frames []media.Frame, c *media.TrackConfig, seq uint32) ([]byte, Ti
 		var cto int32
 		flags := mp4.NonSyncSampleFlags
 		if audio {
-			data = f.Data[0]
-			flags = mp4.SyncSampleFlags
 			if len(f.Data) != 1 {
 				return nil, Timing{}, fmt.Errorf("fmp4: segment: audio frame %d has %d units", i, len(f.Data))
 			}
+			data = f.Data[0]
+			flags = mp4.SyncSampleFlags
 		} else {
 			cto = int32(f.PTS - f.DTS)
 			if f.Key {

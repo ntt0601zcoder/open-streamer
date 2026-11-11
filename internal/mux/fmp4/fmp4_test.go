@@ -274,6 +274,10 @@ func TestSegmentErrors(t *testing.T) {
 	two[0].Data = [][]byte{{1}, {2}}
 	_, _, err = fmp4.Segment(two, cfg, 1)
 	require.Error(t, err, "audio frame with several units")
+	none := mk(0)
+	none[0].Data = nil
+	_, _, err = fmp4.Segment(none, cfg, 1)
+	require.Error(t, err, "audio frame without data")
 	_, _, err = fmp4.Segment(mk(0), audioCfg(96000, 2, nil), 1)
 	require.Error(t, err)
 	_, err = fmp4.Init(audioCfg(48000, 0, nil))
