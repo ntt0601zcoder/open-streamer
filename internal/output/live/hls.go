@@ -79,7 +79,7 @@ func parseTrackPlaylist(name string) (media.Kind, int, bool) {
 func (p *Packager) targetDuration(key string, s Snapshot, extinfs []time.Duration) int {
 	td := int(math.Ceil(float64(s.Target) / media.ClockRate))
 	for _, d := range extinfs {
-		td = max(td, int(math.Round(d.Seconds())))
+		td = max(td, int(math.Round(d.Round(time.Millisecond).Seconds()))) // as printed by EXTINF
 	}
 	p.tdMu.Lock()
 	defer p.tdMu.Unlock()
