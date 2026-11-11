@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,4 +186,59 @@ func TestRunBadInput(t *testing.T) {
 	err := Run(context.Background(), h, Options{Open: openBytes(bytes.Repeat([]byte("garbage!"), 500))})
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "pipeline:")
+}
+
+type blockingReader struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *blockingReader) Read([]byte) (int, error) {
+	<-b.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (b *blockingReader) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+func TestRunCancelBlockedRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	br := &blockingReader{closed: make(chan struct{})}
+	res := make(chan error, 1)
+	go func() {
+		res <- Run(ctx, hub.New(hub.Options{}), Options{Open: func() (io.ReadCloser, error) { return br, nil }})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-res:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestPaceLongEpochNoOverflow(t *testing.T) {
+	now := time.Unix(1000, 0)
+	var slept time.Duration
+	const span = 30 * 24 * 3600 * media.ClockRate
+	w := &writer{
+		h: hub.New(hub.Options{}),
+		opt: Options{
+			Pace: true,
+			Now:  func() time.Time { return now },
+			Sleep: func(_ context.Context, d time.Duration) error {
+				slept = d
+				return nil
+			},
+		},
+		anchored: 1,
+		anchors:  map[uint32]media.Anchor{1: {Epoch: 1, Start: 0, Wall: now}, 0: {Epoch: 0}},
+	}
+	require.NoError(t, w.write(context.Background(), []media.Frame{{Epoch: 1, DTS: span, PTS: span}}))
+	assert.Equal(t, 30*24*time.Hour, slept)
+	assert.Len(t, w.anchors, 1, "older epochs are pruned")
 }
