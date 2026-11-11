@@ -1,10 +1,12 @@
 package live
 
 import (
+	"cmp"
 	"context"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -109,13 +111,15 @@ func TestMPDUnlistedAndEmpty(t *testing.T) {
 	clk.Set(t0.Add(-time.Second))
 	code, _ := get(t, srv, "/live/s/cmaf/index.mpd")
 	assert.Equal(t, http.StatusNotFound, code)
-	assert.Nil(t, buildMPD(Snapshot{}))
+	body, _ := buildMPD(Snapshot{})
+	assert.Nil(t, body)
 	// Listed but nothing usable: no init for any track.
 	s := p.Snapshot()
 	for i := range s.Epochs {
 		s.Epochs[i].Tracks = []EpochTrack{{Track: 0, Config: s.Epochs[i].Tracks[0].Config}}
 	}
-	assert.Nil(t, buildMPD(s))
+	body, _ = buildMPD(s)
+	assert.Nil(t, body)
 }
 
 func TestMPDBandwidth(t *testing.T) {
@@ -138,56 +142,148 @@ func TestMPDBandwidth(t *testing.T) {
 	}
 }
 
+// synthAV is synth plus an audio track 1 (48 kHz AAC, 1024-sample frames)
+// covering the same span of stream time.
+func synthAV(t *testing.T, epoch uint32, start int64) []hub.Delivery {
+	t.Helper()
+	aac, err := media.NewAACConfig([]byte{0x11, 0x90})
+	require.NoError(t, err)
+	out := synth(h264Config(t), epoch, start, 100)
+	for ts := start; ts < start+100*3600; ts += 1920 {
+		out = append(out, hub.Delivery{Frame: media.Frame{
+			Track: 1, Config: aac, PTS: ts, DTS: ts, Key: true, Data: [][]byte{{0x21, 0x00}}, Epoch: epoch,
+		}})
+	}
+	slices.SortStableFunc(out, func(a, b hub.Delivery) int { return cmp.Compare(a.Frame.DTS, b.Frame.DTS) })
+	return out
+}
+
+// mediaEnd returns the end of a timeline entry as an offset from the start of
+// its period, rounded up.
+func mediaEnd(tpl *dash.SegmentTemplate, sg dash.Seg) time.Duration {
+	ticks := sg.T + sg.D - tpl.PresentationTimeOffset
+	ts := uint64(tpl.Timescale)
+	return time.Duration((ticks*uint64(time.Second) + ts - 1) / ts)
+}
+
 func TestMPDPeriodAfterPause(t *testing.T) {
-	cfg := h264Config(t)
 	h := hub.New(hub.Options{})
 	clk := &fakeNow{t: t0.Add(time.Hour)}
-	p := NewPackager(h, Options{Window: 3, Now: clk.Now})
+	p := NewPackager(h, Options{Window: 10, Now: clk.Now})
 	srv := serve(p)
 
+	// Epoch 2 continues stream time after a 10 s wallclock pause.
 	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
-	handleAll(p, synth(cfg, 1, 0, 100))
+	handleAll(p, synthAV(t, 1, 0))
 	h.SetAnchor(media.Anchor{Epoch: 2, Start: 360000, Wall: t0.Add(14 * time.Second)})
-	handleAll(p, synth(cfg, 2, 360000, 100))
+	handleAll(p, synthAV(t, 2, 360000))
 	p.Flush()
 
-	m := mpdOf(t, srv)
-	var e2 dash.Period
-	for _, per := range m.Periods {
-		if per.ID == "e2" {
-			e2 = per
+	// Now sits exactly at the end of the first segment of epoch 2.
+	snap := p.Snapshot()
+	var seg2 SegmentInfo
+	for _, sg := range snap.Segments {
+		if sg.Epoch == 2 {
+			seg2 = sg
+			break
 		}
 	}
-	require.Equal(t, "e2", e2.ID)
-	assert.Equal(t, dash.Duration(14*time.Second), e2.Start)
-	st := e2.AdaptationSets[0].SegmentTemplate
-	assert.EqualValues(t, 360000, st.PresentationTimeOffset)
+	e2info, _ := snap.Epoch(2)
+	clk.Set(e2info.WallAt(seg2.End))
+	snap = p.Snapshot()
+	require.Less(t, snap.Listed, len(snap.Segments), "later segments are not listed yet")
 
-	// Nothing listed ends after Now.
-	snap := p.Snapshot()
-	for _, per := range m.Periods {
+	m := mpdOf(t, srv)
+	require.Len(t, m.Periods, 2)
+	e2 := m.Periods[1]
+	assert.Equal(t, "e2", e2.ID)
+	assert.Equal(t, dash.Duration(14*time.Second), e2.Start)
+	require.Len(t, e2.AdaptationSets, 2)
+	assert.EqualValues(t, 360000, e2.AdaptationSets[0].SegmentTemplate.PresentationTimeOffset)
+	assert.EqualValues(t, 192000, e2.AdaptationSets[1].SegmentTemplate.PresentationTimeOffset)
+
+	oneSample := time.Second/48000 + 1
+	for i, per := range m.Periods {
+		var last time.Duration
 		for _, as := range per.AdaptationSets {
 			tpl := as.SegmentTemplate
 			for _, sg := range tpl.Timeline.Resolve() {
-				end := time.Duration(per.Start) + time.Duration((sg.T+sg.D-tpl.PresentationTimeOffset)*uint64(time.Second)/uint64(tpl.Timescale))
-				assert.LessOrEqual(t, snap.AST.Add(end), snap.Now)
+				end := mediaEnd(tpl, sg)
+				last = max(last, end)
+				abs := snap.AST.Add(time.Duration(per.Start) + end)
+				assert.LessOrEqual(t, abs.Sub(snap.Now), oneSample, "%s %s ends after Now", per.ID, as.ContentType)
 			}
 		}
+		if i+1 < len(m.Periods) {
+			assert.LessOrEqual(t, time.Duration(per.Start)+last, time.Duration(m.Periods[i+1].Start), "%s overlaps the next period", per.ID)
+		}
 	}
+}
 
-	// Later epoch 1 slides out: epoch 2 keeps its start.
-	h.SetAnchor(media.Anchor{Epoch: 3, Start: 720000, Wall: t0.Add(40 * time.Second)})
-	handleAll(p, synth(cfg, 3, 720000, 100))
+func TestMPDPeriodStartSurvivesSlide(t *testing.T) {
+	h := hub.New(hub.Options{})
+	p := NewPackager(h, Options{Window: 3, Now: farFuture})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+	handleAll(p, synthAV(t, 1, 0))
+	h.SetAnchor(media.Anchor{Epoch: 2, Start: 360000, Wall: t0.Add(14 * time.Second)})
+	handleAll(p, synthAV(t, 2, 360000))
 	p.Flush()
-	m2 := mpdOf(t, srv)
+	before := mpdOf(t, serve(p))
+	require.Len(t, before.Periods, 2)
+	h.SetAnchor(media.Anchor{Epoch: 3, Start: 720000, Wall: t0.Add(40 * time.Second)})
+	handleAll(p, synthAV(t, 3, 720000))
+	p.Flush()
+	after := mpdOf(t, serve(p))
 	var got dash.Duration = -1
-	for _, per := range m2.Periods {
-		assert.NotEqual(t, "e1", per.ID)
+	for _, per := range after.Periods {
+		assert.NotEqual(t, "e1", per.ID, "epoch 1 slid out")
 		if per.ID == "e2" {
 			got = per.Start
 		}
 	}
-	assert.Equal(t, e2.Start, got)
+	assert.Equal(t, before.Periods[1].Start, got)
+}
+
+func TestMPDAudioOffset(t *testing.T) {
+	h := hub.New(hub.Options{})
+	p := NewPackager(h, Options{Window: 10, Now: farFuture})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 548640, Wall: t0})
+	handleAll(p, synthAV(t, 1, 548640))
+	p.Flush()
+	m := mpdOf(t, serve(p))
+	require.Len(t, m.Periods, 1)
+	sets := m.Periods[0].AdaptationSets
+	require.Len(t, sets, 2)
+	assert.EqualValues(t, 548640, sets[0].SegmentTemplate.PresentationTimeOffset)
+	assert.EqualValues(t, 292608, sets[1].SegmentTemplate.PresentationTimeOffset)
+	// The first segment starts at the offset in both timescales.
+	assert.Equal(t, int64(548640), int64(*sets[0].SegmentTemplate.Timeline.S[0].T))
+	assert.InDelta(t, 292608, float64(*sets[1].SegmentTemplate.Timeline.S[0].T), 1024)
+}
+
+func TestMPDCodecStringFailure(t *testing.T) {
+	p, _ := packClip(t, "h264_aac.ts", Options{Window: 100, Now: farFuture})
+	s := p.Snapshot()
+	bad := *s.Epochs[0].Tracks[0].Config
+	bad.SPS = nil
+	s.Epochs[0].Tracks = []EpochTrack{
+		{Track: 0, Config: &bad, Init: s.Epochs[0].Tracks[0].Init},
+		s.Epochs[0].Tracks[1],
+	}
+	body, skipped := buildMPD(s)
+	assert.Equal(t, 1, skipped)
+	m, err := dash.Parse(body)
+	require.NoError(t, err)
+	require.Len(t, m.Periods[0].AdaptationSets, 1)
+	assert.Equal(t, "audio", m.Periods[0].AdaptationSets[0].ContentType)
+
+	// The route counts the skip as a packager error.
+	before := p.Errors()
+	i := slices.IndexFunc(playlistRoutes, func(r playlistRoute) bool { return r.dir == dirCMAF && r.match("index.mpd") })
+	require.GreaterOrEqual(t, i, 0)
+	_, _, ok := playlistRoutes[i].build(p, s, "index.mpd")
+	assert.True(t, ok)
+	assert.EqualValues(t, before+1, p.Errors())
 }
 
 func TestMPDMissingTrack(t *testing.T) {
@@ -197,6 +293,7 @@ func TestMPDMissingTrack(t *testing.T) {
 	assert.Len(t, m.Periods[0].AdaptationSets, 2)
 	p2 := m.Periods[1]
 	assert.Equal(t, "e2", p2.ID)
+	assert.Equal(t, dash.Duration(6096*time.Millisecond), p2.Start)
 	require.Len(t, p2.AdaptationSets, 1)
 	assert.Equal(t, "video", p2.AdaptationSets[0].ContentType)
 	assert.Equal(t, "avc1.4D401E", p2.AdaptationSets[0].Representations[0].Codecs)
@@ -211,7 +308,7 @@ func TestMPDSkipsTrackWithoutInit(t *testing.T) {
 	p, _ := packClip(t, "h264_aac.ts", Options{Window: 100, Now: farFuture})
 	s := p.Snapshot()
 	s.Epochs[0].Tracks = []EpochTrack{s.Epochs[0].Tracks[0], {Track: 1, Config: s.Epochs[0].Tracks[1].Config}}
-	data := buildMPD(s)
+	data, _ := buildMPD(s)
 	m, err := dash.Parse(data)
 	require.NoError(t, err)
 	require.Len(t, m.Periods[0].AdaptationSets, 1)
