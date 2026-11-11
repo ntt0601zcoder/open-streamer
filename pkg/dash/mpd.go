@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -53,7 +54,7 @@ type MPD struct {
 	MinimumUpdatePeriod        Duration   `xml:"minimumUpdatePeriod,attr,omitempty"`
 	TimeShiftBufferDepth       Duration   `xml:"timeShiftBufferDepth,attr,omitempty"`
 	SuggestedPresentationDelay Duration   `xml:"suggestedPresentationDelay,attr,omitempty"`
-	MinBufferTime              Duration   `xml:"minBufferTime,attr,omitempty"`
+	MinBufferTime              Duration   `xml:"minBufferTime,attr"`
 	Periods                    []Period   `xml:"Period"`
 	UTCTiming                  *UTCTiming `xml:"UTCTiming,omitempty"`
 }
@@ -115,12 +116,51 @@ type SegmentTimeline struct {
 	S []S `xml:"S"`
 }
 
-// S is one timeline entry. T is always written; R is the repeat count
-// (omitted when zero).
+// S is one timeline entry. T is written whenever it is set; nil means the
+// attribute is absent and the start follows the previous entry (see
+// SegmentTimeline.Resolve). R is the repeat count (omitted when zero).
 type S struct {
-	T uint64 `xml:"t,attr"`
-	D uint64 `xml:"d,attr"`
-	R int64  `xml:"r,attr,omitempty"`
+	T *uint64 `xml:"t,attr,omitempty"`
+	D uint64  `xml:"d,attr"`
+	R int64   `xml:"r,attr,omitempty"`
+}
+
+// Seg is one resolved segment: absolute start T and duration D in timescale
+// units.
+type Seg struct {
+	T, D uint64
+}
+
+// maxRepeat bounds the expansion of a single S entry so a hostile r value
+// cannot exhaust memory.
+const maxRepeat = 100000
+
+// Resolve expands repeats and applies the implicit-start rule: an S without t
+// starts where the previous entry ended (previous t + d*(r+1)), and the first
+// S without t starts at 0. A negative r (repeat to the end of the period) is
+// treated as 0 because the end is unknown here; r is capped at 100000.
+func (t SegmentTimeline) Resolve() []Seg {
+	var out []Seg
+	var next uint64
+	for _, e := range t.S {
+		start := next
+		if e.T != nil {
+			start = *e.T
+		}
+		r := e.R
+		if r < 0 {
+			r = 0
+		}
+		if r > maxRepeat {
+			r = maxRepeat
+		}
+		for i := int64(0); i <= r; i++ {
+			out = append(out, Seg{T: start, D: e.D})
+			start += e.D
+		}
+		next = start
+	}
+	return out
 }
 
 // Encode returns the MPD as XML. Times are written in UTC. Xmlns defaults to
@@ -275,10 +315,20 @@ func ParseDuration(s string) (time.Duration, error) {
 		if err != nil {
 			return bad(err.Error())
 		}
-		total += time.Duration(v) * unit[u]
-		if u == 'S' {
-			total += fracNanos(num)
+		if v > int64(math.MaxInt64/unit[u]) {
+			return bad("out of range")
 		}
+		part := time.Duration(v) * unit[u]
+		if u == 'S' {
+			part += fracNanos(num) // below one second, cannot overflow past the check
+			if part < 0 {
+				return bad("out of range")
+			}
+		}
+		if total > math.MaxInt64-part {
+			return bad("out of range")
+		}
+		total += part
 		components++
 	}
 	if components == 0 {
