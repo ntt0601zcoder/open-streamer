@@ -148,3 +148,60 @@ func TestParseADTSPayloadCapacityLimited(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, len(frames[0].Payload), cap(frames[0].Payload))
 }
+
+func TestAppendADTS(t *testing.T) {
+	tests := []struct {
+		name string
+		asc  []byte
+		rate int
+		ch   uint8
+	}{
+		{"mono", []byte{0x11, 0x88}, 48000, 1},
+		{"stereo", []byte{0x12, 0x10}, 44100, 2},
+		{"5.1", []byte{0x12, 0x30}, 44100, 6},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p1, p2 := bytes.Repeat([]byte{0x5A}, 100), bytes.Repeat([]byte{0xA5}, 3000)
+			buf, err := AppendADTS([]byte{}, tt.asc, p1)
+			require.NoError(t, err)
+			buf, err = AppendADTS(buf, tt.asc, p2)
+			require.NoError(t, err)
+			frames, err := ParseADTS(buf)
+			require.NoError(t, err)
+			require.Len(t, frames, 2)
+			assert.Equal(t, p1, frames[0].Payload)
+			assert.Equal(t, p2, frames[1].Payload)
+			for _, f := range frames {
+				assert.Equal(t, tt.asc, f.AudioSpecificConfig())
+				assert.Equal(t, tt.rate, f.SampleRate)
+				assert.Equal(t, tt.ch, f.ChannelConfig)
+			}
+		})
+	}
+}
+
+func TestAppendADTSErrors(t *testing.T) {
+	tests := map[string][]byte{
+		"short asc":     {0x12},
+		"object type 5": {0x2A, 0x10},
+		"object type 0": {0x02, 0x10},
+		"sample index":  {0x17, 0x90},
+		"channels 0":    {0x12, 0x00},
+		"channels 8":    {0x12, 0x40},
+	}
+	for name, asc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := AppendADTS(nil, asc, []byte{1})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "mpegts: adts:")
+		})
+	}
+	_, err := AppendADTS(nil, []byte{0x12, 0x10}, make([]byte, 8185))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mpegts: adts:")
+	buf, err := AppendADTS(nil, []byte{0x12, 0x10}, make([]byte, 8184))
+	require.NoError(t, err)
+	_, err = ParseADTS(buf)
+	assert.NoError(t, err)
+}
