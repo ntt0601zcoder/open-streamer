@@ -71,6 +71,7 @@ const (
 	defaultGOPCacheFrames  = 1500
 	defaultAudioCacheTicks = media.ClockRate
 	defaultQueue           = 1024
+	maxAnchors             = 64
 )
 
 // Options tunes a Hub. Zero values select the defaults.
@@ -129,6 +130,7 @@ type Hub struct {
 	started bool  // latest is set
 	anchor  int   // track the cache is anchored on, or -1 for the audio cache
 	cache   []media.Frame
+	anchors []media.Anchor // oldest first, at most maxAnchors
 }
 
 // Sub is one subscriber. Its methods are safe for concurrent use.
@@ -384,4 +386,34 @@ func (h *Hub) dropCacheFront(n int) {
 	m := copy(h.cache, h.cache[n:])
 	clear(h.cache[m:])
 	h.cache = h.cache[:m]
+}
+
+// SetAnchor records an epoch's wallclock anchor. The hub keeps the last 64;
+// an anchor with an Epoch already held replaces that one.
+func (h *Hub) SetAnchor(a media.Anchor) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.anchors {
+		if h.anchors[i].Epoch == a.Epoch {
+			h.anchors[i] = a
+			return
+		}
+	}
+	if len(h.anchors) >= maxAnchors {
+		n := copy(h.anchors, h.anchors[1:])
+		h.anchors = h.anchors[:n]
+	}
+	h.anchors = append(h.anchors, a)
+}
+
+// Anchor returns the anchor recorded for epoch, if the hub still holds it.
+func (h *Hub) Anchor(epoch uint32) (media.Anchor, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, a := range h.anchors {
+		if a.Epoch == epoch {
+			return a, true
+		}
+	}
+	return media.Anchor{}, false
 }
