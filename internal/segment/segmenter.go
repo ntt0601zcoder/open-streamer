@@ -70,7 +70,11 @@ type open struct {
 	seg    Segment
 	anchor int
 	lost   bool // opened after Lost > 0: early non-anchor frames are dropped
-	tracks map[int]*trackAcc
+	disc   bool // s.disc when it opened, restored if the segment is carried
+	// leading marks an audio-anchored segment that opened before any segment
+	// of its epoch closed: a video anchor supersedes it instead of cutting it.
+	leading bool
+	tracks  map[int]*trackAcc
 }
 
 // Segmenter cuts deliveries into segments. Create one with New.
@@ -84,8 +88,10 @@ type Segmenter struct {
 	epoch       uint32
 	anchor      int // -1 when the epoch has no track yet
 	anchorVideo bool
-	disc        bool // next segment is a discontinuity
-	lost        bool // next segment opens after Lost > 0
+	disc        bool          // next segment is a discontinuity
+	lost        bool          // next segment opens after Lost > 0
+	closed      bool          // a segment of this epoch has closed
+	carry       []media.Frame // leading audio waiting for the video anchor's keyframe
 }
 
 // New returns a Segmenter.
@@ -113,21 +119,29 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 			s.disc = true
 		}
 		s.haveEpoch, s.epoch = true, f.Epoch
-		s.anchor, s.anchorVideo = -1, false
+		s.anchor, s.anchorVideo, s.closed = -1, false, false
+		s.dropCarry()
 	}
 	if d.Lost > 0 {
 		if s.cur != nil {
 			out = append(out, s.closeOpen(-1))
 		}
+		s.dropCarry()
 		s.disc, s.lost = true, true
 	}
 	if s.promote(f) && s.cur != nil {
-		out = append(out, s.closeOpen(-1))
+		if s.cur.leading {
+			s.uncut()
+		} else {
+			out = append(out, s.closeOpen(-1))
+		}
 	}
 
 	isAnchor := f.Track == s.anchor
 	opens := isAnchor && (f.Key || !s.anchorVideo)
 	switch {
+	case s.cur == nil && !opens && s.carry != nil && !isAnchor:
+		s.carry = append(s.carry, f)
 	case s.cur == nil && !opens:
 		s.dropped++
 	case s.cur == nil:
@@ -161,6 +175,7 @@ func (s *Segmenter) promote(f media.Frame) bool {
 
 // Flush closes the open segment, if any.
 func (s *Segmenter) Flush() []Segment {
+	s.dropCarry()
 	if s.cur == nil {
 		return nil
 	}
@@ -175,13 +190,39 @@ func (s *Segmenter) openAt(f media.Frame) {
 			Discontinuity: s.disc && s.seq > 0,
 			Start:         f.PTS,
 		},
-		anchor: f.Track,
-		lost:   s.lost,
-		tracks: map[int]*trackAcc{},
+		anchor:  f.Track,
+		lost:    s.lost,
+		disc:    s.disc,
+		leading: !s.anchorVideo && !s.closed,
+		tracks:  map[int]*trackAcc{},
 	}
 	s.seq++
 	s.disc, s.lost = false, false
+	carry := s.carry
+	s.carry = nil
+	for _, c := range carry {
+		if c.PTS < f.PTS {
+			s.dropped++
+			continue
+		}
+		s.add(c)
+	}
 	s.add(f)
+}
+
+// uncut takes back the open leading audio segment: its frames wait in carry
+// for the video anchor's first keyframe and its Seq is released.
+func (s *Segmenter) uncut() {
+	c := s.cur
+	s.cur = nil
+	s.seq--
+	s.disc, s.lost = c.disc, c.lost
+	s.carry = c.seg.Frames
+}
+
+func (s *Segmenter) dropCarry() {
+	s.dropped += uint64(len(s.carry))
+	s.carry = nil
 }
 
 func (s *Segmenter) add(f media.Frame) {
@@ -210,6 +251,7 @@ func defaultDelta(f media.Frame) int64 {
 func (s *Segmenter) closeOpen(duration int64) Segment {
 	c := s.cur
 	s.cur = nil
+	s.closed = true
 	seg := c.seg
 	if duration < 0 {
 		duration = c.tracks[c.anchor].end() - seg.Start

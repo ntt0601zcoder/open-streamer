@@ -100,10 +100,9 @@ func TestSegmentLost(t *testing.T) {
 
 func TestSegmentLostDropsEarlyAudio(t *testing.T) {
 	s := New(Options{})
-	require.Empty(t, s.Push(aud(0))) // audio-only start: opens a segment
+	require.Empty(t, video(s, 1, 0, 10, 90000))
 	d := vid(1, 500000, true)
 	d.Lost = 3
-	// New video track appears: becomes anchor, closes the audio-anchored segment.
 	segs := s.Push(d)
 	require.Len(t, segs, 1)
 	assert.Empty(t, s.Push(aud(499000)))
@@ -114,6 +113,69 @@ func TestSegmentLostDropsEarlyAudio(t *testing.T) {
 	require.Len(t, out, 1)
 	assert.Len(t, out[0].Frames, 2)
 	assert.True(t, out[0].Discontinuity)
+}
+
+func TestSegmentAudioFirstCarried(t *testing.T) {
+	s := New(Options{})
+	require.Empty(t, s.Push(aud(1000)))
+	require.Empty(t, s.Push(aud(1000+aDur)))
+	require.Empty(t, s.Push(vid(1, 1000, true))) // re-anchors; no segment emitted
+	require.Empty(t, s.Push(vid(1, 4600, false)))
+	out := s.Flush()
+	require.Len(t, out, 1)
+	assert.EqualValues(t, 0, out[0].Seq)
+	assert.False(t, out[0].Discontinuity)
+	assert.EqualValues(t, 1000, out[0].Start)
+	require.Len(t, out[0].Frames, 4)
+	assert.Equal(t, 1, out[0].Frames[0].Track)
+	assert.Equal(t, 1, out[0].Frames[1].Track)
+	assert.True(t, out[0].Frames[2].Key)
+	assert.Zero(t, s.Dropped())
+}
+
+func TestSegmentAudioFirstWaitsForKey(t *testing.T) {
+	s := New(Options{})
+	require.Empty(t, s.Push(aud(0)))
+	require.Empty(t, s.Push(aud(aDur)))
+	require.Empty(t, s.Push(vid(1, 0, false))) // dropped: not a keyframe
+	require.Empty(t, s.Push(aud(2*aDur)))      // joins the pending audio
+	require.Empty(t, s.Push(vid(1, 3*aDur, true)))
+	out := s.Flush()
+	require.Len(t, out, 1)
+	assert.EqualValues(t, 0, out[0].Seq)
+	assert.EqualValues(t, 3*aDur, out[0].Start)
+	assert.Len(t, out[0].Frames, 1)       // audio below the key's PTS was dropped
+	assert.EqualValues(t, 4, s.Dropped()) // 3 audio + the non-key video
+}
+
+func TestSegmentAnchorChangeAfterAudioSegment(t *testing.T) {
+	s := New(Options{})
+	var segs []Segment
+	for i := int64(0); i < 100; i++ { // real audio-only stretch: closes by rule 4
+		segs = append(segs, s.Push(aud(i*aDur))...)
+	}
+	require.Len(t, segs, 1)
+	segs = append(segs, s.Push(vid(1, 100*aDur, true))...)
+	require.Len(t, segs, 2) // the open audio segment closed, not carried
+	assert.Equal(t, uint64(1), segs[1].Seq)
+	assert.False(t, segs[1].Discontinuity)
+	out := s.Flush()
+	require.Len(t, out, 1)
+	assert.False(t, out[0].Discontinuity)
+	assert.EqualValues(t, 2, out[0].Seq)
+}
+
+func TestSegmentLostWithoutOpenSegment(t *testing.T) {
+	s := New(Options{})
+	require.Empty(t, video(s, 1, 0, 5, 90000))
+	require.Len(t, s.Flush(), 1) // nothing open now
+	d := vid(1, 900000, true)
+	d.Lost = 2
+	require.Empty(t, s.Push(d))
+	out := s.Flush()
+	require.Len(t, out, 1)
+	assert.True(t, out[0].Discontinuity)
+	assert.EqualValues(t, 1, out[0].Seq)
 }
 
 func TestSegmentAudioOnly(t *testing.T) {
