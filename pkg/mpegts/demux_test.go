@@ -769,6 +769,94 @@ func TestDemuxProgramZeroSkipped(t *testing.T) {
 	assert.Zero(t, st.PSIErrors)
 }
 
+// patSectionN builds section number num of last of a PAT from (program
+// number, PMT PID) pairs.
+func patSectionN(version, num, last uint8, pairs ...uint16) []byte {
+	sec := patSection(version, pairs...)
+	sec[6], sec[7] = num, last
+	return fixSectionCRC(sec)
+}
+
+// fixSectionCRC recomputes the CRC_32 of a section after an edit.
+func fixSectionCRC(sec []byte) []byte {
+	end := len(sec) - 4
+	c := crc32MPEG2(sec[:end])
+	sec[end], sec[end+1], sec[end+2], sec[end+3] = byte(c>>24), byte(c>>16), byte(c>>8), byte(c)
+	return sec
+}
+
+func TestDemuxMultiSectionPAT(t *testing.T) {
+	const pmt2 = 0x1002
+	sec0 := patSectionN(0, 0, 1, 0, 0x10, 1, tPMT)
+	sec1 := patSectionN(0, 1, 1, 2, pmt2)
+	b := newTS()
+	for i := range 4 {
+		// Section 1 comes first in the first repetition.
+		if i == 0 {
+			b.psi(0, sec1, sec0)
+		} else {
+			b.psi(0, sec0).psi(0, sec1)
+		}
+		b.psi(tPMT, pmtSection(1, 0, tVideo, Stream{tVideo, tH264}))
+		b.psi(pmt2, pmtSection(2, 0, tAudio, Stream{tAudio, tAAC}))
+		b.pes(tVideo, pesBytes(int64(i), -1, payloadOf(20, byte(i)), true), 0)
+		b.pes(tAudio, pesBytes(int64(i), -1, payloadOf(20, byte(i)), true), 0)
+	}
+	// A repetition of section 0 that moves program 1's PMT is followed.
+	b.psi(0, patSectionN(1, 0, 1, 1, 0x1003)).psi(0, patSectionN(1, 1, 1, 2, pmt2))
+	b.psi(0x1003, pmtSection(1, 0, tVideo, Stream{tVideo, tH264}))
+	b.pes(tVideo, pesBytes(9, -1, payloadOf(20, 9), true), 0)
+
+	evs, st := demuxBytes(t, b.bytes())
+	pmts := pmtsOf(evs)
+	require.Len(t, pmts, 2)
+	assert.Equal(t, uint16(tPMT), pmts[0].PID)
+	assert.Equal(t, uint16(1), pmts[0].Program)
+	assert.Equal(t, uint16(0x1003), pmts[1].PID)
+	ps := videoOf(evs)
+	require.Len(t, ps, 5)
+	for i, p := range ps[:4] {
+		assert.Equal(t, int64(i), p.PTS)
+	}
+	assert.Equal(t, int64(9), ps[4].PTS)
+	assert.Zero(t, st.CCErrors)
+	assert.Zero(t, st.PSIErrors)
+	assert.Zero(t, st.PESErrors)
+}
+
+func TestDemuxPATVersionMovesProgram(t *testing.T) {
+	// A new PAT version whose section 0 lists no program: section 1 chooses.
+	b := newTS().psi(0, patSectionN(0, 0, 0, 1, tPMT))
+	b.psi(tPMT, pmtSection(1, 0, tVideo, Stream{tVideo, tH264}))
+	b.psi(0, patSectionN(1, 0, 1, 0, 0x10)).psi(0, patSectionN(1, 1, 1, 3, 0x1003))
+	b.psi(0x1003, pmtSection(3, 0, tVideo, Stream{tVideo, tH264}))
+	evs, st := demuxBytes(t, b.bytes())
+	pmts := pmtsOf(evs)
+	require.Len(t, pmts, 2)
+	assert.Equal(t, uint16(3), pmts[1].Program)
+	assert.Zero(t, st.PSIErrors)
+}
+
+func TestDemuxOtherTableCutShort(t *testing.T) {
+	// A section of another table cut short by the next section start is
+	// ignored; a cut PMT section counts.
+	other := section(0xC0, 1, 0, true, make([]byte, 300))
+	pmt := pmtSection(1, 0, tVideo, Stream{tVideo, tH264})
+	b := newTS().psi(0, patSection(0, 1, tPMT))
+	b.raw(buildPacket(tPMT, b.nextCC(tPMT), true, nil, append([]byte{0}, other[:183]...)))
+	b.psi(tPMT, pmt)
+	evs, st := demuxBytes(t, b.bytes())
+	assert.Len(t, pmtsOf(evs), 1)
+	assert.Zero(t, st.PSIErrors)
+
+	long := pmtSection(1, 1, tVideo, manyStreams(40)...)
+	b.raw(buildPacket(tPMT, b.nextCC(tPMT), true, nil, append([]byte{0}, long[:183]...)))
+	b.psi(tPMT, pmt)
+	evs, st = demuxBytes(t, b.bytes())
+	assert.Len(t, pmtsOf(evs), 1)
+	assert.Equal(t, uint64(1), st.PSIErrors)
+}
+
 func TestDemuxProgramChangeSamePID(t *testing.T) {
 	b := newTS().base()
 	b.psi(tPMT, pmtSection(2, 0, tVideo, Stream{tVideo, tH264})) // another program: ignored

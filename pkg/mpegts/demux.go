@@ -88,6 +88,10 @@ type Demux struct {
 	havePMTPID bool
 	program    uint16
 	pmtPID     uint16
+	// patSection and patVersion identify the PAT section the program was
+	// chosen from.
+	patSection uint8
+	patVersion uint8
 	pmt        *PMT
 	es         map[uint16]*esState // the current PMT's streams
 	cc         map[uint16]uint8    // last continuity_counter per tracked PID
@@ -224,7 +228,17 @@ func (d *Demux) onPAT(sec []byte) {
 		d.stats.PSIErrors++
 		return
 	}
-	if !ok || d.havePMTPID && pid == d.pmtPID && prog == d.program {
+	if !ok {
+		return
+	}
+	// The program comes from the lowest-numbered section that lists one, so
+	// the sections of a multi-section PAT do not take turns choosing. A new
+	// PAT version lets any section choose again.
+	if d.havePMTPID && ls.version == d.patVersion && ls.number > d.patSection {
+		return
+	}
+	d.patSection, d.patVersion = ls.number, ls.version
+	if d.havePMTPID && pid == d.pmtPID && prog == d.program {
 		return
 	}
 	d.selectProgram(prog, pid)
