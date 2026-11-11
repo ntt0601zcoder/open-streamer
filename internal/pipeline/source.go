@@ -45,9 +45,14 @@ func (w *writer) write(ctx context.Context, frames []media.Frame) error {
 				}
 			}
 		}
+		for id := range w.anchors {
+			if id < f.Epoch {
+				delete(w.anchors, id) // pacing needs only the current epoch
+			}
+		}
 		if w.opt.Pace {
 			if a, ok := w.anchors[f.Epoch]; ok {
-				due := a.Wall.Add(time.Duration(f.DTS-a.Start) * time.Second / media.ClockRate)
+				due := a.Wall.Add(media.ToDuration(f.DTS - a.Start))
 				if d := due.Sub(w.opt.Now()); d > 0 {
 					if err := w.opt.Sleep(ctx, d); err != nil {
 						return err
@@ -105,7 +110,10 @@ func (w *writer) runOnce(ctx context.Context) (done bool, err error) {
 		return true, w.finish(ctx, fmt.Errorf("pipeline: open: %w", err))
 	}
 	defer func() { _ = rc.Close() }()
-	d, err := ts.NewDemuxer(rc) //nolint:contextcheck // the demuxer reads from rc; closing rc on return ends it
+	// A blocked Read never sees ctx, so closing the source on cancel unblocks it.
+	stop := context.AfterFunc(ctx, func() { _ = rc.Close() })
+	defer stop()
+	d, err := ts.NewDemuxer(rc) //nolint:contextcheck // NewDemuxer builds astits with context.Background internally; rc.Close on cancel interrupts it
 	if err != nil {
 		return true, w.finish(ctx, fmt.Errorf("pipeline: demux: %w", err))
 	}
