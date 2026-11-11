@@ -2,20 +2,20 @@ package ts
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/iotest"
 
-	"github.com/asticode/go-astits"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 )
 
 func fixture(t *testing.T, name string) []byte {
@@ -27,13 +27,23 @@ func fixture(t *testing.T, name string) []byte {
 
 func demuxAll(t *testing.T, data []byte) (*Demuxer, []media.Frame) {
 	t.Helper()
-	d, err := NewDemuxer(bytes.NewReader(data))
+	return demuxAllOpts(t, data, DemuxOptions{})
+}
+
+func demuxAllOpts(t *testing.T, data []byte, opt DemuxOptions) (*Demuxer, []media.Frame) {
+	t.Helper()
+	d, err := NewDemuxerWithOptions(bytes.NewReader(data), opt)
 	require.NoError(t, err)
+	return d, readAll(t, d)
+}
+
+func readAll(t *testing.T, d *Demuxer) []media.Frame {
+	t.Helper()
 	var frames []media.Frame
 	for {
 		f, err := d.Read()
 		if errors.Is(err, io.EOF) {
-			return d, frames
+			return frames
 		}
 		require.NoError(t, err)
 		frames = append(frames, f)
@@ -148,12 +158,18 @@ func TestDemuxWrap(t *testing.T) {
 	assert.Greater(t, span, int64(5.8*90000))
 	assert.Less(t, span, int64(6*90000))
 
-	ad := astits.NewDemuxer(context.Background(), bytes.NewReader(data))
+	md := mpegts.NewDemux(bytes.NewReader(data))
+	video := map[uint16]bool{}
 	for {
-		dd, err := ad.NextData()
+		ev, err := md.Next()
 		require.NoError(t, err)
-		if dd.PES != nil && dd.PES.Header.StreamID>>4 == 0xE {
-			assert.Greater(t, dd.PES.Header.OptionalHeader.PTS.Base, int64(1<<33-10*90000))
+		if ev.PMT != nil {
+			for _, s := range ev.PMT.Streams {
+				video[s.PID] = s.Type == typeH264
+			}
+		}
+		if ev.PES != nil && video[ev.PES.PID] {
+			assert.Greater(t, ev.PES.PTS, int64(1<<33-10*90000))
 			break
 		}
 	}
@@ -268,4 +284,318 @@ func TestDemuxBadConfigDropsFrames(t *testing.T) {
 	d.handleVideo(tr, au(cfg.SPS[0]), 7200, 7200)
 	require.Len(t, d.queue, 2)
 	assert.Same(t, good, d.queue[1].Config)
+}
+
+func dtsOf(frames []media.Frame) []int64 {
+	out := make([]int64, len(frames))
+	for i, f := range frames {
+		out[i] = f.DTS
+	}
+	return out
+}
+
+func TestDemuxSharedDecoder(t *testing.T) {
+	data := fixture(t, "h264_aac.ts")
+	_, whole := demuxAll(t, data)
+
+	// Each cut is a PAT packet directly preceding a keyframe PES.
+	cuts := []int{0, 265, 538, 831, len(data) / mpegts.PacketSize}
+	var dec mpegts.TimeDecoder
+	var parts []media.Frame
+	for i := 0; i+1 < len(cuts); i++ {
+		seg := data[cuts[i]*mpegts.PacketSize : cuts[i+1]*mpegts.PacketSize]
+		_, fs := demuxAllOpts(t, seg, DemuxOptions{Decoder: &dec})
+		parts = append(parts, fs...)
+	}
+	for tr := 0; tr < 2; tr++ {
+		require.NotEmpty(t, byTrack(whole, tr))
+		assert.Equal(t, dtsOf(byTrack(whole, tr)), dtsOf(byTrack(parts, tr)), "track %d", tr)
+	}
+}
+
+func TestDemuxNonSeekableReader(t *testing.T) {
+	data := fixture(t, "h264_aac.ts")
+	_, want := demuxAll(t, data)
+	d, err := NewDemuxer(iotest.OneByteReader(bytes.NewReader(data)))
+	require.NoError(t, err)
+	got := readAll(t, d)
+	assert.Equal(t, want, got)
+}
+
+const (
+	videoPID = 256
+	audioPID = 257
+)
+
+// fixturePES returns a fixture's PES packets in stream order.
+func fixturePES(t *testing.T, name string) []*mpegts.PES {
+	t.Helper()
+	d := mpegts.NewDemux(bytes.NewReader(fixture(t, name)))
+	var out []*mpegts.PES
+	for {
+		ev, err := d.Next()
+		if errors.Is(err, io.EOF) {
+			return out
+		}
+		require.NoError(t, err)
+		if ev.PES != nil {
+			out = append(out, ev.PES)
+		}
+	}
+}
+
+// tsBuilder writes a test stream with mpegts.Writer.
+type tsBuilder struct {
+	t   *testing.T
+	buf bytes.Buffer
+	w   *mpegts.Writer
+}
+
+func newTSBuilder(t *testing.T) *tsBuilder {
+	b := &tsBuilder{t: t}
+	b.w = mpegts.NewWriter(&b.buf)
+	return b
+}
+
+// program sets the program, with PCR on the first stream, and writes the
+// tables.
+func (b *tsBuilder) program(streams ...mpegts.Stream) {
+	b.t.Helper()
+	require.NoError(b.t, b.w.SetProgram(mpegts.PMT{PCRPID: streams[0].PID, Streams: streams}))
+	b.tables()
+}
+
+func (b *tsBuilder) tables() {
+	b.t.Helper()
+	require.NoError(b.t, b.w.WriteTables())
+}
+
+func (b *tsBuilder) pes(p *mpegts.PES) {
+	b.t.Helper()
+	require.NoError(b.t, b.w.WritePES(p.PID, p.Data, mpegts.PESOptions{
+		PTS: p.PTS, DTS: p.DTS, HasDTS: p.DTS != p.PTS,
+		RandomAccess: p.RandomAccess, PCR: -1, Video: p.PID == videoPID,
+	}))
+}
+
+// adtsFrames counts the ADTS frames in audio PES.
+func adtsFrames(t *testing.T, pes []*mpegts.PES) int {
+	t.Helper()
+	n := 0
+	for _, p := range pes {
+		fs, err := mpegts.ParseADTS(p.Data)
+		require.NoError(t, err)
+		n += len(fs)
+	}
+	return n
+}
+
+var (
+	h264Stream = mpegts.Stream{PID: videoPID, Type: typeH264}
+	aacStream  = mpegts.Stream{PID: audioPID, Type: typeAAC}
+)
+
+// addTrackStream is h264_aac.ts video-only under a video-only program for
+// the first 30 video PES, then a program that adds the audio, then both.
+func addTrackStream(t *testing.T) []byte {
+	pes := fixturePES(t, "h264_aac.ts")
+	b := newTSBuilder(t)
+	b.program(h264Stream)
+	nv, i := 0, 0
+	for ; nv < 30; i++ {
+		if pes[i].PID == videoPID {
+			b.pes(pes[i])
+			nv++
+		}
+	}
+	b.program(h264Stream, aacStream)
+	for _, p := range pes[i:] {
+		b.pes(p)
+	}
+	return b.buf.Bytes()
+}
+
+func TestDemuxLaterPMTAddsTrack(t *testing.T) {
+	d, frames := demuxAllOpts(t, addTrackStream(t), DemuxOptions{FollowPMT: true})
+	assert.Equal(t, 2, d.NumTracks())
+	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, d.TrackKinds())
+	assert.Len(t, byTrack(frames, 0), 150)
+	a := byTrack(frames, 1)
+	require.NotEmpty(t, a)
+	for _, f := range a {
+		assert.Equal(t, media.CodecAAC, f.Config.Codec)
+	}
+	assert.Len(t, frames, 150+len(a))
+	assert.Empty(t, d.Skipped())
+}
+
+func TestDemuxLaterPMTIgnored(t *testing.T) {
+	d, frames := demuxAll(t, addTrackStream(t))
+	assert.Equal(t, 1, d.NumTracks())
+	assert.Equal(t, []media.Kind{media.KindVideo}, d.TrackKinds())
+	assert.Len(t, frames, 150)
+	assert.Len(t, byTrack(frames, 0), 150)
+}
+
+// writeUntilVideo writes pes in order from index i until n video PES have
+// been written, and returns the next index.
+func writeUntilVideo(b *tsBuilder, pes []*mpegts.PES, i, n int) int {
+	for nv := 0; nv < n; i++ {
+		b.pes(pes[i])
+		if pes[i].PID == videoPID {
+			nv++
+		}
+	}
+	return i
+}
+
+func TestDemuxLaterPMTChangesCodec(t *testing.T) {
+	h264 := fixturePES(t, "h264_aac.ts")
+	_, ref := demuxAll(t, fixture(t, "h264_aac.ts"))
+	var h265Video []*mpegts.PES
+	for _, p := range fixturePES(t, "h265_aac51.ts") {
+		if p.PID == videoPID {
+			h265Video = append(h265Video, p)
+		}
+	}
+	b := newTSBuilder(t)
+	b.program(h264Stream, aacStream)
+	i := writeUntilVideo(b, h264, 0, 30)
+	cut := b.buf.Len()
+	b.program(mpegts.Stream{PID: videoPID, Type: typeH265}, aacStream)
+	var audioAfter []*mpegts.PES
+	for _, p := range h264[i:] {
+		if p.PID == audioPID {
+			audioAfter = append(audioAfter, p)
+			b.pes(p)
+		}
+	}
+	for _, p := range h265Video[:20] {
+		b.pes(p)
+	}
+	data := b.buf.Bytes()
+
+	before, _ := demuxAllOpts(t, data[:cut], DemuxOptions{FollowPMT: true})
+	d, frames := demuxAllOpts(t, data, DemuxOptions{FollowPMT: true})
+	assert.Equal(t, 2, d.NumTracks())
+	v := byTrack(frames, 0)
+	require.Len(t, v, 30)
+	for k, f := range v {
+		assert.Equal(t, media.CodecH264, f.Config.Codec)
+		assert.Equal(t, byTrack(ref, 0)[k].Data, f.Data)
+	}
+	assert.Len(t, frames, 30+len(byTrack(frames, 1)))
+	// Audio keeps flowing after the change.
+	assert.GreaterOrEqual(t, len(byTrack(frames, 1)), adtsFrames(t, audioAfter))
+	assert.Equal(t, before.Stats().DecodeErrors, d.Stats().DecodeErrors)
+	assert.Empty(t, d.Skipped())
+}
+
+func TestDemuxLaterPMTUnsupportedCodec(t *testing.T) {
+	pes := fixturePES(t, "h264_aac.ts")
+	mp2 := mpegts.Stream{PID: videoPID, Type: 0x03}
+	b := newTSBuilder(t)
+	b.program(h264Stream, aacStream)
+	i := writeUntilVideo(b, pes, 0, 30)
+	b.program(aacStream, mp2)
+	b.tables()
+	b.program(aacStream, mpegts.Stream{PID: videoPID, Type: 0x04})
+	// The PID returns as H.264, but a stopped PID is never re-added.
+	b.program(h264Stream, aacStream)
+	writeUntilVideo(b, pes, i, 30)
+
+	d, frames := demuxAllOpts(t, b.buf.Bytes(), DemuxOptions{FollowPMT: true})
+	assert.Equal(t, 2, d.NumTracks())
+	assert.Len(t, byTrack(frames, 0), 30)
+	assert.NotEmpty(t, byTrack(frames, 1))
+	require.Len(t, d.Skipped(), 1)
+	assert.Contains(t, d.Skipped()[0], "pid 256")
+	assert.Contains(t, d.Skipped()[0], "mpeg audio")
+}
+
+func TestDemuxRepeatedPMT(t *testing.T) {
+	pes := fixturePES(t, "h264_aac.ts")
+	mp2 := mpegts.Stream{PID: 258, Type: 0x03}
+	b := newTSBuilder(t)
+	var audio []*mpegts.PES
+	phase := func(withAudio bool, from, videos int) int {
+		if withAudio {
+			b.program(h264Stream, aacStream, mp2)
+		} else {
+			b.program(h264Stream, mp2)
+		}
+		nv := 0
+		for ; nv < videos && from < len(pes); from++ {
+			p := pes[from]
+			b.tables() // The same PMT before every PES.
+			switch {
+			case p.PID == videoPID:
+				b.pes(p)
+				nv++
+			case withAudio:
+				b.pes(p)
+				audio = append(audio, p)
+			}
+		}
+		return from
+	}
+	i := phase(false, 0, 30)
+	i = phase(true, i, 40)
+	i = phase(false, i, 40)
+	phase(true, i, 40)
+
+	d, frames := demuxAllOpts(t, b.buf.Bytes(), DemuxOptions{FollowPMT: true})
+	assert.Equal(t, 2, d.NumTracks())
+	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, d.TrackKinds())
+	assert.Len(t, byTrack(frames, 0), 150)
+	assert.Len(t, byTrack(frames, 1), adtsFrames(t, audio))
+	assert.Len(t, frames, 150+adtsFrames(t, audio))
+	require.Len(t, d.Skipped(), 1)
+	assert.Contains(t, d.Skipped()[0], "pid 258")
+}
+
+var errBoom = errors.New("boom")
+
+// failingReader returns data and then errBoom.
+type failingReader struct{ data []byte }
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, errBoom
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestDemuxReadError(t *testing.T) {
+	data := fixture(t, "h264_aac.ts")
+	_, err := NewDemuxer(&failingReader{data: data[:mpegts.PacketSize]})
+	require.ErrorIs(t, err, errBoom)
+	assert.Contains(t, err.Error(), "ts: demux:")
+
+	d, err := NewDemuxer(&failingReader{data: data[:100*mpegts.PacketSize]})
+	require.NoError(t, err)
+	var frames []media.Frame
+	for {
+		f, rerr := d.Read()
+		if rerr != nil {
+			err = rerr
+			break
+		}
+		frames = append(frames, f)
+	}
+	require.ErrorIs(t, err, errBoom)
+	assert.Contains(t, err.Error(), "ts: demux:")
+	assert.NotEmpty(t, frames)
+	_, err = d.Read()
+	require.ErrorIs(t, err, errBoom, "the error repeats")
+}
+
+func TestDemuxNoSupportedTrack(t *testing.T) {
+	b := newTSBuilder(t)
+	b.program(mpegts.Stream{PID: audioPID, Type: 0x03})
+	_, err := NewDemuxer(bytes.NewReader(b.buf.Bytes()))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no supported track in PMT")
 }

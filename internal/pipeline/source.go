@@ -113,7 +113,7 @@ func (w *writer) runOnce(ctx context.Context) (done bool, err error) {
 	// A blocked Read never sees ctx, so closing the source on cancel unblocks it.
 	stop := context.AfterFunc(ctx, func() { _ = rc.Close() })
 	defer stop()
-	d, err := ts.NewDemuxer(rc) //nolint:contextcheck // NewDemuxer builds astits with context.Background internally; rc.Close on cancel interrupts it
+	d, err := ts.NewDemuxer(rc)
 	if err != nil {
 		return true, w.finish(ctx, fmt.Errorf("pipeline: demux: %w", err))
 	}

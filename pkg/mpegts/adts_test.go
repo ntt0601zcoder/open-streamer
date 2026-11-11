@@ -2,14 +2,12 @@ package mpegts
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/asticode/go-astits"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,23 +17,23 @@ func firstAudioPES(t *testing.T, name string) []byte {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", "fixtures", name))
 	require.NoError(t, err)
-	dmx := astits.NewDemuxer(context.Background(), bytes.NewReader(raw))
+	dmx := NewDemux(bytes.NewReader(raw))
 	audio := map[uint16]bool{}
 	for {
-		d, err := dmx.NextData()
-		if errors.Is(err, io.EOF) || errors.Is(err, astits.ErrNoMorePackets) {
+		ev, err := dmx.Next()
+		if errors.Is(err, io.EOF) {
 			t.Fatalf("no audio PES in %s", name)
 		}
 		require.NoError(t, err)
-		if d.PMT != nil {
-			for _, es := range d.PMT.ElementaryStreams {
-				if es.StreamType == astits.StreamTypeAACAudio {
-					audio[es.ElementaryPID] = true
+		if ev.PMT != nil {
+			for _, s := range ev.PMT.Streams {
+				if s.Type == 0x0F {
+					audio[s.PID] = true
 				}
 			}
 		}
-		if d.PES != nil && audio[d.FirstPacket.Header.PID] {
-			return d.PES.Data
+		if ev.PES != nil && audio[ev.PES.PID] {
+			return ev.PES.Data
 		}
 	}
 }

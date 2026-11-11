@@ -90,7 +90,7 @@ func counts(frames []media.Frame) map[epochTrack]int {
 //     keyframe and dropped by the Clock (rule 5).
 //   - The loop and then_640 fixtures demux one video frame fewer from the
 //     first clip: the continuity counter jumps at the concatenation point,
-//     and go-astits then discards the PES it was still assembling, the
+//     and the continuity check drops the PES still being assembled, the
 //     first clip's last video frame (M2 counts this loss).
 //   - midgop drops audio before the first keyframe.
 func TestM1Fixtures(t *testing.T) {

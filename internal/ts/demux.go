@@ -3,28 +3,43 @@ package ts
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
 
 	"github.com/Eyevinn/mp4ff/avc"
-	"github.com/asticode/go-astits"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 )
 
-// maxConsecutiveErrors is how many NextData errors in a row Read tolerates.
-const maxConsecutiveErrors = 100
+// Supported PMT stream_type values.
+const (
+	typeH264 = 0x1B
+	typeH265 = 0x24
+	typeAAC  = 0x0F
+)
 
 // DemuxStats counts events the demuxer recovered from.
 type DemuxStats struct {
 	// DroppedNoConfig counts video frames dropped before the first complete
 	// parameter-set group.
 	DroppedNoConfig uint64
-	// DecodeErrors counts malformed packets, PES payloads and ADTS frames.
+	// DecodeErrors counts continuity gaps, malformed PSI sections, PES
+	// packets and packet runs, PES without a PTS, and bad parameter sets and
+	// ADTS frames.
 	DecodeErrors uint64
+}
+
+// DemuxOptions configures a Demuxer.
+type DemuxOptions struct {
+	// Decoder unwraps PES timestamps. Demuxers that read consecutive parts
+	// of one stream share it to keep a single timeline; nil means a private
+	// decoder.
+	Decoder *mpegts.TimeDecoder
+	// FollowPMT applies PMTs after the first: new supported PIDs become new
+	// tracks. Without it later PMTs are ignored.
+	FollowPMT bool
 }
 
 type streamInfo struct {
@@ -32,14 +47,14 @@ type streamInfo struct {
 	codec media.Codec
 }
 
-var supportedTypes = map[astits.StreamType]streamInfo{
-	astits.StreamTypeH264Video: {media.KindVideo, media.CodecH264},
-	astits.StreamTypeH265Video: {media.KindVideo, media.CodecH265},
-	astits.StreamTypeAACAudio:  {media.KindAudio, media.CodecAAC},
+var supportedTypes = map[uint8]streamInfo{
+	typeH264: {media.KindVideo, media.CodecH264},
+	typeH265: {media.KindVideo, media.CodecH265},
+	typeAAC:  {media.KindAudio, media.CodecAAC},
 }
 
 type track struct {
-	pid    uint16
+	idx    int
 	kind   media.Kind
 	codec  media.Codec
 	config *media.TrackConfig // nil while the parameter sets are invalid
@@ -51,36 +66,52 @@ type track struct {
 
 // Demuxer reads media frames from an MPEG-TS stream.
 type Demuxer struct {
-	dmx      *astits.Demuxer
-	tracks   []*track
-	byPID    map[uint16]*track
-	skipped  []string
-	timeDec  mpegts.TimeDecoder
-	queue    []media.Frame
-	stats    DemuxStats
-	errsRun  int
-	finished bool
+	dmx     *mpegts.Demux
+	follow  bool
+	tracks  []*track
+	byPID   map[uint16]*track // PIDs whose PES are decoded
+	seen    map[uint16]uint8  // stream_type of every PID at its first PMT
+	skipped []string
+	skipPID map[uint16]bool // PIDs reported in skipped
+	timeDec *mpegts.TimeDecoder
+	queue   []media.Frame
+	stats   DemuxStats
+	err     error // a read error, returned once the queue is empty
 }
 
-// NewDemuxer reads r up to the first PMT and returns a demuxer for its
-// supported tracks.
+// NewDemuxer is NewDemuxerWithOptions without options: a private timestamp
+// decoder, and PMTs after the first are ignored (the pipeline handles PMT
+// changes in M2).
 func NewDemuxer(r io.Reader) (*Demuxer, error) {
+	return NewDemuxerWithOptions(r, DemuxOptions{})
+}
+
+// NewDemuxerWithOptions reads r up to the first PMT and returns a demuxer for
+// its supported tracks. Only PIDs in the current PMT produce frames.
+func NewDemuxerWithOptions(r io.Reader, opt DemuxOptions) (*Demuxer, error) {
 	d := &Demuxer{
-		dmx:   astits.NewDemuxer(context.Background(), r),
-		byPID: make(map[uint16]*track),
+		dmx:     mpegts.NewDemux(r),
+		follow:  opt.FollowPMT,
+		byPID:   map[uint16]*track{},
+		seen:    map[uint16]uint8{},
+		skipPID: map[uint16]bool{},
+		timeDec: opt.Decoder,
+	}
+	if d.timeDec == nil {
+		d.timeDec = &mpegts.TimeDecoder{}
 	}
 	for {
-		data, err := d.dmx.NextData()
+		ev, err := d.dmx.Next()
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("ts: demux: no supported track: no PMT before end of input")
+		}
 		if err != nil {
-			if isEOF(err) {
-				return nil, errors.New("ts: demux: no supported track: no PMT before end of input")
-			}
 			return nil, fmt.Errorf("ts: demux: read: %w", err)
 		}
-		if data.PMT == nil {
+		if ev.PMT == nil {
 			continue
 		}
-		d.setupTracks(data.PMT)
+		d.applyPMT(ev.PMT)
 		if len(d.tracks) == 0 {
 			return nil, errors.New("ts: demux: no supported track in PMT")
 		}
@@ -88,30 +119,46 @@ func NewDemuxer(r io.Reader) (*Demuxer, error) {
 	}
 }
 
-func isEOF(err error) bool {
-	return errors.Is(err, astits.ErrNoMorePackets) || errors.Is(err, io.EOF)
+// applyPMT adds the PMT's supported PIDs never seen before as tracks. A PID
+// whose stream_type differs from its first one stops producing frames for
+// good; its track index stays.
+func (d *Demuxer) applyPMT(pmt *mpegts.PMT) {
+	for _, s := range pmt.Streams {
+		info, supported := supportedTypes[s.Type]
+		first, known := d.seen[s.PID]
+		switch {
+		case !known:
+			d.seen[s.PID] = s.Type
+			if !supported {
+				d.skip(s)
+				continue
+			}
+			t := &track{
+				idx: len(d.tracks), kind: info.kind, codec: info.codec,
+				vps: map[uint32][]byte{}, sps: map[uint32][]byte{}, pps: map[uint32][]byte{},
+			}
+			d.tracks = append(d.tracks, t)
+			d.byPID[s.PID] = t
+		case s.Type != first:
+			delete(d.byPID, s.PID)
+			if !supported {
+				d.skip(s)
+			}
+		}
+	}
 }
 
-func (d *Demuxer) setupTracks(pmt *astits.PMTData) {
-	for _, es := range pmt.ElementaryStreams {
-		t := &track{pid: es.ElementaryPID}
-		if info, ok := supportedTypes[es.StreamType]; ok {
-			t.kind, t.codec = info.kind, info.codec
-		} else {
-			name := "unsupported"
-			if es.StreamType == 0x03 || es.StreamType == 0x04 {
-				name = "mpeg audio"
-			}
-			d.skipped = append(d.skipped, fmt.Sprintf("pid %d: %s (0x%02x)", es.ElementaryPID, name, uint8(es.StreamType)))
-			continue
-		}
-		if _, dup := d.byPID[t.pid]; dup {
-			continue
-		}
-		t.vps, t.sps, t.pps = map[uint32][]byte{}, map[uint32][]byte{}, map[uint32][]byte{}
-		d.tracks = append(d.tracks, t)
-		d.byPID[t.pid] = t
+// skip reports an unsupported PID once.
+func (d *Demuxer) skip(s mpegts.Stream) {
+	if d.skipPID[s.PID] {
+		return
 	}
+	d.skipPID[s.PID] = true
+	name := "unsupported"
+	if s.Type == 0x03 || s.Type == 0x04 {
+		name = "mpeg audio"
+	}
+	d.skipped = append(d.skipped, fmt.Sprintf("pid %d: %s (0x%02x)", s.PID, name, s.Type))
 }
 
 // NumTracks returns the number of supported tracks.
@@ -130,9 +177,17 @@ func (d *Demuxer) TrackKinds() []media.Kind {
 func (d *Demuxer) Skipped() []string { return append([]string(nil), d.skipped...) }
 
 // Stats returns the recovery counters.
-func (d *Demuxer) Stats() DemuxStats { return d.stats }
+func (d *Demuxer) Stats() DemuxStats {
+	s := d.stats
+	if d.dmx != nil {
+		ms := d.dmx.Stats()
+		s.DecodeErrors += ms.CCErrors + ms.PSIErrors + ms.PESErrors + ms.Reader.Errored
+	}
+	return s
+}
 
-// Read returns the next frame, or io.EOF at the end of the stream.
+// Read returns the next frame, or io.EOF at the end of the stream. A read
+// error from the input is returned wrapped, and again on later calls.
 func (d *Demuxer) Read() (media.Frame, error) {
 	for {
 		if len(d.queue) > 0 {
@@ -140,70 +195,44 @@ func (d *Demuxer) Read() (media.Frame, error) {
 			d.queue = d.queue[1:]
 			return f, nil
 		}
-		if d.finished {
-			return media.Frame{}, io.EOF
+		if d.err != nil {
+			return media.Frame{}, d.err
 		}
-		data, err := d.dmx.NextData()
-		if err != nil {
-			if isEOF(err) {
-				d.finished = true
-				return media.Frame{}, io.EOF
+		ev, err := d.dmx.Next()
+		switch {
+		case errors.Is(err, io.EOF):
+			d.err = io.EOF
+			continue
+		case err != nil:
+			d.err = fmt.Errorf("ts: demux: read: %w", err)
+			continue
+		case ev.PMT != nil:
+			if d.follow {
+				d.applyPMT(ev.PMT)
 			}
-			d.stats.DecodeErrors++
-			d.errsRun++
-			if d.errsRun >= maxConsecutiveErrors {
-				d.finished = true
-				return media.Frame{}, fmt.Errorf("ts: demux: %d consecutive read errors, last: %w", d.errsRun, err)
+		case ev.PES != nil:
+			if t := d.byPID[ev.PES.PID]; t != nil {
+				d.handlePES(t, ev.PES)
 			}
-			continue
 		}
-		d.errsRun = 0
-		if data.PES == nil {
-			continue
-		}
-		t := d.byPID[data.PID]
-		if t == nil {
-			continue
-		}
-		d.handlePES(t, data.PES)
 	}
 }
 
-func (d *Demuxer) trackIndex(t *track) int {
-	for i, x := range d.tracks {
-		if x == t {
-			return i
-		}
-	}
-	return -1
-}
-
-// timestamps returns the unwrapped PTS and DTS of a PES.
-func (d *Demuxer) timestamps(pes *astits.PESData) (pts, dts int64, ok bool) {
-	if pes.Header == nil || pes.Header.OptionalHeader == nil || pes.Header.OptionalHeader.PTS == nil {
-		return 0, 0, false
-	}
-	oh := pes.Header.OptionalHeader
-	pts = d.timeDec.Decode(oh.PTS.Base)
-	dts = pts
-	if oh.DTS != nil {
-		dts = d.timeDec.Decode(oh.DTS.Base)
-	}
-	return pts, dts, true
-}
-
-func (d *Demuxer) handlePES(t *track, pes *astits.PESData) {
-	pts, dts, ok := d.timestamps(pes)
-	if !ok {
+func (d *Demuxer) handlePES(t *track, pes *mpegts.PES) {
+	if !pes.HasPTS {
 		d.stats.DecodeErrors++
 		return
 	}
-	payload := bytes.Clone(pes.Data)
+	pts := d.timeDec.Decode(pes.PTS)
+	dts := pts
+	if pes.DTS != pes.PTS {
+		dts = d.timeDec.Decode(pes.DTS)
+	}
 	if t.kind == media.KindAudio {
-		d.handleAudio(t, payload, pts)
+		d.handleAudio(t, pes.Data, pts)
 		return
 	}
-	d.handleVideo(t, payload, pts, dts)
+	d.handleVideo(t, pes.Data, pts, dts)
 }
 
 func (d *Demuxer) handleAudio(t *track, payload []byte, pts int64) {
@@ -211,7 +240,6 @@ func (d *Demuxer) handleAudio(t *track, payload []byte, pts int64) {
 	if err != nil {
 		d.stats.DecodeErrors++
 	}
-	idx := d.trackIndex(t)
 	for i, a := range frames {
 		asc := a.AudioSpecificConfig()
 		if t.config == nil || !bytes.Equal(t.config.ASC, asc) {
@@ -224,7 +252,7 @@ func (d *Demuxer) handleAudio(t *track, payload []byte, pts int64) {
 		}
 		ts := pts + media.SampleTime(int64(i)*1024, t.config.SampleRate)
 		d.queue = append(d.queue, media.Frame{
-			Track:  idx,
+			Track:  t.idx,
 			Config: t.config,
 			PTS:    ts,
 			DTS:    ts,
@@ -338,7 +366,7 @@ func (d *Demuxer) handleVideo(t *track, payload []byte, pts, dts int64) {
 		return
 	}
 	d.queue = append(d.queue, media.Frame{
-		Track:  d.trackIndex(t),
+		Track:  t.idx,
 		Config: t.config,
 		PTS:    pts,
 		DTS:    dts,
