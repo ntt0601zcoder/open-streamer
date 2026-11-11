@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -105,7 +106,16 @@ func TestHLSFMP4Playlists(t *testing.T) {
 	assert.Equal(t, "v0.m3u8", v.URI)
 	assert.Equal(t, "aud", v.Audio)
 	assert.Equal(t, 320, v.Width)
-	assert.Positive(t, v.Bandwidth)
+	peak := 1.0
+	for _, seg := range snap.Segments {
+		sum := 0.0
+		for _, part := range seg.Parts {
+			et, _ := snap.Epochs[0].Track(part.Track)
+			sum += float64(len(part.Data)) * 8 * float64(timescaleOf(et.Config)) / float64(part.Timing.Duration)
+		}
+		peak = max(peak, sum)
+	}
+	assert.Equal(t, int(math.Ceil(peak)), v.Bandwidth)
 	assert.Contains(t, v.Codecs, "avc1.")
 	assert.Contains(t, v.Codecs, "mp4a.40.2")
 	require.Len(t, m.Renditions, 1)
@@ -134,11 +144,20 @@ func TestHLSConfigChange(t *testing.T) {
 	require.Len(t, snap.Epochs, 2)
 
 	ts := media3(t, srv, "/live/s/hls/index.m3u8")
+	var first2 SegmentInfo
+	for _, seg := range snap.Segments {
+		if seg.Epoch == 2 {
+			first2 = seg
+			break
+		}
+	}
+	require.NotZero(t, first2.Duration)
+	e2 := snap.Epochs[1]
 	var discs int
 	for _, s := range ts.Segments {
 		if s.Discontinuity {
 			discs++
-			assert.False(t, s.ProgramDateTime.IsZero())
+			assert.Equal(t, e2.WallAt(first2.Start).Truncate(time.Millisecond).UnixMilli(), s.ProgramDateTime.UnixMilli())
 		}
 	}
 	assert.Equal(t, 1, discs)
@@ -151,7 +170,8 @@ func TestHLSConfigChange(t *testing.T) {
 		if s.Discontinuity {
 			discs++
 			assert.Equal(t, "init-0-2.mp4", s.Map)
-			assert.False(t, s.ProgramDateTime.IsZero())
+			earliest := int64(first2.Parts[0].Timing.Earliest) // video timescale is 90 kHz
+			assert.Equal(t, e2.WallAt(earliest).Truncate(time.Millisecond).UnixMilli(), s.ProgramDateTime.UnixMilli())
 		}
 	}
 	assert.Equal(t, map[string]bool{"init-0-1.mp4": true, "init-0-2.mp4": true}, maps)
@@ -164,7 +184,8 @@ func TestHLSConfigChange(t *testing.T) {
 			n++
 		}
 	}
-	assert.LessOrEqual(t, len(a.Segments), n, "the audio playlist stops growing")
+	assert.Len(t, a.Segments, n, "the audio playlist stops growing")
+	assert.Equal(t, 3, n)
 	for _, s := range a.Segments {
 		assert.Equal(t, "init-1-1.mp4", s.Map)
 		assert.False(t, s.Discontinuity)
@@ -263,6 +284,9 @@ func TestHLSTargetDurationNeverShrinks(t *testing.T) {
 	assert.Equal(t, 3, p.targetDuration("a", s, []time.Duration{time.Second}), "never shrinks")
 	assert.Equal(t, 2, p.targetDuration("b", s, []time.Duration{time.Second}), "per playlist")
 	assert.Equal(t, 3, p.targetDuration("c", Snapshot{Target: 190000}, nil), "ceil of the target")
+	// 2.4996 s prints as 2.500 in EXTINF, which clients round up to 3.
+	assert.Equal(t, 3, p.targetDuration("d", s, []time.Duration{2499600 * time.Microsecond}))
+	assert.Equal(t, 2, p.targetDuration("e", s, []time.Duration{2499400 * time.Microsecond}))
 }
 
 func TestHLSUnlistedNotAdvertised(t *testing.T) {
