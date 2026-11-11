@@ -398,3 +398,75 @@ func probeStreams(t *testing.T, probe, file string) map[string]string {
 	}
 	return got
 }
+
+// patVersions returns the PAT version of every PAT packet in b.
+func patVersions(t *testing.T, b []byte) []uint8 {
+	t.Helper()
+	var vs []uint8
+	r := NewReader(bytes.NewReader(b))
+	for {
+		p, err := r.Next()
+		if err != nil {
+			return vs
+		}
+		if p.PID == 0 && p.PUSI {
+			vs = append(vs, p.Payload[1+5]>>1&0x1F)
+		}
+	}
+}
+
+func TestWriterPATVersion(t *testing.T) {
+	var buf bytes.Buffer
+	w := newTestWriter(t, &buf)
+	tables := func() {
+		require.NoError(t, w.WriteTables())
+		require.NoError(t, w.WritePES(tVideo, []byte{1}, PESOptions{PTS: 1, PCR: -1}))
+	}
+	tables()
+	require.NoError(t, w.SetProgram(testProgram()))
+	tables()
+	p := testProgram()
+	p.Streams = p.Streams[:1] // PMT changes, PAT does not
+	require.NoError(t, w.SetProgram(p))
+	tables()
+	p.PID = 0x200
+	require.NoError(t, w.SetProgram(p))
+	tables()
+	p.Program = 9
+	require.NoError(t, w.SetProgram(p))
+	tables()
+	require.NoError(t, w.SetProgram(p))
+	tables()
+	assert.Equal(t, []uint8{0, 0, 0, 1, 2, 2}, patVersions(t, buf.Bytes()))
+
+	pes, pmts, st := wDemux(t, buf.Bytes())
+	assert.Zero(t, st.CCErrors+st.PSIErrors)
+	assert.Len(t, pes, 6)
+	require.NotEmpty(t, pmts)
+	last := pmts[len(pmts)-1]
+	assert.Equal(t, uint16(9), last.Program)
+	assert.Equal(t, uint16(0x200), last.PID)
+}
+
+func TestWriterPMTTooLarge(t *testing.T) {
+	prog := func(n int) PMT {
+		p := PMT{PCRPID: 0x100}
+		for i := range n {
+			p.Streams = append(p.Streams, Stream{PID: 0x100 + uint16(i), Type: tAAC})
+		}
+		return p
+	}
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	require.NoError(t, w.SetProgram(prog(33)))
+	require.NoError(t, w.WriteTables())
+	assert.Zero(t, buf.Len()%PacketSize)
+	_, pmts, st := wDemux(t, buf.Bytes())
+	require.Len(t, pmts, 1)
+	assert.Len(t, pmts[0].Streams, 33)
+	assert.Zero(t, st.PSIErrors)
+
+	err := w.SetProgram(prog(34))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mpegts:")
+}

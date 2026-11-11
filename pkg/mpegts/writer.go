@@ -21,6 +21,9 @@ const (
 	// tsPayloadLen is the payload capacity of a packet without adaptation field.
 	tsPayloadLen = PacketSize - 4
 	ts33Mask     = 1<<33 - 1
+	// maxPMTSection is the largest PMT section that fits one packet after the
+	// pointer_field.
+	maxPMTSection = tsPayloadLen - 1
 )
 
 // PESOptions describes one PES packet to write.
@@ -39,6 +42,7 @@ type Writer struct {
 	out     io.Writer
 	program PMT
 	set     bool
+	patVer  uint8 // PAT version
 	cc      map[uint16]uint8
 	buf     []byte
 }
@@ -81,8 +85,15 @@ func (w *Writer) SetProgram(p PMT) error {
 	if !seen[p.PCRPID] {
 		return fmt.Errorf("mpegts: set program: PCR PID %d is not a stream", p.PCRPID)
 	}
+	if n := pmtSectionLen(len(p.Streams)); n > maxPMTSection {
+		return fmt.Errorf("mpegts: set program: %d streams need a %d-byte PMT section, over the %d that fit one packet",
+			len(p.Streams), n, maxPMTSection)
+	}
 	p.Streams = slices.Clone(p.Streams)
 	if w.set {
+		if w.program.Program != p.Program || w.program.PID != p.PID {
+			w.patVer = (w.patVer + 1) & 0x1F
+		}
 		p.Version = w.program.Version
 		old := w.program
 		if old.Program != p.Program || old.PID != p.PID || old.PCRPID != p.PCRPID ||
@@ -101,7 +112,7 @@ func (w *Writer) WriteTables() error {
 	if !w.set {
 		return errors.New("mpegts: write tables: no program set")
 	}
-	pat := longSectionBytes(tablePAT, tsID, 0, []byte{
+	pat := longSectionBytes(tablePAT, tsID, w.patVer, []byte{
 		byte(w.program.Program >> 8), byte(w.program.Program),
 		0xE0 | byte(w.program.PID>>8), byte(w.program.PID),
 	})
@@ -263,3 +274,7 @@ func appendTimestamp(dst []byte, prefix byte, ts int64) []byte {
 		byte(t<<1)|1,
 	)
 }
+
+// pmtSectionLen is the size of the PMT section the writer generates for n
+// streams: header, PCR PID and program info, 5 bytes per stream, CRC_32.
+func pmtSectionLen(n int) int { return longHeaderLen + 4 + 5*n + crcLen }
