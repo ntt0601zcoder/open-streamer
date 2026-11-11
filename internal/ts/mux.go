@@ -151,17 +151,18 @@ func (m *Muxer) WriteFrame(f media.Frame) error {
 	}
 
 	pid := uint16(firstPID + f.Track)
+	video := tc.Codec.Kind() == media.KindVideo
 	opt := mpegts.PESOptions{
 		PTS:          (f.PTS + timeOffset) & ts33Mask,
 		DTS:          (f.DTS + timeOffset) & ts33Mask,
-		HasDTS:       f.DTS != f.PTS,
-		RandomAccess: f.Key && tc.Codec.Kind() == media.KindVideo,
+		HasDTS:       video && f.DTS != f.PTS,
+		RandomAccess: f.Key && video,
 		PCR:          -1,
-		Video:        tc.Codec.Kind() == media.KindVideo,
+		Video:        video,
 	}
 	if pid == m.pcrPID {
 		opt.PCR = (f.DTS + pcrOffset) & ts33Mask
-		if m.needTables(f, opt.Video) {
+		if m.needTables(f, video) {
 			if err := m.w.WriteTables(); err != nil {
 				return fmt.Errorf("ts: mux: %w", err)
 			}
