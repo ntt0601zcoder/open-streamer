@@ -70,8 +70,9 @@ func (s *sectionAssembler) reset() {
 
 // feed adds one packet's payload and passes every completed section to emit;
 // the section is valid only during the call. It returns how many framing
-// errors it found: a pointer_field beyond the payload, a section cut short
-// by the next section start, or an oversized PAT or PMT section_length.
+// errors it found: a pointer_field beyond the payload, a PAT or PMT section
+// cut short by the next section start, or an oversized PAT or PMT
+// section_length. Sections of other tables are ignored without error.
 func (s *sectionAssembler) feed(pusi bool, payload []byte, emit func([]byte)) int {
 	if len(payload) == 0 {
 		return 0
@@ -86,7 +87,7 @@ func (s *sectionAssembler) feed(pusi bool, payload []byte, emit func([]byte)) in
 		if s.active {
 			s.buf = append(s.buf, payload[1:1+ptr]...)
 			errs += s.drain(emit)
-			if s.active && len(s.buf) > 0 {
+			if s.active && len(s.buf) > 0 && s.buf[0] == s.table {
 				errs++
 			}
 		}
@@ -133,6 +134,7 @@ type longSection struct {
 	idExt   uint16 // table_id_extension: transport_stream_id or program_number
 	version uint8
 	current bool   // current_next_indicator
+	number  uint8  // section_number
 	body    []byte // after last_section_number, before CRC_32
 }
 
@@ -160,6 +162,7 @@ func parseLongSection(sec []byte) (longSection, error) {
 		idExt:   be16(sec[3:]),
 		version: sec[5] >> 1 & 0x1F,
 		current: sec[5]&0x01 != 0,
+		number:  sec[6],
 		body:    sec[longHeaderLen:end],
 	}, nil
 }
