@@ -70,3 +70,37 @@ func (a ADTS) AudioSpecificConfig() []byte {
 	v := uint16(a.ObjectType&0x1f)<<11 | uint16(a.SampleRateIndex&0x0f)<<7 | uint16(a.ChannelConfig&0x0f)<<3
 	return []byte{byte(v >> 8), byte(v)}
 }
+
+// AppendADTS appends one ADTS frame (7-byte header, no CRC) carrying payload
+// to dst. The header comes from asc, an AAC AudioSpecificConfig: the object
+// type must be 1 to 4 (the ADTS profile is the object type minus one), the
+// sampling frequency index 0 to 12 and the channel configuration 1 to 7.
+func AppendADTS(dst, asc, payload []byte) ([]byte, error) {
+	if len(asc) < 2 {
+		return dst, fmt.Errorf("mpegts: adts: audio specific config has %d bytes, need 2", len(asc))
+	}
+	v := uint16(asc[0])<<8 | uint16(asc[1])
+	objType, srIdx, chans := v>>11, (v>>7)&0x0F, (v>>3)&0x0F
+	if objType < 1 || objType > 4 {
+		return dst, fmt.Errorf("mpegts: adts: object type %d cannot be written in an ADTS header", objType)
+	}
+	if srIdx >= 13 {
+		return dst, fmt.Errorf("mpegts: adts: invalid sampling frequency index %d", srIdx)
+	}
+	if chans < 1 || chans > 7 {
+		return dst, fmt.Errorf("mpegts: adts: channel configuration %d is not supported", chans)
+	}
+	if len(payload) > maxADTSPayload {
+		return dst, fmt.Errorf("mpegts: adts: payload of %d bytes does not fit one frame", len(payload))
+	}
+	fl := 7 + len(payload)
+	dst = append(dst,
+		0xFF, 0xF1, // sync word, MPEG-4, layer 0, protection absent
+		byte(objType-1)<<6|byte(srIdx)<<2|byte(chans>>2),
+		byte(chans&3)<<6|byte(fl>>11),
+		byte(fl>>3),
+		byte(fl<<5)|0x1F,
+		0xFC,
+	)
+	return append(dst, payload...), nil
+}
