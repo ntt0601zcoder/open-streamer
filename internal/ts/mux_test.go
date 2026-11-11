@@ -189,15 +189,49 @@ func checkPCR(t *testing.T, c muxClip, data []byte) {
 	}
 }
 
+// checkTimestamps asserts that the PES of every track carry PTS and DTS of
+// stream time + 126000 modulo 2^33, and that audio PES have no DTS field.
+func checkTimestamps(t *testing.T, c muxClip, data []byte) {
+	t.Helper()
+	got := map[uint16][]*mpegts.PES{}
+	dmx := mpegts.NewDemux(bytes.NewReader(data))
+	for {
+		ev, err := dmx.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		if ev.PES != nil {
+			got[ev.PES.PID] = append(got[ev.PES.PID], ev.PES)
+		}
+	}
+	for track := range c.tracks {
+		in, pes := byTrack(c.frames, track), got[uint16(firstPID+track)]
+		require.Len(t, pes, len(in))
+		for i, f := range in {
+			assert.Equal(t, (f.PTS+126000)&ts33Mask, pes[i].PTS, "pts %d/%d", track, i)
+			assert.Equal(t, (f.DTS+126000)&ts33Mask, pes[i].DTS, "dts %d/%d", track, i)
+		}
+	}
+	for _, p := range readPackets(t, data) {
+		if p.PID == firstPID+1 && p.PUSI {
+			assert.Zero(t, p.Payload[7]&0x40, "audio PES has a DTS")
+		}
+	}
+}
+
 func TestMuxPCREveryPES(t *testing.T) {
 	c := loadClip(t, "h264_aac.ts", 5000)
-	checkPCR(t, c, muxClipBytes(t, c))
+	data := muxClipBytes(t, c)
+	checkPCR(t, c, data)
+	checkTimestamps(t, c, data)
 }
 
 func TestMuxWrap(t *testing.T) {
 	c := loadClip(t, "h264_aac.ts", ts33Mask+1-126000-90000)
 	data := muxClipBytes(t, c)
 	checkPCR(t, c, data)
+	checkTimestamps(t, c, data)
 
 	// The clip crosses the written DTS wrap (stream time 2^33 - 126000) and
 	// the PCR wrap (2^33 - 63000).
@@ -323,15 +357,32 @@ func TestMuxSetTracks(t *testing.T) {
 		m, err := NewMuxer(&buf, []*media.TrackConfig{nil, c.tracks[1]})
 		require.NoError(t, err)
 		audio := byTrack(c.frames, 1)
+		muxFrames(t, m, audio[:2])
 		require.NoError(t, m.WriteTables())
-		muxFrames(t, m, audio[:4]) // 4 frames: under 9000 ticks since the explicit tables
-		pats := 0
+		ref := audio[2].DTS // the first frame after the explicit tables
+		muxFrames(t, m, audio[2:12])
+
+		// Tables: the first one before audio[0], the explicit one before
+		// audio[2], the next one before the first frame at ref + 9000.
+		var tableAt []int64 // PCR of the PES after each table pair
 		for _, p := range readPackets(t, buf.Bytes()) {
 			if p.PID == 0 {
-				pats++
+				tableAt = append(tableAt, -1)
+			} else if p.PID == firstPID+1 && p.PUSI && len(tableAt) > 0 && tableAt[len(tableAt)-1] == -1 {
+				tableAt[len(tableAt)-1] = p.PCR
 			}
 		}
-		assert.Equal(t, 1, pats)
+		var want int64
+		for _, f := range audio[2:12] {
+			if f.DTS >= ref+9000 {
+				want = (f.DTS + 63000) & ts33Mask
+				break
+			}
+		}
+		require.NotZero(t, want)
+		assert.Equal(t, []int64{
+			(audio[0].DTS + 63000) & ts33Mask, (ref + 63000) & ts33Mask, want,
+		}, tableAt)
 	})
 
 	t.Run("codec change", func(t *testing.T) {
