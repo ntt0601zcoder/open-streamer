@@ -22,13 +22,22 @@ import (
 //   - Epochs holds every epoch that has a segment in the window, ascending.
 //     Each epoch's Start and Wall were computed once, when its first segment
 //     was packaged, and never change.
-//   - EvictedDiscontinuities counts SegmentInfo.Discontinuity flags of
-//     segments that left the window; EvictedTrackDiscontinuities counts
-//     CMAFPart.Discontinuity flags that left it, per track (nil when none).
+//   - Three discontinuity views, each with an eviction counter for the
+//     playlist's DISCONTINUITY-SEQUENCE. SegmentInfo.Discontinuity is the
+//     segmenter's flag (epoch change or lost frames); EvictedDiscontinuities
+//     counts it on segments that left the window. SegmentInfo.TSDiscontinuity
+//     is the HLS-TS flag: set on a segment with TS bytes when it is
+//     Discontinuity or a TS segment was dropped (TS == nil) since the last
+//     segment with TS bytes; it is always false when TS is nil, and
+//     EvictedTSDiscontinuities counts it on segments that left the window.
+//     CMAFPart.Discontinuity is the per-track flag (see CMAFPart);
+//     EvictedTrackDiscontinuities counts it per track (nil when none).
 //
 // Byte slices (SegmentInfo.TS, CMAFPart.Data, EpochTrack.Init) and configs
-// are shared with the packager and must never be modified. Every slice and
-// map header is the snapshot's own.
+// are shared with the packager and must never be modified. Segments, Epochs
+// and the map are the snapshot's own; SegmentInfo.Parts and
+// EpochInfo.Tracks share immutable backing arrays clipped to their length,
+// so appending to them never touches the packager's data.
 type Snapshot struct {
 	Target                      int64     // segment target, 90 kHz ticks
 	Window                      int       // window length in segments
@@ -38,6 +47,7 @@ type Snapshot struct {
 	Listed                      int
 	Epochs                      []EpochInfo
 	EvictedDiscontinuities      uint64
+	EvictedTSDiscontinuities    uint64
 	EvictedTrackDiscontinuities map[int]uint64
 }
 
@@ -51,9 +61,12 @@ type SegmentInfo struct {
 	Duration      int64 // anchor track span, ticks
 	End           int64 // end of the latest-ending frame over all tracks
 	// TS is the muxed TS segment, served as hls/{Seq}.ts; nil when muxing
-	// failed.
-	TS    []byte
-	Parts []CMAFPart // one per track that has frames and muxed cleanly, ascending Track
+	// failed. HLS-TS skips such a segment.
+	TS []byte
+	// TSDiscontinuity is the HLS-TS discontinuity flag: TS is non-nil and
+	// the segment is Discontinuity or follows dropped TS segments.
+	TSDiscontinuity bool
+	Parts           []CMAFPart // one per track that has frames and muxed cleanly, ascending Track
 }
 
 // CMAFPart is one track's CMAF media segment, served as cmaf/{Track}-{N}.m4s.
@@ -62,7 +75,8 @@ type CMAFPart struct {
 	// N numbers the track's parts from 0 with no holes, across epochs.
 	N uint64
 	// Discontinuity is set when any segment since the track's previous part
-	// (inclusive of this one) was discontinuous.
+	// (inclusive of this one) was discontinuous, or a part of the track
+	// failed to mux since its previous part.
 	Discontinuity bool
 	Timing        fmp4.Timing // in the track's timescale (fmp4.Timescale)
 	Data          []byte
@@ -126,6 +140,7 @@ type store struct {
 	segs        []SegmentInfo
 	epochs      []EpochInfo // ascending Epoch, only epochs with a segment in segs
 	evicted     uint64
+	evictedTS   uint64
 	evictedPart map[int]uint64
 }
 
@@ -157,6 +172,9 @@ func (s *store) add(seg SegmentInfo, ep EpochInfo, window int) {
 		if old.Discontinuity {
 			s.evicted++
 		}
+		if old.TSDiscontinuity {
+			s.evictedTS++
+		}
 		for _, part := range old.Parts {
 			if part.Discontinuity {
 				if s.evictedPart == nil {
@@ -181,6 +199,7 @@ func (s *store) snapshot() Snapshot {
 		Segments:                    slices.Clone(s.segs),
 		Epochs:                      slices.Clone(s.epochs),
 		EvictedDiscontinuities:      s.evicted,
+		EvictedTSDiscontinuities:    s.evictedTS,
 		EvictedTrackDiscontinuities: maps.Clone(s.evictedPart),
 	}
 }
