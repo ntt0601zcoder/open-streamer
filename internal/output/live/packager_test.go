@@ -123,6 +123,7 @@ func TestPackagerTSAndCMAF(t *testing.T) {
 	assert.Equal(t, t0, snap.AST)
 	assert.Equal(t, farFuture(), snap.Now)
 	assert.Zero(t, p.Errors())
+	assert.Zero(t, p.FallbackAnchors())
 
 	require.Len(t, snap.Epochs, 1)
 	ep := snap.Epochs[0]
@@ -489,11 +490,15 @@ func TestPackagerMuxErrorsPerFormat(t *testing.T) {
 	assert.Nil(t, snap.Segments[0].TS)
 	require.Len(t, snap.Segments[0].Parts, 1)
 	assert.EqualValues(t, 0, snap.Segments[0].Parts[0].N)
+	assert.False(t, snap.Segments[0].Parts[0].Discontinuity)
 	assert.NotNil(t, snap.Segments[1].TS)
+	assert.True(t, snap.Segments[1].TSDiscontinuity, "the TS before it was dropped")
 	assert.Empty(t, snap.Segments[1].Parts)
 	assert.Nil(t, snap.Segments[2].TS)
 	require.Len(t, snap.Segments[2].Parts, 1)
 	assert.EqualValues(t, 1, snap.Segments[2].Parts[0].N, "n has no hole after a failed segment")
+	assert.False(t, snap.Segments[2].Discontinuity)
+	assert.True(t, snap.Segments[2].Parts[0].Discontinuity, "the part before it was dropped")
 	assert.EqualValues(t, 4, p.Errors())
 
 	srv := serve(p)
@@ -511,8 +516,11 @@ func TestPackagerNoAnchorFallsBackToNow(t *testing.T) {
 	snap := p.Snapshot()
 	require.Len(t, snap.Epochs, 1)
 	ep := snap.Epochs[0]
-	assert.Equal(t, media.Anchor{Epoch: 7, Start: 900, Wall: t0.Add(5 * time.Second)}, ep.Anchor)
+	// Anchored at the segment's end (900 + 50 frames), close to its arrival.
+	assert.Equal(t, media.Anchor{Epoch: 7, Start: 180900, Wall: t0.Add(5 * time.Second)}, ep.Anchor)
 	assert.Equal(t, ep.Anchor.Wall, snap.AST)
+	assert.EqualValues(t, 1, p.FallbackAnchors())
+	assert.True(t, snap.IsListed(snap.Segments[0]))
 }
 
 func TestEffectiveWall(t *testing.T) {
@@ -721,4 +729,119 @@ func TestPackagerSetupErrors(t *testing.T) {
 	assert.Equal(t, 0, snap.Segments[1].Parts[0].Track)
 	assert.True(t, snap.Segments[1].Parts[0].Discontinuity)
 	assert.EqualValues(t, 4, p.Errors())
+}
+
+// dropTS packages 5 segments of epoch 1 and 2 of epoch 2 with the TS output
+// of segments 1 and 5 (the first of epoch 2) failing.
+func dropTS(t *testing.T, window int) *Packager {
+	t.Helper()
+	cfg := h264Config(t)
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Wall: t0})
+	h.SetAnchor(media.Anchor{Epoch: 2, Start: 250 * 3600, Wall: t0})
+	p := NewPackager(h, Options{Window: window, Now: farFuture})
+	ds := synth(cfg, 1, 0, 250)
+	ds[53].Frame.Data = nil
+	e2 := synth(cfg, 2, 250*3600, 100)
+	e2[2].Frame.Data = nil
+	handleAll(p, append(ds, e2...))
+	p.Flush()
+	return p
+}
+
+func TestTSDiscontinuityAfterDroppedTS(t *testing.T) {
+	p := dropTS(t, 100)
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 7)
+	assert.EqualValues(t, 2, p.Errors())
+	n := len(snap.Segments)
+	tsNil, tsDisc, disc := make([]bool, 0, n), make([]bool, 0, n), make([]bool, 0, n)
+	for _, s := range snap.Segments {
+		tsNil = append(tsNil, s.TS == nil)
+		tsDisc = append(tsDisc, s.TSDiscontinuity)
+		disc = append(disc, s.Discontinuity)
+	}
+	assert.Equal(t, []bool{false, true, false, false, false, true, false}, tsNil)
+	assert.Equal(t, []bool{false, false, false, false, false, true, false}, disc)
+	// Segment 2 follows a dropped TS; segment 6 inherits the discontinuity of
+	// the dropped segment 5.
+	assert.Equal(t, []bool{false, false, true, false, false, false, true}, tsDisc)
+
+	// Window 1: segments 0..5 left, carrying one TS flag (segment 2) and
+	// one segment flag (segment 5).
+	snap = dropTS(t, 1).Snapshot()
+	require.Len(t, snap.Segments, 1)
+	assert.EqualValues(t, 6, snap.Segments[0].Seq)
+	assert.EqualValues(t, 1, snap.EvictedTSDiscontinuities)
+	assert.EqualValues(t, 1, snap.EvictedDiscontinuities)
+	// Window 2: segment 5 is still in; its dropped TS has no flag.
+	snap = dropTS(t, 2).Snapshot()
+	assert.EqualValues(t, 1, snap.EvictedTSDiscontinuities)
+	assert.Zero(t, snap.EvictedDiscontinuities)
+}
+
+func TestSnapshotSlicesClipped(t *testing.T) {
+	aac, err := media.NewAACConfig([]byte{0x11, 0x90})
+	require.NoError(t, err)
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Wall: t0})
+	p := NewPackager(h, Options{Window: 100, Now: farFuture})
+	// Three tracks: appending three parts leaves spare capacity unless clipped.
+	for _, d := range synth(h264Config(t), 1, 0, 60) {
+		p.Handle(d)
+		if d.Frame.DTS%7200 == 0 {
+			for track := 1; track <= 2; track++ {
+				p.Handle(hub.Delivery{Frame: media.Frame{
+					Track: track, Config: aac, PTS: d.Frame.DTS, DTS: d.Frame.DTS, Key: true, Data: [][]byte{{0x21, 0x00}}, Epoch: 1,
+				}})
+			}
+		}
+	}
+	p.Flush()
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 2)
+	for _, s := range snap.Segments {
+		require.Len(t, s.Parts, 3)
+		assert.Equal(t, len(s.Parts), cap(s.Parts))
+	}
+	for _, e := range snap.Epochs {
+		require.Len(t, e.Tracks, 3)
+		assert.Equal(t, len(e.Tracks), cap(e.Tracks))
+	}
+	assert.Zero(t, p.Errors())
+}
+
+func TestCMAFUsesEpochConfig(t *testing.T) {
+	a48, err := media.NewAACConfig([]byte{0x11, 0x90})
+	require.NoError(t, err)
+	a44, err := media.NewAACConfig([]byte{0x12, 0x10})
+	require.NoError(t, err)
+	require.Equal(t, 44100, a44.SampleRate)
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Wall: t0})
+	p := NewPackager(h, Options{Window: 100, Now: farFuture})
+	var second int64 = -1
+	for _, d := range synth(h264Config(t), 1, 0, 100) {
+		p.Handle(d)
+		if d.Frame.DTS%7200 != 0 {
+			continue
+		}
+		cfg := a48
+		if d.Frame.DTS >= 180000 {
+			cfg = a44 // a stray config inside the epoch
+			if second < 0 {
+				second = d.Frame.DTS
+			}
+		}
+		p.Handle(hub.Delivery{Frame: media.Frame{Track: 1, Config: cfg, PTS: d.Frame.DTS, DTS: d.Frame.DTS, Key: true, Data: [][]byte{{0x21, 0x00}}, Epoch: 1}})
+	}
+	p.Flush()
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 2)
+	part := snap.Segments[1].Parts[1]
+	require.Equal(t, 1, part.Track)
+	assert.Equal(t, uint64(media.Rescale(second, 48000)), part.Timing.BaseTime, "timescale of the epoch's init")
+	tr, ok := snap.Epochs[0].Track(1)
+	require.True(t, ok)
+	assert.Equal(t, a48, tr.Config)
 }

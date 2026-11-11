@@ -24,6 +24,7 @@ package live
 import (
 	"bytes"
 	"context"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -57,7 +58,7 @@ type epochState struct {
 // publish returns an immutable copy of the epoch for the store.
 func (e *epochState) publish() EpochInfo {
 	info := e.info
-	info.Tracks = make([]EpochTrack, 0, len(e.tracks))
+	info.Tracks = make([]EpochTrack, 0, len(e.tracks)) // full capacity: appends copy
 	for _, t := range e.tracks {
 		info.Tracks = append(info.Tracks, *t)
 	}
@@ -68,11 +69,12 @@ func (e *epochState) publish() EpochInfo {
 // Packager packages one stream. Handle, Flush and Run serialise with each
 // other; Snapshot and the HTTP handler may run concurrently with them.
 type Packager struct {
-	h      *hub.Hub
-	target int64
-	window int
-	now    func() time.Time
-	errors atomic.Uint64
+	h        *hub.Hub
+	target   int64
+	window   int
+	now      func() time.Time
+	errors   atomic.Uint64
+	fallback atomic.Uint64
 
 	// Writer state, guarded by work.
 	work    sync.Mutex
@@ -83,6 +85,7 @@ type Packager struct {
 	ast     time.Time              // valid once prev is set
 	nextN   map[int]uint64         // per track: N of its next CMAF part
 	pending map[int]bool           // per track: a discontinuity since its last part
+	tsGap   bool                   // a TS segment was dropped since the last good one
 
 	// Shared state. The writer changes it only while holding both work and
 	// mu, so it may read it holding work alone.
@@ -117,6 +120,9 @@ func NewPackager(h *hub.Hub, opt Options) *Packager {
 // Errors returns the number of mux errors so far. Each one dropped one
 // segment's output in one format.
 func (p *Packager) Errors() uint64 { return p.errors.Load() }
+
+// FallbackAnchors returns the number of epochs placed without a hub anchor.
+func (p *Packager) FallbackAnchors() uint64 { return p.fallback.Load() }
 
 // Handle feeds one delivery and packages the segments it completes. It
 // returns when they are in the window.
@@ -184,6 +190,12 @@ func (p *Packager) pack(s segment.Segment) {
 		End:           s.End,
 		TS:            p.muxTS(s.Frames),
 	}
+	if info.TS == nil {
+		p.tsGap = true
+	} else {
+		info.TSDiscontinuity = s.Discontinuity || p.tsGap
+		p.tsGap = false
+	}
 	if s.Discontinuity {
 		for track := range p.nextN {
 			p.pending[track] = true
@@ -195,6 +207,7 @@ func (p *Packager) pack(s segment.Segment) {
 		}
 	}
 
+	info.Parts = slices.Clip(info.Parts)
 	p.mu.Lock()
 	p.st.ast = p.ast
 	p.st.add(info, ep.publish(), p.window)
@@ -219,8 +232,9 @@ func (p *Packager) inWindow(id uint32) bool {
 }
 
 // placeEpoch computes a new epoch's start and effective wall from its hub
-// anchor. Without an anchor the epoch is anchored at its first segment and
-// the packager's clock. Called with work held.
+// anchor. Without an anchor (the hub keeps only the last 64) the epoch is
+// anchored at its first segment's End and the packager's clock, close to the
+// segment's arrival, and FallbackAnchors counts it. Called with work held.
 func (p *Packager) placeEpoch(s segment.Segment) *epochState {
 	var a media.Anchor
 	ok := false
@@ -228,7 +242,8 @@ func (p *Packager) placeEpoch(s segment.Segment) *epochState {
 		a, ok = p.h.Anchor(s.Epoch)
 	}
 	if !ok {
-		a = media.Anchor{Epoch: s.Epoch, Start: s.Start, Wall: p.now()}
+		a = media.Anchor{Epoch: s.Epoch, Start: s.End, Wall: p.now()}
+		p.fallback.Add(1)
 	}
 	if p.prev == nil {
 		p.ast = a.Wall
@@ -328,9 +343,10 @@ func splitTracks(frames []media.Frame) []trackFrames {
 }
 
 // muxCMAF writes one track's CMAF part, writing the epoch's init for the
-// track first if it has none. On failure it counts an error, and the track's
-// numbering and pending discontinuity are left for its next part. Called with
-// work held.
+// track first if it has none. Init and media segment both use the epoch's
+// config for the track. On failure it counts an error, leaves the track's
+// numbering alone and marks the track discontinuous, since its timeline now
+// has a gap. Called with work held.
 func (p *Packager) muxCMAF(ep *epochState, tf trackFrames, disc bool) (CMAFPart, bool) {
 	var cfg *media.TrackConfig
 	for _, f := range tf.frames {
@@ -341,9 +357,7 @@ func (p *Packager) muxCMAF(ep *epochState, tf trackFrames, disc bool) (CMAFPart,
 	}
 	fail := func() (CMAFPart, bool) {
 		p.errors.Add(1)
-		if disc {
-			p.pending[tf.track] = true
-		}
+		p.pending[tf.track] = true
 		return CMAFPart{}, false
 	}
 	if cfg == nil || tf.track < 0 {
@@ -362,7 +376,7 @@ func (p *Packager) muxCMAF(ep *epochState, tf trackFrames, disc bool) (CMAFPart,
 		et.Init = init
 	}
 	n := p.nextN[tf.track]
-	data, tm, err := fmp4.Segment(tf.frames, cfg, uint32(n+1))
+	data, tm, err := fmp4.Segment(tf.frames, et.Config, uint32(n+1))
 	if err != nil {
 		return fail()
 	}
