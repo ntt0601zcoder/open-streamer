@@ -32,7 +32,7 @@ func sampleMPD() MPD {
 						SegmentTemplate: &SegmentTemplate{
 							Timescale: 90000, PresentationTimeOffset: 900, StartNumber: &five,
 							Initialization: "init-1-0.mp4", Media: "1-$Number$.m4s",
-							Timeline: &SegmentTimeline{S: []S{{T: 900, D: 180000}, {T: 180900, D: 180000}}},
+							Timeline: &SegmentTimeline{S: []S{{T: u64(900), D: 180000}, {T: u64(180900), D: 180000}}},
 						},
 					}},
 				},
@@ -148,6 +148,8 @@ func TestParseForeign(t *testing.T) {
 	require.Len(t, st.Timeline.S, 2)
 	assert.Equal(t, int64(2), st.Timeline.S[0].R)
 	assert.Equal(t, uint64(90000), st.Timeline.S[1].D)
+	assert.Nil(t, st.Timeline.S[1].T)
+	assert.Equal(t, []Seg{{0, 180000}, {180000, 180000}, {360000, 180000}, {540000, 90000}}, st.Timeline.Resolve())
 	assert.Equal(t, 640, as.Representations[0].Width)
 }
 
@@ -165,4 +167,48 @@ func TestParseErrors(t *testing.T) {
 		require.Error(t, err, name)
 		assert.True(t, strings.HasPrefix(err.Error(), "dash:"), name+": "+err.Error())
 	}
+}
+
+func u64(v uint64) *uint64 { return &v }
+
+func TestResolveImplicitStart(t *testing.T) {
+	tl := SegmentTimeline{S: []S{{D: 96256, R: 1}, {D: 256}, {T: u64(1000000), D: 10}, {D: 10, R: -1}}}
+	assert.Equal(t, []Seg{
+		{0, 96256},
+		{96256, 96256},
+		{192512, 256},
+		{1000000, 10},
+		{1000010, 10},
+	}, tl.Resolve())
+	assert.Empty(t, SegmentTimeline{}.Resolve())
+	assert.Len(t, SegmentTimeline{S: []S{{D: 1, R: 1 << 40}}}.Resolve(), maxRepeat+1)
+}
+
+func TestMissingTNotWritten(t *testing.T) {
+	m := MPD{Periods: []Period{{AdaptationSets: []AdaptationSet{{Representations: []Representation{{
+		ID: "v", SegmentTemplate: &SegmentTemplate{Timeline: &SegmentTimeline{S: []S{{D: 5, R: 1}, {D: 6}}}},
+	}}}}}}}
+	b := m.Encode()
+	assert.NotContains(t, string(b), ` t="`)
+	got, err := Parse(b)
+	require.NoError(t, err)
+	assert.Nil(t, got.Periods[0].AdaptationSets[0].Representations[0].SegmentTemplate.Timeline.S[0].T)
+}
+
+func TestMinBufferTimeAlwaysWritten(t *testing.T) {
+	assert.Contains(t, string(MPD{}.Encode()), `minBufferTime="PT0S"`)
+}
+
+func TestParseDurationOverflow(t *testing.T) {
+	for _, in := range []string{
+		"P999999999D", "PT9999999999999S", "PT9223372036854775807S", "PT9999999999H",
+		"P106751DT24H", "P106751D106751D",
+	} {
+		_, err := ParseDuration(in)
+		require.Error(t, err, in)
+		assert.Contains(t, err.Error(), "dash:")
+	}
+	d, err := ParseDuration("PT9223372036S")
+	require.NoError(t, err)
+	assert.Equal(t, 9223372036*time.Second, d)
 }
