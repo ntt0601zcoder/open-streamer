@@ -85,6 +85,7 @@ type Packager struct {
 	ast     time.Time              // valid once prev is set
 	nextN   map[int]uint64         // per track: N of its next CMAF part
 	pending map[int]bool           // per track: a discontinuity since its last part
+	tsSeq   uint64                 // TSSeq of the next segment with TS bytes
 	tsGap   bool                   // a TS segment was dropped since the last good one
 
 	// Shared state. The writer changes it only while holding both work and
@@ -193,7 +194,11 @@ func (p *Packager) pack(s segment.Segment) {
 	if info.TS == nil {
 		p.tsGap = true
 	} else {
-		info.TSDiscontinuity = s.Discontinuity || p.tsGap
+		// The first segment with TS bytes has nothing before it to be
+		// discontinuous with, like the segmenter's first segment.
+		info.TSSeq = p.tsSeq
+		info.TSDiscontinuity = p.tsSeq > 0 && (s.Discontinuity || p.tsGap)
+		p.tsSeq++
 		p.tsGap = false
 	}
 	if s.Discontinuity {
@@ -233,8 +238,9 @@ func (p *Packager) inWindow(id uint32) bool {
 
 // placeEpoch computes a new epoch's start and effective wall from its hub
 // anchor. Without an anchor (the hub keeps only the last 64) the epoch is
-// anchored at its first segment's End and the packager's clock, close to the
-// segment's arrival, and FallbackAnchors counts it. Called with work held.
+// placed so that its first segment ends at the packager's clock, close to
+// the segment's arrival: Start is the segment's Start and Wall is Now minus
+// the segment's span. FallbackAnchors counts it. Called with work held.
 func (p *Packager) placeEpoch(s segment.Segment) *epochState {
 	var a media.Anchor
 	ok := false
@@ -242,7 +248,7 @@ func (p *Packager) placeEpoch(s segment.Segment) *epochState {
 		a, ok = p.h.Anchor(s.Epoch)
 	}
 	if !ok {
-		a = media.Anchor{Epoch: s.Epoch, Start: s.End, Wall: p.now()}
+		a = media.Anchor{Epoch: s.Epoch, Start: s.Start, Wall: p.now().Add(-media.ToDuration(s.End - s.Start))}
 		p.fallback.Add(1)
 	}
 	if p.prev == nil {
@@ -346,7 +352,7 @@ func splitTracks(frames []media.Frame) []trackFrames {
 // track first if it has none. Init and media segment both use the epoch's
 // config for the track. On failure it counts an error, leaves the track's
 // numbering alone and marks the track discontinuous, since its timeline now
-// has a gap. Called with work held.
+// has a gap. A track's first part is never discontinuous. Called with work held.
 func (p *Packager) muxCMAF(ep *epochState, tf trackFrames, disc bool) (CMAFPart, bool) {
 	var cfg *media.TrackConfig
 	for _, f := range tf.frames {
@@ -355,6 +361,7 @@ func (p *Packager) muxCMAF(ep *epochState, tf trackFrames, disc bool) (CMAFPart,
 			break
 		}
 	}
+	n, had := p.nextN[tf.track]
 	fail := func() (CMAFPart, bool) {
 		p.errors.Add(1)
 		p.pending[tf.track] = true
@@ -375,7 +382,6 @@ func (p *Packager) muxCMAF(ep *epochState, tf trackFrames, disc bool) (CMAFPart,
 		}
 		et.Init = init
 	}
-	n := p.nextN[tf.track]
 	data, tm, err := fmp4.Segment(tf.frames, et.Config, uint32(n+1))
 	if err != nil {
 		return fail()
@@ -383,7 +389,7 @@ func (p *Packager) muxCMAF(ep *epochState, tf trackFrames, disc bool) (CMAFPart,
 	part := CMAFPart{
 		Track:         tf.track,
 		N:             n,
-		Discontinuity: disc || p.pending[tf.track],
+		Discontinuity: had && (disc || p.pending[tf.track]),
 		Timing:        tm,
 		Data:          data,
 	}

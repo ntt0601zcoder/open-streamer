@@ -492,7 +492,8 @@ func TestPackagerMuxErrorsPerFormat(t *testing.T) {
 	assert.EqualValues(t, 0, snap.Segments[0].Parts[0].N)
 	assert.False(t, snap.Segments[0].Parts[0].Discontinuity)
 	assert.NotNil(t, snap.Segments[1].TS)
-	assert.True(t, snap.Segments[1].TSDiscontinuity, "the TS before it was dropped")
+	assert.False(t, snap.Segments[1].TSDiscontinuity, "the first segment with TS bytes")
+	assert.Zero(t, snap.Segments[1].TSSeq)
 	assert.Empty(t, snap.Segments[1].Parts)
 	assert.Nil(t, snap.Segments[2].TS)
 	require.Len(t, snap.Segments[2].Parts, 1)
@@ -516,8 +517,9 @@ func TestPackagerNoAnchorFallsBackToNow(t *testing.T) {
 	snap := p.Snapshot()
 	require.Len(t, snap.Epochs, 1)
 	ep := snap.Epochs[0]
-	// Anchored at the segment's end (900 + 50 frames), close to its arrival.
-	assert.Equal(t, media.Anchor{Epoch: 7, Start: 180900, Wall: t0.Add(5 * time.Second)}, ep.Anchor)
+	// Anchored at the segment's start, placed so that it ends at Now.
+	assert.Equal(t, media.Anchor{Epoch: 7, Start: 900, Wall: t0.Add(3 * time.Second)}, ep.Anchor)
+	assert.Equal(t, clk.Now(), ep.WallAt(snap.Segments[0].End))
 	assert.Equal(t, ep.Anchor.Wall, snap.AST)
 	assert.EqualValues(t, 1, p.FallbackAnchors())
 	assert.True(t, snap.IsListed(snap.Segments[0]))
@@ -727,7 +729,7 @@ func TestPackagerSetupErrors(t *testing.T) {
 	assert.Nil(t, snap.Segments[1].TS)
 	require.Len(t, snap.Segments[1].Parts, 1)
 	assert.Equal(t, 0, snap.Segments[1].Parts[0].Track)
-	assert.True(t, snap.Segments[1].Parts[0].Discontinuity)
+	assert.False(t, snap.Segments[1].Parts[0].Discontinuity, "the track's first part")
 	assert.EqualValues(t, 4, p.Errors())
 }
 
@@ -844,4 +846,115 @@ func TestCMAFUsesEpochConfig(t *testing.T) {
 	tr, ok := snap.Epochs[0].Track(1)
 	require.True(t, ok)
 	assert.Equal(t, a48, tr.Config)
+}
+
+// failTS packages 6 segments whose TS output fails at segments 0, 1 and 4.
+func failTS(t *testing.T, window int) *Packager {
+	t.Helper()
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Wall: t0})
+	p := NewPackager(h, Options{Window: window, Now: farFuture})
+	ds := synth(h264Config(t), 1, 0, 300)
+	for _, i := range []int{3, 53, 203} {
+		ds[i].Frame.Data = nil
+	}
+	handleAll(p, ds)
+	p.Flush()
+	return p
+}
+
+func TestTSSeqHasNoHoles(t *testing.T) {
+	p := failTS(t, 100)
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 6)
+	assert.EqualValues(t, 3, p.Errors())
+	type entry struct {
+		seq, tsSeq uint64
+		disc       bool
+	}
+	var got []entry
+	for _, s := range snap.Segments[:snap.Listed] {
+		if s.TS != nil {
+			got = append(got, entry{s.Seq, s.TSSeq, s.TSDiscontinuity})
+		} else {
+			assert.False(t, s.TSDiscontinuity)
+		}
+	}
+	// Segment 2 is the first with TS bytes (no flag despite the drops
+	// before it); segment 5 follows the dropped segment 4.
+	assert.Equal(t, []entry{{2, 0, false}, {3, 1, false}, {5, 2, true}}, got)
+
+	for window, first := range map[int]uint64{3: 1, 2: 2, 1: 2} {
+		snap := failTS(t, window).Snapshot()
+		var tsSeqs []uint64
+		for _, s := range snap.Segments[:snap.Listed] {
+			if s.TS != nil {
+				tsSeqs = append(tsSeqs, s.TSSeq)
+			}
+		}
+		require.NotEmpty(t, tsSeqs, "window %d", window)
+		assert.Equal(t, first, tsSeqs[0], "window %d", window)
+		for i := range tsSeqs {
+			assert.Equal(t, first+uint64(i), tsSeqs[i], "window %d", window)
+		}
+		assert.Zero(t, snap.EvictedTSDiscontinuities, "window %d: segment 5's flag is still in", window)
+	}
+}
+
+func TestCMAFFailureFlags(t *testing.T) {
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Wall: t0})
+	p := NewPackager(h, Options{Window: 100, Now: farFuture})
+	ds := synth(h264Config(t), 1, 0, 250)
+	// A repeated DTS fails the video part of segments 0, 2 and 3.
+	for _, i := range []int{10, 110, 160} {
+		ds[i].Frame.DTS, ds[i].Frame.PTS = ds[i-1].Frame.DTS, ds[i-1].Frame.PTS
+	}
+	handleAll(p, ds)
+	p.Flush()
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 5)
+	assert.EqualValues(t, 3, p.Errors())
+	for _, i := range []int{0, 2, 3} {
+		assert.Empty(t, snap.Segments[i].Parts, "segment %d", i)
+	}
+	// A failure before the track's first part does not flag it.
+	require.Len(t, snap.Segments[1].Parts, 1)
+	assert.EqualValues(t, 0, snap.Segments[1].Parts[0].N)
+	assert.False(t, snap.Segments[1].Parts[0].Discontinuity)
+	// Two consecutive failures after it flag the next part once.
+	require.Len(t, snap.Segments[4].Parts, 1)
+	assert.EqualValues(t, 1, snap.Segments[4].Parts[0].N)
+	assert.True(t, snap.Segments[4].Parts[0].Discontinuity)
+	for _, s := range snap.Segments {
+		assert.False(t, s.Discontinuity)
+	}
+}
+
+func TestFirstTSSegmentNeverDiscontinuous(t *testing.T) {
+	cfg := h264Config(t)
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Wall: t0})
+	h.SetAnchor(media.Anchor{Epoch: 2, Start: 50 * 3600, Wall: t0})
+	p := NewPackager(h, Options{Window: 100, Now: farFuture})
+	// Epoch 1's only segment fails TS; epoch 2's first segment is the first
+	// with TS bytes, and discontinuous for the segmenter.
+	e1 := synth(cfg, 1, 0, 50)
+	e1[3].Frame.Data = nil
+	handleAll(p, e1)
+	handleAll(p, synth(cfg, 2, 50*3600, 100))
+	p.Flush()
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 3)
+	assert.Nil(t, snap.Segments[0].TS)
+	s1 := snap.Segments[1]
+	assert.True(t, s1.Discontinuity)
+	require.NotNil(t, s1.TS)
+	assert.Zero(t, s1.TSSeq)
+	assert.False(t, s1.TSDiscontinuity)
+	assert.EqualValues(t, 1, snap.Segments[2].TSSeq)
+	assert.False(t, snap.Segments[2].TSDiscontinuity)
+	// The video track's parts: the first is never discontinuous.
+	assert.False(t, snap.Segments[0].Parts[0].Discontinuity)
+	assert.True(t, s1.Parts[0].Discontinuity)
 }

@@ -26,12 +26,16 @@ import (
 //     playlist's DISCONTINUITY-SEQUENCE. SegmentInfo.Discontinuity is the
 //     segmenter's flag (epoch change or lost frames); EvictedDiscontinuities
 //     counts it on segments that left the window. SegmentInfo.TSDiscontinuity
-//     is the HLS-TS flag: set on a segment with TS bytes when it is
-//     Discontinuity or a TS segment was dropped (TS == nil) since the last
-//     segment with TS bytes; it is always false when TS is nil, and
-//     EvictedTSDiscontinuities counts it on segments that left the window.
-//     CMAFPart.Discontinuity is the per-track flag (see CMAFPart);
-//     EvictedTrackDiscontinuities counts it per track (nil when none).
+//     is the HLS-TS flag: set on a segment with TS bytes, other than the
+//     first one ever, when it is Discontinuity or a TS segment was dropped
+//     (TS == nil) since the previous segment with TS bytes; it is always
+//     false when TS is nil, and EvictedTSDiscontinuities counts it on
+//     segments that left the window. CMAFPart.Discontinuity is the
+//     per-track flag (see CMAFPart); EvictedTrackDiscontinuities counts it
+//     per track (nil when none).
+//   - HLS-TS numbering: a segment with TS == nil has no TS entry. Segments
+//     with TS bytes carry TSSeq, which counts them from 0 with no holes, so
+//     the TS playlist's MEDIA-SEQUENCE is the TSSeq of its first entry.
 //
 // Byte slices (SegmentInfo.TS, CMAFPart.Data, EpochTrack.Init) and configs
 // are shared with the packager and must never be modified. Segments, Epochs
@@ -61,10 +65,15 @@ type SegmentInfo struct {
 	Duration      int64 // anchor track span, ticks
 	End           int64 // end of the latest-ending frame over all tracks
 	// TS is the muxed TS segment, served as hls/{Seq}.ts; nil when muxing
-	// failed. HLS-TS skips such a segment.
+	// failed, and then the segment has no HLS-TS entry.
 	TS []byte
-	// TSDiscontinuity is the HLS-TS discontinuity flag: TS is non-nil and
-	// the segment is Discontinuity or follows dropped TS segments.
+	// TSSeq numbers the segments with TS bytes from 0, consecutively and
+	// never reused: the HLS-TS media sequence number. Valid only when TS is
+	// non-nil.
+	TSSeq uint64
+	// TSDiscontinuity is the HLS-TS discontinuity flag: TS is non-nil, this
+	// is not the first segment with TS bytes, and the segment is
+	// Discontinuity or follows dropped TS segments.
 	TSDiscontinuity bool
 	Parts           []CMAFPart // one per track that has frames and muxed cleanly, ascending Track
 }
@@ -74,9 +83,9 @@ type CMAFPart struct {
 	Track int
 	// N numbers the track's parts from 0 with no holes, across epochs.
 	N uint64
-	// Discontinuity is set when any segment since the track's previous part
-	// (inclusive of this one) was discontinuous, or a part of the track
-	// failed to mux since its previous part.
+	// Discontinuity is set when the track has a previous part and, since
+	// that part, any segment (inclusive of this one) was discontinuous or a
+	// part of the track failed to mux. A track's first part never has it.
 	Discontinuity bool
 	Timing        fmp4.Timing // in the track's timescale (fmp4.Timescale)
 	Data          []byte
