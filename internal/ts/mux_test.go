@@ -564,3 +564,29 @@ func TestMuxFFprobe(t *testing.T) {
 		})
 	}
 }
+
+func TestMuxAudioPESNeverHasDTS(t *testing.T) {
+	c := loadClip(t, "h264_aac.ts", 0)
+	var buf bytes.Buffer
+	m, err := NewMuxer(&buf, []*media.TrackConfig{nil, c.tracks[1]})
+	require.NoError(t, err)
+	f := byTrack(c.frames, 1)[0]
+	f.PTS, f.DTS = 5000, 3000 // DTS != PTS
+	require.NoError(t, m.WriteFrame(f))
+
+	for _, p := range readPackets(t, buf.Bytes()) {
+		if p.PID == firstPID+1 && p.PUSI {
+			assert.Zero(t, p.Payload[7]&0x40, "PES header has the DTS flag")
+		}
+	}
+	dmx := mpegts.NewDemux(bytes.NewReader(buf.Bytes()))
+	for {
+		ev, err := dmx.Next()
+		require.NoError(t, err)
+		if ev.PES != nil {
+			assert.Equal(t, int64(5000+126000), ev.PES.PTS)
+			assert.Equal(t, ev.PES.PTS, ev.PES.DTS)
+			return
+		}
+	}
+}
