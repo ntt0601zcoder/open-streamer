@@ -653,8 +653,9 @@ func TestDemuxSizedPESIncomplete(t *testing.T) {
 	ps := videoOf(evs)
 	require.Len(t, ps, 1)
 	assert.Equal(t, int64(2), ps[0].PTS)
-	assert.False(t, ps[0].Discontinuity)
+	assert.True(t, ps[0].Discontinuity, "the cut PES marks the next one")
 	assert.Equal(t, uint64(2), st.PESErrors, "one at the next PUSI, one at EOF")
+	assert.Equal(t, uint64(2), st.LostPES)
 	assert.Zero(t, st.CCErrors)
 }
 
@@ -955,7 +956,9 @@ func TestDemuxMalformedPES(t *testing.T) {
 			ps := videoOf(evs)
 			require.Len(t, ps, 1)
 			assert.Equal(t, int64(7), ps[0].PTS)
+			assert.True(t, ps[0].Discontinuity, "the PES after a dropped one is marked")
 			assert.Equal(t, uint64(1), st.PESErrors)
+			assert.Equal(t, uint64(1), st.LostPES)
 		})
 	}
 	t.Run("header cut by the next PUSI", func(t *testing.T) {
@@ -965,6 +968,7 @@ func TestDemuxMalformedPES(t *testing.T) {
 		b.raw(esPacket(tVideo, b.nextCC(tVideo), true, 0, []byte{0, 0, 1, 0xE0}))
 		evs, st := demuxBytes(t, b.bytes())
 		require.Len(t, videoOf(evs), 1)
+		assert.True(t, videoOf(evs)[0].Discontinuity)
 		assert.Equal(t, uint64(2), st.PESErrors)
 	})
 	t.Run("continuation without a start", func(t *testing.T) {

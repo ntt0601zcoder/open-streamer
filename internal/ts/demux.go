@@ -34,16 +34,23 @@ type DemuxStats struct {
 	// differed from the current one. It counts only in Remap mode.
 	PMTChanges uint64
 	// LostFrames counts access units not emitted because PES data for them
-	// was lost or dropped (mpegts LostPES or Discontinuity). It is a lower
-	// bound: each Discontinuity counts one access unit, plus the frames of
-	// PES without PTS dropped after it.
+	// was lost or dropped (mpegts LostPES, signalled by Discontinuity): one
+	// per Discontinuity for the lost data, which held at least one unit
+	// (several PES lost in one run count once), plus every unit the demuxer
+	// discards because of the loss: the pending video unit on a track that
+	// carries PES without PTS, and the units or audio frames in PES without
+	// PTS dropped after the loss.
 	LostFrames uint64
 	// SplitAUs counts access units found after the first one inside one PES
-	// and given extrapolated timestamps.
+	// (or starting in a PES without PTS) and given interpolated or
+	// extrapolated timestamps.
 	SplitAUs uint64
 	// SplitAUsReordered counts such access units dropped because the PES had
 	// PTS != DTS.
 	SplitAUsReordered uint64
+	// SplitAUsNoRoom counts such access units dropped because no DTS was
+	// left for them: below the next PES's DTS and above the track's last.
+	SplitAUsNoRoom uint64
 	// Continued counts video PES without PTS appended to the previous access
 	// unit.
 	Continued uint64
@@ -104,9 +111,16 @@ type track struct {
 	timed    bool     // a PES with a PTS has been seen
 	ptsIsDTS bool     // the last PES with a PTS had PTS == DTS
 	pesDTS   int64    // DTS of the last PES with a PTS
-	pesAUs   int      // access units started since it; 0 after a loss
-	lastDTS  int64    // DTS of the last access unit started
-	step     int64    // measured per-access-unit DTS step; 0 when unknown
+	pesAUs   int      // access units started since it: its group
+	step     int64    // last evenly spaced per-unit DTS step; 0 when unknown
+	// group holds the completed split units of the group, waiting for the
+	// next PES with a PTS to time them; groupSize is their size.
+	group     []*videoAU
+	groupSize int
+	lastOut   int64 // DTS of the last video frame queued
+	haveOut   bool
+	// fieldSPS holds the IDs of H.264 SPS that allow field coding.
+	fieldSPS map[uint32]bool
 
 	// lost: PES data was lost since the last PES with a PTS, so a PES
 	// without PTS is dropped.
@@ -125,6 +139,8 @@ type track struct {
 // videoAU is a video access unit under assembly.
 type videoAU struct {
 	pts, dts  int64
+	idx       int // position in its group; 0 is the PES's own unit
+	config    *media.TrackConfig
 	data      [][]byte
 	key, rasl bool
 	size      int  // bytes of its NAL units, held ones included
@@ -206,6 +222,14 @@ func (d *Demuxer) applyPMT(pmt *mpegts.PMT) {
 	if d.remap {
 		return
 	}
+	// A PID absent from this PMT sends no PES until it returns, so its
+	// pending units complete now, as in Remap mode.
+	for _, t := range d.tracks {
+		absent := !slices.ContainsFunc(pmt.Streams, func(s mpegts.Stream) bool { return s.PID == t.pid })
+		if absent && d.byPID[t.pid] == t {
+			d.flushTrack(t)
+		}
+	}
 	for _, s := range pmt.Streams {
 		info, supported := supportedTypes[s.Type]
 		first, known := d.seen[s.PID]
@@ -225,7 +249,7 @@ func (d *Demuxer) applyPMT(pmt *mpegts.PMT) {
 			d.byPID[s.PID] = t
 		case s.Type != first:
 			if t := d.byPID[s.PID]; t != nil {
-				d.finishAU(t, true) // Its PES stop here.
+				d.flushTrack(t) // Its PES stop here.
 			}
 			delete(d.byPID, s.PID)
 			if !supported {
@@ -380,7 +404,9 @@ func (d *Demuxer) Stats() DemuxStats {
 // error from the input is returned wrapped, and again on later calls. A video
 // access unit may span PES, so it is returned once something completes it:
 // the next access-unit start on its track, a PMT change, or the end of input
-// or a read error, which return every pending unit first.
+// or a read error, which return every pending unit first. A split unit (see
+// handleVideo) also waits for the next PES with a PTS on its track, which
+// times it.
 func (d *Demuxer) Read() (media.Frame, error) {
 	for {
 		if len(d.queue) > 0 {
@@ -416,9 +442,17 @@ func (d *Demuxer) Read() (media.Frame, error) {
 	}
 }
 
-// defaultFrameStep is the DTS step of an extrapolated access unit on a track
-// with no measured step.
+// defaultFrameStep is the DTS step of a split access unit on a track with no
+// measured step.
 const defaultFrameStep = 3600
+
+// maxSplitStep is the largest per-unit gap split units are spaced over:
+// above 0.5 s the next PES is taken as a timestamp jump.
+const maxSplitStep = 45000
+
+// maxGroupSize bounds the split units of one track waiting for the next PES
+// with a PTS, as mpegts bounds all partial PES of a demux.
+const maxGroupSize = 32 << 20
 
 // aacFrameSamples is the number of samples in one AAC frame.
 const aacFrameSamples = 1024
@@ -591,15 +625,38 @@ func (t *track) leadsAU(typ uint8) bool {
 	return typ == 6
 }
 
-// countPictures counts the slices that start a picture.
-func (t *track) countPictures(nalus [][]byte) int {
-	n := 0
+// splitsOnSlice reports whether a first slice after a slice starts a new
+// access unit. H.264 fields of one frame each start with
+// first_mb_in_slice == 0 and commonly share a PES, so a track whose SPS
+// allow field coding (frame_mbs_only_flag == 0), or with no SPS yet, splits
+// only on AUD.
+func (t *track) splitsOnSlice() bool {
+	if t.codec == media.CodecH265 {
+		return true
+	}
+	return len(t.sps) > 0 && len(t.fieldSPS) == 0
+}
+
+// startsAU reports a NAL unit that starts an access unit when it follows a
+// slice.
+func (t *track) startsAU(typ uint8, n []byte) bool {
+	return t.isAUD(typ) || t.isVCL(typ) && t.isFirstSlice(typ, n) && t.splitsOnSlice()
+}
+
+// countAUs counts the access units that start in a PES.
+func (t *track) countAUs(nalus [][]byte) int {
+	n, slice, started := 0, false, false
 	for _, nal := range nalus {
-		if len(nal) == 0 {
+		if len(nal) == 0 || (t.codec == media.CodecH265 && len(nal) < 2) {
 			continue
 		}
-		if typ := t.nalType(nal); t.isVCL(typ) && t.isFirstSlice(typ, nal) {
+		typ := t.nalType(nal)
+		if t.startsAU(typ, nal) && (!started || slice) {
 			n++
+			started, slice = true, false
+		}
+		if t.isVCL(typ) {
+			slice = true
 		}
 	}
 	return n
@@ -607,38 +664,43 @@ func (t *track) countPictures(nalus [][]byte) int {
 
 // handleVideo adds a video PES to its track's access units. A PES with a PTS
 // starts an access unit and completes the pending one. A PES without PTS
-// continues the pending unit. Inside either, an AUD or a first slice after a
-// slice starts another access unit, timed by extrapolation (startSplitAU).
+// continues the pending unit. Inside either, an AUD or (see splitsOnSlice) a
+// first slice after a slice starts another access unit, a split unit, timed
+// by releaseGroup once the next PES with a PTS arrives.
 //
-// A Discontinuity counts one lost access unit, the one the lost data belonged
-// to. On a track that carries PES without PTS that may be the pending unit,
-// so it is dropped in its place; on a track whose PES all have a PTS the lost
-// data was a whole PES and the pending unit is complete. A PES without PTS
-// after a loss is dropped until the next PES with a PTS. Later frames pass
-// through: decoders conceal the loss.
+// A Discontinuity counts one lost access unit for the lost data. On a track
+// that carries PES without PTS the pending unit may be missing data, so it is
+// dropped and counted too; on a track whose PES all have a PTS the lost data
+// was whole PES and the pending unit is complete. A PES without PTS after a
+// loss is dropped, with the units starting in it, until the next PES with a
+// PTS. Later frames pass through: decoders conceal the loss.
 func (d *Demuxer) handleVideo(t *track, pes *mpegts.PES) {
 	if !pes.HasPTS {
 		t.ptsLess = true
 	}
+	var pts, dts int64
+	if pes.HasPTS {
+		pts, dts = d.decodeTimes(pes)
+	}
 	if pes.Discontinuity {
 		d.stats.LostFrames++
-		if t.ptsLess {
-			d.finishAU(t, false)
+		if t.ptsLess && d.finishAU(t, false) {
+			d.stats.LostFrames++
 		}
-		t.pesAUs = 0 // No step is measured across the loss.
 		if !pes.HasPTS {
+			d.releaseGroup(t, 0, false, false)
 			t.lost = true
 		}
 	}
 	nalus := avc.ExtractNalusFromByteStream(pes.Data)
 	switch {
 	case pes.HasPTS:
-		pts, dts := d.decodeTimes(pes)
 		d.finishAU(t, true)
+		d.releaseGroup(t, dts, true, !pes.Discontinuity)
 		t.lost = false
 		t.startPES(pts, dts, pes.PTS == pes.DTS)
 	case t.lost:
-		d.stats.LostFrames += uint64(t.countPictures(nalus))
+		d.stats.LostFrames += uint64(t.countAUs(nalus))
 		return
 	case t.au == nil:
 		// Nothing to continue: data before the next access-unit start is
@@ -655,27 +717,18 @@ func (d *Demuxer) handleVideo(t *track, pes *mpegts.PES) {
 	}
 }
 
-// startPES starts the access unit of a PES with a PTS. The per-unit DTS step
-// is the DTS distance from the previous PES with a PTS divided by the access
-// units started since it.
+// startPES starts the access unit of a PES with a PTS, unit 0 of a new group.
 func (t *track) startPES(pts, dts int64, ptsIsDTS bool) {
-	if t.pesAUs > 0 {
-		if step := dts - t.pesDTS; step > 0 {
-			t.step = step / int64(t.pesAUs)
-		}
-	}
 	t.timed = true
 	t.pesDTS, t.pesAUs, t.ptsIsDTS = dts, 1, ptsIsDTS
-	t.lastDTS = dts
 	t.au = &videoAU{pts: pts, dts: dts}
 }
 
-// startSplitAU starts an access unit found inside a PES after its first, or
-// in a PES without PTS: DTS is the previous unit's DTS plus the track's step
-// (3600 if none) and PTS = DTS when the last PES with a PTS had PTS == DTS.
-// Otherwise its presentation order is unknown and it is dropped.
+// startSplitAU starts a split access unit: one found inside a PES after its
+// first, or in a PES without PTS. Its presentation order is known only when
+// the last PES with a PTS had PTS == DTS; otherwise it is dropped.
 func (d *Demuxer) startSplitAU(t *track) {
-	au := &videoAU{}
+	au := &videoAU{idx: t.pesAUs}
 	t.pesAUs++
 	switch {
 	case !t.timed:
@@ -683,16 +736,46 @@ func (d *Demuxer) startSplitAU(t *track) {
 	case !t.ptsIsDTS:
 		au.drop = true
 		d.stats.SplitAUsReordered++
-	default:
-		step := t.step
-		if step <= 0 {
-			step = defaultFrameStep
-		}
-		t.lastDTS += step
-		au.pts, au.dts = t.lastDTS, t.lastDTS
-		d.stats.SplitAUs++
 	}
 	t.au = au
+}
+
+// releaseGroup times and queues the completed split units of the group that
+// started at the last PES with a PTS (pesDTS, pesAUs units). next is the DTS
+// of the next PES with a PTS when haveNext. Unit i of N gets
+// pesDTS + i*(next-pesDTS)/N when even spacing is allowed (no loss between)
+// and the gap per unit is within maxSplitStep; that gap becomes the track's
+// step. Otherwise unit i gets pesDTS + i*step (defaultFrameStep if none),
+// and a unit whose DTS would reach next, or not pass the last DTS queued on
+// the track, has no room and is dropped (SplitAUsNoRoom). PTS = DTS.
+func (d *Demuxer) releaseGroup(t *track, next int64, haveNext, even bool) {
+	n := int64(t.pesAUs)
+	gap := next - t.pesDTS
+	spaced := even && haveNext && t.timed && n > 0 && gap > 0 && gap/n <= maxSplitStep
+	if spaced {
+		t.step = gap / n
+	}
+	step := t.step
+	if step <= 0 {
+		step = defaultFrameStep
+	}
+	for _, au := range t.group {
+		i := int64(au.idx)
+		var dts int64
+		if spaced {
+			dts = t.pesDTS + i*gap/n
+		} else {
+			dts = t.pesDTS + i*step
+		}
+		if (haveNext && dts >= next) || (t.haveOut && dts <= t.lastOut) {
+			d.stats.SplitAUsNoRoom++
+			continue
+		}
+		au.pts, au.dts = dts, dts
+		d.stats.SplitAUs++
+		d.queueAU(t, au)
+	}
+	t.group, t.groupSize = nil, 0
 }
 
 // addNAL adds one NAL unit to the pending access unit. Parameter sets and
@@ -702,7 +785,7 @@ func (d *Demuxer) addNAL(t *track, n []byte) {
 	typ := t.nalType(n)
 	aud := t.isAUD(typ)
 	vcl := t.isVCL(typ)
-	if (aud || vcl && t.isFirstSlice(typ, n)) && (t.au == nil || t.au.slice) {
+	if t.startsAU(typ, n) && (t.au == nil || t.au.slice) {
 		held := t.held
 		t.held = nil
 		if aud {
@@ -763,6 +846,9 @@ func (d *Demuxer) commitNAL(t *track, n []byte) {
 		if old, have := sets[id]; !have || !bytes.Equal(old, n) {
 			sets[id] = bytes.Clone(n)
 			t.dirty = true
+			if t.codec == media.CodecH264 && typ == 7 {
+				t.noteFieldCoding(id, n)
+			}
 		}
 		if t.config == nil {
 			t.dirty = true // Retry the rebuild whenever a set arrives while invalid.
@@ -787,12 +873,29 @@ func (d *Demuxer) commitNAL(t *track, n []byte) {
 	}
 }
 
+// noteFieldCoding records whether an H.264 SPS allows field coding. An SPS
+// that does not parse is treated as field-coded, the safe side for
+// splitsOnSlice.
+func (t *track) noteFieldCoding(id uint32, sps []byte) {
+	parsed, err := avc.ParseSPSNALUnit(sps, false)
+	if err == nil && parsed.FrameMbsOnlyFlag {
+		delete(t.fieldSPS, id)
+		return
+	}
+	if t.fieldSPS == nil {
+		t.fieldSPS = map[uint32]bool{}
+	}
+	t.fieldSPS[id] = true
+}
+
 // finishAU completes the pending access unit: the parameter sets it carried
-// update the track's config, and it is queued when emit is set.
-func (d *Demuxer) finishAU(t *track, emit bool) {
+// update the track's config. With emit, unit 0 of a group is queued and a
+// split unit joins the group; without, it reports whether a frame that would
+// have been queued was discarded.
+func (d *Demuxer) finishAU(t *track, emit bool) (discarded bool) {
 	au := t.au
 	if au == nil {
-		return
+		return false
 	}
 	d.commit(t, t.held)
 	t.held = nil
@@ -804,16 +907,38 @@ func (d *Demuxer) finishAU(t *track, emit bool) {
 		t.dirty = false
 		d.rebuildVideoConfig(t)
 	}
-	if !emit || au.drop || len(au.data) == 0 {
-		return
+	if au.drop || len(au.data) == 0 {
+		return false
 	}
 	if t.config == nil {
-		d.stats.DroppedNoConfig++
-		return
+		if emit {
+			d.stats.DroppedNoConfig++
+		}
+		return false
 	}
+	if !emit {
+		return true
+	}
+	au.config = t.config
+	if au.idx == 0 {
+		d.queueAU(t, au)
+		return false
+	}
+	if t.groupSize+au.size > maxGroupSize {
+		// Bound what waits for the next PES: time the group now.
+		d.releaseGroup(t, 0, false, false)
+	}
+	t.group = append(t.group, au)
+	t.groupSize += au.size
+	return false
+}
+
+// queueAU queues a timed access unit.
+func (d *Demuxer) queueAU(t *track, au *videoAU) {
+	t.lastOut, t.haveOut = au.dts, true
 	d.queue = append(d.queue, media.Frame{
 		Track:  t.idx,
-		Config: t.config,
+		Config: au.config,
 		PTS:    au.pts,
 		DTS:    au.dts,
 		Key:    au.key,
@@ -822,10 +947,17 @@ func (d *Demuxer) finishAU(t *track, emit bool) {
 	})
 }
 
-// flushAll queues every pending access unit.
+// flushTrack queues a track's pending access unit and split units, without
+// a next DTS.
+func (d *Demuxer) flushTrack(t *track) {
+	d.finishAU(t, true)
+	d.releaseGroup(t, 0, false, false)
+}
+
+// flushAll flushes every track.
 func (d *Demuxer) flushAll() {
 	for _, t := range d.tracks {
-		d.finishAU(t, true)
+		d.flushTrack(t)
 	}
 }
 
