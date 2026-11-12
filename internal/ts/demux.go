@@ -122,6 +122,8 @@ type track struct {
 	haveOut   bool
 	// fieldSPS holds the IDs of H.264 SPS that allow field coding.
 	fieldSPS map[uint32]bool
+	// cls decides Key and RASL for each timed access unit; nil for audio.
+	cls *media.NALClassifier
 
 	// lost: PES data was lost since the last PES with a PTS, so a PES
 	// without PTS is dropped.
@@ -139,14 +141,13 @@ type track struct {
 
 // videoAU is a video access unit under assembly.
 type videoAU struct {
-	pts, dts  int64
-	idx       int // position in its group; 0 is the PES's own unit
-	config    *media.TrackConfig
-	data      [][]byte
-	key, rasl bool
-	size      int  // bytes of its NAL units, held ones included
-	slice     bool // it has a slice
-	drop      bool // never emitted: unknown timestamps, or over maxAUSize
+	pts, dts int64
+	idx      int // position in its group; 0 is the PES's own unit
+	config   *media.TrackConfig
+	data     [][]byte
+	size     int  // bytes of its NAL units, held ones included
+	slice    bool // it has a slice
+	drop     bool // never emitted: unknown timestamps, or over maxAUSize
 }
 
 // Demuxer reads media frames from an MPEG-TS stream.
@@ -261,10 +262,14 @@ func (d *Demuxer) applyPMT(pmt *mpegts.PMT) {
 }
 
 func newTrack(idx int, s mpegts.Stream, info streamInfo) *track {
-	return &track{
+	t := &track{
 		idx: idx, pid: s.PID, stype: s.Type, active: true, kind: info.kind, codec: info.codec,
 		vps: map[uint32][]byte{}, sps: map[uint32][]byte{}, pps: map[uint32][]byte{},
 	}
+	if info.kind == media.KindVideo {
+		t.cls = media.NewNALClassifier(info.codec)
+	}
+	return t
 }
 
 // skipCap reports a stream left out by the track cap, once.
@@ -584,17 +589,6 @@ func (t *track) paramSets(typ uint8) map[uint32][]byte {
 	return nil
 }
 
-func (t *track) isKeySlice(typ uint8) bool {
-	if t.codec == media.CodecH265 {
-		return typ >= 16 && typ <= 21
-	}
-	return typ == 5
-}
-
-func (t *track) isRASL(typ uint8) bool {
-	return t.codec == media.CodecH265 && (typ == 8 || typ == 9)
-}
-
 // isVCL reports a slice NAL unit.
 func (t *track) isVCL(typ uint8) bool {
 	if t.codec == media.CodecH265 {
@@ -879,12 +873,6 @@ func (d *Demuxer) commitNAL(t *track, n []byte) {
 	if t.isVCL(typ) {
 		au.slice = true
 	}
-	if t.isKeySlice(typ) {
-		au.key = true
-	}
-	if t.isRASL(typ) {
-		au.rasl = true
-	}
 	if !au.drop {
 		au.data = append(au.data, n)
 	}
@@ -953,13 +941,14 @@ func (d *Demuxer) finishAU(t *track, emit bool) (discarded bool) {
 // queueAU queues a timed access unit.
 func (d *Demuxer) queueAU(t *track, au *videoAU) {
 	t.lastOut, t.haveOut = au.dts, true
+	key, rasl := t.cls.Classify(au.data, au.pts)
 	d.queue = append(d.queue, media.Frame{
 		Track:  t.idx,
 		Config: au.config,
 		PTS:    au.pts,
 		DTS:    au.dts,
-		Key:    au.key,
-		RASL:   au.rasl,
+		Key:    key,
+		RASL:   rasl,
 		Data:   au.data,
 	})
 }

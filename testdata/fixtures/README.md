@@ -21,3 +21,19 @@ make fixtures
 | `h264_aac_midgop.ts` | `h264_aac.ts` cut at 3/8 of its packets | Mid-GOP start: begins without a keyframe or parameter sets |
 | `h264_aac_pmtchange.ts` | `h264_aac.ts` then a 3 s clip with the same codecs on all-new PIDs (0x200 and up, PMT on 0x1100), timeline continuing | PMT change that remaps every track, timestamps unbroken |
 | `h264_aac_audiopid.ts` | `h264_aac.ts` then a 3 s clip whose video PID is unchanged and whose audio PID is 0x120, timeline continuing | PMT change that remaps only the audio track |
+| `h264_opengop.ts` | 6 s, H.264 Main 320x240 25 fps, `-x264-params open-gop=1:keyint=25:min-keyint=25:scenecut=0 -bf 2`, AAC-LC stereo 48 kHz | H.264 open GOP: IDR first, then non-IDR I slices with a recovery point SEI |
+| `h264_opengop_midgop.ts` | `h264_opengop.ts` cut at 3/8 of its packets | Open-GOP feed that starts mid-GOP: the first usable key is a recovery point |
+
+## H.264 open-GOP fixtures
+
+Check (every key after the first is a non-IDR I slice, `slice_type` 7, preceded by an SEI with `recovery_frame_cnt` 0):
+
+```
+ffmpeg -i h264_opengop.ts -map 0:v -c copy -bsf:v trace_headers -f null - -v trace
+```
+
+Key PTS in `h264_opengop.ts` as the demuxer reports them (90 kHz, first frame at 0; `ffprobe` shows these plus the container start of 133200):
+`0` (IDR), `90000`, `180000`, `270000`, `360000`, `450000` (recovery points).
+Leading B frames (RASL) in decode order, PTS: `86400`, `172800`, `176400`, `262800`, `266400`.
+
+`h264_opengop_midgop.ts`: the first recovery point after the cut is at PTS `57600` (demuxer time, whose zero is the first PTS in this file); its leading B frames are at `50400` and `54000`. The next keys are at `147600` and `237600`.

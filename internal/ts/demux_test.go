@@ -252,7 +252,7 @@ func TestDemuxBadConfigDropsFrames(t *testing.T) {
 		return b
 	}
 	tr := &track{
-		codec: media.CodecH264, kind: media.KindVideo,
+		codec: media.CodecH264, kind: media.KindVideo, cls: media.NewNALClassifier(media.CodecH264),
 		vps: map[uint32][]byte{}, sps: map[uint32][]byte{}, pps: map[uint32][]byte{},
 	}
 	d := &Demuxer{tracks: []*track{tr}, byPID: map[uint16]*track{}, timeDec: &mpegts.TimeDecoder{}}
