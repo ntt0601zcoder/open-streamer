@@ -49,6 +49,7 @@ type Snapshot struct {
 	AST                         time.Time // wall of the first anchor ever packaged; zero before the first segment
 	Segments                    []SegmentInfo
 	Listed                      int
+	Ended                       bool // the stream ended (Packager.End); Segments is final
 	Epochs                      []EpochInfo
 	EvictedDiscontinuities      uint64
 	EvictedTSDiscontinuities    uint64
@@ -155,6 +156,7 @@ type store struct {
 	evicted     uint64
 	evictedTS   uint64
 	evictedPart map[int]uint64
+	ended       bool
 }
 
 // add appends a segment and the current state of its epoch, then evicts
@@ -209,6 +211,7 @@ func (s *store) add(seg SegmentInfo, ep EpochInfo, window int) {
 func (s *store) snapshot() Snapshot {
 	return Snapshot{
 		AST:                         s.ast,
+		Ended:                       s.ended,
 		Segments:                    slices.Clone(s.segs),
 		Epochs:                      slices.Clone(s.epochs),
 		EvictedDiscontinuities:      s.evicted,

@@ -304,3 +304,40 @@ func TestHLSUnlistedNotAdvertised(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, code, path)
 	}
 }
+
+// When the hub closes, Run flushes the last partial segment and the stream
+// ends: once every segment is listed, the HLS playlists carry ENDLIST.
+func TestHLSEndListAfterHubCloses(t *testing.T) {
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Wall: t0})
+	sub := h.Subscribe("pkg", 1<<12)
+	clk := &fakeNow{t: t0}
+	p := NewPackager(h, Options{Now: clk.Now})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.Run(context.Background(), sub)
+	}()
+	for _, d := range synth(h264Config(t), 1, 0, 75) { // 1.5 segments
+		h.Write(d.Frame)
+	}
+	clk.Set(farFuture())
+	require.Eventually(t, func() bool { return p.Snapshot().Listed == 1 }, 5*time.Second, time.Millisecond)
+	srv := serve(p)
+	assert.False(t, media3(t, srv, "/live/s/hls/index.m3u8").Ended, "not before the end")
+	assert.False(t, p.Snapshot().Ended)
+
+	h.Close()
+	<-done
+	snap := p.Snapshot()
+	assert.True(t, snap.Ended)
+	require.Len(t, snap.Segments, 2, "the partial segment was flushed")
+	assert.True(t, media3(t, srv, "/live/s/hls/index.m3u8").Ended)
+	assert.True(t, media3(t, srv, "/live/s/cmaf/v0.m3u8").Ended)
+
+	// Not every segment listed yet: no ENDLIST, or it would hide the rest.
+	clk.Set(t0.Add(2 * time.Second))
+	snap = p.Snapshot()
+	require.Equal(t, 1, snap.Listed)
+	assert.False(t, media3(t, srv, "/live/s/hls/index.m3u8").Ended)
+}

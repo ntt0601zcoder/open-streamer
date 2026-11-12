@@ -118,6 +118,12 @@ func independent(s Snapshot, epochs map[uint32]bool) bool {
 	return h264
 }
 
+// ended reports whether a media playlist gets EXT-X-ENDLIST: the stream
+// ended and every segment is listed, so nothing can follow.
+func ended(s Snapshot) bool {
+	return s.Ended && s.Listed == len(s.Segments)
+}
+
 // pdt returns the program date-time of stream time pts in an epoch.
 func pdt(s Snapshot, epoch uint32, pts int64) time.Time {
 	e, _ := s.Epoch(epoch)
@@ -154,6 +160,7 @@ func buildTSPlaylist(p *Packager, s Snapshot) []byte {
 	}
 	pl.TargetDuration = p.targetDuration("hls/index", s, extinfs)
 	pl.Independent = independent(s, epochs)
+	pl.Ended = ended(s)
 	return pl.Encode()
 }
 
@@ -237,6 +244,7 @@ func buildTrackPlaylist(p *Packager, s Snapshot, kind media.Kind, track int, nam
 	}
 	pl.TargetDuration = p.targetDuration("cmaf/"+name, s, extinfs)
 	pl.Independent = independent(s, epochs)
+	pl.Ended = ended(s)
 	return pl.Encode()
 }
 
