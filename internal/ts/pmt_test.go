@@ -201,3 +201,32 @@ func TestRemapFollowPMTExclusive(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exclusive")
 }
+
+func TestReadGenTagsFlushedFramesWithOldGeneration(t *testing.T) {
+	d, err := ts.NewDemuxerWithOptions(bytes.NewReader(fixtureBytes(t, "h264_aac_pmtchange.ts")), ts.DemuxOptions{Remap: true})
+	require.NoError(t, err)
+	var gens []uint32
+	cfgs := map[uint32]map[*media.TrackConfig]bool{}
+	for {
+		f, g, err := d.ReadGen()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		if len(gens) > 0 {
+			assert.GreaterOrEqual(t, g, gens[len(gens)-1])
+		}
+		gens = append(gens, g)
+		if cfgs[g] == nil {
+			cfgs[g] = map[*media.TrackConfig]bool{}
+		}
+		cfgs[g][f.Config] = true
+	}
+	assert.Equal(t, uint32(1), gens[len(gens)-1])
+	assert.Zero(t, gens[0])
+	assert.Len(t, cfgs[0], 2, "generation 0 holds only old Configs: one per track")
+	assert.Len(t, cfgs[1], 2)
+	assert.Equal(t, []int{0, 1}, d.TakeRemapped(1))
+	assert.Nil(t, d.TakeRemapped(1), "taken once")
+	assert.Nil(t, d.TakeRemapped(5))
+}

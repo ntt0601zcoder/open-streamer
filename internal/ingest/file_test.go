@@ -190,20 +190,107 @@ func TestTSReaderPMTChangeIsOneEpoch(t *testing.T) {
 	r := openTSFixture(t, "h264_aac_pmtchange.ts")
 	defer r.Close()
 	c := clock.New(clock.Options{Kinds: r.Kinds()})
-	breaks := 0
-	var released int
+
+	oldCfg := map[int]map[*media.TrackConfig]bool{}
+	newCfg := map[int]map[*media.TrackConfig]bool{}
+	breaks, before, after := 0, 0, 0
+	var firstAfter *Frame
 	readThroughBreaks(t, r, func(f *Frame, err error) {
 		if err != nil {
 			breaks++
 			c.Break(false)
 			return
 		}
-		released += len(c.PushAt(f.Frame, f.Arrival))
+		side := oldCfg
+		if breaks > 0 {
+			side = newCfg
+			after++
+			if firstAfter == nil {
+				firstAfter = f
+			}
+		} else {
+			before++
+		}
+		if side[f.Track] == nil {
+			side[f.Track] = map[*media.TrackConfig]bool{}
+		}
+		side[f.Track][f.Config] = true
+		c.PushAt(f.Frame, f.Arrival)
 	})
-	released += len(c.Flush())
+	c.Flush()
+
 	assert.Equal(t, 1, breaks)
+	assert.Positive(t, before)
+	assert.Positive(t, after)
 	assert.Len(t, c.Epochs(), 2)
-	assert.Positive(t, released)
+	require.NotNil(t, firstAfter)
+	for track := range 2 {
+		// One Config per side per track: nothing of the old PMT leaks past
+		// the break, and the remapped slot gets a new pointer although the
+		// codecs are identical.
+		require.Len(t, oldCfg[track], 1, "track %d", track)
+		require.Len(t, newCfg[track], 1, "track %d", track)
+		for o := range oldCfg[track] {
+			for n := range newCfg[track] {
+				assert.NotSame(t, o, n, "track %d", track)
+				assert.True(t, o.Equal(n), "identical codecs, track %d", track)
+			}
+		}
+	}
+	assert.True(t, newCfg[firstAfter.Track][firstAfter.Config], "the first frame after the break has a new Config")
+}
+
+func TestTSReaderAppendedSlotIsNoBreak(t *testing.T) {
+	// Video only, then the PMT gains an audio stream.
+	b, err := os.ReadFile(fixturePath("h264_aac.ts"))
+	require.NoError(t, err)
+	d, err := ts.NewDemuxerWithOptions(bytes.NewReader(b), ts.DemuxOptions{Remap: true})
+	require.NoError(t, err)
+	var frames []media.Frame
+	for {
+		f, err := d.Read()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		frames = append(frames, f)
+	}
+	cfgs := make([]*media.TrackConfig, 2)
+	for _, f := range frames {
+		cfgs[f.Track] = f.Config
+	}
+
+	var out bytes.Buffer
+	m, err := ts.NewMuxer(&out, []*media.TrackConfig{cfgs[0]})
+	require.NoError(t, err)
+	video, switched := 0, false
+	for _, f := range frames {
+		if f.Track == 0 {
+			video++
+			if video == 40 && !switched {
+				require.NoError(t, m.SetTracks(cfgs))
+				switched = true
+			}
+		} else if !switched {
+			continue
+		}
+		require.NoError(t, m.WriteFrame(f))
+	}
+
+	r, err := NewTSReader(io.NopCloser(bytes.NewReader(out.Bytes())), nil)
+	require.NoError(t, err)
+	defer r.Close()
+	assert.Equal(t, []media.Kind{media.KindVideo}, r.Kinds())
+	var audio int
+	readThroughBreaks(t, r, func(f *Frame, err error) {
+		require.NoError(t, err, "no break")
+		if f.Track == 1 {
+			audio++
+		}
+	})
+	assert.Positive(t, audio)
+	assert.EqualValues(t, 1, r.Stats()["pmt_changes"])
+	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
 }
 
 func openTSFixture(t *testing.T, name string) Reader {
