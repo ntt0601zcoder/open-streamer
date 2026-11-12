@@ -269,3 +269,68 @@ func TestSegmentFixture(t *testing.T) {
 		assert.Positive(t, g.Duration)
 	}
 }
+
+// One keyframe, then 60 s of video without one: the open segment is cut at
+// MaxDuration (default 5 × Target) on a non-key frame, and the segment it
+// opens is Forced and not a discontinuity.
+func TestSegmentMaxDurationWithoutKeyframes(t *testing.T) {
+	s := New(Options{})
+	var segs []Segment
+	for i := 0; i < 1500; i++ {
+		pts := int64(i) * 3600
+		segs = append(segs, s.Push(vid(1, pts, i == 0))...)
+		segs = append(segs, s.Push(aud(pts))...)
+	}
+	segs = append(segs, s.Flush()...)
+	require.Len(t, segs, 6)
+	for i, sg := range segs {
+		assert.EqualValues(t, int64(i)*900000, sg.Start, "segment %d", i)
+		assert.LessOrEqual(t, sg.Duration, int64(900000), "segment %d", i)
+		assert.Equal(t, i > 0, sg.Forced, "segment %d", i)
+		assert.False(t, sg.Discontinuity, "segment %d", i)
+		require.NotEmpty(t, sg.Frames)
+		assert.Equal(t, i == 0, sg.Frames[0].Key && sg.Frames[0].Track == 0, "segment %d", i)
+	}
+}
+
+// The cap is a field; it never goes below Target.
+func TestSegmentMaxDurationOption(t *testing.T) {
+	s := New(Options{Target: 90000, MaxDuration: 180000})
+	segs := video(s, 1, 0, 100, 1<<40)
+	require.Len(t, segs, 1)
+	assert.EqualValues(t, 180000, segs[0].Duration)
+	s = New(Options{Target: 180000, MaxDuration: 90000})
+	segs = video(s, 1, 0, 100, 1<<40)
+	require.Len(t, segs, 1)
+	assert.EqualValues(t, 180000, segs[0].Duration, "raised to Target")
+}
+
+// Video stops entirely while audio goes on: the cap cuts on an audio frame,
+// so the open segment still stays bounded.
+func TestSegmentMaxDurationVideoStalls(t *testing.T) {
+	s := New(Options{})
+	var segs []Segment
+	segs = append(segs, video(s, 1, 0, 25, 90000)...)
+	for i := 0; i < 1500; i++ {
+		segs = append(segs, s.Push(aud(int64(i)*aDur))...)
+	}
+	require.NotEmpty(t, segs)
+	for _, sg := range segs {
+		// Cut on the first frame at or past the cap: within one audio frame.
+		assert.LessOrEqual(t, sg.Duration, int64(900000+aDur))
+	}
+	assert.True(t, segs[len(segs)-1].Forced)
+}
+
+// Leading audio waiting for the video anchor's first keyframe is kept to
+// MaxDuration, so a video track that never keys cannot grow it unbounded.
+func TestSegmentCarryBounded(t *testing.T) {
+	s := New(Options{})
+	require.Empty(t, s.Push(aud(0)))
+	require.Empty(t, s.Push(vid(1, 0, false))) // video anchor, no keyframe: audio waits
+	for i := 1; i < 3000; i++ {
+		require.Empty(t, s.Push(aud(int64(i)*aDur)))
+	}
+	assert.LessOrEqual(t, len(s.carry), 900000/aDur+1)
+	assert.Positive(t, s.Dropped())
+}

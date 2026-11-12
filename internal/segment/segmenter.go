@@ -5,8 +5,19 @@
 // lowest-numbered audio track. A segment opens on an anchor keyframe (any
 // anchor frame for audio) and closes at the first anchor keyframe whose PTS
 // is at least Target past the segment's start, or before a delivery that
-// changes epoch or reports lost frames. The Segmenter starts no goroutines
-// and is not safe for concurrent use.
+// changes epoch or reports lost frames.
+//
+// A segment is also cut when a frame of any track is presented MaxDuration
+// or more past its start, even without a keyframe, so a source whose
+// keyframes stop or are far apart cannot grow the open segment without
+// bound. The segment that frame opens is Forced: its first anchor frame need
+// not be a keyframe. It is not a discontinuity, because the media continues
+// and a decoder must keep its references across the cut; outputs that
+// promise segments starting on a keyframe (HLS EXT-X-INDEPENDENT-SEGMENTS)
+// must not promise it for a Forced segment. Leading audio held for the
+// video anchor's first keyframe is likewise kept to MaxDuration.
+//
+// The Segmenter starts no goroutines and is not safe for concurrent use.
 package segment
 
 import (
@@ -23,7 +34,8 @@ const (
 
 // Options tunes a Segmenter.
 type Options struct {
-	Target int64 // ticks; 0 means 180000 (2 s)
+	Target      int64 // ticks; 0 means 180000 (2 s)
+	MaxDuration int64 // ticks; 0 means 5 × Target; never below Target
 }
 
 // Segment is one run of frames from every track, cut on an anchor keyframe.
@@ -31,6 +43,7 @@ type Segment struct {
 	Seq           uint64 // from 0, never reused
 	Epoch         uint32
 	Discontinuity bool          // first segment after an epoch change or Lost > 0
+	Forced        bool          // opened by the MaxDuration cut: its first frame need not be a keyframe
 	Start         int64         // PTS of the anchor track's first frame
 	Duration      int64         // ticks, anchor track
 	End           int64         // largest frame PTS + that track's last DTS delta, over all tracks
@@ -80,6 +93,7 @@ type open struct {
 // Segmenter cuts deliveries into segments. Create one with New.
 type Segmenter struct {
 	target  int64
+	maxDur  int64
 	cur     *open
 	seq     uint64
 	dropped uint64
@@ -100,7 +114,11 @@ func New(opt Options) *Segmenter {
 	if t <= 0 {
 		t = defaultTarget
 	}
-	return &Segmenter{target: t, anchor: -1}
+	m := opt.MaxDuration
+	if m <= 0 {
+		m = 5 * t
+	}
+	return &Segmenter{target: t, maxDur: max(m, t), anchor: -1}
 }
 
 // Dropped returns the number of frames discarded: those that arrived before
@@ -142,6 +160,11 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 	switch {
 	case s.cur == nil && !opens && s.carry != nil && !isAnchor:
 		s.carry = append(s.carry, f)
+		s.trimCarry()
+	case s.cur != nil && !opens && f.PTS >= s.cur.seg.Start+s.maxDur:
+		out = append(out, s.closeOpen(f.PTS-s.cur.seg.Start))
+		s.openAt(f)
+		s.cur.seg.Forced = true
 	case s.cur == nil && !opens:
 		s.dropped++
 	case s.cur == nil:
@@ -218,6 +241,20 @@ func (s *Segmenter) uncut() {
 	s.seq--
 	s.disc, s.lost = c.disc, c.lost
 	s.carry = c.seg.Frames
+}
+
+// trimCarry drops the oldest leading audio while the carry spans
+// MaxDuration or more.
+func (s *Segmenter) trimCarry() {
+	n := 0
+	last := s.carry[len(s.carry)-1].PTS
+	for n < len(s.carry) && last-s.carry[n].PTS >= s.maxDur {
+		n++
+	}
+	if n > 0 {
+		s.dropped += uint64(n)
+		s.carry = append(s.carry[:0], s.carry[n:]...)
+	}
 }
 
 func (s *Segmenter) dropCarry() {

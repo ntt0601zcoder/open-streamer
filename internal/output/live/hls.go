@@ -91,10 +91,15 @@ func (p *Packager) targetDuration(key string, s Snapshot, extinfs []time.Duratio
 	return td
 }
 
-// independent reports whether the video of the given epochs is H.264 (every
-// segment starts on an IDR): at least one video track, and none of another
-// codec.
+// independent reports whether every listed segment of the given epochs
+// starts on an IDR: their video is H.264 (at least one video track, and none
+// of another codec) and none of those segments is Forced.
 func independent(s Snapshot, epochs map[uint32]bool) bool {
+	for _, seg := range s.Segments[:s.Listed] {
+		if seg.Forced && epochs[seg.Epoch] {
+			return false
+		}
+	}
 	h264 := false
 	for _, e := range s.Epochs {
 		if !epochs[e.Epoch] {

@@ -198,6 +198,7 @@ func (p *Packager) pack(s segment.Segment) {
 		Seq:           s.Seq,
 		Epoch:         s.Epoch,
 		Discontinuity: s.Discontinuity,
+		Forced:        s.Forced,
 		Start:         s.Start,
 		Duration:      s.Duration,
 		End:           s.End,

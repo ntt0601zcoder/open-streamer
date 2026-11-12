@@ -590,3 +590,43 @@ func TestMuxAudioPESNeverHasDTS(t *testing.T) {
 		}
 	}
 }
+
+// After WriteTables, each video track's next frame carries the parameter
+// sets even when it is not a keyframe, so a segment that starts without a
+// keyframe (a forced cut) is still self-describing. Later non-key frames do
+// not repeat them.
+func TestMuxParamSetsAfterExplicitTables(t *testing.T) {
+	c := loadClip(t, "h264_aac.ts", 0)
+	var buf bytes.Buffer
+	m, err := NewMuxer(&buf, c.tracks)
+	require.NoError(t, err)
+	var nonKey []media.Frame
+	for _, f := range c.frames {
+		if f.Track == 0 && !f.Key {
+			nonKey = append(nonKey, f)
+			if len(nonKey) == 2 {
+				break
+			}
+		}
+	}
+	require.NoError(t, m.WriteTables())
+	nk := nonKey[0]
+	nk.Config = nil // the track's config supplies the sets
+	muxFrames(t, m, []media.Frame{nk, nonKey[1]})
+	dmx := mpegts.NewDemux(bytes.NewReader(buf.Bytes()))
+	var got [][][]byte
+	for {
+		ev, err := dmx.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		if ev.PES != nil && ev.PES.PID == firstPID {
+			got = append(got, annexB(ev.PES.Data)[1:])
+		}
+	}
+	require.Len(t, got, 2)
+	want := append(append(append([][]byte{}, c.tracks[0].SPS...), c.tracks[0].PPS...), nonKey[0].Data...)
+	assert.Equal(t, want, got[0])
+	assert.Equal(t, nonKey[1].Data, got[1])
+}
