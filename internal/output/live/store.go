@@ -64,6 +64,10 @@ type SegmentInfo struct {
 	Start         int64 // PTS of the anchor track's first frame
 	Duration      int64 // anchor track span, ticks
 	End           int64 // end of the latest-ending frame over all tracks
+	// Forced marks a segment cut by the segmenter's duration cap: its first
+	// video frame need not be a keyframe, so no HLS playlist listing it
+	// claims EXT-X-INDEPENDENT-SEGMENTS. It is not a discontinuity.
+	Forced bool
 	// TS is the muxed TS segment, served as hls/{Seq}.ts; nil when muxing
 	// failed, and then the segment has no HLS-TS entry.
 	TS []byte

@@ -45,7 +45,10 @@ type Muxer struct {
 	// explicit is set by WriteTables: the next PCR PID frame gets no
 	// automatic tables and its DTS becomes lastTables.
 	explicit bool
-	buf      []byte
+	// setsDue marks, by track, video tracks whose next frame carries the
+	// parameter sets although it is not a keyframe: set by WriteTables.
+	setsDue map[int]bool
+	buf     []byte
 }
 
 // NewMuxer returns a Muxer writing to w. tracks is indexed by Frame.Track; a
@@ -78,6 +81,7 @@ func (m *Muxer) SetTracks(tracks []*media.TrackConfig) error {
 	m.tracks = append([]*media.TrackConfig(nil), tracks...)
 	m.pcrPID = pmt.PCRPID
 	m.haveTables, m.explicit = false, false
+	clear(m.setsDue)
 	return nil
 }
 
@@ -120,12 +124,22 @@ func buildProgram(tracks []*media.TrackConfig) (mpegts.PMT, error) {
 }
 
 // WriteTables writes the PAT and PMT now. The next frame on the PCR PID gets
-// no automatic tables.
+// no automatic tables, and the next frame of every video track carries its
+// parameter sets even when it is not a keyframe, so output that starts here
+// is self-describing.
 func (m *Muxer) WriteTables() error {
 	if err := m.w.WriteTables(); err != nil {
 		return fmt.Errorf("ts: mux: %w", err)
 	}
 	m.explicit = true
+	if m.setsDue == nil {
+		m.setsDue = map[int]bool{}
+	}
+	for i, tc := range m.tracks {
+		if tc != nil && tc.Codec.Kind() == media.KindVideo {
+			m.setsDue[i] = true
+		}
+	}
 	return nil
 }
 
@@ -142,7 +156,7 @@ func (m *Muxer) WriteFrame(f media.Frame) error {
 	}
 	var err error
 	if tc.Codec.Kind() == media.KindVideo {
-		err = m.buildVideo(tc.Codec, f)
+		err = m.buildVideo(tc, f)
 	} else {
 		err = m.buildAudio(tc, f)
 	}
@@ -187,22 +201,29 @@ func (m *Muxer) needTables(f media.Frame, video bool) bool {
 	return !m.haveTables || f.DTS-m.lastTables >= tableInterval
 }
 
-// buildVideo fills m.buf with the Annex-B access unit of f.
-func (m *Muxer) buildVideo(codec media.Codec, f media.Frame) error {
+// buildVideo fills m.buf with the Annex-B access unit of f: parameter sets
+// first for a keyframe (from its own config) or for the track's first frame
+// after WriteTables (from its config, else the track's).
+func (m *Muxer) buildVideo(tc *media.TrackConfig, f media.Frame) error {
 	if len(f.Data) == 0 {
 		return errors.New("ts: mux: video frame has no data")
 	}
 	b := append(m.buf[:0], startCode...)
-	if codec == media.CodecH265 {
+	if tc.Codec == media.CodecH265 {
 		b = append(b, audH265...)
 	} else {
 		b = append(b, audH264...)
 	}
-	if f.Key {
-		if f.Config == nil {
-			return errors.New("ts: mux: keyframe without config")
-		}
-		for _, sets := range [][][]byte{f.Config.VPS, f.Config.SPS, f.Config.PPS} {
+	cfg := f.Config
+	if f.Key && cfg == nil {
+		return errors.New("ts: mux: keyframe without config")
+	}
+	if cfg == nil {
+		cfg = tc
+	}
+	if f.Key || m.setsDue[f.Track] {
+		delete(m.setsDue, f.Track)
+		for _, sets := range [][][]byte{cfg.VPS, cfg.SPS, cfg.PPS} {
 			for _, n := range sets {
 				b = append(append(b, startCode...), n...)
 			}
