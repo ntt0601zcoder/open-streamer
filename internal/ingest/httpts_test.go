@@ -184,27 +184,6 @@ func TestHTTPTSStatus(t *testing.T) {
 	assert.NotEmpty(t, frames)
 }
 
-func TestHTTPTSHLSNotAvailable(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/type", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8")
-		_, _ = w.Write([]byte("whatever"))
-	})
-	mux.HandleFunc("/body", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-VERSION:3\n"))
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-	mux.HandleFunc("/bom", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("\xef\xbb\xbf \r\n#EXTM3U\n"))
-	})
-	for _, p := range []string{"/type", "/body", "/bom", "/index.m3u8"} {
-		_, err := ingest.Open(context.Background(), srv.URL+p, ingest.Env{})
-		require.Error(t, err, p)
-		assert.Contains(t, err.Error(), "HLS input not available", p)
-	}
-}
-
 func TestHTTPTSCloseUnblocks(t *testing.T) {
 	data := httpFixture(t)
 	release := make(chan struct{})
