@@ -21,10 +21,6 @@ import (
 // default HTTP client.
 const httpTimeout = 10 * time.Second
 
-// errHLSNotAvailable is returned for HTTP inputs that are HLS playlists until
-// the HLS reader exists.
-var errHLSNotAvailable = errors.New("HLS input not available")
-
 // defaultClient is shared by every Open that has no Env.HTTP. It has dial and
 // response header timeouts and no overall timeout: the body of a live pull
 // never ends. Keep-alives are off: a streaming pull gains nothing from
@@ -64,6 +60,19 @@ func isHLSType(contentType string) bool {
 	return false
 }
 
+// isPlaylist reports whether a body starts with #EXTM3U, after an optional
+// BOM and white space.
+func isPlaylist(r *bufio.Reader) bool {
+	// MPEG-TS starts with 0x47; only a '#' needs a longer look.
+	first, err := r.Peek(1)
+	if err != nil || first[0] == 0x47 {
+		return false
+	}
+	head, _ := r.Peek(64) // a short body ends the peek early
+	head = bytes.TrimPrefix(head, []byte("\xef\xbb\xbf"))
+	return bytes.HasPrefix(bytes.TrimLeft(head, " \t\r\n"), []byte("#EXTM3U"))
+}
+
 // httpBody is the response body behind a sniffing buffer; Close cancels the
 // request.
 type httpBody struct {
@@ -91,10 +100,9 @@ type httpReader struct {
 	rawURL string
 }
 
+// openHTTP opens an HTTP input: HLS when the URL ends in .m3u8 or the
+// response is a playlist by content type or body, HTTP-TS otherwise.
 func openHTTP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, error) {
-	if p.spec.Pace {
-		return nil, httpErr(rawURL, "open", errHLSNotAvailable)
-	}
 	client := env.HTTP
 	if client == nil {
 		client = defaultClient
@@ -103,14 +111,17 @@ func openHTTP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, er
 	// cancels it.
 	rctx, cancel := context.WithCancel(context.Background())
 	stop := context.AfterFunc(ctx, cancel)
-	r, err := doHTTP(ctx, rctx, cancel, client, rawURL, env)
+	r, err := doHTTP(ctx, rctx, cancel, client, rawURL, p, env)
 	if !stop() {
 		// ctx ended during the open: the request is cancelled.
 		if r != nil {
 			_ = r.Close()
 		}
-		if err == nil {
+		switch {
+		case err == nil:
 			err = ctx.Err()
+		case !errors.Is(err, ctx.Err()):
+			err = fmt.Errorf("%w: %w", err, ctx.Err())
 		}
 		return nil, httpErr(rawURL, "open", err)
 	}
@@ -121,7 +132,8 @@ func openHTTP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, er
 	return r, nil
 }
 
-func doHTTP(ctx, rctx context.Context, cancel context.CancelFunc, client *http.Client, rawURL string, env Env) (*httpReader, error) {
+func doHTTP(ctx, rctx context.Context, cancel context.CancelFunc, client *http.Client, rawURL string, p parsed, env Env) (Reader, error) {
+	loaded := time.Now()
 	req, err := http.NewRequestWithContext(rctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, httpErr(rawURL, "request", stripURLError(err))
@@ -135,19 +147,22 @@ func doHTTP(ctx, rctx context.Context, cancel context.CancelFunc, client *http.C
 		_ = resp.Body.Close()
 		return nil, httpErr(rawURL, "get", fmt.Errorf("status %s", resp.Status))
 	}
-	if isHLSType(resp.Header.Get("Content-Type")) {
-		_ = resp.Body.Close()
-		return nil, httpErr(rawURL, "open", errHLSNotAvailable)
-	}
 	body := &httpBody{r: bufio.NewReaderSize(resp.Body, 64<<10), body: resp.Body, cancel: cancel}
-	// MPEG-TS starts with 0x47; only a '#' needs a longer look.
-	if first, err := body.r.Peek(1); err == nil && first[0] != 0x47 {
-		head, _ := body.r.Peek(64) // a short body ends the peek early
-		head = bytes.TrimPrefix(head, []byte("\xef\xbb\xbf"))
-		if bytes.HasPrefix(bytes.TrimLeft(head, " \t\r\n"), []byte("#EXTM3U")) {
-			_ = body.Close()
-			return nil, httpErr(rawURL, "open", errHLSNotAvailable)
+	if p.spec.Pace || isHLSType(resp.Header.Get("Content-Type")) || isPlaylist(body.r) {
+		// The request context stays alive: the HLS reader owns it.
+		data, err := io.ReadAll(io.LimitReader(body.r, maxPlaylistBytes+1))
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, httpErr(rawURL, "read playlist", stripURLError(err))
 		}
+		if len(data) > maxPlaylistBytes {
+			return nil, httpErr(rawURL, "read playlist", fmt.Errorf("playlist exceeds %d bytes", maxPlaylistBytes))
+		}
+		h, err := openHLS(rctx, cancel, client, rawURL, data, resp.Request.URL, loaded, env)
+		if err != nil {
+			return nil, err
+		}
+		return h, nil
 	}
 	t, err := openTS(ctx, body, env.now(), Spec{Live: true}, &media.ConfigCache{})
 	if err != nil {
