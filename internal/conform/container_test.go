@@ -1188,3 +1188,45 @@ func TestReadFinalMasterFails(t *testing.T) {
 	_, err = ReadHLS(context.Background(), u, ReadOptions{Duration: time.Hour})
 	require.NoError(t, err)
 }
+
+// A server that stops sending does not hang a reader: each request is
+// bounded by ReadOptions.Timeout, and an HTTP-TS stream by the stall between
+// body reads.
+func TestReadTimeout(t *testing.T) {
+	stop := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "headers.m3u8"):
+			// never answers
+		case strings.HasSuffix(r.URL.Path, ".ts"):
+			w.Header().Set("Content-Type", "video/mp2t")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(bytes.Repeat([]byte{0x47, 0x1f, 0xff, 0x10}, 47)) // a null packet
+			w.(http.Flusher).Flush()
+		default:
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("#EXTM3U\n"))
+			w.(http.Flusher).Flush()
+		}
+		select {
+		case <-stop:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(stop)
+
+	opt := ReadOptions{Once: true, Timeout: 200 * time.Millisecond}
+	for _, u := range []string{"/headers.m3u8", "/body.m3u8"} {
+		start := time.Now()
+		_, err := ReadHLS(context.Background(), srv.URL+u, opt)
+		require.Error(t, err, u)
+		assert.Less(t, time.Since(start), 5*time.Second, u)
+	}
+	start := time.Now()
+	_, err := ReadTS(context.Background(), srv.URL+"/stream.ts", opt)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stalled")
+	assert.Less(t, time.Since(start), 5*time.Second)
+}

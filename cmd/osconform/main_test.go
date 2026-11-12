@@ -104,6 +104,25 @@ func TestOsconformExitCodes(t *testing.T) {
 	}
 }
 
+// A server that never answers is a read error after -timeout, not a hang.
+func TestOsconformTimeout(t *testing.T) {
+	stop := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-stop:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(stop)
+	for _, ext := range []string{"x.m3u8", "x.ts"} {
+		start := time.Now()
+		code, _ := runConform(t, "-url", srv.URL+"/"+ext, "-once", "-timeout", "200ms")
+		assert.Equal(t, 2, code, ext)
+		assert.Less(t, time.Since(start), 5*time.Second, ext)
+	}
+}
+
 func TestOsconformBadArgs(t *testing.T) {
 	for name, args := range map[string][]string{
 		"no url":      {},
@@ -112,6 +131,7 @@ func TestOsconformBadArgs(t *testing.T) {
 		"bad suffix":  {"-url", "http://x/a.txt"},
 		"bad url":     {"-url", "http://a b/a.ts"},
 		"bad duratio": {"-url", "http://x/a.ts", "-duration", "soon"},
+		"bad timeout": {"-url", "http://x/a.ts", "-timeout", "soon"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			code, out := runConform(t, args...)

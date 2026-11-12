@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
@@ -53,7 +54,14 @@ type ReadOptions struct {
 	Once bool
 	// Client makes the requests; nil means http.DefaultClient.
 	Client *http.Client
+	// Timeout bounds each playlist, manifest or segment request, body
+	// included, and for ReadTS the wait for the response headers and every
+	// stall between body reads, so a stalled server cannot hang a reader.
+	// 0 means 30 s.
+	Timeout time.Duration
 }
+
+const defaultTimeout = 30 * time.Second
 
 // Capture is a read-back output: the frames of every track merged by DTS
 // (stable), and the container and frame rule violations found.
@@ -64,7 +72,8 @@ type Capture struct {
 
 // reader is the HTTP side shared by the readers.
 type reader struct {
-	client *http.Client
+	client  *http.Client
+	timeout time.Duration
 }
 
 func newReader(opt ReadOptions) reader {
@@ -72,11 +81,17 @@ func newReader(opt ReadOptions) reader {
 	if c == nil {
 		c = http.DefaultClient
 	}
-	return reader{client: c}
+	t := opt.Timeout
+	if t <= 0 {
+		t = defaultTimeout
+	}
+	return reader{client: c, timeout: t}
 }
 
-// get fetches a URL and returns the status and body.
+// get fetches a URL within the timeout and returns the status and body.
 func (r reader) get(ctx context.Context, u string) (int, []byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return 0, nil, fmt.Errorf("conform: read: %w", err)
@@ -923,21 +938,39 @@ func templateWidth(format string) (int, error) {
 // epochs are skipped.
 func ReadTS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	r := newReader(opt)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	// The request is cancelled when the server stalls for the timeout: the
+	// timer runs until the headers arrive and restarts on every body read.
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var stalled atomic.Bool
+	timer := time.AfterFunc(r.timeout, func() {
+		stalled.Store(true)
+		cancel()
+	})
+	defer timer.Stop()
+	fail := func(err error) error {
+		if stalled.Load() && ctx.Err() == nil {
+			return fmt.Errorf("conform: read: %s: stalled for %v: %w", u, r.timeout, err)
+		}
+		return fmt.Errorf("conform: read: %s: %w", u, err)
+	}
+	req, err := http.NewRequestWithContext(rctx, http.MethodGet, u, nil)
 	if err != nil {
 		return Capture{}, fmt.Errorf("conform: read: %w", err)
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return Capture{}, fmt.Errorf("conform: read: %w", err)
+		return Capture{}, fail(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return Capture{}, fmt.Errorf("conform: read: GET %s: status %d", u, resp.StatusCode)
 	}
-	d, err := ts.NewDemuxerWithOptions(resp.Body, ts.DemuxOptions{FollowPMT: true})
+	timer.Reset(r.timeout)
+	body := &stallReader{r: resp.Body, timer: timer, d: r.timeout}
+	d, err := ts.NewDemuxerWithOptions(body, ts.DemuxOptions{FollowPMT: true})
 	if err != nil {
-		return Capture{}, fmt.Errorf("conform: read: %s: %w", u, err)
+		return Capture{}, fail(err)
 	}
 	b := newBuilder()
 	b.httpTS = true
@@ -952,7 +985,7 @@ func ReadTS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 			if ctx.Err() != nil {
 				return Capture{}, fmt.Errorf("conform: read: %w", ctx.Err())
 			}
-			return Capture{}, fmt.Errorf("conform: read: %s: %w", u, err)
+			return Capture{}, fail(err)
 		}
 		f.Track = b.track("ts", f.Track)
 		f.Epoch = 1
@@ -966,4 +999,17 @@ func ReadTS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 		}
 	}
 	return b.finish(), nil
+}
+
+// stallReader restarts timer for d after every read.
+type stallReader struct {
+	r     io.Reader
+	timer *time.Timer
+	d     time.Duration
+}
+
+func (s *stallReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	s.timer.Reset(s.d)
+	return n, err
 }

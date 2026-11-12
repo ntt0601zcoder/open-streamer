@@ -31,6 +31,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	u := fs.String("url", "", "URL of a .m3u8, .mpd or .ts output")
 	dur := fs.Duration("duration", 30*time.Second, "media time to capture")
 	once := fs.Bool("once", false, "read the playlist or MPD once instead of polling")
+	timeout := fs.Duration("timeout", 30*time.Second, "limit on each request, and on a stall of the .ts stream")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "osconform: %v\n", err)
 		return 2
@@ -44,7 +45,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 		fmt.Fprintln(os.Stderr, "osconform: -url is required and must be a valid URL")
 		return 2
 	}
-	opt := conform.ReadOptions{Duration: *dur, Once: *once}
+	opt := conform.ReadOptions{Duration: *dur, Once: *once, Timeout: *timeout}
 	var read func(context.Context, string, conform.ReadOptions) (conform.Capture, error)
 	switch p := strings.ToLower(pu.Path); {
 	case strings.HasSuffix(p, ".m3u8"):
