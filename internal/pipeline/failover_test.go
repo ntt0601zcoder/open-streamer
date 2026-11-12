@@ -577,6 +577,11 @@ func TestFailoverSearchReachesLowest(t *testing.T) {
 	var searchCalls []time.Duration // the After calls left when input 2 activates
 	var opens0 int                  // input 0's opens when input 2 activates
 	opt.OnEvent = func(e Event) {
+		if e.Kind == EventActive && e.Input == 0 {
+			// The start-up timers were armed before the activation. Drained
+			// here, on the Run goroutine, the search's timers cannot be.
+			drainCalls(ft)
+		}
 		if e.Kind == EventActive && e.Input == 2 {
 			mu.Lock()
 			activeAt = ft.Now()
@@ -597,7 +602,6 @@ func TestFailoverSearchReachesLowest(t *testing.T) {
 	e, ok := ev.next()
 	require.True(t, ok)
 	require.Equal(t, Event{Kind: EventActive, Input: 0}, e)
-	drainCalls(ft) // the start-up timers were armed before the activation
 	e, ok = ev.next()
 	require.True(t, ok)
 	require.Equal(t, EventFailed, e.Kind)
