@@ -85,8 +85,10 @@ type pesBuf struct {
 //
 // A PES with a non-zero PES_packet_length is returned as soon as it is
 // complete; one with length 0 at the next PES start on its PID, at EOF, or
-// when its PID leaves the PMT. A Demux starts no goroutines and is not safe
-// for concurrent use.
+// when its PID leaves the PMT. Every PES counted in LostPES (a gap,
+// oversize, the total cap, a bad header, or a sized PES ended early) marks
+// the PID's next PES Discontinuity. A Demux starts no goroutines and is not
+// safe for concurrent use.
 type Demux struct {
 	r      *Reader
 	stats  DemuxStats
@@ -378,7 +380,7 @@ func (d *Demux) onES(p Packet, st *esState) {
 	switch {
 	case b.want > 0 && len(b.raw) >= b.want:
 		d.release(st)
-		d.finishPES(p.PID, b, b.raw[:b.want])
+		d.finishPES(p.PID, st, b, b.raw[:b.want])
 	case len(b.raw) > d.maxPES, d.total > d.maxTotal:
 		d.drop(st)
 	}
@@ -401,7 +403,7 @@ func (d *Demux) drop(st *esState) {
 }
 
 // endPES ends the PES pending on a PID: a length-0 one is complete, any
-// other is incomplete and counted.
+// other is incomplete, counted, and marks the PID's next PES.
 func (d *Demux) endPES(pid uint16, st *esState) {
 	b := st.pes
 	if b == nil {
@@ -409,16 +411,20 @@ func (d *Demux) endPES(pid uint16, st *esState) {
 	}
 	d.release(st)
 	if b.known && b.want == 0 {
-		d.finishPES(pid, b, b.raw)
+		d.finishPES(pid, st, b, b.raw)
 		return
 	}
+	st.lost = true
 	d.stats.PESErrors++
 	d.stats.LostPES++
 }
 
-func (d *Demux) finishPES(pid uint16, b *pesBuf, raw []byte) {
+// finishPES returns a complete PES. One that does not parse is lost and marks
+// the PID's next PES.
+func (d *Demux) finishPES(pid uint16, st *esState, b *pesBuf, raw []byte) {
 	pes, err := parsePES(raw)
 	if err != nil {
+		st.lost = true
 		d.stats.PESErrors++
 		d.stats.LostPES++
 		return

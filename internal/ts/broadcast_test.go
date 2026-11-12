@@ -72,11 +72,12 @@ func (b *tsBuilder) pesNoPTS(pid uint16, data []byte) {
 	copy(pes[9:14], bytes.Repeat([]byte{0xFF}, 5))
 }
 
-// cutPacket removes the packet at index i counted from byte offset start.
-func (b *tsBuilder) cutPacket(start, i int) {
+// cutSecondPacket removes the second packet written from byte offset start,
+// a continuity gap inside a multi-packet PES.
+func (b *tsBuilder) cutSecondPacket(start int) {
 	b.t.Helper()
 	all := b.buf.Bytes()
-	at := start + i*mpegts.PacketSize
+	at := start + mpegts.PacketSize
 	require.LessOrEqual(b.t, at+mpegts.PacketSize, len(all))
 	out := append(append([]byte(nil), all[:at]...), all[at+mpegts.PacketSize:]...)
 	b.buf.Reset()
@@ -210,13 +211,9 @@ func TestVideoPESManyAUsFixture(t *testing.T) {
 			for k, f := range frames {
 				assert.Equal(t, refV[k].Data, f.Data, "frame %d", k)
 				assert.Equal(t, refV[k].Key, f.Key, "frame %d", k)
-				// The first pair has no measured step, so 3600; then the
-				// 6000-tick PES step over two units.
-				want := int64(k) * 3000
-				if k == 1 {
-					want = 3600
-				}
-				assert.Equal(t, want, f.DTS, "frame %d", k)
+				// Units are spaced evenly up to the next PES; the last pair
+				// uses the last step.
+				assert.Equal(t, int64(k)*3000, f.DTS, "frame %d", k)
 			}
 			assert.Equal(t, uint64(len(video)/2), d.Stats().SplitAUs)
 		})
@@ -254,7 +251,7 @@ func TestLostFramesCounted(t *testing.T) {
 		b.videoPES(videoPID, 0, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 50)))
 		start := b.buf.Len()
 		b.videoPES(videoPID, 3600, 3600, joinNALUs(nalAUD, pSlice(true, 600)))
-		b.cutPacket(start, 1)
+		b.cutSecondPacket(start)
 		next := pSlice(true, 50)
 		b.videoPES(videoPID, 7200, 7200, joinNALUs(nalAUD, next))
 		b.videoPES(videoPID, 10800, 10800, joinNALUs(nalAUD, pSlice(true, 50)))
@@ -274,16 +271,16 @@ func TestLostFramesCounted(t *testing.T) {
 		b.pesNoPTS(videoPID, joinNALUs(idrSlice(false, 50)))
 		start := b.buf.Len()
 		b.videoPES(videoPID, 3600, 3600, joinNALUs(nalAUD, pSlice(true, 600)))
-		b.cutPacket(start, 1)
+		b.cutSecondPacket(start)
 		b.pesNoPTS(videoPID, joinNALUs(pSlice(false, 50)))
 		b.videoPES(videoPID, 7200, 7200, joinNALUs(nalAUD, pSlice(true, 50)))
 
 		d, frames := demuxAll(t, b.buf.Bytes())
-		// The track carries PES without PTS, so the pending unit may be the
-		// one missing data: it is dropped in its place, and so is the
-		// continuation after the loss.
+		// The track carries PES without PTS, so the pending unit may be
+		// missing data: it is dropped, and so is the continuation after the
+		// loss. LostFrames: the lost PES and the dropped pending unit.
 		assert.Equal(t, []int64{7200}, dtsOf(frames))
-		assert.Equal(t, uint64(1), d.Stats().LostFrames)
+		assert.Equal(t, uint64(2), d.Stats().LostFrames)
 		assert.Equal(t, uint64(1), d.Stats().Continued)
 	})
 }
@@ -341,4 +338,203 @@ func TestVideoAccessUnitBounded(t *testing.T) {
 	require.Len(t, frames, 1)
 	assert.Equal(t, [][]byte{next}, frames[0].Data)
 	assert.Equal(t, uint64(1), d.Stats().DecodeErrors)
+}
+
+// fieldSPS is a Main-profile SPS with frame_mbs_only_flag == 0 (PAFF),
+// sps_id 0, 336x288.
+var fieldSPS = []byte{0x67, 0x4D, 0x00, 0x1E, 0xF4, 0x0A, 0x89, 0x24}
+
+func TestFieldCodedH264(t *testing.T) {
+	_, pps := h264Params(t)
+	top, bottom := idrSlice(true, 40), pSlice(true, 41)
+	b := newTSBuilder(t)
+	b.program(h264Stream)
+	// Both fields of a frame in one PES with PTS != DTS: each field's first
+	// slice has first_mb_in_slice == 0, but field-coded streams split only
+	// on AUD.
+	b.videoPES(videoPID, 7200, 3600, joinNALUs(nalAUD, fieldSPS, pps, top, bottom))
+	b.videoPES(videoPID, 10800, 7200, joinNALUs(nalAUD, pSlice(true, 42), pSlice(true, 43)))
+
+	d, frames := demuxAll(t, b.buf.Bytes())
+	require.Len(t, frames, 2)
+	assert.Equal(t, [][]byte{top, bottom}, frames[0].Data)
+	assert.Equal(t, 336, frames[0].Config.Width)
+	st := d.Stats()
+	assert.Zero(t, st.SplitAUsReordered)
+	assert.Zero(t, st.SplitAUs)
+	assert.Zero(t, st.DroppedNoConfig)
+}
+
+// assertIncreasing checks that DTS strictly increases.
+func assertIncreasing(t *testing.T, frames []media.Frame) {
+	t.Helper()
+	for i := 1; i < len(frames); i++ {
+		assert.Greater(t, frames[i].DTS, frames[i-1].DTS, "frame %d", i)
+	}
+}
+
+func TestSplitAUsSpacedToNextPES(t *testing.T) {
+	sps, pps := h264Params(t)
+	// 60 fps, four units per PES, no step measured before the first PES.
+	b := newTSBuilder(t)
+	b.program(h264Stream)
+	for p := range 4 {
+		var nalus [][]byte
+		for u := range 4 {
+			nalus = append(nalus, nalAUD)
+			if p == 0 && u == 0 {
+				nalus = append(nalus, sps, pps, idrSlice(true, 30))
+				continue
+			}
+			nalus = append(nalus, pSlice(true, 30+u))
+		}
+		dts := int64(p) * 6000
+		b.videoPES(videoPID, dts, dts, joinNALUs(nalus...))
+	}
+	d, frames := demuxAll(t, b.buf.Bytes())
+	require.Len(t, frames, 16)
+	for i, f := range frames {
+		assert.Equal(t, int64(i)*1500, f.DTS, "frame %d", i)
+		assert.Equal(t, f.DTS, f.PTS, "frame %d", i)
+	}
+	assert.Equal(t, uint64(12), d.Stats().SplitAUs)
+}
+
+func TestSplitAUsAcrossJumps(t *testing.T) {
+	sps, pps := h264Params(t)
+	three := func() []byte {
+		return joinNALUs(nalAUD, pSlice(true, 30), nalAUD, pSlice(true, 31), nalAUD, pSlice(true, 32))
+	}
+	build := func(next int64) []byte {
+		b := newTSBuilder(t)
+		b.program(h264Stream)
+		b.videoPES(videoPID, 0, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 30)))
+		b.videoPES(videoPID, 9000, 9000, joinNALUs(nalAUD, pSlice(true, 30))) // step 9000
+		b.videoPES(videoPID, 18000, 18000, three())
+		b.videoPES(videoPID, next, next, joinNALUs(nalAUD, pSlice(true, 33)))
+		return b.buf.Bytes()
+	}
+	t.Run("forward splice", func(t *testing.T) {
+		// +10 s with continuous CC: the gap per unit is too large to space
+		// evenly, so the last step is used, below the next PES DTS.
+		d, frames := demuxAll(t, build(18000+900000))
+		assert.Equal(t, []int64{0, 9000, 18000, 27000, 36000, 918000}, dtsOf(frames))
+		assertIncreasing(t, frames)
+		assert.Zero(t, d.Stats().SplitAUsNoRoom)
+	})
+	t.Run("backward jump", func(t *testing.T) {
+		// No DTS between the PES and the next one: the split units have no
+		// room and are dropped.
+		d, frames := demuxAll(t, build(5000))
+		assert.Equal(t, []int64{0, 9000, 18000, 5000}, dtsOf(frames))
+		assert.Equal(t, uint64(2), d.Stats().SplitAUsNoRoom)
+	})
+	t.Run("loss clamps to the next PES", func(t *testing.T) {
+		// A loss before the next PES: no even spacing; the 9000 step would
+		// pass the next DTS, so the second unit has no room.
+		b := newTSBuilder(t)
+		b.program(h264Stream)
+		b.videoPES(videoPID, 0, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 30)))
+		b.videoPES(videoPID, 9000, 9000, joinNALUs(nalAUD, pSlice(true, 30)))
+		b.videoPES(videoPID, 18000, 18000, three())
+		start := b.buf.Len()
+		b.videoPES(videoPID, 24000, 24000, joinNALUs(nalAUD, pSlice(true, 600)))
+		b.cutSecondPacket(start)
+		b.videoPES(videoPID, 30000, 30000, joinNALUs(nalAUD, pSlice(true, 34)))
+		d, frames := demuxAll(t, b.buf.Bytes())
+		assert.Equal(t, []int64{0, 9000, 18000, 27000, 30000}, dtsOf(frames))
+		assert.Equal(t, uint64(1), d.Stats().SplitAUsNoRoom)
+	})
+}
+
+func TestPTSLessPESStartsAU(t *testing.T) {
+	sps, pps := h264Params(t)
+	t.Run("spaced", func(t *testing.T) {
+		p1 := pSlice(true, 31)
+		b := newTSBuilder(t)
+		b.program(h264Stream)
+		b.videoPES(videoPID, 0, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 30)))
+		b.pesNoPTS(videoPID, joinNALUs(nalAUD, p1))
+		b.videoPES(videoPID, 6000, 6000, joinNALUs(nalAUD, pSlice(true, 32)))
+		d, frames := demuxAll(t, b.buf.Bytes())
+		assert.Equal(t, []int64{0, 3000, 6000}, dtsOf(frames))
+		require.Len(t, frames, 3)
+		assert.Equal(t, [][]byte{p1}, frames[1].Data)
+		assert.Equal(t, uint64(1), d.Stats().SplitAUs)
+		assert.Equal(t, uint64(1), d.Stats().Continued)
+	})
+	t.Run("reordered", func(t *testing.T) {
+		b := newTSBuilder(t)
+		b.program(h264Stream)
+		b.videoPES(videoPID, 3600, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 30)))
+		b.pesNoPTS(videoPID, joinNALUs(nalAUD, pSlice(true, 31)))
+		b.videoPES(videoPID, 10800, 7200, joinNALUs(nalAUD, pSlice(true, 32)))
+		d, frames := demuxAll(t, b.buf.Bytes())
+		assert.Len(t, frames, 2)
+		assert.Equal(t, uint64(1), d.Stats().SplitAUsReordered)
+	})
+}
+
+func TestAudioContinuationDroppedAfterLoss(t *testing.T) {
+	asc := []byte{0x11, 0x90}
+	adts := func(n, size int) []byte {
+		var b []byte
+		for i := range n {
+			var err error
+			b, err = mpegts.AppendADTS(b, asc, bytes.Repeat([]byte{byte(0x21 + i)}, size))
+			require.NoError(t, err)
+		}
+		return b
+	}
+	b := newTSBuilder(t)
+	b.program(aacStream)
+	b.pes(&mpegts.PES{PID: audioPID, PTS: 0, DTS: 0, Data: adts(2, 20)})
+	start := b.buf.Len()
+	b.pes(&mpegts.PES{PID: audioPID, PTS: 3840, DTS: 3840, Data: adts(3, 200)})
+	b.cutSecondPacket(start)
+	b.pesNoPTS(audioPID, adts(3, 20))
+	b.pes(&mpegts.PES{PID: audioPID, PTS: 17280, DTS: 17280, Data: adts(1, 20)})
+
+	d, frames := demuxAll(t, b.buf.Bytes())
+	assert.Equal(t, []int64{0, 1920, 17280}, ptsOf(frames))
+	// The lost PES counts one; the dropped continuation its three frames.
+	assert.Equal(t, uint64(4), d.Stats().LostFrames)
+}
+
+func TestFollowPMTFlushesAbsentPID(t *testing.T) {
+	sps, pps := h264Params(t)
+	b := newTSBuilder(t)
+	b.program(h264Stream, aacStream)
+	b.videoPES(videoPID, 0, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 50)))
+	b.videoPES(videoPID, 3600, 3600, joinNALUs(nalAUD, pSlice(true, 50)))
+	b.program(aacStream)
+	adts, err := mpegts.AppendADTS(nil, []byte{0x11, 0x90}, bytes.Repeat([]byte{0x21}, 20))
+	require.NoError(t, err)
+	b.pes(&mpegts.PES{PID: audioPID, PTS: 7200, DTS: 7200, Data: adts})
+
+	_, frames := demuxAllOpts(t, b.buf.Bytes(), DemuxOptions{FollowPMT: true})
+	require.Len(t, frames, 3)
+	assert.Equal(t, []int{0, 0, 1}, []int{frames[0].Track, frames[1].Track, frames[2].Track})
+}
+
+func TestRemapRebindResetsAssembly(t *testing.T) {
+	sps, pps := h264Params(t)
+	const newPID = 0x300
+	b := newTSBuilder(t)
+	b.program(h264Stream)
+	b.videoPES(videoPID, 0, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 50)))
+	b.pesNoPTS(videoPID, joinNALUs(idrSlice(false, 50))) // the old PID carries PES without PTS
+	b.program(mpegts.Stream{PID: newPID, Type: typeH264})
+	b.videoPES(newPID, 7200, 7200, joinNALUs(nalAUD, sps, pps, idrSlice(true, 50)))
+	start := b.buf.Len()
+	b.videoPES(newPID, 10800, 10800, joinNALUs(nalAUD, pSlice(true, 600)))
+	b.cutSecondPacket(start)
+	b.videoPES(newPID, 14400, 14400, joinNALUs(nalAUD, pSlice(true, 50)))
+
+	d, frames := demuxAllOpts(t, b.buf.Bytes(), DemuxOptions{Remap: true})
+	// The rebound slot does not inherit "carries PES without PTS", so the
+	// loss keeps its complete pending unit.
+	assert.Equal(t, []int64{0, 7200, 14400}, dtsOf(frames))
+	assert.Equal(t, uint64(1), d.Stats().LostFrames)
+	assert.False(t, d.tracks[0].ptsLess)
 }
