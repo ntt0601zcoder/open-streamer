@@ -24,7 +24,10 @@ type Options struct {
 }
 
 // writer feeds clock output to the hub, recording each epoch's anchor before
-// its first frame and pacing frames against that anchor.
+// its first frame and pacing frames against that anchor. The anchor's Wall is
+// the Clock's effective wall, the same wall the packager advertises, so
+// pacing waits out each epoch's presentation-end excess and the walls never
+// run ahead of the frames (see clock.Epoch).
 type writer struct {
 	h        *hub.Hub
 	c        *clock.Clock

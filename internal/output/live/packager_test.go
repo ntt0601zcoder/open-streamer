@@ -542,8 +542,10 @@ func TestEffectiveWall(t *testing.T) {
 	assert.Equal(t, 14001*time.Millisecond, e2.Start)
 	assert.Equal(t, t0.Add(14001*time.Millisecond), e2.Wall)
 
-	// Epoch 3: anchors only 1 s apart while stream time advanced 4 s plus
-	// 45 ticks (500 µs): the stream-time term wins and rounds up.
+	// Epoch 3: the anchor wall is the effective wall (the Clock already kept
+	// epochs apart, or chose to overlap to bound the lead), so the packager
+	// takes it as it is and adds no stream-time chain of its own: a chain
+	// here would compound the Clock's and let the lead accumulate.
 	h.SetAnchor(media.Anchor{Epoch: 3, Start: 720045, Wall: t0.Add(15 * time.Second)})
 	// A later anchor update for epoch 2 must not move its stored start.
 	h.SetAnchor(media.Anchor{Epoch: 2, Start: 360000, Wall: t0.Add(50 * time.Second)})
@@ -554,8 +556,8 @@ func TestEffectiveWall(t *testing.T) {
 	assert.Equal(t, t0, snap.AST)
 	e3, ok := snap.Epoch(3)
 	require.True(t, ok)
-	assert.Equal(t, 18002*time.Millisecond, e3.Start) // ceil(14.001 + 4.0005 s)
-	assert.Equal(t, t0.Add(18002*time.Millisecond), e3.Wall)
+	assert.Equal(t, 15*time.Second, e3.Start)
+	assert.Equal(t, t0.Add(15*time.Second), e3.Wall)
 	assert.Equal(t, media.Anchor{Epoch: 3, Start: 720045, Wall: t0.Add(15 * time.Second)}, e3.Anchor)
 	// Epoch 1 left the window; epoch 2 kept the start computed when its first
 	// segment was packaged.
@@ -567,14 +569,56 @@ func TestEffectiveWall(t *testing.T) {
 	assert.Equal(t, e2.Wall, e2b.Wall)
 	assert.Equal(t, e2.Anchor, e2b.Anchor)
 
-	// Listing uses W_n, not the raw anchor wall.
+	// Listing uses W_n.
 	last := snap.Segments[len(snap.Segments)-1]
 	require.EqualValues(t, 3, last.Epoch)
-	endWall := t0.Add(18002*time.Millisecond + media.ToDuration(last.End-720045))
+	endWall := t0.Add(15*time.Second + media.ToDuration(last.End-720045))
 	clk.Set(endWall.Add(-time.Nanosecond))
 	assert.Equal(t, len(snap.Segments)-1, p.Snapshot().Listed)
 	clk.Set(endWall)
 	assert.Len(t, p.Snapshot().Segments, p.Snapshot().Listed)
+}
+
+// Period starts strictly increase even when anchor walls do not.
+func TestEffectiveWallMonotonic(t *testing.T) {
+	cfg := h264Config(t)
+	h := hub.New(hub.Options{})
+	p := NewPackager(h, Options{Window: 10, Now: farFuture})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0.Add(time.Second)})
+	handleAll(p, synth(cfg, 1, 0, 50))
+	h.SetAnchor(media.Anchor{Epoch: 2, Start: 180000, Wall: t0})
+	handleAll(p, synth(cfg, 2, 180000, 50))
+	p.Flush()
+	snap := p.Snapshot()
+	require.Len(t, snap.Epochs, 2)
+	assert.Equal(t, time.Duration(0), snap.Epochs[0].Start)
+	assert.Equal(t, time.Millisecond, snap.Epochs[1].Start)
+}
+
+// Without hub anchors, epochs are placed from their arrival by the Clock's
+// rule: chained by stream time to avoid overlap, but at most MaxAnchorLead
+// past the arrival.
+func TestFallbackWallLeadBounded(t *testing.T) {
+	cfg := h264Config(t)
+	clk := &fakeNow{t: t0}
+	p := NewPackager(nil, Options{Window: 10, Now: clk.Now})
+	// Epoch 1: 2 s of stream time arriving by t0+2s.
+	clk.Set(t0.Add(2 * time.Second))
+	handleAll(p, synth(cfg, 1, 0, 51))
+	// Epoch 2 arrives 500 ms early against the chain: chained.
+	clk.Set(t0.Add(3500 * time.Millisecond))
+	handleAll(p, synth(cfg, 2, 180000, 51))
+	// Epoch 3 arrives 2 s early against the chain: capped at 1 s of lead.
+	clk.Set(t0.Add(4 * time.Second))
+	handleAll(p, synth(cfg, 3, 360000, 51))
+	p.Flush()
+	snap := p.Snapshot()
+	require.Len(t, snap.Epochs, 3)
+	assert.EqualValues(t, 3, p.FallbackAnchors())
+	assert.Equal(t, time.Duration(0), snap.Epochs[0].Start)
+	assert.Equal(t, 2*time.Second, snap.Epochs[1].Start, "chained: no overlap with epoch 1")
+	assert.Equal(t, t0.Add(2*time.Second), snap.Epochs[2].Anchor.Wall, "arrival: Now minus the segment's span")
+	assert.Equal(t, 3*time.Second, snap.Epochs[2].Start, "capped: 1 s past the arrival, not the 4 s chain")
 }
 
 func TestCeilMillisecond(t *testing.T) {
