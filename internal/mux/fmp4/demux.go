@@ -19,6 +19,17 @@ import (
 // timescale units, so that sums with composition offsets stay inside int64.
 const maxMediaTime = 1 << 62
 
+// Bound on the samples one segment may declare. Every sample that carries a
+// frame needs at least one byte of mdat, so a segment may declare at most one
+// sample per byte of input plus maxSampleSlack, and never more than
+// maxSegmentSamples. The bound is checked on the raw trun headers before
+// mp4ff decodes a moof, so a small hostile segment cannot make it allocate
+// per declared sample.
+const (
+	maxSampleSlack    = 1024
+	maxSegmentSamples = 1 << 20
+)
+
 // errTimeRange reports a time that does not fit the 90 kHz source timeline.
 var errTimeRange = errors.New("time out of range")
 
@@ -33,6 +44,9 @@ type DemuxStats struct {
 	// DecodeErrors counts malformed video samples and parameter sets that
 	// have no readable ID or do not build a config.
 	DecodeErrors uint64
+	// DroppedEmpty counts samples that carry no frame: size 0, or video
+	// samples holding only parameter sets and access unit delimiters.
+	DroppedEmpty uint64
 }
 
 // Demuxer reads frames from the media segments of a fragmented MP4 stream.
@@ -256,9 +270,13 @@ func (d *Demuxer) Stats() DemuxStats { return d.stats }
 // Video samples are split into NAL units; parameter sets move into the
 // frame's Config and access unit delimiters are dropped. Key and RASL come
 // from a media.NALClassifier, and configs go through a media.ConfigCache so
-// that an unchanged config keeps its pointer. A track whose decode time
-// goes backwards within the segment, or a sample outside every mdat, is an
-// error and no frame of the segment is returned. Frames do not alias b.
+// that an unchanged config keeps its pointer. Samples without frame data
+// (size 0, or video holding only parameter sets) are counted in
+// DemuxStats.DroppedEmpty. A segment declaring more samples than one per
+// byte plus maxSampleSlack (at most maxSegmentSamples), a traf starting
+// before the end of the previous traf of its track in the segment, or a
+// sample outside every mdat is an error, and no frame of the segment is
+// returned. Frames do not alias b.
 func (d *Demuxer) Segment(b []byte) ([]media.Frame, error) {
 	frames, err := d.segment(bytes.Clone(b))
 	if err != nil {
@@ -286,6 +304,20 @@ func (d *Demuxer) segment(b []byte) ([]media.Frame, error) {
 	if err != nil {
 		return nil, err
 	}
+	limit := min(uint64(len(b))+maxSampleSlack, maxSegmentSamples)
+	var declared uint64
+	for _, r := range refs {
+		if r.typ != "moof" {
+			continue
+		}
+		n, err := countSamples(b[r.body:r.end])
+		if err != nil {
+			return nil, fmt.Errorf("moof at %d: %w", r.start, err)
+		}
+		if declared += n; declared > limit {
+			return nil, fmt.Errorf("segment of %d bytes declares more than %d samples", len(b), limit)
+		}
+	}
 	var (
 		moofs []*mp4.MoofBox
 		mdats []boxRef
@@ -309,16 +341,23 @@ func (d *Demuxer) segment(b []byte) ([]media.Frame, error) {
 
 	// Read every sample first: nothing changes the demuxer's state unless
 	// the whole segment is valid.
-	raw := make([][]sample, len(d.tracks))
-	next := make([]uint64, len(d.tracks))
+	rd := segReader{
+		b:     b,
+		mdats: mdats,
+		raw:   make([][]sample, len(d.tracks)),
+		next:  make([]uint64, len(d.tracks)),
+		seen:  make([]bool, len(d.tracks)),
+	}
 	for i, t := range d.tracks {
-		next[i] = t.next
+		rd.next[i] = t.next
 	}
 	for _, moof := range moofs {
-		if err := d.readMoof(b, moof, mdats, raw, next); err != nil {
+		if err := d.readMoof(&rd, moof); err != nil {
 			return nil, err
 		}
 	}
+	raw, next := rd.raw, rd.next
+	d.stats.DroppedEmpty += rd.empty
 	times := make([][]timed, len(d.tracks))
 	shifts := make([]int64, len(d.tracks))
 	for i, t := range d.tracks {
@@ -338,9 +377,50 @@ func (d *Demuxer) segment(b []byte) ([]media.Frame, error) {
 	return merge(per), nil
 }
 
-// readMoof appends the samples of every traf of a kept track to raw and
-// advances next, the per-track decode time after the last sample.
-func (d *Demuxer) readMoof(b []byte, moof *mp4.MoofBox, mdats []boxRef, raw [][]sample, next []uint64) error {
+// countSamples returns the sample count the trun boxes of a moof payload
+// declare, read from the raw box headers.
+func countSamples(moof []byte) (uint64, error) {
+	children, err := walkBoxes(moof)
+	if err != nil {
+		return 0, err
+	}
+	var n uint64
+	for _, c := range children {
+		if c.typ != "traf" {
+			continue
+		}
+		boxes, err := walkBoxes(moof[c.body:c.end])
+		if err != nil {
+			return 0, fmt.Errorf("traf: %w", err)
+		}
+		for _, r := range boxes {
+			if r.typ != "trun" {
+				continue
+			}
+			if r.end-r.body < 8 {
+				return 0, errors.New("traf: trun shorter than its header")
+			}
+			n += uint64(binary.BigEndian.Uint32(moof[c.body+r.body+4:])) // after version and flags
+		}
+	}
+	return n, nil
+}
+
+// segReader collects the samples of one segment before any of them changes
+// the demuxer's state.
+type segReader struct {
+	b     []byte
+	mdats []boxRef
+	raw   [][]sample // per track, samples with data
+	next  []uint64   // per track, decode time after the last sample
+	seen  []bool     // per track, a traf was read in this segment
+	empty uint64     // size-0 samples of kept tracks
+}
+
+// readMoof appends the samples of every traf of a kept track to rd.raw and
+// advances rd.next. Size-0 samples only advance the decode time.
+func (d *Demuxer) readMoof(rd *segReader, moof *mp4.MoofBox) error {
+	b := rd.b
 	var prevEnd int64 // end of the previous traf's data
 	for i, traf := range moof.Trafs {
 		tfhd := traf.Tfhd
@@ -368,28 +448,36 @@ func (d *Demuxer) readMoof(b []byte, moof *mp4.MoofBox, mdats []boxRef, raw [][]
 		pos := base
 		var dts uint64
 		if t != nil {
-			dts = next[t.idx]
+			dts = rd.next[t.idx]
 		}
 		if traf.Tfdt != nil {
 			dts = traf.Tfdt.BaseMediaDecodeTime()
 		}
-		if t != nil && len(raw[t.idx]) > 0 && dts < raw[t.idx][len(raw[t.idx])-1].dts {
-			return fmt.Errorf("track %d: decode time goes backwards to %d", t.id, dts)
+		if t != nil {
+			if dts > maxMediaTime {
+				return fmt.Errorf("track %d: decode time %d: %w", t.id, dts, errTimeRange)
+			}
+			if rd.seen[t.idx] && dts < rd.next[t.idx] {
+				return fmt.Errorf("track %d: decode time goes backwards from %d to %d", t.id, rd.next[t.idx], dts)
+			}
 		}
 		for _, trun := range traf.Truns {
 			if trun.HasDataOffset() {
 				pos = base + int64(trun.DataOffset)
 			}
 			for k, s := range trun.Samples {
+				if pos < 0 || pos > int64(len(b)) {
+					return fmt.Errorf("track %d: sample %d at %d outside the segment", tfhd.TrackID, k, pos)
+				}
 				dur, size := sampleDefaults(trun, tfhd, trex, s)
-				var data []byte
-				if t != nil && size > 0 {
-					if !inMdat(mdats, pos, size) {
+				switch {
+				case t == nil:
+				case size == 0:
+					rd.empty++
+				default:
+					if !inMdat(rd.mdats, pos, size) {
 						return fmt.Errorf("track %d: sample %d (%d bytes at %d) outside every mdat", t.id, k, size, pos)
 					}
-					data = b[pos : pos+size : pos+size]
-				}
-				if t != nil {
 					if dts > maxMediaTime {
 						return fmt.Errorf("track %d: decode time %d: %w", t.id, dts, errTimeRange)
 					}
@@ -400,7 +488,8 @@ func (d *Demuxer) readMoof(b []byte, moof *mp4.MoofBox, mdats []boxRef, raw [][]
 							cto = int64(uint32(s.CompositionTimeOffset))
 						}
 					}
-					raw[t.idx] = append(raw[t.idx], sample{dts: dts, cto: cto, data: data})
+					data := b[pos : pos+size : pos+size]
+					rd.raw[t.idx] = append(rd.raw[t.idx], sample{dts: dts, cto: cto, data: data})
 				}
 				pos += size
 				dts += uint64(dur)
@@ -408,10 +497,12 @@ func (d *Demuxer) readMoof(b []byte, moof *mp4.MoofBox, mdats []boxRef, raw [][]
 		}
 		prevEnd = pos
 		if t != nil {
+			// dts started at most maxMediaTime and grew by at most
+			// maxSegmentSamples durations of 32 bits: no wrap.
 			if dts > maxMediaTime {
 				return fmt.Errorf("track %d: decode time %d: %w", t.id, dts, errTimeRange)
 			}
-			next[t.idx] = dts
+			rd.next[t.idx], rd.seen[t.idx] = dts, true
 		}
 	}
 	return nil
@@ -443,7 +534,7 @@ func sampleDefaults(trun *mp4.TrunBox, tfhd *mp4.TfhdBox, trex *mp4.TrexBox, s m
 // inMdat reports whether size bytes at pos lie inside one mdat payload.
 func inMdat(mdats []boxRef, pos, size int64) bool {
 	for _, m := range mdats {
-		if pos >= int64(m.body) && pos+size <= int64(m.end) {
+		if pos >= int64(m.body) && pos <= int64(m.end) && size <= int64(m.end)-pos {
 			return true
 		}
 	}
@@ -508,10 +599,9 @@ func (d *Demuxer) frames(t *track, ss []timed) []media.Frame {
 	out := make([]media.Frame, 0, len(ss))
 	for _, s := range ss {
 		if t.codec.Kind() == media.KindAudio {
-			switch {
-			case s.drop:
+			if s.drop {
 				d.stats.DroppedPTSBeforeDTS++
-			case len(s.data) > 0:
+			} else {
 				out = append(out, media.Frame{
 					Track: t.idx, Config: t.config, PTS: s.pts, DTS: s.dts, Key: true, Data: [][]byte{s.data},
 				})
@@ -527,6 +617,7 @@ func (d *Demuxer) frames(t *track, ss []timed) []media.Frame {
 		data := d.takeSets(t, nalus)
 		switch {
 		case len(data) == 0:
+			d.stats.DroppedEmpty++
 		case s.drop:
 			d.stats.DroppedPTSBeforeDTS++
 		case t.config == nil:

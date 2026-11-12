@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,9 +22,8 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
 )
 
-func fixturePath(name string) string {
-	return filepath.Join("..", "..", "..", "testdata", "fixtures", name)
-}
+// fragPath is the fragmented MP4 fixture with both tracks in one init.
+var fragPath = filepath.Join("..", "..", "..", "testdata", "fixtures", "h264_aac_frag.mp4")
 
 // topBoxes splits b into its top-level boxes (32-bit sizes only).
 func topBoxes(t testing.TB, b []byte) [][]byte {
@@ -295,7 +295,7 @@ func ffprobeTimes(t *testing.T, path, stream string) [][2]int64 {
 }
 
 func TestDemuxMuxedInit(t *testing.T) {
-	path := fixturePath("h264_aac_frag.mp4")
+	path := fragPath
 	b := fixture(t, path)
 	init, frags := splitFile(t, b)
 	require.Greater(t, len(frags), 3)
@@ -639,7 +639,7 @@ func TestDemuxSkipsUnsupportedTracks(t *testing.T) {
 }
 
 func TestDemuxHostile(t *testing.T) {
-	b := fixture(t, fixturePath("h264_aac_frag.mp4"))
+	b := fixture(t, fragPath)
 	init, frags := splitFile(t, b)
 	for n := range len(init) {
 		_, err := fmp4.NewDemuxer(init[:n])
@@ -704,8 +704,109 @@ func TestDemuxHostile(t *testing.T) {
 	}
 }
 
+// box returns an ISO BMFF box of type typ around body.
+func mkBox(typ string, body ...[]byte) []byte {
+	b := bytes.Join(body, nil)
+	return append(append(binary.BigEndian.AppendUint32(nil, uint32(8+len(b))), typ...), b...)
+}
+
+// A small segment that declares millions of samples (4096 truns of 1024
+// samples with no per-sample fields and default size 0) is rejected before
+// mp4ff decodes it, without allocating per declared sample.
+func TestDemuxHostileSampleCount(t *testing.T) {
+	init, _ := splitFile(t, fixture(t, fragPath))
+	d, err := fmp4.NewDemuxer(init)
+	require.NoError(t, err)
+	tfhd := mkBox("tfhd", []byte{0, 0x02, 0, 0}, binary.BigEndian.AppendUint32(nil, 1)) // default-base-is-moof
+	tfdt := mkBox("tfdt", []byte{0, 0, 0, 0}, []byte{0, 0, 0, 0})
+	trun := mkBox("trun", []byte{0, 0, 0, 0}, binary.BigEndian.AppendUint32(nil, 1024))
+	truns := bytes.Repeat(trun, 4096)
+	mfhd := mkBox("mfhd", []byte{0, 0, 0, 0}, binary.BigEndian.AppendUint32(nil, 1))
+	seg := mkBox("moof", mfhd, mkBox("traf", tfhd, tfdt, truns))
+	require.Equal(t, 65600, len(seg))
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	frames, err := d.Segment(seg)
+	runtime.ReadMemStats(&after)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fmp4: demux segment:")
+	assert.Empty(t, frames)
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(4<<20), "bytes allocated")
+
+	// Within the bound, size-0 samples are not kept: 1024 of them in a
+	// segment big enough to allow them cost no frames and little memory.
+	seg = append(mkBox("moof", mfhd, mkBox("traf", tfhd, tfdt, trun)), mkBox("mdat", make([]byte, 1024))...)
+	frames, err = d.Segment(seg)
+	require.NoError(t, err)
+	assert.Empty(t, frames)
+	assert.Equal(t, uint64(1024), d.Stats().DroppedEmpty)
+}
+
+// A traf that starts before the end of the previous traf of its track in
+// the same segment is an error.
+func TestDemuxOverlappingTrafs(t *testing.T) {
+	video := gop2(t)
+	init, err := fmp4.Init(video[0].Config)
+	require.NoError(t, err)
+	d, err := fmp4.NewDemuxer(init)
+	require.NoError(t, err)
+	cto := func(f media.Frame) int32 { return int32(f.PTS - f.DTS) }
+	first := ctoSegment(t, video[:25], 1, cto)
+	// The second fragment starts half a frame before the first one ends:
+	// after its last sample's DTS, before its end.
+	second := shift(video[25:], -1800)
+	_, err = d.Segment(append(bytes.Clone(first), ctoSegment(t, second, 2, cto)...))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "backwards")
+	// Each alone is fine.
+	_, err = d.Segment(first)
+	require.NoError(t, err)
+}
+
+// Samples without frame data are dropped and counted: size 0, and video
+// samples holding only parameter sets.
+func TestDemuxEmptySamples(t *testing.T) {
+	video := gop2(t)[:5]
+	cfg := video[0].Config
+	init, err := fmp4.Init(cfg)
+	require.NoError(t, err)
+	frames := append([]media.Frame(nil), video...)
+	setsOnly := media.Frame{DTS: video[4].DTS + 3600, Data: append(append([][]byte(nil), cfg.SPS...), cfg.PPS...)}
+	empty := media.Frame{DTS: video[4].DTS + 7200}
+	frames = append(frames, setsOnly, empty)
+	d, err := fmp4.NewDemuxer(init)
+	require.NoError(t, err)
+	out, err := d.Segment(ctoSegment(t, frames, 1, func(f media.Frame) int32 { return int32(max(f.PTS-f.DTS, 0)) }))
+	require.NoError(t, err)
+	assert.Len(t, out, 5)
+	assert.Equal(t, uint64(2), d.Stats().DroppedEmpty)
+
+	acfg, err := media.NewAACConfig([]byte{0x12, 0x10})
+	require.NoError(t, err)
+	ainit, err := fmp4.Init(acfg)
+	require.NoError(t, err)
+	frag, err := mp4.CreateFragment(1, 1)
+	require.NoError(t, err)
+	for k, data := range [][]byte{{1}, nil, {3}} {
+		frag.AddFullSample(mp4.FullSample{
+			Sample:     mp4.Sample{Flags: mp4.SyncSampleFlags, Dur: 1024, Size: uint32(len(data))},
+			DecodeTime: uint64(k) * 1024,
+			Data:       data,
+		})
+	}
+	da, err := fmp4.NewDemuxer(ainit)
+	require.NoError(t, err)
+	aout, err := da.Segment(encodeFrag(t, frag))
+	require.NoError(t, err)
+	require.Len(t, aout, 2)
+	assert.Equal(t, media.SampleTime(2048, 44100), aout[1].DTS)
+	assert.Equal(t, uint64(1), da.Stats().DroppedEmpty)
+}
+
 func FuzzDemuxSegment(f *testing.F) {
-	b, err := os.ReadFile(fixturePath("h264_aac_frag.mp4"))
+	b, err := os.ReadFile(fragPath)
 	if err != nil {
 		f.Fatal(err)
 	}

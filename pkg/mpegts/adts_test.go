@@ -222,6 +222,8 @@ func TestAppendADTSHEAAC(t *testing.T) {
 	}{
 		{"aot5 24k/48k stereo", heASC(5, 6, 2, 3, 2), 24000, 6, 2},
 		{"aot29 24k/48k mono core", heASC(29, 6, 1, 3, 2), 24000, 6, 1},
+		// PS always has a mono core; an ASC that says 2 is written as 1.
+		{"aot29 wrongly stereo", heASC(29, 6, 2, 3, 2), 24000, 6, 1},
 		{"aot5 22.05k/44.1k explicit ext fs", heASC(5, 7, 2, 15, 2), 22050, 7, 2},
 		{"aot5 bytes 2B 11 88 00", []byte{0x2B, 0x11, 0x88, 0x00}, 24000, 6, 2},
 	}
