@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/pkg/dash"
@@ -31,10 +32,16 @@ func serve(t *testing.T, suffix string, edit func([]byte) []byte) string {
 	require.NoError(t, err)
 	h := hub.New(hub.Options{})
 	sub := h.Subscribe("pkg", 1<<16)
-	require.NoError(t, pipeline.Run(context.Background(), h, pipeline.Options{
-		Open: func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil },
-		Now:  func() time.Time { return t0 },
-	}))
+	now := func() time.Time { return t0 }
+	require.NoError(t, pipeline.New(h, pipeline.Options{
+		Inputs: []string{"mem"},
+		Open: func(context.Context, string) (ingest.Reader, error) {
+			return ingest.NewTSReader(io.NopCloser(bytes.NewReader(b)), now)
+		},
+		Parse:    func(string) (ingest.Spec, error) { return ingest.Spec{}, nil },
+		EndOnEOF: true,
+		Now:      now,
+	}).Run(context.Background()))
 	h.Close()
 	p := live.NewPackager(h, live.Options{Window: 100, Now: func() time.Time { return t0.Add(time.Hour) }})
 	p.Run(context.Background(), sub)

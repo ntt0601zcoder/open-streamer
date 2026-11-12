@@ -17,8 +17,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,10 +51,10 @@ func (s *streamFlags) String() string     { return strings.Join(*s, ",") }
 func (s *streamFlags) Set(v string) error { *s = append(*s, v); return nil }
 
 type source struct {
-	name, path string
-	hub        *hub.Hub
-	pack       *live.Packager
-	reported   [3]uint64 // Errors, CodecErrors and FallbackAnchors at the last report
+	name, input string // input is the stream's input URL or bare path
+	hub         *hub.Hub
+	pack        *live.Packager
+	reported    [3]uint64 // Errors, CodecErrors and FallbackAnchors at the last report
 }
 
 // lockedWriter serialises writes from several goroutines.
@@ -128,8 +130,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stderr, "osdev: duplicate stream %q\n", name)
 			return 2
 		}
+		input := path
+		if *loop {
+			abs, err := filepath.Abs(path)
+			if err != nil {
+				_, _ = fmt.Fprintf(stderr, "osdev: stream %s: %v\n", name, err)
+				return 2
+			}
+			input = (&url.URL{Scheme: "file", Path: abs, RawQuery: "loop=1"}).String()
+		}
 		h := hub.New(hub.Options{})
-		src := &source{name: name, path: path, hub: h, pack: live.NewPackager(h, live.Options{})}
+		src := &source{name: name, input: input, hub: h, pack: live.NewPackager(h, live.Options{})}
 		srcs[name] = src
 		order = append(order, src)
 	}
@@ -180,14 +191,25 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}()
 		go func() {
 			defer wg.Done()
-			opt := pipeline.Options{
-				Open: func() (io.ReadCloser, error) { return os.Open(s.path) },
-				Loop: *loop,
-				Pace: true,
-			}
-			err := pipeline.Run(ctx, s.hub, opt)
+			// A stream has one input and stops at its first failure.
+			sctx, scancel := context.WithCancel(ctx)
+			defer scancel()
+			var failure error // set from the Run goroutine, read after Run
+			err := pipeline.New(s.hub, pipeline.Options{
+				Inputs:   []string{s.input},
+				EndOnEOF: true,
+				OnEvent: func(ev pipeline.Event) {
+					if ev.Kind == pipeline.EventFailed && failure == nil {
+						failure = ev.Err
+						scancel()
+					}
+				},
+			}).Run(sctx)
 			if ctx.Err() != nil {
 				return // shutting down: run closes the hubs
+			}
+			if failure != nil {
+				err = failure
 			}
 			// The stream is over: closing the hub ends it in the packager.
 			s.hub.Close()

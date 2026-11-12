@@ -21,6 +21,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/clock"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/mux/fmp4"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/httpts"
@@ -62,10 +63,16 @@ func fixture(t *testing.T, name string) []byte {
 func runClip(t *testing.T, h *hub.Hub, name string) {
 	t.Helper()
 	b := fixture(t, name)
-	require.NoError(t, pipeline.Run(context.Background(), h, pipeline.Options{
-		Open: func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil },
-		Now:  func() time.Time { return t0 },
-	}))
+	now := func() time.Time { return t0 }
+	require.NoError(t, pipeline.New(h, pipeline.Options{
+		Inputs: []string{"mem"},
+		Open: func(context.Context, string) (ingest.Reader, error) {
+			return ingest.NewTSReader(io.NopCloser(bytes.NewReader(b)), now)
+		},
+		Parse:    func(string) (ingest.Spec, error) { return ingest.Spec{}, nil },
+		EndOnEOF: true,
+		Now:      now,
+	}).Run(context.Background()))
 }
 
 // packClip packages a whole fixture; the packager clock is now.

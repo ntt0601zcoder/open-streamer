@@ -1,10 +1,10 @@
 package e2e
 
 import (
-	"bytes"
 	"context"
-	"errors"
-	"io"
+	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,6 +15,14 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 )
+
+// loopURL writes clip to a temporary file and returns its looping file URL.
+func loopURL(t *testing.T, clip []byte) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "clip.ts")
+	require.NoError(t, os.WriteFile(p, clip, 0o600))
+	return (&url.URL{Scheme: "file", Path: p, RawQuery: "loop=1"}).String()
+}
 
 // headClip returns the first n whole TS packets of a fixture.
 func headClip(t *testing.T, name string, n int) []byte {
@@ -32,7 +40,6 @@ func headClip(t *testing.T, name string, n int) []byte {
 func TestPacedLoopDoesNotDrift(t *testing.T) {
 	clip := headClip(t, "h264_aac.ts", 120)
 	const loops = 1000
-	errStop := errors.New("stop")
 
 	clk := newFakeClock(m3aT0)
 	h := hub.New(hub.Options{})
@@ -40,7 +47,7 @@ func TestPacedLoopDoesNotDrift(t *testing.T) {
 	defer sub.Close()
 	p := live.NewPackager(h, live.Options{Now: clk.Now})
 
-	var opens []time.Time // fake wall at each Open: the next epoch's arrival
+	var opens []time.Time // fake wall at each pass start: the next epoch's arrival
 	leads := map[uint32]time.Duration{}
 	warm, checks, minListed := false, 0, -1
 	check := func() {
@@ -73,24 +80,36 @@ func TestPacedLoopDoesNotDrift(t *testing.T) {
 			require.GreaterOrEqual(t, s.Listed, s.Window-1, "listed at %v, %d epochs", clk.Now().Sub(m3aT0), len(opens))
 		}
 	}
-	err := pipeline.Run(context.Background(), h, pipeline.Options{
-		Open: func() (io.ReadCloser, error) {
-			if len(opens) == loops {
-				return nil, errStop
-			}
-			opens = append(opens, clk.Now())
-			return io.NopCloser(bytes.NewReader(clip)), nil
-		},
-		Loop: true,
-		Pace: true,
-		Now:  clk.Now,
+	// The clip loops inside one file reader: each loop is an
+	// ErrDiscontinuity, answered by one Clock break. The first activation and
+	// each discontinuity mark the fake wall where the next pass opens, its
+	// epoch's arrival; the run stops at the end of the last pass.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := pipeline.New(h, pipeline.Options{
+		Inputs: []string{loopURL(t, clip)},
+		Now:    clk.Now,
 		Sleep: func(_ context.Context, d time.Duration) error {
 			check()
 			clk.Set(clk.Now().Add(d))
 			return nil
 		},
-	})
-	require.ErrorIs(t, err, errStop)
+		OnEvent: func(ev pipeline.Event) {
+			switch ev.Kind {
+			case pipeline.EventActive, pipeline.EventDiscontinuity:
+				if len(opens) == loops {
+					cancel()
+					return
+				}
+				opens = append(opens, clk.Now())
+			case pipeline.EventFailed:
+				t.Errorf("input failed: %v", ev.Err)
+				cancel()
+			}
+		},
+	}).Run(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Len(t, opens, loops)
 	check()
 	require.Positive(t, checks)
 	last := uint32(loops - 1) // the last epoch's segment is still open
