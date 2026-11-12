@@ -71,17 +71,50 @@ func (a ADTS) AudioSpecificConfig() []byte {
 	return []byte{byte(v >> 8), byte(v)}
 }
 
+// AAC object types AppendADTS treats specially.
+const (
+	aotLC     = 2
+	aotSBR    = 5  // HE-AAC v1
+	aotPS     = 29 // HE-AAC v2
+	aotEscape = 31
+)
+
 // AppendADTS appends one ADTS frame (7-byte header, no CRC) carrying payload
 // to dst. The header comes from asc, an AAC AudioSpecificConfig: the object
 // type must be 1 to 4 (the ADTS profile is the object type minus one), the
 // sampling frequency index 0 to 12 and the channel configuration 1 to 7.
+//
+// An HE-AAC config (object type 5 or 29, explicit hierarchical signalling,
+// whose core object type must be AAC-LC) is written as an AAC-LC header
+// (profile 1) at the core sampling frequency and the core channel
+// configuration: ADTS cannot signal SBR or PS, so decoders find them in the
+// payload (implicit signalling).
 func AppendADTS(dst, asc, payload []byte) ([]byte, error) {
 	if len(asc) < 2 {
 		return dst, fmt.Errorf("mpegts: adts: audio specific config has %d bytes, need 2", len(asc))
 	}
-	v := uint16(asc[0])<<8 | uint16(asc[1])
-	objType, srIdx, chans := v>>11, (v>>7)&0x0F, (v>>3)&0x0F
+	r := ascReader{b: asc}
+	objType, srIdx, chans := r.read(5), r.read(4), r.read(4)
+	if objType == aotSBR || objType == aotPS {
+		if srIdx == 15 {
+			return dst, errors.New("mpegts: adts: explicit core sampling frequency cannot be written in an ADTS header")
+		}
+		if r.read(4) == 15 { // extensionSamplingFrequencyIndex
+			r.read(24)
+		}
+		core := r.read(5)
+		if r.short {
+			return dst, fmt.Errorf("mpegts: adts: HE-AAC audio specific config truncated (%d bytes)", len(asc))
+		}
+		if core != aotLC {
+			return dst, fmt.Errorf("mpegts: adts: HE-AAC core object type %d is not AAC-LC", core)
+		}
+		objType = aotLC
+	}
 	if objType < 1 || objType > 4 {
+		if objType == aotEscape {
+			return dst, errors.New("mpegts: adts: escaped object type cannot be written in an ADTS header")
+		}
 		return dst, fmt.Errorf("mpegts: adts: object type %d cannot be written in an ADTS header", objType)
 	}
 	if srIdx >= 13 {
@@ -103,4 +136,26 @@ func AppendADTS(dst, asc, payload []byte) ([]byte, error) {
 		0xFC,
 	)
 	return append(dst, payload...), nil
+}
+
+// ascReader reads big-endian bit fields from an AudioSpecificConfig. Reading
+// past the end yields zero bits and sets short.
+type ascReader struct {
+	b     []byte
+	pos   int // bit position
+	short bool
+}
+
+func (r *ascReader) read(n int) uint32 {
+	var v uint32
+	for range n {
+		v <<= 1
+		if r.pos>>3 >= len(r.b) {
+			r.short = true
+		} else {
+			v |= uint32(r.b[r.pos>>3]>>(7-r.pos&7)) & 1
+		}
+		r.pos++
+	}
+	return v
 }

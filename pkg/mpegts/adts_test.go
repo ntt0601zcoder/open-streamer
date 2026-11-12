@@ -181,14 +181,85 @@ func TestAppendADTS(t *testing.T) {
 	}
 }
 
+// heASC builds an HE-AAC AudioSpecificConfig with explicit hierarchical
+// signalling: aot, core sampling index, channels, extension sampling index,
+// core object type. An index of 15 is followed by a 24-bit frequency.
+func heASC(aot, core, chans, ext, coreAOT uint64) []byte {
+	var v uint64
+	n := 0
+	put := func(x uint64, bits int) { v, n = v<<bits|x, n+bits }
+	put(aot, 5)
+	put(core, 4)
+	if core == 15 {
+		put(24000, 24)
+	}
+	put(chans, 4)
+	put(ext, 4)
+	if ext == 15 {
+		put(48000, 24)
+	}
+	put(coreAOT, 5)
+	put(0, 3) // GASpecificConfig
+	pad := (8 - n%8) % 8
+	v <<= pad
+	n += pad
+	out := make([]byte, n/8)
+	for i := range out {
+		out[i] = byte(v >> (8 * (len(out) - 1 - i)))
+	}
+	return out
+}
+
+// HE-AAC ASCs are written as an AAC-LC ADTS header at the core sampling
+// frequency and channel configuration (implicit SBR/PS signalling).
+func TestAppendADTSHEAAC(t *testing.T) {
+	tests := []struct {
+		name  string
+		asc   []byte
+		rate  int
+		srIdx uint8
+		chans uint8
+	}{
+		{"aot5 24k/48k stereo", heASC(5, 6, 2, 3, 2), 24000, 6, 2},
+		{"aot29 24k/48k mono core", heASC(29, 6, 1, 3, 2), 24000, 6, 1},
+		{"aot5 22.05k/44.1k explicit ext fs", heASC(5, 7, 2, 15, 2), 22050, 7, 2},
+		{"aot5 bytes 2B 11 88 00", []byte{0x2B, 0x11, 0x88, 0x00}, 24000, 6, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := bytes.Repeat([]byte{0x5A}, 200)
+			buf, err := AppendADTS([]byte{0xEE}, tt.asc, payload)
+			require.NoError(t, err)
+			require.Equal(t, byte(0xEE), buf[0], "dst prefix kept")
+			frames, err := ParseADTS(buf[1:])
+			require.NoError(t, err)
+			require.Len(t, frames, 1)
+			f := frames[0]
+			assert.Equal(t, uint8(2), f.ObjectType, "ADTS profile LC")
+			assert.Equal(t, tt.srIdx, f.SampleRateIndex)
+			assert.Equal(t, tt.rate, f.SampleRate)
+			assert.Equal(t, tt.chans, f.ChannelConfig)
+			assert.Equal(t, payload, f.Payload)
+		})
+	}
+}
+
 func TestAppendADTSErrors(t *testing.T) {
 	tests := map[string][]byte{
 		"short asc":     {0x12},
-		"object type 5": {0x2A, 0x10},
 		"object type 0": {0x02, 0x10},
+		"object type 6": {0x32, 0x10},
+		"escape 31":     {0xF8, 0x00, 0x00},
 		"sample index":  {0x17, 0x90},
 		"channels 0":    {0x12, 0x00},
 		"channels 8":    {0x12, 0x40},
+		// HE-AAC: aot 5 needs the extension index and the core object type.
+		"he-aac truncated":     {0x2B, 0x10},
+		"he-aac core index":    heASC(5, 13, 2, 3, 2),
+		"he-aac explicit fs":   heASC(5, 15, 2, 3, 2),
+		"he-aac core not lc":   heASC(5, 6, 2, 3, 1),
+		"he-aac channels 0":    heASC(5, 6, 0, 3, 2),
+		"he-aac ext truncated": {0x2B, 0x17, 0x80},
 	}
 	for name, asc := range tests {
 		t.Run(name, func(t *testing.T) {
