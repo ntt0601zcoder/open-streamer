@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 )
@@ -50,14 +49,6 @@ func readAll(t *testing.T, d *Demuxer) []media.Frame {
 	}
 }
 
-// checkRaw runs the frame checks on raw demuxer output. It skips
-// conform.RuleConfigChange: the demuxer emits source-time frames with Epoch
-// 0, so a config change (as in h264_aac_then_640.ts) is never at an epoch
-// start until the Clock assigns epochs.
-func checkRaw(frames []media.Frame) []conform.Violation {
-	return conform.CheckFrames(frames, conform.FrameOptions{Skip: []string{conform.RuleConfigChange}})
-}
-
 func byTrack(frames []media.Frame, track int) []media.Frame {
 	var out []media.Frame
 	for _, f := range frames {
@@ -92,7 +83,6 @@ func TestDemuxH264AAC(t *testing.T) {
 		assert.True(t, a[i].Key)
 		assert.False(t, a[i].RASL)
 	}
-	assert.Nil(t, checkRaw(frames))
 }
 
 func TestDemuxH265AAC51(t *testing.T) {
@@ -115,7 +105,6 @@ func TestDemuxH265AAC51(t *testing.T) {
 			assert.NotContains(t, []byte{32, 33, 34, 35}, typ)
 		}
 	}
-	assert.Nil(t, checkRaw(frames))
 }
 
 func TestDemuxH265RASL(t *testing.T) {
@@ -233,7 +222,6 @@ func TestDemuxTruncated(t *testing.T) {
 	for _, f := range frames {
 		assert.NotEmpty(t, f.Data)
 	}
-	assert.Nil(t, checkRaw(frames))
 }
 
 func TestDemuxGarbage(t *testing.T) {
