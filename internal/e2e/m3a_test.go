@@ -821,7 +821,7 @@ func TestM3aFFprobe(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 			start := time.Now()
-			cmd := exec.CommandContext(ctx, ffprobe, "-v", "error",
+			cmd := exec.CommandContext(ctx, ffprobe, "-v", "warning",
 				"-show_entries", "stream=codec_type,codec_name,width,height,channels,sample_rate",
 				"-of", "json", base+out)
 			var stderr bytes.Buffer
@@ -842,9 +842,13 @@ func TestM3aFFprobe(t *testing.T) {
 }
 
 // The audio-surviving slow variant: a queue and burst of slowAudioBurst
-// every slowAudioEvery writes. 48 every 56 or 96 instead lands a loss
+// every slowAudioEvery writes. 48 every 56 or 96 instead lands a hub loss
 // right after epoch 2's first keyframe, so that epoch's first segment has
-// no audio; see the task 19 fix report.
+// no audio and its audio starts later inside the epoch. The consequences
+// are a DASH track-start-offset violation (DASH cannot signal a mid-period
+// discontinuity) and unequal discontinuity counts across the HLS-fMP4
+// renditions. That is an accepted degraded-mode limitation, Ruling R7: the
+// content was genuinely lost, so these values keep the test off it.
 const (
 	slowAudioBurst = 48
 	slowAudioEvery = 64
