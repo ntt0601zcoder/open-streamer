@@ -559,3 +559,51 @@ func TestFieldCodedH264WithAUDs(t *testing.T) {
 	assert.Zero(t, st.SplitAUsNoRoom)
 	assert.Zero(t, st.DroppedNoConfig)
 }
+
+func TestSplitAUsAfterPTSLessLoss(t *testing.T) {
+	sps, pps := h264Params(t)
+	three := joinNALUs(nalAUD, pSlice(true, 30), nalAUD, pSlice(true, 31), nalAUD, pSlice(true, 32))
+	t.Run("group clamped to the next PES", func(t *testing.T) {
+		b := newTSBuilder(t)
+		b.program(h264Stream)
+		b.videoPES(videoPID, 0, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 30)))
+		b.videoPES(videoPID, 9000, 9000, joinNALUs(nalAUD, pSlice(true, 30))) // step 9000
+		b.videoPES(videoPID, 18000, 18000, three)
+		start := b.buf.Len()
+		b.pesNoPTS(videoPID, joinNALUs(pSlice(false, 600)))
+		b.cutSecondPacket(start)                           // lost
+		b.pesNoPTS(videoPID, joinNALUs(pSlice(false, 40))) // Discontinuity, dropped
+		b.videoPES(videoPID, 24000, 24000, joinNALUs(nalAUD, pSlice(true, 33)))
+
+		d, frames := demuxAll(t, b.buf.Bytes())
+		// Unit 1 of the 18000 group would get 27000 with the 9000 step,
+		// past the next PES: no room. Unit 2 was pending at the loss.
+		assert.Equal(t, []int64{0, 9000, 18000, 24000}, dtsOf(frames))
+		assertIncreasing(t, frames)
+		st := d.Stats()
+		assert.Equal(t, uint64(1), st.SplitAUsNoRoom)
+		assert.Equal(t, uint64(2), st.LostFrames, "the lost PES and the dropped pending unit")
+	})
+	t.Run("no step measured across the loss", func(t *testing.T) {
+		b := newTSBuilder(t)
+		b.program(h264Stream)
+		b.videoPES(videoPID, 0, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 30)))
+		b.videoPES(videoPID, 9000, 9000, joinNALUs(nalAUD, pSlice(true, 30))) // step 9000
+		b.videoPES(videoPID, 18000, 18000, joinNALUs(nalAUD, pSlice(true, 30)))
+		start := b.buf.Len()
+		b.pesNoPTS(videoPID, joinNALUs(nalAUD, pSlice(true, 600)))
+		b.cutSecondPacket(start)                                  // lost
+		b.pesNoPTS(videoPID, joinNALUs(pSlice(false, 40)))        // Discontinuity, dropped
+		b.pesNoPTS(videoPID, joinNALUs(nalAUD, pSlice(true, 41))) // dropped, no flag
+		b.videoPES(videoPID, 54000, 54000, three)                 // no Discontinuity flag
+
+		d, frames := demuxAll(t, b.buf.Bytes())
+		// The 18000 unit was pending at the loss and is dropped.
+		// 54000-18000 over one counted unit would measure 36000; the last
+		// good step stays 9000 and times the final group at EOF.
+		assert.Equal(t, []int64{0, 9000, 54000, 63000, 72000}, dtsOf(frames))
+		assert.Equal(t, uint64(3), d.Stats().LostFrames,
+			"the lost PES, the dropped pending unit and the unit starting in a dropped continuation")
+		assert.Equal(t, int64(9000), d.tracks[0].step)
+	})
+}
