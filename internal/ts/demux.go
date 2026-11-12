@@ -27,12 +27,26 @@ type DemuxStats struct {
 	// parameter-set group.
 	DroppedNoConfig uint64
 	// DecodeErrors counts continuity gaps, malformed PSI sections, PES
-	// packets and packet runs, PES without a PTS, and bad parameter sets and
-	// ADTS frames.
+	// packets and packet runs, PES without a PTS that continue nothing, and
+	// bad parameter sets and ADTS frames.
 	DecodeErrors uint64
 	// PMTChanges counts PMTs after the first whose (PID, stream_type) set
 	// differed from the current one. It counts only in Remap mode.
 	PMTChanges uint64
+	// LostFrames counts access units not emitted because PES data for them
+	// was lost or dropped (mpegts LostPES or Discontinuity). It is a lower
+	// bound: each Discontinuity counts one access unit, plus the frames of
+	// PES without PTS dropped after it.
+	LostFrames uint64
+	// SplitAUs counts access units found after the first one inside one PES
+	// and given extrapolated timestamps.
+	SplitAUs uint64
+	// SplitAUsReordered counts such access units dropped because the PES had
+	// PTS != DTS.
+	SplitAUsReordered uint64
+	// Continued counts video PES without PTS appended to the previous access
+	// unit.
+	Continued uint64
 }
 
 // defaultMaxTracks is the track cap when DemuxOptions.MaxTracks is zero.
@@ -80,6 +94,42 @@ type track struct {
 
 	// Video parameter sets, one per ID (the newest wins), keyed by ID.
 	vps, sps, pps map[uint32][]byte
+	// dirty: a set changed, or arrived while config is nil, since the last
+	// rebuild; bad: a set since then had no readable ID.
+	dirty, bad bool
+
+	// Video access-unit assembly.
+	au       *videoAU // the pending access unit; nil when none
+	held     [][]byte // parameter sets and prefix SEI after au's last slice
+	timed    bool     // a PES with a PTS has been seen
+	ptsIsDTS bool     // the last PES with a PTS had PTS == DTS
+	pesDTS   int64    // DTS of the last PES with a PTS
+	pesAUs   int      // access units started since it; 0 after a loss
+	lastDTS  int64    // DTS of the last access unit started
+	step     int64    // measured per-access-unit DTS step; 0 when unknown
+
+	// lost: PES data was lost since the last PES with a PTS, so a PES
+	// without PTS is dropped.
+	lost bool
+	// ptsLess: a PES without PTS has been seen, so an access unit may span
+	// several PES.
+	ptsLess bool
+
+	// Audio timing: the next frame is aSamples samples at aRate after aBase.
+	aTimed   bool
+	aBase    int64
+	aSamples int64
+	aRate    int
+}
+
+// videoAU is a video access unit under assembly.
+type videoAU struct {
+	pts, dts  int64
+	data      [][]byte
+	key, rasl bool
+	size      int  // bytes of its NAL units, held ones included
+	slice     bool // it has a slice
+	drop      bool // never emitted: unknown timestamps, or over maxAUSize
 }
 
 // Demuxer reads media frames from an MPEG-TS stream.
@@ -174,6 +224,9 @@ func (d *Demuxer) applyPMT(pmt *mpegts.PMT) {
 			d.tracks = append(d.tracks, t)
 			d.byPID[s.PID] = t
 		case s.Type != first:
+			if t := d.byPID[s.PID]; t != nil {
+				d.finishAU(t, true) // Its PES stop here.
+			}
 			delete(d.byPID, s.PID)
 			if !supported {
 				d.skip(s)
@@ -216,6 +269,8 @@ func (d *Demuxer) remapPMT(pmt *mpegts.PMT) {
 	}
 	if !first {
 		d.stats.PMTChanges++
+		// Pending access units complete with the Config of the old PMT.
+		d.flushAll()
 	}
 	d.curSet = slices.Clone(pmt.Streams)
 	if d.curSet == nil {
@@ -322,7 +377,10 @@ func (d *Demuxer) Stats() DemuxStats {
 }
 
 // Read returns the next frame, or io.EOF at the end of the stream. A read
-// error from the input is returned wrapped, and again on later calls.
+// error from the input is returned wrapped, and again on later calls. A video
+// access unit may span PES, so it is returned once something completes it:
+// the next access-unit start on its track, a PMT change, or the end of input
+// or a read error, which return every pending unit first.
 func (d *Demuxer) Read() (media.Frame, error) {
 	for {
 		if len(d.queue) > 0 {
@@ -336,9 +394,11 @@ func (d *Demuxer) Read() (media.Frame, error) {
 		ev, err := d.dmx.Next()
 		switch {
 		case errors.Is(err, io.EOF):
+			d.flushAll()
 			d.err = io.EOF
 			continue
 		case err != nil:
+			d.flushAll()
 			d.err = fmt.Errorf("ts: demux: read: %w", err)
 			continue
 		case ev.PMT != nil:
@@ -356,39 +416,77 @@ func (d *Demuxer) Read() (media.Frame, error) {
 	}
 }
 
+// defaultFrameStep is the DTS step of an extrapolated access unit on a track
+// with no measured step.
+const defaultFrameStep = 3600
+
+// aacFrameSamples is the number of samples in one AAC frame.
+const aacFrameSamples = 1024
+
+// maxAUSize bounds one video access unit, as mpegts bounds one PES: a stream
+// of PES without PTS and no access-unit start would otherwise grow it
+// without limit.
+const maxAUSize = 8 << 20
+
 func (d *Demuxer) handlePES(t *track, pes *mpegts.PES) {
-	if !pes.HasPTS {
-		d.stats.DecodeErrors++
+	if t.kind == media.KindAudio {
+		d.handleAudio(t, pes)
 		return
 	}
-	pts := d.timeDec.Decode(pes.PTS)
-	dts := pts
+	d.handleVideo(t, pes)
+}
+
+// decodeTimes unwraps the timestamps of a PES with a PTS.
+func (d *Demuxer) decodeTimes(pes *mpegts.PES) (pts, dts int64) {
+	pts = d.timeDec.Decode(pes.PTS)
+	dts = pts
 	if pes.DTS != pes.PTS {
 		dts = d.timeDec.Decode(pes.DTS)
 	}
-	if t.kind == media.KindAudio {
-		d.handleAudio(t, pes.Data, pts)
-		return
-	}
-	d.handleVideo(t, pes.Data, pts, dts)
+	return pts, dts
 }
 
-func (d *Demuxer) handleAudio(t *track, payload []byte, pts int64) {
-	frames, err := mpegts.ParseADTS(payload)
+// handleAudio emits the ADTS frames of an audio PES. Frames are timed by
+// sample count from the last PES with a PTS, so a PES without PTS continues
+// 1024 samples per frame after the previous frame. After a loss
+// (Discontinuity) such a PES is dropped until the next PES with a PTS.
+func (d *Demuxer) handleAudio(t *track, pes *mpegts.PES) {
+	if pes.Discontinuity {
+		d.stats.LostFrames++
+		t.lost = true
+	}
+	if pes.HasPTS {
+		pts, _ := d.decodeTimes(pes)
+		t.lost = false
+		t.aTimed, t.aBase, t.aSamples = true, pts, 0
+	}
+	frames, err := mpegts.ParseADTS(pes.Data)
 	if err != nil {
 		d.stats.DecodeErrors++
 	}
-	for i, a := range frames {
+	if !pes.HasPTS {
+		switch {
+		case t.lost:
+			d.stats.LostFrames += uint64(len(frames))
+			return
+		case !t.aTimed:
+			d.stats.DecodeErrors++
+			return
+		}
+	}
+	for _, a := range frames {
 		asc := a.AudioSpecificConfig()
 		if t.config == nil || !bytes.Equal(t.config.ASC, asc) {
 			cfg, cerr := media.NewAACConfig(asc)
 			if cerr != nil {
 				d.stats.DecodeErrors++
+				t.aSamples += aacFrameSamples
 				continue
 			}
 			t.config = cfg
 		}
-		ts := pts + media.SampleTime(int64(i)*1024, t.config.SampleRate)
+		ts := t.audioTime(t.config.SampleRate)
+		t.aSamples += aacFrameSamples
 		d.queue = append(d.queue, media.Frame{
 			Track:  t.idx,
 			Config: t.config,
@@ -398,6 +496,19 @@ func (d *Demuxer) handleAudio(t *track, payload []byte, pts int64) {
 			Data:   [][]byte{a.Payload},
 		})
 	}
+}
+
+// audioTime returns the PTS of the next audio frame at rate. A rate change
+// moves the base to the end of the samples counted at the old rate.
+func (t *track) audioTime(rate int) int64 {
+	if rate != t.aRate {
+		if t.aRate > 0 {
+			t.aBase += media.SampleTime(t.aSamples, t.aRate)
+			t.aSamples = 0
+		}
+		t.aRate = rate
+	}
+	return t.aBase + media.SampleTime(t.aSamples, rate)
 }
 
 // NAL unit classification helpers.
@@ -449,54 +560,251 @@ func (t *track) isRASL(typ uint8) bool {
 	return t.codec == media.CodecH265 && (typ == 8 || typ == 9)
 }
 
-func (d *Demuxer) handleVideo(t *track, payload []byte, pts, dts int64) {
-	nalus := avc.ExtractNalusFromByteStream(payload)
-	var (
-		data  [][]byte
-		key   bool
-		rasl  bool
-		dirty bool
-		bad   bool
-	)
+// isVCL reports a slice NAL unit.
+func (t *track) isVCL(typ uint8) bool {
+	if t.codec == media.CodecH265 {
+		return typ <= 31
+	}
+	return typ >= 1 && typ <= 5
+}
+
+// isFirstSlice reports a slice that starts a picture: first_mb_in_slice == 0
+// (H.264; partitions B and C carry no slice header) or
+// first_slice_segment_in_pic_flag (H.265). Both are the first bit after the
+// NAL unit header; ue(v) 0 is the single bit 1.
+func (t *track) isFirstSlice(typ uint8, n []byte) bool {
+	if t.codec == media.CodecH265 {
+		return len(n) > 2 && n[2]&0x80 != 0
+	}
+	return (typ == 1 || typ == 2 || typ == 5) && len(n) > 1 && n[1]&0x80 != 0
+}
+
+// leadsAU reports the non-VCL types that, after the last slice of an access
+// unit, belong to the next one: parameter sets and prefix SEI.
+func (t *track) leadsAU(typ uint8) bool {
+	if t.paramSets(typ) != nil {
+		return true
+	}
+	if t.codec == media.CodecH265 {
+		return typ == 39
+	}
+	return typ == 6
+}
+
+// countPictures counts the slices that start a picture.
+func (t *track) countPictures(nalus [][]byte) int {
+	n := 0
+	for _, nal := range nalus {
+		if len(nal) == 0 {
+			continue
+		}
+		if typ := t.nalType(nal); t.isVCL(typ) && t.isFirstSlice(typ, nal) {
+			n++
+		}
+	}
+	return n
+}
+
+// handleVideo adds a video PES to its track's access units. A PES with a PTS
+// starts an access unit and completes the pending one. A PES without PTS
+// continues the pending unit. Inside either, an AUD or a first slice after a
+// slice starts another access unit, timed by extrapolation (startSplitAU).
+//
+// A Discontinuity counts one lost access unit, the one the lost data belonged
+// to. On a track that carries PES without PTS that may be the pending unit,
+// so it is dropped in its place; on a track whose PES all have a PTS the lost
+// data was a whole PES and the pending unit is complete. A PES without PTS
+// after a loss is dropped until the next PES with a PTS. Later frames pass
+// through: decoders conceal the loss.
+func (d *Demuxer) handleVideo(t *track, pes *mpegts.PES) {
+	if !pes.HasPTS {
+		t.ptsLess = true
+	}
+	if pes.Discontinuity {
+		d.stats.LostFrames++
+		if t.ptsLess {
+			d.finishAU(t, false)
+		}
+		t.pesAUs = 0 // No step is measured across the loss.
+		if !pes.HasPTS {
+			t.lost = true
+		}
+	}
+	nalus := avc.ExtractNalusFromByteStream(pes.Data)
+	switch {
+	case pes.HasPTS:
+		pts, dts := d.decodeTimes(pes)
+		d.finishAU(t, true)
+		t.lost = false
+		t.startPES(pts, dts, pes.PTS == pes.DTS)
+	case t.lost:
+		d.stats.LostFrames += uint64(t.countPictures(nalus))
+		return
+	case t.au == nil:
+		// Nothing to continue: data before the next access-unit start is
+		// discarded.
+		d.stats.DecodeErrors++
+	default:
+		d.stats.Continued++
+	}
 	for _, n := range nalus {
 		if len(n) == 0 || (t.codec == media.CodecH265 && len(n) < 2) {
 			continue
 		}
-		typ := t.nalType(n)
-		if t.isAUD(typ) {
-			continue
-		}
-		if sets := t.paramSets(typ); sets != nil {
-			id, err := media.ParamSetID(t.codec, n)
-			if err != nil {
-				// The slices that follow may depend on this set, so the
-				// current config can no longer be trusted.
-				d.stats.DecodeErrors++
-				t.config = nil
-				bad = true
-				continue
-			}
-			if old, have := sets[id]; !have || !bytes.Equal(old, n) {
-				sets[id] = bytes.Clone(n)
-				dirty = true
-			}
-			if t.config == nil {
-				dirty = true // Retry the rebuild whenever a set arrives while invalid.
-			}
-			continue
-		}
-		if t.isKeySlice(typ) {
-			key = true
-		}
-		if t.isRASL(typ) {
-			rasl = true
-		}
-		data = append(data, n)
+		d.addNAL(t, n)
 	}
-	if dirty && !bad {
+}
+
+// startPES starts the access unit of a PES with a PTS. The per-unit DTS step
+// is the DTS distance from the previous PES with a PTS divided by the access
+// units started since it.
+func (t *track) startPES(pts, dts int64, ptsIsDTS bool) {
+	if t.pesAUs > 0 {
+		if step := dts - t.pesDTS; step > 0 {
+			t.step = step / int64(t.pesAUs)
+		}
+	}
+	t.timed = true
+	t.pesDTS, t.pesAUs, t.ptsIsDTS = dts, 1, ptsIsDTS
+	t.lastDTS = dts
+	t.au = &videoAU{pts: pts, dts: dts}
+}
+
+// startSplitAU starts an access unit found inside a PES after its first, or
+// in a PES without PTS: DTS is the previous unit's DTS plus the track's step
+// (3600 if none) and PTS = DTS when the last PES with a PTS had PTS == DTS.
+// Otherwise its presentation order is unknown and it is dropped.
+func (d *Demuxer) startSplitAU(t *track) {
+	au := &videoAU{}
+	t.pesAUs++
+	switch {
+	case !t.timed:
+		au.drop = true // Counted with the PES that continues nothing.
+	case !t.ptsIsDTS:
+		au.drop = true
+		d.stats.SplitAUsReordered++
+	default:
+		step := t.step
+		if step <= 0 {
+			step = defaultFrameStep
+		}
+		t.lastDTS += step
+		au.pts, au.dts = t.lastDTS, t.lastDTS
+		d.stats.SplitAUs++
+	}
+	t.au = au
+}
+
+// addNAL adds one NAL unit to the pending access unit. Parameter sets and
+// prefix SEI after a slice are held until the next NAL unit shows whether
+// they start the next access unit.
+func (d *Demuxer) addNAL(t *track, n []byte) {
+	typ := t.nalType(n)
+	aud := t.isAUD(typ)
+	vcl := t.isVCL(typ)
+	if (aud || vcl && t.isFirstSlice(typ, n)) && (t.au == nil || t.au.slice) {
+		held := t.held
+		t.held = nil
+		if aud {
+			// Units before an AUD end the pending access unit.
+			d.commit(t, held)
+			held = nil
+		}
+		d.finishAU(t, true)
+		d.startSplitAU(t)
+		d.commit(t, held)
+	}
+	if au := t.au; au != nil && !aud {
+		au.size += len(n)
+		if au.size > maxAUSize && !au.drop {
+			d.stats.DecodeErrors++
+			au.drop, au.data = true, nil
+		}
+	}
+	switch {
+	case aud:
+	case t.au == nil:
+		// Data of an access unit no longer pending; parameter sets still
+		// apply.
+		if t.paramSets(typ) != nil {
+			d.commitNAL(t, n)
+		}
+	case vcl:
+		d.commit(t, t.held)
+		t.held = nil
+		d.commitNAL(t, n)
+	case t.au.slice && !t.au.drop && t.leadsAU(typ):
+		t.held = append(t.held, n)
+	default:
+		d.commitNAL(t, n)
+	}
+}
+
+func (d *Demuxer) commit(t *track, nalus [][]byte) {
+	for _, n := range nalus {
+		d.commitNAL(t, n)
+	}
+}
+
+// commitNAL stores a parameter set, or appends any other NAL unit to the
+// pending access unit.
+func (d *Demuxer) commitNAL(t *track, n []byte) {
+	typ := t.nalType(n)
+	if sets := t.paramSets(typ); sets != nil {
+		id, err := media.ParamSetID(t.codec, n)
+		if err != nil {
+			// The slices that follow may depend on this set, so the
+			// current config can no longer be trusted.
+			d.stats.DecodeErrors++
+			t.config = nil
+			t.bad = true
+			return
+		}
+		if old, have := sets[id]; !have || !bytes.Equal(old, n) {
+			sets[id] = bytes.Clone(n)
+			t.dirty = true
+		}
+		if t.config == nil {
+			t.dirty = true // Retry the rebuild whenever a set arrives while invalid.
+		}
+		return
+	}
+	au := t.au
+	if au == nil {
+		return
+	}
+	if t.isVCL(typ) {
+		au.slice = true
+	}
+	if t.isKeySlice(typ) {
+		au.key = true
+	}
+	if t.isRASL(typ) {
+		au.rasl = true
+	}
+	if !au.drop {
+		au.data = append(au.data, n)
+	}
+}
+
+// finishAU completes the pending access unit: the parameter sets it carried
+// update the track's config, and it is queued when emit is set.
+func (d *Demuxer) finishAU(t *track, emit bool) {
+	au := t.au
+	if au == nil {
+		return
+	}
+	d.commit(t, t.held)
+	t.held = nil
+	t.au = nil
+	switch {
+	case t.bad:
+		t.bad, t.dirty = false, false
+	case t.dirty:
+		t.dirty = false
 		d.rebuildVideoConfig(t)
 	}
-	if len(data) == 0 {
+	if !emit || au.drop || len(au.data) == 0 {
 		return
 	}
 	if t.config == nil {
@@ -506,12 +814,19 @@ func (d *Demuxer) handleVideo(t *track, payload []byte, pts, dts int64) {
 	d.queue = append(d.queue, media.Frame{
 		Track:  t.idx,
 		Config: t.config,
-		PTS:    pts,
-		DTS:    dts,
-		Key:    key,
-		RASL:   rasl,
-		Data:   data,
+		PTS:    au.pts,
+		DTS:    au.dts,
+		Key:    au.key,
+		RASL:   au.rasl,
+		Data:   au.data,
 	})
+}
+
+// flushAll queues every pending access unit.
+func (d *Demuxer) flushAll() {
+	for _, t := range d.tracks {
+		d.finishAU(t, true)
+	}
 }
 
 func collect(m map[uint32][]byte) [][]byte {
