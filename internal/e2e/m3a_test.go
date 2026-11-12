@@ -31,7 +31,6 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/output/httpts"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
-	"github.com/ntt0601zcoder/open-streamer/internal/segment"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/dash"
 	"github.com/ntt0601zcoder/open-streamer/pkg/hls"
@@ -222,7 +221,7 @@ func serve(t *testing.T, p *live.Packager, fd feed) string {
 		return h, true
 	}
 	mux := http.NewServeMux()
-	mux.Handle("GET /live/{stream}/stream.ts", httpts.Handler(hubLookup, bigQueue))
+	mux.Handle("GET /live/{stream}/stream.ts", httpts.Handler(hubLookup, 0))
 	mux.Handle("/live/", live.Handler(func(name string) (*live.Packager, bool) { return p, name == "s" }))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -474,29 +473,46 @@ func TestM3aConfigChange(t *testing.T) {
 	}
 }
 
-// TestM3aSlowPackager hands the packager 8 deliveries every 40 writes from
-// a queue-8 subscriber, so the hub drops frames and the segmenter marks
-// discontinuities within an epoch.
-func TestM3aSlowPackager(t *testing.T) {
-	start := time.Now()
-	clk := newFakeClock(m3aT0)
-	steps := clockSteps(t, "h264_aac_loop.ts", clk.Now)
+// slowRun is a packager fed by a slow subscriber.
+type slowRun struct {
+	steps  []step
+	p      *live.Packager
+	handed []hub.Delivery
+	lost   int
+}
+
+func (r slowRun) handedFrames(k media.Kind) []media.Frame {
+	var out []media.Frame
+	for _, dl := range r.handed {
+		if dl.Frame.Kind() == k {
+			out = append(out, dl.Frame)
+		}
+	}
+	return out
+}
+
+// slowPackage writes the Clock output of h264_aac_loop.ts into a hub with a
+// subscriber of the given queue and, every `every` writes, hands up to
+// `burst` deliveries to Packager.Handle, so the hub drops frames and the
+// segmenter marks discontinuities within an epoch.
+func slowPackage(t *testing.T, clk *fakeClock, queue, every, burst int) slowRun {
+	t.Helper()
+	r := slowRun{steps: clockSteps(t, "h264_aac_loop.ts", clk.Now)}
 	h := hub.New(hub.Options{})
-	sub := h.Subscribe("slow", 8)
-	p := live.NewPackager(h, live.Options{Window: m3aWindow, Now: clk.Now})
-	var handed []hub.Delivery
-	lost := 0
+	sub := h.Subscribe("slow", queue)
+	r.p = live.NewPackager(h, live.Options{Window: m3aWindow, Now: clk.Now})
 	take := func(dl hub.Delivery) {
 		if dl.Lost > 0 {
-			lost++
+			r.lost++
+			require.True(t, dl.Frame.Key && dl.Frame.Kind() == media.KindVideo, "delivery after a loss is a video keyframe")
 		}
-		handed = append(handed, dl)
-		p.Handle(dl)
+		r.handed = append(r.handed, dl)
+		r.p.Handle(dl)
 	}
-	for i, s := range steps {
+	for i, s := range r.steps {
 		s.write(h)
-		if (i+1)%40 == 0 {
-			for range 8 {
+		if (i+1)%every == 0 {
+			for range burst {
 				select {
 				case dl := <-sub.C():
 					take(dl)
@@ -509,41 +525,23 @@ func TestM3aSlowPackager(t *testing.T) {
 	for dl := range sub.C() {
 		take(dl)
 	}
-	p.Flush()
-	require.Positive(t, lost)
-	require.Zero(t, p.Errors())
-	require.Zero(t, p.FallbackAnchors())
-	content := advance(t, p, clk)
+	r.p.Flush()
+	require.Zero(t, r.p.Errors())
+	require.Zero(t, r.p.FallbackAnchors())
+	return r
+}
 
-	// A reference segmenter fed the same deliveries gives the frames the
-	// segments hold: after each loss it drops the burst's audio presented
-	// before the keyframe that opens the next segment.
-	ref := segment.New(segment.Options{})
-	handedFrames := make([]media.Frame, 0, len(handed))
-	var kept []media.Frame
-	for _, dl := range handed {
-		handedFrames = append(handedFrames, dl.Frame)
-		for _, s := range ref.Push(dl) {
-			kept = append(kept, s.Frames...)
-		}
-	}
-	for _, s := range ref.Flush() {
-		kept = append(kept, s.Frames...)
-	}
-	require.Equal(t, uint64(len(handed)-len(kept)), ref.Dropped())
-
-	snap := p.Snapshot()
-	t.Logf("written %d frames, handed %d %s in %d losses, segmented %d %s (%d dropped), content %v, %d segments, %d epochs",
-		len(steps), len(handed), kindCounts(handedFrames), lost, len(kept), kindCounts(kept), ref.Dropped(),
-		content, len(snap.Segments), len(snap.Epochs))
-	assert.Equal(t, kindCounts(handedFrames)[epochKind{1, media.KindVideo}], kindCounts(kept)[epochKind{1, media.KindVideo}],
-		"every handed video frame is segmented")
-	lossDiscs := 0
+// lossSegments returns the indexes of the window's segments that are
+// discontinuous without an epoch change, and checks that each starts on a
+// video keyframe.
+func lossSegments(t *testing.T, snap live.Snapshot) []int {
+	t.Helper()
+	var out []int
 	for i, seg := range snap.Segments {
 		if i == 0 || !seg.Discontinuity || seg.Epoch != snap.Segments[i-1].Epoch {
 			continue
 		}
-		lossDiscs++
+		out = append(out, i)
 		d, err := ts.NewDemuxer(bytes.NewReader(seg.TS))
 		require.NoError(t, err)
 		var first *media.Frame
@@ -561,21 +559,185 @@ func TestM3aSlowPackager(t *testing.T) {
 		assert.True(t, first.Key, "segment %d after a loss starts on a keyframe", seg.Seq)
 		assert.Zero(t, d.Stats().DroppedNoConfig, "segment %d", seg.Seq)
 	}
-	t.Logf("%d discontinuities without an epoch change", lossDiscs)
-	assert.Positive(t, lossDiscs, "a discontinuity with no epoch change")
+	return out
+}
 
-	base := serve(t, p, stepsFeed(steps))
-	caps := readAll(t, base)
-	want := flat(kindCounts(kept))
-	for _, f := range []string{"hls-ts", "hls-fmp4", "dash"} {
-		assert.Equal(t, want, flat(kindCounts(caps[f].Frames)), f)
+// videoDTS returns the DTS of the video frames, sorted, relative to the
+// first one.
+func videoDTS(frames []media.Frame) []int64 {
+	var out []int64
+	for _, f := range frames {
+		if f.Kind() == media.KindVideo {
+			out = append(out, f.DTS)
+		}
 	}
-	written := make([]media.Frame, 0, len(steps))
-	for _, s := range steps {
+	slices.Sort(out)
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] -= out[0]
+	}
+	return out
+}
+
+func minDTS(frames []media.Frame, k media.Kind) int64 {
+	var lo int64 = 1 << 62
+	for _, f := range frames {
+		if f.Kind() == k {
+			lo = min(lo, f.DTS)
+		}
+	}
+	return lo
+}
+
+func epochRange(n uint32) []uint32 {
+	out := make([]uint32, 0, n)
+	for e := uint32(1); e <= n; e++ {
+		out = append(out, e)
+	}
+	return out
+}
+
+// TestM3aSlowPackager hands the packager 8 deliveries every 40 writes from
+// a queue-8 subscriber. The fixture muxes audio about 300 ms behind video,
+// so each burst after a loss holds the keyframe that opens the next
+// segment and audio presented before it, which the segmenter drops; the
+// audio that would fall inside the segment is lost in the hub. The outputs
+// carry every handed video frame and no audio.
+func TestM3aSlowPackager(t *testing.T) {
+	start := time.Now()
+	clk := newFakeClock(m3aT0)
+	r := slowPackage(t, clk, 8, 40, 8)
+	content := advance(t, r.p, clk)
+	snap := r.p.Snapshot()
+	video, audio := r.handedFrames(media.KindVideo), r.handedFrames(media.KindAudio)
+	t.Logf("written %d frames, handed %d (%d video, %d audio) in %d losses, content %v, %d segments, %d epochs",
+		len(r.steps), len(r.handed), len(video), len(audio), r.lost, content, len(snap.Segments), len(snap.Epochs))
+
+	// Deterministic for this fixture and pattern: 11 losses, one of them
+	// across the epoch change, so 10 discontinuities within an epoch.
+	assert.Equal(t, 11, r.lost)
+	losses := lossSegments(t, snap)
+	assert.Len(t, losses, 10)
+
+	// Every handed audio frame follows a loss and is presented before the
+	// keyframe delivered with that loss, which opens the next segment.
+	var lossKey *media.Frame
+	starts := map[int64]bool{}
+	for _, seg := range snap.Segments {
+		starts[seg.Start] = true
+	}
+	for _, dl := range r.handed {
+		f := dl.Frame
+		if dl.Lost > 0 {
+			lossKey = &f
+			assert.True(t, starts[f.PTS], "the keyframe at PTS %d opens a segment", f.PTS)
+			continue
+		}
+		if f.Kind() == media.KindAudio {
+			require.NotNil(t, lossKey, "audio at PTS %d follows a loss", f.PTS)
+			assert.Less(t, f.PTS, lossKey.PTS, "audio is presented before the segment opened after the loss")
+		}
+	}
+
+	base := serve(t, r.p, stepsFeed(r.steps))
+	caps := readAll(t, base)
+	for _, f := range []string{"hls-ts", "hls-fmp4", "dash"} {
+		assert.Equal(t, videoDTS(video), videoDTS(caps[f].Frames),
+			"%s: every handed video frame, in every epoch", f)
+		assert.Zero(t, kindCounts(caps[f].Frames)[epochKind{1, media.KindAudio}], f)
+		assert.Equal(t, len(video), len(caps[f].Frames), "%s: video only", f)
+	}
+	// HLS epochs count discontinuities: 1 + 11 (10 losses and the epoch
+	// change); DASH periods follow the 2 epochs.
+	assert.Equal(t, epochRange(12), epochs(caps["hls-ts"].Frames))
+	assert.Equal(t, epochRange(12), epochs(caps["hls-fmp4"].Frames))
+	assert.Equal(t, epochRange(2), epochs(caps["dash"].Frames))
+	written := make([]media.Frame, 0, len(r.steps))
+	for _, s := range r.steps {
 		written = append(written, s.f)
 	}
 	assert.Equal(t, flat(kindCounts(written)), kindCounts(caps["http-ts"].Frames), "http-ts")
 	t.Logf("scenario took %v", time.Since(start).Round(time.Millisecond))
+}
+
+// TestM3aSlowPackagerAudio hands bursts long enough to reach past the
+// audio mux lag, so audio survives each loss: its part after a loss is
+// discontinuous and every track's part numbers stay hole-free.
+func TestM3aSlowPackagerAudio(t *testing.T) {
+	start := time.Now()
+	clk := newFakeClock(m3aT0)
+	r := slowPackage(t, clk, slowAudioBurst, slowAudioEvery, slowAudioBurst)
+	content := advance(t, r.p, clk)
+	snap := r.p.Snapshot()
+	video, audio := r.handedFrames(media.KindVideo), r.handedFrames(media.KindAudio)
+	t.Logf("written %d frames, handed %d (%d video, %d audio) in %d losses, content %v, %d segments, %d epochs",
+		len(r.steps), len(r.handed), len(video), len(audio), r.lost, content, len(snap.Segments), len(snap.Epochs))
+	// Deterministic for this fixture and pattern: 7 losses, one of them
+	// across the epoch change.
+	assert.Equal(t, 7, r.lost)
+	losses := lossSegments(t, snap)
+	require.Len(t, losses, 6)
+
+	// Part numbers run from 0 with no holes per track.
+	parts := map[int][]live.CMAFPart{}
+	for _, seg := range snap.Segments {
+		for _, part := range seg.Parts {
+			parts[part.Track] = append(parts[part.Track], part)
+		}
+	}
+	require.Len(t, parts, 2)
+	for track, ps := range parts {
+		for i, part := range ps {
+			assert.Equal(t, uint64(i), part.N, "track %d part numbering", track)
+		}
+	}
+
+	// After each loss, the audio track's next part is discontinuous, and
+	// its fMP4 playlist entry carries EXT-X-DISCONTINUITY.
+	base := serve(t, r.p, stepsFeed(r.steps))
+	audioPL := mediaPlaylist(t, base+"cmaf/a1.m3u8")
+	disc := map[string]bool{}
+	uris := make([]string, 0, len(audioPL.Segments))
+	for _, s := range audioPL.Segments {
+		disc[s.URI] = s.Discontinuity
+		uris = append(uris, s.URI)
+	}
+	for i, u := range uris {
+		assert.Equal(t, fmt.Sprintf("1-%d.m4s", i), u, "audio playlist numbering")
+	}
+	for i, seg := range mediaPlaylist(t, base+"cmaf/v0.m3u8").Segments {
+		assert.Equal(t, fmt.Sprintf("0-%d.m4s", i), seg.URI, "video playlist numbering")
+	}
+	for _, li := range losses {
+		seg := snap.Segments[li]
+		var part *live.CMAFPart
+		for _, p := range seg.Parts {
+			if p.Track == 1 {
+				part = &p
+			}
+		}
+		require.NotNil(t, part, "segment %d after a loss has audio", seg.Seq)
+		assert.True(t, part.Discontinuity, "audio part %d after a loss is discontinuous", part.N)
+		assert.True(t, disc[fmt.Sprintf("1-%d.m4s", part.N)], "audio part %d has EXT-X-DISCONTINUITY", part.N)
+	}
+
+	// Handed frames in the capture timeline: the captures carry every
+	// handed video frame, so the first video DTS maps the timelines.
+	firstLoss := snap.Segments[losses[0]].Start
+	caps := readAll(t, base)
+	for _, f := range []string{"hls-fmp4", "dash"} {
+		assert.Equal(t, videoDTS(video), videoDTS(caps[f].Frames),
+			"%s: every handed video frame", f)
+		off := minDTS(caps[f].Frames, media.KindVideo) - minDTS(video, media.KindVideo)
+		n := 0
+		for _, fr := range caps[f].Frames {
+			if fr.Kind() == media.KindAudio && fr.PTS-off >= firstLoss {
+				n++
+			}
+		}
+		assert.Positive(t, n, "%s: audio after a loss", f)
+		t.Logf("%s: %d audio frames at or after the first loss (PTS %d)", f, n, firstLoss)
+	}
+	t.Logf("%d losses within an epoch; scenario took %v", len(losses), time.Since(start).Round(time.Millisecond))
 }
 
 // garbled returns h264_aac.ts behind 1000 random bytes with no sync byte,
@@ -598,26 +760,22 @@ func garbled(t *testing.T, cut int) []byte {
 
 func TestM3aGarbageInput(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		cut  int
-		lost media.Kind
+		name         string
+		cut          int
+		video, audio int
 	}{
-		{"video-loss", 188 * 855, media.KindVideo},
-		{"audio-loss", 188*900 + 100, media.KindAudio},
+		{"video-loss", 188 * 855, 149, 282},
+		{"audio-loss", 188*900 + 100, 150, 266},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, _, caps := pipelineScenario(t, garbled(t, tc.cut))
 			assert.Len(t, p.Snapshot().Epochs, 1)
-			// The cut loses frames of one kind only: h264_aac.ts delivers
-			// 150 video and 282 audio frames whole.
-			got := kindCounts(caps["hls-ts"].Frames)
-			full := kindMap{{1, media.KindVideo}: 150, {1, media.KindAudio}: 282}
-			for k, n := range full {
-				if k.kind == tc.lost {
-					assert.Less(t, got[k], n, "%v frames lost", k.kind)
-				} else {
-					assert.Equal(t, n, got[k], "%v frames whole", k.kind)
-				}
+			// h264_aac.ts delivers 150 video and 282 audio frames whole;
+			// each cut loses frames of one kind only. pipelineScenario has
+			// checked every format against the frames written.
+			want := kindMap{{1, media.KindVideo}: tc.video, {1, media.KindAudio}: tc.audio}
+			for _, f := range formats {
+				assert.Equal(t, want, kindCounts(caps[f].Frames), f)
 			}
 		})
 	}
@@ -676,8 +834,18 @@ func TestM3aFFprobe(t *testing.T) {
 			require.NoError(t, json.Unmarshal(b, &res))
 			got := slices.Clone(res.Streams)
 			slices.SortFunc(got, func(a, b probeStream) int { return strings.Compare(a.CodecType, b.CodecType) })
-			assert.Equal(t, want, got, "streams %+v; stderr %s", res.Streams, stderr.String())
+			assert.Equal(t, want, got, "streams %+v", res.Streams)
+			assert.Empty(t, stderr.String(), "ffprobe stderr")
 			t.Logf("%s: %+v in %v; stderr %q", out, res.Streams, time.Since(start).Round(time.Millisecond), stderr.String())
 		})
 	}
 }
+
+// The audio-surviving slow variant: a queue and burst of slowAudioBurst
+// every slowAudioEvery writes. 48 every 56 or 96 instead lands a loss
+// right after epoch 2's first keyframe, so that epoch's first segment has
+// no audio; see the task 19 fix report.
+const (
+	slowAudioBurst = 48
+	slowAudioEvery = 64
+)
