@@ -574,10 +574,16 @@ func TestFailoverSearchReachesLowest(t *testing.T) {
 	opt := multiOptions(ft, m, ev, "fake://0", "fake://1", "fake://2")
 	var mu sync.Mutex
 	var activeAt time.Time
+	var searchCalls []time.Duration // the After calls left when input 2 activates
+	var opens0 int                  // input 0's opens when input 2 activates
 	opt.OnEvent = func(e Event) {
 		if e.Kind == EventActive && e.Input == 2 {
 			mu.Lock()
 			activeAt = ft.Now()
+			opens0 = o0.count()
+			for len(ft.calls) > 0 {
+				searchCalls = append(searchCalls, <-ft.calls)
+			}
 			mu.Unlock()
 		}
 		ev.on(e)
@@ -619,16 +625,18 @@ func TestFailoverSearchReachesLowest(t *testing.T) {
 	require.Equal(t, Event{Kind: EventActive, Input: 2}, e, "the search goes on to input 2, not back to input 0")
 	mu.Lock()
 	assert.LessOrEqual(t, activeAt.Sub(failedAt), 2*defaultStartTimeout)
+	// Once input 2 is active, input 0 is reopened as a probe.
+	assert.Equal(t, 1, opens0, "input 0 not retried before input 2 was tried")
 	mu.Unlock()
-	assert.Equal(t, 1, o0.count(), "input 0 not retried before input 2 was tried")
 	assert.Equal(t, uint64(1), p.Stats().Switches)
 	cancel()
 	require.ErrorIs(t, <-res, context.Canceled)
-	// No timer was armed for a retry the search would not start (input 0's
-	// and input 1's 0.5 s backoffs).
-	for len(ft.calls) > 0 {
-		calls = append(calls, <-ft.calls)
-	}
+	// No timer was armed during the search for a retry it would not start
+	// (input 0's and input 1's 0.5 s backoffs). Once input 2 is active, both
+	// are probes and their retries are armed.
+	mu.Lock()
+	calls = append(calls, searchCalls...)
+	mu.Unlock()
 	assert.NotContains(t, calls, firstRetry)
 }
 
@@ -736,7 +744,8 @@ func TestBackgroundPassiveNotJudged(t *testing.T) {
 		got[e.Kind] = e.Input
 	}
 	require.Equal(t, map[EventKind]int{EventActive: 0, EventFailed: 1}, got)
-	ft.Advance(500 * time.Millisecond)
+	waitCall(t, ft, firstRetry) // the listener's retry timer is armed
+	ft.Advance(firstRetry)
 	<-r1.blocked // the listener's frames were all read
 	ft.Advance(defaultStartTimeout + time.Second)
 	select {
