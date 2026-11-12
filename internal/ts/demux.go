@@ -406,6 +406,10 @@ func (d *Demuxer) Stats() DemuxStats {
 	return s
 }
 
+// CCErrors returns the continuity-counter gaps on tracked PIDs, which Stats
+// folds into DecodeErrors.
+func (d *Demuxer) CCErrors() uint64 { return d.dmx.Stats().CCErrors }
+
 // Read returns the next frame, or io.EOF at the end of the stream. A read
 // error from the input is returned wrapped, and again on later calls. A video
 // access unit may span PES, so it is returned once something completes it:

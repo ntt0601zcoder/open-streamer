@@ -35,7 +35,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Check ffmpeg has SRT
+        run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
       - run: make test
+        env:
+          OS_REQUIRE_PEERS: "1"
 
   coverage:
     runs-on: ubuntu-latest
@@ -44,7 +50,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Check ffmpeg has SRT
+        run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
       - run: make cover covercheck
+        env:
+          OS_REQUIRE_PEERS: "1"
 
   govulncheck:
     runs-on: ubuntu-latest
