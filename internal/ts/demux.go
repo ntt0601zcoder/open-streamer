@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/Eyevinn/mp4ff/avc"
 
@@ -29,7 +30,13 @@ type DemuxStats struct {
 	// packets and packet runs, PES without a PTS, and bad parameter sets and
 	// ADTS frames.
 	DecodeErrors uint64
+	// PMTChanges counts PMTs after the first whose (PID, stream_type) set
+	// differed from the current one. It counts only in Remap mode.
+	PMTChanges uint64
 }
+
+// defaultMaxTracks is the track cap when DemuxOptions.MaxTracks is zero.
+const defaultMaxTracks = 16
 
 // DemuxOptions configures a Demuxer.
 type DemuxOptions struct {
@@ -38,8 +45,16 @@ type DemuxOptions struct {
 	// decoder.
 	Decoder *mpegts.TimeDecoder
 	// FollowPMT applies PMTs after the first: new supported PIDs become new
-	// tracks. Without it later PMTs are ignored.
+	// tracks, and PIDs a later PMT removes stop producing frames. Without
+	// FollowPMT or Remap later PMTs are ignored.
 	FollowPMT bool
+	// Remap is the ingest mode: a PMT whose (PID, stream_type) set differs
+	// from the current one re-assigns the tracks by (kind, ordinal). The
+	// track slots are fixed by the first PMT; see remap.
+	Remap bool
+	// MaxTracks caps the tracks; streams beyond it are skipped with a
+	// reason. 0 means 16.
+	MaxTracks int
 }
 
 type streamInfo struct {
@@ -56,6 +71,8 @@ var supportedTypes = map[uint8]streamInfo{
 type track struct {
 	idx    int
 	pid    uint16
+	stype  uint8
+	active bool // Remap: the current PMT has a stream for this slot
 	kind   media.Kind
 	codec  media.Codec
 	config *media.TrackConfig // nil while the parameter sets are invalid
@@ -69,6 +86,9 @@ type track struct {
 type Demuxer struct {
 	dmx     *mpegts.Demux
 	follow  bool
+	remap   bool
+	maxTrks int
+	curSet  []mpegts.Stream // Remap: the (PID, stream_type) set of the current PMT
 	tracks  []*track
 	byPID   map[uint16]*track // PIDs whose PES are decoded
 	seen    map[uint16]uint8  // stream_type of every PID at its first PMT
@@ -90,13 +110,21 @@ func NewDemuxer(r io.Reader) (*Demuxer, error) {
 // NewDemuxerWithOptions reads r up to the first PMT and returns a demuxer for
 // its supported tracks. Only PIDs in the current PMT produce frames.
 func NewDemuxerWithOptions(r io.Reader, opt DemuxOptions) (*Demuxer, error) {
+	if opt.FollowPMT && opt.Remap {
+		return nil, errors.New("ts: demux: FollowPMT and Remap are exclusive")
+	}
 	d := &Demuxer{
 		dmx:     mpegts.NewDemux(r),
 		follow:  opt.FollowPMT,
+		remap:   opt.Remap,
+		maxTrks: opt.MaxTracks,
 		byPID:   map[uint16]*track{},
 		seen:    map[uint16]uint8{},
 		skipPID: map[uint16]bool{},
 		timeDec: opt.Decoder,
+	}
+	if d.maxTrks <= 0 {
+		d.maxTrks = defaultMaxTracks
 	}
 	if d.timeDec == nil {
 		d.timeDec = &mpegts.TimeDecoder{}
@@ -113,6 +141,7 @@ func NewDemuxerWithOptions(r io.Reader, opt DemuxOptions) (*Demuxer, error) {
 			continue
 		}
 		d.applyPMT(ev.PMT)
+		d.remapPMT(ev.PMT)
 		if len(d.tracks) == 0 {
 			return nil, errors.New("ts: demux: no supported track in PMT")
 		}
@@ -124,6 +153,9 @@ func NewDemuxerWithOptions(r io.Reader, opt DemuxOptions) (*Demuxer, error) {
 // whose stream_type differs from its first one stops producing frames for
 // good; its track index stays.
 func (d *Demuxer) applyPMT(pmt *mpegts.PMT) {
+	if d.remap {
+		return
+	}
 	for _, s := range pmt.Streams {
 		info, supported := supportedTypes[s.Type]
 		first, known := d.seen[s.PID]
@@ -134,10 +166,11 @@ func (d *Demuxer) applyPMT(pmt *mpegts.PMT) {
 				d.skip(s)
 				continue
 			}
-			t := &track{
-				idx: len(d.tracks), pid: s.PID, kind: info.kind, codec: info.codec,
-				vps: map[uint32][]byte{}, sps: map[uint32][]byte{}, pps: map[uint32][]byte{},
+			if len(d.tracks) >= d.maxTrks {
+				d.skipCap(s)
+				continue
 			}
+			t := newTrack(len(d.tracks), s, info)
 			d.tracks = append(d.tracks, t)
 			d.byPID[s.PID] = t
 		case s.Type != first:
@@ -147,6 +180,98 @@ func (d *Demuxer) applyPMT(pmt *mpegts.PMT) {
 			}
 		}
 	}
+}
+
+func newTrack(idx int, s mpegts.Stream, info streamInfo) *track {
+	return &track{
+		idx: idx, pid: s.PID, stype: s.Type, active: true, kind: info.kind, codec: info.codec,
+		vps: map[uint32][]byte{}, sps: map[uint32][]byte{}, pps: map[uint32][]byte{},
+	}
+}
+
+// skipCap reports a stream left out by the track cap, once.
+func (d *Demuxer) skipCap(s mpegts.Stream) {
+	if d.skipPID[s.PID] {
+		return
+	}
+	d.skipPID[s.PID] = true
+	d.skipped = append(d.skipped, fmt.Sprintf("pid %d: track limit %d reached (0x%02x)", s.PID, d.maxTrks, s.Type))
+}
+
+// remapPMT is the single place Remap mode re-assigns tracks. The first PMT
+// fixes one slot per (kind, ordinal) in PMT order. A later PMT whose
+// (PID, stream_type) list differs maps each supported stream to the slot of
+// the same kind and ordinal, appending a slot for a new ordinal while the cap
+// allows. A slot whose PID and type changed, or that was absent, starts
+// fresh: no parameter sets and, once they arrive, a new Config. A slot with
+// the same PID and type keeps its state. A slot with no stream in the new
+// PMT produces nothing. A PMT with an identical list changes nothing.
+func (d *Demuxer) remapPMT(pmt *mpegts.PMT) {
+	if !d.remap {
+		return
+	}
+	first := d.curSet == nil
+	if !first && slices.Equal(d.curSet, pmt.Streams) {
+		return
+	}
+	if !first {
+		d.stats.PMTChanges++
+	}
+	d.curSet = slices.Clone(pmt.Streams)
+	if d.curSet == nil {
+		d.curSet = []mpegts.Stream{}
+	}
+	next := make([]bool, len(d.tracks), d.maxTrks)
+	d.byPID = map[uint16]*track{}
+	ordinal := map[media.Kind]int{}
+	for _, s := range pmt.Streams {
+		info, supported := supportedTypes[s.Type]
+		if !supported {
+			d.skip(s)
+			continue
+		}
+		k := ordinal[info.kind]
+		ordinal[info.kind]++
+		slot := d.slotOf(info.kind, k)
+		var t *track
+		switch {
+		case slot < 0:
+			if len(d.tracks) >= d.maxTrks {
+				d.skipCap(s)
+				continue
+			}
+			slot = len(d.tracks)
+			t = newTrack(slot, s, info)
+			d.tracks = append(d.tracks, t)
+			next = append(next, true)
+		case d.tracks[slot].active && d.tracks[slot].pid == s.PID && d.tracks[slot].stype == s.Type:
+			t = d.tracks[slot]
+			next[slot] = true
+		default:
+			t = newTrack(slot, s, info)
+			d.tracks[slot] = t
+			next[slot] = true
+		}
+		d.byPID[s.PID] = t
+	}
+	for i, t := range d.tracks {
+		t.active = next[i]
+	}
+}
+
+// slotOf returns the index of the ordinal-th track of a kind, or -1.
+func (d *Demuxer) slotOf(kind media.Kind, ordinal int) int {
+	n := 0
+	for i, t := range d.tracks {
+		if t.kind != kind {
+			continue
+		}
+		if n == ordinal {
+			return i
+		}
+		n++
+	}
+	return -1
 }
 
 // skip reports an unsupported PID once.
@@ -217,8 +342,11 @@ func (d *Demuxer) Read() (media.Frame, error) {
 			d.err = fmt.Errorf("ts: demux: read: %w", err)
 			continue
 		case ev.PMT != nil:
-			if d.follow {
+			switch {
+			case d.follow:
 				d.applyPMT(ev.PMT)
+			case d.remap:
+				d.remapPMT(ev.PMT)
 			}
 		case ev.PES != nil:
 			if t := d.byPID[ev.PES.PID]; t != nil {

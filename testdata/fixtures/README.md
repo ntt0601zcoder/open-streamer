@@ -19,3 +19,5 @@ make fixtures
 | `h264_aac_loop.ts` | `h264_aac.ts` twice back to back | One backwards timestamp jump |
 | `h264_aac_then_640.ts` | `h264_aac.ts` then `h264_640.ts` | One resolution change plus a timestamp jump |
 | `h264_aac_midgop.ts` | `h264_aac.ts` cut at 3/8 of its packets | Mid-GOP start: begins without a keyframe or parameter sets |
+| `h264_aac_pmtchange.ts` | `h264_aac.ts` then a 3 s clip with the same codecs on all-new PIDs (0x200 and up, PMT on 0x1100), timeline continuing | PMT change that remaps every track, timestamps unbroken |
+| `h264_aac_audiopid.ts` | `h264_aac.ts` then a 3 s clip whose video PID is unchanged and whose audio PID is 0x120, timeline continuing | PMT change that remaps only the audio track |
