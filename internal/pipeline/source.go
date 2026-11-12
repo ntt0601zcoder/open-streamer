@@ -97,7 +97,7 @@ func Run(ctx context.Context, h *hub.Hub, opt Options) error {
 			return err
 		}
 		if !first {
-			w.c.Break()
+			w.c.Break(false)
 		}
 		done, err := w.runOnce(ctx)
 		if err != nil || done {

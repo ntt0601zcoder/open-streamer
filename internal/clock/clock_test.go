@@ -356,9 +356,9 @@ func TestClockSmallBackStep(t *testing.T) {
 func TestClockBreak(t *testing.T) {
 	c := New(Options{Kinds: av})
 	out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...) // to 32400 / 34560
-	c.Break()
+	c.Break(false)
 	require.Empty(t, c.Push(video(36000, true))) // held by epoch 2
-	c.Break()                                    // already pending: restarts it and drops the held keyframe
+	c.Break(false)                               // already pending: restarts it and drops the held keyframe
 	assert.Equal(t, uint64(1), c.Stats().DroppedStale)
 	out = append(out, push(c, video(39600, true), audio(39840), video(43200, false), audio(41760))...)
 
@@ -395,7 +395,7 @@ func TestClockFailoverNewConfigs(t *testing.T) {
 		c := New(Options{Kinds: av})
 		out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...) // to 176400 / 178560
 		n := len(out)
-		c.Break()
+		c.Break(false)
 		v2 := &media.TrackConfig{Codec: media.CodecH264}
 		a2 := &media.TrackConfig{Codec: media.CodecAAC}
 		in := withConfig(mux(lag, videoRun(t1, 75), audioRun(t1, 141)), v2, a2)
@@ -422,9 +422,9 @@ func TestClockFailoverNewConfigs(t *testing.T) {
 		c := New(Options{Kinds: av})
 		out := push(c, mux(0, videoRun(0, 50), audioRun(0, 94))...)
 		n := len(out)
-		c.Break()                                          // the input dies
+		c.Break(false)                                     // the input dies
 		out = append(out, push(c, video(180000, true))...) // a last frame of the dead input, held
-		c.Break()                                          // failover: the held frame must not mix with the new input
+		c.Break(false)                                     // failover: the held frame must not mix with the new input
 		assert.Equal(t, uint64(1), c.Stats().DroppedStale)
 		v2 := &media.TrackConfig{Codec: media.CodecH264}
 		a2 := &media.TrackConfig{Codec: media.CodecAAC}
@@ -476,6 +476,7 @@ func TestClockConfigChangeOpensEpoch(t *testing.T) {
 		later := video(39600, false)
 		later.Config = changed.Config
 		out = append(out, push(c, changed, audio(36480), later, audio(38400))...)
+		out = append(out, c.Flush()...) // a config epoch holds its whole window
 
 		require.Equal(t, []uint32{1, 2}, epochIDs(c))
 		require.Len(t, out, n+4)
@@ -494,6 +495,7 @@ func TestClockConfigChangeOpensEpoch(t *testing.T) {
 		second := video(39600, true)
 		second.Config = newH264()
 		out = append(out, push(c, first, second, audio(40320))...)
+		out = append(out, c.Flush()...)
 
 		require.Equal(t, []uint32{1, 2}, epochIDs(c))
 		assert.Equal(t, uint64(1), c.Stats().DroppedStale)
@@ -511,6 +513,7 @@ func TestClockConfigChangeOpensEpoch(t *testing.T) {
 		a2 := audio(36480)
 		a2.Config = &media.TrackConfig{Codec: media.CodecAAC}
 		out = append(out, push(c, changed, a2)...)
+		out = append(out, c.Flush()...)
 
 		require.Equal(t, []uint32{1, 2}, epochIDs(c))
 		assert.Equal(t, Stats{}, c.Stats())
@@ -521,7 +524,7 @@ func TestClockConfigChangeOpensEpoch(t *testing.T) {
 	t.Run("change that jumps against held frames restarts", func(t *testing.T) {
 		c := New(Options{Kinds: av})
 		out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...)
-		c.Break()
+		c.Break(false)
 		out = append(out, c.Push(audio(36480))...) // held by epoch 2
 		changed := video(5_000_000, true)
 		changed.Config = newH264()
@@ -545,13 +548,19 @@ func TestClockStaleDropped(t *testing.T) {
 	// Audio still on the old timeline after the release.
 	out = append(out, push(c, audio(902400), audio(904320), audio(906240))...)
 	assert.Equal(t, uint64(3), c.Stats().DroppedStale)
-	// Audio on the new timeline joins epoch 2.
-	out = append(out, c.Push(audio(93600))...)
-	last := out[len(out)-1]
-	assert.Equal(t, 1, last.Track)
-	assert.Equal(t, uint32(2), last.Epoch)
-	assert.Equal(t, []uint32{1, 2}, epochIDs(c))
-	requireConform(t, out, conform.RuleStartOffset) // audio joins epoch 2 after release
+	// Audio on the new timeline was not in epoch 2 at its release: it joins
+	// late and opens epoch 3 at the next video keyframe (180000).
+	var v []media.Frame
+	for dts := int64(93600); dts <= 194400; dts += vDur {
+		v = append(v, video(dts, dts%90000 == 0))
+	}
+	out = append(out, push(c, mux(0, v, audioRun(93600, 55))...)...)
+	assert.Equal(t, uint64(3), c.Stats().DroppedStale)
+	assert.Equal(t, uint64(1), c.Stats().LateJoins)
+	require.Equal(t, []uint32{1, 2, 3}, epochIDs(c))
+	assert.Empty(t, onTrack(inEpoch(out, 2), 1))
+	assert.NotEmpty(t, onTrack(inEpoch(out, 3), 1))
+	requireConform(t, out)
 }
 
 func TestClockLateTrackDropped(t *testing.T) {
@@ -570,12 +579,19 @@ func TestClockLateTrackDropped(t *testing.T) {
 	// The late keyframe did not open track 1's gate.
 	out = append(out, c.Push(v1(53600, false))...)
 	assert.Equal(t, uint64(1), c.Stats().DroppedBeforeKey)
+	// Track 1 was not in epoch 1 at its release: its keyframe joins late and
+	// opens epoch 2, which track 0 joins with its next keyframe.
 	out = append(out, c.Push(v1(193600, true))...)
+	assert.Empty(t, onTrack(out, 1))
+	assert.Equal(t, uint64(1), c.Stats().LateJoins)
+	out = append(out, c.Push(video(193600, true))...)
+	require.Equal(t, []uint32{1, 2}, epochIDs(c))
 	t1 := onTrack(out, 1)
 	require.Len(t, t1, 1)
 	assert.True(t, t1[0].Key)
-	assert.Equal(t, int64(93600), t1[0].DTS)
-	requireConform(t, out, conform.RuleStartOffset) // track 1 starts after release
+	assert.Equal(t, uint32(2), t1[0].Epoch)
+	assert.Equal(t, c.Epochs()[1].Start, t1[0].DTS)
+	requireConform(t, out)
 }
 
 func TestClockDropsUntilKey(t *testing.T) {
@@ -692,7 +708,7 @@ func TestClockEpochStartAfterPresentationEnd(t *testing.T) {
 		frame(10800, 14400, false), // B
 	)
 	require.Len(t, out, 4)
-	c.Break()
+	c.Break(false)
 	out = append(out, push(c, frame(14400, 14400, true), frame(18000, 18000, false), frame(21600, 21600, false))...)
 
 	require.Equal(t, []uint32{1, 2}, epochIDs(c))
@@ -772,7 +788,7 @@ func TestClockWallAnchor(t *testing.T) {
 	assert.Equal(t, t0.Add(3*time.Second), c.Epochs()[0].Wall) // not 1 s (first push) or 4 s (release)
 
 	// The next epoch anchors on its own first released frame.
-	c.Break()
+	c.Break(false)
 	require.Empty(t, at(6, video(14400, false))) // before the keyframe
 	require.Empty(t, at(7, video(18000, true)))
 	require.Len(t, at(8, audio(18000)), 2)
@@ -820,7 +836,7 @@ func TestClockConfigRestartKeepsContinuousAudio(t *testing.T) {
 	t.Run("after Break", func(t *testing.T) {
 		c := New(Options{Kinds: av})
 		out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...) // to 32400 / 34560
-		c.Break()
+		c.Break(false)
 		out = append(out, c.Push(audio(36480))...) // joins epoch 2, held
 		out = append(out, restartAt(c, 36480)...)
 		run(t, c, out, 36480+2*aDur)
@@ -932,7 +948,7 @@ func TestClockEpochsKeepsLast64(t *testing.T) {
 	c := New(Options{Kinds: []media.Kind{media.KindVideo}})
 	for i := range 70 {
 		require.Len(t, c.Push(video(int64(i)*vDur, true)), 1)
-		c.Break()
+		c.Break(false)
 	}
 	ids := epochIDs(c)
 	require.Len(t, ids, 64)
@@ -953,7 +969,7 @@ func wallRun(t *testing.T, epochs int, arrive func(i int) time.Duration) (arriva
 	i := 0
 	for e := range epochs {
 		if e > 0 {
-			c.Break()
+			c.Break(false)
 		}
 		run := videoRun(int64(e)*1000*vDur, videoGOP)
 		run[len(run)-1].PTS += 3 * vDur
