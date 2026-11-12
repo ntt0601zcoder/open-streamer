@@ -255,21 +255,26 @@ func TestDemuxBadConfigDropsFrames(t *testing.T) {
 		codec: media.CodecH264, kind: media.KindVideo,
 		vps: map[uint32][]byte{}, sps: map[uint32][]byte{}, pps: map[uint32][]byte{},
 	}
-	d := &Demuxer{tracks: []*track{tr}, byPID: map[uint16]*track{}}
+	d := &Demuxer{tracks: []*track{tr}, byPID: map[uint16]*track{}, timeDec: &mpegts.TimeDecoder{}}
+	// video adds one access unit in a PES and completes it.
+	video := func(payload []byte, ts int64) {
+		d.handleVideo(tr, &mpegts.PES{HasPTS: true, PTS: ts, DTS: ts, Data: payload})
+		d.flushAll()
+	}
 
-	d.handleVideo(tr, au(cfg.SPS[0]), 0, 0)
+	video(au(cfg.SPS[0]), 0)
 	require.Len(t, d.queue, 1)
 	good := d.queue[0].Config
 	require.NotNil(t, good)
 
 	// Truncated SPS: its ID cannot be read, so the config is invalidated.
-	d.handleVideo(tr, au(cfg.SPS[0][:5]), 3600, 3600)
+	video(au(cfg.SPS[0][:5]), 3600)
 	assert.Len(t, d.queue, 1, "frame with unparsable SPS must not be emitted")
 	assert.Equal(t, uint64(1), d.stats.DroppedNoConfig)
 
 	// A repaired SPS restores output with the same config pointer as before,
 	// so the Clock sees no configuration change.
-	d.handleVideo(tr, au(cfg.SPS[0]), 7200, 7200)
+	video(au(cfg.SPS[0]), 7200)
 	require.Len(t, d.queue, 2)
 	assert.Same(t, good, d.queue[1].Config)
 }
