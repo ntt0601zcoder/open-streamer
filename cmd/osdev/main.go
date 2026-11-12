@@ -105,15 +105,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	var streams streamFlags
 	fs.Var(&streams, "stream", "name=path.ts to serve; repeatable")
 	if err := fs.Parse(args); err != nil {
-		fmt.Fprintf(stderr, "osdev: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return 2
 	}
 	if fs.NArg() > 0 {
-		fmt.Fprintf(stderr, "osdev: unexpected argument %q\n", fs.Arg(0))
+		_, _ = fmt.Fprintf(stderr, "osdev: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
 	if len(streams) == 0 {
-		fmt.Fprintln(stderr, "osdev: at least one -stream name=path.ts is required")
+		_, _ = fmt.Fprintln(stderr, "osdev: at least one -stream name=path.ts is required")
 		return 2
 	}
 	srcs := map[string]*source{}
@@ -121,11 +121,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	for _, s := range streams {
 		name, path, ok := strings.Cut(s, "=")
 		if !ok || name == "" || path == "" || strings.ContainsAny(name, "/?#% ") || name == "." || name == ".." {
-			fmt.Fprintf(stderr, "osdev: malformed -stream %q, want name=path.ts\n", s)
+			_, _ = fmt.Fprintf(stderr, "osdev: malformed -stream %q, want name=path.ts\n", s)
 			return 2
 		}
 		if srcs[name] != nil {
-			fmt.Fprintf(stderr, "osdev: duplicate stream %q\n", name)
+			_, _ = fmt.Fprintf(stderr, "osdev: duplicate stream %q\n", name)
 			return 2
 		}
 		h := hub.New(hub.Options{})
@@ -136,7 +136,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listen)
 	if err != nil {
-		fmt.Fprintf(stderr, "osdev: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return 2
 	}
 	addr := ln.Addr().String()
@@ -226,7 +226,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	select {
 	case <-ctx.Done():
 	case err := <-errc:
-		fmt.Fprintf(stderr, "osdev: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		code = 2
 	}
 	cancel()
