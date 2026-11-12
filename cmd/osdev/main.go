@@ -1,11 +1,17 @@
 // Command osdev serves MPEG-TS files as live streams for development: each
 // -stream is replayed in real time into a hub and packaged as HLS, CMAF and
 // DASH, and also served as one continuous MPEG-TS response.
+//
+// Without -loop a stream ends with its file: its hub closes, the last partial
+// segment is packaged and the HLS playlists end with EXT-X-ENDLIST, while
+// the server keeps serving. A stream whose source fails is reported on
+// stderr; osdev then exits 1 at shutdown, or at once when every stream has
+// failed. Packager mux errors and fallback anchors are reported on stderr
+// every 30 s while they grow, and once more at shutdown.
 package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +21,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
@@ -23,11 +30,14 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 )
 
-const subQueue = 1024
+const (
+	subQueue       = 1024
+	reportInterval = 30 * time.Second
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	code := run(ctx, os.Args[1:], os.Stdout)
+	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }
@@ -42,6 +52,34 @@ type source struct {
 	name, path string
 	hub        *hub.Hub
 	pack       *live.Packager
+	reported   [2]uint64 // Errors and FallbackAnchors at the last report
+}
+
+// lockedWriter serialises writes from several goroutines.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(b []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(b)
+}
+
+// report writes one line per stream whose packager counted mux errors or
+// fallback anchors: on every call when final, else only when they grew
+// since the last report.
+func report(w io.Writer, srcs []*source, final bool) {
+	for _, s := range srcs {
+		now := [2]uint64{s.pack.Errors(), s.pack.FallbackAnchors()}
+		if now == ([2]uint64{}) || (!final && now == s.reported) {
+			continue
+		}
+		s.reported = now
+		_, _ = fmt.Fprintf(w, "osdev: stream %s: %d packager mux errors (dropped segment outputs), %d epochs placed without a hub anchor\n",
+			s.name, now[0], now[1])
+	}
 }
 
 // newServer returns the HTTP server. It sets no ReadTimeout or WriteTimeout:
@@ -58,7 +96,8 @@ func newServer(h http.Handler) *http.Server {
 	}
 }
 
-func run(ctx context.Context, args []string, stdout io.Writer) int {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	stderr = &lockedWriter{w: stderr}
 	fs := flag.NewFlagSet("osdev", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	listen := fs.String("listen", ":8080", "address to listen on")
@@ -66,15 +105,15 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	var streams streamFlags
 	fs.Var(&streams, "stream", "name=path.ts to serve; repeatable")
 	if err := fs.Parse(args); err != nil {
-		fmt.Fprintf(os.Stderr, "osdev: %v\n", err)
+		fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return 2
 	}
 	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "osdev: unexpected argument %q\n", fs.Arg(0))
+		fmt.Fprintf(stderr, "osdev: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
 	if len(streams) == 0 {
-		fmt.Fprintln(os.Stderr, "osdev: at least one -stream name=path.ts is required")
+		fmt.Fprintln(stderr, "osdev: at least one -stream name=path.ts is required")
 		return 2
 	}
 	srcs := map[string]*source{}
@@ -82,11 +121,11 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	for _, s := range streams {
 		name, path, ok := strings.Cut(s, "=")
 		if !ok || name == "" || path == "" || strings.ContainsAny(name, "/?#% ") || name == "." || name == ".." {
-			fmt.Fprintf(os.Stderr, "osdev: malformed -stream %q, want name=path.ts\n", s)
+			fmt.Fprintf(stderr, "osdev: malformed -stream %q, want name=path.ts\n", s)
 			return 2
 		}
 		if srcs[name] != nil {
-			fmt.Fprintf(os.Stderr, "osdev: duplicate stream %q\n", name)
+			fmt.Fprintf(stderr, "osdev: duplicate stream %q\n", name)
 			return 2
 		}
 		h := hub.New(hub.Options{})
@@ -97,7 +136,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listen)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "osdev: %v\n", err)
+		fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return 2
 	}
 	addr := ln.Addr().String()
@@ -114,7 +153,24 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var wg sync.WaitGroup
+	var (
+		wg     sync.WaitGroup
+		failed atomic.Int32
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(reportInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				report(stderr, order, false)
+			}
+		}
+	}()
 	for _, s := range order {
 		sub := s.hub.Subscribe(s.name, subQueue)
 		wg.Add(2)
@@ -129,8 +185,20 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 				Loop: *loop,
 				Pace: true,
 			}
-			if err := pipeline.Run(ctx, s.hub, opt); err != nil && !errors.Is(err, context.Canceled) {
-				fmt.Fprintf(os.Stderr, "osdev: stream %s: %v\n", s.name, err)
+			err := pipeline.Run(ctx, s.hub, opt)
+			if ctx.Err() != nil {
+				return // shutting down: run closes the hubs
+			}
+			// The stream is over: closing the hub ends it in the packager.
+			s.hub.Close()
+			if err == nil {
+				_, _ = fmt.Fprintf(stderr, "osdev: stream %s: source ended\n", s.name)
+				return
+			}
+			_, _ = fmt.Fprintf(stderr, "osdev: stream %s stopped: %v\n", s.name, err)
+			if int(failed.Add(1)) == len(order) {
+				_, _ = fmt.Fprintln(stderr, "osdev: every stream failed")
+				cancel()
 			}
 		}()
 	}
@@ -158,7 +226,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	select {
 	case <-ctx.Done():
 	case err := <-errc:
-		fmt.Fprintf(os.Stderr, "osdev: %v\n", err)
+		fmt.Fprintf(stderr, "osdev: %v\n", err)
 		code = 2
 	}
 	cancel()
@@ -171,5 +239,9 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 		_ = srv.Close()
 	}
 	wg.Wait()
+	report(stderr, order, true)
+	if code == 0 && failed.Load() > 0 {
+		code = 1
+	}
 	return code
 }

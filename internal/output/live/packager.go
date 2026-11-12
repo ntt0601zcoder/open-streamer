@@ -156,8 +156,23 @@ func (p *Packager) Flush() {
 	}
 }
 
+// End packages the open segment, if any, and marks the stream ended: no
+// segment follows, and once every segment is listed the HLS playlists carry
+// EXT-X-ENDLIST. Handle must not be called after End.
+func (p *Packager) End() {
+	p.work.Lock()
+	defer p.work.Unlock()
+	for _, s := range p.seg.Flush() {
+		p.pack(s)
+	}
+	p.mu.Lock()
+	p.st.ended = true
+	p.mu.Unlock()
+}
+
 // Run hands every delivery of sub to Handle. It returns when ctx is done, or
-// after a Flush when sub's channel closes. It does not close sub.
+// after End when sub's channel closes (the hub closed). It does not close
+// sub.
 func (p *Packager) Run(ctx context.Context, sub *hub.Sub) {
 	for {
 		select {
@@ -165,7 +180,7 @@ func (p *Packager) Run(ctx context.Context, sub *hub.Sub) {
 			return
 		case d, ok := <-sub.C():
 			if !ok {
-				p.Flush()
+				p.End()
 				return
 			}
 			p.Handle(d)
