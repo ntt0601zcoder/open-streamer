@@ -39,6 +39,9 @@ func Init(c *media.TrackConfig) ([]byte, error) {
 	case media.CodecH264, media.CodecH265:
 		init.AddEmptyTrack(videoTimescale, "video", "und")
 		trak := init.Moov.Trak
+		if len(c.SPS) == 0 || len(c.PPS) == 0 || (c.Codec == media.CodecH265 && len(c.VPS) == 0) {
+			return nil, fmt.Errorf("fmp4: init: %v config lacks parameter sets", c.Codec)
+		}
 		var err error
 		if c.Codec == media.CodecH264 {
 			err = trak.SetAVCDescriptor("avc1", c.SPS, c.PPS, true)
