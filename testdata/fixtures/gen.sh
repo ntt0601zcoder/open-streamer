@@ -1,5 +1,5 @@
 #!/bin/sh
-# Generates the MPEG-TS fixtures. Output is bitexact: a re-run changes nothing.
+# Generates the MPEG-TS and fragmented MP4 fixtures. Output is bitexact: a re-run changes nothing.
 set -eu
 cd "$(dirname "$0")"
 
@@ -29,3 +29,5 @@ cat h264_aac.ts tmp_pmtchange.ts > h264_aac_pmtchange.ts
 $F $(v 320x240) $(a 48000) -t 3 $X264 -c:a aac -ac 2 -b:a 64k -output_ts_offset 6 -streamid 1:0x120 $BX tmp_audiopid.ts
 cat h264_aac.ts tmp_audiopid.ts > h264_aac_audiopid.ts
 rm -f tmp_pmtchange.ts tmp_audiopid.ts
+# Fragmented MP4: both traks in one init, a fragment per video keyframe.
+$F $(v 320x240) $(a 48000) -t 6 $X264 -c:a aac -ac 2 -b:a 64k -threads 1 -fflags +bitexact -flags:v +bitexact -flags:a +bitexact -f mp4 -movflags frag_keyframe+empty_moov+default_base_moof h264_aac_frag.mp4

@@ -1,6 +1,6 @@
 # Media fixtures
 
-Generated MPEG-TS clips used by the media, TS demuxer, Clock and end-to-end tests.
+Generated MPEG-TS and fragmented MP4 clips used by the media, TS demuxer, Clock and end-to-end tests.
 Output is bitexact, so regenerating changes no file.
 
 Regenerate (needs ffmpeg with libx264 and libx265):
@@ -23,6 +23,7 @@ make fixtures
 | `h264_aac_audiopid.ts` | `h264_aac.ts` then a 3 s clip whose video PID is unchanged and whose audio PID is 0x120, timeline continuing | PMT change that remaps only the audio track |
 | `h264_opengop.ts` | 6 s, H.264 Main 320x240 25 fps, `-x264-params open-gop=1:keyint=25:min-keyint=25:scenecut=0 -bf 2`, AAC-LC stereo 48 kHz | H.264 open GOP: IDR first, then non-IDR I slices with a recovery point SEI |
 | `h264_opengop_midgop.ts` | `h264_opengop.ts` cut at 3/8 of its packets | Open-GOP feed that starts mid-GOP: the first usable key is a recovery point |
+| `h264_aac_frag.mp4` | 6 s, same sources and encoder settings as `h264_aac.ts`, fragmented MP4 (`-movflags frag_keyframe+empty_moov+default_base_moof`): one init with both traks (video track 1 at timescale 12800, audio track 2 at 48000), then one `moof`+`mdat` per video keyframe with a `traf` per track; trun version 0, no edit list; ffmpeg gives the first audio sample a duration of 3840 | fMP4 demuxer: muxed init, multi-traf fragments, default-base-is-moof offsets. ffprobe counts 150 video and 283 audio packets |
 
 ## H.264 open-GOP fixtures
 
