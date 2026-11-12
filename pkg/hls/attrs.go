@@ -6,7 +6,8 @@ import (
 )
 
 // parseAttrs parses an HLS attribute list such as `A=1,B="x,y"`. Quoted
-// values are unquoted and may contain commas.
+// values are unquoted and may contain commas. Errors give a byte position,
+// never the text, which may hold a signed URI.
 func parseAttrs(s string) (map[string]string, error) {
 	out := map[string]string{}
 	i := 0
@@ -19,7 +20,7 @@ func parseAttrs(s string) (map[string]string, error) {
 		}
 		eq := strings.IndexByte(s[i:], '=')
 		if eq < 0 {
-			return nil, fmt.Errorf("attribute without value in %q", s)
+			return nil, fmt.Errorf("attribute without value at byte %d", i)
 		}
 		key := strings.TrimSpace(s[i : i+eq])
 		i += eq + 1
@@ -27,12 +28,12 @@ func parseAttrs(s string) (map[string]string, error) {
 		if i < len(s) && s[i] == '"' {
 			end := strings.IndexByte(s[i+1:], '"')
 			if end < 0 {
-				return nil, fmt.Errorf("unterminated quoted string in %q", s)
+				return nil, fmt.Errorf("unterminated quoted string at byte %d", i)
 			}
 			val = s[i+1 : i+1+end]
 			i += end + 2
 			if i < len(s) && s[i] != ',' && s[i] != ' ' {
-				return nil, fmt.Errorf("junk after quoted string in %q", s)
+				return nil, fmt.Errorf("junk after quoted string at byte %d", i)
 			}
 		} else {
 			end := strings.IndexByte(s[i:], ',')

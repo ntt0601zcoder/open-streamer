@@ -1,6 +1,7 @@
 package hls
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -95,6 +96,7 @@ func (p MediaPlaylist) Encode() []byte {
 // ParseMedia parses a media playlist. Unknown tags are ignored; EXT-X-MAP and
 // EXT-X-KEY are carried to every following segment. An EXT-X-BYTERANGE
 // without an offset starts where the previous range of the same URI ended.
+// Errors never quote playlist text, which may hold signed URIs.
 func ParseMedia(b []byte) (MediaPlaylist, error) {
 	var p MediaPlaylist
 	lines := splitLines(b)
@@ -112,7 +114,7 @@ func ParseMedia(b []byte) (MediaPlaylist, error) {
 	for _, l := range lines[1:] {
 		if !strings.HasPrefix(l, "#") {
 			if !haveInf {
-				return p, fmt.Errorf("hls: URI %q without #EXTINF", l)
+				return p, fmt.Errorf("hls: segment %d: URI without #EXTINF", len(p.Segments))
 			}
 			cur.URI = l
 			cur.Map = curMap
@@ -228,7 +230,7 @@ func (r *pendingRange) resolve(uri string, ends map[string]int64) (*ByteRange, e
 	if !r.hasOffset {
 		end, ok := ends[uri]
 		if !ok {
-			return nil, fmt.Errorf("no offset and no previous range of %q", uri)
+			return nil, errors.New("no offset and no previous range of the same URI")
 		}
 		off = end
 	}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -313,20 +314,17 @@ func TestHLSPullRedirectRelative(t *testing.T) {
 	assert.Equal(t, []string{"/new/dir/s0.ts", "/new/dir/sub/s1.ts", "/new/dir/s2.ts"}, got)
 }
 
-func TestHLSPullByteRange(t *testing.T) {
-	segs := tsSegments(t)
-	file := bytes.Join(segs, nil)
+// byteRangePlaylist lists segs as consecutive ranges of all.ts: the first
+// with its offset, the others defaulting to the previous end.
+func byteRangePlaylist(segs [][]byte) (text string, want []string) {
 	pl := hls.MediaPlaylist{Version: 4, TargetDuration: 2, Ended: true}
-	want := make([]string, 0, len(segs))
 	off := 0
 	for _, s := range segs {
 		want = append(want, fmt.Sprintf("bytes=%d-%d", off, off+len(s)-1))
 		pl.Segments = append(pl.Segments, hls.Segment{URI: "all.ts", Duration: time.Second})
 		off += len(s)
 	}
-	// The first range has its offset; the others default to the previous end.
-	text := string(pl.Encode())
-	parts := strings.Split(text, "#EXTINF")
+	parts := strings.Split(string(pl.Encode()), "#EXTINF")
 	for i := 1; i < len(parts); i++ {
 		r := fmt.Sprintf("#EXT-X-BYTERANGE:%d", len(segs[i-1]))
 		if i == 1 {
@@ -334,31 +332,68 @@ func TestHLSPullByteRange(t *testing.T) {
 		}
 		parts[i-1] += r + "\n"
 	}
-	text = strings.Join(parts, "#EXTINF")
+	return strings.Join(parts, "#EXTINF"), want
+}
 
-	var mu sync.Mutex
-	var ranges []string
-	mux := http.NewServeMux()
-	mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(text)) })
-	mux.HandleFunc("/all.ts", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		ranges = append(ranges, r.Header.Get("Range"))
-		mu.Unlock()
-		http.ServeContent(w, r, "all.ts", time.Time{}, bytes.NewReader(file))
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+func TestHLSPullByteRange(t *testing.T) {
+	segs := tsSegments(t)
+	file := bytes.Join(segs, nil)
+	serve := map[string]http.HandlerFunc{
+		"partial": func(w http.ResponseWriter, r *http.Request) {
+			http.ServeContent(w, r, "all.ts", time.Time{}, bytes.NewReader(file))
+		},
+		// A server that ignores Range: the reader cuts the range out.
+		"ignored": func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(file) },
+		// A 206 whose Content-Range is not the requested one is refused.
+		"wrong range": func(w http.ResponseWriter, r *http.Request) {
+			var from, to int
+			_, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &from, &to)
+			require.NoError(t, err)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from+188, to+188, len(file)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(file[from+188 : min(to+189, len(file))])
+		},
+	}
+	for name, h := range serve {
+		t.Run(name, func(t *testing.T) {
+			list := segs
+			if name == "wrong range" {
+				list = segs[:2]
+			}
+			text, want := byteRangePlaylist(list)
+			var mu sync.Mutex
+			var ranges []string
+			mux := http.NewServeMux()
+			mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(text)) })
+			mux.HandleFunc("/all.ts", func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				ranges = append(ranges, r.Header.Get("Range"))
+				mu.Unlock()
+				h(w, r)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
 
-	r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{})
-	require.NoError(t, err)
-	res := pullAll(r)
-	require.ErrorIs(t, res.err, io.EOF)
-	require.NoError(t, r.Close())
-	assert.Empty(t, res.breaks)
-	assert.Equal(t, fixtureTrackCounts(t, file), trackCounts(res.frames))
-	mu.Lock()
-	defer mu.Unlock()
-	assert.Equal(t, want, ranges)
+			r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{})
+			if name == "wrong range" {
+				require.Error(t, err)
+				mu.Lock()
+				defer mu.Unlock()
+				assert.Len(t, ranges, 4, "each segment tried twice, then skipped")
+				return
+			}
+			require.NoError(t, err)
+			res := pullAll(r)
+			require.ErrorIs(t, res.err, io.EOF)
+			require.NoError(t, r.Close())
+			assert.Empty(t, res.breaks)
+			assert.Equal(t, fixtureTrackCounts(t, file), trackCounts(res.frames))
+			assert.Zero(t, r.Stats()["segment_errors"])
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Equal(t, want, ranges)
+		})
+	}
 }
 
 func TestHLSPullEncryptedRefused(t *testing.T) {
@@ -391,6 +426,7 @@ func TestHLSPullSegmentRetry(t *testing.T) {
 	segs := tsSegments(t)
 	var mu sync.Mutex
 	tries := map[int]int{}
+	at := map[int][]time.Time{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(vodPlaylist(2, []string{"0.ts", "1.ts", "2.ts", "3.ts"}))
@@ -402,6 +438,7 @@ func TestHLSPullSegmentRetry(t *testing.T) {
 		mu.Lock()
 		tries[n]++
 		try := tries[n]
+		at[n] = append(at[n], time.Now())
 		mu.Unlock()
 		switch {
 		case n == 1: // fails for good: skipped
@@ -423,6 +460,10 @@ func TestHLSPullSegmentRetry(t *testing.T) {
 	require.Len(t, res.breaks, 1, "the skipped segment is a discontinuity")
 	mu.Lock()
 	assert.Equal(t, map[int]int{0: 1, 1: 2, 2: 2, 3: 1}, tries)
+	for _, n := range []int{1, 2} {
+		// The retry waits a quarter target (2 s), at most 500 ms.
+		assert.GreaterOrEqual(t, at[n][1].Sub(at[n][0]), 450*time.Millisecond, "segment %d", n)
+	}
 	mu.Unlock()
 	st := r.Stats()
 	assert.EqualValues(t, 1, st["skipped_segments"])
@@ -529,10 +570,235 @@ func TestHLSOpenCtxAborts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := ingest.Open(ctx, srv.URL+"/index.m3u8", ingest.Env{})
+	_, err := ingest.Open(ctx, srv.URL+"/index.m3u8?token=hunter2", ingest.Env{})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, time.Since(start), 2*time.Second)
+	assert.Equal(t, 1, strings.Count(err.Error(), "ingest:"), "one prefix: %v", err)
+	assert.Equal(t, 1, strings.Count(err.Error(), "/index.m3u8"), "one URL: %v", err)
+	assert.NotContains(t, err.Error(), "hunter2")
+}
+
+func TestHLSTargetDurationClamped(t *testing.T) {
+	segs := tsSegments(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:9223372036\n#EXTINF:1,\n0.ts\n#EXT-X-ENDLIST\n"))
+	})
+	mux.HandleFunc("/0.ts", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(segs[0]) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, r.Close()) }()
+	assert.Equal(t, 90*time.Second, r.Spec().StallTimeout, "1.5 x the 60 s cap")
+}
+
+// segmentWindow is a playlist of 1 s target listing first..first+5 as
+// "<seq>.ts", with a discontinuity sequence.
+func segmentWindow(first, disc uint64, ended bool) []byte {
+	pl := hls.MediaPlaylist{Version: 3, TargetDuration: 1, MediaSequence: first, DiscontinuitySequence: disc, Ended: ended}
+	for i := range 6 {
+		pl.Segments = append(pl.Segments, hls.Segment{URI: fmt.Sprintf("%d.ts", first+uint64(i)), Duration: time.Second})
+	}
+	return pl.Encode()
+}
+
+// windowServer serves the playlists in order (the last one repeats) and
+// segment n as segs[n%len(segs)], recording the playlist request times and
+// the segments served.
+type windowServer struct {
+	mu        sync.Mutex
+	playlists [][]byte
+	loads     []time.Time
+	served    []int
+}
+
+func (ws *windowServer) handler(t *testing.T, segs [][]byte) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		ws.mu.Lock()
+		i := min(len(ws.loads), len(ws.playlists)-1)
+		ws.loads = append(ws.loads, time.Now())
+		pl := ws.playlists[i]
+		ws.mu.Unlock()
+		_, _ = w.Write(pl)
+	})
+	mux.HandleFunc("/{n}", func(w http.ResponseWriter, r *http.Request) {
+		var n int
+		_, err := fmt.Sscanf(r.PathValue("n"), "%d.ts", &n)
+		require.NoError(t, err)
+		ws.mu.Lock()
+		ws.served = append(ws.served, n)
+		ws.mu.Unlock()
+		_, _ = w.Write(segs[n%len(segs)])
+	})
+	return mux
+}
+
+// A load-balanced edge can answer a reload with an older copy of the
+// playlist: it is ignored, without replay or break, and the next reload
+// comes after half a target.
+func TestHLSPullStalePlaylist(t *testing.T) {
+	segs := tsSegments(t)
+	ws := &windowServer{playlists: [][]byte{
+		segmentWindow(0, 0, false), // read 3, 4, 5
+		segmentWindow(1, 0, false), // read 6
+		segmentWindow(0, 0, false), // stale: ends at 5
+		segmentWindow(2, 0, true),  // read 7, end
+	}}
+	srv := httptest.NewServer(ws.handler(t, segs))
+	defer srv.Close()
+
+	r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{})
+	require.NoError(t, err)
+	res := pullAll(r)
+	require.ErrorIs(t, res.err, io.EOF)
+	require.NoError(t, r.Close())
+	assert.Empty(t, res.breaks)
+	st := r.Stats()
+	assert.Zero(t, st["fell_behind"])
+	assert.Zero(t, st["playlist_restarts"])
+	assert.EqualValues(t, 1, st["stale_playlists"])
+
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	assert.Equal(t, []int{3, 4, 5, 6, 7}, ws.served, "nothing replayed")
+	require.Len(t, ws.loads, 4)
+	// A load with new segments waits a target (1 s); after the stale one,
+	// half a target.
+	for i, want := range []time.Duration{time.Second, time.Second, 500 * time.Millisecond} {
+		gap := ws.loads[i+1].Sub(ws.loads[i])
+		assert.GreaterOrEqual(t, gap, want-50*time.Millisecond, "reload %d", i+1)
+		assert.Less(t, gap, want+400*time.Millisecond, "reload %d", i+1)
+	}
+}
+
+// A playlist that restarts far below the reader's position is one break,
+// then the reader rejoins three from the new end.
+func TestHLSPullPlaylistRestart(t *testing.T) {
+	segs := tsSegments(t)
+	ws := &windowServer{playlists: [][]byte{
+		segmentWindow(100, 0, false), // read 103, 104, 105
+		segmentWindow(0, 0, true),    // restarted: read 3, 4, 5
+	}}
+	srv := httptest.NewServer(ws.handler(t, segs))
+	defer srv.Close()
+
+	r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{})
+	require.NoError(t, err)
+	res := pullAll(r)
+	require.ErrorIs(t, res.err, io.EOF)
+	require.NoError(t, r.Close())
+	require.Len(t, res.breaks, 1)
+	st := r.Stats()
+	assert.EqualValues(t, 1, st["playlist_restarts"])
+	assert.Zero(t, st["fell_behind"])
+	assert.Zero(t, st["stale_playlists"])
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	assert.Equal(t, []int{103, 104, 105, 3, 4, 5}, ws.served)
+}
+
+// A restart that keeps the numbers close is told apart from a stale copy by
+// a changed discontinuity sequence.
+func TestHLSPullPlaylistRestartDiscSeq(t *testing.T) {
+	segs := tsSegments(t)
+	ws := &windowServer{playlists: [][]byte{
+		segmentWindow(4, 3, false), // read 7, 8, 9
+		segmentWindow(2, 0, true),  // ends at 7, discontinuity sequence reset: read 5, 6, 7
+	}}
+	srv := httptest.NewServer(ws.handler(t, segs))
+	defer srv.Close()
+
+	r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{})
+	require.NoError(t, err)
+	res := pullAll(r)
+	require.ErrorIs(t, res.err, io.EOF)
+	require.NoError(t, r.Close())
+	require.Len(t, res.breaks, 1)
+	assert.EqualValues(t, 1, r.Stats()["playlist_restarts"])
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	assert.Equal(t, []int{7, 8, 9, 5, 6, 7}, ws.served)
+}
+
+func TestHLSPullCloseAbortsSegment(t *testing.T) {
+	segs := tsSegments(t)
+	release := make(chan struct{})
+	defer close(release)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:1,\n0.ts\n#EXTINF:1,\n1.ts\n"))
+	})
+	mux.HandleFunc("/0.ts", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(segs[0]) })
+	var hung atomic.Bool
+	mux.HandleFunc("/1.ts", func(w http.ResponseWriter, r *http.Request) {
+		// Half the segment, then a stall.
+		w.Header().Set("Content-Length", fmt.Sprint(len(segs[1])))
+		_, _ = w.Write(segs[1][:len(segs[1])/2])
+		w.(http.Flusher).Flush()
+		hung.Store(true)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{})
+	require.NoError(t, err)
+	done := make(chan pullResult, 1)
+	go func() { done <- pullAll(r) }()
+	require.Eventually(t, hung.Load, 2*time.Second, 5*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, r.Close())
+	select {
+	case res := <-done:
+		require.Error(t, res.err)
+		assert.NotErrorIs(t, res.err, io.EOF)
+	case <-time.After(time.Second):
+		t.Fatal("Close did not abort the segment download")
+	}
+	assert.Zero(t, r.Stats()["skipped_segments"], "a closed reader skips nothing")
+}
+
+// Readers opened and closed in a loop leave no connection behind.
+// Not parallel: it counts goroutines.
+func TestHLSOpenCloseLeaksNothing(t *testing.T) {
+	segs := tsSegments(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(vodPlaylist(2, []string{"0.ts", "1.ts"}))
+	})
+	mux.HandleFunc("/aes.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:1,\n0.ts\n"))
+	})
+	mux.HandleFunc("/{n}", func(w http.ResponseWriter, r *http.Request) {
+		var n int
+		_, _ = fmt.Sscanf(r.PathValue("n"), "%d.ts", &n)
+		_, _ = w.Write(segs[n])
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	cycle := func() {
+		r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{})
+		require.NoError(t, err)
+		_, err = r.Read()
+		require.NoError(t, err)
+		require.NoError(t, r.Close())
+		_, err = ingest.Open(context.Background(), srv.URL+"/aes.m3u8", ingest.Env{})
+		require.Error(t, err)
+	}
+	cycle() // warm up lazily started goroutines
+	time.Sleep(100 * time.Millisecond)
+	before := runtime.NumGoroutine()
+	for range 20 {
+		cycle()
+	}
+	assert.Eventually(t, func() bool { return runtime.NumGoroutine() <= before+2 },
+		2*time.Second, 20*time.Millisecond, "goroutines before=%d now=%d", before, runtime.NumGoroutine())
 }
 
 func TestHLSPullFromOurOutput(t *testing.T) {
