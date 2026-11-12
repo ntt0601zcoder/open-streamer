@@ -88,9 +88,10 @@ type Pipeline struct {
 
 	// Run goroutine only.
 	layout      []media.Kind
-	last        int           // input active last, -1 before the first
-	stall       time.Duration // the active input's stall limit
-	activeSince time.Time
+	last        int            // input active last, -1 before the first
+	stall       time.Duration  // the active input's stall limit
+	activeSince time.Time      // when the active input delivered its first frame
+	lastFrame   time.Time      // when the active input last delivered a mapped frame
 	wg          sync.WaitGroup // input goroutines
 
 	mu  sync.Mutex // guards st and cur
@@ -173,7 +174,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		}
 		a := p.start(ctx, 0)
 		cause := p.serve(ctx, a)
-		healthy := p.end(ctx, a)
+		healthy := p.end(ctx, a, errors.Is(cause, errEnded))
 		if errors.Is(cause, errEnded) {
 			return nil
 		}
@@ -181,6 +182,8 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			return err
 		}
 		p.emit(Event{Kind: EventFailed, Input: a.in, Err: cause})
+		// Healthy time runs from the first frame to the last, not to the
+		// failure's detection.
 		if healthy >= healthyReset {
 			backoff = 0
 		}
@@ -305,7 +308,10 @@ func (a *attempt) stop() {
 // serve feeds the hub from a until it fails, ends (errEnded) or ctx is done.
 // The timeout runs only while Run waits on the input: StartTimeout from the
 // open to the first frame, then the stall limit from the end of each frame's
-// processing, so pacing sleeps never count.
+// processing, so pacing sleeps never count. Only frames that map onto the
+// layout are progress: they activate the input and re-arm the stall limit,
+// as does a discontinuity's flush when it wrote frames (it may have paced
+// them); an input of unmapped tracks or bare discontinuities stalls.
 func (p *Pipeline) serve(ctx context.Context, a *attempt) error {
 	wait := p.opt.After(p.opt.StartTimeout)
 	for {
@@ -332,17 +338,32 @@ func (p *Pipeline) serve(ctx context.Context, a *attempt) error {
 				p.layout = a.r.Kinds()
 			}
 		case it.err == nil:
+			if len(p.layout) == 0 {
+				p.layout = a.r.Kinds()
+			}
+			t, ok := a.track(it.f.Track, p.layout)
+			if !ok {
+				p.mu.Lock()
+				p.st.Unmapped++
+				p.mu.Unlock()
+				break
+			}
 			if !a.active {
 				p.activate(a)
 			}
-			if err := p.push(ctx, a, it.f); err != nil {
+			p.lastFrame = p.opt.Now()
+			if err := p.push(ctx, it.f, t); err != nil {
 				return err
 			}
 			wait = p.opt.After(p.stall)
 		case errors.Is(it.err, ingest.ErrDiscontinuity):
 			if a.active {
-				if err := p.breakClock(ctx, false); err != nil {
+				wrote, err := p.breakClock(ctx, false)
+				if err != nil {
 					return err
+				}
+				if wrote > 0 {
+					wait = p.opt.After(p.stall)
 				}
 				a.tracks = nil // a remapped slot may change kind
 				p.emit(Event{Kind: EventDiscontinuity, Input: a.in})
@@ -362,9 +383,6 @@ func (p *Pipeline) serve(ctx context.Context, a *attempt) error {
 func (p *Pipeline) activate(a *attempt) {
 	spec := a.r.Spec()
 	p.stall = max(p.opt.StallTimeout, spec.StallTimeout)
-	if len(p.layout) == 0 {
-		p.layout = a.r.Kinds()
-	}
 	if p.w.c == nil {
 		p.w.c = clock.New(clock.Options{Kinds: p.layout, Now: p.opt.Now})
 	} else {
@@ -392,8 +410,10 @@ func (p *Pipeline) activate(a *attempt) {
 }
 
 // end stops a after serve returned. When a was active, it flushes the Clock
-// (unless ctx is done) and returns how long a was active.
-func (p *Pipeline) end(ctx context.Context, a *attempt) time.Duration {
+// (unless ctx is done) and returns how long a was healthy, from its first
+// frame to its last. The flush is paced only when a ended (ended); a failed
+// input's held frames are written at once, so pacing never delays failover.
+func (p *Pipeline) end(ctx context.Context, a *attempt, ended bool) time.Duration {
 	a.stop()
 	if !a.active {
 		return 0
@@ -402,22 +422,18 @@ func (p *Pipeline) end(ctx context.Context, a *attempt) time.Duration {
 	p.st.Active = -1
 	p.cur = nil
 	p.mu.Unlock()
+	if !ended {
+		p.w.pace = false // the next activation sets it again
+	}
 	if ctx.Err() == nil {
 		// Only a cancelled context fails the flush, and Run returns then.
-		_ = p.flush(ctx)
+		_, _ = p.flush(ctx)
 	}
-	return p.opt.Now().Sub(p.activeSince)
+	return p.lastFrame.Sub(p.activeSince)
 }
 
-// push maps f onto the layout and runs it through the Clock into the hub.
-func (p *Pipeline) push(ctx context.Context, a *attempt, f ingest.Frame) error {
-	t, ok := a.track(f.Track, p.layout)
-	if !ok {
-		p.mu.Lock()
-		p.st.Unmapped++
-		p.mu.Unlock()
-		return nil
-	}
+// push runs f, mapped onto layout track t, through the Clock into the hub.
+func (p *Pipeline) push(ctx context.Context, f ingest.Frame, t int) error {
 	mf := f.Frame
 	mf.Track = t
 	out := p.w.c.PushAt(mf, f.Arrival)
@@ -426,19 +442,22 @@ func (p *Pipeline) push(ctx context.Context, a *attempt, f ingest.Frame) error {
 }
 
 // breakClock releases what the Clock holds, so the frames from before the
-// break are written rather than dropped as stale, then breaks it.
-func (p *Pipeline) breakClock(ctx context.Context, newInput bool) error {
-	if err := p.flush(ctx); err != nil {
-		return err
+// break are written rather than dropped as stale, then breaks it. It returns
+// how many frames it wrote.
+func (p *Pipeline) breakClock(ctx context.Context, newInput bool) (int, error) {
+	n, err := p.flush(ctx)
+	if err != nil {
+		return n, err
 	}
 	p.w.c.Break(newInput)
-	return nil
+	return n, nil
 }
 
-func (p *Pipeline) flush(ctx context.Context) error {
+// flush writes the frames the Clock holds and returns how many it wrote.
+func (p *Pipeline) flush(ctx context.Context) (int, error) {
 	out := p.w.c.Flush()
 	p.syncClock()
-	return p.w.write(ctx, out)
+	return len(out), p.w.write(ctx, out)
 }
 
 func (p *Pipeline) syncClock() {

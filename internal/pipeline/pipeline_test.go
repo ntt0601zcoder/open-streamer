@@ -744,3 +744,190 @@ func TestPipelineStatsWhileActive(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, <-res, context.Canceled)
 }
+
+// vFrames returns n video frames of reader track 0 from DTS start, a key
+// every gop frames, arriving in real time.
+func vFrames(n, gop int, start int64) []step {
+	return av{video: 0, audio: -1, gop: gop, start: start, span: int64(n) * vDur, arrival: realTime}.steps()
+}
+
+// aFrames returns n audio frames of reader track 0 from DTS start, arriving
+// in real time.
+func aFrames(n int, start int64) []step {
+	out := make([]step, 0, n)
+	for i := range n {
+		d := start + int64(i)*aDur
+		f := media.Frame{Track: 0, Config: audioCfg, DTS: d, PTS: d, Key: true, Data: [][]byte{{2}}}
+		out = append(out, step{f: ingest.Frame{Frame: f, Arrival: realTime(d)}})
+	}
+	return out
+}
+
+func TestPipelineDiscontinuityFlushNotStall(t *testing.T) {
+	ft, ev := newFakeTime(), newEvents()
+	// Layout [video audio] with video alone: epoch 1 stays pending for its
+	// 1 s window, so the discontinuity's flush paces 0.92 s of frames, over
+	// the 0.5 s stall limit.
+	held := vFrames(24, 250, 0)
+	after := vFrames(50, 25, 24*vDur)
+	steps := append(append(append([]step{}, held...), step{err: ingest.ErrDiscontinuity}), after...)
+	r := newFakeReader([]media.Kind{media.KindVideo}, ingest.Spec{Pace: true}, steps, true)
+	h := hub.New(hub.Options{})
+	sub := h.Subscribe("t", 1<<16)
+	opt := fakeOptions(ft, one(r), ev)
+	opt.Layout = []media.Kind{media.KindVideo, media.KindAudio}
+	opt.StallTimeout = 500 * time.Millisecond
+	opt.EndOnEOF = true
+	require.NoError(t, New(h, opt).Run(ev.failCtx(t)))
+	assert.Equal(t, []EventKind{EventActive, EventDiscontinuity}, ev.kinds(), "no stall")
+	assert.GreaterOrEqual(t, ft.Now().Sub(fakeT0), 900*time.Millisecond, "the flush was paced")
+	assert.Len(t, drain(sub), len(held)+len(after))
+}
+
+func TestPipelineDiscontinuitiesOnlyStall(t *testing.T) {
+	ft, ev := newFakeTime(), newEvents()
+	frames := vFrames(10, 25, 0)
+	steps := append([]step{}, frames...)
+	for range 1000 {
+		steps = append(steps, step{err: ingest.ErrDiscontinuity})
+	}
+	r := newFakeReader([]media.Kind{media.KindVideo}, ingest.Spec{}, steps, true)
+	// Each discontinuity takes 100 ms: they flush nothing, so the stall
+	// limit runs from the last frame.
+	r.onRead = func(i int) {
+		if i >= len(frames) {
+			ft.Advance(100 * time.Millisecond)
+		}
+	}
+	opt := fakeOptions(ft, one(r), ev)
+	p := New(hub.New(hub.Options{}), opt)
+	require.ErrorIs(t, p.Run(ev.failCtx(t)), context.Canceled)
+	e := ev.evs[len(ev.evs)-1]
+	require.Equal(t, EventFailed, e.Kind)
+	assert.ErrorIs(t, e.Err, errStalled)
+	assert.Less(t, r.i, len(steps), "stalled before the reader ran out")
+}
+
+func TestPipelineUnmappedOnly(t *testing.T) {
+	t.Run("never active", func(t *testing.T) {
+		ft, ev := newFakeTime(), newEvents()
+		r := newFakeReader([]media.Kind{media.KindAudio}, ingest.Spec{}, aFrames(25, 0), false)
+		opt := fakeOptions(ft, one(r), ev)
+		opt.Layout = []media.Kind{media.KindVideo}
+		p := New(hub.New(hub.Options{}), opt)
+		ctx := ev.failCtx(t)
+		res := make(chan error, 1)
+		go func() { res <- p.Run(ctx) }()
+		<-r.blocked
+		ft.Advance(defaultStartTimeout)
+		require.ErrorIs(t, <-res, context.Canceled)
+		require.Equal(t, []EventKind{EventFailed}, ev.kinds(), "unmapped frames do not activate")
+		assert.ErrorIs(t, ev.evs[0].Err, errNoStart)
+		assert.Equal(t, uint64(len(r.steps)), p.Stats().Unmapped)
+	})
+	t.Run("stalls", func(t *testing.T) {
+		ft, ev := newFakeTime(), newEvents()
+		video := vFrames(25, 25, 0)
+		steps := append([]step{}, video...)
+		for _, s := range aFrames(300, media.ClockRate) { // 11.5 s of audio outside the layout
+			s.f.Track = 1
+			steps = append(steps, s)
+		}
+		// io.EOF after the steps: an input that never stalls fails on it instead.
+		r := newFakeReader([]media.Kind{media.KindVideo, media.KindAudio}, ingest.Spec{}, steps, true)
+		r.onRead = func(i int) {
+			if i >= len(video) {
+				ft.Advance(media.ToDuration(aDur))
+			}
+		}
+		opt := fakeOptions(ft, one(r), ev)
+		opt.Layout = []media.Kind{media.KindVideo}
+		p := New(hub.New(hub.Options{}), opt)
+		require.ErrorIs(t, p.Run(ev.failCtx(t)), context.Canceled)
+		require.Equal(t, []EventKind{EventActive, EventFailed}, ev.kinds())
+		assert.ErrorIs(t, ev.evs[1].Err, errStalled)
+		assert.Less(t, r.i, len(steps), "stalled while unmapped frames kept coming")
+		assert.Positive(t, p.Stats().Unmapped)
+	})
+}
+
+func TestPipelineHealthyUntilLastFrame(t *testing.T) {
+	ft, ev := newFakeTime(), newEvents()
+	boom := errors.New("boom")
+	var r *fakeReader
+	o := &opener{next: func(n int, _ context.Context) (ingest.Reader, error) {
+		if n == 2 {
+			// Frames, then silence until an 11 s stall limit expires:
+			// detected 11 s or more after activation, healthy for at most
+			// the 2 s the frames span.
+			r = newFakeReader([]media.Kind{media.KindVideo}, ingest.Spec{Pace: true, StallTimeout: 11 * time.Second}, vFrames(50, 25, 0), false)
+			return r, nil
+		}
+		return nil, boom
+	}}
+	p := New(hub.New(hub.Options{}), fakeOptions(ft, o, ev))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	res := make(chan error, 1)
+	go func() { res <- p.Run(ctx) }()
+	next := func(want time.Duration) {
+		t.Helper()
+		for {
+			d, ok := ft.nextCall()
+			require.True(t, ok)
+			if d == want {
+				return
+			}
+		}
+	}
+	next(500 * time.Millisecond)
+	ft.Advance(500 * time.Millisecond)
+	next(time.Second)
+	ft.Advance(time.Second)
+	e, ok := ev.next()
+	require.True(t, ok)
+	require.Equal(t, EventFailed, e.Kind)
+	e, ok = ev.next()
+	require.True(t, ok)
+	require.Equal(t, EventFailed, e.Kind)
+	e, ok = ev.next()
+	require.True(t, ok)
+	require.Equal(t, EventActive, e.Kind)
+	<-r.blocked
+	for len(ft.calls) > 0 {
+		<-ft.calls
+	}
+	ft.Advance(11 * time.Second)
+	e, ok = ev.next()
+	require.True(t, ok)
+	require.Equal(t, EventFailed, e.Kind)
+	require.ErrorIs(t, e.Err, errStalled)
+	d, ok := ft.nextCall()
+	require.True(t, ok)
+	assert.Equal(t, 2*time.Second, d, "the silence before the stall is not healthy time")
+	cancel()
+	require.ErrorIs(t, <-res, context.Canceled)
+}
+
+func TestPipelineFailureFlushUnpaced(t *testing.T) {
+	ft, ev := newFakeTime(), newEvents()
+	boom := errors.New("boom")
+	// Epoch 1 stays pending (video alone in a [video audio] layout), then
+	// the input fails: its held frames are written at once, not paced.
+	held := vFrames(24, 250, 0)
+	r := newFakeReader([]media.Kind{media.KindVideo}, ingest.Spec{Pace: true}, append(append([]step{}, held...), step{err: boom}), false)
+	h := hub.New(hub.Options{})
+	sub := h.Subscribe("t", 1<<16)
+	sleeps := 0
+	opt := fakeOptions(ft, one(r), ev)
+	opt.Layout = []media.Kind{media.KindVideo, media.KindAudio}
+	opt.Sleep = func(ctx context.Context, d time.Duration) error {
+		sleeps++
+		return ft.Sleep(ctx, d)
+	}
+	require.ErrorIs(t, New(h, opt).Run(ev.failCtx(t)), context.Canceled)
+	assert.Equal(t, []EventKind{EventActive, EventFailed}, ev.kinds())
+	assert.Zero(t, sleeps, "EventFailed is not delayed by pacing")
+	assert.Equal(t, fakeT0, ft.Now())
+	assert.Len(t, drain(sub), len(held), "the held frames are written")
+}

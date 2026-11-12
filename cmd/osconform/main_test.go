@@ -33,6 +33,9 @@ func serve(t *testing.T, suffix string, edit func([]byte) []byte) string {
 	h := hub.New(hub.Options{})
 	sub := h.Subscribe("pkg", 1<<16)
 	now := func() time.Time { return t0 }
+	// A failed input would be retried without end: fail at once instead.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	require.NoError(t, pipeline.New(h, pipeline.Options{
 		Inputs: []string{"mem"},
 		Open: func(context.Context, string) (ingest.Reader, error) {
@@ -41,7 +44,13 @@ func serve(t *testing.T, suffix string, edit func([]byte) []byte) string {
 		Parse:    func(string) (ingest.Spec, error) { return ingest.Spec{}, nil },
 		EndOnEOF: true,
 		Now:      now,
-	}).Run(context.Background()))
+		OnEvent: func(ev pipeline.Event) {
+			if ev.Kind == pipeline.EventFailed {
+				t.Errorf("pipeline input failed: %v", ev.Err)
+				cancel()
+			}
+		},
+	}).Run(ctx))
 	h.Close()
 	p := live.NewPackager(h, live.Options{Window: 100, Now: func() time.Time { return t0.Add(time.Hour) }})
 	p.Run(context.Background(), sub)
