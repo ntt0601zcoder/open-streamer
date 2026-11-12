@@ -1,2 +1,0 @@
-This directory holds committable benchmark reports.
-Each sweep produces bench/reports/<sweep>/report.md plus a runs/ subdir.
