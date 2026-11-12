@@ -15,8 +15,11 @@ const (
 	// pesOptHeaderLen is pesPrefixLen plus the two flag bytes and
 	// PES_header_data_length.
 	pesOptHeaderLen = 9
-	// defaultMaxPES bounds a length-0 PES that never sees its next PUSI.
-	defaultMaxPES = 64 << 20
+	// defaultMaxPES bounds one PES, notably a length-0 one that never sees its
+	// next PUSI.
+	defaultMaxPES = 8 << 20
+	// defaultMaxTotal bounds all partial PES of one Demux together.
+	defaultMaxTotal = 32 << 20
 )
 
 // PES is one complete PES packet of an elementary stream in the PMT.
@@ -42,6 +45,13 @@ type DemuxStats struct {
 	CCErrors  uint64 // continuity_counter gaps on tracked PIDs
 	PSIErrors uint64 // malformed PAT or PMT sections and bad CRCs
 	PESErrors uint64 // unparseable PES headers and incomplete sized PES
+	LostPES   uint64 // PES dropped: continuity gap, oversize, total cap, or bad header
+}
+
+// DemuxOptions sets the memory bounds of a Demux.
+type DemuxOptions struct {
+	MaxPES   int // one PES; 0 means 8 << 20
+	MaxTotal int // all partial PES of this demux; 0 means 32 << 20
 }
 
 // esState is the assembly state of one elementary-stream PID in the PMT.
@@ -84,6 +94,9 @@ type Demux struct {
 	head   int
 	eof    bool
 	maxPES int
+	// maxTotal bounds total, the bytes held by all partial PES.
+	maxTotal int
+	total    int
 
 	havePMTPID bool
 	program    uint16
@@ -99,15 +112,29 @@ type Demux struct {
 	pat, pmtSec sectionAssembler
 }
 
-// NewDemux returns a Demux reading the transport stream from r.
+// NewDemux returns a Demux with the default bounds reading the transport
+// stream from r.
 func NewDemux(r io.Reader) *Demux {
+	return NewDemuxWithOptions(r, DemuxOptions{})
+}
+
+// NewDemuxWithOptions returns a Demux reading the transport stream from r with
+// the given bounds; a zero field takes its default.
+func NewDemuxWithOptions(r io.Reader, opt DemuxOptions) *Demux {
+	if opt.MaxPES <= 0 {
+		opt.MaxPES = defaultMaxPES
+	}
+	if opt.MaxTotal <= 0 {
+		opt.MaxTotal = defaultMaxTotal
+	}
 	return &Demux{
-		r:      NewReader(r),
-		maxPES: defaultMaxPES,
-		es:     map[uint16]*esState{},
-		cc:     map[uint16]uint8{},
-		pat:    sectionAssembler{table: tablePAT},
-		pmtSec: sectionAssembler{table: tablePMT},
+		r:        NewReader(r),
+		maxPES:   opt.MaxPES,
+		maxTotal: opt.MaxTotal,
+		es:       map[uint16]*esState{},
+		cc:       map[uint16]uint8{},
+		pat:      sectionAssembler{table: tablePAT},
+		pmtSec:   sectionAssembler{table: tablePMT},
 	}
 }
 
@@ -120,7 +147,8 @@ func (d *Demux) Stats() DemuxStats {
 
 // Next returns the next event. At the end of the input it flushes the pending
 // PES in ascending PID order and then returns io.EOF. A read error from the
-// underlying reader is returned as is; decoding errors are only counted.
+// underlying reader is returned as is; a timeout leaves the partial PES in
+// place and the next call continues. Decoding errors are only counted.
 func (d *Demux) Next() (Event, error) {
 	for {
 		if d.head < len(d.queue) {
@@ -202,7 +230,12 @@ func (d *Demux) gap(pid uint16, st *esState) {
 	d.stats.CCErrors++
 	switch {
 	case st != nil:
-		st.pes = nil
+		// A gap loses a PES once: a second gap in the same lost PES does not
+		// count again.
+		if st.pes != nil || !st.lost {
+			d.stats.LostPES++
+		}
+		d.release(st)
 		st.lost = true
 	case pid == pidPAT:
 		d.pat.reset()
@@ -325,13 +358,13 @@ func (d *Demux) onES(p Packet, st *esState) {
 	}
 	b := st.pes
 	b.raw = append(b.raw, p.Payload...)
+	d.total += len(p.Payload)
 	if !b.known {
 		if len(b.raw) < pesPrefixLen {
 			return
 		}
 		if b.raw[0] != 0 || b.raw[1] != 0 || b.raw[2] != 1 {
-			st.pes = nil
-			d.stats.PESErrors++
+			d.drop(st)
 			return
 		}
 		b.known = true
@@ -344,12 +377,27 @@ func (d *Demux) onES(p Packet, st *esState) {
 	}
 	switch {
 	case b.want > 0 && len(b.raw) >= b.want:
-		st.pes = nil
+		d.release(st)
 		d.finishPES(p.PID, b, b.raw[:b.want])
-	case len(b.raw) > d.maxPES:
-		st.pes = nil
-		d.stats.PESErrors++
+	case len(b.raw) > d.maxPES, d.total > d.maxTotal:
+		d.drop(st)
 	}
+}
+
+// release detaches the PES under assembly from st and from the total.
+func (d *Demux) release(st *esState) {
+	if st.pes != nil {
+		d.total -= len(st.pes.raw)
+		st.pes = nil
+	}
+}
+
+// drop discards the PES under assembly as lost and marks the next one.
+func (d *Demux) drop(st *esState) {
+	d.release(st)
+	st.lost = true
+	d.stats.PESErrors++
+	d.stats.LostPES++
 }
 
 // endPES ends the PES pending on a PID: a length-0 one is complete, any
@@ -359,18 +407,20 @@ func (d *Demux) endPES(pid uint16, st *esState) {
 	if b == nil {
 		return
 	}
-	st.pes = nil
+	d.release(st)
 	if b.known && b.want == 0 {
 		d.finishPES(pid, b, b.raw)
 		return
 	}
 	d.stats.PESErrors++
+	d.stats.LostPES++
 }
 
 func (d *Demux) finishPES(pid uint16, b *pesBuf, raw []byte) {
 	pes, err := parsePES(raw)
 	if err != nil {
 		d.stats.PESErrors++
+		d.stats.LostPES++
 		return
 	}
 	pes.PID = pid
