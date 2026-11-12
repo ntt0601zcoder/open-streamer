@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
 
@@ -253,5 +254,69 @@ func TestLateJoinHold(t *testing.T) {
 		require.Equal(t, []uint32{1, 2, 3, 4}, epochIDs(c))
 		assert.Equal(t, uint64(2), c.Stats().LateJoins)
 		requireConform(t, out)
+	})
+}
+
+// gopRun returns n frames of a video track from dts, with a keyframe every
+// gop frames starting at the first.
+func gopRun(track int, cfg *media.TrackConfig, from int64, n, gop int) []media.Frame {
+	out := make([]media.Frame, n)
+	for i := range out {
+		dts := from + int64(i)*vDur
+		out[i] = media.Frame{Track: track, Config: cfg, PTS: dts, DTS: dts, Key: i%gop == 0}
+	}
+	return out
+}
+
+// A late video track whose keyframes are out of phase with a running video
+// track's, with GOPs longer than AlignWindow. The late-join epoch waits for
+// the running track's keyframe (up to VideoWait from its own), so the running
+// track loses no frame and is not taken for a late track itself. Out-of-phase
+// GOPs cannot start within 40 ms of each other: the one start-offset
+// violation is the phase between the two keyframes.
+func TestLateJoinWaitsForRunningVideo(t *testing.T) {
+	second := &media.TrackConfig{Codec: media.CodecH264}
+	kinds := []media.Kind{media.KindVideo, media.KindVideo}
+
+	t.Run("keyframe within VideoWait", func(t *testing.T) {
+		c := New(Options{Kinds: kinds})
+		v0 := gopRun(0, h264, 0, 300, 75)        // 3 s GOPs: keyframes at 0, 270000, 540000, …
+		v1 := gopRun(1, second, 405000, 188, 75) // appears 1.5 s out of phase
+		out := push(c, mux(0, v0, v1)...)
+		out = append(out, c.Flush()...)
+
+		require.Equal(t, []uint32{1, 2}, epochIDs(c))
+		st := c.Stats()
+		assert.Equal(t, uint64(1), st.LateJoins)
+		assert.Zero(t, st.LateTracks)
+		assert.Zero(t, st.DroppedBeforeKey)
+		assert.Len(t, onTrack(out, 0), len(v0))
+		assert.Len(t, onTrack(out, 1), len(v1))
+		e2 := inEpoch(out, 2)
+		require.True(t, onTrack(e2, 0)[0].Key)
+		require.True(t, onTrack(e2, 1)[0].Key)
+		vs := conform.CheckFrames(out, conform.FrameOptions{})
+		require.Len(t, vs, 1, "%v", vs)
+		assert.Equal(t, conform.RuleStartOffset, vs[0].Rule)
+		assert.Equal(t, 0, vs[0].Track)
+		assert.Contains(t, vs[0].Detail, "135000 ticks after earliest")
+	})
+
+	t.Run("keyframe beyond VideoWait", func(t *testing.T) {
+		c := New(Options{Kinds: kinds})
+		v0 := gopRun(0, h264, 0, 300, 250) // keyframes at 0 and 900000
+		v1 := gopRun(1, second, 405000, 188, 250)
+		out := push(c, mux(0, v0, v1)...)
+		out = append(out, c.Flush()...)
+
+		// The epoch releases 5 s after track 1's keyframe; track 0 counts as
+		// present and starts at its keyframe, losing the 12 frames between (856800 to 896400).
+		require.Equal(t, []uint32{1, 2}, epochIDs(c))
+		st := c.Stats()
+		assert.Equal(t, uint64(1), st.LateJoins)
+		assert.Zero(t, st.LateTracks)
+		assert.Equal(t, uint64(12), st.DroppedBeforeKey)
+		assert.Len(t, onTrack(out, 0), len(v0)-12)
+		requireConform(t, out, conform.RuleStartOffset) // track 0 starts 5 s in
 	})
 }

@@ -487,7 +487,7 @@ func TestClockConfigChangeOpensEpoch(t *testing.T) {
 		requireConform(t, out)
 	})
 
-	t.Run("second change while pending restarts", func(t *testing.T) {
+	t.Run("second change on the same track drops its held frames", func(t *testing.T) {
 		c := New(Options{Kinds: av})
 		out := push(c, mux(0, videoRun(0, 10), audioRun(0, 19))...)
 		first := video(36000, true)
