@@ -9,7 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -192,7 +195,10 @@ func TestHTTPTSHLSNotAvailable(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
-	for _, p := range []string{"/type", "/body", "/index.m3u8"} {
+	mux.HandleFunc("/bom", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("\xef\xbb\xbf \r\n#EXTM3U\n"))
+	})
+	for _, p := range []string{"/type", "/body", "/bom", "/index.m3u8"} {
 		_, err := ingest.Open(context.Background(), srv.URL+p, ingest.Env{})
 		require.Error(t, err, p)
 		assert.Contains(t, err.Error(), "HLS input not available", p)
@@ -257,4 +263,65 @@ func TestHTTPTSOpenCtxAborts(t *testing.T) {
 	_, err := ingest.Open(ctx, srv.URL+"/live.ts", ingest.Env{})
 	require.Error(t, err)
 	assert.Less(t, time.Since(start), 2*time.Second)
+}
+
+func TestHTTPTSEnvHTTPUsed(t *testing.T) {
+	data := httpFixture(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "yes", r.Header.Get("X-Test"))
+		_, _ = w.Write(data)
+	}))
+	defer srv.Close()
+	var used atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		used.Add(1)
+		r.Header.Set("X-Test", "yes")
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	r, err := ingest.Open(context.Background(), srv.URL+"/x.ts", ingest.Env{HTTP: client})
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	assert.EqualValues(t, 1, used.Load())
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestHTTPTSUserinfoRedacted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	u := "http://alice:s3cret@" + strings.TrimPrefix(srv.URL, "http://") + "/x.ts"
+	_, err := ingest.Open(context.Background(), u, ingest.Env{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "403")
+	assert.NotContains(t, err.Error(), "s3cret")
+	// A request that cannot even be built must not leak the raw URL either.
+	_, err = ingest.Open(context.Background(), "http://alice:s3cret@127.0.0.1:1/\x7f", ingest.Env{})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "s3cret")
+}
+
+// A failing source retried in a loop must not accumulate connections.
+// Not parallel: it counts goroutines.
+func TestHTTPTSFailedOpensLeakNothing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	open := func() {
+		_, err := ingest.Open(context.Background(), srv.URL+"/x.ts", ingest.Env{})
+		require.Error(t, err)
+	}
+	open() // warm up lazily started goroutines
+	time.Sleep(100 * time.Millisecond)
+	before := runtime.NumGoroutine()
+	for range 30 {
+		open()
+	}
+	assert.Eventually(t, func() bool { return runtime.NumGoroutine() <= before+2 },
+		2*time.Second, 20*time.Millisecond, "goroutines before=%d now=%d", before, runtime.NumGoroutine())
 }

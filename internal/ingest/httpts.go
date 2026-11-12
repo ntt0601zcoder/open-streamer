@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,15 +25,26 @@ const httpTimeout = 10 * time.Second
 // the HLS reader exists.
 var errHLSNotAvailable = errors.New("HLS input not available")
 
-// defaultHTTPClient has dial and response header timeouts and no overall
-// timeout: the body of a live pull never ends.
-func defaultHTTPClient() *http.Client {
-	return &http.Client{Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: httpTimeout}).DialContext,
-		TLSHandshakeTimeout:   httpTimeout,
-		ResponseHeaderTimeout: httpTimeout,
-	}}
+// defaultClient is shared by every Open that has no Env.HTTP. It has dial and
+// response header timeouts and no overall timeout: the body of a live pull
+// never ends. Keep-alives are off: a streaming pull gains nothing from
+// connection reuse, and an idle pool would hold a connection (and its
+// goroutines) for every failed attempt of a retry loop, e.g. a bare 503.
+var defaultClient = &http.Client{Transport: &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           (&net.Dialer{Timeout: httpTimeout}).DialContext,
+	TLSHandshakeTimeout:   httpTimeout,
+	ResponseHeaderTimeout: httpTimeout,
+	DisableKeepAlives:     true,
+}}
+
+// stripURLError drops the URL that net/http embeds in its errors.
+func stripURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 func httpErr(rawURL, op string, err error) error {
@@ -85,7 +97,7 @@ func openHTTP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, er
 	}
 	client := env.HTTP
 	if client == nil {
-		client = defaultHTTPClient()
+		client = defaultClient
 	}
 	// The request outlives ctx; only Close (or ctx, before the open ends)
 	// cancels it.
@@ -112,16 +124,12 @@ func openHTTP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, er
 func doHTTP(ctx, rctx context.Context, cancel context.CancelFunc, client *http.Client, rawURL string, env Env) (*httpReader, error) {
 	req, err := http.NewRequestWithContext(rctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, httpErr(rawURL, "request", err)
+		return nil, httpErr(rawURL, "request", stripURLError(err))
 	}
 	resp, err := client.Do(req)
 	if err != nil {
 		// net/http errors embed the URL: report ours, redacted.
-		var ue *url.Error
-		if errors.As(err, &ue) {
-			err = ue.Err
-		}
-		return nil, httpErr(rawURL, "get", err)
+		return nil, httpErr(rawURL, "get", stripURLError(err))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_ = resp.Body.Close()
@@ -133,8 +141,10 @@ func doHTTP(ctx, rctx context.Context, cancel context.CancelFunc, client *http.C
 	}
 	body := &httpBody{r: bufio.NewReaderSize(resp.Body, 64<<10), body: resp.Body, cancel: cancel}
 	// MPEG-TS starts with 0x47; only a '#' needs a longer look.
-	if first, err := body.r.Peek(1); err == nil && first[0] == '#' {
-		if head, _ := body.r.Peek(len("#EXTM3U")); string(head) == "#EXTM3U" {
+	if first, err := body.r.Peek(1); err == nil && first[0] != 0x47 {
+		head, _ := body.r.Peek(64) // a short body ends the peek early
+		head = bytes.TrimPrefix(head, []byte("\xef\xbb\xbf"))
+		if bytes.HasPrefix(bytes.TrimLeft(head, " \t\r\n"), []byte("#EXTM3U")) {
 			_ = body.Close()
 			return nil, httpErr(rawURL, "open", errHLSNotAvailable)
 		}
