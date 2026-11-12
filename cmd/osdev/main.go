@@ -44,6 +44,20 @@ type source struct {
 	pack       *live.Packager
 }
 
+// newServer returns the HTTP server. It sets no ReadTimeout or WriteTimeout:
+// either would cut the long-lived HTTP-TS responses, and each handler sets
+// its own per-write deadline instead (live and httpts, 10 s). The header,
+// idle and header-size limits keep idle or slow clients from holding
+// connections.
+func newServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
 func run(ctx context.Context, args []string, stdout io.Writer) int {
 	fs := flag.NewFlagSet("osdev", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -136,7 +150,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	mux := http.NewServeMux()
 	mux.Handle("GET /live/{stream}/stream.ts", httpts.Handler(hubLookup, 0))
 	mux.Handle("/live/", live.Handler(packLookup))
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := newServer(mux)
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()

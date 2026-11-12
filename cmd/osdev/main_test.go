@@ -109,3 +109,14 @@ func TestOsdevMissingFile(t *testing.T) {
 	var sb strings.Builder
 	assert.Equal(t, 0, run(ctx, []string{"-listen", "127.0.0.1:0", "-stream", "a=/nonexistent.ts"}, &sb))
 }
+
+func TestOsdevServerTimeouts(t *testing.T) {
+	srv := newServer(http.NotFoundHandler())
+	assert.Positive(t, srv.ReadHeaderTimeout)
+	assert.Positive(t, srv.IdleTimeout)
+	assert.Positive(t, srv.MaxHeaderBytes)
+	// Long-lived HTTP-TS responses carry their own rolling write deadline; a
+	// server-wide read or write timeout would cut them.
+	assert.Zero(t, srv.ReadTimeout)
+	assert.Zero(t, srv.WriteTimeout)
+}

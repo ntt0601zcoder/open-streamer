@@ -2,6 +2,7 @@ package live
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,10 @@ const (
 	typeTS   = "video/mp2t"
 	typeInit = "video/mp4"
 	typeM4S  = "video/iso.segment"
+
+	// defaultWriteTimeout bounds writing one response, so a client that
+	// stops reading cannot hold a handler and its body forever.
+	defaultWriteTimeout = 10 * time.Second
 )
 
 // playlistRoute serves one kind of playlist or manifest file in dir.
@@ -35,10 +40,12 @@ var playlistRoutes []playlistRoute
 // unknown stream or file, for a segment or init outside the window, and for
 // every playlist until the window lists a segment.
 func Handler(lookup func(stream string) (*Packager, bool)) http.Handler {
-	return newHandler(lookup, playlistRoutes)
+	return newHandler(lookup, playlistRoutes, defaultWriteTimeout)
 }
 
-func newHandler(lookup func(stream string) (*Packager, bool), routes []playlistRoute) http.Handler {
+// newHandler builds the handler; timeout is the write deadline of each
+// response.
+func newHandler(lookup func(stream string) (*Packager, bool), routes []playlistRoute, timeout time.Duration) http.Handler {
 	mux := http.NewServeMux()
 	for _, dir := range []string{dirHLS, dirCMAF} {
 		mux.HandleFunc("GET /live/{stream}/"+dir+"/{file}", func(w http.ResponseWriter, r *http.Request) {
@@ -49,7 +56,7 @@ func newHandler(lookup func(stream string) (*Packager, bool), routes []playlistR
 			}
 			name := r.PathValue("file")
 			if body, ctype, ok := p.file(dir, name); ok {
-				writeBody(w, r, ctype, body)
+				writeBody(w, r, ctype, body, timeout)
 				return
 			}
 			for _, rt := range routes {
@@ -58,7 +65,7 @@ func newHandler(lookup func(stream string) (*Packager, bool), routes []playlistR
 				}
 				if s := p.Snapshot(); s.Listed > 0 {
 					if body, ctype, ok := rt.build(p, s, name); ok {
-						writeBody(w, r, ctype, body)
+						writeBody(w, r, ctype, body, timeout)
 						return
 					}
 				}
@@ -70,9 +77,13 @@ func newHandler(lookup func(stream string) (*Packager, bool), routes []playlistR
 	return mux
 }
 
-// writeBody answers with body, honouring HEAD and Range requests. No lock is
-// held here.
-func writeBody(w http.ResponseWriter, r *http.Request, contentType string, body []byte) {
+// writeBody answers with body, honouring HEAD and Range requests, under a
+// write deadline of timeout from now. No lock is held here.
+func writeBody(w http.ResponseWriter, r *http.Request, contentType string, body []byte, timeout time.Duration) {
+	err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout))
+	if err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return
+	}
 	w.Header().Set("Content-Type", contentType)
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
 }

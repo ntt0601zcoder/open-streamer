@@ -716,7 +716,7 @@ func TestPlaylistRoutes(t *testing.T) {
 			build: func(*Packager, Snapshot, string) ([]byte, string, bool) { return nil, "", false },
 		},
 	}
-	srv := newHandler(func(name string) (*Packager, bool) { return p, name == "s" }, routes)
+	srv := newHandler(func(name string) (*Packager, bool) { return p, name == "s" }, routes, time.Second)
 
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/live/s/hls/index.m3u8", nil))
