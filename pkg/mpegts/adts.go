@@ -87,8 +87,9 @@ const (
 // An HE-AAC config (object type 5 or 29, explicit hierarchical signalling,
 // whose core object type must be AAC-LC) is written as an AAC-LC header
 // (profile 1) at the core sampling frequency and the core channel
-// configuration: ADTS cannot signal SBR or PS, so decoders find them in the
-// payload (implicit signalling).
+// configuration, which is always 1 for object type 29 (PS codes a mono
+// core): ADTS cannot signal SBR or PS, so decoders find them in the payload
+// (implicit signalling).
 func AppendADTS(dst, asc, payload []byte) ([]byte, error) {
 	if len(asc) < 2 {
 		return dst, fmt.Errorf("mpegts: adts: audio specific config has %d bytes, need 2", len(asc))
@@ -108,6 +109,9 @@ func AppendADTS(dst, asc, payload []byte) ([]byte, error) {
 		}
 		if core != aotLC {
 			return dst, fmt.Errorf("mpegts: adts: HE-AAC core object type %d is not AAC-LC", core)
+		}
+		if objType == aotPS {
+			chans = 1 // PS always codes a mono core
 		}
 		objType = aotLC
 	}
