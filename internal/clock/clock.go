@@ -10,6 +10,10 @@
 // opens the next epoch at the next video keyframe (a late join), at most once
 // per input; an epoch opened by a configuration change holds its whole align
 // window, so staggered changes on several tracks are one epoch change.
+//
+// For a live source, the Clock also compares each epoch's decode timing with
+// the frames' arrival times, and re-anchors the wall when the source's clock
+// drifts from arrival by more than Options.MaxDrift (see Epoch).
 package clock
 
 import (
@@ -28,6 +32,7 @@ const (
 	defaultDuration    = 3600                // lastDuration when a track has no DTS delta yet
 	lateMargin         = media.ClockRate / 5 // added to a late track's lateness for its hold
 	maxEpochs          = 64
+	driftWindow        = 10 // seconds of arrivals in the drift baseline and in each drift sample
 )
 
 // Options tunes a Clock. Zero values select the defaults.
@@ -39,6 +44,15 @@ type Options struct {
 	MaxBackStep int64            // per-track continuity tolerance while an epoch is pending; 0 means 45000
 	VideoWait   int64            // held audio span before releasing without a video keyframe; 0 means 5*90000
 	Now         func() time.Time // nil means time.Now
+
+	// MaxDrift re-anchors the wall when the source's clock drifts from
+	// arrival by more than it (see Epoch); 0 disables. It must exceed
+	// media.MaxAnchorLead: a value in (0, MaxAnchorLead] is raised to
+	// 2 × MaxAnchorLead.
+	MaxDrift time.Duration
+	// DriftPositiveOnly reacts only to a source falling behind arrival, for
+	// paced inputs, which cannot run ahead.
+	DriftPositiveOnly bool
 }
 
 // Epoch is the anchor of one timeline. Its smallest DTS maps to stream time
@@ -68,6 +82,29 @@ type Options struct {
 // epoch after epoch, so the lead over R_n is capped at L, and beyond it the
 // epoch overlaps the previous one's tail instead. Walls are rounded on their
 // own values, so rounding never accumulates either.
+//
+// A live source whose clock drifts from arrival is re-anchored by a drift
+// epoch (Options.MaxDrift, Clock.SetDrift). Within each epoch, a released
+// frame's offset is off = arrival − (DTS − Start). The baseline is the
+// smallest offset over the epoch's first 10 s of arrivals: bursts and network
+// delay only raise an offset above the true one, and a chain lead is constant
+// within the epoch. Once per second of arrivals after that, the drift is the
+// smallest offset over the last 10 s minus the baseline. When the drift
+// exceeds MaxDrift, or falls below −MaxDrift and DriftPositiveOnly is unset,
+// the next video keyframe (any frame for a stream without video) opens a
+// drift epoch. With b = baseline − Wall_{n−1}, the previous epoch's constant
+// offset (burst, chain lead, first-frame delay), the drift epoch drops its
+// frames with arrival − b before Wall_{n−1} + Δ (Stats.DroppedDrift), so
+// epochs never overlap, and
+//
+//	Wall_n = R_n = ceil_ms(arrival_key − b)
+//
+// raised to ceil_ms(Wall_{n−1} + Δ) if below it, where arrival_key is the
+// arrival of its first held video keyframe (its first held frame without
+// video). The constant offset is kept and only the drift is removed. A source
+// that fell behind (positive drift) leaves a wall gap of about the drift
+// between the two epochs; one that ran ahead drops about the drift, plus the
+// frames up to its next keyframe (Stats.DroppedBeforeKey).
 type Epoch struct {
 	ID    uint32
 	Start int64
@@ -84,6 +121,9 @@ type Stats struct {
 	// counts late tracks that joined their epoch late instead, because they
 	// had already opened a late-join epoch on this input.
 	LateJoins, LateTracks uint64
+	// DriftBreaks counts drift epochs. DroppedDrift counts the frames a drift
+	// epoch dropped so as not to overlap the previous epoch.
+	DriftBreaks, DroppedDrift uint64
 }
 
 // gate is a video track's start-of-epoch gate (rule 5).
@@ -103,7 +143,116 @@ const (
 	causeJump                // a jump against the high-water mark (rule 2)
 	causeLate                // a late-joining track
 	causeConfig              // a configuration change (rule 8)
+	causeDrift               // the released epoch's drift exceeded MaxDrift
 )
+
+// reanchors reports whether tracks running in the released epoch keep
+// emitting there until they join the pending epoch at their next video
+// keyframe (any frame for audio-only streams): the epoch re-anchors a
+// timeline that continues.
+func (w cause) reanchors() bool {
+	switch w {
+	case causeLate, causeDrift:
+		return true
+	case causeBreak, causeJump, causeConfig:
+	}
+	return false
+}
+
+// driftCfg is the drift setting of one epoch.
+type driftCfg struct {
+	max          time.Duration // 0 disables
+	positiveOnly bool
+}
+
+// newDriftCfg applies the MaxDrift clamp.
+func newDriftCfg(maxDrift time.Duration, positiveOnly bool) driftCfg {
+	switch {
+	case maxDrift <= 0:
+		maxDrift = 0
+	case maxDrift <= media.MaxAnchorLead:
+		maxDrift = 2 * media.MaxAnchorLead
+	}
+	return driftCfg{max: maxDrift, positiveOnly: positiveOnly}
+}
+
+// driftSec is the smallest offset among the frames released in one second of
+// arrivals.
+type driftSec struct {
+	sec int64
+	min time.Time
+	ok  bool
+}
+
+// driftState measures a released epoch's drift (see Epoch). Arrivals are
+// counted in whole seconds from the epoch's first released frame; an arrival
+// earlier than the current second counts in it.
+type driftState struct {
+	driftCfg
+	started  bool
+	t0       time.Time // arrival of the epoch's first released frame
+	sec      int64     // the current second
+	secMin   time.Time // smallest offset in it
+	recent   [driftWindow]driftSec
+	hasBase  bool
+	baseline time.Time     // smallest offset over the first driftWindow seconds
+	evals    int           // drift evaluations so far
+	last     time.Duration // the last drift evaluated
+	due      bool          // the drift exceeded max: the next keyframe opens a drift epoch
+}
+
+// observe records the offset of a frame released at arrival at.
+func (d *driftState) observe(at, off time.Time) {
+	if d.max == 0 || d.due {
+		return
+	}
+	if !d.started {
+		d.started, d.t0, d.sec, d.secMin = true, at, 0, off
+		return
+	}
+	sec := int64(at.Sub(d.t0) / time.Second)
+	if sec <= d.sec {
+		if off.Before(d.secMin) {
+			d.secMin = off
+		}
+		return
+	}
+	d.closeSec()
+	d.sec, d.secMin = sec, off
+	if sec > driftWindow {
+		d.evaluate()
+	}
+}
+
+// closeSec stores the current second, in the baseline too while it is one of
+// the first driftWindow seconds.
+func (d *driftState) closeSec() {
+	if d.sec < driftWindow && (!d.hasBase || d.secMin.Before(d.baseline)) {
+		d.hasBase, d.baseline = true, d.secMin
+	}
+	d.recent[d.sec%driftWindow] = driftSec{sec: d.sec, min: d.secMin, ok: true}
+}
+
+// evaluate computes the drift over the driftWindow seconds before the current
+// one, and sets due when it is out of bounds.
+func (d *driftState) evaluate() {
+	var lo time.Time
+	found := false
+	for _, s := range d.recent {
+		if s.ok && s.sec >= d.sec-driftWindow && (!found || s.min.Before(lo)) {
+			lo, found = s.min, true
+		}
+	}
+	if !found || !d.hasBase {
+		return
+	}
+	drift := lo.Sub(d.baseline)
+	d.evals++
+	d.last = drift
+	if drift > d.max || (drift < -d.max && !d.positiveOnly) {
+		d.due = true
+	}
+}
 
 // trackEpoch is one track's state within one epoch.
 type trackEpoch struct {
@@ -162,12 +311,13 @@ type epoch struct {
 	anchor      int64 // DTS of its first video keyframe, or base without one
 	jump        bool  // opened by a jump: unjoined tracks get rule 3's old test
 	audioOnly   bool  // released by VideoWait: the first keyframe opens the next epoch
+	drift       driftState
 }
 
 // heldFrame is a frame held by a pending epoch, in source time.
 type heldFrame struct {
 	f  media.Frame
-	at time.Time // arrival: Now() during its Push
+	at time.Time // arrival, as given to PushAt
 }
 
 // pending is an epoch that holds frames until it is released.
@@ -178,9 +328,18 @@ type pending struct {
 	hasKey    bool
 	keyPTS    int64 // smallest first-keyframe PTS among video tracks
 	hasAnchor bool
-	anchor    int64 // DTS of the first video keyframe held
+	anchor    int64     // DTS of the first video keyframe held
+	anchorAt  time.Time // its arrival
 	hasHW     bool
 	hw        int64 // largest source DTS accepted
+	drift     driftCfg
+
+	// A drift epoch's reset (see Epoch), cleared by a restart: the PTS of
+	// the frame that opened it, before which audio stays in the released
+	// epoch, and b, the released epoch's constant offset.
+	reset  bool
+	cut    int64
+	offset time.Duration
 }
 
 // Clock maps one stream's source time to stream time. It is not safe for
@@ -195,6 +354,8 @@ type Clock struct {
 	epochs      []Epoch
 	stats       Stats
 	out         []media.Frame
+	drift       driftCfg  // for epochs opened from now on
+	now         time.Time // arrival of the frame being pushed
 }
 
 // New returns a Clock with epoch 1 pending.
@@ -208,10 +369,13 @@ func New(opt Options) *Clock {
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
+	drift := newDriftCfg(opt.MaxDrift, opt.DriftPositiveOnly)
+	opt.MaxDrift = drift.max
 	return &Clock{
 		opt:         opt,
 		expectVideo: slices.Contains(opt.Kinds, media.KindVideo),
-		pend:        &pending{id: 1},
+		pend:        &pending{id: 1, drift: drift},
+		drift:       drift,
 	}
 }
 
@@ -222,10 +386,17 @@ func orDefault(v, def int64) int64 {
 	return v
 }
 
-// Push takes one frame in source time and returns the frames it releases, in
-// stream time and arrival order. f.Track must not be negative. A frame with
-// PTS below DTS is dropped and counted in Stats.DroppedInvalid.
+// Push is PushAt(f, Now()).
 func (c *Clock) Push(f media.Frame) []media.Frame {
+	return c.PushAt(f, c.opt.Now())
+}
+
+// PushAt takes one frame in source time, which arrived at arrival, and
+// returns the frames it releases, in stream time and arrival order. f.Track
+// must not be negative. A frame with PTS below DTS is dropped and counted in
+// Stats.DroppedInvalid.
+func (c *Clock) PushAt(f media.Frame, arrival time.Time) []media.Frame {
+	c.now = arrival
 	if f.PTS < f.DTS {
 		c.stats.DroppedInvalid++
 		return nil
@@ -265,6 +436,16 @@ func (c *Clock) Break(newInput bool) {
 	}
 	c.restart()
 	c.pend.cause = causeBreak
+}
+
+// SetDrift sets MaxDrift and DriftPositiveOnly, with the same clamp. It
+// applies to the pending epoch when one is pending (always after New and
+// right after Break), else from the next epoch opened.
+func (c *Clock) SetDrift(maxDrift time.Duration, positiveOnly bool) {
+	c.drift = newDriftCfg(maxDrift, positiveOnly)
+	if c.pend != nil {
+		c.pend.drift = c.drift
+	}
 }
 
 // Flush releases the frames held by a pending epoch.
@@ -405,6 +586,11 @@ func (c *Clock) acceptReleased(f media.Frame, t *track) {
 	c.hw = max(c.hw, f.DTS)
 
 	ep := c.cur
+	if c.pend == nil && ep.drift.due && c.opensDrift(f) {
+		c.openDrift(f)
+		c.join(f)
+		return
+	}
 	kind := c.kindOf(f)
 	switch kind {
 	case media.KindVideo:
@@ -449,7 +635,32 @@ func (c *Clock) acceptReleased(f media.Frame, t *track) {
 	if kind == media.KindAudio {
 		te.audioOut = true
 	}
-	c.emit(f, t, ep)
+	c.emit(f, t, ep, c.now)
+}
+
+// opensDrift reports whether f opens the drift epoch that the released epoch
+// is due: a video keyframe, or any frame of a stream without video. After an
+// audio-only release the first keyframe opens an epoch anyway (rule 6).
+func (c *Clock) opensDrift(f media.Frame) bool {
+	if !c.expectVideo {
+		return true
+	}
+	return c.kindOf(f) == media.KindVideo && f.Key && !c.cur.audioOnly
+}
+
+// openDrift opens a drift epoch at f (see Epoch).
+func (c *Clock) openDrift(f media.Frame) {
+	prev := c.cur
+	c.stats.DriftBreaks++
+	c.openPending(causeDrift)
+	p := c.pend
+	p.reset, p.cut, p.offset = true, f.PTS, prev.drift.baseline.Sub(prev.wall)
+}
+
+// driftEnd is the previous epoch's presentation end on its wall,
+// Wall_{n−1} + Δ, so far.
+func (c *Clock) driftEnd() time.Time {
+	return c.cur.wall.Add(media.ToDuration(c.nextStart(c.pend.id) - c.cur.start))
 }
 
 // lateJoin handles f, the first frame of a track that was not in the released
@@ -510,7 +721,7 @@ func (c *Clock) keepsReleased(f media.Frame, t *track) bool {
 	switch c.pend.cause {
 	case causeJump:
 		return t.cur.hasLast && c.isOld(f.DTS, t.cur.last)
-	case causeLate:
+	case causeLate, causeDrift:
 		return c.kindOf(f) == media.KindVideo && !f.Key && t.emittedIn(c.cur) && c.continues(f, t)
 	case causeBreak, causeConfig:
 	}
@@ -527,6 +738,16 @@ func (c *Clock) join(f media.Frame) {
 	if !p.hasHW || f.DTS > p.hw {
 		p.hw, p.hasHW = f.DTS, true
 	}
+	if p.reset {
+		if c.kindOf(f) == media.KindAudio && f.PTS < p.cut {
+			c.earlyAudio(f)
+			return
+		}
+		if c.now.Add(-p.offset).Before(c.driftEnd()) {
+			c.stats.DroppedDrift++ // its gates stay as they were
+			return
+		}
+	}
 
 	switch c.kindOf(f) {
 	case media.KindVideo:
@@ -538,7 +759,7 @@ func (c *Clock) join(f media.Frame) {
 			}
 			te.gate, te.keyPTS = gateRASL, f.PTS
 			if !p.hasAnchor {
-				p.anchor, p.hasAnchor = f.DTS, true
+				p.anchor, p.anchorAt, p.hasAnchor = f.DTS, c.now, true
 			}
 			if !p.hasKey || f.PTS < p.keyPTS {
 				p.hasKey, p.keyPTS = true, f.PTS
@@ -557,7 +778,7 @@ func (c *Clock) join(f media.Frame) {
 		}
 	}
 
-	p.held = append(p.held, heldFrame{f: f, at: c.opt.Now()})
+	p.held = append(p.held, heldFrame{f: f, at: c.now})
 	te.held++
 	c.tryRelease()
 }
@@ -595,12 +816,15 @@ func (c *Clock) dropEarlyAudio() {
 }
 
 // earlyAudio handles an audio frame presented before the pending epoch's
-// keyframe. In a late-join epoch, a track running in the released epoch
-// emits it there, since its frames up to that keyframe belong to it; any
-// other is dropped (rule 5).
+// keyframe. In a late-join or drift epoch, a track running in the released
+// epoch emits it there, since its frames up to that keyframe belong to it; any
+// other is dropped (rule 5). A drift epoch whose reset holds keeps only audio
+// before the frame that opened it: the frames after it are in the new epoch,
+// even when the drop dropped that frame.
 func (c *Clock) earlyAudio(f media.Frame) {
 	t := c.tracks[f.Track]
-	if c.pend.cause == causeLate && t.emittedIn(c.cur) {
+	p := c.pend
+	if p.cause.reanchors() && (!p.reset || f.PTS < p.cut) && t.emittedIn(c.cur) {
 		c.acceptReleased(f, t)
 		return
 	}
@@ -629,7 +853,7 @@ func (c *Clock) dropTrack(track int) {
 	p.hasKey, p.hasAnchor = false, false
 	for _, h := range p.held {
 		if c.kindOf(h.f) == media.KindVideo {
-			p.anchor, p.hasAnchor = h.f.DTS, true
+			p.anchor, p.anchorAt, p.hasAnchor = h.f.DTS, h.at, true
 			break
 		}
 	}
@@ -673,10 +897,10 @@ func (c *Clock) tryRelease() {
 	}
 }
 
-// awaitsRunning reports whether a late-join epoch holds no frame yet of a
-// track running in the released epoch.
+// awaitsRunning reports whether a late-join or drift epoch holds no frame yet
+// of a track running in the released epoch.
 func (c *Clock) awaitsRunning() bool {
-	if c.pend.cause != causeLate {
+	if !c.pend.cause.reanchors() {
 		return false
 	}
 	for _, t := range c.tracks {
@@ -719,11 +943,17 @@ func (c *Clock) release(audioOnly bool) {
 	ep := &epoch{
 		id: p.id, base: base, start: c.nextStart(p.id), anchor: base,
 		hasKey: p.hasKey, keyPTS: p.keyPTS, jump: p.cause == causeJump, audioOnly: audioOnly,
+		drift: driftState{driftCfg: p.drift},
 	}
 	if p.hasAnchor {
 		ep.anchor = p.anchor
 	}
-	ep.wall, ep.raw = c.placeWall(p.held[0].at, ep.start)
+	if p.reset {
+		ep.wall = c.placeDrift(p, ep.start)
+		ep.raw = ep.wall
+	} else {
+		ep.wall, ep.raw = c.placeWall(p.held[0].at, ep.start)
+	}
 	c.record(Epoch{ID: ep.id, Start: ep.start, Wall: ep.wall})
 	for _, t := range c.tracks {
 		switch {
@@ -738,9 +968,9 @@ func (c *Clock) release(audioOnly bool) {
 		default:
 			// Not joined: keep the previous lastSourceDTS for rule 3. Its
 			// first frame in the epoch is a late join, unless it was running
-			// in the previous epoch and a late-join epoch released (by
-			// VideoWait) before its keyframe: it is present, not late.
-			running := p.cause == causeLate && t.emittedIn(c.cur)
+			// in the previous epoch and a late-join or drift epoch released
+			// (by VideoWait) before its keyframe: it is present, not late.
+			running := p.cause.reanchors() && t.emittedIn(c.cur)
 			t.cur = trackEpoch{atStart: running, hasLast: t.cur.hasLast, last: t.cur.last}
 		}
 		t.pend = trackEpoch{}
@@ -751,7 +981,7 @@ func (c *Clock) release(audioOnly bool) {
 		if c.kindOf(h.f) == media.KindAudio {
 			t.cur.audioOut = true
 		}
-		c.emit(h.f, t, ep)
+		c.emit(h.f, t, ep, h.at)
 	}
 }
 
@@ -791,6 +1021,18 @@ func (c *Clock) placeWall(arrival time.Time, start int64) (wall, raw time.Time) 
 	return later(wall, prev.wall.Add(time.Millisecond)), raw
 }
 
+// placeDrift returns the wall of a drift epoch p that starts at stream time
+// start (see Epoch); R is the same value.
+func (c *Clock) placeDrift(p *pending, start int64) time.Time {
+	prev := c.cur
+	at := p.held[0].at
+	if p.hasAnchor {
+		at = p.anchorAt
+	}
+	end := ceilMS(prev.wall.Add(media.ToDuration(start - prev.start)))
+	return later(ceilMS(at.Add(-p.offset)), end)
+}
+
 func later(a, b time.Time) time.Time {
 	if b.After(a) {
 		return b
@@ -817,7 +1059,7 @@ func (c *Clock) record(e Epoch) {
 
 // openPending opens the next epoch. Every track starts unjoined.
 func (c *Clock) openPending(why cause) {
-	c.pend = &pending{id: c.cur.id + 1, cause: why}
+	c.pend = &pending{id: c.cur.id + 1, cause: why, drift: c.drift}
 	for _, t := range c.tracks {
 		t.pend = trackEpoch{}
 	}
@@ -825,12 +1067,14 @@ func (c *Clock) openPending(why cause) {
 
 // restart drops the pending epoch's held frames and starts it again (rule 8).
 // Joined tracks stay joined and keep lastSourceDTS; their next accepted frame
-// rejoins the restarted epoch.
+// rejoins the restarted epoch. A restarted drift epoch loses its reset: the
+// frames that restarted it are on another timeline, so it is placed by the
+// ordinary rule.
 func (c *Clock) restart() {
 	p := c.pend
 	c.stats.DroppedStale += uint64(len(p.held))
 	clear(p.held)
-	*p = pending{id: p.id, cause: p.cause, held: p.held[:0]}
+	*p = pending{id: p.id, cause: p.cause, held: p.held[:0], drift: p.drift}
 	for _, t := range c.tracks {
 		t.pend.held, t.pend.gate, t.pend.audioOut = 0, gateKey, false
 		if t.pend.joined {
@@ -839,12 +1083,14 @@ func (c *Clock) restart() {
 	}
 }
 
-// emit maps f into ep (rule 7) and appends it to the output.
-func (c *Clock) emit(f media.Frame, t *track, ep *epoch) {
+// emit maps f, which arrived at at, into ep (rule 7), measures ep's drift,
+// and appends f to the output.
+func (c *Clock) emit(f media.Frame, t *track, ep *epoch, at time.Time) {
 	off := ep.start - ep.base
 	f.PTS += off
 	f.DTS += off
 	f.Epoch = ep.id
+	ep.drift.observe(at, at.Add(-media.ToDuration(f.DTS-ep.start)))
 	if !ep.hasDTS || f.DTS > ep.maxDTS {
 		ep.hasDTS, ep.maxDTS = true, f.DTS
 	}

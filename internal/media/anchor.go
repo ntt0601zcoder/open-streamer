@@ -4,6 +4,8 @@ import "time"
 
 // MaxAnchorLead bounds how far past the source's own timing an epoch's wall
 // is pushed to keep it from overlapping the previous epoch (see clock.Epoch).
+// A Clock's drift limit (clock.Options.MaxDrift) must exceed it; a smaller
+// non-zero limit is raised to twice MaxAnchorLead.
 const MaxAnchorLead = time.Second
 
 // Anchor maps one epoch's stream time to wallclock: stream time Start (90 kHz
