@@ -745,24 +745,66 @@ func TestDemuxHostileSampleCount(t *testing.T) {
 }
 
 // A traf that starts before the end of the previous traf of its track in
-// the same segment is an error.
+// the same segment is clamped to that end when the overlap is at most one
+// sample duration (the first sample's), and counted; a larger overlap is an
+// error, and a rejected segment counts nothing.
 func TestDemuxOverlappingTrafs(t *testing.T) {
 	video := gop2(t)
 	init, err := fmp4.Init(video[0].Config)
 	require.NoError(t, err)
-	d, err := fmp4.NewDemuxer(init)
-	require.NoError(t, err)
 	cto := func(f media.Frame) int32 { return int32(f.PTS - f.DTS) }
 	first := ctoSegment(t, video[:25], 1, cto)
-	// The second fragment starts half a frame before the first one ends:
-	// after its last sample's DTS, before its end.
-	second := shift(video[25:], -1800)
-	_, err = d.Segment(append(bytes.Clone(first), ctoSegment(t, second, 2, cto)...))
+	for _, overlap := range []int64{1, 1800, 3600} {
+		d, err := fmp4.NewDemuxer(init)
+		require.NoError(t, err)
+		second := shift(video[25:], -overlap)
+		out, err := d.Segment(append(bytes.Clone(first), ctoSegment(t, second, 2, cto)...))
+		require.NoError(t, err, "overlap %d", overlap)
+		require.Len(t, out, 50)
+		sameFrames(t, video, out) // the second traf moved back to the first one's end
+		assert.Equal(t, uint64(1), d.Stats().ClampedOverlaps, "overlap %d", overlap)
+	}
+
+	d, err := fmp4.NewDemuxer(init)
+	require.NoError(t, err)
+	// More than a sample: rejected. The first traf's size-0 sample is not
+	// counted, since nothing of the segment is taken.
+	withEmpty := append(append([]media.Frame(nil), video[:25]...), media.Frame{DTS: video[24].DTS + 3600})
+	second := shift(video[25:], -3601-3600)
+	_, err = d.Segment(append(ctoSegment(t, withEmpty, 1, cto), ctoSegment(t, second, 2, cto)...))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "backwards")
+	assert.Equal(t, fmp4.DemuxStats{}, d.Stats(), "a rejected segment counts nothing")
 	// Each alone is fine.
 	_, err = d.Segment(first)
 	require.NoError(t, err)
+}
+
+// A sample position outside the segment in a skipped track's trun skips
+// that track's samples; the kept track's frames still come out.
+func TestDemuxUnsupportedTrackBadOffset(t *testing.T) {
+	video := gop2(t)[:25]
+	cfg := video[0].Config
+	in := mp4.CreateEmptyInit()
+	in.AddEmptyTrack(1000, "wvtt", "und").Mdia.Minf.Stbl.Stsd.AddChild(mp4.NewWvttBox())
+	vt := in.AddEmptyTrack(90000, "video", "und")
+	require.NoError(t, vt.SetAVCDescriptor("avc1", cfg.SPS, cfg.PPS, true))
+	d, err := fmp4.NewDemuxer(encodeInit(t, in))
+	require.NoError(t, err)
+
+	text, err := mp4.CreateFragment(1, 1)
+	require.NoError(t, err)
+	text.AddFullSample(mp4.FullSample{Sample: mp4.Sample{Dur: 1000, Size: 4}, Data: []byte("vtte")})
+	tb := encodeFrag(t, text)
+	i := bytes.Index(tb, []byte("trun"))
+	require.Positive(t, i)
+	require.NotZero(t, tb[i+7]&0x01, "trun carries a data offset")
+	binary.BigEndian.PutUint32(tb[i+12:], 0x7fffffff) // far past the segment
+	vseg, _, err := fmp4.Segment(video, cfg, 1)
+	require.NoError(t, err)
+	out, err := d.Segment(append(tb, retrack(t, vseg, 2)...))
+	require.NoError(t, err)
+	sameFrames(t, video, out)
 }
 
 // Samples without frame data are dropped and counted: size 0, and video

@@ -47,6 +47,10 @@ type DemuxStats struct {
 	// DroppedEmpty counts samples that carry no frame: size 0, or video
 	// samples holding only parameter sets and access unit delimiters.
 	DroppedEmpty uint64
+	// ClampedOverlaps counts trafs whose decode time started before the end
+	// of the previous traf of their track in the segment, by at most their
+	// first sample's duration, and were moved to that end.
+	ClampedOverlaps uint64
 }
 
 // Demuxer reads frames from the media segments of a fragmented MP4 stream.
@@ -272,11 +276,14 @@ func (d *Demuxer) Stats() DemuxStats { return d.stats }
 // from a media.NALClassifier, and configs go through a media.ConfigCache so
 // that an unchanged config keeps its pointer. Samples without frame data
 // (size 0, or video holding only parameter sets) are counted in
-// DemuxStats.DroppedEmpty. A segment declaring more samples than one per
-// byte plus maxSampleSlack (at most maxSegmentSamples), a traf starting
-// before the end of the previous traf of its track in the segment, or a
-// sample outside every mdat is an error, and no frame of the segment is
-// returned. Frames do not alias b.
+// DemuxStats.DroppedEmpty. A traf starting before the end of the previous
+// traf of its track in the segment by at most its first sample's duration
+// is moved to that end (DemuxStats.ClampedOverlaps). A segment declaring
+// more samples than one per byte plus maxSampleSlack (at most
+// maxSegmentSamples), a traf starting earlier than that, or a sample of a
+// kept track outside every mdat is an error, no frame of the segment is
+// returned and no counter changes; the samples of a skipped track are never
+// read, so their positions are not checked. Frames do not alias b.
 func (d *Demuxer) Segment(b []byte) ([]media.Frame, error) {
 	frames, err := d.segment(bytes.Clone(b))
 	if err != nil {
@@ -357,7 +364,6 @@ func (d *Demuxer) segment(b []byte) ([]media.Frame, error) {
 		}
 	}
 	raw, next := rd.raw, rd.next
-	d.stats.DroppedEmpty += rd.empty
 	times := make([][]timed, len(d.tracks))
 	shifts := make([]int64, len(d.tracks))
 	for i, t := range d.tracks {
@@ -366,6 +372,8 @@ func (d *Demuxer) segment(b []byte) ([]media.Frame, error) {
 		}
 	}
 
+	d.stats.DroppedEmpty += rd.empty
+	d.stats.ClampedOverlaps += rd.clamped
 	per := make([][]media.Frame, len(d.tracks))
 	for i, t := range d.tracks {
 		t.next = next[i]
@@ -409,12 +417,13 @@ func countSamples(moof []byte) (uint64, error) {
 // segReader collects the samples of one segment before any of them changes
 // the demuxer's state.
 type segReader struct {
-	b     []byte
-	mdats []boxRef
-	raw   [][]sample // per track, samples with data
-	next  []uint64   // per track, decode time after the last sample
-	seen  []bool     // per track, a traf was read in this segment
-	empty uint64     // size-0 samples of kept tracks
+	b       []byte
+	mdats   []boxRef
+	raw     [][]sample // per track, samples with data
+	next    []uint64   // per track, decode time after the last sample
+	seen    []bool     // per track, a traf was read in this segment
+	empty   uint64     // size-0 samples of kept tracks
+	clamped uint64     // trafs moved to the previous traf's end
 }
 
 // readMoof appends the samples of every traf of a kept track to rd.raw and
@@ -437,6 +446,12 @@ func (d *Demuxer) readMoof(rd *segReader, moof *mp4.MoofBox) error {
 		switch {
 		case tfhd.HasBaseDataOffset():
 			if tfhd.BaseDataOffset > uint64(len(b)) {
+				if t == nil {
+					// A skipped track's data is never read: only a later
+					// traf relying on its end can fail.
+					prevEnd = -1
+					continue
+				}
 				return fmt.Errorf("track %d: base data offset %d beyond the segment", tfhd.TrackID, tfhd.BaseDataOffset)
 			}
 			base = int64(tfhd.BaseDataOffset)
@@ -445,21 +460,26 @@ func (d *Demuxer) readMoof(rd *segReader, moof *mp4.MoofBox) error {
 		default:
 			base = prevEnd
 		}
-		pos := base
-		var dts uint64
-		if t != nil {
-			dts = rd.next[t.idx]
+		if t == nil {
+			prevEnd = skippedEnd(traf, tfhd, trex, base)
+			continue
 		}
+		pos := base
+		dts := rd.next[t.idx]
 		if traf.Tfdt != nil {
 			dts = traf.Tfdt.BaseMediaDecodeTime()
 		}
-		if t != nil {
-			if dts > maxMediaTime {
-				return fmt.Errorf("track %d: decode time %d: %w", t.id, dts, errTimeRange)
-			}
-			if rd.seen[t.idx] && dts < rd.next[t.idx] {
+		if dts > maxMediaTime {
+			return fmt.Errorf("track %d: decode time %d: %w", t.id, dts, errTimeRange)
+		}
+		if rd.seen[t.idx] && dts < rd.next[t.idx] {
+			// A start up to one sample early is a rounding slip of the
+			// packager: move it to the previous end.
+			if rd.next[t.idx]-dts > uint64(firstDuration(traf, tfhd, trex)) {
 				return fmt.Errorf("track %d: decode time goes backwards from %d to %d", t.id, rd.next[t.idx], dts)
 			}
+			dts = rd.next[t.idx]
+			rd.clamped++
 		}
 		for _, trun := range traf.Truns {
 			if trun.HasDataOffset() {
@@ -470,11 +490,9 @@ func (d *Demuxer) readMoof(rd *segReader, moof *mp4.MoofBox) error {
 					return fmt.Errorf("track %d: sample %d at %d outside the segment", tfhd.TrackID, k, pos)
 				}
 				dur, size := sampleDefaults(trun, tfhd, trex, s)
-				switch {
-				case t == nil:
-				case size == 0:
+				if size == 0 {
 					rd.empty++
-				default:
+				} else {
 					if !inMdat(rd.mdats, pos, size) {
 						return fmt.Errorf("track %d: sample %d (%d bytes at %d) outside every mdat", t.id, k, size, pos)
 					}
@@ -496,16 +514,44 @@ func (d *Demuxer) readMoof(rd *segReader, moof *mp4.MoofBox) error {
 			}
 		}
 		prevEnd = pos
-		if t != nil {
-			// dts started at most maxMediaTime and grew by at most
-			// maxSegmentSamples durations of 32 bits: no wrap.
-			if dts > maxMediaTime {
-				return fmt.Errorf("track %d: decode time %d: %w", t.id, dts, errTimeRange)
-			}
-			rd.next[t.idx], rd.seen[t.idx] = dts, true
+		// dts started at most maxMediaTime and grew by at most
+		// maxSegmentSamples durations of 32 bits: no wrap.
+		if dts > maxMediaTime {
+			return fmt.Errorf("track %d: decode time %d: %w", t.id, dts, errTimeRange)
 		}
+		rd.next[t.idx], rd.seen[t.idx] = dts, true
 	}
 	return nil
+}
+
+// skippedEnd returns the end of a skipped track's traf data, which starts at
+// base, without checking any position: the samples are never read. The sum
+// cannot wrap, as the segment declares at most maxSegmentSamples samples of
+// at most 2^32 bytes.
+func skippedEnd(traf *mp4.TrafBox, tfhd *mp4.TfhdBox, trex *mp4.TrexBox, base int64) int64 {
+	pos := base
+	for _, trun := range traf.Truns {
+		if trun.HasDataOffset() {
+			pos = base + int64(trun.DataOffset)
+		}
+		for _, s := range trun.Samples {
+			_, size := sampleDefaults(trun, tfhd, trex, s)
+			pos += size
+		}
+	}
+	return pos
+}
+
+// firstDuration returns the duration of a traf's first sample, 0 when it
+// has none.
+func firstDuration(traf *mp4.TrafBox, tfhd *mp4.TfhdBox, trex *mp4.TrexBox) uint32 {
+	for _, trun := range traf.Truns {
+		if len(trun.Samples) > 0 {
+			dur, _ := sampleDefaults(trun, tfhd, trex, trun.Samples[0])
+			return dur
+		}
+	}
+	return 0
 }
 
 // sampleDefaults returns a sample's duration and size: from the trun, else
