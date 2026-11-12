@@ -60,3 +60,24 @@ func TestHLSKeyAndByteRangeErrors(t *testing.T) {
 		assert.Error(t, err, name)
 	}
 }
+
+// Playlist lines can carry credentials (signed URIs, key URLs): errors must
+// not quote them.
+func TestParseErrorsQuoteNoLine(t *testing.T) {
+	const secret = "s3cret"
+	cases := []string{
+		"#EXTM3U\nhttps://u:" + secret + "@h/a.ts\n",
+		"#EXTM3U\n#EXT-X-BYTERANGE:10\n#EXTINF:1,\nhttps://h/a.ts?token=" + secret + "\n",
+		"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://h/k?token=" + secret + "\n#EXTINF:1,\na.ts\n",
+		"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://h/k?token=" + secret + "\"x\n#EXTINF:1,\na.ts\n",
+		"#EXTM3U\n#EXT-X-MAP:" + secret + "\n#EXTINF:1,\na.ts\n",
+	}
+	for _, src := range cases {
+		_, err := ParseMedia([]byte(src))
+		require.Error(t, err, src)
+		assert.NotContains(t, err.Error(), secret, src)
+	}
+	_, err := ParseMultivariant([]byte("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,URI=\"https://h/a?token=" + secret + "\n"))
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), secret)
+}

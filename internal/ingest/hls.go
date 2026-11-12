@@ -25,6 +25,12 @@ const (
 	// liveStartSegments is how far from the end a live playlist is joined
 	// (RFC 8216 §6.3.3).
 	liveStartSegments = 3
+	// maxTargetDuration caps EXT-X-TARGETDURATION, which sets the reload
+	// interval and StallTimeout, so neither can grow without bound.
+	maxTargetDuration = 60 * time.Second
+	// maxRetryDelay caps the wait before a failed fetch is tried again; the
+	// wait is a quarter target below it.
+	maxRetryDelay = 500 * time.Millisecond
 )
 
 var (
@@ -47,19 +53,22 @@ const (
 // hlsReader pulls a media playlist of MPEG-TS segments. The segments between
 // two timeline breaks are one run: they feed one demuxer in order, so a PES
 // may span segments. Every break (EXT-X-DISCONTINUITY, a skipped segment, a
-// reader that fell behind the live window) ends the run with
-// ErrDiscontinuity, and the next run has a new demuxer and timestamp
-// decoder; the config cache is shared, so equal configs keep their pointer.
+// reader that fell behind the live window, a playlist that restarted) ends
+// the run with ErrDiscontinuity, and the next run has a new demuxer and
+// timestamp decoder; the config cache is shared, so equal configs keep their
+// pointer. A reload that returns an older copy of the playlist, as
+// load-balanced edges do, is ignored.
 //
 // All fetching happens in the Read goroutine, as the demuxer reads.
 type hlsReader struct {
-	rawURL string // the input URL, reloaded as given
-	client *http.Client
-	ctx    context.Context // cancelled by Close
-	cancel context.CancelFunc
-	now    func() time.Time
-	spec   Spec
-	target time.Duration // EXT-X-TARGETDURATION of the first load
+	rawURL    string // the input URL, reloaded as given
+	client    *http.Client
+	transport *http.Transport // the reader's own, when Env.HTTP is nil
+	ctx       context.Context // cancelled by Close
+	cancel    context.CancelFunc
+	now       func() time.Time
+	spec      Spec
+	target    time.Duration // EXT-X-TARGETDURATION of the first load
 
 	// Read goroutine only.
 	pl      hls.MediaPlaylist
@@ -73,7 +82,7 @@ type hlsReader struct {
 
 	segments, segmentErrors, skipped  atomic.Uint64
 	fellBehind, reloads, reloadErrors atomic.Uint64
-	discontinuities                   atomic.Uint64
+	discontinuities, restarts, stale  atomic.Uint64
 
 	mu     sync.Mutex // guards the fields below
 	run    *tsReader
@@ -85,7 +94,8 @@ type hlsReader struct {
 // openHLS starts a reader on a playlist fetched from final, whose load began
 // at loaded, and reads up to the first PMT. Every request runs under rctx,
 // which the reader owns and Close cancels (cancel); openHTTP cancels it when
-// the open ctx ends first.
+// the open ctx ends first. Without Env.HTTP the reader has its own client,
+// whose connections are kept alive between fetches and closed with it.
 func openHLS(rctx context.Context, cancel context.CancelFunc, client *http.Client, rawURL string,
 	body []byte, final *url.URL, loaded time.Time, env Env,
 ) (*hlsReader, error) {
@@ -93,17 +103,26 @@ func openHLS(rctx context.Context, cancel context.CancelFunc, client *http.Clien
 		rawURL: rawURL, client: client, ctx: rctx, cancel: cancel, now: env.now(),
 		loaded: loaded, grew: true, done: map[string]uint64{},
 	}
-	if err := r.setPlaylist(body, final); err != nil {
+	pl, err := parsePlaylist(body)
+	if err != nil {
 		return nil, r.errf("open", err)
 	}
-	r.target = time.Duration(r.pl.TargetDuration) * time.Second
+	r.pl, r.base = pl, final
+	r.target = time.Duration(min(pl.TargetDuration, int(maxTargetDuration/time.Second))) * time.Second
 	r.spec = Spec{Pace: true, Live: true, StallTimeout: r.target * 3 / 2}
+	if env.HTTP == nil {
+		r.transport = newTransport()
+		r.transport.MaxIdleConnsPerHost = 2
+		r.transport.IdleConnTimeout = 2 * r.target
+		r.client = &http.Client{Transport: r.transport}
+	}
 	r.next = r.pl.MediaSequence
 	if !r.pl.Ended {
 		r.next = r.liveStart()
 	}
 	r.arrival = r.now()
 	if err := r.startRun(); err != nil {
+		r.closeIdle()
 		if errors.Is(err, io.EOF) {
 			err = errors.New("playlist ended before the first PMT")
 		}
@@ -116,28 +135,46 @@ func (r *hlsReader) errf(op string, err error) error {
 	return fmt.Errorf("ingest: hls: %s %s: %w", op, Redact(r.rawURL), err)
 }
 
-// setPlaylist parses a playlist fetched from final and makes it current.
-func (r *hlsReader) setPlaylist(body []byte, final *url.URL) error {
+// parsePlaylist parses a media playlist and checks that it can be played.
+func parsePlaylist(body []byte) (hls.MediaPlaylist, error) {
 	if bytes.Contains(body, []byte("#EXT-X-STREAM-INF")) {
-		return errHLSMultivariant
+		return hls.MediaPlaylist{}, errHLSMultivariant
 	}
 	pl, err := hls.ParseMedia(body)
 	if err != nil {
-		return fmt.Errorf("parse playlist: %w", err)
+		return hls.MediaPlaylist{}, fmt.Errorf("parse playlist: %w", err)
 	}
 	if pl.TargetDuration <= 0 {
-		return errors.New("playlist has no EXT-X-TARGETDURATION")
+		return hls.MediaPlaylist{}, errors.New("playlist has no EXT-X-TARGETDURATION")
 	}
 	for _, s := range pl.Segments {
 		if s.Key.Method != "" && s.Key.Method != "NONE" {
-			return errHLSEncrypted
+			return hls.MediaPlaylist{}, errHLSEncrypted
 		}
 		if s.Map != "" {
-			return errHLSFMP4
+			return hls.MediaPlaylist{}, errHLSFMP4
 		}
 	}
-	r.pl, r.base = pl, final
-	return nil
+	return pl, nil
+}
+
+// windowEnd returns the media sequence number after the playlist's last
+// segment.
+func windowEnd(pl hls.MediaPlaylist) uint64 {
+	return pl.MediaSequence + uint64(len(pl.Segments))
+}
+
+// restarted reports whether pl, which ends before the current playlist,
+// restarted the stream rather than being an older copy of it. An older copy
+// lags by at most a window and has the same discontinuity sequence.
+func (r *hlsReader) restarted(pl hls.MediaPlaylist) bool {
+	window := uint64(max(len(r.pl.Segments), liveStartSegments))
+	return pl.DiscontinuitySequence != r.pl.DiscontinuitySequence || windowEnd(pl)+window < windowEnd(r.pl)
+}
+
+// retryDelay is the wait before a failed fetch is tried again.
+func (r *hlsReader) retryDelay() time.Duration {
+	return min(r.target/4, maxRetryDelay)
 }
 
 // liveStart returns the media sequence number liveStartSegments from the
@@ -236,14 +273,17 @@ func (r *hlsReader) nextSegment(started bool) ([]byte, runEnd, error) {
 		if err := r.ctx.Err(); err != nil {
 			return nil, runFailed, err
 		}
-		first := r.pl.MediaSequence
-		end := first + uint64(len(r.pl.Segments))
+		first, end := r.pl.MediaSequence, windowEnd(r.pl)
 		switch {
 		case r.next < first || r.next > end:
 			// The wanted segment left the window, or the playlist restarted
-			// below it: rejoin the live edge.
+			// below it (reload accepts no older copy): rejoin the live edge.
+			if r.next < first {
+				r.fellBehind.Add(1)
+			} else {
+				r.restarts.Add(1)
+			}
 			r.next = r.liveStart()
-			r.fellBehind.Add(1)
 			if started {
 				return nil, runBreak, nil
 			}
@@ -284,7 +324,12 @@ func (r *hlsReader) fetchSegment(s hls.Segment) ([]byte, error) {
 		r.segmentErrors.Add(1)
 		return nil, fmt.Errorf("segment uri: %w", err)
 	}
-	for range 2 {
+	for try := range 2 {
+		if try > 0 {
+			if err := r.sleepUntil(time.Now().Add(r.retryDelay())); err != nil {
+				return nil, err
+			}
+		}
 		var data []byte
 		data, _, err = r.get(u, s.ByteRange, maxSegmentBytes)
 		if err == nil {
@@ -300,7 +345,8 @@ func (r *hlsReader) fetchSegment(s hls.Segment) ([]byte, error) {
 }
 
 // reload waits out the reload interval, then loads the playlist again,
-// retrying once.
+// retrying once. An older copy than the current playlist is ignored and
+// counts as a load without a new segment.
 func (r *hlsReader) reload() error {
 	interval := r.target
 	if !r.grew {
@@ -309,10 +355,18 @@ func (r *hlsReader) reload() error {
 	if err := r.sleepUntil(r.loaded.Add(interval)); err != nil {
 		return err
 	}
-	prevEnd := r.pl.MediaSequence + uint64(len(r.pl.Segments))
-	var err error
-	for range 2 {
-		if err = r.loadPlaylist(); err == nil {
+	var (
+		pl    hls.MediaPlaylist
+		final *url.URL
+		err   error
+	)
+	for try := range 2 {
+		if try > 0 {
+			if err := r.sleepUntil(time.Now().Add(r.retryDelay())); err != nil {
+				return err
+			}
+		}
+		if pl, final, err = r.loadPlaylist(); err == nil {
 			break
 		}
 		if r.ctx.Err() != nil {
@@ -324,21 +378,29 @@ func (r *hlsReader) reload() error {
 		return fmt.Errorf("reload: %w", err)
 	}
 	r.reloads.Add(1)
-	r.grew = r.pl.MediaSequence+uint64(len(r.pl.Segments)) > prevEnd
+	prevEnd := windowEnd(r.pl)
+	if windowEnd(pl) < prevEnd && !r.restarted(pl) {
+		r.stale.Add(1)
+		r.grew = false
+		return nil
+	}
+	r.grew = windowEnd(pl) > prevEnd
+	r.pl, r.base = pl, final
 	return nil
 }
 
-func (r *hlsReader) loadPlaylist() error {
+func (r *hlsReader) loadPlaylist() (hls.MediaPlaylist, *url.URL, error) {
 	r.loaded = time.Now()
 	u, err := url.Parse(r.rawURL)
 	if err != nil {
-		return errors.New("invalid url")
+		return hls.MediaPlaylist{}, nil, errors.New("invalid url")
 	}
 	body, final, err := r.get(u, nil, maxPlaylistBytes)
 	if err != nil {
-		return err
+		return hls.MediaPlaylist{}, nil, err
 	}
-	return r.setPlaylist(body, final)
+	pl, err := parsePlaylist(body)
+	return pl, final, err
 }
 
 // sleepUntil waits until t or Close.
@@ -374,10 +436,19 @@ func (r *hlsReader) get(u *url.URL, br *hls.ByteRange, limit int64) ([]byte, *ur
 	if err != nil {
 		return nil, nil, stripURLError(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_ = resp.Body.Close()
+		if r.ctx.Err() != nil {
+			// Close may have run before this connection went idle.
+			r.closeIdle()
+		}
+	}()
 	partial := false
 	switch {
 	case br != nil && resp.StatusCode == http.StatusPartialContent:
+		if err := checkContentRange(resp.Header.Get("Content-Range"), br); err != nil {
+			return nil, nil, err
+		}
 		partial, limit = true, br.Length
 	case resp.StatusCode == http.StatusOK && br != nil:
 		// The server ignored Range: cut the range out of the whole body.
@@ -389,7 +460,7 @@ func (r *hlsReader) get(u *url.URL, br *hls.ByteRange, limit int64) ([]byte, *ur
 	default:
 		return nil, nil, fmt.Errorf("status %s", resp.Status)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	body, err := readLimited(resp.Body, resp.ContentLength, limit)
 	if err != nil {
 		return nil, nil, stripURLError(err)
 	}
@@ -409,6 +480,49 @@ func (r *hlsReader) get(u *url.URL, br *hls.ByteRange, limit int64) ([]byte, *ur
 	return body, resp.Request.URL, nil
 }
 
+// checkContentRange checks that a 206 answers the requested range.
+func checkContentRange(header string, br *hls.ByteRange) error {
+	var from, to int64
+	if _, err := fmt.Sscanf(header, "bytes %d-%d/", &from, &to); err != nil {
+		return fmt.Errorf("206 with Content-Range %q", header)
+	}
+	if from != br.Offset || to != br.Offset+br.Length-1 {
+		return fmt.Errorf("asked bytes %d-%d, got %d-%d", br.Offset, br.Offset+br.Length-1, from, to)
+	}
+	return nil
+}
+
+// readLimited reads up to limit+1 bytes of rd, preallocating for size bytes
+// when the size is known (>= 0).
+func readLimited(rd io.Reader, size, limit int64) ([]byte, error) {
+	n := int64(512)
+	if size >= 0 {
+		n = min(size, limit) + 1
+	}
+	b := make([]byte, 0, n)
+	lr := io.LimitReader(rd, limit+1)
+	for {
+		m, err := lr.Read(b[len(b):cap(b)])
+		b = b[:len(b)+m]
+		if errors.Is(err, io.EOF) {
+			return b, nil
+		}
+		if err != nil {
+			return b, err //nolint:wrapcheck // the caller wraps.
+		}
+		if len(b) == cap(b) {
+			b = append(b, 0)[:len(b)]
+		}
+	}
+}
+
+// closeIdle closes the idle connections of the reader's own transport.
+func (r *hlsReader) closeIdle() {
+	if r.transport != nil {
+		r.transport.CloseIdleConnections()
+	}
+}
+
 // Kinds implements Reader.
 func (r *hlsReader) Kinds() []media.Kind {
 	r.mu.Lock()
@@ -425,7 +539,7 @@ func (r *hlsReader) Spec() Spec { return r.spec }
 // Stats implements Reader.
 func (r *hlsReader) Stats() map[string]uint64 {
 	r.mu.Lock()
-	out := make(map[string]uint64, len(r.done)+7)
+	out := make(map[string]uint64, len(r.done)+9)
 	for k, v := range r.done {
 		out[k] = v
 	}
@@ -442,6 +556,8 @@ func (r *hlsReader) Stats() map[string]uint64 {
 	out["playlist_reloads"] = r.reloads.Load()
 	out["playlist_errors"] = r.reloadErrors.Load()
 	out["discontinuities"] = r.discontinuities.Load()
+	out["playlist_restarts"] = r.restarts.Load()
+	out["stale_playlists"] = r.stale.Load()
 	return out
 }
 
@@ -455,6 +571,7 @@ func (r *hlsReader) Close() error {
 	if run != nil {
 		_ = run.Close()
 	}
+	r.closeIdle()
 	return nil
 }
 

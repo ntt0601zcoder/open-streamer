@@ -26,13 +26,22 @@ const httpTimeout = 10 * time.Second
 // never ends. Keep-alives are off: a streaming pull gains nothing from
 // connection reuse, and an idle pool would hold a connection (and its
 // goroutines) for every failed attempt of a retry loop, e.g. a bare 503.
-var defaultClient = &http.Client{Transport: &http.Transport{
-	Proxy:                 http.ProxyFromEnvironment,
-	DialContext:           (&net.Dialer{Timeout: httpTimeout}).DialContext,
-	TLSHandshakeTimeout:   httpTimeout,
-	ResponseHeaderTimeout: httpTimeout,
-	DisableKeepAlives:     true,
-}}
+var defaultClient = &http.Client{Transport: func() *http.Transport {
+	t := newTransport()
+	t.DisableKeepAlives = true
+	return t
+}()}
+
+// newTransport returns a transport with the default client's dial, TLS
+// handshake and response header timeouts.
+func newTransport() *http.Transport {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: httpTimeout}).DialContext,
+		TLSHandshakeTimeout:   httpTimeout,
+		ResponseHeaderTimeout: httpTimeout,
+	}
+}
 
 // stripURLError drops the URL that net/http embeds in its errors.
 func stripURLError(err error) error {
@@ -117,13 +126,14 @@ func openHTTP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, er
 		if r != nil {
 			_ = r.Close()
 		}
+		// doHTTP's errors already carry the prefix and the URL.
 		switch {
 		case err == nil:
-			err = ctx.Err()
+			return nil, httpErr(rawURL, "open", ctx.Err())
 		case !errors.Is(err, ctx.Err()):
-			err = fmt.Errorf("%w: %w", err, ctx.Err())
+			return nil, fmt.Errorf("%w: %w", err, ctx.Err())
 		}
-		return nil, httpErr(rawURL, "open", err)
+		return nil, err
 	}
 	if err != nil {
 		cancel()
