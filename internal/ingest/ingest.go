@@ -218,6 +218,8 @@ func Open(ctx context.Context, rawURL string, env Env) (Reader, error) {
 	switch p.scheme {
 	case schemeFile:
 		return openFile(ctx, p, env)
+	case schemeSRT:
+		return openSRT(ctx, rawURL, p, env)
 	default:
 		return nil, fmt.Errorf("ingest: open %s: %s inputs are not available yet", Redact(rawURL), p.scheme)
 	}
