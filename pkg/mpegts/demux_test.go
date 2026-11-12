@@ -978,10 +978,9 @@ func TestDemuxMalformedPES(t *testing.T) {
 
 func TestDemuxMaxPES(t *testing.T) {
 	b := newTS().base().
-		pes(tVideo, pesBytes(1, -1, payloadOf(5000, 1), false), 0).
+		pes(tVideo, pesBytes(1, -1, payloadOf(2<<20, 1), false), 0).
 		pes(tVideo, pesBytes(2, -1, payloadOf(100, 2), false), 0)
-	d := NewDemux(bytes.NewReader(b.bytes()))
-	d.maxPES = 1000
+	d := NewDemuxWithOptions(bytes.NewReader(b.bytes()), DemuxOptions{MaxPES: 1 << 20})
 	var got []*PES
 	for {
 		ev, err := d.Next()
@@ -995,7 +994,52 @@ func TestDemuxMaxPES(t *testing.T) {
 	}
 	require.Len(t, got, 1)
 	assert.Equal(t, int64(2), got[0].PTS)
+	assert.Equal(t, payloadOf(100, 2), got[0].Data)
 	assert.Equal(t, uint64(1), d.Stats().PESErrors)
+	assert.Equal(t, uint64(1), d.Stats().LostPES)
+}
+
+func TestDemuxMaxTotal(t *testing.T) {
+	const size = 600 << 10
+	// A holds 600 KiB; B crosses the 1 MiB cap and is dropped; A ends with the
+	// next PES on its PID, freeing room for C.
+	b := newTS().psi(0, patSection(0, 1, tPMT)).
+		psi(tPMT, pmtSection(1, 0, 0x100, Stream{0x100, tH264}, Stream{0x101, tH264}, Stream{0x102, tH264})).
+		pes(0x100, pesBytes(1, -1, payloadOf(size, 1), false), 0).
+		pes(0x101, pesBytes(2, -1, payloadOf(size, 2), false), 0).
+		pes(0x100, pesBytes(4, -1, payloadOf(10, 4), false), 0).
+		pes(0x102, pesBytes(3, -1, payloadOf(size, 3), false), 0)
+	d := NewDemuxWithOptions(bytes.NewReader(b.bytes()), DemuxOptions{MaxTotal: 1 << 20})
+	big := map[uint16][]byte{}
+	for {
+		ev, err := d.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		if ev.PES != nil && len(ev.PES.Data) >= size {
+			big[ev.PES.PID] = ev.PES.Data
+		}
+	}
+	assert.Equal(t, uint64(1), d.Stats().LostPES)
+	require.Len(t, big, 2)
+	assert.Equal(t, payloadOf(size, 1), big[0x100])
+	assert.Equal(t, payloadOf(size, 3), big[0x102])
+}
+
+func TestDemuxLostPESOnCCGap(t *testing.T) {
+	pkts := splitPES(tVideo, pesBytes(1, -1, payloadOf(600, 1), true), 0, counter(0))
+	b := newTS().base()
+	b.raw(pkts[0]).raw(pkts[1]).raw(pkts[3])
+	for _, p := range splitPES(tVideo, pesBytes(2, -1, payloadOf(10, 2), true), 0, counter(4)) {
+		b.raw(p)
+	}
+	evs, st := demuxBytes(t, b.bytes())
+	assert.Equal(t, uint64(1), st.LostPES)
+	assert.Equal(t, uint64(1), st.CCErrors)
+	ps := videoOf(evs)
+	require.Len(t, ps, 1)
+	assert.True(t, ps[0].Discontinuity)
 }
 
 func TestDemuxReadError(t *testing.T) {

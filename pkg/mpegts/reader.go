@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 )
 
 const (
@@ -62,8 +63,10 @@ func (r *Reader) Stats() ReaderStats {
 
 // Next returns the next valid packet. Its Payload aliases the reader's buffer
 // and is valid only until the next call. Next returns io.EOF at the end of
-// the input; a trailing partial packet is dropped. A read error other than
-// io.EOF is returned as is, after every complete packet read before it.
+// the input; a trailing partial packet is dropped. A read error is returned as
+// is, after every complete packet read before it. A timeout (a net.Error whose
+// Timeout reports true) is returned for that call only: buffered bytes are
+// kept and the next call reads on. Any other error ends the Reader for good.
 func (r *Reader) Next() (Packet, error) {
 	for {
 		if err := r.fill(1); err != nil {
@@ -106,9 +109,15 @@ func (r *Reader) lock() error {
 		if err := r.fill(1); err != nil {
 			return err
 		}
-		if r.buf[r.pos] == syncByte && r.confirm() {
-			r.locked = true
-			return nil
+		if r.buf[r.pos] == syncByte {
+			ok, err := r.confirm()
+			if err != nil {
+				return err
+			}
+			if ok {
+				r.locked = true
+				return nil
+			}
 		}
 		r.pos++
 		skipped++
@@ -117,22 +126,33 @@ func (r *Reader) lock() error {
 
 // confirm reports whether the bytes one and two packets after r.pos are sync
 // bytes. A position the input ends before counts as matching; the error that
-// ended the input is returned by the following fill.
-func (r *Reader) confirm() bool {
+// ended the input is returned by the following fill. A recoverable timeout is
+// returned so the scan can resume.
+func (r *Reader) confirm() (bool, error) {
 	for k := 1; k <= 2; k++ {
 		off := k * PacketSize
-		if r.fill(off+1) != nil {
-			return true
+		if err := r.fill(off + 1); err != nil {
+			if isTimeout(err) {
+				return false, err
+			}
+			return true, nil
 		}
 		if r.buf[r.pos+off] != syncByte {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
+}
+
+// isTimeout reports whether err is a recoverable read timeout.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // fill makes at least need bytes available from r.pos. It returns the
 // reader's terminal error (io.EOF or a read error) when the input ends first.
+// A timeout is returned without being stored.
 func (r *Reader) fill(need int) error {
 	for r.end-r.pos < need {
 		if r.err != nil {
@@ -145,6 +165,8 @@ func (r *Reader) fill(need int) error {
 		n, err := r.rd.Read(r.buf[r.end:])
 		r.end += n
 		switch {
+		case err != nil && isTimeout(err):
+			return err
 		case err != nil:
 			r.err = err
 		case n == 0:

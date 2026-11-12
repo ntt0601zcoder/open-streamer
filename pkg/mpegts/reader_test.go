@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -329,3 +330,62 @@ func (d *dataErrReader) Read(p []byte) (int, error) {
 type zeroReader struct{}
 
 func (zeroReader) Read([]byte) (int, error) { return 0, nil }
+
+// timeoutErr is a net.Error that reports a timeout.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+// timeoutReader returns a timeout after each chunk of data it has served.
+type timeoutReader struct {
+	chunks [][]byte
+	slept  bool
+}
+
+func (t *timeoutReader) Read(p []byte) (int, error) {
+	if !t.slept && len(t.chunks) == 1 {
+		t.slept = true
+		return 0, timeoutErr{}
+	}
+	if len(t.chunks) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, t.chunks[0])
+	t.chunks[0] = t.chunks[0][n:]
+	if len(t.chunks[0]) == 0 {
+		t.chunks = t.chunks[1:]
+	}
+	return n, nil
+}
+
+func TestReaderTimeoutIsNotSticky(t *testing.T) {
+	raw := readH264AAC(t)
+	// The timeout lands in the middle of the fourth packet.
+	cut := 3*PacketSize + 50
+	r := NewReader(&timeoutReader{chunks: [][]byte{raw[:cut], raw[cut : 8*PacketSize]}})
+	for range 3 {
+		_, err := r.Next()
+		require.NoError(t, err)
+	}
+	_, err := r.Next()
+	var ne net.Error
+	require.True(t, errors.As(err, &ne))
+	assert.True(t, ne.Timeout())
+	p, err := r.Next()
+	require.NoError(t, err, "the Reader recovers after a timeout")
+	want, _ := parsePacket(raw[3*PacketSize : 4*PacketSize])
+	assert.Equal(t, want.PID, p.PID)
+	assert.Equal(t, want.CC, p.CC)
+
+	// Any other error still ends the Reader.
+	boom := errors.New("boom")
+	r = NewReader(io.MultiReader(bytes.NewReader(raw[:PacketSize]), iotest.ErrReader(boom)))
+	_, err = r.Next()
+	require.NoError(t, err)
+	_, err = r.Next()
+	assert.Same(t, boom, err)
+	_, err = r.Next()
+	assert.Same(t, boom, err)
+}
