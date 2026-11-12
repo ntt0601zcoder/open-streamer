@@ -55,6 +55,7 @@ var supportedTypes = map[uint8]streamInfo{
 
 type track struct {
 	idx    int
+	pid    uint16
 	kind   media.Kind
 	codec  media.Codec
 	config *media.TrackConfig // nil while the parameter sets are invalid
@@ -134,7 +135,7 @@ func (d *Demuxer) applyPMT(pmt *mpegts.PMT) {
 				continue
 			}
 			t := &track{
-				idx: len(d.tracks), kind: info.kind, codec: info.codec,
+				idx: len(d.tracks), pid: s.PID, kind: info.kind, codec: info.codec,
 				vps: map[uint32][]byte{}, sps: map[uint32][]byte{}, pps: map[uint32][]byte{},
 			}
 			d.tracks = append(d.tracks, t)
@@ -171,6 +172,15 @@ func (d *Demuxer) TrackKinds() []media.Kind {
 		kinds[i] = t.kind
 	}
 	return kinds
+}
+
+// TrackPIDs returns the PID of each track, by track index.
+func (d *Demuxer) TrackPIDs() []uint16 {
+	pids := make([]uint16, len(d.tracks))
+	for i, t := range d.tracks {
+		pids[i] = t.pid
+	}
+	return pids
 }
 
 // Skipped describes the PMT entries that are not demuxed.
