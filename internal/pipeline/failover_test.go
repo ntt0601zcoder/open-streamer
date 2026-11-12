@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/clock"
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
@@ -22,14 +23,17 @@ var (
 	videoAud  = []media.Kind{media.KindVideo, media.KindAudio}
 )
 
+// idxGOP is the GOP of idxFrames, in frames.
+const idxGOP = 30
+
 // idxFrames returns the video frames of source indexes [from, to) on reader
-// track 0: DTS idx×vDur, a key every gop indexes, Data {marker, idx},
+// track 0: DTS idx×vDur, a key every idxGOP indexes, Data {marker, idx},
 // arriving at base plus their DTS.
-func idxFrames(from, to, gop int, marker byte, base time.Time) []step {
+func idxFrames(from, to int, marker byte, base time.Time) []step {
 	out := make([]step, 0, to-from)
 	for i := from; i < to; i++ {
 		d := int64(i) * vDur
-		f := media.Frame{Track: 0, Config: videoCfg, DTS: d, PTS: d, Key: i%gop == 0, Data: [][]byte{{marker, byte(i >> 8), byte(i)}}}
+		f := media.Frame{Track: 0, Config: videoCfg, DTS: d, PTS: d, Key: i%idxGOP == 0, Data: [][]byte{{marker, byte(i >> 8), byte(i)}}}
 		out = append(out, step{f: ingest.Frame{Frame: f, Arrival: base.Add(media.ToDuration(d))}})
 	}
 	return out
@@ -90,6 +94,26 @@ func frames(ds []hub.Delivery) []media.Frame {
 	return out
 }
 
+// waitCall waits for an After(d) call: once it is reported, its timer is
+// registered, so advancing the time cannot overtake the arming.
+func waitCall(t *testing.T, ft *fakeTime, d time.Duration) {
+	t.Helper()
+	for {
+		got, ok := ft.nextCall()
+		require.True(t, ok, "no After(%v)", d)
+		if got == d {
+			return
+		}
+	}
+}
+
+// drainCalls forgets the After calls made so far.
+func drainCalls(ft *fakeTime) {
+	for len(ft.calls) > 0 {
+		<-ft.calls
+	}
+}
+
 func timeout(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
@@ -97,59 +121,91 @@ func timeout(t *testing.T) context.Context {
 }
 
 func TestFailoverOneEpoch(t *testing.T) {
-	ft, ev := newFakeTime(), newEvents()
 	boom := errors.New("boom")
-	r0 := newFakeReader(videoOnly, ingest.Spec{}, append(idxFrames(0, 50, 30, 0, fakeT0), step{err: boom}), false)
-	var r1 *fakeReader
-	m := byURL{
-		"fake://0": one(r0),
-		// The backup carries the same source from the frame after input 0's
-		// last, which is mid-GOP: its first key is index 60.
-		"fake://1": standby(videoOnly, func(n int) (ingest.Reader, error) {
-			if n > 1 {
-				return nil, errors.New("reopened")
+	for name, tc := range map[string]struct {
+		steps0 []step // input 0's, then boom
+		from1  int    // input 1's first source index
+		events []EventKind
+		lost0  int // input 0's frames read but not written
+	}{
+		// Input 0 ends cleanly; the backup carries the same source from the
+		// frame after input 0's last, which is mid-GOP: its first key is
+		// index 60.
+		"clean end": {
+			steps0: idxFrames(0, 50, 0, fakeT0),
+			from1:  50,
+			events: []EventKind{EventActive, EventFailed, EventActive},
+		},
+		// Input 0 breaks its timeline mid-GOP and fails before its next key:
+		// the Clock drops its frames 50-54; the backup starts at 55.
+		"lost tail": {
+			steps0: append(append(idxFrames(0, 50, 0, fakeT0), step{err: ingest.ErrDiscontinuity}), idxFrames(50, 55, 0, fakeT0)...),
+			from1:  55,
+			events: []EventKind{EventActive, EventDiscontinuity, EventFailed, EventActive},
+			lost0:  5,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ft, ev := newFakeTime(), newEvents()
+			r0 := newFakeReader(videoOnly, ingest.Spec{}, append(append([]step{}, tc.steps0...), step{err: boom}), false)
+			m := byURL{
+				"fake://0": one(r0),
+				"fake://1": standby(videoOnly, func(n int) (ingest.Reader, error) {
+					if n > 1 {
+						return nil, errors.New("reopened")
+					}
+					return newFakeReader(videoOnly, ingest.Spec{}, idxFrames(tc.from1, 150, 1, fakeT0), true), nil
+				}),
 			}
-			r1 = newFakeReader(videoOnly, ingest.Spec{}, idxFrames(50, 150, 30, 1, fakeT0), true)
-			return r1, nil
-		}),
-	}
-	h := hub.New(hub.Options{})
-	sub := h.Subscribe("t", 1<<16)
-	opt := multiOptions(ft, m, ev, "fake://0", "fake://1")
-	opt.EndOnEOF = true
-	p := New(h, opt)
-	require.NoError(t, p.Run(timeout(t)))
+			h := hub.New(hub.Options{})
+			sub := h.Subscribe("t", 1<<16)
+			opt := multiOptions(ft, m, ev, "fake://0", "fake://1")
+			opt.EndOnEOF = true
+			var p *Pipeline
+			var atFailure clock.Stats // the Clock's drops up to input 0's failure
+			opt.OnEvent = func(e Event) {
+				if e.Kind == EventFailed {
+					atFailure = p.Stats().Clock
+				}
+				ev.on(e)
+			}
+			p = New(h, opt)
+			require.NoError(t, p.Run(timeout(t)))
 
-	require.Equal(t, []EventKind{EventActive, EventFailed, EventActive}, ev.kinds())
-	assert.Equal(t, 0, ev.evs[0].Input)
-	assert.Equal(t, 0, ev.evs[1].Input)
-	assert.ErrorIs(t, ev.evs[1].Err, boom)
-	assert.Equal(t, 1, ev.evs[2].Input)
-	st := p.Stats()
-	assert.Equal(t, uint64(1), st.Switches)
-	assert.True(t, m["fake://1"].reader(0).isClosed(), "the start-up standby reader is closed")
-	assert.True(t, r0.isClosed())
+			require.Equal(t, tc.events, ev.kinds())
+			failed := ev.evs[len(ev.evs)-2]
+			assert.Equal(t, 0, failed.Input)
+			assert.ErrorIs(t, failed.Err, boom)
+			assert.Equal(t, 1, ev.evs[len(ev.evs)-1].Input)
+			st := p.Stats()
+			assert.Equal(t, uint64(1), st.Switches)
+			assert.True(t, m["fake://1"].reader(0).isClosed(), "the start-up standby reader is closed")
+			assert.True(t, r0.isClosed())
 
-	ds := drain(sub)
-	assert.Len(t, epochsOf(ds), 2, "exactly one more epoch")
-	assert.Nil(t, conform.CheckFrames(frames(ds), conform.FrameOptions{}))
-	seen := map[int]bool{}
-	written0 := 0
-	for _, d := range ds {
-		seen[frameIdx(d.Frame)] = true
-		if d.Frame.Data[0][0] == 0 {
-			written0++
-		}
+			ds := drain(sub)
+			assert.Len(t, epochsOf(ds), 2, "exactly one more epoch")
+			assert.Nil(t, conform.CheckFrames(frames(ds), conform.FrameOptions{}))
+			seen := map[int]bool{}
+			written0 := 0
+			for _, d := range ds {
+				seen[frameIdx(d.Frame)] = true
+				if d.Frame.Data[0][0] == 0 {
+					written0++
+				}
+			}
+			gap := 0
+			for i := range 150 {
+				if !seen[i] {
+					gap++
+				}
+			}
+			unwritten0 := r0.framesRead() - written0
+			dropped1 := int(st.Clock.DroppedBeforeKey - atFailure.DroppedBeforeKey)
+			assert.Equal(t, tc.lost0, unwritten0, "input 0's frames read but not written")
+			assert.Equal(t, gap, unwritten0+dropped1, "the gap is input 0's unwritten frames plus input 1's frames before its key")
+			assert.Equal(t, 10, gap, "indexes 50-59")
+		})
 	}
-	gap := 0
-	for i := range 150 {
-		if !seen[i] {
-			gap++
-		}
-	}
-	lost := (r0.framesRead() - written0) + int(st.Clock.DroppedBeforeKey)
-	assert.Equal(t, gap, lost, "the gap is input 0's unwritten frames plus input 1's frames before its key")
-	assert.Equal(t, 10, gap, "indexes 50-59")
 }
 
 func TestFailoverTrackMismatch(t *testing.T) {
@@ -479,4 +535,217 @@ func TestPipelinePassiveReconnect(t *testing.T) {
 	assert.Len(t, epochsOf(ds), 2, "the reconnect is one epoch")
 	assert.Len(t, ds, len(first)+len(second))
 	assert.Nil(t, conform.CheckFrames(frames(ds), conform.FrameOptions{}))
+}
+
+// deadThenHealthy returns an opener whose first open is the start-up standby,
+// whose opens up to dead fail as given (a reader that never delivers when
+// err is nil) and whose later opens return a healthy, never-ending reader.
+func deadThenHealthy(dead int, err error, healthy func() ingest.Reader) *opener {
+	return standby(videoOnly, func(n int) (ingest.Reader, error) {
+		if n <= dead {
+			if err != nil {
+				return nil, err
+			}
+			return newFakeReader(videoOnly, ingest.Spec{}, nil, false), nil
+		}
+		return healthy(), nil
+	})
+}
+
+func TestFailoverSearchReachesLowest(t *testing.T) {
+	ft, ev := newFakeTime(), newEvents()
+	boom := errors.New("boom")
+	// Input 0 delivers 2 s, fails, and its reopens never deliver; input 1's
+	// open succeeds but never delivers; input 2 is healthy.
+	r0 := newFakeReader(videoOnly, ingest.Spec{}, append(vFrames(50, 25, 0), step{err: boom}), false)
+	o0 := &opener{next: func(n int, _ context.Context) (ingest.Reader, error) {
+		if n == 0 {
+			return r0, nil
+		}
+		return newFakeReader(videoOnly, ingest.Spec{}, nil, false), nil
+	}}
+	m := byURL{
+		"fake://0": o0,
+		"fake://1": deadThenHealthy(1<<30, nil, nil),
+		"fake://2": deadThenHealthy(0, nil, func() ingest.Reader {
+			return newFakeReader(videoOnly, ingest.Spec{}, vFrames(50, 25, 50*vDur), false)
+		}),
+	}
+	opt := multiOptions(ft, m, ev, "fake://0", "fake://1", "fake://2")
+	var mu sync.Mutex
+	var activeAt time.Time
+	opt.OnEvent = func(e Event) {
+		if e.Kind == EventActive && e.Input == 2 {
+			mu.Lock()
+			activeAt = ft.Now()
+			mu.Unlock()
+		}
+		ev.on(e)
+	}
+	p := New(hub.New(hub.Options{}), opt)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	res := make(chan error, 1)
+	go func() { res <- p.Run(ctx) }()
+
+	e, ok := ev.next()
+	require.True(t, ok)
+	require.Equal(t, Event{Kind: EventActive, Input: 0}, e)
+	drainCalls(ft) // the start-up timers were armed before the activation
+	e, ok = ev.next()
+	require.True(t, ok)
+	require.Equal(t, EventFailed, e.Kind)
+	require.Equal(t, 0, e.Input)
+	failedAt := ft.Now()
+	// Input 1's try ends at its start timeout: advance once its timer is
+	// armed. The calls checked at the end are the ones from here on.
+	var calls []time.Duration
+	for {
+		d, ok := ft.nextCall()
+		require.True(t, ok, "input 1's start timer")
+		calls = append(calls, d)
+		if d == defaultStartTimeout {
+			break
+		}
+	}
+	require.Eventually(t, func() bool { return m["fake://1"].count() == 2 }, 5*time.Second, time.Millisecond, "input 1 tried")
+	ft.Advance(defaultStartTimeout)
+	e, ok = ev.next()
+	require.True(t, ok)
+	require.Equal(t, EventFailed, e.Kind)
+	require.Equal(t, 1, e.Input, "input 1 fails its start")
+	e, ok = ev.next()
+	require.True(t, ok)
+	require.Equal(t, Event{Kind: EventActive, Input: 2}, e, "the search goes on to input 2, not back to input 0")
+	mu.Lock()
+	assert.LessOrEqual(t, activeAt.Sub(failedAt), 2*defaultStartTimeout)
+	mu.Unlock()
+	assert.Equal(t, 1, o0.count(), "input 0 not retried before input 2 was tried")
+	assert.Equal(t, uint64(1), p.Stats().Switches)
+	cancel()
+	require.ErrorIs(t, <-res, context.Canceled)
+	// No timer was armed for a retry the search would not start (input 0's
+	// and input 1's 0.5 s backoffs).
+	for len(ft.calls) > 0 {
+		calls = append(calls, <-ft.calls)
+	}
+	assert.NotContains(t, calls, firstRetry)
+}
+
+func TestFailoverAllDeadThenRecover(t *testing.T) {
+	ft, ev := newFakeTime(), newEvents()
+	boom := errors.New("boom")
+	down := errors.New("down")
+	r0 := newFakeReader(videoOnly, ingest.Spec{}, append(vFrames(50, 25, 0), step{err: boom}), false)
+	var mu sync.Mutex
+	opens := map[string][]time.Duration{}
+	record := func(u string, o *opener) *opener {
+		next := o.next
+		o.next = func(n int, ctx context.Context) (ingest.Reader, error) {
+			mu.Lock()
+			opens[u] = append(opens[u], ft.Now().Sub(fakeT0))
+			mu.Unlock()
+			return next(n, ctx)
+		}
+		return o
+	}
+	m := byURL{
+		"fake://0": record("0", &opener{next: func(n int, _ context.Context) (ingest.Reader, error) {
+			if n == 0 {
+				return r0, nil
+			}
+			return nil, down
+		}}),
+		// Input 1 is down for its search try, then recovers.
+		"fake://1": record("1", deadThenHealthy(1, down, func() ingest.Reader {
+			return newFakeReader(videoOnly, ingest.Spec{}, vFrames(50, 25, 50*vDur), false)
+		})),
+		"fake://2": record("2", deadThenHealthy(1<<30, down, nil)),
+	}
+	opt := multiOptions(ft, m, ev, "fake://0", "fake://1", "fake://2")
+	p := New(hub.New(hub.Options{}), opt)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	res := make(chan error, 1)
+	go func() { res <- p.Run(ctx) }()
+
+	// Input 0 fails at 0 s; the search tries 1, then 2: all three are dead.
+	e, ok := ev.next()
+	require.True(t, ok)
+	require.Equal(t, Event{Kind: EventActive, Input: 0}, e)
+	for _, in := range []int{0, 1, 2} {
+		e, ok = ev.next()
+		require.True(t, ok)
+		require.Equal(t, EventFailed, e.Kind)
+		require.Equal(t, in, e.Input)
+	}
+	// Every input waits 0.5 s; then all three reopen at once and input 1,
+	// recovered, becomes active. Inputs 0 and 2 may be closed by that
+	// activation before their open errors are taken, so they may not report
+	// EventFailed.
+	waitCall(t, ft, firstRetry)
+	ft.Advance(firstRetry)
+	for {
+		e, ok = ev.next()
+		require.True(t, ok)
+		if e.Kind == EventActive {
+			assert.Equal(t, Event{Kind: EventActive, Input: 1}, e)
+			break
+		}
+		require.Equal(t, EventFailed, e.Kind)
+	}
+	assert.Equal(t, uint64(1), p.Stats().Switches)
+	cancel()
+	require.ErrorIs(t, <-res, context.Canceled)
+	mu.Lock()
+	defer mu.Unlock()
+	half := 500 * time.Millisecond
+	assert.Equal(t, []time.Duration{0, half}, opens["0"])
+	assert.Equal(t, []time.Duration{0, 0, half}, opens["1"])
+	assert.Equal(t, []time.Duration{0, 0, half}, opens["2"])
+}
+
+func TestBackgroundPassiveNotJudged(t *testing.T) {
+	ft, ev := newFakeTime(), newEvents()
+	// Input 0 is active throughout; the passive input 1 fails its first open,
+	// then listens again after its backoff, with frames that are dropped.
+	r0 := newFakeReader(videoOnly, ingest.Spec{}, vFrames(50, 25, 0), false)
+	r1 := newFakeReader(videoOnly, ingest.Spec{Live: true}, vFrames(25, 25, 0), false)
+	m := byURL{
+		"fake://0": one(r0),
+		"passive://1": &opener{next: func(n int, _ context.Context) (ingest.Reader, error) {
+			if n == 0 {
+				return nil, errors.New("port busy")
+			}
+			return r1, nil
+		}},
+	}
+	opt := multiOptions(ft, m, ev, "fake://0", "passive://1")
+	opt.Parse = passiveParse
+	opt.StallTimeout = time.Minute // input 0 never stalls in this test
+	p := New(hub.New(hub.Options{}), opt)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	res := make(chan error, 1)
+	go func() { res <- p.Run(ctx) }()
+
+	got := map[EventKind]int{}
+	for range 2 {
+		e, ok := ev.next()
+		require.True(t, ok)
+		got[e.Kind] = e.Input
+	}
+	require.Equal(t, map[EventKind]int{EventActive: 0, EventFailed: 1}, got)
+	ft.Advance(500 * time.Millisecond)
+	<-r1.blocked // the listener's frames were all read
+	ft.Advance(defaultStartTimeout + time.Second)
+	select {
+	case e := <-ev.c:
+		t.Fatalf("unexpected event %+v", e)
+	case <-time.After(100 * time.Millisecond):
+	}
+	assert.False(t, r1.isClosed(), "the background listener keeps listening")
+	assert.Equal(t, 0, p.Stats().Active)
+	cancel()
+	require.ErrorIs(t, <-res, context.Canceled)
 }
