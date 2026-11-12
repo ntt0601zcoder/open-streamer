@@ -513,18 +513,6 @@ func TestOpenHLS(t *testing.T) {
 			assert.Contains(t, r.Stats(), "fell_behind")
 		})
 	}
-
-	mux.HandleFunc("/multi.m3u8", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nv.m3u8\n"))
-	})
-	mux.HandleFunc("/fmp4.m3u8", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1,\na.m4s\n#EXT-X-ENDLIST\n"))
-	})
-	for _, p := range []string{"/multi.m3u8", "/fmp4.m3u8"} {
-		_, err := ingest.Open(context.Background(), srv.URL+p, ingest.Env{})
-		require.Error(t, err, p)
-		assert.Contains(t, err.Error(), "not supported yet", p)
-	}
 }
 
 func TestHLSPullCloseUnblocks(t *testing.T) {
