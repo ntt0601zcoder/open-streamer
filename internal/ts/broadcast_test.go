@@ -538,3 +538,24 @@ func TestRemapRebindResetsAssembly(t *testing.T) {
 	assert.Equal(t, uint64(1), d.Stats().LostFrames)
 	assert.False(t, d.tracks[0].ptsLess)
 }
+
+func TestFieldCodedH264WithAUDs(t *testing.T) {
+	_, pps := h264Params(t)
+	top, bottom := idrSlice(true, 40), pSlice(true, 41)
+	b := newTSBuilder(t)
+	b.program(h264Stream)
+	// Each field is preceded by an AUD, in one PES with PTS != DTS: a
+	// field-coded track never splits a PES, so both fields stay one frame.
+	b.videoPES(videoPID, 7200, 3600, joinNALUs(nalAUD, fieldSPS, pps, top, nalAUD, bottom))
+	b.videoPES(videoPID, 10800, 7200, joinNALUs(nalAUD, pSlice(true, 42), nalAUD, pSlice(true, 43)))
+
+	d, frames := demuxAll(t, b.buf.Bytes())
+	require.Len(t, frames, 2)
+	assert.Equal(t, [][]byte{top, bottom}, frames[0].Data)
+	assert.Len(t, frames[1].Data, 2)
+	st := d.Stats()
+	assert.Zero(t, st.SplitAUsReordered)
+	assert.Zero(t, st.SplitAUs)
+	assert.Zero(t, st.SplitAUsNoRoom)
+	assert.Zero(t, st.DroppedNoConfig)
+}

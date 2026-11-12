@@ -625,21 +625,32 @@ func (t *track) leadsAU(typ uint8) bool {
 	return typ == 6
 }
 
+// fieldCoded reports an H.264 track with an SPS that allows field coding
+// (frame_mbs_only_flag == 0: PAFF or MBAFF). The fields of a frame commonly
+// share one PES, each starting with first_mb_in_slice == 0 and often with an
+// AUD, and their order is unknown without POC, so such a track never splits:
+// each PES stays one frame, and a PES without PTS continues it.
+func (t *track) fieldCoded() bool {
+	return t.codec == media.CodecH264 && len(t.fieldSPS) > 0
+}
+
 // splitsOnSlice reports whether a first slice after a slice starts a new
-// access unit. H.264 fields of one frame each start with
-// first_mb_in_slice == 0 and commonly share a PES, so a track whose SPS
-// allow field coding (frame_mbs_only_flag == 0), or with no SPS yet, splits
-// only on AUD.
+// access unit: always for H.265, and for H.264 only once SPS are known and
+// all are progressive (frame_mbs_only_flag == 1).
 func (t *track) splitsOnSlice() bool {
 	if t.codec == media.CodecH265 {
 		return true
 	}
-	return len(t.sps) > 0 && len(t.fieldSPS) == 0
+	return len(t.sps) > 0 && !t.fieldCoded()
 }
 
 // startsAU reports a NAL unit that starts an access unit when it follows a
-// slice.
+// slice: an AUD, or a first slice when splitsOnSlice. Nothing does on a
+// field-coded track.
 func (t *track) startsAU(typ uint8, n []byte) bool {
+	if t.fieldCoded() {
+		return false
+	}
 	return t.isAUD(typ) || t.isVCL(typ) && t.isFirstSlice(typ, n) && t.splitsOnSlice()
 }
 
@@ -666,7 +677,8 @@ func (t *track) countAUs(nalus [][]byte) int {
 // starts an access unit and completes the pending one. A PES without PTS
 // continues the pending unit. Inside either, an AUD or (see splitsOnSlice) a
 // first slice after a slice starts another access unit, a split unit, timed
-// by releaseGroup once the next PES with a PTS arrives.
+// by releaseGroup once the next PES with a PTS arrives. A field-coded H.264
+// track never splits (see fieldCoded).
 //
 // A Discontinuity counts one lost access unit for the lost data. On a track
 // that carries PES without PTS the pending unit may be missing data, so it is
