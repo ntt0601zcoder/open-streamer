@@ -939,3 +939,69 @@ func TestClockEpochsKeepsLast64(t *testing.T) {
 	assert.Equal(t, uint32(7), ids[0])
 	assert.Equal(t, uint32(70), ids[63])
 }
+
+// wallRun feeds epochs of one second of 25 fps video, each opened by
+// Break, whose last frame is presented three frames after its DTS (B-frame
+// reordering), so each epoch's presentation runs 120 ms past its last DTS.
+// Frame i arrives at t0 + arrive(i). It returns every epoch's arrival (the
+// time its first frame was pushed) and wall.
+func wallRun(t *testing.T, epochs int, arrive func(i int) time.Duration) (arrivals, walls []time.Time) {
+	t.Helper()
+	t0 := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	clk := t0
+	c := New(Options{Kinds: []media.Kind{media.KindVideo}, Now: func() time.Time { return clk }})
+	i := 0
+	for e := range epochs {
+		if e > 0 {
+			c.Break()
+		}
+		run := videoRun(int64(e)*1000*vDur, videoGOP)
+		run[len(run)-1].PTS += 3 * vDur
+		for j, f := range run {
+			clk = t0.Add(arrive(i))
+			i++
+			if j == 0 {
+				arrivals = append(arrivals, clk)
+			}
+			c.Push(f)
+		}
+		eps := c.Epochs()
+		require.Len(t, eps, min(e+1, maxEpochs))
+		walls = append(walls, eps[len(eps)-1].Wall)
+	}
+	return arrivals, walls
+}
+
+// A live source delivers in real time and cannot wait out each epoch's
+// presentation-end excess: the lead of the wall over arrival is bounded by
+// MaxAnchorLead instead of growing by 120 ms per epoch, and walls stay
+// whole milliseconds and increasing.
+func TestClockWallLiveLeadBounded(t *testing.T) {
+	frame := 40 * time.Millisecond
+	arrivals, walls := wallRun(t, 200, func(i int) time.Duration { return time.Duration(i) * frame })
+	for n := range walls {
+		lead := walls[n].Sub(arrivals[n])
+		assert.GreaterOrEqual(t, lead, time.Duration(0), "epoch %d", n+1)
+		assert.LessOrEqual(t, lead, media.MaxAnchorLead+time.Millisecond, "epoch %d", n+1)
+		assert.Equal(t, walls[n], walls[n].Truncate(time.Millisecond), "epoch %d", n+1)
+		if n > 0 {
+			assert.True(t, walls[n].After(walls[n-1]), "epoch %d", n+1)
+		}
+	}
+	// While the lead is under the cap, epochs do not overlap: epoch 2 starts
+	// where epoch 1's presentation ends (25 frames plus the 120 ms excess).
+	assert.Equal(t, walls[0].Add(25*frame+3*frame), walls[1])
+	assert.Equal(t, 3*frame, walls[1].Sub(arrivals[1]))
+	// The excess has added up to the cap, which is what bounds it.
+	assert.Greater(t, walls[len(walls)-1].Sub(arrivals[len(walls)-1]), media.MaxAnchorLead-3*frame)
+}
+
+// A source read faster than real time (here all at once) keeps its decode
+// timing: epochs follow each other by their presentation spans, as before.
+func TestClockWallFloodKeepsStreamTiming(t *testing.T) {
+	arrivals, walls := wallRun(t, 5, func(int) time.Duration { return 0 })
+	for n := 1; n < len(walls); n++ {
+		assert.Equal(t, walls[n-1].Add(28*40*time.Millisecond), walls[n], "epoch %d", n+1)
+	}
+	assert.Equal(t, arrivals[0], walls[0])
+}

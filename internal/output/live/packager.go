@@ -10,15 +10,23 @@
 //
 // When an epoch's first segment is packaged, the packager places the epoch
 // on the wallclock once. AST is the wall of the first anchor ever packaged.
-// The epoch's start relative to AST, rounded up to the millisecond, is
+// The hub's anchor wall is already the epoch's effective wall (the Clock
+// keeps epochs from overlapping without letting the lead accumulate; see
+// clock.Epoch), so the epoch's start relative to AST is
 //
-//	start_1 = anchor_1.Wall − AST
-//	start_n = max(anchor_n.Wall − AST, start_{n−1} + (anchor_n.Start − anchor_{n−1}.Start)/90000 s)
+//	start_n = max(ceil_ms(anchor_n.Wall − AST), start_{n−1} + 1 ms)
 //
-// and its effective wall is W_n = AST + start_n. Every wallclock value the
-// outputs derive (HLS program date-time, DASH period start, segment
-// availability) goes through W_n, never the raw anchor wall, so an epoch
-// never starts before the previous epoch's media has been presented.
+// and its effective wall is W_n = AST + start_n. Clock walls are whole
+// milliseconds, so W_n equals the anchor wall and a pipeline pacing on the
+// anchor releases frames exactly at the wall the outputs advertise. Every
+// wallclock value the outputs derive (HLS program date-time, DASH period
+// start, segment availability) goes through W_n, never a raw arrival time.
+//
+// An epoch without a hub anchor (see FallbackAnchors) is placed from its
+// arrival A = Now − the first segment's span instead, by the Clock's rule
+// with R = A: start_n = ceil_ms(max(A − AST, min(start_{n−1} + Δ, A − AST +
+// media.MaxAnchorLead))), Δ being the stream time between the two epochs'
+// anchors.
 package live
 
 import (
@@ -244,7 +252,8 @@ func (p *Packager) inWindow(id uint32) bool {
 // anchor. Without an anchor (the hub keeps only the last 64) the epoch is
 // placed so that its first segment ends at the packager's clock, close to
 // the segment's arrival: Start is the segment's Start and Wall is Now minus
-// the segment's span. FallbackAnchors counts it. Called with work held.
+// the segment's span, then pushed later as the package doc describes.
+// FallbackAnchors counts it. Called with work held.
 func (p *Packager) placeEpoch(s segment.Segment) *epochState {
 	var a media.Anchor
 	ok := false
@@ -259,10 +268,14 @@ func (p *Packager) placeEpoch(s segment.Segment) *epochState {
 		p.ast = a.Wall
 	}
 	start := a.Wall.Sub(p.ast)
-	if p.prev != nil {
-		start = max(start, p.prev.info.Start+media.ToDuration(a.Start-p.prev.info.Anchor.Start))
+	if p.prev != nil && !ok {
+		chain := p.prev.info.Start + media.ToDuration(a.Start-p.prev.info.Anchor.Start)
+		start = max(start, min(chain, start+media.MaxAnchorLead))
 	}
 	start = ceilMS(start)
+	if p.prev != nil {
+		start = max(start, p.prev.info.Start+time.Millisecond)
+	}
 	ep := &epochState{
 		info:   EpochInfo{Epoch: s.Epoch, Anchor: a, Start: start, Wall: p.ast.Add(start)},
 		tracks: map[int]*EpochTrack{},

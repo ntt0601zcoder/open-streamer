@@ -36,9 +36,32 @@ type Options struct {
 }
 
 // Epoch is the anchor of one timeline. Its smallest DTS maps to stream time
-// Start. Wall is the arrival time (Now() during its Push) of the first frame
-// the epoch released, that is, the earliest-arriving held frame that survived
-// the start gates and the early-audio drop.
+// Start, presented at wallclock Wall.
+//
+// Wall is the epoch's effective wall, a whole millisecond. Epoch 1's is its
+// arrival A_1, rounded up: the arrival time (Now() during its Push) of the
+// first frame the epoch released, that is, the earliest-arriving held frame
+// that survived the start gates and the early-audio drop. For a later epoch
+// n, with Δ = Start_n − Start_{n−1} (the previous epoch's presentation span)
+// and L = media.MaxAnchorLead,
+//
+//	R_n    = max(A_n, R_{n−1} + D_{n−1})     R_1 = A_1
+//	Wall_n = ceil_ms(max(A_n, min(Wall_{n−1} + Δ, R_n + L)))
+//
+// then raised to Wall_{n−1} + 1 ms if below it. D_{n−1} is the previous
+// epoch's DTS span, its largest stream DTS minus its Start, so R_n is where
+// the source's own decode timing puts the epoch: it runs ahead of arrival
+// only when the source delivers faster than real time (a file read unpaced,
+// or encoder drift, which is left as it is). Wall_{n−1} + Δ is the earliest
+// wall at which the epoch does not overlap the previous one's presentation;
+// it exceeds R_n by the previous epoch's presentation-end excess (B-frame
+// reordering and the last frame's duration). Taking it, up to L past R_n,
+// keeps epochs from overlapping, and a pipeline that paces on Wall waits the
+// excess out, so the next arrival starts from Wall again and nothing
+// accumulates. An unpaced live source cannot wait: its excess would add up
+// epoch after epoch, so the lead over R_n is capped at L, and beyond it the
+// epoch overlaps the previous one's tail instead. Walls are rounded on their
+// own values, so rounding never accumulates either.
 type Epoch struct {
 	ID    uint32
 	Start int64
@@ -98,6 +121,10 @@ func (t *track) duration() int64 {
 type epoch struct {
 	id          uint32
 	base, start int64
+	wall        time.Time // effective wall (Epoch.Wall)
+	raw         time.Time // R_n: arrival carried by the source's decode timing
+	hasDTS      bool
+	maxDTS      int64 // largest stream DTS emitted in the epoch
 	hasKey      bool
 	keyPTS      int64
 	jump        bool // opened by a jump: unjoined tracks get rule 3's old test
@@ -526,7 +553,8 @@ func (c *Clock) release(audioOnly bool) {
 		id: p.id, base: base, start: c.nextStart(p.id),
 		hasKey: p.hasKey, keyPTS: p.keyPTS, jump: p.jump, audioOnly: audioOnly,
 	}
-	c.record(Epoch{ID: ep.id, Start: ep.start, Wall: p.held[0].at})
+	ep.wall, ep.raw = c.placeWall(p.held[0].at, ep.start)
+	c.record(Epoch{ID: ep.id, Start: ep.start, Wall: ep.wall})
 	for _, t := range c.tracks {
 		switch {
 		case t.pend.fresh:
@@ -570,6 +598,41 @@ func (c *Clock) nextStart(id uint32) int64 {
 	return start
 }
 
+// placeWall returns the effective wall and R of an epoch that starts at
+// stream time start and whose first frame arrived at arrival (see Epoch).
+func (c *Clock) placeWall(arrival time.Time, start int64) (wall, raw time.Time) {
+	prev := c.cur
+	if prev == nil {
+		return ceilMS(arrival), arrival
+	}
+	raw = arrival
+	if prev.hasDTS {
+		raw = later(raw, prev.raw.Add(media.ToDuration(prev.maxDTS-prev.start)))
+	}
+	chain := prev.wall.Add(media.ToDuration(start - prev.start))
+	if limit := raw.Add(media.MaxAnchorLead); chain.After(limit) {
+		chain = limit
+	}
+	wall = ceilMS(later(arrival, chain))
+	return later(wall, prev.wall.Add(time.Millisecond)), raw
+}
+
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// ceilMS rounds t up to a whole millisecond.
+func ceilMS(t time.Time) time.Time {
+	r := t.Truncate(time.Millisecond)
+	if r.Before(t) {
+		r = r.Add(time.Millisecond)
+	}
+	return r
+}
+
 func (c *Clock) record(e Epoch) {
 	if len(c.epochs) == maxEpochs {
 		copy(c.epochs, c.epochs[1:])
@@ -608,6 +671,9 @@ func (c *Clock) emit(f media.Frame, t *track, ep *epoch) {
 	f.PTS += off
 	f.DTS += off
 	f.Epoch = ep.id
+	if !ep.hasDTS || f.DTS > ep.maxDTS {
+		ep.hasDTS, ep.maxDTS = true, f.DTS
+	}
 	if t.emitted && t.lastEmitEpoch == ep.id {
 		t.lastDur = f.DTS - t.lastEmitDTS
 	}
