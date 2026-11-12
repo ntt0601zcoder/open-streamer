@@ -477,7 +477,7 @@ func TestReadConfigChangeWithoutDiscontinuity(t *testing.T) {
 
 // liveMPD serves a packager whose clock lists one more segment on every MPD
 // request, with minimumUpdatePeriod cut to 100 ms; edit may alter the MPD.
-func liveMPD(t *testing.T, edit func(m *dash.MPD, n int)) (string, time.Duration) {
+func liveMPD(t *testing.T, edit func(m *dash.MPD, n int), extra ...func(http.Handler) http.Handler) (string, time.Duration) {
 	t.Helper()
 	clk := &fakeNow{t: farFuture()}
 	p := packClip(t, "h264_aac.ts", 100, clk.Now)
@@ -494,7 +494,7 @@ func liveMPD(t *testing.T, edit func(m *dash.MPD, n int)) (string, time.Duration
 	clk.Set(ends[0])
 	step := 0
 	var mu sync.Mutex
-	base := serveLive(t, p, rewrite("cmaf/index.mpd", func(b []byte, n int) []byte {
+	mpd := rewrite("cmaf/index.mpd", func(b []byte, n int) []byte {
 		m, err := dash.Parse(b)
 		require.NoError(t, err)
 		m.MinimumUpdatePeriod = dash.Duration(100 * time.Millisecond)
@@ -508,7 +508,13 @@ func liveMPD(t *testing.T, edit func(m *dash.MPD, n int)) (string, time.Duration
 		}
 		mu.Unlock()
 		return m.Encode()
-	}))
+	})
+	base := serveLive(t, p, func(h http.Handler) http.Handler {
+		for _, w := range extra {
+			h = w(h)
+		}
+		return mpd(h)
+	})
 	return base, media.ToDuration(total)
 }
 
@@ -863,7 +869,11 @@ func TestReadDASHCaptureCap(t *testing.T) {
 	maxSegments = 5 // the MPD lists 3 video + 3 audio segments
 	_, err := ReadDASH(context.Background(), base+"cmaf/index.mpd", once())
 	assert.ErrorContains(t, err, "MPD timelines above 5 segments")
-	maxSegments = 6
+	// The capture total counts 6 segments, 2 inits and 2 representations.
+	maxSegments = 9
+	_, err = ReadDASH(context.Background(), base+"cmaf/index.mpd", once())
+	assert.ErrorContains(t, err, "capture above 9")
+	maxSegments = 10
 	_, err = ReadDASH(context.Background(), base+"cmaf/index.mpd", once())
 	require.NoError(t, err)
 
@@ -872,7 +882,7 @@ func TestReadDASHCaptureCap(t *testing.T) {
 	for _, tc := range []struct {
 		max  int
 		want string
-	}{{5, "capture above 5 segments"}, {6, ""}} {
+	}{{9, "capture above 9"}, {10, ""}} {
 		sliding, total := liveMPD(t, func(m *dash.MPD, _ int) {
 			for i := range m.Periods[0].AdaptationSets {
 				st := m.Periods[0].AdaptationSets[i].SegmentTemplate
@@ -1032,4 +1042,149 @@ func TestReadRenditionStartsMidEpoch(t *testing.T) {
 	c, err := ReadHLS(context.Background(), base+"cmaf/master.m3u8", once())
 	require.NoError(t, err)
 	assert.Empty(t, c.Violations)
+}
+
+// TestReadDASHInitsCounted: representations with empty timelines and their
+// own (missing) inits still count toward the capture cap.
+func TestReadDASHInitsCounted(t *testing.T) {
+	old := maxSegments
+	t.Cleanup(func() { maxSegments = old })
+	maxSegments = 10
+	timelines := make([][]dash.S, 20)
+	srv := files(t, map[string][]byte{"/x.mpd": timelineMPD(timelines...)})
+	_, err := ReadDASH(context.Background(), srv+"/x.mpd", once())
+	assert.ErrorContains(t, err, "capture above 10")
+}
+
+func TestReadDASHTemplateTooLong(t *testing.T) {
+	long := strings.Repeat("a", 2049)
+	for _, tpl := range []dash.SegmentTemplate{
+		{Initialization: long, Media: "$Number$.m4s"},
+		{Initialization: "init.mp4", Media: long},
+	} {
+		tpl.Timeline = &dash.SegmentTimeline{S: []dash.S{{D: 1}}}
+		m := dash.MPD{Periods: []dash.Period{{AdaptationSets: []dash.AdaptationSet{{
+			SegmentTemplate: &tpl, Representations: []dash.Representation{{ID: "0"}},
+		}}}}}
+		srv := files(t, map[string][]byte{"/x.mpd": m.Encode()})
+		_, err := ReadDASH(context.Background(), srv+"/x.mpd", once())
+		assert.ErrorContains(t, err, "template")
+	}
+}
+
+// TestReadDASHInit404Cached: a missing init is fetched and reported once,
+// not on every refresh.
+func TestReadDASHInit404Cached(t *testing.T) {
+	var mu sync.Mutex
+	gets := 0
+	count := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "cmaf/init-1-1.mp4") {
+				mu.Lock()
+				gets++
+				mu.Unlock()
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	base, total := liveMPD(t, nil, notFound("cmaf/init-1-1.mp4"), count)
+	c, err := ReadDASH(context.Background(), base+"cmaf/index.mpd", ReadOptions{Duration: total - 100*time.Millisecond})
+	require.NoError(t, err)
+	assert.Equal(t, []string{RuleSegmentAvailable}, rules(c.Violations))
+	assert.Len(t, c.Violations, 1)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, gets)
+}
+
+// masterServer serves a hand-built fMP4 capture under two media playlists,
+// a.m3u8 (ended) and b.m3u8 (live, never ending), and a master whose answer
+// to its n-th request (from 1) master chooses.
+func masterServer(t *testing.T, master func(n int, both, onlyA []byte) (int, []byte)) (string, *int) {
+	t.Helper()
+	keys := keyframes(t)
+	m := fmp4Playlist(t, []int{0, keys[1]}, nil)
+	pl, err := hls.ParseMedia(m["/v.m3u8"])
+	require.NoError(t, err)
+	pl.TargetDuration = 1
+	m["/a.m3u8"] = pl.Encode()
+	pl.Ended = false
+	m["/b.m3u8"] = pl.Encode()
+	in, err := parseInit(m["/init.mp4"])
+	require.NoError(t, err)
+	codec, err := media.CodecString(in.cfg)
+	require.NoError(t, err)
+	variant := func(uri string) hls.Variant { return hls.Variant{URI: uri, Codecs: codec, Bandwidth: 1} }
+	both := hls.MultivariantPlaylist{Version: 7, Variants: []hls.Variant{variant("a.m3u8"), variant("b.m3u8")}}.Encode()
+	onlyA := hls.MultivariantPlaylist{Version: 7, Variants: []hls.Variant{variant("a.m3u8")}}.Encode()
+	var mu sync.Mutex
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/master.m3u8" {
+			mu.Lock()
+			n++
+			code, body := master(n, both, onlyA)
+			mu.Unlock()
+			w.WriteHeader(code)
+			_, _ = w.Write(body)
+			return
+		}
+		b, ok := m[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/master.m3u8", &n
+}
+
+// TestReadMasterDropsRendition: once the master stops listing the live
+// playlist and the rest have ended, polling stops.
+func TestReadMasterDropsRendition(t *testing.T) {
+	u, _ := masterServer(t, func(n int, both, onlyA []byte) (int, []byte) {
+		if n == 1 {
+			return http.StatusOK, both
+		}
+		return http.StatusOK, onlyA
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := ReadHLS(ctx, u, ReadOptions{Duration: time.Hour})
+	require.NoError(t, err)
+	assert.NotEmpty(t, c.Frames)
+	assert.Empty(t, c.Violations)
+}
+
+// TestReadFinalMasterFails: a failing last master read keeps the capture,
+// and Once reads the master only once.
+func TestReadFinalMasterFails(t *testing.T) {
+	u, n := masterServer(t, func(n int, _, onlyA []byte) (int, []byte) {
+		if n == 1 {
+			return http.StatusOK, onlyA
+		}
+		return http.StatusInternalServerError, nil
+	})
+	c, err := ReadHLS(context.Background(), u, ReadOptions{Duration: time.Hour})
+	require.NoError(t, err)
+	assert.NotEmpty(t, c.Frames)
+	assert.Empty(t, c.Violations)
+	assert.Equal(t, 2, *n, "the final master read was tried")
+
+	u, n = masterServer(t, func(_ int, _, onlyA []byte) (int, []byte) { return http.StatusOK, onlyA })
+	c, err = ReadHLS(context.Background(), u, once())
+	require.NoError(t, err)
+	assert.Empty(t, c.Violations)
+	assert.Equal(t, 1, *n, "Once reads the master once")
+
+	// A master that turns unparsable is ignored the same way.
+	u, _ = masterServer(t, func(n int, _, onlyA []byte) (int, []byte) {
+		if n == 1 {
+			return http.StatusOK, onlyA
+		}
+		return http.StatusOK, []byte("garbage")
+	})
+	_, err = ReadHLS(context.Background(), u, ReadOptions{Duration: time.Hour})
+	require.NoError(t, err)
 }

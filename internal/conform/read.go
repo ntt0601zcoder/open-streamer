@@ -27,6 +27,8 @@ const (
 	repeatCap = 100000
 	// maxWidth bounds a SegmentTemplate %0Nd width.
 	maxWidth = 32
+	// maxTemplate bounds a SegmentTemplate media or initialization string.
+	maxTemplate = 2 << 10
 	// minPoll is the shortest wait between two refreshes.
 	minPoll = 50 * time.Millisecond
 	// periodTolerance is RulePeriodOrder's tolerance.
@@ -37,7 +39,8 @@ const (
 )
 
 // maxSegments bounds the timeline segments of one MPD, over all its periods
-// and representations, and the distinct segments of one DASH capture.
+// and representations, and the distinct segments, init URLs and
+// representations of one DASH capture.
 var maxSegments = 100000
 
 // ReadOptions configures the readers.
@@ -184,8 +187,10 @@ type hlsCapture struct {
 // When polling, the master is read again on every pass: its CODECS is
 // rebuilt from the window, so the check uses the union over every read, and
 // playlists it newly lists join the capture; playlists it no longer lists
-// are not polled. The master is read once more after the last playlists, so
-// its CODECS covers the newest window they showed.
+// are not polled and do not hold polling open. When polling, the master is
+// read once more after the last playlists, so its CODECS covers the newest
+// window they showed; if that read fails the union collected so far is
+// kept.
 //
 // Accepted limitations, not flagged: a track absent for a whole epoch has
 // no entry carrying that epoch's discontinuity, so its playlist's epoch
@@ -238,17 +243,24 @@ func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	}
 	c.checkTSExtinf()
 	if c.master {
-		// The playlists were read after the master, so a later window may
-		// hold a codec that master did not list yet: read it once more.
-		if body, err = c.r.getOK(ctx, u); err != nil {
-			return Capture{}, err
-		}
-		if err := c.readMaster(u, body); err != nil {
-			return Capture{}, err
+		if !opt.Once {
+			c.finalMaster(ctx, u)
 		}
 		c.b.checkMasterCodecs(c.codecs)
 	}
 	return c.b.finish(), nil
+}
+
+// finalMaster reads the master once more after the last playlist poll: the
+// playlists were read after the previous master, so a later window may hold
+// a codec it did not list yet. A failed read (the master gone after the
+// playlists ended, a transient error) keeps the union collected so far.
+func (c *hlsCapture) finalMaster(ctx context.Context, u string) {
+	body, err := c.r.getOK(ctx, u)
+	if err != nil {
+		return
+	}
+	_ = c.readMaster(u, body) // on error the union collected so far stands
 }
 
 // readMaster reads one version of the master: it adds its CODECS to the
@@ -296,6 +308,9 @@ func (c *hlsCapture) readMaster(u string, body []byte) error {
 func (c *hlsCapture) done(d time.Duration) bool {
 	ended := true
 	for _, pl := range c.lists {
+		if c.master && !c.active[pl.url] {
+			continue // the master no longer lists it
+		}
 		if pl.captured >= d {
 			return true
 		}
@@ -541,11 +556,12 @@ type dashCapture struct {
 	url     string
 	reps    map[string]*dashRep
 	inits   map[string]fmp4Init
+	bad     map[string]bool // inits that did not answer 200, reported once
 	epochs  map[string]uint32
 	ast     *time.Time
 	polled  bool
 	docSegs int64 // timeline segments of the MPD being read
-	total   int   // distinct segments fetched or tried in the capture
+	total   int   // distinct segments, init URLs and representations in the capture
 	firstOK bool  // the first period's start was decided
 }
 
@@ -565,7 +581,7 @@ type dashCapture struct {
 func ReadDASH(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	c := &dashCapture{
 		r: newReader(opt), b: newBuilder(), url: u,
-		reps: map[string]*dashRep{}, inits: map[string]fmp4Init{}, epochs: map[string]uint32{},
+		reps: map[string]*dashRep{}, inits: map[string]fmp4Init{}, bad: map[string]bool{}, epochs: map[string]uint32{},
 	}
 	for {
 		body, err := c.r.getOK(ctx, u)
@@ -587,6 +603,15 @@ func ReadDASH(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 		}
 	}
 	return c.b.finish(), nil
+}
+
+// count adds a new segment, init URL or representation to the capture
+// total, which maxSegments bounds.
+func (c *dashCapture) count() error {
+	if c.total++; c.total > maxSegments {
+		return fmt.Errorf("conform: read: capture above %d segments, inits and representations", maxSegments)
+	}
+	return nil
 }
 
 func (c *dashCapture) done(d time.Duration) bool {
@@ -678,6 +703,9 @@ func (c *dashCapture) period(ctx context.Context, per dash.Period) ([]dashSet, e
 			if tp == nil || tp.Timeline == nil {
 				return nil, fmt.Errorf("conform: read: representation %q: no SegmentTemplate with a SegmentTimeline", rep.ID)
 			}
+			if len(tp.Media) > maxTemplate || len(tp.Initialization) > maxTemplate {
+				return nil, fmt.Errorf("conform: read: representation %q: template above %d bytes", rep.ID, maxTemplate)
+			}
 			tpl := *tp
 			if tpl.Timescale == 0 {
 				tpl.Timescale = 1
@@ -698,13 +726,20 @@ func (c *dashCapture) period(ctx context.Context, per dash.Period) ([]dashSet, e
 			if err != nil {
 				return nil, err
 			}
+			if c.bad[iu] {
+				continue
+			}
 			in, ok := c.inits[iu]
 			if !ok {
+				if err := c.count(); err != nil {
+					return nil, err
+				}
 				var good bool
 				if in, good, err = fetchInit(ctx, c.r, c.b, iu); err != nil {
 					return nil, err
 				}
 				if !good {
+					c.bad[iu] = true
 					continue
 				}
 				c.inits[iu] = in
@@ -733,6 +768,9 @@ func (c *dashCapture) fetchPeriod(ctx context.Context, sets []dashSet, epoch uin
 	for i, s := range sets {
 		rp := c.reps[s.rep.ID]
 		if rp == nil {
+			if err := c.count(); err != nil {
+				return err
+			}
 			rp = &dashRep{track: c.b.track("rep:"+s.rep.ID, 0), fetched: map[string]bool{}}
 			c.reps[s.rep.ID] = rp
 		}
@@ -753,8 +791,8 @@ func (c *dashCapture) fetchPeriod(ctx context.Context, sets []dashSet, epoch uin
 				continue
 			}
 			rp.fetched[u] = true
-			if c.total++; c.total > maxSegments {
-				return fmt.Errorf("conform: read: capture above %d segments", maxSegments)
+			if err := c.count(); err != nil {
+				return err
 			}
 			seg, ok, err := c.segment(ctx, u, s, sg, rp.track, epoch)
 			if err != nil {
