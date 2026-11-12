@@ -38,7 +38,9 @@ var playlistRoutes []playlistRoute
 // Handler serves the HLS and DASH files of every stream that lookup finds,
 // under /live/{stream}/hls/ and /live/{stream}/cmaf/. It answers 404 for an
 // unknown stream or file, for a segment or init outside the window, and for
-// every playlist until the window lists a segment.
+// every playlist until the window lists a segment. Every response allows any
+// origin (CORS), and OPTIONS preflights are answered, so browser players on
+// another origin can play.
 func Handler(lookup func(stream string) (*Packager, bool)) http.Handler {
 	return newHandler(lookup, playlistRoutes, defaultWriteTimeout)
 }
@@ -73,8 +75,20 @@ func newHandler(lookup func(stream string) (*Packager, bool), routes []playlistR
 			}
 			http.NotFound(w, r)
 		})
+		mux.HandleFunc("OPTIONS /live/{stream}/"+dir+"/{file}", func(w http.ResponseWriter, _ *http.Request) {
+			h := w.Header()
+			h.Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+			h.Set("Access-Control-Allow-Headers", "Range")
+			h.Set("Access-Control-Max-Age", "86400")
+			w.WriteHeader(http.StatusNoContent)
+		})
 	}
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // writeBody answers with body, honouring HEAD and Range requests, under a

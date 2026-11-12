@@ -372,6 +372,7 @@ func TestHTTPTSHead(t *testing.T) {
 	_ = resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "video/mp2t", resp.Header.Get("Content-Type"))
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"), "browser players on another origin")
 	assert.Empty(t, h.Stats())
 }
 
