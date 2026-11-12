@@ -111,14 +111,14 @@ func TestMPDUnlistedAndEmpty(t *testing.T) {
 	clk.Set(t0.Add(-time.Second))
 	code, _ := get(t, srv, "/live/s/cmaf/index.mpd")
 	assert.Equal(t, http.StatusNotFound, code)
-	body, _ := buildMPD(Snapshot{})
+	body := buildMPD(Snapshot{})
 	assert.Nil(t, body)
 	// Listed but nothing usable: no init for any track.
 	s := p.Snapshot()
 	for i := range s.Epochs {
 		s.Epochs[i].Tracks = []EpochTrack{{Track: 0, Config: s.Epochs[i].Tracks[0].Config}}
 	}
-	body, _ = buildMPD(s)
+	body = buildMPD(s)
 	assert.Nil(t, body)
 }
 
@@ -264,26 +264,50 @@ func TestMPDAudioOffset(t *testing.T) {
 func TestMPDCodecStringFailure(t *testing.T) {
 	p, _ := packClip(t, "h264_aac.ts", Options{Window: 100, Now: farFuture})
 	s := p.Snapshot()
-	bad := *s.Epochs[0].Tracks[0].Config
-	bad.SPS = nil
-	s.Epochs[0].Tracks = []EpochTrack{
-		{Track: 0, Config: &bad, Init: s.Epochs[0].Tracks[0].Init},
-		s.Epochs[0].Tracks[1],
-	}
-	body, skipped := buildMPD(s)
-	assert.Equal(t, 1, skipped)
-	m, err := dash.Parse(body)
+	bad := s.Epochs[0].Tracks[0]
+	bad.Codec = ""
+	s.Epochs[0].Tracks = []EpochTrack{bad, s.Epochs[0].Tracks[1]}
+	m, err := dash.Parse(buildMPD(s))
 	require.NoError(t, err)
-	require.Len(t, m.Periods[0].AdaptationSets, 1)
+	require.Len(t, m.Periods[0].AdaptationSets, 1, "the set without a codec string is left out")
 	assert.Equal(t, "audio", m.Periods[0].AdaptationSets[0].ContentType)
+}
 
-	// The route counts the skip as a packager error.
-	before := p.Errors()
-	i := slices.IndexFunc(playlistRoutes, func(r playlistRoute) bool { return r.dir == dirCMAF && r.match("index.mpd") })
-	require.GreaterOrEqual(t, i, 0)
-	_, _, ok := playlistRoutes[i].build(p, s, "index.mpd")
-	assert.True(t, ok)
-	assert.EqualValues(t, before+1, p.Errors())
+// A codec string that cannot be built is counted once per epoch and track,
+// when the packager meets the track, never per MPD request, and not as a
+// dropped segment output.
+func TestCodecErrorsCountedOnce(t *testing.T) {
+	cfg := h264Config(t)
+	noASC := &media.TrackConfig{Codec: media.CodecAAC, SampleRate: 48000, Channels: 2}
+	_, err := media.CodecString(noASC)
+	require.Error(t, err)
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Wall: t0})
+	p := NewPackager(h, Options{Window: 100, Now: farFuture})
+	for _, d := range synth(cfg, 1, 0, 200) {
+		p.Handle(d)
+		if d.Frame.DTS%3840 == 0 {
+			p.Handle(hub.Delivery{Frame: media.Frame{Track: 1, Config: noASC, PTS: d.Frame.DTS, DTS: d.Frame.DTS, Key: true, Data: [][]byte{{0x21}}, Epoch: 1}})
+		}
+	}
+	p.Flush()
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 4)
+	et, ok := snap.Epochs[0].Track(1)
+	require.True(t, ok)
+	assert.Empty(t, et.Codec)
+	vt, _ := snap.Epochs[0].Track(0)
+	assert.Equal(t, "avc1.4D400D", vt.Codec)
+	errs := p.Errors()
+	srv := serve(p)
+	for range 5 {
+		m := mpdOf(t, srv)
+		require.Len(t, m.Periods, 1)
+		require.Len(t, m.Periods[0].AdaptationSets, 1)
+		assert.Equal(t, "video", m.Periods[0].AdaptationSets[0].ContentType)
+	}
+	assert.EqualValues(t, 1, p.CodecErrors())
+	assert.Equal(t, errs, p.Errors(), "MPD requests count nothing")
 }
 
 func TestMPDMissingTrack(t *testing.T) {
@@ -308,7 +332,7 @@ func TestMPDSkipsTrackWithoutInit(t *testing.T) {
 	p, _ := packClip(t, "h264_aac.ts", Options{Window: 100, Now: farFuture})
 	s := p.Snapshot()
 	s.Epochs[0].Tracks = []EpochTrack{s.Epochs[0].Tracks[0], {Track: 1, Config: s.Epochs[0].Tracks[1].Config}}
-	data, _ := buildMPD(s)
+	data := buildMPD(s)
 	m, err := dash.Parse(data)
 	require.NoError(t, err)
 	require.Len(t, m.Periods[0].AdaptationSets, 1)
