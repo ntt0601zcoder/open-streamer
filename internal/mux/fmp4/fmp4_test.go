@@ -315,3 +315,17 @@ func TestFFprobeReadsInitAndSegment(t *testing.T) {
 		assert.Contains(t, string(out), want)
 	}
 }
+
+// A video config without its parameter sets is an error, not a panic inside
+// mp4ff.
+func TestInitMissingParamSets(t *testing.T) {
+	for _, c := range []*media.TrackConfig{
+		{Codec: media.CodecH264},
+		{Codec: media.CodecH264, SPS: [][]byte{{0x67}}},
+		{Codec: media.CodecH265, SPS: [][]byte{{0x42}}, PPS: [][]byte{{0x44}}},
+	} {
+		_, err := fmp4.Init(c)
+		require.Error(t, err, "%v", c.Codec)
+		assert.Contains(t, err.Error(), "fmp4: init:")
+	}
+}
