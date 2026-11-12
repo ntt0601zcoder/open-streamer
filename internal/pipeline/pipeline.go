@@ -26,6 +26,7 @@ const (
 	firstRetry           = 500 * time.Millisecond // the first retry wait, doubled up to RetryInterval
 	healthyReset         = 10 * time.Second       // reading this long without failure resets the backoff
 	liveMaxDrift         = 2 * time.Second        // Clock MaxDrift for live inputs
+	maxProbeBytes        = 32 << 20               // a probe drops its held frames over this, until its next key
 )
 
 var (
@@ -47,7 +48,9 @@ type Options struct {
 	// StallTimeout bounds Run's wait for the next frame, excluding its pacing
 	// sleeps (4 s); a reader's Spec().StallTimeout raises it. A failed input
 	// is retried after 0.5 s, doubling up to RetryInterval (10 s), reset by
-	// 10 s of reading without failure. FailbackHold is for fail-back (10 s).
+	// 10 s of reading without failure. FailbackHold is how long an input above
+	// the active one must read without a stall before Run fails back to it
+	// (10 s).
 	StartTimeout, StallTimeout, RetryInterval, FailbackHold time.Duration
 
 	Now     func() time.Time                                 // nil means time.Now; also the Clock's and, when Env.Now is nil, the readers'
@@ -108,9 +111,10 @@ type Pipeline struct {
 	lastFrame   time.Time      // when the active input last delivered a mapped frame
 	wg          sync.WaitGroup // input goroutines
 
-	mu  sync.Mutex // guards st and cur
-	st  Stats      // Input unset
-	cur ingest.Reader
+	mu        sync.Mutex // guards st, cur and probePeak
+	st        Stats      // Input unset
+	cur       ingest.Reader
+	probePeak int // the most frames a probe has held, for tests
 }
 
 // input is the retry state of one entry of Options.Inputs.
@@ -184,13 +188,26 @@ func (p *Pipeline) Stats() Stats {
 // becomes active. When the active input fails, the other pull inputs that are
 // not waiting out a backoff are tried one at a time, highest first, each
 // once, until one delivers; when none is left to try, every pull input
-// reopens after its backoff, as with no active input. The attempts of other
-// pull inputs are closed at every activation. A failed input is closed,
-// reported (EventFailed) and retried after its backoff, except a passive
-// input failing by a timeout, which keeps listening: it becomes active again
-// at its next frame when no input is active. Passive inputs listen whenever
-// they are not waiting out a backoff, dropping their frames, without a start
+// reopens after its backoff, as with no active input. The attempts of the
+// pull inputs below the active one are closed at every activation. A failed
+// input is closed, reported (EventFailed) and retried after its backoff,
+// except a passive input failing by a timeout, which keeps listening: it
+// becomes active again at its next frame when no input is active. Passive
+// inputs listen whenever they are not waiting out a backoff, without a start
 // or stall limit, while another input is active.
+//
+// While an input is active, every input above it is probed for fail-back: a
+// pull input reopens after its backoff, a passive one keeps listening, and
+// Run takes each probe's frames as they come. A probe's hold runs from its
+// first frame and restarts after a gap over its stall limit or a timeline
+// break; a pull probe also fails by its start and stall limits, and its next
+// attempt starts a new hold. Once a probe has read for FailbackHold, it
+// becomes active at its next video key (any frame when it maps no video),
+// unless a higher-priority probe is eligible too: the active input's held
+// frames are flushed, it is closed (a passive one keeps listening), and the
+// probe's frames go to the hub from that key on. While it waits, a probe
+// keeps only its frames from its latest key. The passive inputs below the
+// active one drop their frames.
 func (p *Pipeline) Run(ctx context.Context) error {
 	if len(p.opt.Inputs) == 0 {
 		return errors.New("pipeline: run: no input")
@@ -250,7 +267,8 @@ func latest(a, b time.Time) time.Time {
 }
 
 // schedule starts the attempts that are due: every passive input not waiting
-// out a backoff; with no active input, the pull inputs as Run describes.
+// out a backoff; the pull inputs above the active one, or with no active
+// input, the pull inputs as Run describes.
 func (p *Pipeline) schedule(ctx context.Context) {
 	now := p.now()
 	due := func(in *input) bool { return !in.passive && in.a == nil && !now.Before(in.retryAt) }
@@ -260,6 +278,12 @@ func (p *Pipeline) schedule(ctx context.Context) {
 		}
 	}
 	if p.act != nil {
+		// Probes: the pull inputs above the active one.
+		for i, in := range p.inputs[:p.act.in] {
+			if due(in) {
+				p.start(ctx, i)
+			}
+		}
 		return
 	}
 	if p.search {
@@ -286,8 +310,9 @@ func (p *Pipeline) schedule(ctx context.Context) {
 
 // arm sets the timer to the earliest deadline: an attempt's start or stall
 // limit, a retry that schedule would start, or the end of the layout wait
-// while attempts wait for it. Every deadline is absolute, so a timer armed
-// late still fires at it.
+// while attempts wait for it. Every deadline is absolute: a timer armed late
+// fires late by the lag, and the deadline it was armed for counts as due
+// when it fires (reached), whatever the clock reads.
 func (p *Pipeline) arm() {
 	now := p.now()
 	var next time.Time
@@ -296,11 +321,11 @@ func (p *Pipeline) arm() {
 			next = t
 		}
 	}
-	for _, in := range p.inputs {
+	for i, in := range p.inputs {
 		switch {
 		case in.a != nil:
 			consider(in.a.deadline)
-		case (in.passive || p.reopensPull()) && in.retryAt.After(now):
+		case (in.passive || p.reopens(i)) && in.retryAt.After(now):
 			consider(in.retryAt)
 		}
 	}
@@ -319,10 +344,16 @@ func (p *Pipeline) arm() {
 	p.timer = p.opt.After(next.Sub(now))
 }
 
-// reopensPull reports whether schedule reopens pull inputs when their
-// backoff ends: with no active input and no search running. arm runs after
-// schedule, so a search has a pull attempt running until it ends.
-func (p *Pipeline) reopensPull() bool { return p.act == nil && !p.search }
+// reopens reports whether schedule reopens pull input i when its backoff
+// ends: as a probe above the active input, or with no active input and no
+// search running. arm runs after schedule, so a search has a pull attempt
+// running until it ends.
+func (p *Pipeline) reopens(i int) bool {
+	if p.act != nil {
+		return i < p.act.in
+	}
+	return !p.search
+}
 
 // expire handles the deadlines that are due: the end of the layout wait,
 // then the start and stall limits.
@@ -340,9 +371,12 @@ func (p *Pipeline) expire(ctx context.Context) error {
 			continue
 		}
 		var err error
-		if a == p.act {
+		switch {
+		case a == p.act:
 			err = fmt.Errorf("pipeline: read: %w (%v)", errStalled, p.stall)
-		} else {
+		case !a.since.IsZero(): // a probe that delivered
+			err = fmt.Errorf("pipeline: read: %w (%v)", errStalled, a.stall)
+		default:
 			err = fmt.Errorf("pipeline: start: %w (%v)", errNoStart, p.opt.StartTimeout)
 		}
 		if err := p.fail(ctx, a, err); err != nil {
@@ -370,7 +404,9 @@ type item struct {
 }
 
 // attempt is one open of one input and its goroutine, which opens the input,
-// then reads one item per request so that reads stay in step with Run.
+// then reads one item per request so that reads stay in step with Run. Run
+// requests the next read of an input that is not active as soon as it takes
+// a frame, so probes and background listeners read freely.
 type attempt struct {
 	in     int
 	req    chan struct{} // capacity 1: Run asks for the next Read
@@ -382,6 +418,25 @@ type attempt struct {
 	r        ingest.Reader // set once the open reader is received
 	tracks   []int         // reader track → layout track, -1 unmapped; nil to recompute
 	deadline time.Time     // the start or stall limit; zero for none
+
+	// As a probe.
+	stall    time.Duration // the stall limit, set at the first frame
+	since    time.Time     // when the hold started; zero before the first frame
+	last     time.Time     // the last mapped frame
+	held     []heldFrame   // the frames from the latest key
+	heldSize int           // bytes of held
+}
+
+// heldFrame is a frame a probe holds, with its layout track.
+type heldFrame struct {
+	f ingest.Frame
+	t int
+}
+
+// resetProbe drops a's held frames and restarts its hold at its next frame.
+func (a *attempt) resetProbe() {
+	a.since = time.Time{}
+	a.held, a.heldSize = nil, 0
 }
 
 // start opens input in in a new goroutine; it delivers on p.items.
@@ -499,6 +554,7 @@ func (p *Pipeline) handle(ctx context.Context, it item) error {
 		return p.frame(ctx, a, it.f)
 	case errors.Is(it.err, ingest.ErrDiscontinuity):
 		a.tracks = nil // a remapped slot may change kind
+		a.resetProbe() // a probe's hold and held frames do not span a break
 		if a == p.act {
 			wrote, err := p.breakClock(ctx, false)
 			if err != nil {
@@ -549,8 +605,8 @@ func (p *Pipeline) resumeWaiting() {
 }
 
 // frame processes a frame of a: the active input's goes to the hub; with no
-// active input, a's first mapped frame makes it active; a passive input
-// listening while another is active drops it.
+// active input, a's first mapped frame makes it active; a probe takes its
+// mapped frames; a passive input listening below the active one drops it.
 func (p *Pipeline) frame(ctx context.Context, a *attempt, f ingest.Frame) error {
 	if len(p.layout) == 0 {
 		// The input opened without tracks; it may not be input 0 once the
@@ -561,7 +617,13 @@ func (p *Pipeline) frame(ctx context.Context, a *attempt, f ingest.Frame) error 
 		}
 	}
 	if p.act != nil && a != p.act {
-		a.deadline = time.Time{} // a passive input listening in the background is not judged
+		if a.in < p.act.in {
+			if t, ok := a.track(f.Track, p.layout); ok {
+				return p.probe(ctx, a, f, t)
+			}
+		} else {
+			a.deadline = time.Time{} // a passive input listening in the background is not judged
+		}
 		a.next()
 		return nil
 	}
@@ -595,20 +657,24 @@ func (p *Pipeline) restartStall(a *attempt) {
 }
 
 // activate makes a the active input at its first frame. The attempts of the
-// other pull inputs are closed; passive inputs keep listening. Every
-// activation after the first breaks the Clock once for a new input, the same
-// input reopened or resumed included; a different input than the last one
-// counts as a switch.
+// pull inputs below it are closed; those above it go on as probes; passive
+// inputs keep listening. Every activation after the first breaks the Clock
+// once for a new input, the same input reopened or resumed included; a
+// different input than the last one counts as a switch.
 func (p *Pipeline) activate(a *attempt) {
 	p.act = a
 	p.search = false
-	for _, in := range p.inputs {
+	a.resetProbe()
+	for i, in := range p.inputs {
 		o := in.a
 		switch {
 		case o == nil || o == a:
 		case in.passive:
 			o.deadline = time.Time{} // listening, not judged, while another input is active
-		default:
+			if i > a.in {
+				o.resetProbe()
+			}
+		case i > a.in:
 			p.stopAttempt(o)
 		}
 	}
@@ -639,6 +705,89 @@ func (p *Pipeline) activate(a *attempt) {
 	p.emit(Event{Kind: EventActive, Input: a.in})
 }
 
+// probe takes frame f of a, an input above the active one, mapped onto
+// layout track t. Its hold runs from its first frame and restarts after a gap
+// over its stall limit; a pull probe's stall limit is armed. It holds the
+// frames from its latest key, video when it maps video, else any frame; at a
+// key, once its hold is over and no higher-priority probe is eligible, it
+// fails back.
+func (p *Pipeline) probe(ctx context.Context, a *attempt, f ingest.Frame, t int) error {
+	now := p.now()
+	if a.stall == 0 {
+		a.stall = max(p.opt.StallTimeout, a.r.Spec().StallTimeout)
+	}
+	if a.since.IsZero() || now.Sub(a.last) > a.stall {
+		a.resetProbe()
+		a.since = now
+	}
+	a.last = now
+	if !p.inputs[a.in].passive {
+		a.deadline = now.Add(a.stall) // arm re-arms when it is the earliest
+	}
+	key := !a.mapsVideo(p.layout) || (p.layout[t] == media.KindVideo && f.Key)
+	if key {
+		a.held, a.heldSize = a.held[:0], 0
+	}
+	if size := frameSize(f.Frame); len(a.held) > 0 || key {
+		if a.heldSize+size > maxProbeBytes {
+			a.held, a.heldSize = nil, 0 // too much to hold: wait for the next key
+		} else {
+			a.held = append(a.held, heldFrame{f: f, t: t})
+			a.heldSize += size
+			if len(a.held) > p.probePeak {
+				p.mu.Lock()
+				p.probePeak = len(a.held)
+				p.mu.Unlock()
+			}
+		}
+	}
+	if key && len(a.held) > 0 && p.eligible(a, now) &&
+		!slices.ContainsFunc(p.inputs[:a.in], func(in *input) bool { return in.a != nil && p.eligible(in.a, now) }) {
+		return p.failback(ctx, a)
+	}
+	a.next()
+	return nil
+}
+
+// eligible reports whether probe a has read without a stall for
+// FailbackHold up to now.
+func (p *Pipeline) eligible(a *attempt, now time.Time) bool {
+	return !a.since.IsZero() && now.Sub(a.last) <= a.stall && now.Sub(a.since) >= p.opt.FailbackHold
+}
+
+// failback makes probe a, at its key, the active input: the active input is
+// made inactive, which flushes the Clock, and closed by the activation (a
+// passive one keeps listening); a's held frames, from that key, go to the
+// hub.
+func (p *Pipeline) failback(ctx context.Context, a *attempt) error {
+	old := p.act
+	if p.deactivate(ctx, old, false) >= healthyReset {
+		p.inputs[old.in].backoff = 0
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	held := a.held
+	p.activate(a)
+	for _, h := range held {
+		p.lastFrame = p.now()
+		if err := p.push(ctx, h.f, h.t); err != nil {
+			return err
+		}
+	}
+	p.restartStall(a)
+	a.next()
+	return nil
+}
+
+func frameSize(f media.Frame) int {
+	n := 0
+	for _, b := range f.Data {
+		n += len(b)
+	}
+	return n
+}
+
 // fail handles a's failure by cause. The active input's held frames are
 // flushed at once, so pacing never delays failover, and the other pull
 // inputs are then tried. A passive input that timed out keeps listening;
@@ -657,6 +806,9 @@ func (p *Pipeline) fail(ctx context.Context, a *attempt, cause error) error {
 		if p.deactivate(ctx, a, false) >= healthyReset {
 			in.backoff = 0
 		}
+	}
+	if !a.since.IsZero() && a.last.Sub(a.since) >= healthyReset {
+		in.backoff = 0 // a probe that read long enough (only probes have since set)
 	}
 	if in.passive && (errors.Is(cause, errNoStart) || errors.Is(cause, errStalled)) {
 		a.deadline = time.Time{}
@@ -738,6 +890,12 @@ func (p *Pipeline) emit(ev Event) {
 	if p.opt.OnEvent != nil {
 		p.opt.OnEvent(ev)
 	}
+}
+
+// mapsVideo reports whether a reader track of a, among those mapped so far,
+// maps onto a video track of the layout.
+func (a *attempt) mapsVideo(layout []media.Kind) bool {
+	return slices.ContainsFunc(a.tracks, func(t int) bool { return t >= 0 && layout[t] == media.KindVideo })
 }
 
 // track maps reader track t onto the layout by (kind, ordinal): the k-th

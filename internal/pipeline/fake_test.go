@@ -20,10 +20,17 @@ var fakeT0 = time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
 // time is advanced to its deadline, and reports every call on calls; Sleep
 // advances the time.
 type fakeTime struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []fakeTimer
-	calls  chan time.Duration
+	mu      sync.Mutex
+	now     time.Time
+	timers  []fakeTimer
+	waiters []fakeWaiter
+	calls   chan time.Duration
+}
+
+// fakeWaiter is an until channel, closed once the time reaches at.
+type fakeWaiter struct {
+	at time.Time
+	c  chan struct{}
 }
 
 type fakeTimer struct {
@@ -71,6 +78,29 @@ func (f *fakeTime) Advance(d time.Duration) {
 		t.c <- f.now
 	}
 	f.timers = kept
+	waiting := f.waiters[:0]
+	for _, w := range f.waiters {
+		if w.at.After(f.now) {
+			waiting = append(waiting, w)
+			continue
+		}
+		close(w.c)
+	}
+	f.waiters = waiting
+}
+
+// until returns a channel closed once the time reaches t. Unlike After, it
+// is not reported on calls.
+func (f *fakeTime) until(t time.Time) <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := make(chan struct{})
+	if !f.now.Before(t) {
+		close(c)
+		return c
+	}
+	f.waiters = append(f.waiters, fakeWaiter{at: t, c: c})
+	return c
 }
 
 func (f *fakeTime) Sleep(ctx context.Context, d time.Duration) error {
