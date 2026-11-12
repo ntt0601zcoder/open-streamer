@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -60,9 +61,12 @@ type EventKind uint8
 
 // Event kinds.
 const (
-	EventActive        EventKind = iota + 1 // the input delivered its first frame and feeds the hub
-	EventFailed                             // the input failed (Err) and was closed
-	EventDiscontinuity                      // the active input reported a timeline break
+	EventActive EventKind = iota + 1 // the input delivered its first frame and feeds the hub
+	// EventFailed reports an input's failure (Err). The input was closed and
+	// is retried after its backoff, except a passive input that timed out,
+	// which keeps listening.
+	EventFailed
+	EventDiscontinuity // the active input reported a timeline break
 )
 
 // Event reports a change of an input's state.
@@ -88,8 +92,18 @@ type Pipeline struct {
 
 	// Run goroutine only.
 	layout      []media.Kind
-	last        int            // input active last, -1 before the first
-	stall       time.Duration  // the active input's stall limit
+	inputs      []*input
+	act         *attempt   // the active input's attempt, nil when none
+	search      bool       // the active input failed: other pull inputs are tried one at a time
+	items       chan item  // from every attempt's goroutine
+	layoutAt    time.Time  // when input 0's claim on the layout ends
+	waiting     []*attempt // opened attempts waiting for the layout, in opening order
+	timer       <-chan time.Time
+	timerAt     time.Time // the deadline timer is armed for; zero when none
+	rearm       bool      // arm a new timer even for an unchanged deadline
+	reached     time.Time // the latest deadline whose timer fired
+	last        int       // input active last, -1 before the first
+	stall       time.Duration
 	activeSince time.Time      // when the active input delivered its first frame
 	lastFrame   time.Time      // when the active input last delivered a mapped frame
 	wg          sync.WaitGroup // input goroutines
@@ -97,6 +111,14 @@ type Pipeline struct {
 	mu  sync.Mutex // guards st and cur
 	st  Stats      // Input unset
 	cur ingest.Reader
+}
+
+// input is the retry state of one entry of Options.Inputs.
+type input struct {
+	passive bool
+	a       *attempt      // the running attempt, nil when none
+	backoff time.Duration // the last retry wait, 0 before the first
+	retryAt time.Time     // the input is not reopened before this
 }
 
 // New returns a pipeline that writes to h.
@@ -152,48 +174,171 @@ func (p *Pipeline) Stats() Stats {
 }
 
 // Run reads the inputs into the hub until ctx is done (ctx.Err()) or, with
-// EndOnEOF, the active input ends (nil). A failed input is closed, reported
-// (EventFailed) and retried after its backoff. Run returns after every
-// goroutine it started has ended. It must be called at most once.
+// EndOnEOF, the active input ends (nil). Run returns after every goroutine it
+// started has ended. It must be called at most once.
+//
+// Inputs are tried by priority. With no active input (at start-up, or once
+// every input has failed), every input is open at once, a pull input after
+// its backoff and a passive one listening, and the first to deliver a frame
+// becomes active. When the active input fails, the pull inputs that are not
+// waiting out a backoff are tried one at a time, highest first, until one
+// delivers; the attempts of other pull inputs are closed at every
+// activation. A failed input is closed, reported (EventFailed) and retried
+// after its backoff, except a passive input failing by a timeout, which
+// keeps listening: it becomes active again at its next frame when no input
+// is active. Passive inputs listen whenever they are not waiting out a
+// backoff, dropping their frames while another input is active.
 func (p *Pipeline) Run(ctx context.Context) error {
 	if len(p.opt.Inputs) == 0 {
 		return errors.New("pipeline: run: no input")
 	}
-	for _, u := range p.opt.Inputs {
-		// Parse gives Passive, needed before open by failover; the
-		// effective Spec comes from the open reader.
-		if _, err := p.opt.Parse(u); err != nil {
+	p.inputs = make([]*input, len(p.opt.Inputs))
+	for i, u := range p.opt.Inputs {
+		// Parse gives Passive, needed before open; the effective Spec comes
+		// from the open reader.
+		spec, err := p.opt.Parse(u)
+		if err != nil {
 			return fmt.Errorf("pipeline: parse: %w", err)
 		}
+		p.inputs[i] = &input{passive: spec.Passive}
+	}
+	p.items = make(chan item)
+	if len(p.layout) == 0 {
+		p.layoutAt = p.now().Add(p.opt.StartTimeout)
 	}
 	defer p.wg.Wait()
-	var backoff time.Duration
+	defer p.stopAll()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		a := p.start(ctx, 0)
-		cause := p.serve(ctx, a)
-		healthy := p.end(ctx, a, errors.Is(cause, errEnded))
-		if errors.Is(cause, errEnded) {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		p.emit(Event{Kind: EventFailed, Input: a.in, Err: cause})
-		// Healthy time runs from the first frame to the last, not to the
-		// failure's detection.
-		if healthy >= healthyReset {
-			backoff = 0
-		}
-		backoff = min(max(2*backoff, firstRetry), p.opt.RetryInterval)
+		p.schedule(ctx)
+		p.arm()
+		var err error
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-p.opt.After(backoff):
+		case <-p.timer:
+			p.reached = latest(p.reached, p.timerAt)
+			p.timer, p.timerAt = nil, time.Time{}
+			err = p.expire(ctx)
+		case it := <-p.items:
+			err = p.handle(ctx, it)
+		}
+		if errors.Is(err, errEnded) {
+			p.end(ctx, p.act)
+			return nil
+		}
+		if err != nil {
+			return err
 		}
 	}
+}
+
+// now is the time of the deadlines: the clock, or the last deadline whose
+// timer fired when that is later, so that a fired timer is always due.
+func (p *Pipeline) now() time.Time { return latest(p.opt.Now(), p.reached) }
+
+func latest(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// schedule starts the attempts that are due: every passive input not waiting
+// out a backoff; with no active input, the pull inputs as Run describes.
+func (p *Pipeline) schedule(ctx context.Context) {
+	now := p.now()
+	due := func(in *input) bool { return !in.passive && in.a == nil && !now.Before(in.retryAt) }
+	for i, in := range p.inputs {
+		if in.passive && in.a == nil && !now.Before(in.retryAt) {
+			p.start(ctx, i)
+		}
+	}
+	if p.act != nil {
+		return
+	}
+	if p.search {
+		for _, in := range p.inputs {
+			if !in.passive && in.a != nil {
+				return // one pull input at a time
+			}
+		}
+		if i := slices.IndexFunc(p.inputs, due); i >= 0 {
+			p.start(ctx, i)
+			return
+		}
+		p.search = false // every pull input waits: each reopens after its backoff
+	}
+	for i, in := range p.inputs {
+		if due(in) {
+			p.start(ctx, i)
+		}
+	}
+}
+
+// arm sets the timer to the earliest deadline: an attempt's start or stall
+// limit, a retry that schedule would start, or the end of the layout wait
+// while attempts wait for it. Every deadline is absolute, so a timer armed
+// late still fires at it.
+func (p *Pipeline) arm() {
+	now := p.now()
+	var next time.Time
+	consider := func(t time.Time) {
+		if !t.IsZero() && (next.IsZero() || t.Before(next)) {
+			next = t
+		}
+	}
+	for _, in := range p.inputs {
+		switch {
+		case in.a != nil:
+			consider(in.a.deadline)
+		case (in.passive || p.act == nil) && in.retryAt.After(now):
+			consider(in.retryAt)
+		}
+	}
+	if len(p.waiting) > 0 {
+		consider(p.layoutAt)
+	}
+	if next.Equal(p.timerAt) && !p.rearm {
+		return
+	}
+	p.rearm = false
+	p.timerAt = next
+	if next.IsZero() {
+		p.timer = nil
+		return
+	}
+	p.timer = p.opt.After(next.Sub(now))
+}
+
+// expire handles the deadlines that are due: the end of the layout wait,
+// then the start and stall limits.
+func (p *Pipeline) expire(ctx context.Context) error {
+	now := p.now()
+	if len(p.waiting) > 0 && !now.Before(p.layoutAt) {
+		if len(p.layout) == 0 {
+			p.layout = p.waiting[0].r.Kinds() // the first input that opened
+		}
+		p.resumeWaiting()
+	}
+	for _, in := range p.inputs {
+		a := in.a
+		if a == nil || a.deadline.IsZero() || now.Before(a.deadline) {
+			continue
+		}
+		var err error
+		if a == p.act {
+			err = fmt.Errorf("pipeline: read: %w (%v)", errStalled, p.stall)
+		} else {
+			err = fmt.Errorf("pipeline: start: %w (%v)", errNoStart, p.opt.StartTimeout)
+		}
+		if err := p.fail(ctx, a, err); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // itemKind says what an input goroutine delivered.
@@ -206,6 +351,7 @@ const (
 )
 
 type item struct {
+	a    *attempt
 	kind itemKind
 	r    ingest.Reader
 	f    ingest.Frame
@@ -216,30 +362,41 @@ type item struct {
 // then reads one item per request so that reads stay in step with Run.
 type attempt struct {
 	in     int
-	ch     chan item     // unbuffered: an item is either taken by Run or dropped at stop
 	req    chan struct{} // capacity 1: Run asks for the next Read
 	done   chan struct{} // closed at stop
 	exited chan struct{} // closed when the goroutine returns
 	cancel context.CancelFunc
 
 	// Run goroutine only.
-	r      ingest.Reader // set once the open reader is received
-	active bool          // delivered its first frame
-	tracks []int         // reader track → layout track, -1 unmapped; nil to recompute
+	r        ingest.Reader // set once the open reader is received
+	tracks   []int         // reader track → layout track, -1 unmapped; nil to recompute
+	deadline time.Time     // the start or stall limit; zero for none
 }
 
-// start opens input in in a new goroutine.
-func (p *Pipeline) start(ctx context.Context, in int) *attempt {
+// start opens input in in a new goroutine; it delivers on p.items.
+func (p *Pipeline) start(ctx context.Context, in int) {
 	octx, cancel := context.WithCancel(ctx)
 	a := &attempt{
-		in:     in,
-		ch:     make(chan item),
-		req:    make(chan struct{}, 1),
-		done:   make(chan struct{}),
-		exited: make(chan struct{}),
-		cancel: cancel,
+		in:       in,
+		req:      make(chan struct{}, 1),
+		done:     make(chan struct{}),
+		exited:   make(chan struct{}),
+		cancel:   cancel,
+		deadline: p.now().Add(p.opt.StartTimeout),
 	}
+	p.inputs[in].a = a
+	p.rearm = true
 	url := p.opt.Inputs[in]
+	items := p.items
+	send := func(it item) bool {
+		it.a = a
+		select {
+		case items <- it:
+			return true
+		case <-a.done:
+			return false
+		}
+	}
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -249,10 +406,10 @@ func (p *Pipeline) start(ctx context.Context, in int) *attempt {
 			err = errors.New("no reader")
 		}
 		if err != nil {
-			a.send(item{kind: itemOpenErr, err: fmt.Errorf("pipeline: open: %w", err)})
+			send(item{kind: itemOpenErr, err: fmt.Errorf("pipeline: open: %w", err)})
 			return
 		}
-		if !a.send(item{kind: itemOpened, r: r}) {
+		if !send(item{kind: itemOpened, r: r}) {
 			_ = r.Close()
 			return
 		}
@@ -263,7 +420,7 @@ func (p *Pipeline) start(ctx context.Context, in int) *attempt {
 			case <-a.req:
 			}
 			f, err := r.Read()
-			if !a.send(item{kind: itemRead, f: f, err: err}) {
+			if !send(item{kind: itemRead, f: f, err: err}) {
 				return
 			}
 			if err != nil && !errors.Is(err, ingest.ErrDiscontinuity) {
@@ -271,17 +428,6 @@ func (p *Pipeline) start(ctx context.Context, in int) *attempt {
 			}
 		}
 	}()
-	return a
-}
-
-// send hands it to Run, or reports false once the attempt is stopped.
-func (a *attempt) send(it item) bool {
-	select {
-	case a.ch <- it:
-		return true
-	case <-a.done:
-		return false
-	}
 }
 
 // next asks the goroutine for the next Read.
@@ -305,82 +451,152 @@ func (a *attempt) stop() {
 	<-a.exited
 }
 
-// serve feeds the hub from a until it fails, ends (errEnded) or ctx is done.
-// The timeout runs only while Run waits on the input: StartTimeout from the
-// open to the first frame, then the stall limit from the end of each frame's
-// processing, so pacing sleeps never count. Only frames that map onto the
-// layout are progress: they activate the input and re-arm the stall limit,
-// as does a discontinuity's flush when it wrote frames (it may have paced
-// them); an input of unmapped tracks or bare discontinuities stalls.
-func (p *Pipeline) serve(ctx context.Context, a *attempt) error {
-	wait := p.opt.After(p.opt.StartTimeout)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
+// stopAttempt stops a and forgets it.
+func (p *Pipeline) stopAttempt(a *attempt) {
+	a.stop()
+	p.inputs[a.in].a = nil
+	p.waiting = slices.DeleteFunc(p.waiting, func(w *attempt) bool { return w == a })
+}
+
+func (p *Pipeline) stopAll() {
+	for _, in := range p.inputs {
+		if in.a != nil {
+			p.stopAttempt(in.a)
 		}
-		var it item
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-wait:
-			if a.active {
-				return fmt.Errorf("pipeline: read: %w (%v)", errStalled, p.stall)
-			}
-			return fmt.Errorf("pipeline: start: %w (%v)", errNoStart, p.opt.StartTimeout)
-		case it = <-a.ch:
-		}
-		switch {
-		case it.kind == itemOpenErr:
-			return it.err
-		case it.kind == itemOpened:
-			a.r = it.r
-			if len(p.layout) == 0 && a.in == 0 {
-				p.layout = a.r.Kinds()
-			}
-		case it.err == nil:
-			if len(p.layout) == 0 {
-				p.layout = a.r.Kinds()
-			}
-			t, ok := a.track(it.f.Track, p.layout)
-			if !ok {
-				p.mu.Lock()
-				p.st.Unmapped++
-				p.mu.Unlock()
-				break
-			}
-			if !a.active {
-				p.activate(a)
-			}
-			p.lastFrame = p.opt.Now()
-			if err := p.push(ctx, it.f, t); err != nil {
-				return err
-			}
-			wait = p.opt.After(p.stall)
-		case errors.Is(it.err, ingest.ErrDiscontinuity):
-			if a.active {
-				wrote, err := p.breakClock(ctx, false)
-				if err != nil {
-					return err
-				}
-				if wrote > 0 {
-					wait = p.opt.After(p.stall)
-				}
-				a.tracks = nil // a remapped slot may change kind
-				p.emit(Event{Kind: EventDiscontinuity, Input: a.in})
-			}
-		case errors.Is(it.err, io.EOF) && a.active && p.opt.EndOnEOF:
-			return errEnded
-		default:
-			return fmt.Errorf("pipeline: read: %w", it.err)
-		}
-		a.next()
 	}
 }
 
-// activate makes a the active input at its first frame. Every activation
-// after the first breaks the Clock for a new input, the same input reopened
-// included; a different input than the last one counts as a switch.
+// handle processes one item of an attempt. Only frames that map onto the
+// layout are progress: they activate an input and re-arm the stall limit,
+// as does a discontinuity's flush when it wrote frames (it may have paced
+// them); an input of unmapped tracks or bare discontinuities stalls. The
+// stall limit runs from the end of each frame's processing, so pacing sleeps
+// never count.
+func (p *Pipeline) handle(ctx context.Context, it item) error {
+	a := it.a
+	switch {
+	case it.kind == itemOpenErr:
+		return p.fail(ctx, a, it.err)
+	case it.kind == itemOpened:
+		a.r = it.r
+		p.opened(a)
+		return nil
+	case it.err == nil:
+		return p.frame(ctx, a, it.f)
+	case errors.Is(it.err, ingest.ErrDiscontinuity):
+		a.tracks = nil // a remapped slot may change kind
+		if a == p.act {
+			wrote, err := p.breakClock(ctx, false)
+			if err != nil {
+				return err
+			}
+			if wrote > 0 {
+				p.restartStall(a)
+			}
+			p.emit(Event{Kind: EventDiscontinuity, Input: a.in})
+		}
+		a.next()
+		return nil
+	case errors.Is(it.err, io.EOF) && a == p.act && p.opt.EndOnEOF:
+		return errEnded
+	default:
+		return p.fail(ctx, a, fmt.Errorf("pipeline: read: %w", it.err))
+	}
+}
+
+// opened starts reading an open attempt, once the layout is known: input
+// 0's kinds while it may still open within StartTimeout of Run's start,
+// else the first input's that opens.
+func (p *Pipeline) opened(a *attempt) {
+	if len(p.layout) == 0 {
+		if a.in != 0 && p.now().Before(p.layoutAt) {
+			p.waiting = append(p.waiting, a)
+			return
+		}
+		p.layout = a.r.Kinds()
+	}
+	a.next()
+	if len(p.layout) > 0 {
+		p.resumeWaiting()
+	}
+}
+
+// resumeWaiting starts reading the attempts that waited for the layout. Their
+// start limit runs again from now: they could not deliver while waiting.
+func (p *Pipeline) resumeWaiting() {
+	for _, w := range p.waiting {
+		if !w.deadline.IsZero() {
+			w.deadline = p.now().Add(p.opt.StartTimeout)
+			p.rearm = true
+		}
+		w.next()
+	}
+	p.waiting = nil
+}
+
+// frame processes a frame of a: the active input's goes to the hub; with no
+// active input, a's first mapped frame makes it active; a passive input
+// listening while another is active drops it.
+func (p *Pipeline) frame(ctx context.Context, a *attempt, f ingest.Frame) error {
+	if len(p.layout) == 0 {
+		// The input opened without tracks; it may not be input 0 once the
+		// layout wait is over.
+		p.layout = a.r.Kinds()
+		if len(p.layout) > 0 {
+			p.resumeWaiting()
+		}
+	}
+	if p.act != nil && a != p.act {
+		a.next()
+		return nil
+	}
+	t, ok := a.track(f.Track, p.layout)
+	if !ok {
+		p.mu.Lock()
+		p.st.Unmapped++
+		p.mu.Unlock()
+		a.next()
+		return nil
+	}
+	if a != p.act {
+		p.activate(a)
+	}
+	p.lastFrame = p.now()
+	if err := p.push(ctx, f, t); err != nil {
+		return err
+	}
+	p.restartStall(a)
+	a.next()
+	return nil
+}
+
+// restartStall restarts the active input's stall limit from now. The timer
+// is armed before the next Read is requested, so it is in place by the time
+// the reader blocks.
+func (p *Pipeline) restartStall(a *attempt) {
+	a.deadline = p.now().Add(p.stall)
+	p.rearm = true
+	p.arm()
+}
+
+// activate makes a the active input at its first frame. The attempts of the
+// other pull inputs are closed; passive inputs keep listening. Every
+// activation after the first breaks the Clock once for a new input, the same
+// input reopened or resumed included; a different input than the last one
+// counts as a switch.
 func (p *Pipeline) activate(a *attempt) {
+	p.act = a
+	p.search = false
+	for _, in := range p.inputs {
+		o := in.a
+		switch {
+		case o == nil || o == a:
+		case in.passive:
+			o.deadline = time.Time{} // listening, not judged, while another input is active
+		default:
+			p.stopAttempt(o)
+		}
+	}
 	spec := a.r.Spec()
 	p.stall = max(p.opt.StallTimeout, spec.StallTimeout)
 	if p.w.c == nil {
@@ -396,8 +612,7 @@ func (p *Pipeline) activate(a *attempt) {
 		p.w.c.SetDrift(0, false)
 	}
 	p.w.pace = spec.Pace
-	a.active = true
-	p.activeSince = p.opt.Now()
+	p.activeSince = p.now()
 	p.mu.Lock()
 	if p.last >= 0 && p.last != a.in {
 		p.st.Switches++
@@ -409,15 +624,47 @@ func (p *Pipeline) activate(a *attempt) {
 	p.emit(Event{Kind: EventActive, Input: a.in})
 }
 
-// end stops a after serve returned. When a was active, it flushes the Clock
-// (unless ctx is done) and returns how long a was healthy, from its first
-// frame to its last. The flush is paced only when a ended (ended); a failed
-// input's held frames are written at once, so pacing never delays failover.
-func (p *Pipeline) end(ctx context.Context, a *attempt, ended bool) time.Duration {
-	a.stop()
-	if !a.active {
-		return 0
+// fail handles a's failure by cause. The active input's held frames are
+// flushed at once, so pacing never delays failover, and the other pull
+// inputs are then tried. A passive input that timed out keeps listening;
+// any other failed input is closed and waits out its backoff, which 10 s of
+// healthy reading (from its first frame to its last) resets. EventFailed is
+// not reported once ctx is done.
+func (p *Pipeline) fail(ctx context.Context, a *attempt, cause error) error {
+	in := p.inputs[a.in]
+	if a == p.act {
+		p.search = true
+		if p.deactivate(ctx, a, false) >= healthyReset {
+			in.backoff = 0
+		}
 	}
+	if in.passive && (errors.Is(cause, errNoStart) || errors.Is(cause, errStalled)) {
+		a.deadline = time.Time{}
+	} else {
+		p.stopAttempt(a)
+		in.backoff = min(max(2*in.backoff, firstRetry), p.opt.RetryInterval)
+		in.retryAt = p.now().Add(in.backoff)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.emit(Event{Kind: EventFailed, Input: a.in, Err: cause})
+	return nil
+}
+
+// end stops the active attempt a, which ended, and flushes its held frames
+// paced.
+func (p *Pipeline) end(ctx context.Context, a *attempt) {
+	p.stopAttempt(a)
+	p.deactivate(ctx, a, true)
+}
+
+// deactivate makes a, the active input, inactive. It flushes the Clock
+// (unless ctx is done) and returns how long a was healthy, from its first
+// frame to its last. The flush is paced only when a ended (ended).
+func (p *Pipeline) deactivate(ctx context.Context, a *attempt, ended bool) time.Duration {
+	p.act = nil
+	a.deadline = time.Time{}
 	p.mu.Lock()
 	p.st.Active = -1
 	p.cur = nil

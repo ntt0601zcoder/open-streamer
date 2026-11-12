@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -98,13 +99,16 @@ type step struct {
 }
 
 // fakeReader returns its steps in order, then io.EOF when eof is set, else
-// blocks until Close. onRead, when set, runs before step i is returned.
+// blocks until Close. onRead, when set, runs before step i is returned; a
+// gate for step i holds it until the gate is closed (or the reader is),
+// signalling blocked first.
 type fakeReader struct {
 	kinds  []media.Kind
 	spec   ingest.Spec
 	steps  []step
 	eof    bool
 	onRead func(i int)
+	gates  map[int]chan struct{}
 
 	i       int // Read goroutine only
 	blocked chan struct{}
@@ -128,6 +132,17 @@ func (r *fakeReader) Read() (ingest.Frame, error) {
 	if r.i < len(r.steps) {
 		if r.onRead != nil {
 			r.onRead(r.i)
+		}
+		if g := r.gates[r.i]; g != nil {
+			select {
+			case r.blocked <- struct{}{}:
+			default:
+			}
+			select {
+			case <-g:
+			case <-r.closed:
+				return ingest.Frame{}, errFakeClosed
+			}
 		}
 		s := r.steps[r.i]
 		r.i++
@@ -232,6 +247,27 @@ func (o *opener) open(ctx context.Context, _ string) (ingest.Reader, error) {
 }
 
 func noParse(string) (ingest.Spec, error) { return ingest.Spec{}, nil }
+
+// byURL serves each input URL from its own opener.
+type byURL map[string]*opener
+
+func (m byURL) open(ctx context.Context, u string) (ingest.Reader, error) { return m[u].open(ctx, u) }
+
+// passiveParse marks the URLs starting with "passive" Passive.
+func passiveParse(u string) (ingest.Spec, error) {
+	return ingest.Spec{Passive: strings.HasPrefix(u, "passive")}, nil
+}
+
+// framesRead counts the frames r returned from Read.
+func (r *fakeReader) framesRead() int {
+	n := 0
+	for _, s := range r.steps[:r.i] {
+		if s.err == nil {
+			n++
+		}
+	}
+	return n
+}
 
 // events collects pipeline events; it is used from the Run goroutine and read
 // after Run returns, or under its lock.
