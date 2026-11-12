@@ -19,6 +19,9 @@ cat h264_aac.ts h264_aac.ts > h264_aac_loop.ts
 cat h264_aac.ts h264_640.ts > h264_aac_then_640.ts
 N=$(( $(stat -c%s h264_aac.ts) / 188 ))
 tail -c +$(( 188 * (N * 3 / 8) + 1 )) h264_aac.ts > h264_aac_midgop.ts
+$F $(v 320x240) $(a 48000) -t 6 -c:v libx264 -profile:v main -bf 2 -g 25 -keyint_min 25 -sc_threshold 0 -x264-params open-gop=1:keyint=25:min-keyint=25:scenecut=0 -c:a aac -ac 2 -b:a 64k $BX h264_opengop.ts
+N=$(( $(stat -c%s h264_opengop.ts) / 188 ))
+tail -c +$(( 188 * (N * 3 / 8) + 1 )) h264_opengop.ts > h264_opengop_midgop.ts
 # PMT-change fixtures: the appended 3 s clip continues the timeline
 # (-output_ts_offset 6), so only the PMT signals the change.
 $F $(v 320x240) $(a 48000) -t 3 $X264 -c:a aac -ac 2 -b:a 64k -output_ts_offset 6 -mpegts_start_pid 0x200 -mpegts_pmt_start_pid 0x1100 $BX tmp_pmtchange.ts
