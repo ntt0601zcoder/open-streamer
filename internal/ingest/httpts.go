@@ -144,7 +144,12 @@ func openHTTP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, er
 
 func doHTTP(ctx, rctx context.Context, cancel context.CancelFunc, client *http.Client, rawURL string, p parsed, env Env) (Reader, error) {
 	loaded := time.Now()
-	req, err := http.NewRequestWithContext(rctx, http.MethodGet, rawURL, nil)
+	playlistURL := p.u
+	if p.spec.Pace {
+		// A .m3u8 URL: the variant selector is ours, not the server's.
+		playlistURL = dropQuery(p.u, variantKey)
+	}
+	req, err := http.NewRequestWithContext(rctx, http.MethodGet, playlistURL.String(), nil)
 	if err != nil {
 		return nil, httpErr(rawURL, "request", stripURLError(err))
 	}
@@ -168,7 +173,7 @@ func doHTTP(ctx, rctx context.Context, cancel context.CancelFunc, client *http.C
 		if len(data) > maxPlaylistBytes {
 			return nil, httpErr(rawURL, "read playlist", fmt.Errorf("playlist exceeds %d bytes", maxPlaylistBytes))
 		}
-		h, err := openHLS(rctx, cancel, client, rawURL, data, resp.Request.URL, loaded, env)
+		h, err := openHLS(rctx, cancel, client, rawURL, playlistURL, data, resp.Request.URL, loaded, env)
 		if err != nil {
 			return nil, err
 		}
