@@ -52,7 +52,7 @@ type source struct {
 	name, path string
 	hub        *hub.Hub
 	pack       *live.Packager
-	reported   [2]uint64 // Errors and FallbackAnchors at the last report
+	reported   [3]uint64 // Errors, CodecErrors and FallbackAnchors at the last report
 }
 
 // lockedWriter serialises writes from several goroutines.
@@ -67,18 +67,18 @@ func (l *lockedWriter) Write(b []byte) (int, error) {
 	return l.w.Write(b)
 }
 
-// report writes one line per stream whose packager counted mux errors or
-// fallback anchors: on every call when final, else only when they grew
-// since the last report.
+// report writes one line per stream whose packager counted mux errors,
+// codec string errors or fallback anchors: on every call when final, else
+// only when they grew since the last report.
 func report(w io.Writer, srcs []*source, final bool) {
 	for _, s := range srcs {
-		now := [2]uint64{s.pack.Errors(), s.pack.FallbackAnchors()}
-		if now == ([2]uint64{}) || (!final && now == s.reported) {
+		now := [3]uint64{s.pack.Errors(), s.pack.CodecErrors(), s.pack.FallbackAnchors()}
+		if now == ([3]uint64{}) || (!final && now == s.reported) {
 			continue
 		}
 		s.reported = now
-		_, _ = fmt.Fprintf(w, "osdev: stream %s: %d packager mux errors (dropped segment outputs), %d epochs placed without a hub anchor\n",
-			s.name, now[0], now[1])
+		_, _ = fmt.Fprintf(w, "osdev: stream %s: %d packager mux errors (dropped segment outputs), %d tracks without a codec string, %d epochs placed without a hub anchor\n",
+			s.name, now[0], now[1], now[2])
 	}
 }
 

@@ -109,6 +109,7 @@ type EpochInfo struct {
 type EpochTrack struct {
 	Track  int
 	Config *media.TrackConfig // the track's first config in the epoch
+	Codec  string             // RFC 6381 codec string of Config; "" when it cannot be built (Packager.CodecErrors)
 	Init   []byte             // served as cmaf/init-{Track}-{Epoch}.mp4; nil until fmp4.Init succeeds
 }
 

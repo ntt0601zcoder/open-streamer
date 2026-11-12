@@ -83,6 +83,7 @@ type Packager struct {
 	now      func() time.Time
 	errors   atomic.Uint64
 	fallback atomic.Uint64
+	codecErr atomic.Uint64
 
 	// Writer state, guarded by work.
 	work    sync.Mutex
@@ -136,6 +137,11 @@ func (p *Packager) Errors() uint64 { return p.errors.Load() }
 
 // FallbackAnchors returns the number of epochs placed without a hub anchor.
 func (p *Packager) FallbackAnchors() uint64 { return p.fallback.Load() }
+
+// CodecErrors returns the number of epoch tracks whose codec string could
+// not be built, counted once each when the track's first part is packaged.
+// The DASH MPD leaves such a track out, and the HLS master's CODECS lacks it.
+func (p *Packager) CodecErrors() uint64 { return p.codecErr.Load() }
 
 // Handle feeds one delivery and packages the segments it completes. It
 // returns when they are in the window.
@@ -406,6 +412,11 @@ func (p *Packager) muxCMAF(ep *epochState, tf trackFrames, disc bool) (CMAFPart,
 	et := ep.tracks[tf.track]
 	if et == nil {
 		et = &EpochTrack{Track: tf.track, Config: cfg}
+		if c, err := media.CodecString(cfg); err == nil {
+			et.Codec = c
+		} else {
+			p.codecErr.Add(1)
+		}
 		ep.tracks[tf.track] = et
 	}
 	if et.Init == nil {

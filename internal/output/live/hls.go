@@ -293,7 +293,7 @@ func buildMaster(s Snapshot) []byte {
 				continue
 			}
 			epochs[e.seg.Epoch] = true
-			if c, err := media.CodecString(e.et.Config); err == nil && !slices.Contains(codecs, c) {
+			if c := e.et.Codec; c != "" && !slices.Contains(codecs, c) {
 				codecs = append(codecs, c)
 			}
 			if kind == media.KindVideo && e.et.Config.Width*e.et.Config.Height > v.Width*v.Height {

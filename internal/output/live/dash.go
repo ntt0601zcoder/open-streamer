@@ -16,9 +16,8 @@ func init() {
 	playlistRoutes = append(playlistRoutes, playlistRoute{
 		dir:   dirCMAF,
 		match: func(name string) bool { return name == "index.mpd" },
-		build: func(p *Packager, s Snapshot, _ string) ([]byte, string, bool) {
-			body, skipped := buildMPD(s)
-			p.errors.Add(uint64(skipped))
+		build: func(_ *Packager, s Snapshot, _ string) ([]byte, string, bool) {
+			body := buildMPD(s)
 			return body, typeMPD, body != nil
 		},
 	})
@@ -26,12 +25,12 @@ func init() {
 
 // buildMPD renders cmaf/index.mpd from the listed prefix of the window: one
 // Period per epoch that has a listed part, one AdaptationSet per track that
-// has an init segment and a listed part in it. It returns nil when nothing is
-// listed. skipped counts the adaptation sets left out because their codec
-// string could not be built.
-func buildMPD(s Snapshot) (body []byte, skipped int) {
+// has an init segment, a codec string and a listed part in it (a track
+// without a codec string was counted once in Packager.CodecErrors). It
+// returns nil when nothing is listed.
+func buildMPD(s Snapshot) []byte {
 	if s.Listed == 0 || s.AST.IsZero() {
-		return nil, 0
+		return nil
 	}
 	target := media.ToDuration(s.Target)
 	now := s.Now
@@ -50,41 +49,34 @@ func buildMPD(s Snapshot) (body []byte, skipped int) {
 		},
 	}
 	for _, e := range s.Epochs {
-		per, ok, n := buildPeriod(s, e)
-		skipped += n
-		if ok {
+		if per, ok := buildPeriod(s, e); ok {
 			m.Periods = append(m.Periods, per)
 		}
 	}
 	if len(m.Periods) == 0 {
-		return nil, skipped
+		return nil
 	}
-	return m.Encode(), skipped
+	return m.Encode()
 }
 
-func buildPeriod(s Snapshot, e EpochInfo) (per dash.Period, ok bool, skipped int) {
-	per = dash.Period{ID: "e" + strconv.FormatUint(uint64(e.Epoch), 10), Start: dash.Duration(e.Start)}
+func buildPeriod(s Snapshot, e EpochInfo) (dash.Period, bool) {
+	per := dash.Period{ID: "e" + strconv.FormatUint(uint64(e.Epoch), 10), Start: dash.Duration(e.Start)}
 	for _, et := range e.Tracks {
-		if et.Init == nil || et.Config == nil {
+		if et.Init == nil || et.Config == nil || et.Codec == "" {
 			continue
 		}
-		as, ok, err := buildSet(s, e, et)
-		if err {
-			skipped++
-		}
-		if ok {
+		if as, ok := buildSet(s, e, et); ok {
 			per.AdaptationSets = append(per.AdaptationSets, as)
 		}
 	}
-	return per, len(per.AdaptationSets) > 0, skipped
+	return per, len(per.AdaptationSets) > 0
 }
 
-// buildSet returns the track's set; failed reports a codec string error.
-func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (as dash.AdaptationSet, ok, failed bool) {
+// buildSet returns the track's set, if it has a listed part.
+func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (dash.AdaptationSet, bool) {
 	ts := fmp4.Timescale(et.Config)
-	codec, err := media.CodecString(et.Config)
-	if ts == 0 || err != nil {
-		return dash.AdaptationSet{}, false, ts != 0
+	if ts == 0 {
+		return dash.AdaptationSet{}, false
 	}
 	var tl dash.SegmentTimeline
 	var first uint64
@@ -108,12 +100,12 @@ func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (as dash.AdaptationSet, ok
 		}
 	}
 	if len(tl.S) == 0 {
-		return dash.AdaptationSet{}, false, false
+		return dash.AdaptationSet{}, false
 	}
 	pto := max(media.Rescale(e.Anchor.Start, int(ts)), 0)
 	track := strconv.Itoa(et.Track)
-	rep := dash.Representation{ID: track, Codecs: codec, Bandwidth: int(math.Ceil(peak))}
-	as = dash.AdaptationSet{
+	rep := dash.Representation{ID: track, Codecs: et.Codec, Bandwidth: int(math.Ceil(peak))}
+	as := dash.AdaptationSet{
 		SegmentAlignment: true,
 		SegmentTemplate: &dash.SegmentTemplate{
 			Timescale:              ts,
@@ -136,5 +128,5 @@ func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (as dash.AdaptationSet, ok
 		rep.Width, rep.Height = et.Config.Width, et.Config.Height
 	}
 	as.Representations = []dash.Representation{rep}
-	return as, true, false
+	return as, true
 }
