@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -999,4 +1000,29 @@ func TestFirstTSSegmentNeverDiscontinuous(t *testing.T) {
 	// The video track's parts: the first is never discontinuous.
 	assert.False(t, snap.Segments[0].Parts[0].Discontinuity)
 	assert.True(t, s1.Parts[0].Discontinuity)
+}
+
+// Players on another origin (hls.js, dash.js) can fetch every file: each
+// response allows any origin, and a preflight is answered.
+func TestHandlerCORS(t *testing.T) {
+	p, _ := packClip(t, "h264_aac.ts", Options{Window: 100, Now: farFuture})
+	srv := serve(p)
+	for _, path := range []string{"/live/s/hls/index.m3u8", "/live/s/hls/0.ts", "/live/s/cmaf/index.mpd", "/live/s/cmaf/init-0-1.mp4", "/live/s/hls/99.ts"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil)
+		req.Header.Set("Origin", "https://player.example")
+		srv.ServeHTTP(rec, req)
+		assert.Equal(t, "*", rec.Header().Get("Access-Control-Allow-Origin"), path)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodOptions, "/live/s/cmaf/0-0.m4s", nil)
+	req.Header.Set("Origin", "https://player.example")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	req.Header.Set("Access-Control-Request-Headers", "range")
+	srv.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Equal(t, "*", rec.Header().Get("Access-Control-Allow-Origin"))
+	assert.Contains(t, rec.Header().Get("Access-Control-Allow-Methods"), "GET")
+	assert.Contains(t, strings.ToLower(rec.Header().Get("Access-Control-Allow-Headers")), "range")
+	assert.Empty(t, rec.Body.Bytes())
 }
