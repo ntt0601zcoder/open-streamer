@@ -117,6 +117,7 @@ type track struct {
 	// next PES with a PTS to time them; groupSize is their size.
 	group     []*videoAU
 	groupSize int
+	groupLoss bool  // data was lost since the group started: no even spacing
 	lastOut   int64 // DTS of the last video frame queued
 	haveOut   bool
 	// fieldSPS holds the IDs of H.264 SPS that allow field coding.
@@ -699,8 +700,11 @@ func (d *Demuxer) handleVideo(t *track, pes *mpegts.PES) {
 		if t.ptsLess && d.finishAU(t, false) {
 			d.stats.LostFrames++
 		}
+		// The group waits for the next PES with a PTS, which times it with
+		// the last step clamped below its DTS: units were lost in between,
+		// so neither even spacing nor a step measurement is valid.
+		t.groupLoss = true
 		if !pes.HasPTS {
-			d.releaseGroup(t, 0, false, false)
 			t.lost = true
 		}
 	}
@@ -708,7 +712,7 @@ func (d *Demuxer) handleVideo(t *track, pes *mpegts.PES) {
 	switch {
 	case pes.HasPTS:
 		d.finishAU(t, true)
-		d.releaseGroup(t, dts, true, !pes.Discontinuity)
+		d.releaseGroup(t, dts, true, !t.groupLoss)
 		t.lost = false
 		t.startPES(pts, dts, pes.PTS == pes.DTS)
 	case t.lost:
@@ -733,6 +737,7 @@ func (d *Demuxer) handleVideo(t *track, pes *mpegts.PES) {
 func (t *track) startPES(pts, dts int64, ptsIsDTS bool) {
 	t.timed = true
 	t.pesDTS, t.pesAUs, t.ptsIsDTS = dts, 1, ptsIsDTS
+	t.groupLoss = false
 	t.au = &videoAU{pts: pts, dts: dts}
 }
 
