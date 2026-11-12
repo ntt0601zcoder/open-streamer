@@ -116,6 +116,7 @@ type Pipeline struct {
 // input is the retry state of one entry of Options.Inputs.
 type input struct {
 	passive bool
+	tried   bool          // failed or tried since the active input failed (search)
 	a       *attempt      // the running attempt, nil when none
 	backoff time.Duration // the last retry wait, 0 before the first
 	retryAt time.Time     // the input is not reopened before this
@@ -180,14 +181,16 @@ func (p *Pipeline) Stats() Stats {
 // Inputs are tried by priority. With no active input (at start-up, or once
 // every input has failed), every input is open at once, a pull input after
 // its backoff and a passive one listening, and the first to deliver a frame
-// becomes active. When the active input fails, the pull inputs that are not
-// waiting out a backoff are tried one at a time, highest first, until one
-// delivers; the attempts of other pull inputs are closed at every
-// activation. A failed input is closed, reported (EventFailed) and retried
-// after its backoff, except a passive input failing by a timeout, which
-// keeps listening: it becomes active again at its next frame when no input
-// is active. Passive inputs listen whenever they are not waiting out a
-// backoff, dropping their frames while another input is active.
+// becomes active. When the active input fails, the other pull inputs that are
+// not waiting out a backoff are tried one at a time, highest first, each
+// once, until one delivers; when none is left to try, every pull input
+// reopens after its backoff, as with no active input. The attempts of other
+// pull inputs are closed at every activation. A failed input is closed,
+// reported (EventFailed) and retried after its backoff, except a passive
+// input failing by a timeout, which keeps listening: it becomes active again
+// at its next frame when no input is active. Passive inputs listen whenever
+// they are not waiting out a backoff, dropping their frames, without a start
+// or stall limit, while another input is active.
 func (p *Pipeline) Run(ctx context.Context) error {
 	if len(p.opt.Inputs) == 0 {
 		return errors.New("pipeline: run: no input")
@@ -265,11 +268,14 @@ func (p *Pipeline) schedule(ctx context.Context) {
 				return // one pull input at a time
 			}
 		}
-		if i := slices.IndexFunc(p.inputs, due); i >= 0 {
+		if i := slices.IndexFunc(p.inputs, func(in *input) bool { return due(in) && !in.tried }); i >= 0 {
+			p.inputs[i].tried = true
 			p.start(ctx, i)
 			return
 		}
-		p.search = false // every pull input waits: each reopens after its backoff
+		// Every pull input failed since the active one, or waits out an
+		// earlier backoff: each reopens after its backoff.
+		p.search = false
 	}
 	for i, in := range p.inputs {
 		if due(in) {
@@ -294,7 +300,7 @@ func (p *Pipeline) arm() {
 		switch {
 		case in.a != nil:
 			consider(in.a.deadline)
-		case (in.passive || p.act == nil) && in.retryAt.After(now):
+		case (in.passive || p.reopensPull()) && in.retryAt.After(now):
 			consider(in.retryAt)
 		}
 	}
@@ -312,6 +318,11 @@ func (p *Pipeline) arm() {
 	}
 	p.timer = p.opt.After(next.Sub(now))
 }
+
+// reopensPull reports whether schedule reopens pull inputs when their
+// backoff ends: with no active input and no search running. arm runs after
+// schedule, so a search has a pull attempt running until it ends.
+func (p *Pipeline) reopensPull() bool { return p.act == nil && !p.search }
 
 // expire handles the deadlines that are due: the end of the layout wait,
 // then the start and stall limits.
@@ -377,12 +388,15 @@ type attempt struct {
 func (p *Pipeline) start(ctx context.Context, in int) {
 	octx, cancel := context.WithCancel(ctx)
 	a := &attempt{
-		in:       in,
-		req:      make(chan struct{}, 1),
-		done:     make(chan struct{}),
-		exited:   make(chan struct{}),
-		cancel:   cancel,
-		deadline: p.now().Add(p.opt.StartTimeout),
+		in:     in,
+		req:    make(chan struct{}, 1),
+		done:   make(chan struct{}),
+		exited: make(chan struct{}),
+		cancel: cancel,
+	}
+	if !p.inputs[in].passive || p.act == nil {
+		// A passive input listening in the background is not judged.
+		a.deadline = p.now().Add(p.opt.StartTimeout)
 	}
 	p.inputs[in].a = a
 	p.rearm = true
@@ -547,6 +561,7 @@ func (p *Pipeline) frame(ctx context.Context, a *attempt, f ingest.Frame) error 
 		}
 	}
 	if p.act != nil && a != p.act {
+		a.deadline = time.Time{} // a passive input listening in the background is not judged
 		a.next()
 		return nil
 	}
@@ -633,7 +648,12 @@ func (p *Pipeline) activate(a *attempt) {
 func (p *Pipeline) fail(ctx context.Context, a *attempt, cause error) error {
 	in := p.inputs[a.in]
 	if a == p.act {
+		// The search tries each other pull input once, highest first.
 		p.search = true
+		for _, o := range p.inputs {
+			o.tried = false
+		}
+		in.tried = true
 		if p.deactivate(ctx, a, false) >= healthyReset {
 			in.backoff = 0
 		}
