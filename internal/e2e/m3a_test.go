@@ -71,7 +71,11 @@ type feed func(ctx context.Context, h *hub.Hub) error
 // pipelineFeed runs the unpaced pipeline over data, anchored on now.
 func pipelineFeed(data []byte, now func() time.Time) feed {
 	return func(ctx context.Context, h *hub.Hub) error {
-		return pipeline.New(h, pipeline.Options{
+		// A failed input would be retried without end: return its error.
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var failed error
+		err := pipeline.New(h, pipeline.Options{
 			Inputs: []string{"mem"},
 			Open: func(context.Context, string) (ingest.Reader, error) {
 				return ingest.NewTSReader(io.NopCloser(bytes.NewReader(data)), now)
@@ -79,7 +83,17 @@ func pipelineFeed(data []byte, now func() time.Time) feed {
 			Parse:    func(string) (ingest.Spec, error) { return ingest.Spec{}, nil },
 			EndOnEOF: true,
 			Now:      now,
+			OnEvent: func(ev pipeline.Event) {
+				if ev.Kind == pipeline.EventFailed && failed == nil {
+					failed = ev.Err
+					cancel()
+				}
+			},
 		}).Run(ctx)
+		if failed != nil {
+			return failed
+		}
+		return err
 	}
 }
 

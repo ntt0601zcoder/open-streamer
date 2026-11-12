@@ -98,12 +98,13 @@ type step struct {
 }
 
 // fakeReader returns its steps in order, then io.EOF when eof is set, else
-// blocks until Close.
+// blocks until Close. onRead, when set, runs before step i is returned.
 type fakeReader struct {
-	kinds []media.Kind
-	spec  ingest.Spec
-	steps []step
-	eof   bool
+	kinds  []media.Kind
+	spec   ingest.Spec
+	steps  []step
+	eof    bool
+	onRead func(i int)
 
 	i       int // Read goroutine only
 	blocked chan struct{}
@@ -125,6 +126,9 @@ func (r *fakeReader) Read() (ingest.Frame, error) {
 	default:
 	}
 	if r.i < len(r.steps) {
+		if r.onRead != nil {
+			r.onRead(r.i)
+		}
 		s := r.steps[r.i]
 		r.i++
 		return s.f, s.err

@@ -64,6 +64,9 @@ func runClip(t *testing.T, h *hub.Hub, name string) {
 	t.Helper()
 	b := fixture(t, name)
 	now := func() time.Time { return t0 }
+	// A failed input would be retried without end: fail at once instead.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	require.NoError(t, pipeline.New(h, pipeline.Options{
 		Inputs: []string{"mem"},
 		Open: func(context.Context, string) (ingest.Reader, error) {
@@ -72,7 +75,13 @@ func runClip(t *testing.T, h *hub.Hub, name string) {
 		Parse:    func(string) (ingest.Spec, error) { return ingest.Spec{}, nil },
 		EndOnEOF: true,
 		Now:      now,
-	}).Run(context.Background()))
+		OnEvent: func(ev pipeline.Event) {
+			if ev.Kind == pipeline.EventFailed {
+				t.Errorf("pipeline input failed: %v", ev.Err)
+				cancel()
+			}
+		},
+	}).Run(ctx))
 }
 
 // packClip packages a whole fixture; the packager clock is now.

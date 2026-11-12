@@ -64,6 +64,9 @@ func clip(t *testing.T, name string) (*hub.Hub, *hub.Sub, []hub.Delivery) {
 	sub := h.Subscribe("pkg", 1<<16)
 	check := h.Subscribe("check", 1<<16)
 	now := func() time.Time { return t0 }
+	// A failed input would be retried without end: fail at once instead.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	require.NoError(t, pipeline.New(h, pipeline.Options{
 		Inputs: []string{"mem"},
 		Open: func(context.Context, string) (ingest.Reader, error) {
@@ -72,7 +75,13 @@ func clip(t *testing.T, name string) (*hub.Hub, *hub.Sub, []hub.Delivery) {
 		Parse:    func(string) (ingest.Spec, error) { return ingest.Spec{}, nil },
 		EndOnEOF: true,
 		Now:      now,
-	}).Run(context.Background()))
+		OnEvent: func(ev pipeline.Event) {
+			if ev.Kind == pipeline.EventFailed {
+				t.Errorf("pipeline input failed: %v", ev.Err)
+				cancel()
+			}
+		},
+	}).Run(ctx))
 	h.Close()
 	var ds []hub.Delivery
 	for d := range check.C() {
