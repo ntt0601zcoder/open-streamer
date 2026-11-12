@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/segment"
@@ -62,10 +63,16 @@ func clip(t *testing.T, name string) (*hub.Hub, *hub.Sub, []hub.Delivery) {
 	h := hub.New(hub.Options{})
 	sub := h.Subscribe("pkg", 1<<16)
 	check := h.Subscribe("check", 1<<16)
-	require.NoError(t, pipeline.Run(context.Background(), h, pipeline.Options{
-		Open: func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil },
-		Now:  func() time.Time { return t0 },
-	}))
+	now := func() time.Time { return t0 }
+	require.NoError(t, pipeline.New(h, pipeline.Options{
+		Inputs: []string{"mem"},
+		Open: func(context.Context, string) (ingest.Reader, error) {
+			return ingest.NewTSReader(io.NopCloser(bytes.NewReader(b)), now)
+		},
+		Parse:    func(string) (ingest.Spec, error) { return ingest.Spec{}, nil },
+		EndOnEOF: true,
+		Now:      now,
+	}).Run(context.Background()))
 	h.Close()
 	var ds []hub.Delivery
 	for d := range check.C() {

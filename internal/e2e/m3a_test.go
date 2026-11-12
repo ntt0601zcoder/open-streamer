@@ -27,6 +27,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/clock"
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/httpts"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
@@ -70,10 +71,15 @@ type feed func(ctx context.Context, h *hub.Hub) error
 // pipelineFeed runs the unpaced pipeline over data, anchored on now.
 func pipelineFeed(data []byte, now func() time.Time) feed {
 	return func(ctx context.Context, h *hub.Hub) error {
-		return pipeline.Run(ctx, h, pipeline.Options{
-			Open: func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil },
-			Now:  now,
-		})
+		return pipeline.New(h, pipeline.Options{
+			Inputs: []string{"mem"},
+			Open: func(context.Context, string) (ingest.Reader, error) {
+				return ingest.NewTSReader(io.NopCloser(bytes.NewReader(data)), now)
+			},
+			Parse:    func(string) (ingest.Spec, error) { return ingest.Spec{}, nil },
+			EndOnEOF: true,
+			Now:      now,
+		}).Run(ctx)
 	}
 }
 
