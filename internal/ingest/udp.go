@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
@@ -100,7 +99,11 @@ func (c *udpConn) unwrap(b []byte) []byte {
 }
 
 // countSeq counts forward sequence gaps; a duplicate or an older number
-// (reordering) neither counts nor moves the expectation.
+// (reordering) neither counts nor moves the expectation. Limits: a sender
+// that restarts with a sequence number more than 0x8000 ahead or behind is
+// not resynchronised until the numbers come around, so its gaps are missed;
+// and a reordered pair counts one gap for the early packet, since nothing is
+// reordered back. The counter is an indicator, not an exact loss figure.
 func (c *udpConn) countSeq(seq uint16) {
 	if !c.haveSeq {
 		c.haveSeq, c.lastSeq = true, seq
@@ -179,23 +182,6 @@ func listenUDP(p parsed) (*net.UDPConn, error) {
 	return pc, nil
 }
 
-// effectiveReadBuffer returns the socket's receive buffer as the kernel
-// reports it, or 0 when it cannot be read.
-func effectiveReadBuffer(pc *net.UDPConn) uint64 {
-	rc, err := pc.SyscallConn()
-	if err != nil {
-		return 0
-	}
-	var v int
-	_ = rc.Control(func(fd uintptr) {
-		v, _ = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF)
-	})
-	if v < 0 {
-		return 0
-	}
-	return uint64(v)
-}
-
 // Read implements Reader. A closed socket is an error: a live listener never
 // ends cleanly.
 func (u *udpReader) Read() (Frame, error) {
@@ -214,7 +200,11 @@ func (u *udpReader) Spec() Spec { return u.ts.Spec() }
 
 // Stats implements Reader.
 func (u *udpReader) Stats() map[string]uint64 {
-	m := u.ts.Stats()
+	base := u.ts.Stats() // a fresh map per call, but copy rather than rely on it
+	m := make(map[string]uint64, len(base)+5)
+	for k, v := range base {
+		m[k] = v
+	}
 	m["udp_read_buffer"] = u.rcvBuf
 	m["udp_read_buffer_low"] = u.lowBuf
 	m["rtp_gaps"] = u.conn.rtpGaps.Load()

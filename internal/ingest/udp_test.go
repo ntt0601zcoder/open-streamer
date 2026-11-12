@@ -4,11 +4,16 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"maps"
 	"math/rand"
 	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +22,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
+	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 )
 
 // fixtureDatagrams splits the fixture into 7-packet TS datagrams.
@@ -93,29 +99,90 @@ func openUDPWith(t *testing.T, port int, query string, send func(addr string)) R
 	return o.r
 }
 
-// udpHeldBack is how many trailing frames of a track a live demuxer still
-// holds when the sender stops: they complete only when the next one starts.
-const udpHeldBack = 2
+// udpHeldBackVideo bounds the video frames the demuxer keeps pending when a
+// live source goes quiet (the fixture shows 2: the pending access unit and
+// the group waiting on the next PES). Audio keeps none.
+const udpHeldBackVideo = 2
 
-// assertCounts checks the per-track counts equal want, allowing for them.
-func assertCounts(t *testing.T, got, want map[int]int) {
+// heldBackCounts returns the per-track frame counts a live demuxer yields for
+// the fixture when the source then goes quiet without ending: it flushes
+// nothing at the end, so the last access units stay pending. This is the
+// demuxer's own holdback (video 2 for this fixture, audio 0), independent of
+// the UDP layer; the tests compare the UDP reader against it exactly.
+func heldBackCounts(t *testing.T) map[int]int {
 	t.Helper()
-	for tr, n := range want {
-		assert.GreaterOrEqual(t, got[tr], n-udpHeldBack, "track %d", tr)
-		assert.LessOrEqual(t, got[tr], n, "track %d", tr)
-	}
+	data, err := os.ReadFile(fixturePath("h264_aac.ts"))
+	require.NoError(t, err)
+	src := &quietReader{data: data, quiet: make(chan struct{})}
+	d, err := ts.NewDemuxerWithOptions(src, ts.DemuxOptions{Remap: true})
+	require.NoError(t, err)
+	var mu sync.Mutex
+	counts := map[int]int{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			f, err := d.Read()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			counts[f.Track]++
+			mu.Unlock()
+		}
+	}()
+	require.Eventually(t, func() bool { return src.drained.Load() }, 3*time.Second, 5*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	out := maps.Clone(counts)
+	mu.Unlock()
+	close(src.quiet)
+	<-done
+	return out
 }
 
-func waitCounts(t *testing.T, res *srtResult, mu interface {
-	Lock()
-	Unlock()
-}, want map[int]int) {
+// quietReader serves data, then blocks until quiet is closed, then EOF.
+type quietReader struct {
+	data    []byte
+	quiet   chan struct{}
+	drained atomic.Bool
+}
+
+func (q *quietReader) Read(p []byte) (int, error) {
+	if len(q.data) == 0 {
+		q.drained.Store(true)
+		<-q.quiet
+		return 0, io.EOF
+	}
+	n := copy(p, q.data)
+	q.data = q.data[n:]
+	return n, nil
+}
+
+// waitSettled waits until the reader has received sent datagrams and its
+// per-track counts equal want, and checks they then stay put.
+func waitSettled(t *testing.T, r Reader, res *srtResult, mu *sync.Mutex, sent int, want map[int]int) {
 	t.Helper()
-	assert.Eventually(t, func() bool {
+	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		return res.counts[0] >= want[0]-udpHeldBack && res.counts[1] >= want[1]-udpHeldBack
-	}, 5*time.Second, 20*time.Millisecond)
+		return r.Stats()["datagrams"] >= uint64(sent) && maps.Equal(res.counts, want)
+	}, 5*time.Second, 10*time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, want, res.counts, "counts stay exact")
+}
+
+// assertClean checks a loss-free input: nothing lost, no CC errors, nothing
+// that is not TS.
+func assertClean(t *testing.T, st map[string]uint64) {
+	t.Helper()
+	assert.Zero(t, st["lost_frames"], "lost_frames")
+	assert.Zero(t, st["cc_errors"], "cc_errors")
+	assert.Zero(t, st["non_ts_datagrams"], "non_ts_datagrams")
+	assert.Zero(t, st["rtp_gaps"], "rtp_gaps")
+	assert.Zero(t, st["decode_errors"], "decode_errors")
 }
 
 func TestUDPRawTS(t *testing.T) {
@@ -124,15 +191,16 @@ func TestUDPRawTS(t *testing.T) {
 	r := openUDPWith(t, port, "", func(addr string) { sendAll(t, addr, dgs) })
 	assert.Equal(t, Spec{Live: true, Passive: true}, r.Spec())
 	res, wg, mu := drain(r)
-	want := fixtureCounts(t, "h264_aac.ts")
-	waitCounts(t, res, mu, want)
+	full, want := fixtureCounts(t, "h264_aac.ts"), heldBackCounts(t)
+	assert.Equal(t, full[1], want[1], "audio: nothing held back")
+	assert.GreaterOrEqual(t, want[0], full[0]-udpHeldBackVideo)
+	waitSettled(t, r, res, mu, len(dgs), want)
+	assertClean(t, r.Stats())
 	require.NoError(t, r.Close())
 	wg.Wait()
 	mu.Lock()
 	defer mu.Unlock()
-	assertCounts(t, res.counts, want)
 	assert.Zero(t, res.breaks)
-	assert.Zero(t, r.Stats()["lost_frames"])
 }
 
 func TestUDPRTPWrapped(t *testing.T) {
@@ -146,16 +214,10 @@ func TestUDPRTPWrapped(t *testing.T) {
 			}
 			r := openUDPWith(t, port, "", func(addr string) { sendAll(t, addr, wrapped) })
 			res, wg, mu := drain(r)
-			want := fixtureCounts(t, "h264_aac.ts")
-			waitCounts(t, res, mu, want)
-			stats := r.Stats()
+			waitSettled(t, r, res, mu, len(wrapped), heldBackCounts(t))
+			assertClean(t, r.Stats())
 			require.NoError(t, r.Close())
 			wg.Wait()
-			mu.Lock()
-			defer mu.Unlock()
-			assertCounts(t, res.counts, want)
-			assert.Zero(t, stats["rtp_gaps"])
-			assert.Zero(t, stats["non_ts_datagrams"])
 		})
 	}
 }
@@ -212,25 +274,30 @@ func TestUDPMulticast(t *testing.T) {
 	const group = "239.255.0.1"
 	lo := loopbackInterface(t)
 	port := freeUDPPort(t)
-	type res struct {
-		r   Reader
-		err error
-	}
-	ch := make(chan res, 1)
+	dgs := fixtureDatagrams(t)
+
+	stop := make(chan struct{})
+	var senders sync.WaitGroup
+	defer func() { close(stop); senders.Wait() }() // no sender outlives the test, skip or not
+	senders.Add(1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		r, err := Open(ctx, fmt.Sprintf("udp://%s:%d?iface=%s", group, port, lo), Env{})
-		ch <- res{r, err}
-	}()
-	time.Sleep(300 * time.Millisecond)
-	go func() {
+		defer senders.Done()
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-stop:
+			return
+		}
 		c, err := net.DialUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, &net.UDPAddr{IP: net.ParseIP(group), Port: port})
 		if err != nil {
 			return
 		}
 		defer c.Close()
-		for i, d := range fixtureDatagrams(t) {
+		for i, d := range dgs {
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			if _, err := c.Write(d); err != nil {
 				return
 			}
@@ -239,18 +306,19 @@ func TestUDPMulticast(t *testing.T) {
 			}
 		}
 	}()
-	o := <-ch
-	if o.err != nil {
-		t.Skipf("multicast on %s is not usable here: %v", lo, o.err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	r, err := Open(ctx, fmt.Sprintf("udp://%s:%d?iface=%s", group, port, lo), Env{})
+	if err != nil && strings.Contains(err.Error(), "udp: listen") {
+		t.Skipf("multicast group %s cannot be joined on %s here: %v", group, lo, err)
 	}
-	res2, wg, mu := drain(o.r)
-	want := fixtureCounts(t, "h264_aac.ts")
-	waitCounts(t, res2, mu, want)
-	require.NoError(t, o.r.Close())
+	require.NoError(t, err)
+	res, wg, mu := drain(r)
+	waitSettled(t, r, res, mu, len(dgs), heldBackCounts(t))
+	assertClean(t, r.Stats())
+	require.NoError(t, r.Close())
 	wg.Wait()
-	mu.Lock()
-	defer mu.Unlock()
-	assertCounts(t, res2.counts, want)
 }
 
 func loopbackInterface(t *testing.T) string {
@@ -312,7 +380,6 @@ func TestOpenUDP(t *testing.T) {
 	// A bad interface and a bad port fail the open.
 	_, err := Open(context.Background(), "udp://239.255.0.1:5000?iface=nosuchif0", Env{})
 	require.Error(t, err)
-	assert.NotContains(t, err.Error(), "sekrit")
 	_, err = Open(context.Background(), "udp://@:0", Env{})
 	require.Error(t, err)
 }
@@ -348,4 +415,6 @@ func TestUDPWithFFmpeg(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	clockCheck(t, o.r, r.frames)
+	assert.Zero(t, o.r.Stats()["lost_frames"])
+	assert.Zero(t, o.r.Stats()["non_ts_datagrams"])
 }
