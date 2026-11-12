@@ -1,0 +1,270 @@
+package ingest
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/clock"
+	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/ts"
+	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
+)
+
+func fixtureAbs(t *testing.T, name string) string {
+	t.Helper()
+	p, err := filepath.Abs(fixturePath(name))
+	require.NoError(t, err)
+	return p
+}
+
+func demuxFrames(t *testing.T, name string) []media.Frame {
+	t.Helper()
+	b, err := os.ReadFile(fixturePath(name))
+	require.NoError(t, err)
+	d, err := ts.NewDemuxerWithOptions(bytes.NewReader(b), ts.DemuxOptions{Remap: true})
+	require.NoError(t, err)
+	var out []media.Frame
+	for {
+		f, err := d.Read()
+		if err == io.EOF {
+			return out
+		}
+		require.NoError(t, err)
+		out = append(out, f)
+	}
+}
+
+func TestFileReader(t *testing.T) {
+	want := demuxFrames(t, "h264_aac.ts")
+	now := time.Unix(1000, 0)
+	r, err := Open(context.Background(), fixtureAbs(t, "h264_aac.ts"), Env{Now: func() time.Time { return now }})
+	require.NoError(t, err)
+	defer r.Close()
+	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
+
+	n := 0
+	for {
+		f, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		require.False(t, f.Arrival.IsZero())
+		require.Less(t, n, len(want))
+		assert.Equal(t, want[n].DTS, f.DTS)
+		assert.Equal(t, want[n].Track, f.Track)
+		n++
+	}
+	assert.Equal(t, len(want), n)
+	st := r.Stats()
+	for _, k := range []string{"lost_frames", "pmt_changes", "split_aus", "split_aus_reordered", "continued", "cc_errors"} {
+		assert.Contains(t, st, k)
+	}
+	assert.Zero(t, st["pmt_changes"])
+}
+
+func TestFileLoop(t *testing.T) {
+	path := fixtureAbs(t, "h264_aac.ts")
+	r, err := Open(context.Background(), "file://"+path+"?loop=1", Env{})
+	require.NoError(t, err)
+	defer r.Close()
+
+	var first []Frame
+	var last Frame
+	for {
+		f, err := r.Read()
+		if err == ErrDiscontinuity {
+			break
+		}
+		require.NoError(t, err)
+		if len(first) < 2 {
+			first = append(first, f)
+		}
+		last = f
+	}
+	require.NotZero(t, last.DTS)
+	for i := range first {
+		f, err := r.Read()
+		require.NoError(t, err)
+		assert.Same(t, first[i].Config, f.Config, "config pointers are stable across passes")
+		assert.Equal(t, first[i].DTS, f.DTS)
+	}
+	assert.EqualValues(t, 2, r.Stats()["passes"])
+
+	// Close during Read returns promptly and unblocks the reader.
+	done := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := r.Read(); err != nil && err != ErrDiscontinuity {
+				done <- err
+				return
+			}
+		}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	require.NoError(t, r.Close())
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, errClosed)
+	case <-time.After(time.Second):
+		t.Fatal("Read did not stop after Close")
+	}
+	assert.Less(t, time.Since(start), 100*time.Millisecond)
+}
+
+func TestFileLoopEmptyPass(t *testing.T) {
+	// A PAT and a PMT, no PES.
+	var buf bytes.Buffer
+	w := mpegts.NewWriter(&buf)
+	require.NoError(t, w.SetProgram(mpegts.PMT{PCRPID: 0x100, Streams: []mpegts.Stream{{PID: 0x100, Type: 0x1B}}}))
+	require.NoError(t, w.WriteTables())
+	path := filepath.Join(t.TempDir(), "empty.ts")
+	require.NoError(t, os.WriteFile(path, buf.Bytes(), 0o600))
+
+	r, err := Open(context.Background(), "file://"+path+"?loop=1", Env{})
+	require.NoError(t, err)
+	defer r.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Read()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrDiscontinuity)
+		assert.NotErrorIs(t, err, io.EOF)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read spun on an empty looping file")
+	}
+}
+
+func TestFileReaderStatsConcurrent(t *testing.T) {
+	r, err := Open(context.Background(), "file://"+fixtureAbs(t, "h264_aac.ts")+"?loop=1", Env{})
+	require.NoError(t, err)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = r.Stats()
+				_ = r.Kinds()
+			}
+		}
+	}()
+	for range 400 {
+		_, err := r.Read()
+		if err != nil {
+			require.ErrorIs(t, err, ErrDiscontinuity)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	require.NoError(t, r.Close())
+}
+
+func TestTSReaderKindsStable(t *testing.T) {
+	r := openTSFixture(t, "h264_aac_pmtchange.ts")
+	defer r.Close()
+	readThroughBreaks(t, r, nil)
+	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
+	assert.EqualValues(t, 1, r.Stats()["pmt_changes"])
+}
+
+func TestTSReaderPMTChangeIsOneEpoch(t *testing.T) {
+	r := openTSFixture(t, "h264_aac_pmtchange.ts")
+	defer r.Close()
+	c := clock.New(clock.Options{Kinds: r.Kinds()})
+	breaks := 0
+	var released int
+	readThroughBreaks(t, r, func(f *Frame, err error) {
+		if err != nil {
+			breaks++
+			c.Break(false)
+			return
+		}
+		released += len(c.PushAt(f.Frame, f.Arrival))
+	})
+	released += len(c.Flush())
+	assert.Equal(t, 1, breaks)
+	assert.Len(t, c.Epochs(), 2)
+	assert.Positive(t, released)
+}
+
+func openTSFixture(t *testing.T, name string) Reader {
+	t.Helper()
+	f, err := os.Open(fixturePath(name))
+	require.NoError(t, err)
+	r, err := NewTSReader(f, nil)
+	require.NoError(t, err)
+	return r
+}
+
+// readThroughBreaks reads to EOF, calling fn per frame, or per
+// ErrDiscontinuity with a nil frame.
+func readThroughBreaks(t *testing.T, r Reader, fn func(*Frame, error)) {
+	t.Helper()
+	for {
+		f, err := r.Read()
+		switch err {
+		case io.EOF:
+			return
+		case ErrDiscontinuity:
+			if fn != nil {
+				fn(nil, err)
+			}
+		default:
+			require.NoError(t, err)
+			if fn != nil {
+				fn(&f, nil)
+			}
+		}
+	}
+}
+
+func TestNewTSReaderErrors(t *testing.T) {
+	_, err := NewTSReader(io.NopCloser(bytes.NewReader([]byte("junk"))), nil)
+	assert.Error(t, err)
+
+	// Closing the reader aborts a blocked open.
+	pr, pw := io.Pipe()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := NewTSReader(pr, nil)
+		errc <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	_ = pr.Close()
+	select {
+	case err := <-errc:
+		assert.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("open did not abort")
+	}
+	_ = pw.Close()
+}
+
+func TestOpenContextAbortsBlockedOpen(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := openTS(ctx, pr, nil, Spec{}, &media.ConfigCache{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
