@@ -415,6 +415,7 @@ func TestDemuxLaterPMTAddsTrack(t *testing.T) {
 	}
 	assert.Len(t, frames, 150+len(a))
 	assert.Empty(t, d.Skipped())
+	assert.Equal(t, []uint16{videoPID, audioPID}, d.TrackPIDs())
 }
 
 func TestDemuxLaterPMTIgnored(t *testing.T) {

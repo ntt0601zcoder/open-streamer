@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,8 +23,10 @@ import (
 const (
 	// maxBody bounds every playlist, manifest and segment body.
 	maxBody = 256 << 20
-	// maxSegments bounds the segments one MPD timeline may expand to.
-	maxSegments = 100000
+	// repeatCap is the per-entry repeat cap of dash.SegmentTimeline.Resolve.
+	repeatCap = 100000
+	// maxWidth bounds a SegmentTemplate %0Nd width.
+	maxWidth = 32
 	// minPoll is the shortest wait between two refreshes.
 	minPoll = 50 * time.Millisecond
 	// periodTolerance is RulePeriodOrder's tolerance.
@@ -32,6 +35,10 @@ const (
 	videoFrameTicks = 3600
 	aacFrameSamples = 1024
 )
+
+// maxSegments bounds the timeline segments of one MPD, over all its periods
+// and representations, and the distinct segments of one DASH capture.
+var maxSegments = 100000
 
 // ReadOptions configures the readers.
 type ReadOptions struct {
@@ -153,13 +160,16 @@ type hlsPlaylist struct {
 
 // hlsCapture is the state of one ReadHLS.
 type hlsCapture struct {
-	r      reader
-	b      *builder
-	lists  []*hlsPlaylist
-	inits  map[string]fmp4Init
-	dec    mpegts.TimeDecoder
-	codecs []string // the master's CODECS, nil without a master
-	master bool
+	r        reader
+	b        *builder
+	lists    []*hlsPlaylist
+	byURL    map[string]*hlsPlaylist
+	active   map[string]bool // playlists listed by the latest master
+	inits    map[string]fmp4Init
+	badInits map[string]bool // inits that did not answer 200, reported once
+	dec      mpegts.TimeDecoder
+	codecs   []string // union of the CODECS of every master read
+	master   bool
 }
 
 // ReadHLS reads an HLS master or media playlist, with TS or fMP4 segments,
@@ -171,32 +181,46 @@ type hlsCapture struct {
 // captured segment opens its epoch (MEDIA-SEQUENCE 0 or
 // EXT-X-DISCONTINUITY).
 //
+// When polling, the master is read again on every pass: its CODECS is
+// rebuilt from the window, so the check uses the union over every read, and
+// playlists it newly lists join the capture; playlists it no longer lists
+// are not polled. The master is read once more after the last playlists, so
+// its CODECS covers the newest window they showed.
+//
 // Accepted limitations, not flagged: a track absent for a whole epoch has
 // no entry carrying that epoch's discontinuity, so its playlist's epoch
-// count can diverge from the other renditions' (R4); and a TS segment's
-// tracks are numbered by its own PMT, so a segment missing a lower track
-// renumbers the ones above it.
+// count can diverge from the other renditions' (R4). TS tracks are keyed by
+// PID, so they keep their capture track across segments.
 func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
-	c := &hlsCapture{r: newReader(opt), b: newBuilder(), inits: map[string]fmp4Init{}}
+	c := &hlsCapture{
+		r: newReader(opt), b: newBuilder(), byURL: map[string]*hlsPlaylist{},
+		inits: map[string]fmp4Init{}, badInits: map[string]bool{},
+	}
 	body, err := c.r.getOK(ctx, u)
 	if err != nil {
 		return Capture{}, err
 	}
-	if bytes.Contains(body, []byte("#EXT-X-STREAM-INF")) {
-		if err := c.readMaster(u, body); err != nil {
-			return Capture{}, err
-		}
-		body = nil
-	} else {
+	c.master = bytes.Contains(body, []byte("#EXT-X-STREAM-INF"))
+	if !c.master {
 		c.lists = []*hlsPlaylist{{url: u, src: "pl0"}}
 	}
-	for {
-		for i, pl := range c.lists {
-			if pl.ended {
+	for pass := 0; ; pass++ {
+		if c.master {
+			if pass > 0 {
+				if body, err = c.r.getOK(ctx, u); err != nil {
+					return Capture{}, err
+				}
+			}
+			if err := c.readMaster(u, body); err != nil {
+				return Capture{}, err
+			}
+		}
+		for _, pl := range c.lists {
+			if pl.ended || (c.master && !c.active[pl.url]) {
 				continue
 			}
 			b := body
-			if i > 0 || b == nil {
+			if c.master || pass > 0 {
 				if b, err = c.r.getOK(ctx, pl.url); err != nil {
 					return Capture{}, err
 				}
@@ -205,7 +229,6 @@ func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 				return Capture{}, err
 			}
 		}
-		body = nil
 		if opt.Once || c.done(opt.Duration) {
 			break
 		}
@@ -215,23 +238,31 @@ func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	}
 	c.checkTSExtinf()
 	if c.master {
+		// The playlists were read after the master, so a later window may
+		// hold a codec that master did not list yet: read it once more.
+		if body, err = c.r.getOK(ctx, u); err != nil {
+			return Capture{}, err
+		}
+		if err := c.readMaster(u, body); err != nil {
+			return Capture{}, err
+		}
 		c.b.checkMasterCodecs(c.codecs)
 	}
 	return c.b.finish(), nil
 }
 
-// readMaster lists the media playlists of a master.
+// readMaster reads one version of the master: it adds its CODECS to the
+// union, marks the playlists it lists as active and adds the new ones.
 func (c *hlsCapture) readMaster(u string, body []byte) error {
 	m, err := hls.ParseMultivariant(body)
 	if err != nil {
 		return fmt.Errorf("conform: read: %s: %w", u, err)
 	}
-	c.master = true
 	var uris []string
 	for _, v := range m.Variants {
 		uris = append(uris, v.URI)
 		for _, c1 := range strings.Split(v.Codecs, ",") {
-			if c1 = strings.TrimSpace(c1); c1 != "" {
+			if c1 = strings.TrimSpace(c1); c1 != "" && !slices.Contains(c.codecs, c1) {
 				c.codecs = append(c.codecs, c1)
 			}
 		}
@@ -241,19 +272,21 @@ func (c *hlsCapture) readMaster(u string, body []byte) error {
 			uris = append(uris, rd.URI)
 		}
 	}
-	seen := map[string]bool{}
+	if len(uris) == 0 {
+		return fmt.Errorf("conform: read: %s: master lists no playlist", u)
+	}
+	c.active = map[string]bool{}
 	for _, ref := range uris {
 		abs, err := resolve(u, ref)
 		if err != nil {
 			return err
 		}
-		if !seen[abs] {
-			seen[abs] = true
-			c.lists = append(c.lists, &hlsPlaylist{url: abs, src: "pl" + strconv.Itoa(len(c.lists))})
+		c.active[abs] = true
+		if c.byURL[abs] == nil {
+			pl := &hlsPlaylist{url: abs, src: "pl" + strconv.Itoa(len(c.lists))}
+			c.byURL[abs] = pl
+			c.lists = append(c.lists, pl)
 		}
-	}
-	if len(c.lists) == 0 {
-		return fmt.Errorf("conform: read: %s: master lists no playlist", u)
 	}
 	return nil
 }
@@ -366,9 +399,15 @@ func (c *hlsCapture) init(ctx context.Context, u string) (fmp4Init, bool, error)
 	if in, ok := c.inits[u]; ok {
 		return in, true, nil
 	}
+	if c.badInits[u] {
+		return fmp4Init{}, false, nil
+	}
 	in, ok, err := fetchInit(ctx, c.r, c.b, u)
-	if ok {
+	switch {
+	case ok:
 		c.inits[u] = in
+	case err == nil:
+		c.badInits[u] = true
 	}
 	return in, ok, err
 }
@@ -396,6 +435,9 @@ func (c *hlsCapture) tsSegment(pl *hlsPlaylist, u string, body []byte, msn uint6
 	if err != nil {
 		return fmt.Errorf("conform: read: %s: %w", u, err)
 	}
+	// Tracks are keyed by PID: a segment's demuxer numbers tracks from its
+	// own PMT, so a segment missing a lower track would renumber the rest.
+	pids := d.TrackPIDs()
 	var frames []media.Frame
 	for {
 		f, err := d.Read()
@@ -405,7 +447,7 @@ func (c *hlsCapture) tsSegment(pl *hlsPlaylist, u string, body []byte, msn uint6
 		if err != nil {
 			return fmt.Errorf("conform: read: %s: %w", u, err)
 		}
-		f.Track = c.b.track(pl.src, f.Track)
+		f.Track = c.b.track(pl.src, int(pids[f.Track]))
 		f.Epoch = epoch
 		frames = append(frames, f)
 	}
@@ -502,7 +544,9 @@ type dashCapture struct {
 	epochs  map[string]uint32
 	ast     *time.Time
 	polled  bool
-	firstOK bool // the first period's start was decided
+	docSegs int64 // timeline segments of the MPD being read
+	total   int   // distinct segments fetched or tried in the capture
+	firstOK bool  // the first period's start was decided
 }
 
 // ReadDASH reads a DASH MPD with SegmentTemplate timelines back into frames.
@@ -573,6 +617,7 @@ func (c *dashCapture) poll(ctx context.Context, m dash.MPD) error {
 		c.ast = m.AvailabilityStartTime
 	}
 	c.polled = true
+	c.docSegs = 0
 	var prevStart, prevEnd time.Duration
 	for pi, per := range m.Periods {
 		key := per.ID
@@ -637,14 +682,19 @@ func (c *dashCapture) period(ctx context.Context, per dash.Period) ([]dashSet, e
 			if tpl.Timescale == 0 {
 				tpl.Timescale = 1
 			}
-			count := 0
 			for _, s := range tpl.Timeline.S {
-				count += int(max(s.R, 0)) + 1
-				if count > maxSegments {
-					return nil, fmt.Errorf("conform: read: representation %q: timeline above %d segments", rep.ID, maxSegments)
+				// As Resolve expands it: r below 0 is 0, r above the cap is
+				// the cap, so the sum cannot overflow.
+				c.docSegs += min(max(s.R, 0), repeatCap) + 1
+				if c.docSegs > int64(maxSegments) {
+					return nil, fmt.Errorf("conform: read: MPD timelines above %d segments", maxSegments)
 				}
 			}
-			iu, err := resolve(c.url, expand(tpl.Initialization, rep, 0, 0))
+			ref, err := expand(tpl.Initialization, rep, 0, 0)
+			if err != nil {
+				return nil, err
+			}
+			iu, err := resolve(c.url, ref)
 			if err != nil {
 				return nil, err
 			}
@@ -691,7 +741,11 @@ func (c *dashCapture) fetchPeriod(ctx context.Context, sets []dashSet, epoch uin
 			start = *s.tpl.StartNumber
 		}
 		for j, sg := range s.segs {
-			u, err := resolve(c.url, expand(s.tpl.Media, s.rep, start+uint64(j), sg.T))
+			ref, err := expand(s.tpl.Media, s.rep, start+uint64(j), sg.T)
+			if err != nil {
+				return err
+			}
+			u, err := resolve(c.url, ref)
 			if err != nil {
 				return err
 			}
@@ -699,6 +753,9 @@ func (c *dashCapture) fetchPeriod(ctx context.Context, sets []dashSet, epoch uin
 				continue
 			}
 			rp.fetched[u] = true
+			if c.total++; c.total > maxSegments {
+				return fmt.Errorf("conform: read: capture above %d segments", maxSegments)
+			}
 			seg, ok, err := c.segment(ctx, u, s, sg, rp.track, epoch)
 			if err != nil {
 				return err
@@ -756,24 +813,24 @@ func rescale(v uint64, from, to uint32) uint64 {
 }
 
 // expand substitutes the SegmentTemplate identifiers $RepresentationID$,
-// $Number$, $Time$, $Bandwidth$ (with an optional %0Nd width) and $$.
-func expand(tpl string, rep dash.Representation, number, t uint64) string {
+// $Number$, $Time$, $Bandwidth$ (each but the first with an optional %0Nd
+// width, N at most 32) and $$. An unknown identifier is left as written.
+func expand(tpl string, rep dash.Representation, number, t uint64) (string, error) {
 	var b strings.Builder
 	for {
 		i := strings.IndexByte(tpl, '$')
-		if i < 0 {
-			b.WriteString(tpl)
-			return b.String()
+		j := -1
+		if i >= 0 {
+			j = strings.IndexByte(tpl[i+1:], '$')
 		}
-		j := strings.IndexByte(tpl[i+1:], '$')
 		if j < 0 {
 			b.WriteString(tpl)
-			return b.String()
+			return b.String(), nil
 		}
 		b.WriteString(tpl[:i])
 		id := tpl[i+1 : i+1+j]
 		tpl = tpl[i+2+j:]
-		name, format, _ := strings.Cut(id, "%")
+		name, format, hasFormat := strings.Cut(id, "%")
 		var v uint64
 		switch name {
 		case "":
@@ -793,13 +850,30 @@ func expand(tpl string, rep dash.Representation, number, t uint64) string {
 			continue
 		}
 		s := strconv.FormatUint(v, 10)
-		if w, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(format, "0"), "d")); err == nil && format != "" {
-			for len(s) < w {
-				s = "0" + s
+		if hasFormat {
+			w, err := templateWidth(format)
+			if err != nil {
+				return "", fmt.Errorf("conform: read: template $%s$: %w", id, err)
+			}
+			if pad := w - len(s); pad > 0 {
+				s = strings.Repeat("0", pad) + s
 			}
 		}
 		b.WriteString(s)
 	}
+}
+
+// templateWidth parses the "0Nd" of a %0Nd format tag.
+func templateWidth(format string) (int, error) {
+	digits, ok := strings.CutSuffix(format, "d")
+	if !ok || len(digits) < 2 || digits[0] != '0' {
+		return 0, fmt.Errorf("format %%%s is not %%0[width]d", format)
+	}
+	w, err := strconv.Atoi(digits[1:])
+	if err != nil || w < 1 || w > maxWidth {
+		return 0, fmt.Errorf("format %%%s: width above %d or invalid", format, maxWidth)
+	}
+	return w, nil
 }
 
 // ---- HTTP-TS ----

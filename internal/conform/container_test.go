@@ -300,10 +300,10 @@ func TestReadMidEpochStartRules(t *testing.T) {
 	assert.Equal(t, []string{RuleSegmentAvailable, RuleStartOffset}, rules(c.Violations))
 }
 
-// timed returns a fixture's frames in stream time.
-func timed(t *testing.T, name string) []media.Frame {
+// timedClip returns the frames of h264_aac.ts in stream time.
+func timedClip(t *testing.T) []media.Frame {
 	t.Helper()
-	d, err := ts.NewDemuxer(bytes.NewReader(fixture(t, name)))
+	d, err := ts.NewDemuxer(bytes.NewReader(fixture(t, "h264_aac.ts")))
 	require.NoError(t, err)
 	c := clock.New(clock.Options{Kinds: d.TrackKinds()})
 	var out []media.Frame
@@ -339,7 +339,7 @@ func files(t *testing.T, m map[string][]byte) string {
 func fmp4Playlist(t *testing.T, cuts []int, extinf map[int]int64) map[string][]byte {
 	t.Helper()
 	var video []media.Frame
-	for _, f := range timed(t, "h264_aac.ts") {
+	for _, f := range timedClip(t) {
 		if f.Kind() == media.KindVideo {
 			video = append(video, f)
 		}
@@ -367,7 +367,7 @@ func keyframes(t *testing.T) []int {
 	t.Helper()
 	var out []int
 	i := 0
-	for _, f := range timed(t, "h264_aac.ts") {
+	for _, f := range timedClip(t) {
 		if f.Kind() != media.KindVideo {
 			continue
 		}
@@ -593,6 +593,7 @@ func TestReadSegmentMissing(t *testing.T) {
 		c, err := ReadHLS(context.Background(), base+"cmaf/master.m3u8", once())
 		require.NoError(t, err)
 		assert.Equal(t, []string{RuleSegmentAvailable}, rules(c.Violations))
+		assert.Len(t, c.Violations, 1, "a missing init is fetched and reported once")
 		c, err = ReadDASH(context.Background(), base+"cmaf/index.mpd", once())
 		require.NoError(t, err)
 		assert.Equal(t, []string{RuleSegmentAvailable}, rules(c.Violations))
@@ -618,53 +619,19 @@ func TestReadTimelineAndPeriodOrder(t *testing.T) {
 func TestReadDroppedNoConfig(t *testing.T) {
 	p := packClip(t, "h264_aac.ts", 100, farFuture)
 	snap := p.Snapshot()
-	// Cut the first segment's tables and parameter sets: keep only its
-	// packets after the first keyframe's start.
+	// Turn every SPS of segment 1 into an unknown NAL type in place, so its
+	// demuxer never has a video config and drops all its video frames.
 	base := serveLive(t, p, rewrite("hls/1.ts", func(b []byte, _ int) []byte {
 		require.Equal(t, snap.Segments[1].TS, b)
-		return stripParamSets(t, b)
+		out := bytes.ReplaceAll(b, []byte{0, 0, 0, 1, 0x67}, []byte{0, 0, 0, 1, 0x7f})
+		require.NotEqual(t, b, out)
+		return out
 	}))
 	c, err := ReadHLS(context.Background(), base+"hls/index.m3u8", once())
 	require.NoError(t, err)
-	assert.Contains(t, rules(c.Violations), RuleSegmentKey)
-}
-
-// stripParamSets re-muxes a TS segment with the SPS and PPS removed from
-// every frame, so its demuxer has no video config.
-func stripParamSets(t *testing.T, seg []byte) []byte {
-	t.Helper()
-	d, err := ts.NewDemuxer(bytes.NewReader(seg))
-	require.NoError(t, err)
-	var frames []media.Frame
-	for {
-		f, err := d.Read()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		require.NoError(t, err)
-		frames = append(frames, f)
-	}
-	// A config without parameter-set NAL units in the muxed stream: the
-	// muxer writes Config.SPS/PPS before keyframes, so give video a config
-	// whose sets are empty slices by rewriting the bytes afterwards.
-	var buf bytes.Buffer
-	tracks := []*media.TrackConfig{frames[0].Config, nil}
-	for _, f := range frames {
-		if f.Track == 1 {
-			tracks[1] = f.Config
-			break
-		}
-	}
-	m, err := ts.NewMuxer(&buf, tracks)
-	require.NoError(t, err)
-	require.NoError(t, m.WriteTables())
-	for _, f := range frames {
-		require.NoError(t, m.WriteFrame(f))
-	}
-	out := buf.Bytes()
-	// Replace the SPS NAL header byte (0x67) after each start code so the
-	// demuxer sees an unknown NAL type instead of an SPS.
-	return bytes.ReplaceAll(out, []byte{0, 0, 0, 1, 0x67}, []byte{0, 0, 0, 1, 0x7f})
+	// Without video, segment 1's anchor is its audio, which does not span
+	// the video EXTINF: extinf-matches follows from the dropped frames.
+	assert.Equal(t, []string{RuleExtinf, RuleSegmentKey}, rules(c.Violations))
 }
 
 func TestReadErrors(t *testing.T) {
@@ -799,7 +766,7 @@ func TestReadTSCancel(t *testing.T) {
 		ch <- err
 	}()
 	require.Eventually(t, func() bool { return len(h.Stats()) > 0 }, 5*time.Second, time.Millisecond)
-	for _, f := range timed(t, "h264_aac.ts") {
+	for _, f := range timedClip(t) {
 		h.Write(f)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -814,11 +781,221 @@ func TestReadTSCancel(t *testing.T) {
 
 func TestExpand(t *testing.T) {
 	rep := dash.Representation{ID: "v1", Bandwidth: 5000}
-	assert.Equal(t, "v1-0042-77-5000$.m4s", expand("$RepresentationID$-$Number%04d$-$Time$-$Bandwidth$$$.m4s", rep, 42, 77))
-	assert.Equal(t, "a$Other$b", expand("a$Other$b", rep, 1, 1))
-	assert.Equal(t, "open$tail", expand("open$tail", rep, 1, 1))
+	expandOK := func(tpl string, number, tm uint64) string {
+		s, err := expand(tpl, rep, number, tm)
+		require.NoError(t, err)
+		return s
+	}
+	assert.Equal(t, "v1-0042-77-5000$.m4s", expandOK("$RepresentationID$-$Number%04d$-$Time$-$Bandwidth$$$.m4s", 42, 77))
+	assert.Equal(t, "a$Other$b", expandOK("a$Other$b", 1, 1))
+	assert.Equal(t, "open$tail", expandOK("open$tail", 1, 1))
+	assert.Equal(t, strings.Repeat("0", 31)+"7", expandOK("$Number%032d$", 7, 0))
+	assert.Equal(t, "123456", expandOK("$Number%02d$", 123456, 0))
+	for _, bad := range []string{"$Number%033d$", "$Time%0200000d$", "$Number%0xd$", "$Bandwidth%d$"} {
+		start := time.Now()
+		_, err := expand(bad, rep, 1, 1)
+		assert.Error(t, err, bad)
+		assert.Less(t, time.Since(start), 100*time.Millisecond)
+	}
 	assert.EqualValues(t, 48000, rescale(90000, 90000, 48000))
 	assert.EqualValues(t, 7, rescale(7, 1000, 1000))
+}
+
+func TestReadDASHBadTemplateWidth(t *testing.T) {
+	m := dash.MPD{Periods: []dash.Period{{AdaptationSets: []dash.AdaptationSet{{
+		SegmentTemplate: &dash.SegmentTemplate{
+			Initialization: "init-$Number%0200000d$.mp4", Media: "$Number%0200000d$.m4s",
+			Timeline: &dash.SegmentTimeline{S: []dash.S{{D: 1}}},
+		},
+		Representations: []dash.Representation{{ID: "0"}},
+	}}}}}
+	srv := files(t, map[string][]byte{"/x.mpd": m.Encode()})
+	_, err := ReadDASH(context.Background(), srv+"/x.mpd", once())
+	assert.ErrorContains(t, err, "width")
+}
+
+// timelineMPD returns an MPD with one adaptation set per timeline, each with
+// its own init URL (not served).
+func timelineMPD(timelines ...[]dash.S) []byte {
+	sets := make([]dash.AdaptationSet, 0, len(timelines))
+	for i, s := range timelines {
+		sets = append(sets, dash.AdaptationSet{
+			SegmentTemplate: &dash.SegmentTemplate{
+				Initialization: "init-" + strconv.Itoa(i) + ".mp4", Media: strconv.Itoa(i) + "-$Number$.m4s",
+				Timeline: &dash.SegmentTimeline{S: s},
+			},
+			Representations: []dash.Representation{{ID: strconv.Itoa(i)}},
+		})
+	}
+	return dash.MPD{Periods: []dash.Period{{AdaptationSets: sets}}}.Encode()
+}
+
+func TestReadDASHSegmentCap(t *testing.T) {
+	const maxR = int64(^uint64(0) >> 1)
+	srv := files(t, map[string][]byte{
+		// r = MaxInt64 must not overflow the count.
+		"/overflow.mpd": timelineMPD([]dash.S{{D: 1, R: maxR}, {D: 1, R: maxR}, {D: 1, R: maxR}, {D: 1, R: maxR}}),
+		// Each representation is under the cap; together they are not.
+		"/many.mpd": timelineMPD(
+			[]dash.S{{D: 1, R: 40000}}, []dash.S{{D: 1, R: 40000}}, []dash.S{{D: 1, R: 40000}},
+		),
+		"/under.mpd": timelineMPD([]dash.S{{D: 1, R: 40000}}, []dash.S{{D: 1, R: 40000}}),
+	})
+	for _, u := range []string{"/overflow.mpd", "/many.mpd"} {
+		start := time.Now()
+		_, err := ReadDASH(context.Background(), srv+u, once())
+		assert.ErrorContains(t, err, "segments", u)
+		assert.Less(t, time.Since(start), 2*time.Second, u)
+	}
+	c, err := ReadDASH(context.Background(), srv+"/under.mpd", once())
+	require.NoError(t, err)
+	assert.Equal(t, []string{RuleSegmentAvailable}, rules(c.Violations), "inits are not served")
+}
+
+// TestReadDASHCaptureCap: the cap also bounds the distinct segments of a
+// whole capture, across representations and refreshes, even when each MPD
+// lists few segments.
+func TestReadDASHCaptureCap(t *testing.T) {
+	old := maxSegments
+	t.Cleanup(func() { maxSegments = old })
+	p := packClip(t, "h264_aac.ts", 100, farFuture)
+	base := serveLive(t, p, nil)
+	maxSegments = 5 // the MPD lists 3 video + 3 audio segments
+	_, err := ReadDASH(context.Background(), base+"cmaf/index.mpd", once())
+	assert.ErrorContains(t, err, "MPD timelines above 5 segments")
+	maxSegments = 6
+	_, err = ReadDASH(context.Background(), base+"cmaf/index.mpd", once())
+	require.NoError(t, err)
+
+	// Each refresh lists only the newest segment per representation (2 per
+	// MPD), but the capture fetches 6 distinct segments in all.
+	for _, tc := range []struct {
+		max  int
+		want string
+	}{{5, "capture above 5 segments"}, {6, ""}} {
+		sliding, total := liveMPD(t, func(m *dash.MPD, _ int) {
+			for i := range m.Periods[0].AdaptationSets {
+				st := m.Periods[0].AdaptationSets[i].SegmentTemplate
+				n := uint64(len(st.Timeline.S) - 1)
+				st.Timeline.S = st.Timeline.S[n:]
+				first := *st.StartNumber + n
+				st.StartNumber = &first
+			}
+		})
+		maxSegments = tc.max
+		c, err := ReadDASH(context.Background(), sliding+"cmaf/index.mpd", ReadOptions{Duration: total - 100*time.Millisecond})
+		if tc.want != "" {
+			assert.ErrorContains(t, err, tc.want)
+			continue
+		}
+		require.NoError(t, err)
+		assert.NotZero(t, countKind(c.Frames, media.KindVideo))
+	}
+}
+
+// TestReadHLSPollingAcrossConfigChange: the master's CODECS grows when the
+// window reaches the new config; polling re-reads the master.
+func TestReadHLSPollingAcrossConfigChange(t *testing.T) {
+	for _, window := range []int{3, 100} {
+		t.Run(strconv.Itoa(window), func(t *testing.T) {
+			clk := &fakeNow{t: farFuture()}
+			p := packClip(t, "h264_aac_then_640.ts", window, clk.Now)
+			snap := p.Snapshot()
+			require.Len(t, snap.Epochs, 2)
+			at := func(i int) time.Time {
+				e, _ := snap.Epoch(snap.Segments[i].Epoch)
+				return e.WallAt(snap.Segments[i].End)
+			}
+			clk.Set(at(0))
+			var mu sync.Mutex
+			step := 0
+			var masters []string
+			fast := func(b []byte, _ int) []byte {
+				pl, err := hls.ParseMedia(b)
+				require.NoError(t, err)
+				pl.TargetDuration = 0 // poll at the minimum interval
+				return pl.Encode()
+			}
+			mw := rewrite("cmaf/master.m3u8", func(b []byte, _ int) []byte {
+				mu.Lock()
+				defer mu.Unlock()
+				masters = append(masters, string(b))
+				if step+1 < len(snap.Segments) {
+					step++
+					clk.Set(at(step))
+				}
+				return b
+			})
+			base := serveLive(t, p, func(h http.Handler) http.Handler {
+				return mw(rewrite("cmaf/v0.m3u8", fast)(rewrite("cmaf/a1.m3u8", fast)(h)))
+			})
+			var total int64
+			for _, seg := range snap.Segments {
+				total += seg.Duration
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			c, err := ReadHLS(ctx, base+"cmaf/master.m3u8",
+				ReadOptions{Duration: media.ToDuration(total) - 100*time.Millisecond})
+			require.NoError(t, err)
+			assert.Empty(t, c.Violations)
+			mu.Lock()
+			defer mu.Unlock()
+			require.GreaterOrEqual(t, len(masters), 2)
+			assert.NotEqual(t, masters[0], masters[len(masters)-1], "CODECS changed during the capture")
+		})
+	}
+}
+
+// TestReadTSTracksByPID: a TS segment without the video PID keeps the audio
+// on the same capture track.
+func TestReadTSTracksByPID(t *testing.T) {
+	frames := timedClip(t)
+	var vcfg, acfg *media.TrackConfig
+	for _, f := range frames {
+		if f.Track == 0 && vcfg == nil {
+			vcfg = f.Config
+		}
+		if f.Track == 1 && acfg == nil {
+			acfg = f.Config
+		}
+	}
+	half := frames[len(frames)/2].DTS
+	mux := func(tracks []*media.TrackConfig, keep func(media.Frame) bool) []byte {
+		var buf bytes.Buffer
+		m, err := ts.NewMuxer(&buf, tracks)
+		require.NoError(t, err)
+		require.NoError(t, m.WriteTables())
+		for _, f := range frames {
+			if keep(f) {
+				require.NoError(t, m.WriteFrame(f))
+			}
+		}
+		return buf.Bytes()
+	}
+	seg0 := mux([]*media.TrackConfig{vcfg, acfg}, func(f media.Frame) bool { return f.DTS < half })
+	seg1 := mux([]*media.TrackConfig{nil, acfg}, func(f media.Frame) bool { return f.DTS >= half && f.Track == 1 })
+	pl := hls.MediaPlaylist{Version: 3, TargetDuration: 4, Ended: true, Segments: []hls.Segment{
+		{URI: "0.ts", Duration: time.Second}, {URI: "1.ts", Duration: time.Second},
+	}}
+	srv := files(t, map[string][]byte{"/i.m3u8": pl.Encode(), "/0.ts": seg0, "/1.ts": seg1})
+	c, err := ReadHLS(context.Background(), srv+"/i.m3u8", once())
+	require.NoError(t, err)
+	tracks := map[media.Kind]map[int]bool{media.KindVideo: {}, media.KindAudio: {}}
+	var lastAudio int64
+	for _, f := range c.Frames {
+		tracks[f.Kind()][f.Track] = true
+		if f.Kind() == media.KindAudio {
+			lastAudio = f.DTS
+		}
+	}
+	assert.Len(t, tracks[media.KindVideo], 1)
+	assert.Len(t, tracks[media.KindAudio], 1, "audio keeps one capture track")
+	assert.NotEqual(t, tracks[media.KindVideo], tracks[media.KindAudio])
+	assert.Greater(t, lastAudio, int64(0))
+	for _, v := range c.Violations {
+		assert.NotEqual(t, RuleDTS, v.Rule, v.String())
+	}
 }
 
 func TestSplitNALUs(t *testing.T) {
