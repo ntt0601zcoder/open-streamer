@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -40,15 +39,15 @@ type tsReader struct {
 	cache *media.ConfigCache
 
 	// Read goroutine only.
-	pmtChanges uint64
-	pids       []uint16
-	pending    *Frame // the frame that followed a discontinuity
+	gen     uint32 // PMT generation of the frames returned so far
+	pending *Frame // the frame that followed a discontinuity
 
 	closeOnce sync.Once
 	closeErr  error
 
 	mu    sync.Mutex // guards the snapshots read by Stats and Kinds
-	stats map[string]uint64
+	stats ts.DemuxStats
+	cc    uint64
 	kinds []media.Kind
 }
 
@@ -74,8 +73,9 @@ func newTSReader(rc io.ReadCloser, now func() time.Time, spec Spec, cache *media
 		_ = rc.Close()
 		return nil, fmt.Errorf("ingest: ts reader: %w", err)
 	}
-	r := &tsReader{rc: rc, src: src, dmx: dmx, spec: spec, cache: cache, pids: dmx.TrackPIDs()}
+	r := &tsReader{rc: rc, src: src, dmx: dmx, spec: spec, cache: cache}
 	r.snapshot()
+	r.setKinds()
 	return r, nil
 }
 
@@ -98,23 +98,19 @@ func openTS(ctx context.Context, rc io.ReadCloser, now func() time.Time, spec Sp
 	return r, nil
 }
 
-// snapshot publishes the demuxer's counters and tracks for Stats and Kinds.
+// snapshot publishes the demuxer's counters for Stats; it copies values and
+// allocates nothing.
 func (r *tsReader) snapshot() {
-	s := r.dmx.Stats()
-	m := map[string]uint64{
-		"lost_frames":         s.LostFrames,
-		"pmt_changes":         s.PMTChanges,
-		"split_aus":           s.SplitAUs,
-		"split_aus_reordered": s.SplitAUsReordered,
-		"split_aus_no_room":   s.SplitAUsNoRoom,
-		"continued":           s.Continued,
-		"cc_errors":           r.dmx.CCErrors(),
-		"decode_errors":       s.DecodeErrors,
-		"dropped_no_config":   s.DroppedNoConfig,
-	}
+	s, cc := r.dmx.Stats(), r.dmx.CCErrors()
+	r.mu.Lock()
+	r.stats, r.cc = s, cc
+	r.mu.Unlock()
+}
+
+// setKinds publishes the tracks for Kinds.
+func (r *tsReader) setKinds() {
 	kinds := r.dmx.TrackKinds()
 	r.mu.Lock()
-	r.stats = m
 	r.kinds = kinds
 	r.mu.Unlock()
 }
@@ -126,7 +122,7 @@ func (r *tsReader) Read() (Frame, error) {
 		r.pending = nil
 		return f, nil
 	}
-	mf, err := r.dmx.Read()
+	mf, gen, err := r.dmx.ReadGen()
 	r.snapshot()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
@@ -134,34 +130,23 @@ func (r *tsReader) Read() (Frame, error) {
 		}
 		return Frame{}, fmt.Errorf("ingest: ts reader: read: %w", err)
 	}
-	changed := false
-	if n := r.dmx.Stats().PMTChanges; n != r.pmtChanges {
-		r.pmtChanges = n
-		changed = r.remapped()
+	broke := false
+	for ; r.gen < gen; r.gen++ {
+		r.setKinds()
+		if slots := r.dmx.TakeRemapped(r.gen + 1); len(slots) > 0 {
+			broke = true
+			for _, i := range slots {
+				r.cache.Reset(i)
+			}
+		}
 	}
 	mf.Config = r.cache.Stable(mf.Track, mf.Config)
 	f := Frame{Frame: mf, Arrival: r.src.arrival}
-	if changed {
+	if broke {
 		r.pending = &f
 		return Frame{}, ErrDiscontinuity
 	}
 	return f, nil
-}
-
-// remapped reports whether the last PMT change moved a track to another PID,
-// and forgets the configs of the tracks it moved. A change that left every
-// track in place is not a timeline break.
-func (r *tsReader) remapped() bool {
-	pids := r.dmx.TrackPIDs()
-	moved := false
-	for i, pid := range pids {
-		if i >= len(r.pids) || r.pids[i] != pid {
-			r.cache.Reset(i)
-			moved = true
-		}
-	}
-	r.pids = slices.Clone(pids)
-	return moved
 }
 
 // Kinds implements Reader.
@@ -178,7 +163,18 @@ func (r *tsReader) Spec() Spec { return r.spec }
 func (r *tsReader) Stats() map[string]uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return cloneStats(r.stats)
+	s := r.stats
+	return map[string]uint64{
+		"lost_frames":         s.LostFrames,
+		"pmt_changes":         s.PMTChanges,
+		"split_aus":           s.SplitAUs,
+		"split_aus_reordered": s.SplitAUsReordered,
+		"split_aus_no_room":   s.SplitAUsNoRoom,
+		"continued":           s.Continued,
+		"cc_errors":           r.cc,
+		"decode_errors":       s.DecodeErrors,
+		"dropped_no_config":   s.DroppedNoConfig,
+	}
 }
 
 // Close implements Reader.
@@ -188,8 +184,4 @@ func (r *tsReader) Close() error {
 		return fmt.Errorf("ingest: ts reader: close: %w", r.closeErr)
 	}
 	return nil
-}
-
-func cloneStats(m map[string]uint64) map[string]uint64 {
-	return maps.Clone(m)
 }

@@ -164,6 +164,10 @@ type Demuxer struct {
 	skipPID map[uint16]bool // PIDs reported in skipped
 	timeDec *mpegts.TimeDecoder
 	queue   []media.Frame
+	qgen    []uint32         // PMT generation of each queued frame
+	gen     uint32           // Remap: PMT changes so far
+	lastGen uint32           // generation of the frame Read returned last
+	remaps  map[uint32][]int // Remap: slots re-assigned by the PMT that opened a generation
 	stats   DemuxStats
 	err     error // a read error, returned once the queue is empty
 }
@@ -301,6 +305,7 @@ func (d *Demuxer) remapPMT(pmt *mpegts.PMT) {
 		d.stats.PMTChanges++
 		// Pending access units complete with the Config of the old PMT.
 		d.flushAll()
+		d.gen++
 	}
 	d.curSet = slices.Clone(pmt.Streams)
 	if d.curSet == nil {
@@ -309,6 +314,7 @@ func (d *Demuxer) remapPMT(pmt *mpegts.PMT) {
 	next := make([]bool, len(d.tracks), d.maxTrks)
 	d.byPID = map[uint16]*track{}
 	ordinal := map[media.Kind]int{}
+	var moved []int
 	for _, s := range pmt.Streams {
 		info, supported := supportedTypes[s.Type]
 		if !supported {
@@ -333,6 +339,9 @@ func (d *Demuxer) remapPMT(pmt *mpegts.PMT) {
 			t = d.tracks[slot]
 			next[slot] = true
 		default:
+			if d.tracks[slot].active {
+				moved = append(moved, slot)
+			}
 			t = newTrack(slot, s, info)
 			d.tracks[slot] = t
 			next[slot] = true
@@ -341,6 +350,12 @@ func (d *Demuxer) remapPMT(pmt *mpegts.PMT) {
 	}
 	for i, t := range d.tracks {
 		t.active = next[i]
+	}
+	if len(moved) > 0 {
+		if d.remaps == nil {
+			d.remaps = map[uint32][]int{}
+		}
+		d.remaps[d.gen] = moved
 	}
 }
 
@@ -406,9 +421,42 @@ func (d *Demuxer) Stats() DemuxStats {
 	return s
 }
 
+// enqueue queues a frame under the current PMT generation.
+func (d *Demuxer) enqueue(f media.Frame) {
+	d.queue = append(d.queue, f)
+	d.qgen = append(d.qgen, d.gen)
+}
+
+// ReadGen is Read that also returns the PMT generation of the frame: the
+// number of PMT changes (see DemuxStats.PMTChanges) in effect when the frame
+// was queued. Frames flushed by a PMT change carry the old generation. The
+// generation is 0 without Remap.
+func (d *Demuxer) ReadGen() (media.Frame, uint32, error) {
+	f, err := d.Read()
+	if err != nil {
+		return f, d.gen, err
+	}
+	return f, d.lastGen, nil
+}
+
+// TakeRemapped returns, once, the slots that the PMT opening generation gen
+// moved to another PID or stream_type while they were active. A PMT that
+// only adds a slot, drops one or changes nothing for the existing slots
+// returns none.
+func (d *Demuxer) TakeRemapped(gen uint32) []int {
+	s := d.remaps[gen]
+	delete(d.remaps, gen)
+	return s
+}
+
 // CCErrors returns the continuity-counter gaps on tracked PIDs, which Stats
 // folds into DecodeErrors.
-func (d *Demuxer) CCErrors() uint64 { return d.dmx.Stats().CCErrors }
+func (d *Demuxer) CCErrors() uint64 {
+	if d.dmx == nil {
+		return 0
+	}
+	return d.dmx.Stats().CCErrors
+}
 
 // Read returns the next frame, or io.EOF at the end of the stream. A read
 // error from the input is returned wrapped, and again on later calls. A video
@@ -422,6 +470,8 @@ func (d *Demuxer) Read() (media.Frame, error) {
 		if len(d.queue) > 0 {
 			f := d.queue[0]
 			d.queue = d.queue[1:]
+			d.lastGen = d.qgen[0]
+			d.qgen = d.qgen[1:]
 			return f, nil
 		}
 		if d.err != nil {
@@ -531,7 +581,7 @@ func (d *Demuxer) handleAudio(t *track, pes *mpegts.PES) {
 		}
 		ts := t.audioTime(t.config.SampleRate)
 		t.aSamples += aacFrameSamples
-		d.queue = append(d.queue, media.Frame{
+		d.enqueue(media.Frame{
 			Track:  t.idx,
 			Config: t.config,
 			PTS:    ts,
@@ -946,7 +996,7 @@ func (d *Demuxer) finishAU(t *track, emit bool) (discarded bool) {
 func (d *Demuxer) queueAU(t *track, au *videoAU) {
 	t.lastOut, t.haveOut = au.dts, true
 	key, rasl := t.cls.Classify(au.data, au.pts)
-	d.queue = append(d.queue, media.Frame{
+	d.enqueue(media.Frame{
 		Track:  t.idx,
 		Config: au.config,
 		PTS:    au.pts,

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -236,20 +237,29 @@ func Redact(rawURL string) string {
 		return "<invalid url>"
 	}
 	if u.User != nil {
-		if _, ok := u.User.Password(); ok {
+		pw, hasPW := u.User.Password()
+		switch {
+		case hasPW:
 			u.User = url.UserPassword(u.User.Username(), "xxxxx")
-		} else {
+		case u.User.Username() != "" || pw != "":
 			u.User = url.User("xxxxx")
 		}
 	}
 	if u.RawQuery != "" {
-		q := u.Query()
-		for _, k := range redactedKeys {
-			if _, ok := q[k]; ok {
-				q.Set(k, "xxxxx")
+		pairs := strings.Split(u.RawQuery, "&")
+		for i, pair := range pairs {
+			k, _, ok := strings.Cut(pair, "=")
+			if !ok {
+				continue
+			}
+			if name, err := url.QueryUnescape(k); err == nil {
+				k = name
+			}
+			if slices.Contains(redactedKeys, strings.ToLower(k)) {
+				pairs[i] = pair[:strings.IndexByte(pair, '=')+1] + "xxxxx"
 			}
 		}
-		u.RawQuery = q.Encode()
+		u.RawQuery = strings.Join(pairs, "&")
 	}
 	return u.String()
 }
