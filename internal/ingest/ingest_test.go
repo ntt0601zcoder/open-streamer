@@ -78,7 +78,7 @@ func TestOpenFile(t *testing.T) {
 	}
 
 	for _, u := range []string{
-		"udp://@:5000", "srt://h:1?passphrase=sekrit", "http://u:pw@h/x.ts", "http://h/x.m3u8", "copy://x",
+		"srt://h:1?passphrase=sekrit", "http://u:pw@h/x.ts", "http://h/x.m3u8", "copy://x",
 	} {
 		_, err := Open(context.Background(), u, Env{})
 		require.Error(t, err, u)
