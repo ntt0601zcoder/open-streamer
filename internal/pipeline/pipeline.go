@@ -198,10 +198,13 @@ func (p *Pipeline) Stats() Stats {
 //
 // While an input is active, every input above it is probed for fail-back: a
 // pull input reopens after its backoff, a passive one keeps listening, and
-// Run takes each probe's frames as they come. A probe's hold runs from its
-// first frame and restarts after a gap over its stall limit or a timeline
-// break; a pull probe also fails by its start and stall limits, and its next
-// attempt starts a new hold. Once a probe has read for FailbackHold, it
+// Run takes each probe's frames as they come. Probes read freely and are not
+// paced: a paced input, such as a file, is read as fast as it reads during
+// its hold. A probe's hold runs from its first frame and restarts after a
+// gap over its stall limit or a timeline break; a pull probe also fails by
+// its start and stall limits, and its next attempt starts a new hold. The
+// hold and a probe's stall limit run on Run's clock, at the frames Run takes,
+// so a long paced flush on the active input can only delay a fail-back. Once a probe has read for FailbackHold, it
 // becomes active at its next video key (any frame when it maps no video),
 // unless a higher-priority probe is eligible too: the active input's held
 // frames are flushed, it is closed (a passive one keeps listening), and the
@@ -374,7 +377,7 @@ func (p *Pipeline) expire(ctx context.Context) error {
 		switch {
 		case a == p.act:
 			err = fmt.Errorf("pipeline: read: %w (%v)", errStalled, p.stall)
-		case !a.since.IsZero(): // a probe that delivered
+		case !a.last.IsZero(): // a probe that delivered, before a break too
 			err = fmt.Errorf("pipeline: read: %w (%v)", errStalled, a.stall)
 		default:
 			err = fmt.Errorf("pipeline: start: %w (%v)", errNoStart, p.opt.StartTimeout)
@@ -421,8 +424,8 @@ type attempt struct {
 
 	// As a probe.
 	stall    time.Duration // the stall limit, set at the first frame
-	since    time.Time     // when the hold started; zero before the first frame
-	last     time.Time     // the last mapped frame
+	since    time.Time     // when the hold started; zero before the first frame and after a reset
+	last     time.Time     // the last mapped frame; zero before the first
 	held     []heldFrame   // the frames from the latest key
 	heldSize int           // bytes of held
 }
@@ -758,7 +761,8 @@ func (p *Pipeline) eligible(a *attempt, now time.Time) bool {
 // failback makes probe a, at its key, the active input: the active input is
 // made inactive, which flushes the Clock, and closed by the activation (a
 // passive one keeps listening); a's held frames, from that key, go to the
-// hub.
+// hub. Run takes each probe frame as it comes, so held is that key alone;
+// it would carry more only if probe frames were taken in batches.
 func (p *Pipeline) failback(ctx context.Context, a *attempt) error {
 	old := p.act
 	if p.deactivate(ctx, old, false) >= healthyReset {
@@ -797,10 +801,12 @@ func frameSize(f media.Frame) int {
 func (p *Pipeline) fail(ctx context.Context, a *attempt, cause error) error {
 	in := p.inputs[a.in]
 	if a == p.act {
-		// The search tries each other pull input once, highest first.
+		// The search tries each other pull input once, highest first. A pull
+		// input already running (a probe) is a try in flight: it is not
+		// tried again in this search.
 		p.search = true
 		for _, o := range p.inputs {
-			o.tried = false
+			o.tried = !o.passive && o.a != nil
 		}
 		in.tried = true
 		if p.deactivate(ctx, a, false) >= healthyReset {
