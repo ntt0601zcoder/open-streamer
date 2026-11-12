@@ -645,7 +645,10 @@ func (c *Clock) dropTrack(track int) {
 
 // tryRelease releases the pending epoch when a rule 6 condition holds. An
 // epoch opened by a configuration change does not release early when every
-// track has a frame: it holds its whole window.
+// track has a frame: it holds its whole window. A late-join epoch also waits
+// past its window for the tracks running in the released epoch, up to
+// VideoWait from its keyframe, so a running video track whose keyframe is
+// further than the window keeps its GOP.
 func (c *Clock) tryRelease() {
 	p := c.pend
 	if p.cause != causeConfig && c.allTracksHeld() {
@@ -656,7 +659,7 @@ func (c *Clock) tryRelease() {
 	w := c.window()
 	switch {
 	case p.hasAnchor:
-		if hi-p.anchor >= w {
+		if span := hi - p.anchor; span >= w && (span >= c.opt.VideoWait || !c.awaitsRunning()) {
 			c.release(false)
 		}
 	case !c.expectVideo:
@@ -668,6 +671,20 @@ func (c *Clock) tryRelease() {
 			c.release(true)
 		}
 	}
+}
+
+// awaitsRunning reports whether a late-join epoch holds no frame yet of a
+// track running in the released epoch.
+func (c *Clock) awaitsRunning() bool {
+	if c.pend.cause != causeLate {
+		return false
+	}
+	for _, t := range c.tracks {
+		if t.pend.held == 0 && t.emittedIn(c.cur) {
+			return true
+		}
+	}
+	return false
 }
 
 // window is the source span a pending epoch holds: AlignWindow, raised to
@@ -720,8 +737,11 @@ func (c *Clock) release(audioOnly bool) {
 			t.cur.held, t.cur.atStart = 0, true
 		default:
 			// Not joined: keep the previous lastSourceDTS for rule 3. Its
-			// first frame in the epoch is a late join.
-			t.cur = trackEpoch{hasLast: t.cur.hasLast, last: t.cur.last}
+			// first frame in the epoch is a late join, unless it was running
+			// in the previous epoch and a late-join epoch released (by
+			// VideoWait) before its keyframe: it is present, not late.
+			running := p.cause == causeLate && t.emittedIn(c.cur)
+			t.cur = trackEpoch{atStart: running, hasLast: t.cur.hasLast, last: t.cur.last}
 		}
 		t.pend = trackEpoch{}
 	}
