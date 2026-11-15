@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,13 @@ const (
 var errStreamNotAvailable = errors.New("ingest: rtmp: stream not available")
 
 // rtmpSink receives the publishers of one listen path.
+//
+// offer and busy may still be called after a non-last unregister of the
+// sink's route has returned: a session that reserved the route before the
+// unregister goes on to offer its conn, possibly to a sink that has since
+// closed. A closed sink must therefore refuse offers. The sink must never
+// call unregister while holding a lock that offer or busy takes, since
+// unregister may wait for a session that is calling them.
 type rtmpSink interface {
 	// offer hands over a publisher whose publish was accepted. It returns
 	// false when the sink is closed; the registry then closes conn. It must
@@ -104,7 +112,7 @@ type rtmpListener struct {
 // their cfg and pol are ignored. The returned unregister removes the route;
 // the last one closes the listener and waits for its sessions to end. It is
 // idempotent. unregister must not be called while holding a lock that the
-// sink's offer takes.
+// sink's offer or busy takes (see rtmpSink).
 func (r *rtmpRegistry) register(addr, path string, sink rtmpSink, cfg rtmp.Config, pol listenPolicy) (unregister func(), err error) {
 	key, err := rtmpAddrKey(addr)
 	if err != nil {
@@ -202,21 +210,27 @@ func (r *rtmpRegistry) stats(addr string) map[string]uint64 {
 	}
 }
 
-// rtmpAddrKey normalises a listen address: an empty host, 0.0.0.0 and [::]
-// all become ":port"; any other host is kept.
+// rtmpAddrKey normalises a listen address to one key per bind: the port is
+// written as a number (1..65535); an empty host and every unspecified IP
+// address (0.0.0.0, [::], their other spellings) become ":port"; any other
+// IP address is written canonically, IPv4-mapped IPv6 as IPv4; a host name
+// is kept.
 func rtmpAddrKey(addr string) (string, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return "", fmt.Errorf("ingest: rtmp: listen address %q: %w", addr, err)
 	}
-	if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
 		return "", fmt.Errorf("ingest: rtmp: listen address %q: bad port", addr)
 	}
-	switch host {
-	case "", "0.0.0.0", "::":
-		host = ""
+	if ip, err := netip.ParseAddr(host); err == nil {
+		host = ip.Unmap().String()
+		if ip.Unmap().IsUnspecified() {
+			host = ""
+		}
 	}
-	return net.JoinHostPort(host, port), nil
+	return net.JoinHostPort(host, strconv.Itoa(n)), nil
 }
 
 // redactRTMPPath masks the stream name, the last path segment, keeping its
