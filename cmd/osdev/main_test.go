@@ -7,17 +7,21 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/datarhei/gosrt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
+	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 )
 
 const fixture = "../../testdata/fixtures/h264_aac.ts"
@@ -98,7 +102,9 @@ func TestOsdevBadArgs(t *testing.T) {
 		"empty name":  {"-stream", "=x.ts"},
 		"empty path":  {"-stream", "demo="},
 		"slash name":  {"-stream", "a/b=x.ts"},
-		"duplicate":   {"-stream", "a=x.ts", "-stream", "a=y.ts"},
+		"bad url":     {"-stream", "a=srt://:99999?mode=listener"},
+		"bad layout":  {"-layout", "video,text", "-stream", "a=" + fixture},
+		"empty lay":   {"-layout", "", "-stream", "a=" + fixture},
 		"port in use": {"-listen", ln.Addr().String(), "-stream", "a=" + fixture},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -227,4 +233,126 @@ func TestOsdevServerTimeouts(t *testing.T) {
 	// server-wide read or write timeout would cut them.
 	assert.Zero(t, srv.ReadTimeout)
 	assert.Zero(t, srv.WriteTimeout)
+}
+
+func TestOsdevFailoverFlags(t *testing.T) {
+	parse := func(args ...string) ([]*source, string, int) {
+		var errw strings.Builder
+		cfg, code := parseArgs(args, &errw)
+		if cfg == nil {
+			return nil, errw.String(), code
+		}
+		return cfg.sources, errw.String(), code
+	}
+
+	t.Run("priority order", func(t *testing.T) {
+		srcs, _, _ := parse("-stream", "a=srt://127.0.0.1:9000?mode=listener", "-stream", "b="+fixture,
+			"-stream", "a="+fixture)
+		require.Len(t, srcs, 2)
+		assert.Equal(t, "a", srcs[0].name)
+		assert.Equal(t, []string{"srt://127.0.0.1:9000?mode=listener", fixture}, srcs[0].inputs)
+		assert.Equal(t, "b", srcs[1].name)
+	})
+	t.Run("loop applies to files only", func(t *testing.T) {
+		srcs, _, _ := parse("-loop", "-stream", "a="+fixture, "-stream", "a=udp://@:5000",
+			"-stream", "a=file:///x.ts?pace=0")
+		require.Len(t, srcs, 1)
+		in := srcs[0].inputs
+		require.Len(t, in, 3)
+		assert.True(t, strings.HasPrefix(in[0], "file:///") && strings.HasSuffix(in[0], "h264_aac.ts?loop=1"), in[0])
+		assert.Equal(t, "udp://@:5000", in[1])
+		assert.Equal(t, "file:///x.ts?loop=1&pace=0", in[2])
+	})
+	t.Run("layout", func(t *testing.T) {
+		cfg, code := parseArgs([]string{"-layout", "audio", "-stream", "a=" + fixture}, io.Discard)
+		require.NotNil(t, cfg, code)
+		assert.Equal(t, []media.Kind{media.KindAudio}, cfg.layout)
+		cfg, _ = parseArgs([]string{"-stream", "a=" + fixture}, io.Discard)
+		require.NotNil(t, cfg)
+		assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, cfg.layout)
+	})
+	t.Run("malformed url", func(t *testing.T) {
+		var errw strings.Builder
+		cfg, code := parseArgs([]string{"-stream", "a=" + fixture, "-stream", "a=srt://user:secret@:99999?passphrase=hunter2"}, &errw)
+		assert.Nil(t, cfg)
+		assert.Equal(t, 2, code)
+		assert.NotContains(t, errw.String(), "secret")
+		assert.NotContains(t, errw.String(), "hunter2")
+		var out strings.Builder
+		assert.Equal(t, 2, run(context.Background(), []string{"-stream", "a=srt://:99999?mode=listener"}, &out, io.Discard))
+		assert.NotContains(t, out.String(), "listening")
+	})
+}
+
+func TestOsdevPipelineReport(t *testing.T) {
+	src := &source{name: "a", inputs: []string{"srt://u:p@h:1?passphrase=xyz", "udp://@:5000"}}
+	var sb strings.Builder
+	src.reportPipeline(&sb, pipeline.Stats{Active: 0, Switches: 2, Unmapped: 3, Input: map[string]uint64{"srt_b": 2, "srt_a": 1}})
+	line := sb.String()
+	assert.Contains(t, line, "stream a: input 0 srt://u:xxxxx@h:1?passphrase=xxxxx")
+	assert.Contains(t, line, "switches 2, unmapped 3, drift breaks 0")
+	assert.Contains(t, line, "srt_a=1 srt_b=2")
+	assert.NotContains(t, line, "xyz")
+	src.reportPipeline(&sb, pipeline.Stats{Active: 0, Switches: 2, Unmapped: 3, Input: map[string]uint64{"srt_b": 2, "srt_a": 1}})
+	assert.Equal(t, line, sb.String(), "unchanged: not repeated")
+	src.reportPipeline(&sb, pipeline.Stats{Active: -1, Switches: 3})
+	assert.Contains(t, strings.TrimPrefix(sb.String(), line), "input none")
+}
+
+func TestOsdevSRTStream(t *testing.T) {
+	pc, err := new(net.ListenConfig).ListenPacket(context.Background(), "udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	require.NoError(t, pc.Close())
+
+	var errw syncBuilder
+	addr, stop := startOsdev(t, []string{"-stream", fmt.Sprintf("a=srt://:%d?mode=listener", port)}, &errw)
+
+	data, err := os.ReadFile(fixture)
+	require.NoError(t, err)
+	pubCtx, pubCancel := context.WithCancel(context.Background())
+	var pubWG sync.WaitGroup
+	pubWG.Add(1)
+	go func() {
+		defer pubWG.Done()
+		var conn srt.Conn
+		for pubCtx.Err() == nil {
+			conn, err = srt.Dial("srt", "127.0.0.1:"+strconv.Itoa(port), srt.DefaultConfig())
+			if err == nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if conn == nil {
+			return
+		}
+		defer conn.Close()
+		const chunk = 7 * 188
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for off := 0; off < len(data); off += chunk {
+			select {
+			case <-pubCtx.Done():
+				return
+			case <-tick.C:
+			}
+			if _, err := conn.Write(data[off:min(off+chunk, len(data))]); err != nil {
+				return
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}()
+
+	require.Eventually(t, func() bool {
+		resp, err := httpGet("http://" + addr + "/live/a/hls/index.m3u8")
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode == 200 && strings.Contains(string(b), ".ts")
+	}, 30*time.Second, 100*time.Millisecond)
+	pubCancel()
+	pubWG.Wait()
+	assert.Equal(t, 0, stop())
 }

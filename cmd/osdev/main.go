@@ -1,13 +1,17 @@
-// Command osdev serves MPEG-TS files as live streams for development: each
-// -stream is replayed in real time into a hub and packaged as HLS, CMAF and
-// DASH, and also served as one continuous MPEG-TS response.
+// Command osdev serves input URLs as live streams for development: each
+// -stream name=URL is read into a hub and packaged as HLS, CMAF and DASH, and
+// also served as one continuous MPEG-TS response. A URL is any input of the
+// ingest package (a bare path is a file, replayed in real time); a name given
+// again adds a lower-priority input for failover, and copy://name reads
+// another osdev stream. -layout sets the track layout of every stream.
 //
 // Without -loop a stream ends with its file: its hub closes, the last partial
 // segment is packaged and the HLS playlists end with EXT-X-ENDLIST, while
 // the server keeps serving. A stream whose source fails is reported on
 // stderr; osdev then exits 1 at shutdown, or at once when every stream has
-// failed. Packager mux errors and fallback anchors are reported on stderr
-// every 30 s while they grow, and once more at shutdown.
+// failed. Every 30 s, and at shutdown, osdev reports on stderr each stream's
+// active input, switches, drift breaks and reader counters when they changed,
+// and the packager's mux errors and fallback anchors while they grow.
 package main
 
 import (
@@ -21,12 +25,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
+	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/httpts"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
@@ -51,10 +58,38 @@ func (s *streamFlags) String() string     { return strings.Join(*s, ",") }
 func (s *streamFlags) Set(v string) error { *s = append(*s, v); return nil }
 
 type source struct {
-	name, input string // input is the stream's input URL or bare path
-	hub         *hub.Hub
-	pack        *live.Packager
-	reported    [3]uint64 // Errors, CodecErrors and FallbackAnchors at the last report
+	name     string
+	inputs   []string // input URLs by priority, first highest
+	hub      *hub.Hub
+	pack     *live.Packager
+	pipe     *pipeline.Pipeline
+	reported [3]uint64 // Errors, CodecErrors and FallbackAnchors at the last report
+	lastLine string    // the last pipeline report line
+}
+
+// reportPipeline writes the stream's input state when it differs from the
+// last report: the active input (redacted), switches, unmapped frames, drift
+// breaks and the active reader's counters.
+func (s *source) reportPipeline(w io.Writer, st pipeline.Stats) {
+	active := "none"
+	if st.Active >= 0 && st.Active < len(s.inputs) {
+		active = fmt.Sprintf("%d %s", st.Active, ingest.Redact(s.inputs[st.Active]))
+	}
+	line := fmt.Sprintf("osdev: stream %s: input %s, switches %d, unmapped %d, drift breaks %d",
+		s.name, active, st.Switches, st.Unmapped, st.Clock.DriftBreaks)
+	keys := make([]string, 0, len(st.Input))
+	for k := range st.Input {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		line += fmt.Sprintf(" %s=%d", k, st.Input[k])
+	}
+	if line == s.lastLine {
+		return
+	}
+	s.lastLine = line
+	_, _ = fmt.Fprintln(w, line)
 }
 
 // lockedWriter serialises writes from several goroutines.
@@ -69,11 +104,15 @@ func (l *lockedWriter) Write(b []byte) (int, error) {
 	return l.w.Write(b)
 }
 
-// report writes one line per stream whose packager counted mux errors,
+// report writes each stream's pipeline line when it changed, then one line
+// per stream whose packager counted mux errors,
 // codec string errors or fallback anchors: on every call when final, else
 // only when they grew since the last report.
 func report(w io.Writer, srcs []*source, final bool) {
 	for _, s := range srcs {
+		if s.pipe != nil {
+			s.reportPipeline(w, s.pipe.Stats())
+		}
 		now := [3]uint64{s.pack.Errors(), s.pack.CodecErrors(), s.pack.FallbackAnchors()}
 		if now == ([3]uint64{}) || (!final && now == s.reported) {
 			continue
@@ -98,54 +137,126 @@ func newServer(h http.Handler) *http.Server {
 	}
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	stderr = &lockedWriter{w: stderr}
+// config is the parsed command line.
+type config struct {
+	listen  string
+	sources []*source // in order of first appearance
+	layout  []media.Kind
+}
+
+// parseLayout parses a comma-separated list of video and audio.
+func parseLayout(v string) ([]media.Kind, error) {
+	var out []media.Kind
+	for _, f := range strings.Split(v, ",") {
+		switch strings.TrimSpace(f) {
+		case "video":
+			out = append(out, media.KindVideo)
+		case "audio":
+			out = append(out, media.KindAudio)
+		default:
+			return nil, fmt.Errorf("unknown kind %q, want video or audio", f)
+		}
+	}
+	return out, nil
+}
+
+// withLoop adds loop=1 to a file input: a bare path becomes a file URL.
+func withLoop(input string) (string, error) {
+	if !strings.Contains(input, "://") {
+		abs, err := filepath.Abs(input)
+		if err != nil {
+			return "", err
+		}
+		return (&url.URL{Scheme: "file", Path: abs, RawQuery: "loop=1"}).String(), nil
+	}
+	u, err := url.Parse(input)
+	if err != nil || !strings.EqualFold(u.Scheme, "file") || u.Query().Has("loop") {
+		return input, nil //nolint:nilerr // ingest.Parse reports a malformed URL
+	}
+	if u.RawQuery != "" {
+		u.RawQuery = "loop=1&" + u.RawQuery
+	} else {
+		u.RawQuery = "loop=1"
+	}
+	return u.String(), nil
+}
+
+// parseArgs parses the command line. On failure it reports on stderr and
+// returns a nil config and the exit code.
+func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	fs := flag.NewFlagSet("osdev", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	listen := fs.String("listen", ":8080", "address to listen on")
 	loop := fs.Bool("loop", false, "replay each file at its end")
+	layoutFlag := fs.String("layout", "video,audio", "track layout of every stream: video and audio, comma-separated")
 	var streams streamFlags
-	fs.Var(&streams, "stream", "name=path.ts to serve; repeatable")
+	fs.Var(&streams, "stream", "name=URL (or name=path.ts) to serve; repeat a name to add a lower-priority input")
 	if err := fs.Parse(args); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
-		return 2
+		return nil, 2
 	}
 	if fs.NArg() > 0 {
 		_, _ = fmt.Fprintf(stderr, "osdev: unexpected argument %q\n", fs.Arg(0))
-		return 2
+		return nil, 2
+	}
+	layout, err := parseLayout(*layoutFlag)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "osdev: -layout: %v\n", err)
+		return nil, 2
 	}
 	if len(streams) == 0 {
-		_, _ = fmt.Fprintln(stderr, "osdev: at least one -stream name=path.ts is required")
-		return 2
+		_, _ = fmt.Fprintln(stderr, "osdev: at least one -stream name=URL is required")
+		return nil, 2
 	}
-	srcs := map[string]*source{}
-	var order []*source
+	cfg := &config{listen: *listen, layout: layout}
+	byName := map[string]*source{}
 	for _, s := range streams {
-		name, path, ok := strings.Cut(s, "=")
-		if !ok || name == "" || path == "" || strings.ContainsAny(name, "/?#% ") || name == "." || name == ".." {
-			_, _ = fmt.Fprintf(stderr, "osdev: malformed -stream %q, want name=path.ts\n", s)
-			return 2
+		name, input, ok := strings.Cut(s, "=")
+		if !ok || name == "" || input == "" || strings.ContainsAny(name, "/?#% ") || name == "." || name == ".." {
+			_, _ = fmt.Fprintf(stderr, "osdev: malformed -stream %q, want name=URL\n", ingest.Redact(s))
+			return nil, 2
 		}
-		if srcs[name] != nil {
-			_, _ = fmt.Fprintf(stderr, "osdev: duplicate stream %q\n", name)
-			return 2
-		}
-		input := path
 		if *loop {
-			abs, err := filepath.Abs(path)
-			if err != nil {
+			var err error
+			if input, err = withLoop(input); err != nil {
 				_, _ = fmt.Fprintf(stderr, "osdev: stream %s: %v\n", name, err)
-				return 2
+				return nil, 2
 			}
-			input = (&url.URL{Scheme: "file", Path: abs, RawQuery: "loop=1"}).String()
 		}
-		h := hub.New(hub.Options{})
-		src := &source{name: name, input: input, hub: h, pack: live.NewPackager(h, live.Options{})}
-		srcs[name] = src
-		order = append(order, src)
+		if _, err := ingest.Parse(input); err != nil {
+			_, _ = fmt.Fprintf(stderr, "osdev: stream %s: %v\n", name, err)
+			return nil, 2
+		}
+		src := byName[name]
+		if src == nil {
+			h := hub.New(hub.Options{})
+			src = &source{name: name, hub: h, pack: live.NewPackager(h, live.Options{})}
+			byName[name] = src
+			cfg.sources = append(cfg.sources, src)
+		}
+		src.inputs = append(src.inputs, input)
 	}
+	return cfg, 0
+}
 
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listen)
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	stderr = &lockedWriter{w: stderr}
+	cfg, code := parseArgs(args, stderr)
+	if cfg == nil {
+		return code
+	}
+	order := cfg.sources
+	srcs := map[string]*source{}
+	for _, s := range order {
+		srcs[s.name] = s
+	}
+	hubLookup := func(n string) (*hub.Hub, bool) {
+		if s := srcs[n]; s != nil {
+			return s.hub, true
+		}
+		return nil, false
+	}
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.listen)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return 2
@@ -168,22 +279,34 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		wg     sync.WaitGroup
 		failed atomic.Int32
 	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		t := time.NewTicker(reportInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				report(stderr, order, false)
-			}
-		}
-	}()
 	for _, s := range order {
 		sub := s.hub.Subscribe(s.name, subQueue)
+		// A stream of one file input stops at its failure; any other input
+		// is retried, and its failures are reported.
+		spec, _ := ingest.Parse(s.inputs[0])
+		stopOnFail := len(s.inputs) == 1 && !spec.Live && !spec.Passive
+		sctx, scancel := context.WithCancel(ctx)
+		var failure error // set from the Run goroutine, read after Run
+		s.pipe = pipeline.New(s.hub, pipeline.Options{
+			Inputs:   s.inputs,
+			Env:      ingest.Env{Lookup: hubLookup},
+			Layout:   cfg.layout,
+			EndOnEOF: true,
+			OnEvent: func(ev pipeline.Event) {
+				if ev.Kind != pipeline.EventFailed {
+					return
+				}
+				if stopOnFail {
+					if failure == nil {
+						failure = ev.Err
+						scancel()
+					}
+					return
+				}
+				_, _ = fmt.Fprintf(stderr, "osdev: stream %s: input %d %s failed: %v\n",
+					s.name, ev.Input, ingest.Redact(s.inputs[ev.Input]), ev.Err)
+			},
+		})
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -191,20 +314,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}()
 		go func() {
 			defer wg.Done()
-			// A stream has one input and stops at its first failure.
-			sctx, scancel := context.WithCancel(ctx)
 			defer scancel()
-			var failure error // set from the Run goroutine, read after Run
-			err := pipeline.New(s.hub, pipeline.Options{
-				Inputs:   []string{s.input},
-				EndOnEOF: true,
-				OnEvent: func(ev pipeline.Event) {
-					if ev.Kind == pipeline.EventFailed && failure == nil {
-						failure = ev.Err
-						scancel()
-					}
-				},
-			}).Run(sctx)
+			err := s.pipe.Run(sctx)
 			if ctx.Err() != nil {
 				return // shutting down: run closes the hubs
 			}
@@ -225,15 +336,23 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}()
 	}
 
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(reportInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				report(stderr, order, false)
+			}
+		}
+	}()
 	packLookup := func(n string) (*live.Packager, bool) {
 		if s := srcs[n]; s != nil {
 			return s.pack, true
-		}
-		return nil, false
-	}
-	hubLookup := func(n string) (*hub.Hub, bool) {
-		if s := srcs[n]; s != nil {
-			return s.hub, true
 		}
 		return nil, false
 	}
@@ -244,7 +363,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
-	code := 0
+	code = 0
 	select {
 	case <-ctx.Done():
 	case err := <-errc:
