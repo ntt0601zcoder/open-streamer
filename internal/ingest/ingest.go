@@ -224,6 +224,8 @@ func Open(ctx context.Context, rawURL string, env Env) (Reader, error) {
 		return openUDP(ctx, rawURL, p, env)
 	case schemeHTTP, schemeHTTPS:
 		return openHTTP(ctx, rawURL, p, env)
+	case schemeCopy:
+		return openCopy(ctx, rawURL, p, env)
 	default:
 		return nil, fmt.Errorf("ingest: open %s: %s inputs are not available yet", Redact(rawURL), p.scheme)
 	}
