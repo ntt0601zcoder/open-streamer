@@ -284,12 +284,19 @@ func TestRTMPRegistryAddrNormalised(t *testing.T) {
 		{"127.0.0.1:1935", "127.0.0.1:1935"},
 		{"[::1]:1935", "[::1]:1935"},
 		{"localhost:1935", "localhost:1935"},
+		// Canonical forms: the port as a number, IPv4-mapped IPv6 unmapped,
+		// every unspecified address the wildcard.
+		{":01935", ":1935"},
+		{"[::ffff:127.0.0.1]:1935", "127.0.0.1:1935"},
+		{"[::ffff:0.0.0.0]:1935", ":1935"},
+		{"[0:0::0]:1935", ":1935"},
+		{"[0:0::1]:1935", "[::1]:1935"},
 	} {
 		got, err := rtmpAddrKey(tc.in)
 		require.NoError(t, err, tc.in)
 		assert.Equal(t, tc.want, got, tc.in)
 	}
-	for _, bad := range []string{"", "1935", ":", "host:", ":abc", ":70000"} {
+	for _, bad := range []string{"", "1935", ":", "host:", ":abc", ":70000", ":0", "0.0.0.0:0", ":-1"} {
 		_, err := rtmpAddrKey(bad)
 		assert.Error(t, err, "%q", bad)
 	}
