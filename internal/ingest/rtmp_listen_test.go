@@ -333,6 +333,7 @@ func TestRTMPListenDropsPublisherBeforeTracks(t *testing.T) {
 	assert.Equal(t, want, mediaFrames(log.frames))
 	assert.Empty(t, log.breaks)
 	assert.EqualValues(t, 2, r.Stats()["publishers"])
+	assert.EqualValues(t, len(want), r.Stats()["frames"], "frames dropped during Open are not counted")
 }
 
 // busy holds while the current publisher received a byte, or was offered,
@@ -651,8 +652,56 @@ func TestRTMPListenOpenQueueBound(t *testing.T) {
 	r := awaitOpen(t, ch)
 	assert.Equal(t, []media.Kind{media.KindVideo}, r.Kinds())
 	l := r.(*rtmpListen)
-	assert.GreaterOrEqual(t, len(l.queue), maxOpenFrames)
-	assert.Less(t, len(l.queue), maxOpenFrames+100, "Open stopped at the bound")
+	assert.GreaterOrEqual(t, l.queue.len(), maxOpenFrames)
+	assert.Less(t, l.queue.len(), maxOpenFrames+100, "Open stopped at the bound")
+}
+
+// frameQueue keeps its byte total as frames come and go, and tracksKnown
+// applies Open's rule: both kinds, or one kind with 1 s of source time or a
+// full queue.
+func TestRTMPOpenQueue(t *testing.T) {
+	var q frameQueue
+	fr := func(sizes ...int) Frame {
+		var f Frame
+		for _, n := range sizes {
+			f.Data = append(f.Data, make([]byte, n))
+		}
+		return f
+	}
+	q.push([]Frame{fr(10, 5), fr(7)})
+	q.push(nil)
+	q.push([]Frame{fr(3)})
+	assert.Equal(t, 3, q.len())
+	assert.Equal(t, 25, q.bytes)
+	f, ok := q.pop()
+	require.True(t, ok)
+	assert.Len(t, f.Data, 2)
+	assert.Equal(t, 10, q.bytes)
+	assert.Equal(t, 2, q.drop())
+	assert.Zero(t, q.len())
+	assert.Zero(t, q.bytes)
+	_, ok = q.pop()
+	assert.False(t, ok)
+
+	known := func(video, audio bool, spanned int64, q *frameQueue) bool {
+		f := newFLVFrames(&media.ConfigCache{}, nil)
+		f.seqVideo.Store(video)
+		f.seqAudio.Store(audio)
+		f.firstTS, f.maxTS = 1000, 1000+spanned
+		return tracksKnown(f, q)
+	}
+	var empty frameQueue
+	assert.False(t, known(false, false, 10*openSpan, &empty), "no kind announced")
+	assert.True(t, known(true, true, 0, &empty), "both kinds")
+	assert.False(t, known(true, false, openSpan-1, &empty))
+	assert.True(t, known(false, true, openSpan, &empty), "one kind and 1 s")
+	var full frameQueue
+	full.push(make([]Frame, maxOpenFrames))
+	assert.True(t, known(true, false, 0, &full), "one kind and the frame bound")
+	assert.False(t, known(false, false, 0, &full), "the bound needs a kind")
+	var big frameQueue
+	big.push([]Frame{fr(maxOpenBytes)})
+	assert.True(t, known(true, false, 0, &big), "one kind and the byte bound")
 }
 
 // A flood of idle connections is cut at the pre-publish cap; a legitimate

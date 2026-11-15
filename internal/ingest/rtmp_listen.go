@@ -28,6 +28,79 @@ const (
 	maxOpenBytes  = 32 << 20
 )
 
+// frameQueue holds the frames ready for Read, in order, with the total size
+// of their data kept as frames come and go.
+type frameQueue struct {
+	frames []Frame
+	bytes  int
+}
+
+func frameBytes(f Frame) int {
+	n := 0
+	for _, b := range f.Data {
+		n += len(b)
+	}
+	return n
+}
+
+func (q *frameQueue) push(frames []Frame) {
+	for _, f := range frames {
+		q.bytes += frameBytes(f)
+	}
+	q.frames = append(q.frames, frames...)
+}
+
+func (q *frameQueue) pop() (Frame, bool) {
+	if len(q.frames) == 0 {
+		return Frame{}, false
+	}
+	f := q.frames[0]
+	q.frames[0] = Frame{}
+	q.frames = q.frames[1:]
+	q.bytes -= frameBytes(f)
+	return f, true
+}
+
+func (q *frameQueue) len() int { return len(q.frames) }
+
+// drop empties the queue and returns the number of frames dropped.
+func (q *frameQueue) drop() int {
+	n := len(q.frames)
+	q.frames, q.bytes = nil, 0
+	return n
+}
+
+// tracksKnown is Open's rule for an RTMP session, listen or pull: its
+// tracks are known once both kinds are announced, or once one kind is
+// announced and openSpan of source time is covered or the frames queued
+// meanwhile reach maxOpenFrames or maxOpenBytes.
+func tracksKnown(f *flvFrames, q *frameQueue) bool {
+	v, a := f.announced()
+	switch {
+	case v && a:
+		return true
+	case v || a:
+		return f.spanned() >= openSpan || q.len() >= maxOpenFrames || q.bytes >= maxOpenBytes
+	}
+	return false
+}
+
+// rtmpKinds is the track layout of an RTMP session: video on track 0,
+// audio on track 1 (audio only is [0, audio]).
+func rtmpKinds(video, audio bool) []media.Kind {
+	switch {
+	case audio:
+		k := []media.Kind{0, media.KindAudio}
+		if video {
+			k[0] = media.KindVideo
+		}
+		return k
+	case video:
+		return []media.Kind{media.KindVideo}
+	}
+	return nil
+}
+
 // rtmpListenPolicy is the listener policy that Open passes to the registry;
 // tests lower it.
 var rtmpListenPolicy listenPolicy
@@ -83,7 +156,7 @@ type rtmpListen struct {
 	// The reading goroutine's own state.
 	sess   *rtmpSession // being read; nil while waiting for a publisher
 	opened bool         // Open has returned: a new publisher is a break
-	queue  []Frame      // ready for Read, in order
+	queue  frameQueue   // ready for Read
 	disc   bool         // Read returns ErrDiscontinuity once the queue is empty
 
 	mu       sync.Mutex // guards the fields below
@@ -131,37 +204,16 @@ func openRTMPListen(ctx context.Context, rawURL string, p parsed, env Env) (Read
 	return l, nil
 }
 
-// awaitTracks reads the first publisher until its tracks are known: both
-// kinds announced, or one kind announced and openSpan of source time
-// covered (or the queue bound reached). A publisher that ends before is
-// dropped with its frames, and the wait goes on with the next.
+// awaitTracks reads the first publisher until its tracks are known (see
+// tracksKnown). A publisher that ends before is dropped with its frames,
+// and the wait goes on with the next.
 func (l *rtmpListen) awaitTracks() error {
-	for {
-		if s := l.sess; s != nil {
-			v, a := s.flv.announced()
-			if v && a {
-				return nil
-			}
-			if v || a {
-				if s.flv.spanned() >= openSpan || len(l.queue) >= maxOpenFrames || queuedBytes(l.queue) >= maxOpenBytes {
-					return nil
-				}
-			}
-		}
+	for l.sess == nil || !tracksKnown(l.sess.flv, &l.queue) {
 		if err := l.step(); err != nil {
 			return err
 		}
 	}
-}
-
-func queuedBytes(frames []Frame) int {
-	n := 0
-	for _, f := range frames {
-		for _, b := range f.Data {
-			n += len(b)
-		}
-	}
-	return n
+	return nil
 }
 
 // offer implements rtmpSink. The new publisher replaces the current one,
@@ -192,6 +244,11 @@ func (l *rtmpListen) offer(conn *rtmp.ServerConn) bool {
 // busy implements rtmpSink: the current publisher received a byte within
 // takeoverIdle. A publisher just offered counts from its offer, so a second
 // one cannot take it over before it has had time to send.
+//
+// LastInbound measures bytes read from the connection, and only the reader
+// reads it: a consumer that stalls for takeoverIdle (and lets the TCP
+// window fill) makes a live publisher look idle, so a new one may take it
+// over, and the old session's unread data is lost with it.
 func (l *rtmpListen) busy(now time.Time) bool {
 	l.mu.Lock()
 	s := l.cur
@@ -243,7 +300,7 @@ func (l *rtmpListen) step() error {
 	}
 	// A bad tag is counted by flvFrames and skipped; the session goes on.
 	frames, _ := s.flv.push(m)
-	l.queue = append(l.queue, frames...)
+	l.queue.push(frames)
 	return nil
 }
 
@@ -267,8 +324,9 @@ func (l *rtmpListen) next() (*rtmpSession, error) {
 }
 
 // retire ends the session being read: it is closed, its held video frames
-// are queued (dropped while Open waits, with the session) and its counters
-// and kinds are kept.
+// are queued (dropped while Open waits, with the session's queued frames)
+// and its counters and kinds are kept. The frames counter leaves out the
+// frames dropped, so it counts the frames Read can return.
 func (l *rtmpListen) retire() {
 	s := l.sess
 	l.sess = nil
@@ -286,14 +344,13 @@ func (l *rtmpListen) retire() {
 	if l.opened {
 		l.video = l.video || v
 		l.audio = l.audio || a
+	} else {
+		l.doneStat["frames"] -= uint64(len(frames) + l.queue.drop())
+		frames = nil
 	}
 	l.mu.Unlock()
 	_ = s.conn.Close() // after cur is cleared: a publisher that sees the close can come back at once
-	if l.opened {
-		l.queue = append(l.queue, frames...)
-	} else {
-		l.queue = nil
-	}
+	l.queue.push(frames)
 }
 
 func (l *rtmpListen) isClosed() bool { return l.closing.Load() }
@@ -304,10 +361,7 @@ func (l *rtmpListen) Read() (Frame, error) {
 		if l.isClosed() {
 			return Frame{}, errRTMPClosed
 		}
-		if len(l.queue) > 0 {
-			f := l.queue[0]
-			l.queue[0] = Frame{}
-			l.queue = l.queue[1:]
+		if f, ok := l.queue.pop(); ok {
 			return f, nil
 		}
 		if l.disc {
@@ -322,7 +376,9 @@ func (l *rtmpListen) Read() (Frame, error) {
 
 // Kinds implements Reader: video on track 0, audio on track 1, for every
 // kind announced since Open (audio only is [0, audio]). It grows when a
-// publisher announces a kind the earlier ones did not.
+// publisher announces a kind the earlier ones did not, but the pipeline
+// fixes its track layout from Kinds when the input opens: frames of a kind
+// announced only after Open are dropped there.
 func (l *rtmpListen) Kinds() []media.Kind {
 	l.mu.Lock()
 	v, a := l.video, l.audio
@@ -331,17 +387,7 @@ func (l *rtmpListen) Kinds() []media.Kind {
 		v, a = v || av, a || aa
 	}
 	l.mu.Unlock()
-	switch {
-	case a:
-		k := []media.Kind{0, media.KindAudio}
-		if v {
-			k[0] = media.KindVideo
-		}
-		return k
-	case v:
-		return []media.Kind{media.KindVideo}
-	}
-	return nil
+	return rtmpKinds(v, a)
 }
 
 // Spec implements Reader.
