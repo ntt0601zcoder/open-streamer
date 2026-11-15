@@ -196,7 +196,7 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 		return nil, 2
 	}
 	if fs.NArg() > 0 {
-		_, _ = fmt.Fprintf(stderr, "osdev: unexpected argument %q\n", fs.Arg(0))
+		_, _ = fmt.Fprintf(stderr, "osdev: unexpected argument %q\n", ingest.Redact(fs.Arg(0)))
 		return nil, 2
 	}
 	layout, err := parseLayout(*layoutFlag)
@@ -236,7 +236,66 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 		}
 		src.inputs = append(src.inputs, input)
 	}
+	if err := checkCopyCycles(cfg.sources); err != nil {
+		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
+		return nil, 2
+	}
 	return cfg, 0
+}
+
+// copyTarget returns the stream a copy:// input reads.
+func copyTarget(input string) (string, bool) {
+	u, err := url.Parse(input)
+	if err != nil || !strings.EqualFold(u.Scheme, "copy") {
+		return "", false
+	}
+	return u.Host, true
+}
+
+// checkCopyCycles rejects a copy:// input that reads its own stream, directly
+// or through other streams: such a stream would re-ingest its own output.
+func checkCopyCycles(srcs []*source) error {
+	byName := map[string]*source{}
+	for _, s := range srcs {
+		byName[s.name] = s
+	}
+	const (
+		visiting = 1
+		done     = 2
+	)
+	state := map[string]int{}
+	var visit func(s *source, path []string) error
+	visit = func(s *source, path []string) error {
+		state[s.name] = visiting
+		path = append(path, s.name)
+		for _, in := range s.inputs {
+			t, ok := copyTarget(in)
+			if !ok || byName[t] == nil {
+				continue
+			}
+			switch state[t] {
+			case visiting:
+				if t == s.name {
+					return fmt.Errorf("stream %s: copy://%s reads its own stream", s.name, t)
+				}
+				return fmt.Errorf("copy:// cycle between streams: %s -> %s", strings.Join(path, " -> "), t)
+			case 0:
+				if err := visit(byName[t], path); err != nil {
+					return err
+				}
+			}
+		}
+		state[s.name] = done
+		return nil
+	}
+	for _, s := range srcs {
+		if state[s.name] == 0 {
+			if err := visit(s, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
