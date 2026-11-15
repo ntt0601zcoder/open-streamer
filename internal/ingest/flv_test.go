@@ -439,71 +439,166 @@ func TestFLVFramesFlush(t *testing.T) {
 
 func TestFLVFramesHoldBound(t *testing.T) {
 	vcfg := videoConfig(t, "h264_aac.ts")
-	clk := &flvClock{}
-	f := newFLVFrames(&media.ConfigCache{}, clk.now)
-	_, err := f.push(avcHeader(t, 0, vcfg))
-	require.NoError(t, err)
-	// Frozen timestamps and no second keyframe: the hold is bounded.
-	released := 0
-	for i := range maxHeldVideo {
-		got, err := f.push(avcFrame(0, i == 0, 0, nalP))
-		require.NoError(t, err)
-		released += len(got)
+	// No second keyframe within 1 s: the hold is bounded by frames (with
+	// frozen timestamps) and by bytes.
+	big := append([]byte{0x41, 0xC0}, make([]byte, maxHeldBytes/4)...)
+	cases := []struct {
+		name string
+		n    int
+		nal  []byte
+		ms   func(i int) uint32
+	}{
+		{"frames", maxHeldVideo, nalP, func(int) uint32 { return 0 }},
+		{"bytes", 4, big, func(i int) uint32 { return uint32(i * 40) }},
 	}
-	assert.Equal(t, maxHeldVideo, released)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			clk := &flvClock{}
+			f := newFLVFrames(&media.ConfigCache{}, clk.now)
+			_, err := f.push(avcHeader(t, 0, vcfg))
+			require.NoError(t, err)
+			for i := range c.n {
+				got, err := f.push(avcFrame(c.ms(i), i == 0, 0, c.nal))
+				require.NoError(t, err)
+				if i < c.n-1 {
+					require.Empty(t, got, "frame %d is held", i)
+				} else {
+					require.Len(t, got, c.n, "the last frame releases the hold")
+				}
+			}
+		})
+	}
 }
 
 func TestFLVFramesLateShift(t *testing.T) {
 	vcfg := videoConfig(t, "h264_aac.ts")
 	// No negative offset in the hold (keys at 0 and 400 ms, 40 ms steps),
-	// then one B frame at a negative offset: the late shift costs that
-	// frame. A shift beyond one step also raises the next frame, which
-	// still has PTS ≥ DTS, past the last DTS.
+	// then B frames at negative offsets: each late shift costs its frame.
+	// A shift beyond one step also raises the frames after it that would
+	// go backward; two increases in a row add up.
 	cases := []struct {
 		name   string
-		cts    int32
-		raised int // frames after the B frame whose DTS was raised
+		neg    map[int]int32 // source frame → composition offset (ms)
+		raised int           // frames after the lost ones whose DTS is raised
 	}{
-		{"one step", -40, 0},
-		{"two and a half steps", -100, 1},
+		{"one step", map[int]int32{15: -40}, 0},
+		{"two and a half steps", map[int]int32{15: -100}, 1},
+		{"two increases", map[int]int32{15: -100, 16: -150}, 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			clk := &flvClock{}
 			f := newFLVFrames(&media.ConfigCache{}, clk.now)
 			msgs := []rtmp.Media{avcHeader(t, 0, vcfg)}
+			shift := int64(0)
 			for i := range 20 {
 				ms := uint32(i * 40)
+				cts, neg := c.neg[i]
 				switch {
 				case i%10 == 0:
 					msgs = append(msgs, avcFrame(ms, true, 0, nalIDR))
-				case i == 15:
-					msgs = append(msgs, avcFrame(ms, false, c.cts, nalB))
+				case neg:
+					msgs = append(msgs, avcFrame(ms, false, cts, nalB))
+					shift = max(shift, -int64(cts))
 				default:
 					msgs = append(msgs, avcFrame(ms, false, 0, nalP))
 				}
 			}
 			out := pushAll(t, f, clk, msgs)
-			require.Len(t, out, 19)
+			lost := len(c.neg)
+			require.Len(t, out, 20-lost)
 			for i, fr := range out {
 				require.GreaterOrEqual(t, fr.PTS, fr.DTS, "frame %d", i)
 				if i > 0 {
 					require.Greater(t, fr.DTS, out[i-1].DTS, "frame %d", i)
 				}
 			}
-			// out[15] is source frame 16, the first after the lost B frame.
-			for k := 15; k < 19; k++ {
-				src := int64(k+1) * 40 * 90
+			// out[15:] are the source frames after the lost ones.
+			for k := 15; k < len(out); k++ {
+				src := int64(k+lost) * 40 * 90
 				require.Equal(t, src, out[k].PTS, "frame %d: PTS exact", k)
 				if k < 15+c.raised {
 					require.Equal(t, out[14].DTS+int64(k-14), out[k].DTS, "frame %d raised", k)
 				} else {
-					require.Equal(t, src+int64(c.cts)*90, out[k].DTS, "frame %d shifted", k)
+					require.Equal(t, src-shift*90, out[k].DTS, "frame %d shifted", k)
 				}
 			}
 			st := f.stats()
-			assert.Equal(t, uint64(1), st["dts_shifts"])
-			assert.Equal(t, uint64(1), st["dts_shift_late"])
+			assert.Equal(t, uint64(lost), st["dts_shifts"])
+			assert.Equal(t, uint64(lost), st["dts_shift_late"])
+		})
+	}
+}
+
+func TestFLVFramesBadConfigRecovery(t *testing.T) {
+	cfg := videoConfig(t, "h264_aac.ts")
+	badSPS := []byte{0x67} // too short for an ID
+	badHeader := videoMedia(0, rtmp.VideoTag{Codec: rtmp.VideoAVC, Kind: rtmp.VideoSequenceStart, Data: []byte{1, 2}})
+	cases := []struct {
+		name    string
+		bad     func(ms uint32) rtmp.Media // invalidates the config
+		recover func(ms uint32) []rtmp.Media
+	}{
+		{"bad in-band set, then good in-band sets", func(ms uint32) rtmp.Media {
+			return avcFrame(ms, false, 0, badSPS, nalP)
+		}, func(ms uint32) []rtmp.Media {
+			return []rtmp.Media{avcFrame(ms, true, 0, cfg.SPS[0], cfg.PPS[0], nalIDR)}
+		}},
+		{"bad header, then good header", func(ms uint32) rtmp.Media {
+			m := badHeader
+			m.Timestamp = ms
+			return m
+		}, func(ms uint32) []rtmp.Media {
+			return []rtmp.Media{avcHeader(t, ms, cfg), avcFrame(ms, true, 0, nalIDR)}
+		}},
+		{"bad header, then good in-band sets", func(ms uint32) rtmp.Media {
+			m := badHeader
+			m.Timestamp = ms
+			return m
+		}, func(ms uint32) []rtmp.Media {
+			return []rtmp.Media{avcFrame(ms, true, 0, cfg.SPS[0], cfg.PPS[0], nalIDR)}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			clk := &flvClock{}
+			f := newFLVFrames(&media.ConfigCache{}, clk.now)
+			var out []Frame
+			push := func(m rtmp.Media, wantErr bool) {
+				t.Helper()
+				clk.at = flvBase.Add(time.Duration(m.Timestamp) * time.Millisecond)
+				got, err := f.push(m)
+				if wantErr {
+					require.ErrorContains(t, err, "ingest: flv:")
+				} else {
+					require.NoError(t, err)
+				}
+				out = append(out, got...)
+			}
+			push(avcHeader(t, 0, cfg), false)
+			push(avcFrame(0, true, 0, nalIDR), false)
+			push(avcFrame(40, false, 0, nalP), false)
+			push(c.bad(80), true)
+			// The gap: frames are dropped while the config is invalid.
+			push(avcFrame(120, false, 0, nalP), false)
+			push(avcFrame(160, false, 0, nalP), false)
+			for _, m := range c.recover(200) {
+				push(m, false)
+			}
+			push(avcFrame(240, false, 0, nalP), false)
+			out = append(out, f.flush()...)
+
+			require.Len(t, out, 4)
+			wantPTS := []int64{0, 40 * 90, 200 * 90, 240 * 90}
+			for i, fr := range out {
+				assert.Equal(t, wantPTS[i], fr.PTS, "frame %d", i)
+				assert.Same(t, out[0].Config, fr.Config, "frame %d: the rebuilt config keeps the pointer", i)
+			}
+			assert.True(t, out[2].Key)
+			assert.Equal(t, [][]byte{nalIDR}, out[2].Data)
+			st := f.stats()
+			assert.Equal(t, uint64(2), st["dropped_no_config"])
+			assert.Equal(t, uint64(1), st["bad_tags"])
 		})
 	}
 }
@@ -666,17 +761,22 @@ func TestFLVFramesCounters(t *testing.T) {
 	// Sequence end.
 	_, err = push(videoMedia(0, rtmp.VideoTag{Codec: rtmp.VideoAVC, Kind: rtmp.VideoSequenceEnd}))
 	require.NoError(t, err)
-	// Bad: a truncated NAL length, an undecodable record, a truncated tag.
+	// Bad: a truncated NAL length, a truncated tag, an undecodable record.
 	_, err = push(avcHeader(t, 0, cfg))
 	require.NoError(t, err)
 	_, err = push(videoMedia(0, rtmp.VideoTag{Codec: rtmp.VideoAVC, Kind: rtmp.VideoCodedFrames, Key: true, Data: []byte{0, 0, 0, 9, 0x65}}))
 	require.ErrorContains(t, err, "ingest: flv:")
-	_, err = push(videoMedia(0, rtmp.VideoTag{Codec: rtmp.VideoAVC, Kind: rtmp.VideoSequenceStart, Data: []byte{1, 2}}))
-	require.Error(t, err)
 	_, err = push(rtmp.Media{Type: rtmp.MsgVideo, Payload: []byte{0x17, 1}})
 	require.Error(t, err)
-	// The stream goes on after bad tags, with the earlier config.
+	_, err = push(videoMedia(0, rtmp.VideoTag{Codec: rtmp.VideoAVC, Kind: rtmp.VideoSequenceStart, Data: []byte{1, 2}}))
+	require.Error(t, err)
+	// The bad record invalidated the config until the next valid header.
 	got, err := push(avcFrame(0, true, 0, nalIDR))
+	require.NoError(t, err)
+	require.Empty(t, got)
+	_, err = push(avcHeader(t, 40, cfg))
+	require.NoError(t, err)
+	got, err = push(avcFrame(40, true, 0, nalIDR))
 	require.NoError(t, err)
 	got = append(got, f.flush()...)
 	require.Len(t, got, 1)
@@ -688,7 +788,7 @@ func TestFLVFramesCounters(t *testing.T) {
 		"frames":              1,
 		"unsupported_tags":    2,
 		"bad_tags":            3,
-		"dropped_no_config":   2,
+		"dropped_no_config":   3,
 		"dts_shifts":          0,
 		"dts_shift_late":      0,
 		"audio_reanchors":     0,

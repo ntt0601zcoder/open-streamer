@@ -43,20 +43,30 @@ const (
 //
 // Timestamps are the 32-bit RTMP milliseconds, unwrapped across audio and
 // video together, times 90; only coded frames feed the unwrapper, since
-// sequence headers and metadata are often stamped 0 mid-stream. Video PTS is DTS plus the composition offset;
-// negative offsets are absorbed by a DTS shift s that only grows, learned
-// over the session's first video frames, which are held until the second
-// keyframe or holdSpan of source time (see push). Audio is placed on the
-// AAC sample grid (see audioGrid). Configs come from the sequence headers
-// and from in-band parameter sets, through the shared ConfigCache, so a
-// repeated identical header keeps the config pointer.
+// sequence headers and metadata are often stamped 0 mid-stream.
+//
+// Video PTS is DTS plus the composition offset; negative offsets are
+// absorbed by a DTS shift s that only grows, learned over the session's
+// first video frames, which are held until the second keyframe or holdSpan
+// of source time (see push). Audio is placed on the AAC sample grid (see
+// audioGrid).
+//
+// Configs come from the sequence headers and from in-band parameter sets,
+// through the shared ConfigCache, so a repeated identical header keeps the
+// config pointer. As in ts.Demuxer, a bad sequence header or parameter set
+// invalidates the video config: frames are dropped (dropped_no_config)
+// until a valid sequence header arrives or the in-band sets rebuild a valid
+// config.
 type flvFrames struct {
 	cache *media.ConfigCache
 	now   func() time.Time
 	unw   *unwrap.Unwrapper
 
-	// Video configuration: the codec of vcfg, its parameter sets by ID and
-	// the NAL length size of the decoder configuration record.
+	// Video configuration: the codec of the last valid sequence header, its
+	// parameter sets by ID (updated in band), the NAL length size of its
+	// decoder configuration record and its classifier. vcfg is nil before
+	// the first valid header and while the sets are invalid; the others are
+	// kept then, so that in-band sets can repair the config.
 	vcodec  media.Codec
 	vcfg    *media.TrackConfig
 	vsets   paramSets
@@ -69,8 +79,8 @@ type flvFrames struct {
 	heldBytes int
 	heldKeys  int
 	// shift is s in 90 kHz ticks; lastDTS is the shifted DTS of the last
-	// video frame out; lateDelta is the last late increase of s, while the
-	// frames after it are still below lastDTS.
+	// video frame out; lateDelta is the sum of the late increases of s
+	// since a frame last went above lastDTS on its own.
 	shift, lastDTS, lateDelta int64
 
 	acfg *media.TrackConfig
@@ -179,11 +189,13 @@ func newFLVFrames(cache *media.ConfigCache, now func() time.Time) *flvFrames {
 // push converts one message and returns the frames it completes: none, one,
 // or the held video frames at the end of the hold. Unsupported codecs are
 // counted (unsupported_tags) and skipped, as are frames before their kind's
-// first sequence header (dropped_no_config) and sequence ends. A tag that
-// does not parse, or whose configuration or NAL units are invalid, is counted
-// in bad_tags and skipped, leaving the state as it was; push then returns an
-// error describing it. The error is not terminal: later tags are converted
-// as usual.
+// first sequence header or while the video config is invalid
+// (dropped_no_config), and sequence ends. A tag that does not parse, or
+// whose configuration or NAL units are invalid, is counted in bad_tags and
+// skipped; push then returns an error describing it. A bad sequence header
+// or parameter set also invalidates the video config (see flvFrames);
+// otherwise the state is left as it was. The error is not terminal: later
+// tags are converted as usual.
 //
 // The session's first video frames are held until the second keyframe, or
 // until a frame 1 s of source time after the first, and released together
@@ -268,18 +280,21 @@ func (f *flvFrames) video(m rtmp.Media) ([]Frame, error) {
 	return nil, nil
 }
 
-// videoConfig applies a sequence header: its decoder configuration record
-// replaces the parameter sets. An empty header is ignored.
+// videoConfig applies a sequence header. The record is authoritative: its
+// parameter sets replace the stored ones, in-band sets included. An empty
+// header is ignored. A bad one invalidates the config and keeps the rest.
 func (f *flvFrames) videoConfig(codec media.Codec, rec []byte) error {
 	if len(rec) == 0 {
 		return nil
 	}
 	sets, lenSize, err := decodeRecord(codec, rec)
 	if err != nil {
+		f.vcfg = nil
 		return fmt.Errorf("ingest: flv: %v decoder configuration record: %w", codec, err)
 	}
 	cfg, err := f.buildVideoConfig(codec, sets)
 	if err != nil {
+		f.vcfg = nil
 		return err
 	}
 	if codec != f.vcodec || f.cls == nil {
@@ -319,7 +334,9 @@ func values(m map[uint32][]byte) [][]byte {
 // decodeRecord returns the parameter sets and the NAL length size of an
 // AVC or HEVC decoder configuration record. mp4ff decodes only 4-byte
 // lengths, so the length field is read here and set to 4 on a copy before
-// decoding. NAL units of other types in the record are ignored.
+// decoding. NAL units of other types in the record are ignored. Both
+// records allow lengthSizeMinusOne 0, 1 and 3; 2 (3-byte lengths) is
+// accepted as deliberate leniency, since splitNALUs handles any size.
 func decodeRecord(codec media.Codec, rec []byte) (paramSets, int, error) {
 	b := bytes.Clone(rec)
 	var nalus [][]byte
@@ -374,12 +391,12 @@ func splitNALUs(b []byte, size int) ([][]byte, error) {
 		if len(b) < size {
 			return nil, errors.New("ingest: flv: truncated NAL unit length")
 		}
-		n := 0
+		var n uint64
 		for _, c := range b[:size] {
-			n = n<<8 | int(c)
+			n = n<<8 | uint64(c)
 		}
 		b = b[size:]
-		if n > len(b) {
+		if n > uint64(len(b)) {
 			return nil, fmt.Errorf("ingest: flv: NAL unit of %d bytes exceeds the %d left", n, len(b))
 		}
 		if n > 0 {
@@ -391,10 +408,11 @@ func splitNALUs(b []byte, size int) ([][]byte, error) {
 }
 
 // videoFrame converts coded frames: parameter sets move into the config,
-// AUDs are dropped and the rest is timed.
+// AUDs are dropped and the rest is timed. In-band sets are read even while
+// the config is invalid, and any set arriving then retries the build.
 func (f *flvFrames) videoFrame(codec media.Codec, ms uint32, tag rtmp.VideoTag) ([]Frame, error) {
 	dts := f.unw.Unwrap(uint64(ms)) * 90
-	if f.vcfg == nil || codec != f.vcodec {
+	if f.lenSize == 0 || codec != f.vcodec {
 		f.n.noConfig.Add(1)
 		return nil, nil
 	}
@@ -403,7 +421,8 @@ func (f *flvFrames) videoFrame(codec media.Codec, ms uint32, tag rtmp.VideoTag) 
 		return nil, err
 	}
 	data := make([][]byte, 0, len(nalus))
-	sets, changed := f.vsets, false
+	sets, changed, retry := f.vsets, false, false
+	var badSet error
 	for _, n := range nalus {
 		role := roleOf(codec, n)
 		m := sets.of(role)
@@ -416,8 +435,10 @@ func (f *flvFrames) videoFrame(codec media.Codec, ms uint32, tag rtmp.VideoTag) 
 		}
 		id, err := media.ParamSetID(codec, n)
 		if err != nil {
-			return nil, fmt.Errorf("ingest: flv: in-band parameter set: %w", err)
+			badSet = err
+			continue
 		}
+		retry = true
 		if bytes.Equal(m[id], n) {
 			continue
 		}
@@ -427,12 +448,23 @@ func (f *flvFrames) videoFrame(codec media.Codec, ms uint32, tag rtmp.VideoTag) 
 		}
 		m[id] = n
 	}
-	if changed {
+	f.vsets = sets
+	switch {
+	case badSet != nil:
+		// The slices may depend on the set that was lost.
+		f.vcfg = nil
+		return nil, fmt.Errorf("ingest: flv: in-band parameter set: %w", badSet)
+	case changed || retry && f.vcfg == nil:
 		cfg, err := f.buildVideoConfig(codec, sets)
 		if err != nil {
+			f.vcfg = nil
 			return nil, err
 		}
-		f.vcfg, f.vsets = cfg, sets
+		f.vcfg = cfg
+	}
+	if f.vcfg == nil {
+		f.n.noConfig.Add(1)
+		return nil, nil
 	}
 	if len(data) == 0 {
 		return nil, nil
@@ -466,8 +498,9 @@ func (f *flvFrames) timeVideo(fr Frame, cts int64) []Frame {
 	}
 	if cts < -f.shift {
 		// A late increase: frames from here on map lower by the increase,
-		// so those still below the last DTS out are raised past it.
-		f.lateDelta = -cts - f.shift
+		// so those still below the last DTS out are raised past it. The
+		// increases add up until a frame goes above lastDTS on its own.
+		f.lateDelta += -cts - f.shift
 		f.shift = -cts
 		f.n.dtsShifts.Add(1)
 	}
