@@ -22,6 +22,10 @@ const (
 	defaultIdleTimeout          = 30 * time.Second
 	defaultPingInterval         = 10 * time.Second
 	defaultMaxPrePublishMessage = 64 << 10
+
+	// idleGrace is the shortest read deadline: a read issued after the idle
+	// limit has passed still collects the bytes already waiting.
+	idleGrace = 10 * time.Millisecond
 )
 
 // Config bounds an RTMP session, server or client. A zero field takes its
@@ -45,6 +49,9 @@ type Config struct {
 	// publish is accepted. Default 64 KiB.
 	MaxPrePublishMessage int
 	// Now is the clock for timeouts, pings and LastInbound. Default time.Now.
+	// It must advance with real time: it stamps LastInbound and decides when
+	// a phase, the idle limit or a ping is due, while the deadlines set on
+	// the conn are durations on the real clock.
 	Now func() time.Time
 }
 
@@ -221,6 +228,9 @@ func (s *session) touch(now time.Time) {
 // StreamEOF, …) and other types it does not know. Protocol control messages
 // and pings are handled here, and an aggregate is returned as its
 // sub-messages one by one.
+//
+// An error is terminal: the chunk stream may be left mid-message, so the
+// caller must Close the session and not call next again.
 func (s *session) next() (Message, error) {
 	for {
 		m, ok, err := s.agg.next()
@@ -266,13 +276,11 @@ func (s *session) acknowledge() error {
 	return s.writeControl(MsgAck, binary.BigEndian.AppendUint32(nil, uint32(n)))
 }
 
-// tick fails a timed-out phase or an idle session and sends a due ping.
+// tick fails a timed-out phase and sends a due ping. The idle limit is left
+// to checkIdle, after a read that found nothing.
 func (s *session) tick(now time.Time) error {
 	if !s.phaseEnd.IsZero() && !now.Before(s.phaseEnd) {
 		return fmt.Errorf("rtmp: session: %s timed out: %w", s.phase, os.ErrDeadlineExceeded)
-	}
-	if !now.Before(s.lastIn.Add(s.cfg.IdleTimeout)) {
-		return fmt.Errorf("rtmp: session: no inbound data for %v: %w", s.cfg.IdleTimeout, os.ErrDeadlineExceeded)
 	}
 	if !s.nextPing.IsZero() && !now.Before(s.nextPing) {
 		s.nextPing = now.Add(s.cfg.PingInterval)
@@ -281,10 +289,22 @@ func (s *session) tick(now time.Time) error {
 	return nil
 }
 
+// checkIdle fails a session whose last inbound byte is IdleTimeout old.
+func (s *session) checkIdle(now time.Time) error {
+	if !now.Before(s.lastIn.Add(s.cfg.IdleTimeout)) {
+		return fmt.Errorf("rtmp: session: no inbound data for %v: %w", s.cfg.IdleTimeout, os.ErrDeadlineExceeded)
+	}
+	return nil
+}
+
 // readDeadline is the earliest of the idle limit, the next ping and the
-// phase end.
-func (s *session) readDeadline() time.Time {
+// phase end. The idle limit counts as at least idleGrace from now, so a
+// consumer that comes back late still reads the bytes that are waiting.
+func (s *session) readDeadline(now time.Time) time.Time {
 	d := s.lastIn.Add(s.cfg.IdleTimeout)
+	if floor := now.Add(idleGrace); d.Before(floor) {
+		d = floor
+	}
 	if !s.nextPing.IsZero() && s.nextPing.Before(d) {
 		d = s.nextPing
 	}
@@ -307,7 +327,8 @@ func isTimeout(err error) bool {
 // sessionReader reads the conn for the session's bufio.Reader. A read
 // deadline that expires on a ping slot sends PingRequest and reads on, so the
 // chunk reader above never sees a timeout in the middle of a message; one
-// past the idle limit or the phase end fails.
+// past the phase end fails, and so does a read that times out with nothing
+// received when the last inbound byte is IdleTimeout old.
 type sessionReader struct{ s *session }
 
 func (r sessionReader) Read(p []byte) (int, error) {
@@ -318,7 +339,7 @@ func (r sessionReader) Read(p []byte) (int, error) {
 			return 0, err
 		}
 		// An error here (a closed conn) surfaces from the Read below.
-		_ = s.conn.SetReadDeadline(connDeadline(s.readDeadline(), now))
+		_ = s.conn.SetReadDeadline(connDeadline(s.readDeadline(now), now))
 		n, err := s.conn.Read(p)
 		if n > 0 {
 			s.touch(s.cfg.Now())
@@ -328,6 +349,9 @@ func (r sessionReader) Read(p []byte) (int, error) {
 			return n, err
 		}
 		if err != nil && !isTimeout(err) {
+			return 0, err
+		}
+		if err := s.checkIdle(s.cfg.Now()); err != nil {
 			return 0, err
 		}
 	}
