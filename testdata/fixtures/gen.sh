@@ -31,3 +31,7 @@ cat h264_aac.ts tmp_audiopid.ts > h264_aac_audiopid.ts
 rm -f tmp_pmtchange.ts tmp_audiopid.ts
 # Fragmented MP4: both traks in one init, a fragment per video keyframe.
 $F $(v 320x240) $(a 48000) -t 6 $X264 -c:a aac -ac 2 -b:a 64k -threads 1 -fflags +bitexact -flags:v +bitexact -flags:a +bitexact -f mp4 -movflags frag_keyframe+empty_moov+default_base_moof h264_aac_frag.mp4
+# FLV: remuxed from the TS fixtures (ffmpeg 8.x muxes HEVC as enhanced RTMP).
+FLV="-c copy -threads 1 -fflags +bitexact -flags:v +bitexact -flags:a +bitexact -f flv"
+$F -i h264_aac.ts $FLV h264_aac.flv
+$F -i h265_aac51.ts $FLV h265_aac.flv
