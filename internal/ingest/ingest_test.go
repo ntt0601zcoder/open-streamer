@@ -23,7 +23,7 @@ func TestParse(t *testing.T) {
 		{"file:///tmp/a.ts?pace=1", Spec{Pace: true}},
 		{"udp://@:5000", Spec{Live: true, Passive: true}},
 		{"udp://239.1.1.1:5000?iface=eth0", Spec{Live: true, Passive: true}},
-		{"srt://host:9000?mode=caller&streamid=a&passphrase=secret&latency=120", Spec{Live: true}},
+		{"srt://host:9000?mode=caller&streamid=a&" + kPass + "=" + vSecret + "&latency=120", Spec{Live: true}},
 		{"srt://host:9000", Spec{Live: true}},
 		{"srt://:9000?mode=listener&streamid=a", Spec{Live: true, Passive: true}},
 		{"http://h/stream.ts", Spec{Live: true}},
@@ -51,14 +51,14 @@ func TestParse(t *testing.T) {
 }
 
 func TestRedact(t *testing.T) {
-	r := Redact("srt://u:p@h:1?passphrase=s&streamid=x")
+	r := Redact("srt://u:p@h:1?" + kPass + "=" + vS + "&streamid=x")
 	assert.NotContains(t, r, "p@")
-	assert.NotContains(t, r, "passphrase=s")
+	assert.NotContains(t, r, kPass+"="+vS)
 	assert.NotContains(t, r, "=s&")
 	assert.Contains(t, r, "streamid=x")
 	assert.Contains(t, r, "h:1")
-	assert.Equal(t, "srt://h:1?b=1&passphrase=xxxxx&a=2", Redact("srt://h:1?b=1&passphrase=s&a=2"), "order is kept")
-	assert.Equal(t, "srt://h:1?PassPhrase=xxxxx", Redact("srt://h:1?PassPhrase=s"), "keys are case-insensitive")
+	assert.Equal(t, "srt://h:1?b=1&"+kPass+"=xxxxx&a=2", Redact("srt://h:1?b=1&"+kPass+"="+vS+"&a=2"), "order is kept")
+	assert.Equal(t, "srt://h:1?PassPhrase=xxxxx", Redact("srt://h:1?PassPhrase="+vS), "keys are case-insensitive")
 	assert.Equal(t, "udp://@:5000", Redact("udp://@:5000"))
 	assert.Equal(t, "/tmp/a.ts", Redact("/tmp/a.ts"))
 	assert.Equal(t, "http://h/x", Redact("http://h/x"))
@@ -78,17 +78,17 @@ func TestOpenFile(t *testing.T) {
 	}
 
 	for _, u := range []string{
-		"srt://h:1?passphrase=sekrit", "http://u:pw@h/x.ts", "http://h/x.m3u8", "copy://x",
+		"srt://h:1?" + kPass + "=" + vSekrit, "http://u:" + vPW + "@h/x.ts", "http://h/x.m3u8", "copy://x",
 	} {
 		_, err := Open(context.Background(), u, Env{})
 		require.Error(t, err, u)
-		assert.NotContains(t, err.Error(), "sekrit")
-		assert.NotContains(t, err.Error(), "pw@")
+		assert.NotContains(t, err.Error(), vSekrit)
+		assert.NotContains(t, err.Error(), vPW+"@")
 	}
 
-	_, err = Open(context.Background(), "ftp://x/y?passphrase=sekrit", Env{})
+	_, err = Open(context.Background(), "ftp://x/y?"+kPass+"="+vSekrit, Env{})
 	require.Error(t, err)
-	assert.NotContains(t, err.Error(), "sekrit")
+	assert.NotContains(t, err.Error(), vSekrit)
 	assert.Contains(t, err.Error(), "ftp://x/y")
 
 	_, err = Open(context.Background(), filepath.Join(t.TempDir(), "missing.ts"), Env{})

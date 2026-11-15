@@ -45,7 +45,7 @@ func readFrames(t *testing.T, d *ts.Demuxer) (frames []media.Frame, tracks []int
 	}
 }
 
-func remapDemux(t *testing.T, data []byte) (*ts.Demuxer, []media.Frame, []int) {
+func remapDemux(t *testing.T, data []byte) (*ts.Demuxer, []media.Frame) {
 	t.Helper()
 	d, err := ts.NewDemuxerWithOptions(bytes.NewReader(data), ts.DemuxOptions{Remap: true})
 	require.NoError(t, err)
@@ -54,7 +54,7 @@ func remapDemux(t *testing.T, data []byte) (*ts.Demuxer, []media.Frame, []int) {
 		assert.Equal(t, 2, n)
 	}
 	require.Len(t, changeAt, 1)
-	return d, frames, []int{changeAt[0]}
+	return d, frames
 }
 
 func configs(frames []media.Frame, track int) (ptrs []*media.TrackConfig) {
@@ -70,7 +70,7 @@ func configs(frames []media.Frame, track int) (ptrs []*media.TrackConfig) {
 }
 
 func TestRemapPMTChange(t *testing.T) {
-	d, frames, _ := remapDemux(t, fixtureBytes(t, "h264_aac_pmtchange.ts"))
+	d, frames := remapDemux(t, fixtureBytes(t, "h264_aac_pmtchange.ts"))
 	assert.Equal(t, uint64(1), d.Stats().PMTChanges)
 	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, d.TrackKinds())
 	assert.Equal(t, []uint16{0x200, 0x201}, d.TrackPIDs())
@@ -83,7 +83,7 @@ func TestRemapPMTChange(t *testing.T) {
 	}
 
 	c := clock.New(clock.Options{Kinds: d.TrackKinds()})
-	var out []media.Frame
+	out := make([]media.Frame, 0, len(frames))
 	for _, f := range frames {
 		out = append(out, c.Push(f)...)
 	}
@@ -98,7 +98,7 @@ func TestRemapAudioPIDOnly(t *testing.T) {
 		require.NoError(t, err)
 		return d, readOnly(t, d)
 	}()
-	d, frames, _ := remapDemux(t, fixtureBytes(t, "h264_aac_audiopid.ts"))
+	d, frames := remapDemux(t, fixtureBytes(t, "h264_aac_audiopid.ts"))
 	assert.Equal(t, uint64(1), d.Stats().PMTChanges)
 	assert.Equal(t, []uint16{0x100, 0x120}, d.TrackPIDs())
 	// Video keeps its state: one Config, and every video frame of the

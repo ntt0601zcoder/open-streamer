@@ -24,6 +24,8 @@ import (
 var heaacASC = []byte{0x2B, 0x11, 0x88, 0x00}
 
 // probePackets returns pts and duration of every audio packet ffprobe reads.
+// A duration ffprobe cannot report (older releases print N/A for the first
+// fMP4 packet) is returned as -1; callers derive it from the next pts.
 func probePackets(t *testing.T, ffprobe, path string) (pts, dur []int64) {
 	t.Helper()
 	out, err := exec.CommandContext(t.Context(), ffprobe, "-v", "error", "-select_streams", "a:0",
@@ -34,8 +36,11 @@ func probePackets(t *testing.T, ffprobe, path string) (pts, dur []int64) {
 		require.Len(t, f, 2, line)
 		p, err := strconv.ParseInt(f[0], 10, 64)
 		require.NoError(t, err, line)
-		d, err := strconv.ParseInt(f[1], 10, 64)
-		require.NoError(t, err, line)
+		d := int64(-1)
+		if f[1] != "N/A" {
+			d, err = strconv.ParseInt(f[1], 10, 64)
+			require.NoError(t, err, line)
+		}
 		pts, dur = append(pts, p), append(dur, d)
 	}
 	return pts, dur
@@ -82,6 +87,9 @@ func TestHEAACThroughOutputs(t *testing.T) {
 		pts, dur := probePackets(t, ffprobe, p)
 		require.Len(t, pts, len(frames))
 		for k := range pts {
+			if dur[k] < 0 && k+1 < len(pts) {
+				dur[k] = pts[k+1] - pts[k]
+			}
 			assert.Equal(t, int64(k)*1024, pts[k], "packet %d pts", k)
 			assert.Equal(t, int64(1024), dur[k], "packet %d duration", k)
 		}

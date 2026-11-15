@@ -64,7 +64,7 @@ func rtpWrap(seq uint16, st rtpStyle, payload []byte) []byte {
 // receiver keeps up.
 func sendAll(t *testing.T, addr string, dgs [][]byte) {
 	t.Helper()
-	c, err := net.Dial("udp", addr)
+	c, err := (&net.Dialer{}).DialContext(t.Context(), "udp", addr)
 	if err != nil {
 		t.Error(err)
 		return
@@ -81,7 +81,7 @@ func sendAll(t *testing.T, addr string, dgs [][]byte) {
 }
 
 // openUDPWith opens the listener while send starts shortly after it is up.
-func openUDPWith(t *testing.T, port int, query string, send func(addr string)) Reader {
+func openUDPWith(t *testing.T, port int, send func(addr string)) Reader {
 	t.Helper()
 	type res struct {
 		r   Reader
@@ -89,7 +89,7 @@ func openUDPWith(t *testing.T, port int, query string, send func(addr string)) R
 	}
 	ch := make(chan res, 1)
 	go func() {
-		r, err := Open(context.Background(), fmt.Sprintf("udp://127.0.0.1:%d%s", port, query), Env{})
+		r, err := Open(context.Background(), fmt.Sprintf("udp://127.0.0.1:%d", port), Env{})
 		ch <- res{r, err}
 	}()
 	time.Sleep(200 * time.Millisecond)
@@ -188,7 +188,7 @@ func assertClean(t *testing.T, st map[string]uint64) {
 func TestUDPRawTS(t *testing.T) {
 	port := freeUDPPort(t)
 	dgs := fixtureDatagrams(t)
-	r := openUDPWith(t, port, "", func(addr string) { sendAll(t, addr, dgs) })
+	r := openUDPWith(t, port, func(addr string) { sendAll(t, addr, dgs) })
 	assert.Equal(t, Spec{Live: true, Passive: true}, r.Spec())
 	res, wg, mu := drain(r)
 	full, want := fixtureCounts(t, "h264_aac.ts"), heldBackCounts(t)
@@ -208,11 +208,11 @@ func TestUDPRTPWrapped(t *testing.T) {
 	for _, st := range styles {
 		t.Run(fmt.Sprintf("pt%d_csrc%d_ext%v", st.pt, st.csrc, st.ext), func(t *testing.T) {
 			port := freeUDPPort(t)
-			var wrapped [][]byte
+			wrapped := make([][]byte, 0, len(fixtureDatagrams(t)))
 			for i, d := range fixtureDatagrams(t) {
 				wrapped = append(wrapped, rtpWrap(uint16(65500+i), st, d)) // crosses the seq wrap
 			}
-			r := openUDPWith(t, port, "", func(addr string) { sendAll(t, addr, wrapped) })
+			r := openUDPWith(t, port, func(addr string) { sendAll(t, addr, wrapped) })
 			res, wg, mu := drain(r)
 			waitSettled(t, r, res, mu, len(wrapped), heldBackCounts(t))
 			assertClean(t, r.Stats())
@@ -224,14 +224,14 @@ func TestUDPRTPWrapped(t *testing.T) {
 
 func TestUDPRTPGapsCounted(t *testing.T) {
 	port := freeUDPPort(t)
-	var wrapped [][]byte
+	wrapped := make([][]byte, 0, len(fixtureDatagrams(t)))
 	for i, d := range fixtureDatagrams(t)[:60] {
 		if i == 20 || i == 21 || i == 40 {
 			continue // three lost datagrams
 		}
 		wrapped = append(wrapped, rtpWrap(uint16(i), rtpStyle{pt: 33}, d))
 	}
-	r := openUDPWith(t, port, "", func(addr string) { sendAll(t, addr, wrapped) })
+	r := openUDPWith(t, port, func(addr string) { sendAll(t, addr, wrapped) })
 	defer r.Close()
 	_, _, _ = drain(r)
 	assert.Eventually(t, func() bool { return r.Stats()["datagrams"] >= uint64(len(wrapped)) }, 3*time.Second, 20*time.Millisecond)
@@ -256,7 +256,7 @@ func TestUDPLossAndReorder(t *testing.T) {
 		}
 	}
 	require.Less(t, len(dgs), len(src), "the seed drops something")
-	r := openUDPWith(t, port, "", func(addr string) { sendAll(t, addr, dgs) })
+	r := openUDPWith(t, port, func(addr string) { sendAll(t, addr, dgs) })
 	res, wg, mu := drain(r)
 	assert.Eventually(t, func() bool { return r.Stats()["datagrams"] >= uint64(len(dgs)) }, 5*time.Second, 20*time.Millisecond)
 	time.Sleep(200 * time.Millisecond)
@@ -344,7 +344,7 @@ func TestUDPCloseUnblocksAndAbortsOpen(t *testing.T) {
 	assert.Less(t, time.Since(start), 2*time.Second)
 	assert.False(t, udpPortBound(port), "an aborted open frees the port")
 
-	r := openUDPWith(t, port, "", func(addr string) { sendAll(t, addr, fixtureDatagrams(t)[:20]) })
+	r := openUDPWith(t, port, func(addr string) { sendAll(t, addr, fixtureDatagrams(t)[:20]) })
 	done := make(chan error, 1)
 	go func() {
 		for {
@@ -367,7 +367,7 @@ func TestUDPCloseUnblocksAndAbortsOpen(t *testing.T) {
 
 func TestOpenUDP(t *testing.T) {
 	port := freeUDPPort(t)
-	r := openUDPWith(t, port, "", func(addr string) { sendAll(t, addr, fixtureDatagrams(t)) })
+	r := openUDPWith(t, port, func(addr string) { sendAll(t, addr, fixtureDatagrams(t)) })
 	defer r.Close()
 	assert.Equal(t, Spec{Live: true, Passive: true}, r.Spec())
 	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
