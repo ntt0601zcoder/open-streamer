@@ -314,6 +314,24 @@ func TestSessionPingAndIdle(t *testing.T) {
 	})
 }
 
+// A consumer that calls next later than IdleTimeout after the last byte still
+// gets the bytes that are waiting; idle fails only a read that finds none.
+func TestSessionSlowConsumer(t *testing.T) {
+	cfg := Config{IdleTimeout: 200 * time.Millisecond}
+	s, p := newSessionPair(t, cfg, roleServer, false)
+	b, _ := stream(t, audio(0, 10), audio(20, 10))
+	p.write(b)
+	time.Sleep(400 * time.Millisecond)
+	for i := range 2 {
+		if m, err := s.next(); err != nil || m.Type != MsgAudio {
+			t.Fatalf("next %d after a slow consumer: %v type %d", i, err, m.Type)
+		}
+	}
+	if err := nextErr(t, s); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("next: %v, want an idle timeout once nothing is waiting", err)
+	}
+}
+
 func TestSessionHandshakeTimeout(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()
