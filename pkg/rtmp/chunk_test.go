@@ -134,21 +134,56 @@ func roundTripPlan(tag byte) []plannedMsg {
 	return out
 }
 
+// splitter cuts one message's writer output back into chunks, using only the
+// wire format: the basic header form, the header length per format, and
+// whether the chunk stream's last type 0/1/2 header was extended.
+type splitter struct {
+	size int
+	ext  map[uint32]bool
+}
+
+func (s *splitter) split(t *testing.T, b []byte, length int) [][]byte {
+	t.Helper()
+	var chunks [][]byte
+	for first := true; first || len(b) > 0; first = false {
+		format := b[0] >> 6
+		csid := uint32(b[0] & 0x3F)
+		h := 1
+		switch csid {
+		case 0:
+			csid, h = 64+uint32(b[1]), 2
+		case 1:
+			csid, h = 64+uint32(b[1])+uint32(b[2])<<8, 3
+		}
+		if !first && format != 3 {
+			t.Fatalf("continuation chunk has format %d", format)
+		}
+		if format < 3 {
+			s.ext[csid] = b[h] == 0xFF && b[h+1] == 0xFF && b[h+2] == 0xFF
+		}
+		h += []int{11, 7, 3, 0}[format]
+		if s.ext[csid] {
+			h += 4
+		}
+		n := min(length, s.size)
+		chunks = append(chunks, append([]byte(nil), b[:h+n]...))
+		b = b[h+n:]
+		length -= n
+	}
+	if length != 0 {
+		t.Fatalf("%d payload bytes left after splitting", length)
+	}
+	return chunks
+}
+
 // writeChunks writes m and returns a copy of each chunk it produced.
-func writeChunks(t *testing.T, w *ChunkWriter, out *bytes.Buffer, csid uint32, m Message) [][]byte {
+func writeChunks(t *testing.T, w *ChunkWriter, sp *splitter, out *bytes.Buffer, csid uint32, m Message) [][]byte {
 	t.Helper()
 	start := out.Len()
 	if err := w.WriteMessage(csid, m); err != nil {
 		t.Fatalf("WriteMessage: %v", err)
 	}
-	b := out.Bytes()[start:]
-	cuts := append([]int{0}, w.bounds...)
-	cuts = append(cuts, len(b))
-	chunks := make([][]byte, 0, len(cuts)-1)
-	for i := 0; i+1 < len(cuts); i++ {
-		chunks = append(chunks, append([]byte(nil), b[cuts[i]:cuts[i+1]]...))
-	}
-	return chunks
+	return sp.split(t, out.Bytes()[start:], len(m.Payload))
 }
 
 // interleavedStream encodes the round-trip plan on three chunk streams (one
@@ -161,13 +196,14 @@ func interleavedStream(t *testing.T, size int) (stream []byte, want map[byte][]M
 		t.Fatalf("SetChunkSize: %v", err)
 	}
 	stream = append([]byte(nil), out.Bytes()...)
+	sp := &splitter{size: size, ext: map[uint32]bool{}}
 	want = map[byte][]Message{}
 	csids := []uint32{3, 100, 4000}
 	queues := make([][][]byte, len(csids))
 	for i, csid := range csids {
 		tag := byte(i + 1)
 		for _, pm := range roundTripPlan(tag) {
-			chunks := writeChunks(t, w, &out, csid, pm.m)
+			chunks := writeChunks(t, w, sp, &out, csid, pm.m)
 			if size == 128 {
 				if got := chunks[0][0] >> 6; got != pm.format {
 					t.Fatalf("csid %d ts %#x: writer format %d, want %d", csid, pm.m.Timestamp, got, pm.format)
@@ -462,6 +498,22 @@ func TestChunkHeaderMidMessageDiscardsPartial(t *testing.T) {
 		if c.pending != 0 {
 			t.Fatalf("format %d: pending %d", format, c.pending)
 		}
+		if c.DroppedPartials() != 1 {
+			t.Fatalf("format %d: DroppedPartials %d, want 1", format, c.DroppedPartials())
+		}
+	}
+
+	// Completed messages, a header on an idle chunk stream and an Abort are
+	// not counted.
+	var b raw
+	b.fmt0(5, 0, 4, MsgVideo, 1).data([]byte("aaaa"))
+	b.fmt0(5, 1, 4, MsgVideo, 1).data([]byte("bbbb"))
+	b.basic(1, 5).u24(1).u24(2).u8(MsgAudio).data([]byte("cc"))
+	b.fmt0(6, 0, 300, MsgVideo, 1).data(fill(128, 1))
+	b.fmt0(2, 0, 4, MsgAbort, 0).u32(6)
+	c := newReader(b.Bytes(), ChunkLimits{})
+	if msgs := readAll(t, c); len(msgs) != 4 || c.DroppedPartials() != 0 {
+		t.Fatalf("%d messages, DroppedPartials %d, want 4 and 0", len(msgs), c.DroppedPartials())
 	}
 }
 
@@ -587,6 +639,37 @@ func TestChunkHostile(t *testing.T) {
 		}
 	})
 
+	t.Run("large chunk size reads in steps", func(t *testing.T) {
+		var b raw
+		b.fmt0(2, 0, 4, MsgSetChunkSize, 0).u32(0xFFFFFF)
+		b.fmt0(3, 0, 8<<20, MsgVideo, 1).data(fill(10, 1)) // then the peer stalls
+		c := newReader(b.Bytes(), ChunkLimits{})
+		if _, err := c.ReadMessage(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.ReadMessage(); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("want ErrUnexpectedEOF, got %v", err)
+		}
+		st := c.streams[3]
+		if st == nil || len(st.buf) != 10 || cap(st.buf) > 72<<10 {
+			t.Fatalf("partial buffer len %d cap %d, want 10 and at most one 64 KiB step", len(st.buf), cap(st.buf))
+		}
+		if c.pending != 10 {
+			t.Fatalf("pending %d, want 10", c.pending)
+		}
+
+		// The same stream, delivered in full, still yields one 8 MiB message
+		// with capacity close to its length.
+		big := fill(8<<20, 2)
+		b.Reset()
+		b.fmt0(2, 0, 4, MsgSetChunkSize, 0).u32(0xFFFFFF)
+		b.fmt0(3, 0, 8<<20, MsgVideo, 1).data(big)
+		msgs := readAll(t, newReader(b.Bytes(), ChunkLimits{}))
+		if len(msgs) != 2 || !bytes.Equal(msgs[1].Payload, big) || cap(msgs[1].Payload) > 10<<20 {
+			t.Fatalf("8 MiB message read wrong")
+		}
+	})
+
 	t.Run("first chunk not type 0", func(t *testing.T) {
 		for _, format := range []byte{1, 2, 3} {
 			var b raw
@@ -622,6 +705,68 @@ func TestChunkSetLimitsLowered(t *testing.T) {
 	c.SetLimits(ChunkLimits{MaxMessage: 64 << 10})
 	if _, err := c.ReadMessage(); err == nil || errors.Is(err, io.EOF) {
 		t.Fatalf("lowered limit not applied: %v", err)
+	}
+}
+
+func TestChunkBasicHeaderBoundaries(t *testing.T) {
+	cases := []struct {
+		csid uint32
+		hdr  []byte
+	}{
+		{2, []byte{0x02}},
+		{63, []byte{0x3F}},
+		{64, []byte{0x00, 0x00}},
+		{319, []byte{0x00, 0xFF}},
+		{320, []byte{0x01, 0x00, 0x01}},
+		{65599, []byte{0x01, 0xFF, 0xFF}},
+	}
+	for _, tc := range cases {
+		var out bytes.Buffer
+		w := NewChunkWriter(&out)
+		m := Message{Type: MsgAudio, StreamID: 1, Timestamp: 7, Payload: fill(200, byte(tc.csid))}
+		if err := w.WriteMessage(tc.csid, m); err != nil {
+			t.Fatal(err)
+		}
+		// Type 0 first chunk, then a type 3 continuation with the same csid.
+		cont := append([]byte{tc.hdr[0] | 3<<6}, tc.hdr[1:]...)
+		first := len(tc.hdr) + 11 + 128
+		if !bytes.HasPrefix(out.Bytes(), tc.hdr) || !bytes.HasPrefix(out.Bytes()[first:], cont) {
+			t.Fatalf("csid %d: basic headers %x / %x, want %x / %x", tc.csid,
+				out.Bytes()[:len(tc.hdr)], out.Bytes()[first:first+len(cont)], tc.hdr, cont)
+		}
+		var b raw
+		b.data(tc.hdr).u24(7).u24(200).u8(MsgAudio).le32(1).data(m.Payload[:128])
+		b.data(cont).data(m.Payload[128:])
+		for _, src := range [][]byte{out.Bytes(), b.Bytes()} {
+			msgs := readAll(t, newReader(src, ChunkLimits{}))
+			if len(msgs) != 1 || !sameMessage(msgs[0], m) {
+				t.Fatalf("csid %d: read back %d messages", tc.csid, len(msgs))
+			}
+		}
+	}
+	// csid 64 also has a 3-byte form; both name the same chunk stream.
+	var b raw
+	b.data([]byte{0x00, 0x00}).u24(7).u24(4).u8(MsgAudio).le32(1).data([]byte("abcd"))
+	b.data([]byte{0xC1, 0x00, 0x00}).data([]byte("efgh"))
+	msgs := readAll(t, newReader(b.Bytes(), ChunkLimits{}))
+	if len(msgs) != 2 || string(msgs[1].Payload) != "efgh" || msgs[1].Timestamp != 7 {
+		t.Fatalf("3-byte csid 64: %+v", msgs)
+	}
+}
+
+func TestChunkWriterBufferReuse(t *testing.T) {
+	w := NewChunkWriter(io.Discard)
+	if err := w.WriteMessage(3, Message{Payload: make([]byte, 1000)}); err != nil {
+		t.Fatal(err)
+	}
+	if cap(w.buf) == 0 {
+		t.Fatal("small encode buffer not kept")
+	}
+	if err := w.WriteMessage(3, Message{Payload: make([]byte, 2<<20)}); err != nil {
+		t.Fatal(err)
+	}
+	if w.buf != nil {
+		t.Fatalf("large encode buffer kept: cap %d", cap(w.buf))
 	}
 }
 

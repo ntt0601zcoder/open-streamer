@@ -22,6 +22,12 @@ const (
 	defaultMaxMessage = 8 << 20
 	defaultMaxStreams = 64
 	defaultMaxPending = 16 << 20
+
+	// readStep bounds how much buffer one read allocates ahead of the bytes
+	// that fill it, whatever chunk size the peer chose.
+	readStep = 64 << 10
+	// keepWriteBuf is the largest encode buffer a ChunkWriter keeps for reuse.
+	keepWriteBuf = 1 << 20
 )
 
 // headerLen is the message header length for chunk formats 0 to 3.
@@ -74,6 +80,7 @@ type ChunkReader struct {
 	chunkSize int
 	streams   map[uint32]*inStream
 	pending   int
+	dropped   uint64
 	n         uint64
 	hdr       [11]byte
 }
@@ -95,6 +102,14 @@ func (c *ChunkReader) SetLimits(lim ChunkLimits) {
 	c.lim = lim.withDefaults()
 }
 
+// DroppedPartials counts partial messages abandoned because a type 0, 1 or 2
+// header started a new message on the same chunk stream before the previous
+// one was complete. Discards requested by an Abort message are not counted;
+// the caller sees the Abort itself.
+func (c *ChunkReader) DroppedPartials() uint64 {
+	return c.dropped
+}
+
 // BytesRead is the number of bytes consumed from the reader so far, for
 // acknowledgements.
 func (c *ChunkReader) BytesRead() uint64 {
@@ -105,6 +120,11 @@ func (c *ChunkReader) BytesRead() uint64 {
 // applied to the chunks that follow it, and an Abort discards the named chunk
 // stream's partial message; both are still returned. The Payload is a fresh
 // allocation owned by the caller.
+//
+// When an encoder omits the extended timestamp on the type 3 chunks of a
+// message that needs one, a trailing chunk of 1 to 3 bytes makes the read wait
+// for the next chunk (or an error) before the message is returned; the
+// session's idle timeout bounds that wait.
 func (c *ChunkReader) ReadMessage() (Message, error) {
 	for {
 		m, done, err := c.readChunk()
@@ -141,6 +161,14 @@ func (c *ChunkReader) applyControl(m Message) error {
 		}
 	}
 	return nil
+}
+
+// abandon drops a partial message because a new header replaced it.
+func (c *ChunkReader) abandon(st *inStream) {
+	if st.active && len(st.buf) > 0 {
+		c.dropped++
+	}
+	c.discard(st)
 }
 
 // discard drops a chunk stream's partial message.
@@ -214,7 +242,7 @@ func (c *ChunkReader) readChunk() (m Message, done bool, err error) {
 	start := !st.active
 	switch format {
 	case 0:
-		c.discard(st)
+		c.abandon(st)
 		st.length = be24(h[3:6])
 		st.typ = h[6]
 		st.streamID = binary.LittleEndian.Uint32(h[7:11])
@@ -226,7 +254,7 @@ func (c *ChunkReader) readChunk() (m Message, done bool, err error) {
 		st.delta = 0
 		start = true
 	case 1, 2:
-		c.discard(st)
+		c.abandon(st)
 		if format == 1 {
 			st.length = be24(h[3:6])
 			st.typ = h[6]
@@ -261,15 +289,24 @@ func (c *ChunkReader) readChunk() (m Message, done bool, err error) {
 		st.buf = nil
 	}
 
-	have := len(st.buf)
-	n := min(int(st.length)-have, c.chunkSize)
-	if c.pending+n > c.lim.MaxPending {
-		return Message{}, false, fmt.Errorf("rtmp: chunk: partial messages exceed %d bytes", c.lim.MaxPending)
-	}
-	st.buf = slices.Grow(st.buf, n)[:have+n]
-	c.pending += n
-	if err := c.readFull(st.buf[have:]); err != nil {
-		return Message{}, false, err
+	// The chunk payload is read in steps of at most readStep, so a peer that
+	// declares a large message and a large chunk size and then stalls holds
+	// at most one step of unfilled buffer.
+	for left := min(int(st.length)-len(st.buf), c.chunkSize); left > 0; {
+		step := min(left, readStep)
+		if c.pending+step > c.lim.MaxPending {
+			return Message{}, false, fmt.Errorf("rtmp: chunk: partial messages exceed %d bytes", c.lim.MaxPending)
+		}
+		have := len(st.buf)
+		st.buf = slices.Grow(st.buf, step)[:have+step]
+		got, err := io.ReadFull(c.r, st.buf[have:])
+		c.n += uint64(got)
+		st.buf = st.buf[:have+got]
+		c.pending += got
+		if err != nil {
+			return Message{}, false, fmt.Errorf("rtmp: chunk: read: %w", err)
+		}
+		left -= step
 	}
 	if len(st.buf) < int(st.length) {
 		return Message{}, false, nil
@@ -307,7 +344,6 @@ type ChunkWriter struct {
 	chunkSize int
 	streams   map[uint32]*outStream
 	buf       []byte
-	bounds    []int // offsets of the chunks after the first in buf, for tests
 }
 
 // NewChunkWriter writes chunks to w, one Write per message. The chunk size
@@ -342,7 +378,11 @@ func (c *ChunkWriter) WriteMessage(csid uint32, m Message) error {
 		return fmt.Errorf("rtmp: chunk: message length %d too large", len(m.Payload))
 	}
 	c.encode(csid, m)
-	if _, err := c.w.Write(c.buf); err != nil {
+	_, err := c.w.Write(c.buf)
+	if cap(c.buf) > keepWriteBuf {
+		c.buf = nil // do not pin a large message's buffer between writes
+	}
+	if err != nil {
 		return fmt.Errorf("rtmp: chunk: write: %w", err)
 	}
 	return nil
@@ -402,7 +442,6 @@ func (c *ChunkWriter) encode(csid uint32, m Message) {
 	if st.extended {
 		b = binary.BigEndian.AppendUint32(b, st.extValue)
 	}
-	c.bounds = c.bounds[:0]
 	p := m.Payload
 	for {
 		n := min(len(p), c.chunkSize)
@@ -411,7 +450,6 @@ func (c *ChunkWriter) encode(csid uint32, m Message) {
 		if len(p) == 0 {
 			break
 		}
-		c.bounds = append(c.bounds, len(b))
 		b = appendBasicHeader(b, 3, csid)
 		if st.extended {
 			b = binary.BigEndian.AppendUint32(b, st.extValue)
