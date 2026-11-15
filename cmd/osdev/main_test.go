@@ -356,3 +356,34 @@ func TestOsdevSRTStream(t *testing.T) {
 	pubWG.Wait()
 	assert.Equal(t, 0, stop())
 }
+
+func TestOsdevCopyCycles(t *testing.T) {
+	bad := map[string][]string{
+		"self":     {"-stream", "a=copy://a", "-stream", "a=" + fixture},
+		"two":      {"-stream", "a=copy://b", "-stream", "b=copy://a"},
+		"three":    {"-stream", "a=copy://b", "-stream", "b=copy://c", "-stream", "c=copy://a", "-stream", "c=" + fixture},
+		"failover": {"-stream", "a=" + fixture, "-stream", "a=copy://b", "-stream", "b=copy://a"},
+	}
+	for name, args := range bad {
+		t.Run(name, func(t *testing.T) {
+			var errw strings.Builder
+			cfg, code := parseArgs(args, &errw)
+			assert.Nil(t, cfg)
+			assert.Equal(t, 2, code)
+			assert.Contains(t, errw.String(), "copy://")
+		})
+	}
+	cfg, code := parseArgs([]string{"-stream", "a=" + fixture, "-stream", "b=copy://a", "-stream", "c=copy://b", "-stream", "d=copy://nope"}, io.Discard)
+	require.NotNil(t, cfg, code)
+	assert.Len(t, cfg.sources, 4)
+}
+
+func TestOsdevUnexpectedArgRedacted(t *testing.T) {
+	var errw strings.Builder
+	cfg, code := parseArgs([]string{"srt://u:pw@h:1?passphrase=hunter2&mode=caller"}, &errw)
+	assert.Nil(t, cfg)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, errw.String(), "unexpected argument")
+	assert.NotContains(t, errw.String(), "hunter2")
+	assert.NotContains(t, errw.String(), "pw@")
+}

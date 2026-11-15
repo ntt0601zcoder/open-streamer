@@ -5,6 +5,7 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -84,7 +85,9 @@ func BenchmarkIngest10Streams(b *testing.B) {
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
-				_ = p.Run(ctx)
+				if err := p.Run(ctx); !errors.Is(err, context.Canceled) {
+					b.Errorf("Run: %v", err)
+				}
 				h.Close()
 			}()
 			go func() {
@@ -111,6 +114,9 @@ func BenchmarkIngest10Streams(b *testing.B) {
 		wg.Wait()
 	}
 	b.StopTimer()
+	if got := mediaTicks.Load(); got < int64(b.N*benchStreams*benchMediaSec*media.ClockRate) {
+		b.Fatalf("read %d media ticks, want at least %d", got, b.N*benchStreams*benchMediaSec*media.ClockRate)
+	}
 	cpu := (processCPU(b) - cpu0).Seconds()
 	wall := b.Elapsed().Seconds()
 	mediaSec := float64(mediaTicks.Load()) / media.ClockRate
