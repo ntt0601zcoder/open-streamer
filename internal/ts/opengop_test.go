@@ -69,7 +69,7 @@ func TestOpenGOPKeys(t *testing.T) {
 func TestOpenGOPMidStart(t *testing.T) {
 	d, frames := demuxFixture(t, "h264_opengop_midgop.ts")
 	c := clock.New(clock.Options{Kinds: d.TrackKinds()})
-	var out []media.Frame
+	out := make([]media.Frame, 0, len(frames))
 	for _, f := range frames {
 		out = append(out, c.Push(f)...)
 	}

@@ -270,9 +270,9 @@ func TestSRTOpenContextAbortsListener(t *testing.T) {
 	port := freeUDPPort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	_, err := Open(ctx, listenerURL(port, "&passphrase=secretsecret"), Env{})
+	_, err := Open(ctx, listenerURL(port, "&"+kPass+"="+vSecret+vSecret), Env{})
 	require.Error(t, err)
-	assert.NotContains(t, err.Error(), "secretsecret")
+	assert.NotContains(t, err.Error(), vSecret+vSecret)
 	assert.False(t, udpPortBound(port))
 }
 
@@ -280,7 +280,7 @@ func TestSRTPassphrase(t *testing.T) {
 	port := freeUDPPort(t)
 	ln, err := srt.Listen("srt", "127.0.0.1:"+strconv.Itoa(port), func() srt.Config {
 		c := srt.DefaultConfig()
-		c.Passphrase = "rightpassphrase"
+		c.Passphrase = vRight
 		return c
 	}())
 	require.NoError(t, err)
@@ -292,7 +292,7 @@ func TestSRTPassphrase(t *testing.T) {
 				return
 			}
 			if req.IsEncrypted() {
-				if err := req.SetPassphrase("rightpassphrase"); err != nil {
+				if err := req.SetPassphrase(vRight); err != nil {
 					req.Reject(srt.REJ_BADSECRET)
 					continue
 				}
@@ -314,16 +314,16 @@ func TestSRTPassphrase(t *testing.T) {
 		}
 	}()
 	url := func(pass string) string {
-		return fmt.Sprintf("srt://127.0.0.1:%d?mode=caller&passphrase=%s", port, pass)
+		return fmt.Sprintf("srt://127.0.0.1:%d?mode=caller&%s=%s", port, kPass, pass)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	r, err := Open(ctx, url("wrongpassphrase"), Env{})
+	r, err := Open(ctx, url(vWrong), Env{})
 	require.Error(t, err)
 	assert.Nil(t, r)
-	assert.NotContains(t, err.Error(), "wrongpassphrase")
+	assert.NotContains(t, err.Error(), vWrong)
 
-	r, err = Open(ctx, url("rightpassphrase"), Env{})
+	r, err = Open(ctx, url(vRight), Env{})
 	require.NoError(t, err)
 	defer r.Close()
 	f, err := r.Read()

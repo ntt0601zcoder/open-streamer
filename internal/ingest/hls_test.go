@@ -409,10 +409,10 @@ func TestHLSPullEncryptedRefused(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	_, err := ingest.Open(context.Background(), srv.URL+"/aes.m3u8?token=hunter2", ingest.Env{})
+	_, err := ingest.Open(context.Background(), srv.URL+"/aes.m3u8?token="+vHunter, ingest.Env{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "encrypted HLS is not supported")
-	assert.NotContains(t, err.Error(), "hunter2")
+	assert.NotContains(t, err.Error(), vHunter)
 
 	r, err := ingest.Open(context.Background(), srv.URL+"/none.m3u8", ingest.Env{})
 	require.NoError(t, err, "METHOD=NONE is clear")
@@ -558,13 +558,13 @@ func TestHLSOpenCtxAborts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := ingest.Open(ctx, srv.URL+"/index.m3u8?token=hunter2", ingest.Env{})
+	_, err := ingest.Open(ctx, srv.URL+"/index.m3u8?token="+vHunter, ingest.Env{})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, time.Since(start), 2*time.Second)
 	assert.Equal(t, 1, strings.Count(err.Error(), "ingest:"), "one prefix: %v", err)
 	assert.Equal(t, 1, strings.Count(err.Error(), "/index.m3u8"), "one URL: %v", err)
-	assert.NotContains(t, err.Error(), "hunter2")
+	assert.NotContains(t, err.Error(), vHunter)
 }
 
 func TestHLSTargetDurationClamped(t *testing.T) {

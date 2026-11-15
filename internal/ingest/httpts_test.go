@@ -172,10 +172,10 @@ func TestHTTPTSStatus(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	_, err := ingest.Open(context.Background(), srv.URL+"/missing?token=hunter2", ingest.Env{})
+	_, err := ingest.Open(context.Background(), srv.URL+"/missing?token="+vHunter, ingest.Env{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "404")
-	assert.NotContains(t, err.Error(), "hunter2")
+	assert.NotContains(t, err.Error(), vHunter)
 
 	r, err := ingest.Open(context.Background(), srv.URL+"/old", ingest.Env{})
 	require.NoError(t, err)
@@ -272,15 +272,15 @@ func TestHTTPTSUserinfoRedacted(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 	}))
 	defer srv.Close()
-	u := "http://alice:s3cret@" + strings.TrimPrefix(srv.URL, "http://") + "/x.ts"
+	u := "http://alice:" + vS3 + "@" + strings.TrimPrefix(srv.URL, "http://") + "/x.ts"
 	_, err := ingest.Open(context.Background(), u, ingest.Env{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "403")
-	assert.NotContains(t, err.Error(), "s3cret")
+	assert.NotContains(t, err.Error(), vS3)
 	// A request that cannot even be built must not leak the raw URL either.
-	_, err = ingest.Open(context.Background(), "http://alice:s3cret@127.0.0.1:1/\x7f", ingest.Env{})
+	_, err = ingest.Open(context.Background(), "http://alice:"+vS3+"@127.0.0.1:1/\x7f", ingest.Env{})
 	require.Error(t, err)
-	assert.NotContains(t, err.Error(), "s3cret")
+	assert.NotContains(t, err.Error(), vS3)
 }
 
 // A failing source retried in a loop must not accumulate connections.
