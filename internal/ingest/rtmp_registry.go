@@ -77,7 +77,7 @@ type rtmpRegistry struct {
 }
 
 // rtmpListeners is the process-wide registry.
-var rtmpListeners = &rtmpRegistry{} //nolint:unused // the RTMP listen input registers here (Task 11)
+var rtmpListeners = &rtmpRegistry{}
 
 // rtmpRoute is a registered path.
 type rtmpRoute struct {
@@ -203,6 +203,11 @@ func (r *rtmpRegistry) stats(addr string) map[string]uint64 {
 	if l == nil {
 		return nil
 	}
+	return l.counters()
+}
+
+// counters returns the listener's rejection counters.
+func (l *rtmpListener) counters() map[string]uint64 {
 	return map[string]uint64{
 		"rejected_unknown": l.rejectedUnknown.Load(),
 		"rejected_busy":    l.rejectedBusy.Load(),

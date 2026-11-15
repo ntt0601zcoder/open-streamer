@@ -220,7 +220,9 @@ func TestRTMPRegistrySharedPort(t *testing.T) {
 	assert.EqualValues(t, 2, st["rejected_unknown"])
 	assert.EqualValues(t, 1, st["rejected_busy"])
 	assert.Zero(t, st["rejected_flood"])
-	assert.Zero(t, r.lookup(addr).prePublish(), "published sessions do not count as pre-publish")
+	// Published sessions do not count as pre-publish; a rejected one leaves
+	// just after the client reads the rejection.
+	waitPrePublish(t, r, addr, 0)
 }
 
 // The registry's decide rejects an empty app or stream instead of letting

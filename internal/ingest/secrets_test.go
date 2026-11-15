@@ -14,3 +14,6 @@ const (
 	vWrong  = "wrong" + kPass
 	vXyz    = "x" + "yz"
 )
+
+// vStreamKey is a fake RTMP stream key.
+const vStreamKey = "sk" + "_9f3a7c" + "e21b"

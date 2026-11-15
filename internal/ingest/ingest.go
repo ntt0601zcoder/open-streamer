@@ -20,6 +20,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 )
 
 // ErrDiscontinuity is returned once by Reader.Read at a timeline break; the
@@ -89,6 +90,7 @@ const (
 	schemeHTTP  = "http"
 	schemeHTTPS = "https"
 	schemeCopy  = "copy"
+	schemeRTMP  = "rtmp"
 )
 
 // parsed is a URL checked and classified by parse.
@@ -182,10 +184,45 @@ func parse(rawURL string) (parsed, error) {
 			return fail("no stream name")
 		}
 		p.spec = Spec{Live: true}
+	case schemeRTMP:
+		spec, err := parseRTMP(u, q)
+		if err != nil {
+			return fail("%v", err)
+		}
+		p.spec = spec
 	default:
 		return fail("unsupported scheme %q", u.Scheme)
 	}
 	return p, nil
+}
+
+// parseRTMP checks an rtmp:// URL: a pull (the default with a host) or a
+// listen (mode=listen or listener, any host) for app[/…]/stream.
+func parseRTMP(u *url.URL, q url.Values) (Spec, error) {
+	if u.Port() != "" {
+		if err := checkPort(u.Port()); err != nil {
+			return Spec{}, err
+		}
+	}
+	if path, _ := rtmp.NormalizePath(u.Path, ""); !strings.Contains(path, "/") {
+		return Spec{}, errors.New("the path needs an app and a stream name")
+	}
+	mode := q.Get("mode")
+	if mode == "" && u.Hostname() != "" {
+		mode = "pull"
+	}
+	switch mode {
+	case "pull":
+		if u.Hostname() == "" {
+			return Spec{}, errors.New("pull mode needs a host")
+		}
+		return Spec{Live: true}, nil
+	case "listen", "listener":
+		return Spec{Live: true, Passive: true}, nil
+	case "":
+		return Spec{}, errors.New("no host and no mode")
+	}
+	return Spec{}, fmt.Errorf("unsupported mode %q", mode)
 }
 
 func checkPort(port string) error {
@@ -231,6 +268,11 @@ func Open(ctx context.Context, rawURL string, env Env) (Reader, error) {
 		return openHTTP(ctx, rawURL, p, env)
 	case schemeCopy:
 		return openCopy(ctx, rawURL, p, env)
+	case schemeRTMP:
+		if p.spec.Passive {
+			return openRTMPListen(ctx, rawURL, p, env)
+		}
+		return nil, fmt.Errorf("ingest: open %s: rtmp pull inputs are not available yet", Redact(rawURL))
 	default:
 		return nil, fmt.Errorf("ingest: open %s: %s inputs are not available yet", Redact(rawURL), p.scheme)
 	}
@@ -240,7 +282,9 @@ func Open(ctx context.Context, rawURL string, env Env) (Reader, error) {
 // or logs.
 var redactedKeys = []string{"passphrase", "password", "token", "secret", "key"}
 
-// Redact returns rawURL with its password and secret query values hidden.
+// Redact returns rawURL with its password and secret query values hidden,
+// and for rtmp:// its stream name (the last path segment, the stream key)
+// cut to its first 2 characters.
 func Redact(rawURL string) string {
 	if !strings.Contains(rawURL, "://") {
 		return rawURL
@@ -273,6 +317,15 @@ func Redact(rawURL string) string {
 			}
 		}
 		u.RawQuery = strings.Join(pairs, "&")
+	}
+	if strings.EqualFold(u.Scheme, schemeRTMP) {
+		u.Scheme = schemeRTMP
+		if p := strings.TrimRight(u.Path, "/"); p != "" {
+			u.Path, u.RawPath = redactRTMPPath(p), ""
+		}
+		if u.Opaque != "" {
+			u.Opaque = redactRTMPPath(u.Opaque)
+		}
 	}
 	return u.String()
 }
