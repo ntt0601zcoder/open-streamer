@@ -1,5 +1,6 @@
 // Package rtmptest provides RTMP peers for tests: a publisher that pushes FLV
-// tags to an RTMP server. It imports nothing from internal/.
+// tags to an RTMP server, and a scripted server that clients play FLV tags
+// from. It imports nothing from internal/.
 package rtmptest
 
 import (
@@ -50,6 +51,11 @@ var setDataFrame = []byte{0x02, 0x00, 0x0D, '@', 's', 'e', 't', 'D', 'a', 't', '
 
 var errAbandoned = errors.New("rtmptest: publisher abandoned")
 
+// dialTimeout bounds Dial when its ctx has no deadline, so a server that
+// stops answering fails a test quickly instead of hanging it. Tests in this
+// package lower it.
+var dialTimeout = 10 * time.Second
+
 // Publisher is a connected RTMP publisher whose publish was accepted. Its
 // methods must be called from one goroutine, except Abandon.
 type Publisher struct {
@@ -69,8 +75,14 @@ type Publisher struct {
 // last one plus the query. It returns the code of the server's onStatus
 // reply. When the server rejects the publish it returns nil, that code (for
 // example NetStream.Publish.BadName) and an error carrying the server's
-// description. ctx bounds only Dial.
+// description. ctx bounds only Dial; without a deadline Dial gives up after
+// 10 s.
 func Dial(ctx context.Context, rawURL string) (*Publisher, string, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dialTimeout)
+		defer cancel()
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme != "rtmp" {
 		return nil, "", errors.New("rtmptest: dial: not an rtmp:// URL")
