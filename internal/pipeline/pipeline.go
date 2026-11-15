@@ -364,7 +364,7 @@ func (p *Pipeline) expire(ctx context.Context) error {
 	now := p.now()
 	if len(p.waiting) > 0 && !now.Before(p.layoutAt) {
 		if len(p.layout) == 0 {
-			p.layout = p.waiting[0].r.Kinds() // the first input that opened
+			p.layout = layoutOf(p.waiting[0].r.Kinds()) // the first input that opened
 		}
 		p.resumeWaiting()
 	}
@@ -586,7 +586,7 @@ func (p *Pipeline) opened(a *attempt) {
 			p.waiting = append(p.waiting, a)
 			return
 		}
-		p.layout = a.r.Kinds()
+		p.layout = layoutOf(a.r.Kinds())
 	}
 	a.next()
 	if len(p.layout) > 0 {
@@ -614,7 +614,7 @@ func (p *Pipeline) frame(ctx context.Context, a *attempt, f ingest.Frame) error 
 	if len(p.layout) == 0 {
 		// The input opened without tracks; it may not be input 0 once the
 		// layout wait is over.
-		p.layout = a.r.Kinds()
+		p.layout = layoutOf(a.r.Kinds())
 		if len(p.layout) > 0 {
 			p.resumeWaiting()
 		}
@@ -902,6 +902,13 @@ func (p *Pipeline) emit(ev Event) {
 // maps onto a video track of the layout.
 func (a *attempt) mapsVideo(layout []media.Kind) bool {
 	return slices.ContainsFunc(a.tracks, func(t int) bool { return t >= 0 && layout[t] == media.KindVideo })
+}
+
+// layoutOf is the stream layout taken from a reader's kinds: its unknown
+// (zero) entries, such as a skipped copy:// track index, are dropped, since
+// no frame would ever map onto them.
+func layoutOf(kinds []media.Kind) []media.Kind {
+	return slices.DeleteFunc(slices.Clone(kinds), func(k media.Kind) bool { return k == 0 })
 }
 
 // track maps reader track t onto the layout by (kind, ordinal): the k-th
