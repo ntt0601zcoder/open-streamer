@@ -1,0 +1,403 @@
+package rtmp
+
+import (
+	"bufio"
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Session defaults applied to zero Config fields.
+const (
+	defaultHandshakeTimeout     = 5 * time.Second
+	defaultCommandTimeout       = 10 * time.Second
+	defaultIdleTimeout          = 30 * time.Second
+	defaultPingInterval         = 10 * time.Second
+	defaultMaxPrePublishMessage = 64 << 10
+)
+
+// Config bounds an RTMP session, server or client. A zero field takes its
+// default.
+type Config struct {
+	// HandshakeTimeout bounds the handshake. Default 5 s.
+	HandshakeTimeout time.Duration
+	// CommandTimeout bounds the command exchange before media flows
+	// (connect to publish, or connect to play). Default 10 s.
+	CommandTimeout time.Duration
+	// IdleTimeout fails a session that receives no byte for this long.
+	// Default 30 s.
+	IdleTimeout time.Duration
+	// PingInterval is how often a server sends PingRequest. Clients never
+	// ping. Default 10 s.
+	PingInterval time.Duration
+	// MaxMessage is the largest message accepted once publish is accepted,
+	// and by clients. Default 8 MiB.
+	MaxMessage int
+	// MaxPrePublishMessage is the largest message a server accepts before
+	// publish is accepted. Default 64 KiB.
+	MaxPrePublishMessage int
+	// Now is the clock for timeouts, pings and LastInbound. Default time.Now.
+	Now func() time.Time
+}
+
+func (c Config) withDefaults() Config {
+	if c.HandshakeTimeout <= 0 {
+		c.HandshakeTimeout = defaultHandshakeTimeout
+	}
+	if c.CommandTimeout <= 0 {
+		c.CommandTimeout = defaultCommandTimeout
+	}
+	if c.IdleTimeout <= 0 {
+		c.IdleTimeout = defaultIdleTimeout
+	}
+	if c.PingInterval <= 0 {
+		c.PingInterval = defaultPingInterval
+	}
+	if c.MaxMessage <= 0 {
+		c.MaxMessage = defaultMaxMessage
+	}
+	if c.MaxPrePublishMessage <= 0 {
+		c.MaxPrePublishMessage = defaultMaxPrePublishMessage
+	}
+	if c.Now == nil {
+		c.Now = time.Now
+	}
+	return c
+}
+
+// Media is one audio, video or data (metadata) message of a published or
+// played stream. Type is MsgAudio, MsgVideo or MsgDataAMF0; Timestamp is in
+// milliseconds as carried on the wire, so it wraps at 2^32. Payload is the FLV
+// tag body, a fresh allocation owned by the caller.
+type Media struct {
+	Type      uint8
+	Timestamp uint32
+	Payload   []byte
+}
+
+// mediaOf returns m as Media when it is an audio, video or AMF0 data message.
+func mediaOf(m Message) (Media, bool) {
+	switch m.Type {
+	case MsgAudio, MsgVideo, MsgDataAMF0:
+		return Media{Type: m.Type, Timestamp: m.Timestamp, Payload: m.Payload}, true
+	}
+	return Media{}, false
+}
+
+// role is the side of the connection a session plays.
+type role uint8
+
+const (
+	// roleServer answers the handshake, sends PingRequest every PingInterval
+	// and starts with the pre-publish message limit.
+	roleServer role = iota
+	// roleClient starts the handshake, never pings and accepts MaxMessage
+	// from the start.
+	roleClient
+)
+
+// session is the single-goroutine message loop shared by the server and the
+// client. It owns the buffered reader, the chunk reader and writer,
+// acknowledgements, pings, timeouts, inbound protocol control and aggregate
+// splitting. Every method except Close and LastInbound must be called from
+// one goroutine, which does all reads and all writes.
+type session struct {
+	conn  net.Conn
+	cfg   Config
+	role  role
+	br    *bufio.Reader
+	cr    *ChunkReader
+	cw    *ChunkWriter
+	start time.Time
+
+	lastIn   time.Time // last inbound byte
+	nextPing time.Time // zero until pings start
+	phaseEnd time.Time // zero outside a bounded phase
+	phase    string
+
+	window      uint32 // peer's Window Ack Size; 0 until it sends one
+	lastAck     uint64
+	sentWindow  uint32 // last Window Ack Size we sent
+	peerBW      uint32
+	peerBWLimit uint8
+	hasPeerBW   bool
+
+	agg aggregate
+
+	lastInbound atomic.Int64 // lastIn in Unix nanoseconds, for other goroutines
+	closeOnce   sync.Once
+	closeErr    error
+}
+
+// newSession wraps conn. The caller runs handshake next, then the command
+// exchange of its role.
+func newSession(conn net.Conn, cfg Config, r role) *session {
+	cfg = cfg.withDefaults()
+	now := cfg.Now()
+	s := &session{conn: conn, cfg: cfg, role: r, start: now}
+	s.touch(now)
+	s.br = bufio.NewReader(sessionReader{s})
+	limit := cfg.MaxMessage
+	if r == roleServer {
+		limit = cfg.MaxPrePublishMessage
+	}
+	s.cr = NewChunkReader(s.br, ChunkLimits{MaxMessage: limit})
+	s.cw = NewChunkWriter(sessionWriter{s})
+	return s
+}
+
+// handshake runs the role's handshake within HandshakeTimeout. A server
+// starts pinging once it completes.
+func (s *session) handshake() error {
+	s.setPhase(s.cfg.HandshakeTimeout, "handshake")
+	defer s.endPhase()
+	rw := struct {
+		io.Reader
+		io.Writer
+	}{s.br, sessionWriter{s}}
+	var err error
+	if s.role == roleServer {
+		err = ServerHandshake(rw, rand.Reader)
+	} else {
+		err = ClientHandshake(rw, rand.Reader)
+	}
+	if err != nil {
+		return err
+	}
+	if s.role == roleServer {
+		s.nextPing = s.cfg.Now().Add(s.cfg.PingInterval)
+	}
+	return nil
+}
+
+// setPhase bounds the reads and writes that follow by d, until endPhase;
+// what names the phase in the timeout error.
+func (s *session) setPhase(d time.Duration, what string) {
+	s.phaseEnd = s.cfg.Now().Add(d)
+	s.phase = what
+}
+
+// endPhase removes the phase bound.
+func (s *session) endPhase() {
+	s.phaseEnd = time.Time{}
+	s.phase = ""
+}
+
+// raiseMessageLimit lets messages up to MaxMessage through, once a server has
+// accepted publish.
+func (s *session) raiseMessageLimit() {
+	s.cr.SetLimits(ChunkLimits{MaxMessage: s.cfg.MaxMessage})
+}
+
+// LastInbound is when the last byte arrived from the peer. It is safe to call
+// from any goroutine.
+func (s *session) LastInbound() time.Time {
+	return time.Unix(0, s.lastInbound.Load())
+}
+
+// Close closes the connection, which unblocks a pending read. It never
+// writes, so it is safe to call from any goroutine, and only the first call
+// closes.
+func (s *session) Close() error {
+	s.closeOnce.Do(func() { s.closeErr = s.conn.Close() })
+	return s.closeErr
+}
+
+func (s *session) touch(now time.Time) {
+	s.lastIn = now
+	s.lastInbound.Store(now.UnixNano())
+}
+
+// next returns the next message the session does not consume itself:
+// commands, data, audio, video, stream user control events (StreamBegin,
+// StreamEOF, …) and other types it does not know. Protocol control messages
+// and pings are handled here, and an aggregate is returned as its
+// sub-messages one by one.
+func (s *session) next() (Message, error) {
+	for {
+		m, ok, err := s.agg.next()
+		if err != nil {
+			return Message{}, err
+		}
+		if ok {
+			return m, nil
+		}
+		m, err = s.cr.ReadMessage()
+		if err != nil {
+			return Message{}, err
+		}
+		if err := s.acknowledge(); err != nil {
+			return Message{}, err
+		}
+		consumed, err := s.handleControl(m)
+		if err != nil {
+			return Message{}, err
+		}
+		if consumed {
+			continue
+		}
+		if m.Type == MsgAggregate {
+			s.agg = aggregate{p: m.Payload, ts: m.Timestamp, streamID: m.StreamID}
+			continue
+		}
+		return m, nil
+	}
+}
+
+// acknowledge sends Ack(BytesRead) once a window's worth of bytes has
+// arrived since the last one. The sequence number wraps at 2^32.
+func (s *session) acknowledge() error {
+	if s.window == 0 {
+		return nil
+	}
+	n := s.cr.BytesRead()
+	if n-s.lastAck < uint64(s.window) {
+		return nil
+	}
+	s.lastAck = n
+	return s.writeControl(MsgAck, binary.BigEndian.AppendUint32(nil, uint32(n)))
+}
+
+// tick fails a timed-out phase or an idle session and sends a due ping.
+func (s *session) tick(now time.Time) error {
+	if !s.phaseEnd.IsZero() && !now.Before(s.phaseEnd) {
+		return fmt.Errorf("rtmp: session: %s timed out: %w", s.phase, os.ErrDeadlineExceeded)
+	}
+	if !now.Before(s.lastIn.Add(s.cfg.IdleTimeout)) {
+		return fmt.Errorf("rtmp: session: no inbound data for %v: %w", s.cfg.IdleTimeout, os.ErrDeadlineExceeded)
+	}
+	if !s.nextPing.IsZero() && !now.Before(s.nextPing) {
+		s.nextPing = now.Add(s.cfg.PingInterval)
+		return s.sendUserControl(ucPingRequest, uint32(now.Sub(s.start).Milliseconds()))
+	}
+	return nil
+}
+
+// readDeadline is the earliest of the idle limit, the next ping and the
+// phase end.
+func (s *session) readDeadline() time.Time {
+	d := s.lastIn.Add(s.cfg.IdleTimeout)
+	if !s.nextPing.IsZero() && s.nextPing.Before(d) {
+		d = s.nextPing
+	}
+	if !s.phaseEnd.IsZero() && s.phaseEnd.Before(d) {
+		d = s.phaseEnd
+	}
+	return d
+}
+
+// connDeadline converts a time on the Config clock to one on the conn's.
+func connDeadline(at, now time.Time) time.Time {
+	return time.Now().Add(at.Sub(now))
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// sessionReader reads the conn for the session's bufio.Reader. A read
+// deadline that expires on a ping slot sends PingRequest and reads on, so the
+// chunk reader above never sees a timeout in the middle of a message; one
+// past the idle limit or the phase end fails.
+type sessionReader struct{ s *session }
+
+func (r sessionReader) Read(p []byte) (int, error) {
+	s := r.s
+	for {
+		now := s.cfg.Now()
+		if err := s.tick(now); err != nil {
+			return 0, err
+		}
+		// An error here (a closed conn) surfaces from the Read below.
+		_ = s.conn.SetReadDeadline(connDeadline(s.readDeadline(), now))
+		n, err := s.conn.Read(p)
+		if n > 0 {
+			s.touch(s.cfg.Now())
+			if isTimeout(err) {
+				err = nil
+			}
+			return n, err
+		}
+		if err != nil && !isTimeout(err) {
+			return 0, err
+		}
+	}
+}
+
+// sessionWriter writes to the conn with a deadline of IdleTimeout, or the
+// phase end when that is sooner.
+type sessionWriter struct{ s *session }
+
+func (w sessionWriter) Write(p []byte) (int, error) {
+	s := w.s
+	now := s.cfg.Now()
+	d := now.Add(s.cfg.IdleTimeout)
+	if !s.phaseEnd.IsZero() && s.phaseEnd.Before(d) {
+		d = s.phaseEnd
+	}
+	_ = s.conn.SetWriteDeadline(connDeadline(d, now))
+	return s.conn.Write(p)
+}
+
+// aggregate splits an aggregate message (type 22) into its sub-messages, one
+// per call. Each sub-message is an FLV tag (11-byte header, data, 4-byte
+// back-pointer); its timestamp is the aggregate's plus its offset from the
+// first sub-message, mod 2^32.
+type aggregate struct {
+	p        []byte
+	ts       uint32
+	first    uint32
+	started  bool
+	streamID uint32
+}
+
+const flvTagHeaderLen = 11
+
+func (a *aggregate) next() (Message, bool, error) {
+	for len(a.p) > 0 {
+		if len(a.p) < flvTagHeaderLen {
+			a.p = nil
+			return Message{}, false, errors.New("rtmp: session: truncated aggregate tag header")
+		}
+		typ := a.p[0] & 0x1F
+		size := int(be24(a.p[1:4]))
+		ts := be24(a.p[4:7]) | uint32(a.p[7])<<24
+		if len(a.p)-flvTagHeaderLen < size {
+			a.p = nil
+			return Message{}, false, errors.New("rtmp: session: truncated aggregate tag")
+		}
+		data := a.p[flvTagHeaderLen : flvTagHeaderLen+size]
+		rest := a.p[flvTagHeaderLen+size:]
+		switch {
+		case len(rest) >= 4:
+			rest = rest[4:]
+		case len(rest) > 0:
+			a.p = nil
+			return Message{}, false, errors.New("rtmp: session: truncated aggregate back-pointer")
+		}
+		// The last back-pointer may be missing.
+		a.p = rest
+		if !a.started {
+			a.first, a.started = ts, true
+		}
+		switch typ {
+		case MsgAudio, MsgVideo, MsgDataAMF0:
+			return Message{
+				Type:      typ,
+				StreamID:  a.streamID,
+				Timestamp: a.ts + (ts - a.first),
+				Payload:   slices.Clone(data),
+			}, true, nil
+		}
+	}
+	return Message{}, false, nil
+}
