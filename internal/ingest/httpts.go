@@ -143,7 +143,7 @@ func openHTTP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, er
 }
 
 func doHTTP(ctx, rctx context.Context, cancel context.CancelFunc, client *http.Client, rawURL string, p parsed, env Env) (Reader, error) {
-	loaded := time.Now()
+	loaded := env.now()()
 	playlistURL := p.u
 	if p.spec.Pace {
 		// A .m3u8 URL: the variant selector is ours, not the server's.

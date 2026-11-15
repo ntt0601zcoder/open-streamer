@@ -459,7 +459,10 @@ func (d *Demuxer) CCErrors() uint64 {
 }
 
 // Read returns the next frame, or io.EOF at the end of the stream. A read
-// error from the input is returned wrapped, and again on later calls. A video
+// error from the input is returned wrapped, and again on later calls: any
+// error is final, including a timeout that mpegts.Reader would let a caller
+// read on from. No ingest reader sets read deadlines, so none occurs; a
+// reader that wants recoverable timeouts must not go through Read. A video
 // access unit may span PES, so it is returned once something completes it:
 // the next access-unit start on its track, a PMT change, or the end of input
 // or a read error, which return every pending unit first. A split unit (see

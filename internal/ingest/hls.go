@@ -153,12 +153,12 @@ func (r *hlsReader) open(playlistURL *url.URL, body []byte, final *url.URL, load
 				return errors.New("audio rendition uri does not parse")
 			}
 		}
-		loaded = time.Now()
+		loaded = r.now()
 		if body, final, err = r.get(mainURL, nil, maxPlaylistBytes); err != nil {
 			return fmt.Errorf("variant playlist: %w", err)
 		}
 		if audioURL != nil {
-			audioLoaded = time.Now()
+			audioLoaded = r.now()
 			if audioBody, audioFinal, err = r.get(audioURL, nil, maxPlaylistBytes); err != nil {
 				return fmt.Errorf("audio rendition playlist: %w", err)
 			}
@@ -533,9 +533,9 @@ func (r *hlsReader) closeIdle() {
 	}
 }
 
-// sleepUntil waits until t or Close.
+// sleepUntil waits until t, on the reader's clock, or Close.
 func (r *hlsReader) sleepUntil(t time.Time) error {
-	d := time.Until(t)
+	d := t.Sub(r.now())
 	if d <= 0 {
 		return r.ctx.Err()
 	}
@@ -984,11 +984,11 @@ func (s *hlsSource) fetch(uri string, br *hls.ByteRange, limit int64) ([]byte, e
 	u, err := s.base.Parse(uri)
 	if err != nil {
 		s.segmentErrors.Add(1)
-		return nil, fmt.Errorf("segment uri: %w", err)
+		return nil, fmt.Errorf("segment uri: %w", stripURLError(err)) // the URI may carry a token
 	}
 	for try := range 2 {
 		if try > 0 {
-			if err := s.r.sleepUntil(time.Now().Add(s.retryDelay())); err != nil {
+			if err := s.r.sleepUntil(s.r.now().Add(s.retryDelay())); err != nil {
 				return nil, err
 			}
 		}
@@ -1023,7 +1023,7 @@ func (s *hlsSource) reload() error {
 	)
 	for try := range 2 {
 		if try > 0 {
-			if err := s.r.sleepUntil(time.Now().Add(s.retryDelay())); err != nil {
+			if err := s.r.sleepUntil(s.r.now().Add(s.retryDelay())); err != nil {
 				return err
 			}
 		}
@@ -1051,7 +1051,7 @@ func (s *hlsSource) reload() error {
 }
 
 func (s *hlsSource) loadPlaylist() (hls.MediaPlaylist, *url.URL, error) {
-	s.loaded = time.Now()
+	s.loaded = s.r.now()
 	body, final, err := s.r.get(s.url, nil, maxPlaylistBytes)
 	if err != nil {
 		return hls.MediaPlaylist{}, nil, err

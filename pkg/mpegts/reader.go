@@ -67,6 +67,9 @@ func (r *Reader) Stats() ReaderStats {
 // is, after every complete packet read before it. A timeout (a net.Error whose
 // Timeout reports true) is returned for that call only: buffered bytes are
 // kept and the next call reads on. Any other error ends the Reader for good.
+// The timeout only helps a caller that sets read deadlines on its input and
+// calls Next again; a wrapper that treats every error as final (as
+// open-streamer's ts.Demuxer.Read does) turns it into an ordinary error.
 func (r *Reader) Next() (Packet, error) {
 	for {
 		if err := r.fill(1); err != nil {

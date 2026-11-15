@@ -69,7 +69,8 @@ type Env struct {
 	// HTTP is the client for HTTP inputs; nil means a 10 s dial and
 	// ResponseHeaderTimeout.
 	HTTP *http.Client
-	// Now stamps arrivals; nil means time.Now.
+	// Now stamps arrivals and times HLS playlist reloads and retries (the
+	// waits themselves are real timers); nil means time.Now.
 	Now func() time.Time
 }
 
