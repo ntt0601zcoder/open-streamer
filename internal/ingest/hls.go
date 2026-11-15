@@ -18,6 +18,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/mux/fmp4"
 	"github.com/ntt0601zcoder/open-streamer/pkg/hls"
+	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 )
 
 const (
@@ -67,7 +68,8 @@ const (
 // order). When that variant's audio is a separate EXT-X-MEDIA rendition, the
 // reader follows both media playlists, each in its own goroutine (pump), and
 // merges their frames in DTS order: both are on the presentation timeline
-// (RFC 8216 §6.2.4). The rendition's audio is the reader track after the
+// (RFC 8216 §6.2.4), which TS runs keep by not rebasing their timestamps
+// (see timeDecoder) and fMP4 runs by their absolute tfdt. The rendition's audio is the reader track after the
 // variant's own tracks.
 //
 // A break on either playlist is one ErrDiscontinuity. Before it, the other
@@ -688,6 +690,10 @@ type hlsSource struct {
 	discontinuities, restarts, stale  atomic.Uint64
 	badSegments                       atomic.Uint64
 
+	// The DTS of the last frame read, for the other playlist's next TS run.
+	lastDTS atomic.Int64
+	hasDTS  atomic.Bool
+
 	mu     sync.Mutex // guards the fields below
 	run    runner
 	kinds  []media.Kind      // of the latest run, kept between runs
@@ -765,7 +771,7 @@ func (s *hlsSource) startRun() error {
 		s.st = st
 		var run runner
 		if seg.Map == "" {
-			run, err = newTSReader(&segFeed{st: st}, func() time.Time { return s.arrival }, Spec{}, &s.cache)
+			run, err = newTSReader(&segFeed{st: st}, func() time.Time { return s.arrival }, Spec{}, &s.cache, s.timeDecoder())
 		} else {
 			var init []byte
 			init, err = s.fetchInit(seg)
@@ -805,6 +811,33 @@ func (s *hlsSource) startRun() error {
 		s.runFrame = false
 		return nil
 	}
+}
+
+// timeDecoder returns the timestamp decoder of a new TS run. A lone playlist
+// gets a private one (nil), whose timeline starts at 0. When two playlists
+// are merged, both must stay on the raw 33-bit timeline they share (RFC 8216
+// §6.2.4), not each rebased to its own first PES: a run starts on the raw
+// value, unwrapped near the last DTS read from the other playlist (else from
+// this one), so that a break on one side across a wrap of the counter does
+// not leave the sides 2^33 apart.
+func (s *hlsSource) timeDecoder() *mpegts.TimeDecoder {
+	if s.r.audio == nil {
+		return nil
+	}
+	dec := &mpegts.TimeDecoder{}
+	other := s.r.main
+	if s == s.r.main {
+		other = s.r.audio
+	}
+	switch {
+	case other.hasDTS.Load():
+		dec.AnchorNear(other.lastDTS.Load())
+	case s.hasDTS.Load():
+		dec.AnchorNear(s.lastDTS.Load())
+	default:
+		dec.AnchorRaw()
+	}
+	return dec
 }
 
 // fetchInit returns the init segment of seg's EXT-X-MAP, fetching it unless
@@ -882,6 +915,8 @@ func (s *hlsSource) pump(ch chan<- item, keep func(Frame) (Frame, bool)) {
 	for {
 		f, err := s.read()
 		if err == nil {
+			s.lastDTS.Store(f.DTS)
+			s.hasDTS.Store(true)
 			var ok bool
 			if f, ok = keep(f); !ok {
 				continue

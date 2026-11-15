@@ -11,6 +11,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
+	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 )
 
 // stampReader records when its last read returned data: the arrival of the
@@ -56,19 +57,22 @@ type tsReader struct {
 // aborts it. The reader owns rc: Close closes it, and so does a failed
 // NewTSReader. now stamps arrivals; nil means time.Now.
 func NewTSReader(rc io.ReadCloser, now func() time.Time) (Reader, error) {
-	r, err := newTSReader(rc, now, Spec{}, &media.ConfigCache{})
+	r, err := newTSReader(rc, now, Spec{}, &media.ConfigCache{}, nil)
 	if err != nil {
 		return nil, err
 	}
 	return r, nil
 }
 
-func newTSReader(rc io.ReadCloser, now func() time.Time, spec Spec, cache *media.ConfigCache) (*tsReader, error) {
+// newTSReader is NewTSReader with a spec, a config cache shared across
+// readers, and the timestamp decoder (nil: a private one, whose timeline
+// starts at 0).
+func newTSReader(rc io.ReadCloser, now func() time.Time, spec Spec, cache *media.ConfigCache, dec *mpegts.TimeDecoder) (*tsReader, error) {
 	if now == nil {
 		now = time.Now
 	}
 	src := &stampReader{rc: rc, now: now, arrival: now()}
-	dmx, err := ts.NewDemuxerWithOptions(src, ts.DemuxOptions{Remap: true})
+	dmx, err := ts.NewDemuxerWithOptions(src, ts.DemuxOptions{Remap: true, Decoder: dec})
 	if err != nil {
 		_ = rc.Close()
 		return nil, fmt.Errorf("ingest: ts reader: %w", err)
@@ -83,7 +87,7 @@ func newTSReader(rc io.ReadCloser, now func() time.Time, spec Spec, cache *media
 // ctx ends first, rc is closed, which fails the open.
 func openTS(ctx context.Context, rc io.ReadCloser, now func() time.Time, spec Spec, cache *media.ConfigCache) (*tsReader, error) {
 	stop := context.AfterFunc(ctx, func() { _ = rc.Close() })
-	r, err := newTSReader(rc, now, spec, cache)
+	r, err := newTSReader(rc, now, spec, cache, nil)
 	if !stop() && err == nil {
 		// ctx ended after the PMT but before stop: rc is closed.
 		_ = rc.Close()
