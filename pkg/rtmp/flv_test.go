@@ -40,6 +40,7 @@ func TestFLVVideoRoundTrip(t *testing.T) {
 		{"ex end", VideoTag{Codec: VideoHEVC, Kind: VideoSequenceEnd}, true},
 		{"ex metadata", VideoTag{Codec: VideoHEVC, Kind: VideoMetadata, Data: []byte{1}}, true},
 		{"command", VideoTag{Codec: VideoAVC, Kind: VideoCommand, Data: []byte{0}}, false},
+		{"ex command", VideoTag{Kind: VideoCommand, Data: []byte{1}}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -102,6 +103,18 @@ func TestFLVModExSkipped(t *testing.T) {
 	}
 }
 
+func TestFLVModExExtendedSize(t *testing.T) {
+	// Size byte 0xFF selects a UI16 size: 0x0001+1 = 2 bytes of ModEx data.
+	b := []byte{0x80 | 1<<4 | exModEx, 0xFF, 0x00, 0x01, 0xAA, 0xBB, 0x01, 'a', 'v', 'c', '1', 0, 0, 5, 0x77}
+	got, err := ParseVideoTag(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Codec != VideoAVC || got.Kind != VideoCodedFrames || got.CompTime != 5 || !got.Key || !bytes.Equal(got.Data, []byte{0x77}) {
+		t.Fatalf("%+v", got)
+	}
+}
+
 func TestFLVHostile(t *testing.T) {
 	cases := map[string][]byte{
 		"empty":          {},
@@ -112,6 +125,8 @@ func TestFLVHostile(t *testing.T) {
 		"ex coded short": {0x80 | 1<<4 | exCoded, 'h', 'v', 'c', '1', 0},
 		"modex short":    {0x80 | exModEx, 5, 1},
 		"multitrack":     {0x80 | 1<<4 | exMultitrack, 'h', 'v', 'c', '1'},
+		"modex overrun":  {0x80 | exModEx, 0xFF, 0x00, 0x05, 1, 2},
+		"mpeg2ts start":  {0x80 | 1<<4 | 5, 'h', 'v', 'c', '1'},
 		"unknown fourcc": {0x80 | 1<<4 | exCoded, 'a', 'v', '0', '1', 0, 0, 0},
 		"codec id 2":     {0x12, 0, 0, 0, 0, 0},
 	}
@@ -120,8 +135,10 @@ func TestFLVHostile(t *testing.T) {
 			t.Errorf("%s: no error", name)
 		}
 	}
-	if _, err := ParseVideoTag(cases["multitrack"]); !errors.Is(err, ErrUnsupportedCodec) {
-		t.Errorf("multitrack: %v", err)
+	for _, n := range []string{"multitrack", "mpeg2ts start", "ex unknown pkt"} {
+		if _, err := ParseVideoTag(cases[n]); !errors.Is(err, ErrUnsupportedCodec) {
+			t.Errorf("%s: %v", n, err)
+		}
 	}
 	if _, err := ParseAudioTag([]byte{0xAF}); err == nil {
 		t.Error("truncated audio")
@@ -129,8 +146,10 @@ func TestFLVHostile(t *testing.T) {
 	if _, err := ParseAudioTag([]byte{0xAF, 7}); err == nil {
 		t.Error("unknown AAC packet")
 	}
-	if _, err := ReadFLV(bytes.NewReader([]byte("FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00\x09\xFF\xFF\xFF"))); err == nil {
-		t.Error("oversized tag")
+	// A full 11-byte tag header declaring 0xFFFFFF bytes of data.
+	big := []byte("FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00\x09\xFF\xFF\xFF\x00\x00\x00\x00\x00\x00\x00")
+	if _, err := ReadFLV(bytes.NewReader(big)); !errors.Is(err, errFLVTagTooLarge) {
+		t.Errorf("oversized tag: %v", err)
 	}
 	if _, err := ReadFLV(bytes.NewReader([]byte("XYZ\x01\x05\x00\x00\x00\x09"))); err == nil {
 		t.Error("bad signature")
@@ -138,7 +157,8 @@ func TestFLVHostile(t *testing.T) {
 }
 
 func TestFLVFixtureHEVC(t *testing.T) {
-	var video, audio, seq, skipped int
+	var video, codedX, meta, audio, seq, skipped int
+	var firstHdr []byte
 	for _, tag := range readFixture(t, "h265_aac.flv") {
 		switch tag.Type {
 		case FLVVideo:
@@ -162,7 +182,12 @@ func TestFLVFixtureHEVC(t *testing.T) {
 				}
 			case VideoCodedFrames:
 				video++
-			case VideoSequenceEnd, VideoMetadata, VideoCommand:
+				if tag.Data[0]&0x0F == exCodedX {
+					codedX++
+				}
+			case VideoMetadata:
+				meta++
+			case VideoSequenceEnd, VideoCommand:
 			}
 		case FLVAudio:
 			a, err := ParseAudioTag(tag.Data)
@@ -179,11 +204,17 @@ func TestFLVFixtureHEVC(t *testing.T) {
 			}
 			if !a.SequenceHeader {
 				audio++
+			} else if len(a.Data) > 0 && firstHdr == nil {
+				firstHdr = a.Data
 			}
 		}
 	}
-	if seq != 1 || video != 150 || audio != 260 || skipped != 2 {
-		t.Fatalf("seq %d video %d audio %d skipped %d", seq, video, audio, skipped)
+	if seq != 1 || video != 150 || audio != 260 || skipped != 2 || meta != 1 || codedX != 41 {
+		t.Fatalf("seq %d video %d audio %d skipped %d meta %d codedX %d", seq, video, audio, skipped, meta, codedX)
+	}
+	// AOT 2 (AAC-LC), 44.1 kHz, 6 channels.
+	if !bytes.Equal(firstHdr, []byte{0x12, 0x30}) {
+		t.Fatalf("first non-empty ASC % x", firstHdr)
 	}
 }
 

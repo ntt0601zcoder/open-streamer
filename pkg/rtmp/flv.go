@@ -124,14 +124,9 @@ func ParseVideoTag(b []byte) (VideoTag, error) {
 func parseEnhancedVideo(b []byte) (VideoTag, error) {
 	frame := (b[0] >> 4) & 7
 	pkt := b[0] & 0x0F
+	// Only frame type 1 is Key; type 4 (generated keyframe) is a seek frame, not a random access point.
 	t := VideoTag{Key: frame == frameKey}
 	pos := 1
-	if frame == frameCommand {
-		// A command frame carries a VideoFrameInfo byte and no codec.
-		t.Kind = VideoCommand
-		t.Data = bytes.Clone(b[1:])
-		return t, nil
-	}
 	for pkt == exModEx {
 		if len(b) < pos+1 {
 			return VideoTag{}, errShort("ModEx size")
@@ -145,12 +140,18 @@ func parseEnhancedVideo(b []byte) (VideoTag, error) {
 			size = int(binary.BigEndian.Uint16(b[pos:])) + 1
 			pos += 2
 		}
-		pos += size
-		if len(b) < pos+1 {
+		if size+1 > len(b)-pos {
 			return VideoTag{}, errShort("ModEx data")
 		}
+		pos += size
 		pkt = b[pos] & 0x0F
 		pos++
+	}
+	if frame == frameCommand && pkt != exMetadata {
+		// A command frame carries a VideoFrameInfo byte and no codec.
+		t.Kind = VideoCommand
+		t.Data = bytes.Clone(b[pos:])
+		return t, nil
 	}
 	if pkt == exMultitrack {
 		return VideoTag{}, fmt.Errorf("rtmp: flv: multitrack video: %w", ErrUnsupportedCodec)
@@ -184,7 +185,7 @@ func parseEnhancedVideo(b []byte) (VideoTag, error) {
 	case exMetadata:
 		t.Kind = VideoMetadata
 	default:
-		return VideoTag{}, fmt.Errorf("rtmp: flv: unknown video packet type %d", pkt)
+		return VideoTag{}, fmt.Errorf("rtmp: flv: video packet type %d: %w", pkt, ErrUnsupportedCodec)
 	}
 	t.Data = bytes.Clone(b[pos:])
 	return t, nil
@@ -297,6 +298,9 @@ type FLVTag struct {
 
 const maxFLVTag = 8 << 20
 
+// errFLVTagTooLarge is wrapped when a tag declares more than maxFLVTag bytes.
+var errFLVTagTooLarge = errors.New("rtmp: flv: tag too large")
+
 // ReadFLV reads an FLV file: the header and every tag, each at most 8 MiB.
 func ReadFLV(r io.Reader) ([]FLVTag, error) {
 	var hdr [9]byte
@@ -329,7 +333,7 @@ func ReadFLV(r io.Reader) ([]FLVTag, error) {
 		}
 		n := int(th[1])<<16 | int(th[2])<<8 | int(th[3])
 		if n > maxFLVTag {
-			return nil, fmt.Errorf("rtmp: flv: tag of %d bytes exceeds %d", n, maxFLVTag)
+			return nil, fmt.Errorf("rtmp: flv: tag of %d bytes exceeds %d: %w", n, maxFLVTag, errFLVTagTooLarge)
 		}
 		ts := uint32(th[4])<<16 | uint32(th[5])<<8 | uint32(th[6]) | uint32(th[7])<<24
 		data := make([]byte, n)
