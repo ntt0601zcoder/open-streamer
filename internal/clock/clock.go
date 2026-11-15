@@ -56,7 +56,7 @@ type Options struct {
 	DriftPositiveOnly bool
 	// ArrivalGranularity is the step between the source's arrivals when it
 	// delivers in chunks (an HLS segment arrives whole); 0 means per frame.
-	// The drift window is max(10 s, 3 × ArrivalGranularity) (see Epoch).
+	// The drift window is max(10 s, 4 × ArrivalGranularity) (see Epoch).
 	ArrivalGranularity time.Duration
 }
 
@@ -96,9 +96,12 @@ type Options struct {
 // constant within the epoch. Once per second of arrivals after that, the
 // drift is the smallest offset over the last window minus the baseline,
 // provided the window holds at least three distinct arrival instants. The
-// window is max(10 s, 3 × Options.ArrivalGranularity): a source delivering
+// window is max(10 s, 4 × Options.ArrivalGranularity): a source delivering
 // in chunks (6 s HLS segments) has few arrivals per window, and one slow
-// fetch must not be the only one in it. When the drift
+// fetch must not be the only one in it. Four steps, not three, so that the
+// window strictly holds three arrivals even when a source falling behind
+// spaces them by more than a step (the current, unclosed second is not in
+// the window). When the drift
 // exceeds MaxDrift, or falls below −MaxDrift and DriftPositiveOnly is unset,
 // the next video keyframe (any frame for a stream without video) opens a
 // drift epoch. With b = baseline − Wall_{n−1}, the previous epoch's constant
@@ -176,7 +179,8 @@ type driftCfg struct {
 }
 
 // newDriftCfg applies the MaxDrift clamp and sizes the window from the
-// arrival granularity: max(10 s, 3 × granularity), in whole seconds.
+// arrival granularity: max(10 s, 4 × granularity), rounded up to whole
+// seconds.
 func newDriftCfg(maxDrift time.Duration, positiveOnly bool, granularity time.Duration) driftCfg {
 	switch {
 	case maxDrift <= 0:
@@ -186,7 +190,7 @@ func newDriftCfg(maxDrift time.Duration, positiveOnly bool, granularity time.Dur
 	}
 	window := int64(driftWindow)
 	if g := max(granularity, 0); g > 0 {
-		window = max(window, int64((3*g+time.Second-1)/time.Second))
+		window = max(window, int64((4*g+time.Second-1)/time.Second))
 	}
 	return driftCfg{max: maxDrift, positiveOnly: positiveOnly, window: window}
 }

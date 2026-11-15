@@ -1,6 +1,7 @@
 package clock
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"testing"
 	"time"
@@ -399,7 +400,7 @@ func segmented(seg time.Duration, s float64, slow map[int]time.Duration) func(i 
 }
 
 // With 6 s segments, a single fetch 2.5 s slower than the others is no
-// drift: the window spans three segment arrivals, and the others in it keep
+// drift: the window spans four segment steps, and the other arrivals in it keep
 // its smallest offset where it was.
 func TestDriftSlowFetchLongSegments(t *testing.T) {
 	const seg = 6 * time.Second
@@ -414,26 +415,46 @@ func TestDriftSlowFetchLongSegments(t *testing.T) {
 	}
 }
 
-// A source that keeps falling behind is still re-anchored with 6 s segments,
-// once its drift has held over a whole window (three segments).
+// A source that keeps falling behind is still re-anchored with long
+// segments, once its drift has held over a whole window. The window must
+// strictly contain three arrival steps: a source falling behind spaces its
+// arrivals by more than a segment, and with a window of exactly three steps
+// the oldest one slips out and nothing is ever evaluated (8 % and 5 % slow).
 func TestDriftSlowSourceLongSegments(t *testing.T) {
-	const seg = 6 * time.Second
-	c := New(Options{Kinds: vOnly, MaxDrift: driftMax, DriftPositiveOnly: true, ArrivalGranularity: seg})
-	r := feed(c, videoRun(0, halfHour), segmented(seg, skew, nil))
-	st := c.Stats()
-	require.GreaterOrEqual(t, st.DriftBreaks, uint64(1))
-	requireNoOverlap(t, c)
+	for _, tc := range []struct {
+		seg  time.Duration
+		skew float64
+	}{
+		{6 * time.Second, skew},
+		{6 * time.Second, 0.08},
+		{10 * time.Second, 0.05},
+	} {
+		t.Run(fmt.Sprintf("%v/%.1f%%", tc.seg, tc.skew*100), func(t *testing.T) {
+			c := New(Options{Kinds: vOnly, MaxDrift: driftMax, DriftPositiveOnly: true, ArrivalGranularity: tc.seg})
+			r := feed(c, videoRun(0, halfHour), segmented(tc.seg, tc.skew, nil))
+			st := c.Stats()
+			require.NotEmpty(t, r.drifts[1], "drift evaluated")
+			require.GreaterOrEqual(t, st.DriftBreaks, uint64(1))
+			requireNoOverlap(t, c)
 
-	// The drift passes MaxDrift when k·seg·skew does. The break waits for
-	// the window's oldest segment to be past it (three segments), then for
-	// the next arrival to evaluate it, plus up to a segment of rounding.
-	cross := driftT0.Add(time.Duration(float64(driftMax) / skew))
-	at := r.released[2]
-	assert.False(t, at.Before(cross), "break %v before the drift reached MaxDrift", cross.Sub(at))
-	assert.Less(t, at.Sub(cross), 5*seg+2*time.Second, "break too late")
+			// The drift passes MaxDrift when k·seg·skew does, and is first
+			// judged one window (four segments) in. The break then waits for
+			// the window's oldest arrival to be past it, for the next arrival
+			// to evaluate it, and up to a segment of rounding.
+			window := 4 * tc.seg
+			cross := driftT0.Add(time.Duration(float64(driftMax) / tc.skew))
+			from := cross
+			if first := driftT0.Add(window); from.Before(first) {
+				from = first
+			}
+			at := r.released[2]
+			assert.False(t, at.Before(cross), "break %v before the drift reached MaxDrift", cross.Sub(at))
+			assert.Less(t, at.Sub(from), window+2*tc.seg+2*time.Second, "break too late")
+		})
+	}
 }
 
-// The drift window grows to three arrival steps; ten seconds is its floor.
+// The drift window grows to four arrival steps; ten seconds is its floor.
 func TestDriftWindow(t *testing.T) {
 	for _, tc := range []struct {
 		gran time.Duration
@@ -441,13 +462,15 @@ func TestDriftWindow(t *testing.T) {
 	}{
 		{0, 10},
 		{time.Second, 10},
-		{4 * time.Second, 12},
-		{6 * time.Second, 18},
-		{6500 * time.Millisecond, 20},
+		{2500 * time.Millisecond, 10},
+		{3 * time.Second, 12},
+		{6 * time.Second, 24},
+		{6100 * time.Millisecond, 25},
+		{10 * time.Second, 40},
 	} {
 		assert.Equal(t, tc.want, newDriftCfg(driftMax, false, tc.gran).window, "%v", tc.gran)
 	}
 	c := New(Options{Kinds: vOnly})
 	c.SetDrift(driftMax, true, 6*time.Second)
-	assert.Equal(t, int64(18), c.pend.drift.window, "SetDrift applies to the pending epoch")
+	assert.Equal(t, int64(24), c.pend.drift.window, "SetDrift applies to the pending epoch")
 }
