@@ -232,8 +232,13 @@ func (c *rawClient) publishTo(t *testing.T, app, name string) *rtmp.ServerConn {
 	return r.sc
 }
 
+// mediaReader is a ServerConn or a ClientConn.
+type mediaReader interface {
+	ReadMedia() (rtmp.Media, error)
+}
+
 // readMedia calls ReadMedia, failing after 2 s.
-func readMedia(t *testing.T, sc *rtmp.ServerConn) (rtmp.Media, error) {
+func readMedia(t *testing.T, sc mediaReader) (rtmp.Media, error) {
 	t.Helper()
 	type res struct {
 		m   rtmp.Media
@@ -638,5 +643,68 @@ func TestServerAbandonedPublisher(t *testing.T) {
 	}
 	if _, err := readMedia(t, r.sc); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("ReadMedia from an abandoned publisher: %v, want an idle timeout", err)
+	}
+}
+
+// amf3Command builds a type-17 command message: a 0x00 format byte, then the
+// values in AMF0.
+func amf3Command(t *testing.T, streamID uint32, vals ...any) rtmp.Message {
+	t.Helper()
+	p, err := rtmp.EncodeAMF0(vals...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rtmp.Message{Type: rtmp.MsgCommandAMF3, StreamID: streamID, Payload: append([]byte{0}, p...)}
+}
+
+// TestServerAMF3CommandConnect checks that a connect sent as a type-17
+// command is rejected at once, not left to the command timeout.
+func TestServerAMF3CommandConnect(t *testing.T) {
+	c := startRaw(t, context.Background(), rtmp.Config{CommandTimeout: 5 * time.Second}, nil, true)
+	start := time.Now()
+	c.write(t, 3, amf3Command(t, 0, "connect", 1, rtmp.Object{{Key: "app", Value: "live"}}))
+	cmds := c.closed(t)
+	if len(cmds) != 1 || cmds[0][0] != "_error" || cmds[0][1] != 1.0 {
+		t.Fatalf("server wrote %v, want only _error for txn 1", cmds)
+	}
+	info, _ := cmds[0][len(cmds[0])-1].(rtmp.Object)
+	if code, _ := info.Get("code"); code != "NetConnection.Connect.Rejected" {
+		t.Fatalf("_error code %v, want NetConnection.Connect.Rejected", code)
+	}
+	r := await(t, c.res, time.Second)
+	if r.err == nil || !strings.Contains(r.err.Error(), "AMF3") {
+		t.Fatalf("Accept: %v, want the AMF3 rejection", r.err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("AMF3 connect rejected after %v", elapsed)
+	}
+}
+
+func TestServerAMF3CommandsCounted(t *testing.T) {
+	c := startRaw(t, context.Background(), rtmp.Config{}, nil, true)
+	c.command(t, 0, "connect", 1, rtmp.Object{{Key: "app", Value: "live"}})
+	c.write(t, 3, amf3Command(t, 0, "_checkbw", 2, nil))
+	// An AMF3 value (0x11 switch marker) the AMF0 decoder cannot read.
+	c.write(t, 3, rtmp.Message{Type: rtmp.MsgCommandAMF3, Payload: []byte{0x00, 0x11, 0x06, 0x01}})
+	c.command(t, 0, "createStream", 3, nil)
+	c.command(t, 1, "publish", 4, nil, "s", "live")
+	r := await(t, c.res, 2*time.Second)
+	if r.err != nil {
+		t.Fatalf("Accept: %v", r.err)
+	}
+	if n := r.sc.UnknownCommands(); n != 2 {
+		t.Fatalf("UnknownCommands %d after the exchange, want 2", n)
+	}
+	go func() {
+		for range c.msgs {
+		}
+	}()
+	c.write(t, 3, amf3Command(t, 1, "deleteStream", 5, nil, 1))
+	c.write(t, 4, rtmp.Message{Type: rtmp.MsgAudio, StreamID: 1, Timestamp: 7, Payload: []byte{0xAF, 1, 2}})
+	if m, err := readMedia(t, r.sc); err != nil || m.Type != rtmp.MsgAudio {
+		t.Fatalf("ReadMedia: %v type %d", err, m.Type)
+	}
+	if n := r.sc.UnknownCommands(); n != 3 {
+		t.Fatalf("UnknownCommands %d, want 3", n)
 	}
 }

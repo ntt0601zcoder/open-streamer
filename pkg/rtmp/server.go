@@ -81,6 +81,10 @@ type ServerConn struct {
 // with the description "stream not available" and the error is returned
 // wrapped. A nil decide accepts every request. ctx bounds only Accept. On
 // any error c is closed.
+//
+// An error can follow a decide that accepted: writing the replies can fail,
+// or ctx can end just after the exchange. A caller that reserves something in
+// decide (a route, a slot) must release it whenever Accept returns an error.
 func Accept(ctx context.Context, c net.Conn, cfg Config, decide func(PublishRequest) error) (*ServerConn, error) {
 	s := newSession(c, cfg, roleServer)
 	sc := &ServerConn{s: s}
@@ -110,12 +114,20 @@ func (sc *ServerConn) accept(decide func(PublishRequest) error) error {
 		if err != nil {
 			return fmt.Errorf("rtmp: server: %w", err)
 		}
+		if m.Type == MsgCommandAMF3 {
+			if name, txn, ok := amf3CommandHead(m.Payload); ok && name == "connect" {
+				sc.rejectAMF3(txn)
+				return errAMF3
+			}
+			sc.unknown.Add(1)
+			continue
+		}
 		if m.Type != MsgCommandAMF0 {
 			continue // data, media and user control before publish
 		}
 		name, txn, args, err := parseCommand(m.Payload)
 		if err != nil {
-			return err
+			return fmt.Errorf("rtmp: server: %w", err)
 		}
 		switch name {
 		case "connect":
@@ -161,12 +173,8 @@ func (sc *ServerConn) onConnect(txn float64, args []any) (app, tcURL string, err
 		obj, _ = args[0].(Object)
 	}
 	if enc, _ := obj.Get("objectEncoding"); enc == float64(amf3Encoding) {
-		_ = s.writeCommand(0, "_error", txn, nil, Object{
-			{Key: "level", Value: "error"},
-			{Key: "code", Value: "NetConnection.Connect.Rejected"},
-			{Key: "description", Value: "AMF3 object encoding is not supported"},
-		})
-		return "", "", errors.New("rtmp: server: connect: AMF3 object encoding is not supported")
+		sc.rejectAMF3(txn)
+		return "", "", errAMF3
 	}
 	v, _ := obj.Get("app")
 	app, _ = v.(string)
@@ -189,6 +197,20 @@ func (sc *ServerConn) onConnect(txn float64, args []any) (app, tcURL string, err
 		return "", "", fmt.Errorf("rtmp: server: %w", err)
 	}
 	return app, tcURL, nil
+}
+
+// errAMF3 is returned for a connect that asks for AMF3, by objectEncoding 3
+// or as a type-17 command.
+var errAMF3 = errors.New("rtmp: server: connect: AMF3 object encoding is not supported")
+
+// rejectAMF3 answers connect transaction txn with _error. The session is
+// closed next, so a write error does not matter.
+func (sc *ServerConn) rejectAMF3(txn float64) {
+	_ = sc.s.writeCommand(0, "_error", txn, nil, Object{
+		{Key: "level", Value: "error"},
+		{Key: "code", Value: "NetConnection.Connect.Rejected"},
+		{Key: "description", Value: "AMF3 object encoding is not supported"},
+	})
 }
 
 // onPublish asks decide and answers publish. The reply never echoes the
@@ -228,23 +250,45 @@ func (sc *ServerConn) onPublish(streamID uint32, args []any, app, tcURL string, 
 
 // parseCommand splits an AMF0 command into its name, transaction id and
 // remaining arguments. A missing or non-number transaction id reads as 0.
+// Its errors are wrapped by the caller with its role ("rtmp: server: …").
 func parseCommand(p []byte) (name string, txn float64, args []any, err error) {
 	vals, err := DecodeAMF0(p)
 	if err != nil {
-		return "", 0, nil, fmt.Errorf("rtmp: server: command: %w", err)
+		return "", 0, nil, fmt.Errorf("command: %w", err)
 	}
 	if len(vals) == 0 {
-		return "", 0, nil, errors.New("rtmp: server: empty command")
+		return "", 0, nil, errors.New("empty command")
 	}
 	name, ok := vals[0].(string)
 	if !ok {
-		return "", 0, nil, fmt.Errorf("rtmp: server: command name is %T", vals[0])
+		return "", 0, nil, fmt.Errorf("command name is %T", vals[0])
 	}
 	if len(vals) > 1 {
 		txn, _ = vals[1].(float64)
 		args = vals[2:]
 	}
 	return name, txn, args, nil
+}
+
+// amf3CommandHead reads the name and transaction id of a type-17 (AMF3)
+// command: a 0x00 format byte, then the name and transaction id in AMF0. The
+// arguments, which may switch to AMF3, are not decoded.
+func amf3CommandHead(p []byte) (name string, txn float64, ok bool) {
+	if len(p) > 0 && p[0] == 0 {
+		p = p[1:]
+	}
+	d := amfDecoder{b: p}
+	v, err := d.value(0)
+	if err != nil {
+		return "", 0, false
+	}
+	if name, ok = v.(string); !ok {
+		return "", 0, false
+	}
+	if v, err := d.value(0); err == nil {
+		txn, _ = v.(float64)
+	}
+	return name, txn, true
 }
 
 // Request is the accepted publish request.
@@ -255,7 +299,8 @@ func (sc *ServerConn) Request() PublishRequest {
 // ReadMedia returns the next audio, video or metadata message. A leading
 // "@setDataFrame" is removed from data messages, so metadata reads as the
 // onMetaData tag body. deleteStream, FCUnpublish and closeStream end the
-// stream with io.EOF. Unknown commands are counted and skipped. Any error is
+// stream with io.EOF. Unknown commands, and every type-17 (AMF3) command,
+// are counted and skipped. Any error is
 // terminal and is returned again by later calls; the caller then Closes.
 func (sc *ServerConn) ReadMedia() (Media, error) {
 	if sc.err != nil {
@@ -273,13 +318,17 @@ func (sc *ServerConn) ReadMedia() (Media, error) {
 			}
 			return med, nil
 		}
+		if m.Type == MsgCommandAMF3 {
+			sc.unknown.Add(1)
+			continue
+		}
 		if m.Type != MsgCommandAMF0 {
 			continue
 		}
 		name, _, _, err := parseCommand(m.Payload)
 		if err != nil {
-			sc.err = err
-			return Media{}, err
+			sc.err = fmt.Errorf("rtmp: server: %w", err)
+			return Media{}, sc.err
 		}
 		switch name {
 		case "deleteStream", "FCUnpublish", "closeStream":
@@ -298,7 +347,8 @@ func (sc *ServerConn) LastInbound() time.Time {
 }
 
 // UnknownCommands counts the commands ignored because the server does not
-// know them, such as _checkbw, getStreamLength and FCSubscribe.
+// know them, such as _checkbw, getStreamLength and FCSubscribe, and every
+// type-17 (AMF3) command other than a connect, which is rejected.
 func (sc *ServerConn) UnknownCommands() uint64 {
 	return sc.unknown.Load()
 }
