@@ -83,7 +83,12 @@ func TestClassifyH264EmulationPrevention(t *testing.T) {
 	// before the recovery point.
 	sei := append([]byte{0x06, 0x05, 0x04, 0x00, 0x00, 0x03, 0x01, 0xaa, 0x06, 0x01}, packBits("1"+"1000")...)
 	assert.True(t, h264RecoveryPoint0(sei))
-	assert.Equal(t, []byte{0x01, 0x00, 0x00, 0x01}, unescape([]byte{0x01, 0x00, 0x00, 0x03, 0x01}))
+	e := ebsp{b: []byte{0x01, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x03, 0x03}}
+	var got []byte
+	for v, ok := e.next(); ok; v, ok = e.next() {
+		got = append(got, v)
+	}
+	assert.Equal(t, []byte{0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x03}, got)
 }
 
 func TestClassifyH265(t *testing.T) {
@@ -97,4 +102,46 @@ func TestClassifyH265(t *testing.T) {
 	k, r = c.Classify([][]byte{{1 << 1, 1, 0}}, 0)
 	assert.False(t, k)
 	assert.False(t, r)
+}
+
+// bigNAL returns a 1 MB NAL unit: head, then a body of zeros and
+// emulation-prevention bytes, as an escaped slice body looks.
+func bigNAL(head []byte) []byte {
+	const size = 1 << 20
+	n := make([]byte, size)
+	copy(n, head)
+	for i := len(head); i+2 < size; i += 3 {
+		n[i], n[i+1], n[i+2] = 0, 0, 3
+	}
+	return n
+}
+
+// Classifying an access unit allocates nothing, however large its slices
+// and SEI: only slice-header and SEI-header bytes are read.
+func TestClassifyH264AllocsBounded(t *testing.T) {
+	c := NewNALClassifier(CodecH264)
+	p := bigNAL(slice("1"))
+	i := bigNAL(slice("011"))
+	userData := bigNAL([]byte{0x06, 0x05, 0xff, 0xff, 0xff, 0xff, 0x0f}) // a 1 kB+ payload header, then filler
+	for name, au := range map[string][][]byte{
+		"P frame":        {p},
+		"I slices":       {i, i},
+		"P after I":      {i, p, p, p},
+		"large SEI":      {userData, i},
+		"recovery point": {recoverySEI("1"), i},
+	} {
+		allocs := testing.AllocsPerRun(20, func() { c.Classify(au, 0) })
+		assert.Zero(t, allocs, name)
+	}
+	k, _ := c.Classify([][]byte{recoverySEI("1"), i, i}, 1000)
+	assert.True(t, k, "large I slices with a recovery point still classify")
+}
+
+func BenchmarkClassifyH264LargeSlice(b *testing.B) {
+	c := NewNALClassifier(CodecH264)
+	au := [][]byte{bigNAL(slice("1"))}
+	b.ReportAllocs()
+	for b.Loop() {
+		c.Classify(au, 0)
+	}
 }
