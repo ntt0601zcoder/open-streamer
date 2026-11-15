@@ -931,3 +931,29 @@ func TestPipelineFailureFlushUnpaced(t *testing.T) {
 	assert.Equal(t, fakeT0, ft.Now())
 	assert.Len(t, drain(sub), len(held), "the held frames are written")
 }
+
+// A reader whose Kinds() has an unknown (zero) entry, such as a copy:// source
+// with a skipped track index, gives the layout no phantom track.
+func TestPipelineLayoutDropsUnknownKinds(t *testing.T) {
+	ft, ev := newFakeTime(), newEvents()
+	steps := av{video: 1, audio: 2, gop: 25, span: 2 * media.ClockRate, arrival: realTime}.steps()
+	r := newFakeReader([]media.Kind{0, media.KindVideo, media.KindAudio}, ingest.Spec{}, steps, true)
+	h := hub.New(hub.Options{})
+	sub := h.Subscribe("t", 1<<16)
+	opt := fakeOptions(ft, one(r), ev)
+	opt.EndOnEOF = true
+	p := New(h, opt)
+	require.NoError(t, p.Run(ev.failCtx(t)))
+
+	ds := drain(sub)
+	require.Len(t, ds, len(steps), "every frame delivered")
+	for _, d := range ds {
+		switch d.Frame.Data[0][0] {
+		case 1:
+			assert.Equal(t, 0, d.Frame.Track, "video → layout 0")
+		case 2:
+			assert.Equal(t, 1, d.Frame.Track, "audio → layout 1")
+		}
+	}
+	assert.Zero(t, p.Stats().Unmapped)
+}
