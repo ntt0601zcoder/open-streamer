@@ -22,7 +22,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
 
-func fixture(t *testing.T, name string) []byte {
+func fixture(t testing.TB, name string) []byte {
 	t.Helper()
 	b, err := os.ReadFile("../../testdata/fixtures/" + name)
 	require.NoError(t, err)
@@ -59,7 +59,7 @@ func memOptions(b []byte) Options {
 }
 
 // loopURL writes b to a temporary file and returns its looping file URL.
-func loopURL(t *testing.T, b []byte, query string) string {
+func loopURL(t testing.TB, b []byte, query string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "clip.ts")
 	require.NoError(t, os.WriteFile(p, b, 0o600))
