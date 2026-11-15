@@ -520,6 +520,10 @@ func (a *attempt) stop() {
 	if a.r != nil {
 		_ = a.r.Close()
 	}
+	// This blocks Run until a pending Open returns. Cancelling octx is what
+	// ends it: every M2a Open honours its ctx (a dial, a request, the wait
+	// for a first PMT), so the wait is short; an Open that ignored ctx would
+	// stall Run here, failover included.
 	<-a.exited
 }
 

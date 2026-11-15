@@ -242,11 +242,21 @@ func (l *srtListener) nextPublisher(ctx context.Context) (*tsReader, error) {
 // errSRTClosed is returned by Read after Close.
 var errSRTClosed = errors.New("ingest: srt: closed")
 
-func (l *srtListener) setCur(cur *tsReader) {
+// setCur makes cur the current publisher, with a discontinuity before its
+// first frame. When Close ran since nextPublisher returned it, nobody else
+// will close cur: setCur closes it and reports false.
+func (l *srtListener) setCur(cur *tsReader) bool {
 	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		_ = cur.Close()
+		return false
+	}
 	l.cur = cur
 	l.kinds = cur.Kinds()
+	l.disc = true
 	l.mu.Unlock()
+	return true
 }
 
 // Read implements Reader.
@@ -266,10 +276,9 @@ func (l *srtListener) Read() (Frame, error) {
 			if err != nil {
 				return Frame{}, err
 			}
-			l.setCur(next)
-			l.mu.Lock()
-			l.disc = true
-			l.mu.Unlock()
+			if !l.setCur(next) {
+				return Frame{}, errSRTClosed
+			}
 			continue
 		}
 		if disc {

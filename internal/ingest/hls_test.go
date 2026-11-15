@@ -851,3 +851,55 @@ func TestHLSPullFromOurOutput(t *testing.T) {
 	assert.Zero(t, st["fell_behind"])
 	assert.Zero(t, st["skipped_segments"])
 }
+
+// The injected clock times the reloads as well as the arrivals: a clock an
+// hour ahead of the system's neither stalls the reloads (an hour's wait) nor
+// spins them.
+func TestHLSPullInjectedClock(t *testing.T) {
+	segs := tsSegments(t)
+	var (
+		mu      sync.Mutex
+		start   = time.Now()
+		reloads int
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		reloads++
+		mu.Unlock()
+		// One new 1 s segment per second, a window of three.
+		n := int(time.Since(start)/time.Second) + 3
+		pl := hls.MediaPlaylist{Version: 3, TargetDuration: 1, MediaSequence: uint64(n - 3)}
+		for k := n - 3; k < n; k++ {
+			pl.Segments = append(pl.Segments, hls.Segment{URI: fmt.Sprintf("seg/%d.ts", k), Duration: time.Second})
+		}
+		_, _ = w.Write(pl.Encode())
+	})
+	mux.HandleFunc("/seg/{n}", func(w http.ResponseWriter, r *http.Request) {
+		var n int
+		_, _ = fmt.Sscanf(r.PathValue("n"), "%d.ts", &n)
+		_, _ = w.Write(segs[n%len(segs)])
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ahead := func() time.Time { return time.Now().Add(time.Hour) }
+	r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{Now: ahead})
+	require.NoError(t, err)
+	defer r.Close()
+	var last ingest.Frame
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Since(start) < 4*time.Second {
+		require.True(t, time.Now().Before(deadline), "reloads stalled")
+		f, err := r.Read()
+		if errors.Is(err, ingest.ErrDiscontinuity) {
+			continue
+		}
+		require.NoError(t, err)
+		last = f
+	}
+	assert.WithinDuration(t, ahead(), last.Arrival, 2*time.Second, "arrivals on the injected clock")
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Less(t, reloads, 15, "reloads paced, not spinning")
+}
