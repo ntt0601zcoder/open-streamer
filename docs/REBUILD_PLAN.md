@@ -79,7 +79,9 @@ audio) compute durations from sample counts too.
 ### 3.2 Clock
 
 One per stream, between demux and the source hub. Readers hand it source
-timestamps that are already unwrapped (33-bit TS PTS, 32-bit RTMP, RTP).
+timestamps that are already unwrapped (33-bit TS PTS, 32-bit RTMP, RTP), each
+frame with its arrival time: when the reader received the bytes that completed
+it. `PushAt(frame, arrival)` takes both; `Push` stamps the current time.
 
 - **Within an epoch,** stream time = source time − epoch base + epoch start, so
   deltas between frames and between tracks are kept exactly.
@@ -104,6 +106,23 @@ timestamps that are already unwrapped (33-bit TS PTS, 32-bit RTMP, RTP).
   outputs get one signal for "new init segment or discontinuity". When several
   tracks change together (failover, PMT change), it is one epoch change and the
   new input's first GOP is kept.
+- **A configuration-change epoch holds its whole 1 s window,** even when every
+  track already has a frame. A track that changes later, inside the window,
+  joins the same epoch, so staggered changes are one epoch change.
+- **A late-joining track** (one that was not in an epoch when it was released
+  and shows up later) opens the next epoch at the next video keyframe. Its
+  hold is raised to its lateness plus 200 ms, capped at 5 s, so it starts
+  with the others. Each track does this once per input; after that it joins
+  the current epoch late, and is counted. An input switch resets it.
+- **Drift (live sources).** Per epoch, a frame's offset is its arrival minus
+  its stream time since the epoch start. The baseline is the smallest offset
+  over the epoch's first 10 s of arrivals; bursts and network delay only raise
+  offsets. Once per second after that, the drift is the smallest offset over
+  the last 10 s minus the baseline. Above `MaxDrift` (2 s for live inputs;
+  paced inputs react only to a source falling behind), the next video keyframe
+  opens a drift epoch. It keeps the epoch's constant offset and removes only
+  the drift; frames that would overlap the previous epoch are dropped and
+  counted.
 - Each epoch records a wallclock anchor: the arrival time of its first frame.
   DASH and DVR use it to map stream time to wallclock, never letting a period
   start before the previous one ends, which matters for bursty sources such as
@@ -191,7 +210,7 @@ never as dependencies.
 |---|---|
 | H.264, H.265, AAC parsing (SPS, PPS, VPS, ASC, ADTS); fMP4 boxes | `Eyevinn/mp4ff` |
 | RTP packets and H.264/H.265 packetisers; SDP | `pion/rtp`, `pion/sdp` |
-| SRT | `datarhei/gosrt` (approved: a standalone library repository) |
+| SRT | `datarhei/gosrt` (approved: a standalone library repository); used from M2a by the SRT caller and listener inputs |
 | Transcoding | `asticode/go-astiav` |
 | Transcoder protocol messages | `google.golang.org/protobuf` (M4) |
 | HTTP | `go-chi/chi/v5` |
@@ -248,7 +267,7 @@ before the code they check.
 | | Milestone | Depends on | Exit criteria |
 |---|---|---|---|
 | M1 | Media core: Frame, TS demuxer, Clock, hub, frame checks, fixtures | – | Every fixture goes demux → Clock → hub with no check violation, including the PTS-wrap and looped-source fixtures |
-| M2 | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change restarts the demuxer as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
+| M2 | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change remaps the demuxer's tracks as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
 | M3 | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg, VLC-class clients and MediaMTX play every output; for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it |
 | M4 | Transcoder, watermark, thumbnails | M1, M3 | In CI (no GPU, builder image restored): a 3-rung software ladder and passthrough pass M3's scenarios. On the GPU host: the same with 3 NVENC rungs, run by a make target and recorded in the PR; a killed subprocess comes back as one new epoch; the watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
@@ -261,20 +280,57 @@ outputs that need no other protocol library of ours (segmenter, HLS, DASH,
 HTTP-TS, SRT). M2's HLS pull input comes after `pkg/hls`. M3's RTMP and RTSP
 outputs follow M2's `pkg/rtmp` and `pkg/rtsp`.
 
+M3 runs in two parts: M3a ([plan](superpowers/plans/2026-11-11-m3a-hls-dash.md),
+done) serves HLS, DASH and HTTP-TS; M3b (RTMP play and push, RTSP server, SRT
+output) follows M2b and M2c. M2 is split in three parts:
+
+| Part | Contents |
+|---|---|
+| M2a ([plan](superpowers/plans/2026-11-12-m2a-ts-inputs-failover.md), done) | TS-family inputs (file, UDP and RTP-wrapped UDP, SRT caller and listener, HTTP-TS pull), HLS pull (TS and fMP4 segments, separate audio rendition), `copy://`, failover and fail-back, TS demuxer completion, fMP4 demuxer, HE-AAC in the TS muxer's ADTS writer, the Clock's carried fixes, ingest CPU measurement |
+| M2b | `pkg/unwrap`, `pkg/rtmp` (handshake, chunk stream, AMF0, server and client sessions, FLV, enhanced RTMP), RTMP push and pull inputs |
+| M2c | `pkg/h26x` (DTS from POC, which also fixes reordered access units packed in one PES), `pkg/rtsp` client (TCP interleaved and UDP, RFC 3640 AAC, `pion/rtp` depacketisers, `pion/sdp`), RTSP pull input |
+
+M2a's exit criteria are the M2 row's, for its inputs: each, fed by ffmpeg,
+produces violation-free frames; failover is exactly one epoch change; a PMT
+change is one epoch change; an H.264 open-GOP feed starts video at its first
+recovery point. The `TestM2a` scenarios in `internal/e2e` prove them.
+
+Out of M2a:
+
+| Item | Reason |
+|---|---|
+| Source-specific multicast (232/8) | Needs `golang.org/x/net`; revisit on demand |
+| H.264 intra-refresh (GDR) feeds | They never produce a `Key`; needs decoder-side recovery tracking; revisit on demand |
+| Encrypted HLS | `EXT-X-KEY` other than `NONE` is refused |
+| Packed-audio HLS renditions | `.aac` segments with ID3 timestamps |
+| Single-file fMP4 HLS | `EXT-X-MAP` with `BYTERANGE` |
+| A video-only mode when an HLS audio rendition stalls | The stall fails the whole input |
+| Changing a running pipeline's inputs in place | §3.6; M5's supervisor adds it |
+| Reordered access units packed in one PES | Dropped until M2c's `pkg/h26x` gives DTS from POC |
+| Dropping video to the next keyframe after a TS loss | Frames after the lost one pass through: decoders conceal, and a lossy feed would otherwise freeze |
+| A late join with an inter-track skew above the 2 s backward-jump limit | Loses one GOP once, at start-up |
+| Live-source epochs placed by the chain lead (R10) | Stay as ruled: bounded, and they do not accumulate |
+
 ### Carried from M1
 
-- **M2, H.264 open GOP:** an I-slice carrying a recovery point SEI is `Key`,
-  and the frames after it presented before it (PTS below its PTS) are marked
-  RASL-equivalent. Until then the M1 demuxer cannot start video on such
-  broadcast feeds.
-- **M2, readers:** pass `Kinds` to the Clock, and keep `Config` pointers
-  stable across repeated identical sequence headers.
-- **M2, tests:** failover tests assert both the epoch count and the frames
-  lost; frames lost to continuity-counter discontinuities are
-  counted (`pkg/mpegts` reports them); the one-PES-per-access-unit and PES-without-PTS assumptions get a
-  broadcast-style test.
-- **M2, Clock:** a track that joins an epoch after its `AlignWindow` release
-  can start later than the track-start offset allows; M2 closes this gap.
+The M2 items are done in M2a.
+
+- **M2, H.264 open GOP (done):** an I-slice carrying a recovery point SEI is
+  `Key`, and the frames after it presented before it (PTS below its PTS) are
+  marked RASL-equivalent, so a broadcast feed starts video at its first
+  recovery point (`TestM2aOpenGOP`).
+- **M2, readers (done):** pass `Kinds` to the Clock, and keep `Config`
+  pointers stable across repeated identical sequence headers, segments,
+  demuxer instances and file loops.
+- **M2, tests (done):** failover tests assert both the epoch count and the
+  frames lost (`TestM2aFailoverSRTtoUDP`); frames lost to continuity-counter
+  discontinuities are counted (`pkg/mpegts` reports them); the
+  one-PES-per-access-unit and PES-without-PTS assumptions have broadcast-style
+  tests.
+- **M2, Clock (done):** a track that joins an epoch after its `AlignWindow`
+  release opens a late-join epoch (§3.2).
+- **HE-AAC in the TS muxer's ADTS writer (done):** deferred from M3a to M2b,
+  then done in M2a, whose fMP4 HLS pull is the first HE-AAC input.
 - **M4, transcoder:** rendition epoch numbers never collide (§3.5).
 
 ### Conformance checks
