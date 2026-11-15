@@ -175,7 +175,7 @@ func (r *hlsReader) open(playlistURL *url.URL, body []byte, final *url.URL, load
 		}
 		target = max(target, r.audio.target)
 	}
-	r.spec = Spec{Pace: true, Live: true, StallTimeout: target * 3 / 2}
+	r.spec = Spec{Pace: true, Live: true, StallTimeout: target * 3 / 2, ArrivalGranularity: target}
 	if env.HTTP == nil {
 		r.transport = newTransport()
 		r.transport.MaxIdleConnsPerHost = 2

@@ -292,15 +292,15 @@ func TestSetDrift(t *testing.T) {
 		assert.Equal(t, 2*media.MaxAnchorLead, c.pend.drift.max)
 		c = New(Options{Kinds: vOnly})
 		assert.Zero(t, c.pend.drift.max)
-		c.SetDrift(time.Second, false)
+		c.SetDrift(time.Second, false, 0)
 		assert.Equal(t, 2*media.MaxAnchorLead, c.pend.drift.max)
-		c.SetDrift(3*time.Second, true)
-		assert.Equal(t, driftCfg{max: 3 * time.Second, positiveOnly: true}, c.pend.drift)
+		c.SetDrift(3*time.Second, true, 0)
+		assert.Equal(t, driftCfg{max: 3 * time.Second, positiveOnly: true, window: 10}, c.pend.drift)
 	})
 
 	t.Run("after construction", func(t *testing.T) {
 		c := New(Options{Kinds: vOnly})
-		c.SetDrift(driftMax, false)
+		c.SetDrift(driftMax, false, 0)
 		r := feed(c, videoRun(0, halfHour), source(skew))
 		assert.GreaterOrEqual(t, c.Stats().DriftBreaks, uint64(1))
 		requireNoOverlap(t, c)
@@ -315,7 +315,7 @@ func TestSetDrift(t *testing.T) {
 		for i, f := range frames {
 			if i == 100 {
 				c.Break(true)
-				c.SetDrift(driftMax, false)
+				c.SetDrift(driftMax, false, 0)
 			}
 			r.push(c, f, at(i))
 		}
@@ -335,7 +335,7 @@ func TestSetDrift(t *testing.T) {
 		for i, f := range frames {
 			if i == 100 {
 				require.Nil(t, c.pend)
-				c.SetDrift(driftMax, false)
+				c.SetDrift(driftMax, false, 0)
 			}
 			c.PushAt(f, at(i))
 		}
@@ -384,4 +384,70 @@ func TestDriftDisabled(t *testing.T) {
 		assert.Zero(t, c.Stats().DroppedDrift)
 		assert.Len(t, c.Epochs(), 1)
 	}
+}
+
+// segmented returns the arrival of frame i of a 25 fps track delivered in
+// segments of seg, as paced HLS pulls them: each segment arrives whole,
+// 100 ms after it ends, from a source whose clock runs s slower than
+// arrival; the segments in slow arrive late by that much on top.
+func segmented(seg time.Duration, s float64, slow map[int]time.Duration) func(i int) time.Time {
+	per := int(seg / frameDur)
+	return func(i int) time.Time {
+		k := i / per
+		return skewed(driftT0, time.Duration(k+1)*seg, s).Add(100*time.Millisecond + slow[k])
+	}
+}
+
+// With 6 s segments, a single fetch 2.5 s slower than the others is no
+// drift: the window spans three segment arrivals, and the others in it keep
+// its smallest offset where it was.
+func TestDriftSlowFetchLongSegments(t *testing.T) {
+	const seg = 6 * time.Second
+	slow := map[int]time.Duration{20: 2500 * time.Millisecond, 80: 2500 * time.Millisecond, 200: 2500 * time.Millisecond}
+	c := New(Options{Kinds: vOnly, MaxDrift: driftMax, DriftPositiveOnly: true, ArrivalGranularity: seg})
+	r := feed(c, videoRun(0, halfHour), segmented(seg, 0, slow))
+	assert.Zero(t, c.Stats().DriftBreaks)
+	assert.Len(t, c.Epochs(), 1)
+	require.NotEmpty(t, r.drifts[1], "drift evaluated")
+	for _, d := range r.drifts[1] {
+		require.Less(t, d.Abs(), 100*time.Millisecond)
+	}
+}
+
+// A source that keeps falling behind is still re-anchored with 6 s segments,
+// once its drift has held over a whole window (three segments).
+func TestDriftSlowSourceLongSegments(t *testing.T) {
+	const seg = 6 * time.Second
+	c := New(Options{Kinds: vOnly, MaxDrift: driftMax, DriftPositiveOnly: true, ArrivalGranularity: seg})
+	r := feed(c, videoRun(0, halfHour), segmented(seg, skew, nil))
+	st := c.Stats()
+	require.GreaterOrEqual(t, st.DriftBreaks, uint64(1))
+	requireNoOverlap(t, c)
+
+	// The drift passes MaxDrift when k·seg·skew does. The break waits for
+	// the window's oldest segment to be past it (three segments), then for
+	// the next arrival to evaluate it, plus up to a segment of rounding.
+	cross := driftT0.Add(time.Duration(float64(driftMax) / skew))
+	at := r.released[2]
+	assert.False(t, at.Before(cross), "break %v before the drift reached MaxDrift", cross.Sub(at))
+	assert.Less(t, at.Sub(cross), 5*seg+2*time.Second, "break too late")
+}
+
+// The drift window grows to three arrival steps; ten seconds is its floor.
+func TestDriftWindow(t *testing.T) {
+	for _, tc := range []struct {
+		gran time.Duration
+		want int64
+	}{
+		{0, 10},
+		{time.Second, 10},
+		{4 * time.Second, 12},
+		{6 * time.Second, 18},
+		{6500 * time.Millisecond, 20},
+	} {
+		assert.Equal(t, tc.want, newDriftCfg(driftMax, false, tc.gran).window, "%v", tc.gran)
+	}
+	c := New(Options{Kinds: vOnly})
+	c.SetDrift(driftMax, true, 6*time.Second)
+	assert.Equal(t, int64(18), c.pend.drift.window, "SetDrift applies to the pending epoch")
 }
