@@ -32,6 +32,10 @@ type Spec struct {
 	Live         bool          // the source runs in real time: Clock drift re-anchoring
 	Passive      bool          // the source connects to us (UDP, SRT listener)
 	StallTimeout time.Duration // raises the pipeline's stall limit for this input; 0 means none
+	// ArrivalGranularity is the step between arrivals when the source
+	// delivers in chunks (HLS: the target duration, set after open); 0 means
+	// per frame. It widens the Clock's drift window.
+	ArrivalGranularity time.Duration
 }
 
 // Frame is a media frame with its arrival time.

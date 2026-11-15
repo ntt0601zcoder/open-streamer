@@ -504,7 +504,7 @@ func TestOpenHLS(t *testing.T) {
 			r, err := ingest.Open(ctx, srv.URL+p, ingest.Env{})
 			require.NoError(t, err)
 			cancel() // the open ctx ending does not end the reader
-			assert.Equal(t, ingest.Spec{Pace: true, Live: true, StallTimeout: 3 * time.Second}, r.Spec())
+			assert.Equal(t, ingest.Spec{Pace: true, Live: true, StallTimeout: 3 * time.Second, ArrivalGranularity: 2 * time.Second}, r.Spec())
 			assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
 			res := pullAll(r)
 			require.ErrorIs(t, res.err, io.EOF)
@@ -821,7 +821,7 @@ func TestHLSPullFromOurOutput(t *testing.T) {
 	require.Eventually(t, func() bool { return p.Snapshot().Listed >= 3 }, 15*time.Second, 50*time.Millisecond)
 	r, err := ingest.Open(context.Background(), srv.URL+"/live/s/hls/index.m3u8", ingest.Env{})
 	require.NoError(t, err)
-	assert.Equal(t, ingest.Spec{Pace: true, Live: true, StallTimeout: 1500 * time.Millisecond}, r.Spec())
+	assert.Equal(t, ingest.Spec{Pace: true, Live: true, StallTimeout: 1500 * time.Millisecond, ArrivalGranularity: time.Second}, r.Spec())
 
 	// Read past the loop point (6 s): the packager's discontinuity reaches us.
 	c := clock.New(clock.Options{Kinds: r.Kinds()})

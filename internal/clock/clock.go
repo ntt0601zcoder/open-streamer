@@ -32,7 +32,8 @@ const (
 	defaultDuration    = 3600                // lastDuration when a track has no DTS delta yet
 	lateMargin         = media.ClockRate / 5 // added to a late track's lateness for its hold
 	maxEpochs          = 64
-	driftWindow        = 10 // seconds of arrivals in the drift baseline and in each drift sample
+	driftWindow        = 10 // seconds of arrivals in the drift baseline and in each drift sample, at least
+	driftSamples       = 3  // distinct arrival instants a drift sample needs
 )
 
 // Options tunes a Clock. Zero values select the defaults.
@@ -53,6 +54,10 @@ type Options struct {
 	// DriftPositiveOnly reacts only to a source falling behind arrival, for
 	// paced inputs, which cannot run ahead.
 	DriftPositiveOnly bool
+	// ArrivalGranularity is the step between the source's arrivals when it
+	// delivers in chunks (an HLS segment arrives whole); 0 means per frame.
+	// The drift window is max(10 s, 3 × ArrivalGranularity) (see Epoch).
+	ArrivalGranularity time.Duration
 }
 
 // Epoch is the anchor of one timeline. Its smallest DTS maps to stream time
@@ -86,10 +91,14 @@ type Options struct {
 // A live source whose clock drifts from arrival is re-anchored by a drift
 // epoch (Options.MaxDrift, Clock.SetDrift). Within each epoch, a released
 // frame's offset is off = arrival − (DTS − Start). The baseline is the
-// smallest offset over the epoch's first 10 s of arrivals: bursts and network
-// delay only raise an offset above the true one, and a chain lead is constant
-// within the epoch. Once per second of arrivals after that, the drift is the
-// smallest offset over the last 10 s minus the baseline. When the drift
+// smallest offset over the epoch's first window of arrivals: bursts and
+// network delay only raise an offset above the true one, and a chain lead is
+// constant within the epoch. Once per second of arrivals after that, the
+// drift is the smallest offset over the last window minus the baseline,
+// provided the window holds at least three distinct arrival instants. The
+// window is max(10 s, 3 × Options.ArrivalGranularity): a source delivering
+// in chunks (6 s HLS segments) has few arrivals per window, and one slow
+// fetch must not be the only one in it. When the drift
 // exceeds MaxDrift, or falls below −MaxDrift and DriftPositiveOnly is unset,
 // the next video keyframe (any frame for a stream without video) opens a
 // drift epoch. With b = baseline − Wall_{n−1}, the previous epoch's constant
@@ -163,24 +172,31 @@ func (w cause) reanchors() bool {
 type driftCfg struct {
 	max          time.Duration // 0 disables
 	positiveOnly bool
+	window       int64 // seconds of arrivals in the baseline and in each sample
 }
 
-// newDriftCfg applies the MaxDrift clamp.
-func newDriftCfg(maxDrift time.Duration, positiveOnly bool) driftCfg {
+// newDriftCfg applies the MaxDrift clamp and sizes the window from the
+// arrival granularity: max(10 s, 3 × granularity), in whole seconds.
+func newDriftCfg(maxDrift time.Duration, positiveOnly bool, granularity time.Duration) driftCfg {
 	switch {
 	case maxDrift <= 0:
 		maxDrift = 0
 	case maxDrift <= media.MaxAnchorLead:
 		maxDrift = 2 * media.MaxAnchorLead
 	}
-	return driftCfg{max: maxDrift, positiveOnly: positiveOnly}
+	window := int64(driftWindow)
+	if g := max(granularity, 0); g > 0 {
+		window = max(window, int64((3*g+time.Second-1)/time.Second))
+	}
+	return driftCfg{max: maxDrift, positiveOnly: positiveOnly, window: window}
 }
 
 // driftSec is the smallest offset among the frames released in one second of
-// arrivals.
+// arrivals, and the number of distinct arrival instants among them.
 type driftSec struct {
 	sec int64
 	min time.Time
+	n   int
 	ok  bool
 }
 
@@ -190,10 +206,12 @@ type driftSec struct {
 type driftState struct {
 	driftCfg
 	started  bool
-	t0       time.Time // arrival of the epoch's first released frame
-	sec      int64     // the current second
-	secMin   time.Time // smallest offset in it
-	recent   [driftWindow]driftSec
+	t0       time.Time  // arrival of the epoch's first released frame
+	sec      int64      // the current second
+	secMin   time.Time  // smallest offset in it
+	secN     int        // distinct arrival instants in it
+	latest   time.Time  // the latest arrival: an instant counts once, when first seen
+	recent   []driftSec // ring of window seconds
 	hasBase  bool
 	baseline time.Time     // smallest offset over the first driftWindow seconds
 	evals    int           // drift evaluations so far
@@ -207,43 +225,56 @@ func (d *driftState) observe(at, off time.Time) {
 		return
 	}
 	if !d.started {
-		d.started, d.t0, d.sec, d.secMin = true, at, 0, off
+		d.started, d.t0, d.sec, d.secMin, d.secN, d.latest = true, at, 0, off, 1, at
+		d.recent = make([]driftSec, d.window)
 		return
+	}
+	fresh := at.After(d.latest)
+	if fresh {
+		d.latest = at
 	}
 	sec := int64(at.Sub(d.t0) / time.Second)
 	if sec <= d.sec {
 		if off.Before(d.secMin) {
 			d.secMin = off
 		}
+		if fresh {
+			d.secN++
+		}
 		return
 	}
 	d.closeSec()
-	d.sec, d.secMin = sec, off
-	if sec > driftWindow {
+	d.sec, d.secMin, d.secN = sec, off, 1
+	if sec > d.window {
 		d.evaluate()
 	}
 }
 
 // closeSec stores the current second, in the baseline too while it is one of
-// the first driftWindow seconds.
+// the first window seconds.
 func (d *driftState) closeSec() {
-	if d.sec < driftWindow && (!d.hasBase || d.secMin.Before(d.baseline)) {
+	if d.sec < d.window && (!d.hasBase || d.secMin.Before(d.baseline)) {
 		d.hasBase, d.baseline = true, d.secMin
 	}
-	d.recent[d.sec%driftWindow] = driftSec{sec: d.sec, min: d.secMin, ok: true}
+	d.recent[d.sec%d.window] = driftSec{sec: d.sec, min: d.secMin, n: d.secN, ok: true}
 }
 
-// evaluate computes the drift over the driftWindow seconds before the current
-// one, and sets due when it is out of bounds.
+// evaluate computes the drift over the window seconds before the current
+// one, and sets due when it is out of bounds. A window with fewer than
+// driftSamples distinct arrivals is not evaluated.
 func (d *driftState) evaluate() {
 	var lo time.Time
-	found := false
+	found, n := false, 0
 	for _, s := range d.recent {
-		if s.ok && s.sec >= d.sec-driftWindow && (!found || s.min.Before(lo)) {
+		if !s.ok || s.sec < d.sec-d.window {
+			continue
+		}
+		n += s.n
+		if !found || s.min.Before(lo) {
 			lo, found = s.min, true
 		}
 	}
-	if !found || !d.hasBase {
+	if !found || !d.hasBase || n < driftSamples {
 		return
 	}
 	drift := lo.Sub(d.baseline)
@@ -369,7 +400,7 @@ func New(opt Options) *Clock {
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
-	drift := newDriftCfg(opt.MaxDrift, opt.DriftPositiveOnly)
+	drift := newDriftCfg(opt.MaxDrift, opt.DriftPositiveOnly, opt.ArrivalGranularity)
 	opt.MaxDrift = drift.max
 	return &Clock{
 		opt:         opt,
@@ -438,11 +469,11 @@ func (c *Clock) Break(newInput bool) {
 	c.pend.cause = causeBreak
 }
 
-// SetDrift sets MaxDrift and DriftPositiveOnly, with the same clamp. It
-// applies to the pending epoch when one is pending (always after New and
-// right after Break), else from the next epoch opened.
-func (c *Clock) SetDrift(maxDrift time.Duration, positiveOnly bool) {
-	c.drift = newDriftCfg(maxDrift, positiveOnly)
+// SetDrift sets MaxDrift, DriftPositiveOnly and ArrivalGranularity, with
+// the same clamp. It applies to the pending epoch when one is pending (always
+// after New and right after Break), else from the next epoch opened.
+func (c *Clock) SetDrift(maxDrift time.Duration, positiveOnly bool, granularity time.Duration) {
+	c.drift = newDriftCfg(maxDrift, positiveOnly, granularity)
 	if c.pend != nil {
 		c.pend.drift = c.drift
 	}

@@ -115,10 +115,14 @@ it. `PushAt(frame, arrival)` takes both; `Push` stamps the current time.
   with the others. Each track does this once per input; after that it joins
   the current epoch late, and is counted. An input switch resets it.
 - **Drift (live sources).** Per epoch, a frame's offset is its arrival minus
-  its stream time since the epoch start. The baseline is the smallest offset
-  over the epoch's first 10 s of arrivals; bursts and network delay only raise
-  offsets. Once per second after that, the drift is the smallest offset over
-  the last 10 s minus the baseline. Above `MaxDrift` (2 s for live inputs;
+  its stream time since the epoch start. The window is 10 s, or three
+  arrival steps when the reader delivers in chunks (`Spec.ArrivalGranularity`:
+  an HLS segment arrives whole, so 6 s segments give an 18 s window). The
+  baseline is the smallest offset over the epoch's first window of arrivals;
+  bursts and network delay only raise offsets. Once per second after that,
+  the drift is the smallest offset over the last window minus the baseline,
+  judged only when the window holds three distinct arrival instants, so one
+  slow segment fetch is no drift. Above `MaxDrift` (2 s for live inputs;
   paced inputs react only to a source falling behind), the next video keyframe
   opens a drift epoch. It keeps the epoch's constant offset and removes only
   the drift; frames that would overlap the previous epoch are dropped and

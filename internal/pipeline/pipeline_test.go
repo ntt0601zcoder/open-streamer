@@ -661,6 +661,50 @@ func TestPipelineDriftSettings(t *testing.T) {
 	}
 }
 
+// The reader's arrival granularity reaches the Clock. Paced HLS with 6 s
+// segments: a single fetch 2.5 s slow is no drift, a source that keeps
+// falling behind is. A 10 s window would hold at most two arrivals of 6 s
+// segments, too few to judge, so the slow source's breaks show the window
+// was widened.
+func TestPipelineArrivalGranularity(t *testing.T) {
+	const seg = 6 * time.Second
+	segOf := func(dts int64) int { return int(media.ToDuration(dts) / seg) }
+	for name, tc := range map[string]struct {
+		skew   float64
+		slow   int // the segment fetched 2.5 s late; -1 for none
+		breaks bool
+	}{
+		"slow fetch":  {skew: 0, slow: 5, breaks: false},
+		"slow source": {skew: 0.05, slow: -1, breaks: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ft, ev := newFakeTime(), newEvents()
+			arrival := func(dts int64) time.Time {
+				k := segOf(dts)
+				at := fakeT0.Add(time.Duration(float64(time.Duration(k+1)*seg)*(1+tc.skew)) + 100*time.Millisecond)
+				if k == tc.slow {
+					at = at.Add(2500 * time.Millisecond)
+				}
+				return at
+			}
+			steps := av{video: 0, audio: -1, gop: 25, span: 120 * media.ClockRate, arrival: arrival}.steps()
+			spec := ingest.Spec{Live: true, Pace: true, ArrivalGranularity: seg}
+			r := newFakeReader([]media.Kind{media.KindVideo}, spec, steps, true)
+			opt := fakeOptions(ft, one(r), ev)
+			opt.EndOnEOF = true
+			opt.Sleep = func(context.Context, time.Duration) error { return nil }
+			p := New(hub.New(hub.Options{}), opt)
+			require.NoError(t, p.Run(ev.failCtx(t)))
+			if tc.breaks {
+				assert.Positive(t, p.Stats().Clock.DriftBreaks)
+			} else {
+				assert.Zero(t, p.Stats().Clock.DriftBreaks)
+			}
+		})
+	}
+}
+
 func TestPipelineSniffedSpec(t *testing.T) {
 	const u = "http://example.com/live"
 	parsed, err := ingest.Parse(u)

@@ -420,7 +420,7 @@ func TestHLSPullOurCMAF(t *testing.T) {
 	require.Eventually(t, func() bool { return p.Snapshot().Listed >= 3 }, 15*time.Second, 50*time.Millisecond)
 	r, err := ingest.Open(context.Background(), srv.URL+"/live/s/cmaf/master.m3u8", ingest.Env{})
 	require.NoError(t, err)
-	assert.Equal(t, ingest.Spec{Pace: true, Live: true, StallTimeout: 1500 * time.Millisecond}, r.Spec())
+	assert.Equal(t, ingest.Spec{Pace: true, Live: true, StallTimeout: 1500 * time.Millisecond, ArrivalGranularity: time.Second}, r.Spec())
 	require.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
 
 	// Read past the loop point (6 s): the packager's discontinuity reaches

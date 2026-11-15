@@ -691,9 +691,9 @@ func (p *Pipeline) activate(a *attempt) {
 		p.w.c.Break(true)
 	}
 	if spec.Live {
-		p.w.c.SetDrift(liveMaxDrift, spec.Pace)
+		p.w.c.SetDrift(liveMaxDrift, spec.Pace, spec.ArrivalGranularity)
 	} else {
-		p.w.c.SetDrift(0, false)
+		p.w.c.SetDrift(0, false, 0)
 	}
 	p.w.pace = spec.Pace
 	p.activeSince = p.now()
