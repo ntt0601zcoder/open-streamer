@@ -935,11 +935,6 @@ func TestOpenRTMPListen(t *testing.T) {
 	assert.NotContains(t, err.Error(), vStreamKey)
 	publishTags(t, "rtmp://127.0.0.1:"+port+"/live/"+vStreamKey, fixtureTags(t, "h264_aac.flv")[:20])
 	awaitOpen(t, ch)
-
-	// Pull inputs come with the next task.
-	_, err = Open(context.Background(), "rtmp://127.0.0.1:1/live/"+vStreamKey, Env{})
-	require.Error(t, err)
-	assert.NotContains(t, err.Error(), vStreamKey)
 }
 
 func TestRedactRTMPStreamKey(t *testing.T) {

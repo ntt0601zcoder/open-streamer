@@ -272,7 +272,7 @@ func Open(ctx context.Context, rawURL string, env Env) (Reader, error) {
 		if p.spec.Passive {
 			return openRTMPListen(ctx, rawURL, p, env)
 		}
-		return nil, fmt.Errorf("ingest: open %s: rtmp pull inputs are not available yet", Redact(rawURL))
+		return openRTMPPull(ctx, rawURL, p, env)
 	default:
 		return nil, fmt.Errorf("ingest: open %s: %s inputs are not available yet", Redact(rawURL), p.scheme)
 	}
