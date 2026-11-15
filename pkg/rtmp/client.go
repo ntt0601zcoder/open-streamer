@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // The play exchange.
@@ -32,7 +33,8 @@ const (
 
 // StatusError is a server's refusal: an _error reply, or an onStatus whose
 // level is "error" (such as NetStream.Play.StreamNotFound or
-// NetStream.Play.Failed). Description is the server's text, unchanged.
+// NetStream.Play.Failed). Description is the server's text, except that the
+// play name, which may be a stream key, is redacted (see ClientConn).
 type StatusError struct {
 	Code, Description string
 }
@@ -70,8 +72,36 @@ func statusOf(args []any) (level string, st *StatusError) {
 type playTarget struct {
 	addr   string // host:port to dial
 	app    string
-	stream string // with the query, minus our mode parameter
+	name   string // the stream name, without the query
+	stream string // the name with the query, minus our mode parameter
 	tcURL  string
+}
+
+// redactedName is name cut to its first 2 characters plus "xxxxx", or
+// "xxxxx" alone for a name of up to 2 characters: the form ingest.Redact
+// gives the last path segment of an rtmp:// URL.
+func redactedName(name string) string {
+	r := []rune(name)
+	if len(r) > 2 {
+		return string(r[:2]) + "xxxxx"
+	}
+	return "xxxxx"
+}
+
+// redactor replaces the play name in a server's text: the name with its
+// query (when there is one), then the bare name, by the redacted name. A
+// bare name of up to 2 characters is left alone: replacing so short a
+// string would mangle the text, and a name that short is no secret.
+func (t playTarget) redactor() *strings.Replacer {
+	masked := redactedName(t.name)
+	var pairs []string
+	if t.stream != t.name {
+		pairs = append(pairs, t.stream, masked)
+	}
+	if len([]rune(t.name)) > 2 {
+		pairs = append(pairs, t.name, masked)
+	}
+	return strings.NewReplacer(pairs...)
 }
 
 // splitPlayURL splits rtmp://host[:port]/app[/…]/stream[?query]. The app is
@@ -115,6 +145,7 @@ func splitPlayURL(rawURL string) (playTarget, error) {
 	t := playTarget{
 		addr:   net.JoinHostPort(u.Hostname(), port),
 		app:    app,
+		name:   segs[len(segs)-1],
 		stream: segs[len(segs)-1],
 		tcURL:  "rtmp://" + host + "/" + app,
 	}
@@ -142,13 +173,27 @@ func stripMode(raw string) string {
 }
 
 // ClientConn plays a stream from an RTMP server. ReadMedia must be called
-// from one goroutine; Close is safe from any.
+// from one goroutine; BadCommands and Close are safe from any.
+//
+// The play name is often a stream key, and servers may echo it in their
+// status descriptions. Every StatusError therefore has the name, with or
+// without its query, replaced by its redacted form: the first 2 characters
+// plus "xxxxx", as ingest.Redact masks the last path segment.
 type ClientConn struct {
 	s        *session
 	streamID uint32
+	redact   *strings.Replacer
 	held     []Media // media that arrived before the play exchange ended
 	heldData int     // bytes of data messages in held
 	err      error   // terminal ReadMedia error
+	bad      atomic.Uint64
+}
+
+// status is statusOf with the play name redacted from the description.
+func (c *ClientConn) status(args []any) (level string, st *StatusError) {
+	level, st = statusOf(args)
+	st.Description = c.redact.Replace(st.Description)
+	return level, st
 }
 
 // Play is PlayWith with the default Config.
@@ -161,8 +206,9 @@ func Play(ctx context.Context, rawURL string) (*ClientConn, error) {
 // connect, createStream and play within cfg.CommandTimeout, and returns once
 // the server sends NetStream.Play.Start (or, from a server that does not,
 // the first audio or video message). An _error reply or an onStatus of level
-// "error" returns a *StatusError with the server's description. ctx bounds
-// only PlayWith. Errors never contain the URL.
+// "error", at any step, returns a *StatusError with the server's description
+// (the play name redacted). ctx bounds only PlayWith. Errors never contain
+// the URL.
 func PlayWith(ctx context.Context, rawURL string, cfg Config) (*ClientConn, error) {
 	t, err := splitPlayURL(rawURL)
 	if err != nil {
@@ -174,7 +220,7 @@ func PlayWith(ctx context.Context, rawURL string, cfg Config) (*ClientConn, erro
 		return nil, fmt.Errorf("rtmp: client: dial: %w", err)
 	}
 	s := newSession(conn, cfg, roleClient)
-	c := &ClientConn{s: s}
+	c := &ClientConn{s: s, redact: t.redactor()}
 	stop := context.AfterFunc(ctx, func() { _ = s.Close() })
 	err = c.open(t)
 	if !stop() {
@@ -251,12 +297,19 @@ func (c *ClientConn) open(t playTarget) error {
 }
 
 // awaitResult waits for the _result or _error of transaction txn and
-// returns the _result's arguments.
+// returns the _result's arguments. An onStatus of level "error" fails at
+// once, since a server that sends one may never answer the transaction.
 func (c *ClientConn) awaitResult(txn float64, what string) ([]any, error) {
 	for {
 		cmd, _, err := c.openCommand(false)
 		if err != nil {
 			return nil, err
+		}
+		if cmd.name == "onStatus" {
+			if level, st := c.status(cmd.args); level == "error" {
+				return nil, fmt.Errorf("rtmp: client: %s: %w", what, st)
+			}
+			continue
 		}
 		if cmd.txn != txn {
 			continue
@@ -265,7 +318,7 @@ func (c *ClientConn) awaitResult(txn float64, what string) ([]any, error) {
 		case "_result":
 			return cmd.args, nil
 		case "_error":
-			_, st := statusOf(cmd.args)
+			_, st := c.status(cmd.args)
 			return nil, fmt.Errorf("rtmp: client: %s: %w", what, st)
 		}
 	}
@@ -284,12 +337,12 @@ func (c *ClientConn) awaitPlayStart() error {
 		}
 		switch {
 		case cmd.name == "_error" && cmd.txn == txnPlay:
-			_, st := statusOf(cmd.args)
+			_, st := c.status(cmd.args)
 			return fmt.Errorf("rtmp: client: play: %w", st)
 		case cmd.name != "onStatus":
 			continue
 		}
-		level, st := statusOf(cmd.args)
+		level, st := c.status(cmd.args)
 		switch st.Code {
 		case codePlayStart:
 			return nil
@@ -343,8 +396,9 @@ func (c *ClientConn) openCommand(playing bool) (command, bool, error) {
 // "@setDataFrame" is removed from data messages. The stream ends with io.EOF
 // on user control StreamEOF or onStatus NetStream.Play.Stop or
 // NetStream.Play.UnpublishNotify; an onStatus of level "error" returns a
-// *StatusError. Other commands and notices are skipped. Any error is
-// terminal and is returned again by later calls; the caller then Closes.
+// *StatusError. Other commands and notices are skipped, and so are commands
+// that do not decode, which BadCommands counts. Any error is terminal and is
+// returned again by later calls; the caller then Closes.
 func (c *ClientConn) ReadMedia() (Media, error) {
 	if len(c.held) > 0 {
 		m := c.held[0]
@@ -376,13 +430,13 @@ func (c *ClientConn) ReadMedia() (Media, error) {
 		case MsgCommandAMF0:
 			name, _, args, err := parseCommand(m.Payload)
 			if err != nil {
-				c.err = fmt.Errorf("rtmp: client: %w", err)
-				return Media{}, c.err
+				c.bad.Add(1)
+				continue
 			}
 			if name != "onStatus" {
 				continue
 			}
-			level, st := statusOf(args)
+			level, st := c.status(args)
 			switch st.Code {
 			case "NetStream.Play.Stop", "NetStream.Play.UnpublishNotify":
 				c.err = io.EOF
@@ -394,6 +448,12 @@ func (c *ClientConn) ReadMedia() (Media, error) {
 			}
 		}
 	}
+}
+
+// BadCommands counts the commands from the server that did not decode
+// during playback and were skipped.
+func (c *ClientConn) BadCommands() uint64 {
+	return c.bad.Load()
 }
 
 // Close closes the connection, unblocking a pending ReadMedia. It never

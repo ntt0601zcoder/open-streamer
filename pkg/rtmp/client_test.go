@@ -302,16 +302,16 @@ func TestClientAggregate(t *testing.T) {
 
 func TestClientStreamNotFound(t *testing.T) {
 	srv := rtmptest.NewPlayServer(t, nil, rtmptest.PlayOptions{NotFound: true})
-	r := awaitPlay(t, startPlay(context.Background(), srv.URL("live/secretname"), rtmp.Config{}), 5*time.Second)
+	r := awaitPlay(t, startPlay(context.Background(), srv.URL("live/secretname?token=abc"), rtmp.Config{}), 5*time.Second)
 	if r.err == nil || r.c != nil {
 		t.Fatalf("Play: %v, want an error", r.err)
 	}
 	var se *rtmp.StatusError
-	if !errors.As(r.err, &se) || se.Code != "NetStream.Play.StreamNotFound" || se.Description != "stream not found" {
+	if !errors.As(r.err, &se) || se.Code != "NetStream.Play.StreamNotFound" || se.Description != "stream sexxxxx not found" {
 		t.Fatalf("Play: %v, want a StatusError NetStream.Play.StreamNotFound", r.err)
 	}
 	msg := r.err.Error()
-	if !strings.HasPrefix(msg, "rtmp: client: ") || !strings.Contains(msg, "stream not found") || strings.Contains(msg, "secretname") {
+	if !strings.HasPrefix(msg, "rtmp: client: ") || !strings.Contains(msg, "stream sexxxxx not found") || strings.Contains(msg, "secretname") || strings.Contains(msg, "abc") {
 		t.Fatalf("Play error %q: want the server's description and no stream name", msg)
 	}
 }
@@ -467,6 +467,17 @@ func TestClientErrors(t *testing.T) {
 			v := p.expect(t, "createStream")
 			p.command(t, 0, "_result", v[1], nil, "one")
 		}, "", "createStream"},
+		// An onStatus of level error before play fails at once, well within
+		// the 2 s wait, not after the 10 s CommandTimeout.
+		{"connect onStatus error", func(t *testing.T, p *playPeer) {
+			p.expect(t, "connect")
+			p.status(t, 0, "error", "NetConnection.Connect.Rejected", "auth failed")
+		}, "NetConnection.Connect.Rejected", "connect: NetConnection.Connect.Rejected: auth failed"},
+		{"createStream onStatus error", func(t *testing.T, p *playPeer) {
+			p.connectOK(t)
+			p.expect(t, "createStream")
+			p.status(t, 0, "error", "NetConnection.Call.Failed", "no streams")
+		}, "NetConnection.Call.Failed", "createStream: NetConnection.Call.Failed: no streams"},
 		{"server closes", func(t *testing.T, p *playPeer) {
 			p.expect(t, "connect")
 			_ = p.conn.Close()
@@ -551,6 +562,85 @@ func TestClientErrorDuringPlay(t *testing.T) {
 		if !errors.As(err, &se) || se.Code != "NetStream.Play.Failed" || !strings.HasPrefix(err.Error(), "rtmp: client: ") {
 			t.Fatalf("ReadMedia: %v, want the server's NetStream.Play.Failed", err)
 		}
+	}
+}
+
+// A server's description that echoes the play name, with or without its
+// query, carries the redacted name instead (the first 2 characters kept),
+// in the StatusError and in the error text, at every stage. Names of up to
+// 2 characters are left alone.
+func TestClientRedactsStreamName(t *testing.T) {
+	const name = "secretname"
+	for _, tc := range []struct {
+		name  string
+		path  string
+		serve func(t *testing.T, p *playPeer, res <-chan playResult) error
+		want  string // the Description received
+	}{
+		{"play onStatus", "live/" + name + "?token=abc", func(t *testing.T, p *playPeer, res <-chan playResult) error {
+			p.toPlay(t)
+			p.status(t, 1, "error", "NetStream.Play.StreamNotFound", "no stream live/"+name+"?token=abc, also "+name)
+			return awaitPlay(t, res, 2*time.Second).err
+		}, "no stream live/sexxxxx, also sexxxxx"},
+		{"play _error", "live/" + name, func(t *testing.T, p *playPeer, res <-chan playResult) error {
+			v := p.toPlay(t)
+			p.command(t, 1, "_error", v[1], nil, rtmp.Object{{Key: "code", Value: "NetStream.Play.Failed"}, {Key: "description", Value: name + " denied"}})
+			return awaitPlay(t, res, 2*time.Second).err
+		}, "sexxxxx denied"},
+		{"during playback", "live/" + name, func(t *testing.T, p *playPeer, res <-chan playResult) error {
+			c := p.started(t, res)
+			p.status(t, 1, "error", "NetStream.Play.Failed", "lost "+name)
+			_, err := readMedia(t, c)
+			return err
+		}, "lost sexxxxx"},
+		{"short name kept", "live/s", func(t *testing.T, p *playPeer, res <-chan playResult) error {
+			p.toPlay(t)
+			p.status(t, 1, "error", "NetStream.Play.StreamNotFound", "stream s not found")
+			return awaitPlay(t, res, 2*time.Second).err
+		}, "stream s not found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, peers := acceptPeers(t)
+			res := startPlay(context.Background(), base+"/"+tc.path, rtmp.Config{})
+			p := awaitPeer(t, peers)
+			err := tc.serve(t, p, res)
+			var se *rtmp.StatusError
+			if !errors.As(err, &se) {
+				t.Fatalf("error %v, want a StatusError", err)
+			}
+			if se.Description != tc.want {
+				t.Fatalf("Description %q, want %q", se.Description, tc.want)
+			}
+			if strings.Contains(err.Error(), name) || strings.Contains(err.Error(), "abc") {
+				t.Fatalf("error %q carries the stream name or its query", err)
+			}
+		})
+	}
+}
+
+// An undecodable command during playback is counted and skipped; the
+// session goes on.
+func TestClientSkipsBadCommand(t *testing.T) {
+	base, peers := acceptPeers(t)
+	res := startPlay(context.Background(), base+"/live/s", rtmp.Config{})
+	p := awaitPeer(t, peers)
+	c := p.started(t, res)
+	go func() {
+		for range p.msgs {
+		}
+	}()
+	p.write(t, 3, rtmp.Message{Type: rtmp.MsgCommandAMF0, Payload: []byte{0xFF, 0x01}})                   // unknown AMF0 marker
+	p.write(t, 3, rtmp.Message{Type: rtmp.MsgCommandAMF0, Payload: []byte{0x00, 0, 0, 0, 0, 0, 0, 0, 0}}) // a number, not a name
+	p.write(t, 6, rtmp.Message{Type: rtmp.MsgVideo, StreamID: 1, Timestamp: 40, Payload: []byte{0x17, 1}})
+	p.userControl(t, 0, 1, 0, 0, 0, 1) // StreamEOF
+	if m, err := readMedia(t, c); err != nil || m.Type != rtmp.MsgVideo || m.Timestamp != 40 {
+		t.Fatalf("ReadMedia after bad commands: %v %+v, want the video message", err, m)
+	}
+	if _, err := readMedia(t, c); !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadMedia: %v, want io.EOF", err)
+	}
+	if n := c.BadCommands(); n != 2 {
+		t.Fatalf("BadCommands %d, want 2", n)
 	}
 }
 
