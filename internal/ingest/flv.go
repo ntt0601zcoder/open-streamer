@@ -86,6 +86,11 @@ type flvFrames struct {
 	acfg *media.TrackConfig
 	grid audioGrid
 
+	// firstTS and maxTS are the first and the largest unwrapped coded-frame
+	// time, in ticks; haveTS tells whether there was one.
+	firstTS, maxTS int64
+	haveTS         bool
+
 	metaVideo, metaAudio, seqVideo, seqAudio atomic.Bool
 	n                                        flvCounters
 }
@@ -231,6 +236,24 @@ func (f *flvFrames) flush() []Frame {
 	out := f.release()
 	f.n.frames.Add(uint64(len(out)))
 	return out
+}
+
+// sourceTime unwraps the RTMP time of a coded frame into ticks and records
+// the span of source time seen.
+func (f *flvFrames) sourceTime(ms uint32) int64 {
+	ts := f.unw.Unwrap(uint64(ms)) * 90
+	if !f.haveTS {
+		f.firstTS, f.maxTS, f.haveTS = ts, ts, true
+	}
+	f.maxTS = max(f.maxTS, ts)
+	return ts
+}
+
+// spanned is the source time covered by the coded frames pushed so far,
+// sequence headers and metadata aside: the largest frame time minus the
+// first.
+func (f *flvFrames) spanned() int64 {
+	return f.maxTS - f.firstTS
 }
 
 // announced reports the kinds the session announced: by onMetaData with a
@@ -411,7 +434,7 @@ func splitNALUs(b []byte, size int) ([][]byte, error) {
 // AUDs are dropped and the rest is timed. In-band sets are read even while
 // the config is invalid, and any set arriving then retries the build.
 func (f *flvFrames) videoFrame(codec media.Codec, ms uint32, tag rtmp.VideoTag) ([]Frame, error) {
-	dts := f.unw.Unwrap(uint64(ms)) * 90
+	dts := f.sourceTime(ms)
 	if f.lenSize == 0 || codec != f.vcodec {
 		f.n.noConfig.Add(1)
 		return nil, nil
@@ -563,7 +586,7 @@ func (f *flvFrames) audio(m rtmp.Media) ([]Frame, error) {
 		f.seqAudio.Store(true)
 		return nil, nil
 	}
-	rtmpPTS := f.unw.Unwrap(uint64(m.Timestamp)) * 90
+	rtmpPTS := f.sourceTime(m.Timestamp)
 	if f.acfg == nil {
 		f.n.noConfig.Add(1)
 		return nil, nil
