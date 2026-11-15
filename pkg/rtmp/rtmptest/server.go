@@ -38,6 +38,9 @@ type PlayOptions struct {
 	// and sends no media. The description echoes the play name as sent,
 	// query included ("stream <name> not found"), as some servers do.
 	NotFound bool
+	// Hold sends nothing after the tags and never ends the stream, like a
+	// live source gone silent.
+	Hold bool
 }
 
 // PlayRequest is what a client asked a PlayServer for. Stream is the play
@@ -49,8 +52,8 @@ type PlayRequest struct {
 // PlayServer is a scripted RTMP server on 127.0.0.1 that every client may
 // play from. It answers connect, createStream and play; then it sends
 // StreamBegin(1), onStatus NetStream.Play.Start, the tags, onStatus
-// NetStream.Play.UnpublishNotify and StreamEOF(1), and keeps the connection
-// open until the client closes it. It never pings.
+// NetStream.Play.UnpublishNotify and StreamEOF(1) (unless Hold is set), and
+// keeps the connection open until the client closes it. It never pings.
 type PlayServer struct {
 	// Addr is the host:port the server listens on.
 	Addr string
@@ -189,7 +192,7 @@ func (s *PlayServer) serve(c net.Conn) {
 	if !s.exchange(p, cr) {
 		return
 	}
-	if !s.opt.NotFound && s.sendTags(p) == nil {
+	if !s.opt.NotFound && s.sendTags(p) == nil && !s.opt.Hold {
 		if p.status("status", "NetStream.Play.UnpublishNotify", "stream ended") == nil {
 			_ = p.userControl(1) // StreamEOF
 		}
