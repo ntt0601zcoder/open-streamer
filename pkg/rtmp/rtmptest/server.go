@@ -35,7 +35,8 @@ type PlayOptions struct {
 	// tags spanning less than 1 s, with the sub-tags' own timestamps.
 	Aggregate bool
 	// NotFound answers play with onStatus NetStream.Play.StreamNotFound
-	// (description "stream not found") and sends no media.
+	// and sends no media. The description echoes the play name as sent,
+	// query included ("stream <name> not found"), as some servers do.
 	NotFound bool
 }
 
@@ -233,7 +234,7 @@ func (s *PlayServer) exchange(p *playConn, cr *rtmp.ChunkReader) bool {
 			s.reqs = append(s.reqs, PlayRequest{App: app, Stream: name, TCURL: tcURL})
 			s.mu.Unlock()
 			if s.opt.NotFound {
-				return p.status("error", "NetStream.Play.StreamNotFound", "stream not found") == nil
+				return p.status("error", "NetStream.Play.StreamNotFound", "stream "+name+" not found") == nil
 			}
 			return p.userControl(0) == nil && // StreamBegin
 				p.status("status", "NetStream.Play.Start", "Started playing") == nil
