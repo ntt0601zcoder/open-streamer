@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -45,7 +46,7 @@ var serverKey = append([]byte("Genuine Adobe Flash Media Server 001"), keyConsta
 // digest gets a digest S1/S2 in the same schema; any other C1 gets the simple
 // handshake (random S1 with zero version, S2 echoing C1). C2 is not
 // validated. Deadlines belong to the caller.
-func ServerHandshake(rw io.ReadWriter, rand io.Reader) error {
+func ServerHandshake(rw io.ReadWriter, rnd io.Reader) error {
 	c0c1 := make([]byte, 1+handshakeSize)
 	if _, err := io.ReadFull(rw, c0c1); err != nil {
 		return fmt.Errorf("rtmp: handshake: read C0+C1: %w", err)
@@ -59,14 +60,14 @@ func ServerHandshake(rw io.ReadWriter, rand io.Reader) error {
 	out[0] = rtmpVersion
 	s1 := out[1 : 1+handshakeSize]
 	s2 := out[1+handshakeSize:]
-	if _, err := io.ReadFull(rand, s1[8:]); err != nil {
+	if _, err := io.ReadFull(rnd, s1[8:]); err != nil {
 		return fmt.Errorf("rtmp: handshake: random: %w", err)
 	}
 
 	if schema, ok := findDigest(c1, clientKey[:30]); ok {
 		binary.BigEndian.PutUint32(s1[4:8], serverVersion)
 		signDigest(s1, schema, serverKey[:36])
-		if _, err := io.ReadFull(rand, s2[:handshakeSize-digestLen]); err != nil {
+		if _, err := io.ReadFull(rnd, s2[:handshakeSize-digestLen]); err != nil {
 			return fmt.Errorf("rtmp: handshake: random: %w", err)
 		}
 		pos := digestOffset(c1, schema)
@@ -89,16 +90,16 @@ func ServerHandshake(rw io.ReadWriter, rand io.Reader) error {
 // ClientHandshake performs an RTMP handshake as the client. It sends a digest
 // C1 (schema 1) and reads exactly S0+S1+S2. S2 is verified only when S1
 // carries a valid digest. Deadlines belong to the caller.
-func ClientHandshake(rw io.ReadWriter, rand io.Reader) error {
-	return clientHandshake(rw, rand, 1)
+func ClientHandshake(rw io.ReadWriter, rnd io.Reader) error {
+	return clientHandshake(rw, rnd, 1)
 }
 
 // clientHandshake is ClientHandshake with a chosen C1 digest schema.
-func clientHandshake(rw io.ReadWriter, rand io.Reader, schema int) error {
+func clientHandshake(rw io.ReadWriter, rnd io.Reader, schema int) error {
 	c0c1 := make([]byte, 1+handshakeSize)
 	c0c1[0] = rtmpVersion
 	c1 := c0c1[1:]
-	if _, err := io.ReadFull(rand, c1[8:]); err != nil {
+	if _, err := io.ReadFull(rnd, c1[8:]); err != nil {
 		return fmt.Errorf("rtmp: handshake: random: %w", err)
 	}
 	binary.BigEndian.PutUint32(c1[4:8], clientVersion)
@@ -123,9 +124,9 @@ func clientHandshake(rw io.ReadWriter, rand io.Reader, schema int) error {
 		key := hmacSHA256(serverKey, c1[pos:pos+digestLen])
 		want := hmacSHA256(key, s2[:handshakeSize-digestLen])
 		if !hmac.Equal(want, s2[handshakeSize-digestLen:]) {
-			return fmt.Errorf("rtmp: handshake: S2 digest mismatch")
+			return errors.New("rtmp: handshake: S2 digest mismatch")
 		}
-		if _, err := io.ReadFull(rand, c2[:handshakeSize-digestLen]); err != nil {
+		if _, err := io.ReadFull(rnd, c2[:handshakeSize-digestLen]); err != nil {
 			return fmt.Errorf("rtmp: handshake: random: %w", err)
 		}
 		sPos := digestOffset(s1, s1Schema)
