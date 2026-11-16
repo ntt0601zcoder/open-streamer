@@ -19,6 +19,7 @@ const (
 const (
 	nalSPS264 = 7
 	nalPPS264 = 8
+	nalVPS265 = 32
 	nalSPS265 = 33
 	nalPPS265 = 34
 )
@@ -29,10 +30,6 @@ const (
 	maxMbs  = 4096  // H.264 macroblocks per dimension (65536 luma samples)
 	maxLuma = 65536 // H.265 luma samples per dimension
 )
-
-// maxRPSPics bounds the pictures of a derived st_ref_pic_set (a DPB holds at
-// most 16).
-const maxRPSPics = 16
 
 // SPS is a parsed sequence parameter set. Fields marked H.264 or H.265 are
 // zero for the other codec. Values named after a syntax element without its
@@ -362,7 +359,7 @@ func parseSPS264(r *bitReader, s *SPS) int {
 	s.Width, s.Height = int(width), int(height)
 	vuiBit := r.pos
 	if r.flag() { // vui_parameters_present_flag
-		lenientVUI(r, s, func() { parseVUI264(r, s) })
+		_ = lenientVUI(r, s, func() { parseVUI264(r, s) })
 	}
 	return vuiBit
 }
@@ -370,12 +367,15 @@ func parseSPS264(r *bitReader, s *SPS) int {
 // lenientVUI runs a VUI parser. A VUI cut short by the end of the NAL unit,
 // a known encoder quirk, leaves the SPS usable with the VUI-derived fields
 // absent; any other error stands.
-func lenientVUI(r *bitReader, s *SPS, parse func()) {
+// It reports whether the VUI was cut short.
+func lenientVUI(r *bitReader, s *SPS, parse func()) (truncated bool) {
 	parse()
 	if errors.Is(r.err, errTruncated) {
 		r.err = nil
 		s.ReorderFrames, s.FrameDuration = -1, 0
+		return true
 	}
+	return false
 }
 
 // scalingList264 skips scaling_list() for list i (H.264 §7.3.2.1.1.1): lists
@@ -557,10 +557,42 @@ func parseSPS265(r *bitReader, s *SPS) int {
 	vuiBit := r.pos
 	if r.flag() { // vui_parameters_present_flag
 		reorder := s.ReorderFrames
-		lenientVUI(r, s, func() { parseVUI265(r, s, int(maxSub)) })
+		truncated := lenientVUI(r, s, func() { parseVUI265(r, s, int(maxSub)) })
 		s.ReorderFrames = reorder // from the SPS itself, not the VUI
+		if truncated {
+			return vuiBit // nothing follows a VUI cut short
+		}
 	}
+	spsExtensions(r)
 	return vuiBit
+}
+
+// spsExtensions reads sps_extension_present_flag and the extension flags
+// (H.265 §7.3.2.2.1). The range extension is skipped; the multilayer, 3D and
+// SCC extensions and sps_extension_4bits are not supported and fail, so the
+// SPS is never accepted with extension data this package does not check.
+func spsExtensions(r *bitReader) {
+	if !r.flag() { // sps_extension_present_flag
+		return
+	}
+	rangeExt := r.flag()
+	multilayer, d3, scc := r.flag(), r.flag(), r.flag()
+	ext4 := r.u(4)
+	if r.err != nil {
+		return
+	}
+	switch {
+	case multilayer:
+		r.fail(errors.New("unsupported sps_multilayer_extension"))
+	case d3:
+		r.fail(errors.New("unsupported sps_3d_extension"))
+	case scc:
+		r.fail(errors.New("unsupported sps_scc_extension"))
+	case ext4 != 0:
+		r.fail(fmt.Errorf("unsupported sps_extension_4bits %#x", ext4))
+	case rangeExt:
+		r.skip(9) // sps_range_extension(): nine flags
+	}
 }
 
 // profileTierLevel parses profile_tier_level(1, maxSub) (H.265 §7.3.3).
@@ -644,8 +676,11 @@ func parseShortTermRPS(r *bitReader, idx, num int, sets []ShortTermRPS, maxDecMi
 			return out
 		}
 		out = deriveRPS(ref, deltaRps, used, useDelta)
-		if out.NumDeltaPocs() > maxRPSPics {
-			r.fail(fmt.Errorf("st_ref_pic_set %d has %d pictures", idx, out.NumDeltaPocs()))
+		// The bound of the explicit form: NumNegativePics ≤ max and
+		// NumPositivePics ≤ max − NumNegativePics.
+		if uint32(out.NumDeltaPocs()) > maxDecMinus1 {
+			r.fail(fmt.Errorf("st_ref_pic_set %d has %d pictures, more than sps_max_dec_pic_buffering_minus1 %d",
+				idx, out.NumDeltaPocs(), maxDecMinus1))
 			return ShortTermRPS{}
 		}
 		return out
@@ -747,7 +782,7 @@ func parseVUI265(r *bitReader, s *SPS, maxSub int) {
 			r.ue() // vui_num_ticks_poc_diff_one_minus1
 		}
 		if r.flag() { // vui_hrd_parameters_present_flag
-			hrd265(r, maxSub)
+			hrd265(r, true, maxSub)
 		}
 	}
 	if r.flag() { // bitstream_restriction_flag
@@ -760,10 +795,12 @@ func parseVUI265(r *bitReader, s *SPS, maxSub int) {
 	}
 }
 
-// hrd265 skips hrd_parameters(1, maxSub) (H.265 §E.2.2).
-func hrd265(r *bitReader, maxSub int) {
-	nal, vcl := r.flag(), r.flag()
-	subPic := false
+// hrd265 skips hrd_parameters(common, maxSub) (H.265 §E.2.2).
+func hrd265(r *bitReader, common bool, maxSub int) {
+	var nal, vcl, subPic bool
+	if common {
+		nal, vcl = r.flag(), r.flag()
+	}
 	if nal || vcl {
 		subPic = r.flag()
 		if subPic {
@@ -812,6 +849,78 @@ func subLayerHRD265(r *bitReader, cpb uint32, subPic bool) {
 		}
 		r.flag() // cbr_flag
 	}
+}
+
+// CheckVPS parses an H.265 video parameter set NAL unit (with its NAL
+// header, without a start code) through vps_timing_info and its HRD
+// parameters, checking every count against its range, and keeps only the
+// verdict. It is the pre-check to run before handing a VPS to a parser
+// without bounds.
+func CheckVPS(nalu []byte) error {
+	if _, err := checkVPS(nalu); err != nil {
+		return fmt.Errorf("h26x: check vps: %w", err)
+	}
+	return nil
+}
+
+// checkVPS parses video_parameter_set_rbsp (H.265 §7.3.2.1) up to
+// vps_extension_flag and returns the bit offset where it stopped.
+func checkVPS(nalu []byte) (int, error) {
+	hdr, err := checkHeader(H265, nalu, 0, nalVPS265)
+	if err != nil {
+		return 0, err
+	}
+	r := &bitReader{buf: unescape(nalu), pos: hdr * 8}
+	r.skip(4)                // vps_video_parameter_set_id
+	baseInternal := r.flag() // vps_base_layer_internal_flag
+	r.flag()                 // vps_base_layer_available_flag
+	maxLayers := r.u(6)      // vps_max_layers_minus1
+	maxSub := r.u(3)         // vps_max_sub_layers_minus1
+	if r.err == nil && maxLayers > 6 {
+		return r.pos, fmt.Errorf("vps_max_layers_minus1 %d out of range [0, 6]", maxLayers)
+	}
+	if r.err == nil && maxSub > 6 {
+		return r.pos, fmt.Errorf("vps_max_sub_layers_minus1 %d out of range [0, 6]", maxSub)
+	}
+	r.flag()   // vps_temporal_id_nesting_flag
+	r.skip(16) // vps_reserved_0xffff_16bits
+	profileTierLevel(r, &SPS{}, int(maxSub))
+	first := maxSub
+	if r.flag() { // vps_sub_layer_ordering_info_present_flag
+		first = 0
+	}
+	for i := first; i <= maxSub && r.err == nil; i++ {
+		dec := r.ueMax("vps_max_dec_pic_buffering_minus1", 15)
+		r.ueMax("vps_max_num_reorder_pics", dec)
+		r.ue() // vps_max_latency_increase_plus1
+	}
+	maxLayerID := r.u(6)
+	if r.err == nil && maxLayerID > 62 {
+		return r.pos, fmt.Errorf("vps_max_layer_id %d out of range [0, 62]", maxLayerID)
+	}
+	numLayerSets := r.ueMax("vps_num_layer_sets_minus1", 1023)
+	for i := uint32(1); i <= numLayerSets && r.err == nil; i++ {
+		r.skip(int(maxLayerID) + 1) // layer_id_included_flag[i][0..vps_max_layer_id]
+	}
+	if r.flag() { // vps_timing_info_present_flag
+		r.skip(64)    // vps_num_units_in_tick, vps_time_scale
+		if r.flag() { // vps_poc_proportional_to_timing_flag
+			r.ue() // vps_num_ticks_poc_diff_one_minus1
+		}
+		numHRD := r.ueMax("vps_num_hrd_parameters", numLayerSets+1)
+		minIdx := uint32(1)
+		if baseInternal {
+			minIdx = 0
+		}
+		for i := uint32(0); i < numHRD && r.err == nil; i++ {
+			if idx := r.ue(); r.err == nil && (idx < minIdx || idx > numLayerSets) {
+				r.fail(fmt.Errorf("hrd_layer_set_idx %d out of range [%d, %d]", idx, minIdx, numLayerSets))
+			}
+			common := i == 0 || r.flag() // cprms_present_flag[i]
+			hrd265(r, common, int(maxSub))
+		}
+	}
+	return r.pos, r.err
 }
 
 // ParsePPS parses a picture parameter set NAL unit (with its NAL header,
@@ -1059,16 +1168,9 @@ func (p *ParamSets) update(c Codec, nalu []byte) error {
 	if !isSPS && !isPPS {
 		return nil
 	}
-	if p.codec != c || p.sps == nil {
-		*p = ParamSets{
-			codec:  c,
-			spsRaw: map[uint32][]byte{},
-			sps:    map[uint32]*SPS{},
-			ppsRaw: map[uint32][]byte{},
-			pps:    map[uint32]*PPS{},
-		}
-	}
 	if isPPS {
+		// A PPS of another codec than the stored sets finds no SPS (ParsePPS
+		// checks the codec), so it fails without touching them.
 		pps, err := parsePPS(c, nalu, p.sps)
 		if err != nil {
 			return fmt.Errorf("pps: %w", err)
@@ -1079,6 +1181,15 @@ func (p *ParamSets) update(c Codec, nalu []byte) error {
 	sps, _, err := parseSPS(c, nalu)
 	if err != nil {
 		return fmt.Errorf("sps: %w", err)
+	}
+	if p.codec != c || p.sps == nil {
+		*p = ParamSets{
+			codec:  c,
+			spsRaw: map[uint32][]byte{},
+			sps:    map[uint32]*SPS{},
+			ppsRaw: map[uint32][]byte{},
+			pps:    map[uint32]*PPS{},
+		}
 	}
 	if bytes.Equal(p.spsRaw[sps.ID], nalu) {
 		return nil
@@ -1099,8 +1210,11 @@ func (p *ParamSets) update(c Codec, nalu []byte) error {
 	return nil
 }
 
-// SPS returns the stored SPS with an ID, or nil.
+// SPS returns the stored SPS with an ID, or nil. The SPS, including its
+// OffsetForRefFrame and ShortTermRefPicSets slices, is shared with the
+// ParamSets and must be treated as read-only.
 func (p *ParamSets) SPS(id uint32) *SPS { return p.sps[id] }
 
-// PPS returns the stored PPS with an ID, or nil.
+// PPS returns the stored PPS with an ID, or nil. The PPS is shared with the
+// ParamSets and must be treated as read-only.
 func (p *ParamSets) PPS(id uint32) *PPS { return p.pps[id] }

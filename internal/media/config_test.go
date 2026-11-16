@@ -159,57 +159,38 @@ func TestTrackConfigEqual(t *testing.T) {
 	assert.False(t, a.Equal(aac))
 }
 
-// hostilePOC1SPS returns a Main-profile H.264 SPS with pic_order_cnt_type 1
-// and num_ref_frames_in_pic_order_cnt_cycle set to cycle, followed by ones
-// zero-valued offsets (one bit each) and a valid tail, so that a parser
-// without a range check accepts it.
-func hostilePOC1SPS(cycle uint64, ones int) []byte {
-	var bitsOut []bool
-	put := func(n int, v uint64) {
-		for i := n - 1; i >= 0; i-- {
-			bitsOut = append(bitsOut, v>>uint(i)&1 == 1)
-		}
+// bitWriter builds RBSP bit strings for hand-made parameter sets.
+type bitWriter struct{ bits []bool }
+
+func (w *bitWriter) u(n int, v uint64) *bitWriter {
+	for i := n - 1; i >= 0; i-- {
+		w.bits = append(w.bits, v>>uint(i)&1 == 1)
 	}
-	ue := func(v uint64) {
-		v++
-		n := 0
-		for x := v; x > 1; x >>= 1 {
-			n++
-		}
-		put(n, 0)
-		put(n+1, v)
+	return w
+}
+
+func (w *bitWriter) ue(v uint64) *bitWriter {
+	v++
+	n := 0
+	for x := v; x > 1; x >>= 1 {
+		n++
 	}
-	put(8, 77)
-	put(8, 0)
-	put(8, 30)
-	ue(0)     // seq_parameter_set_id
-	ue(0)     // log2_max_frame_num_minus4
-	ue(1)     // pic_order_cnt_type
-	put(1, 0) // delta_pic_order_always_zero_flag
-	put(1, 1) // offset_for_non_ref_pic = 0
-	put(1, 1) // offset_for_top_to_bottom_field = 0
-	ue(cycle)
-	for i := 0; i < ones; i++ {
-		put(1, 1) // offset_for_ref_frame[i] = 0
+	return w.u(n, 0).u(n+1, v)
+}
+
+// nal appends rbsp_trailing_bits and returns the NAL unit with emulation
+// prevention bytes inserted after the header.
+func (w *bitWriter) nal(header ...byte) []byte {
+	w.u(1, 1)
+	for len(w.bits)%8 != 0 {
+		w.u(1, 0)
 	}
-	ue(1)     // max_num_ref_frames
-	put(1, 0) // gaps
-	ue(19)    // 320
-	ue(14)    // 240
-	put(1, 1) // frame_mbs_only_flag
-	put(1, 1) // direct_8x8_inference_flag
-	put(1, 0) // frame_cropping_flag
-	put(1, 0) // vui_parameters_present_flag
-	put(1, 1) // rbsp_stop_one_bit
-	for len(bitsOut)%8 != 0 {
-		bitsOut = append(bitsOut, false)
-	}
-	out := []byte{0x67}
+	out := append([]byte{}, header...)
 	zeros := 0
-	for i := 0; i < len(bitsOut); i += 8 {
+	for i := 0; i < len(w.bits); i += 8 {
 		var b byte
 		for j := 0; j < 8; j++ {
-			if bitsOut[i+j] {
+			if w.bits[i+j] {
 				b |= 0x80 >> uint(j)
 			}
 		}
@@ -225,6 +206,65 @@ func hostilePOC1SPS(cycle uint64, ones int) []byte {
 		}
 	}
 	return out
+}
+
+// hostilePOC1SPS returns a Main-profile H.264 SPS with pic_order_cnt_type 1
+// and num_ref_frames_in_pic_order_cnt_cycle set to cycle, followed by ones
+// zero-valued offsets (one bit each) and a valid tail, so that a parser
+// without a range check accepts it.
+func hostilePOC1SPS(cycle uint64, ones int) []byte {
+	w := &bitWriter{}
+	w.u(8, 77).u(8, 0).u(8, 30)
+	w.ue(0)      // seq_parameter_set_id
+	w.ue(0)      // log2_max_frame_num_minus4
+	w.ue(1)      // pic_order_cnt_type
+	w.u(1, 0)    // delta_pic_order_always_zero_flag
+	w.u(2, 0b11) // offset_for_non_ref_pic = 0, offset_for_top_to_bottom_field = 0
+	w.ue(cycle)  // num_ref_frames_in_pic_order_cnt_cycle
+	for i := 0; i < ones; i++ {
+		w.u(1, 1) // offset_for_ref_frame[i] = 0
+	}
+	w.ue(1)       // max_num_ref_frames
+	w.u(1, 0)     // gaps
+	w.ue(19)      // 320
+	w.ue(14)      // 240
+	w.u(3, 0b110) // frame_mbs_only_flag, direct_8x8_inference_flag, frame_cropping_flag
+	w.u(1, 0)     // vui_parameters_present_flag
+	return w.nal(0x67)
+}
+
+// hostileSCCSPS returns a 320x240 H.265 SPS without VUI whose SCC extension
+// declares 2^40 palette predictor initializers; mp4ff runs out of memory on
+// it.
+func hostileSCCSPS() []byte {
+	w := &bitWriter{}
+	w.u(4, 0).u(3, 0).u(1, 1)
+	w.u(2, 0).u(1, 0).u(5, 1).u(32, 0x60000000).u(48, 0x900000000000).u(8, 60) // profile_tier_level
+	w.ue(0).ue(1).ue(320).ue(240).u(1, 0)                                      // id, 4:2:0, size, no window
+	w.ue(0).ue(0).ue(4).u(1, 1).ue(4).ue(2).ue(3)                              // depths, poc lsb, ordering
+	w.ue(0).ue(3).ue(0).ue(3).ue(0).ue(0)                                      // block sizes
+	w.u(4, 0b0100)                                                             // scaling, amp, sao, pcm
+	w.ue(0)                                                                    // num_short_term_ref_pic_sets
+	w.u(4, 0b0110)                                                             // long term, tmvp, smoothing, vui
+	w.u(1, 1).u(4, 0b0001).u(4, 0)                                             // extension: scc only
+	w.u(1, 0).u(1, 1).ue(63).ue(64).u(1, 1).ue(1 << 40)                        // palette, 2^40 initializers
+	for range 64 {
+		w.u(8, 0x80)
+	}
+	return w.nal(0x42, 0x01)
+}
+
+// hostileVPS returns an H.265 VPS with vps_num_hrd_parameters near 2^32;
+// mp4ff allocates a table of that many pointers.
+func hostileVPS() []byte {
+	w := &bitWriter{}
+	w.u(4, 0).u(1, 1).u(1, 1).u(6, 0).u(3, 0).u(1, 1).u(16, 0xffff)
+	w.u(2, 0).u(1, 0).u(5, 1).u(32, 0x60000000).u(48, 0x900000000000).u(8, 60) // profile_tier_level
+	w.u(1, 1).ue(4).ue(2).ue(0)                                                // sub-layer ordering
+	w.u(6, 0).ue(0)                                                            // max layer id, layer sets
+	w.u(1, 1).u(64, 25).u(1, 0)                                                // timing
+	w.ue(0xfffffffe)                                                           // vps_num_hrd_parameters
+	return w.nal(0x40, 0x01)
 }
 
 func TestMediaRejectsHostileSPS(t *testing.T) {
@@ -245,6 +285,24 @@ func TestMediaRejectsHostileSPS(t *testing.T) {
 		_, err := NewH264Config([][]byte{sps}, [][]byte{pps})
 		require.Error(t, err)
 		_, err = CodecString(&TrackConfig{Codec: CodecH264, SPS: [][]byte{sps}, PPS: [][]byte{pps}})
+		require.Error(t, err)
+	})
+	t.Run("h265 scc", func(t *testing.T) {
+		vps, pps := unhex(t, h265VPSHex), unhex(t, h265PPSHex)
+		sps := hostileSCCSPS()
+		_, err := NewH265Config([][]byte{vps}, [][]byte{sps}, [][]byte{pps})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "sps_scc_extension")
+		_, err = CodecString(&TrackConfig{Codec: CodecH265, SPS: [][]byte{sps}})
+		require.Error(t, err)
+	})
+	t.Run("h265 vps", func(t *testing.T) {
+		sps, pps := unhex(t, h265SPSHex), unhex(t, h265PPSHex)
+		vps := hostileVPS()
+		_, err := NewH265Config([][]byte{vps}, [][]byte{sps}, [][]byte{pps})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "vps_num_hrd_parameters")
+		_, err = ParamSetID(CodecH265, vps)
 		require.Error(t, err)
 	})
 	t.Run("h265", func(t *testing.T) {

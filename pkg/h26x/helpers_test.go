@@ -98,9 +98,9 @@ func splitAnnexB(b []byte) [][]byte {
 	return out
 }
 
-// fixtureSets returns the distinct SPS and PPS NAL units of a fixture's
-// video track, in order of appearance.
-func fixtureSets(t *testing.T, name string, c Codec) (sps, pps [][]byte) {
+// fixtureNALs returns the distinct NAL units of a fixture's video track by
+// NAL unit type, in order of appearance.
+func fixtureNALs(t *testing.T, name string, c Codec) map[byte][][]byte {
 	t.Helper()
 	f, err := os.Open(filepath.Join("..", "..", "testdata", "fixtures", name))
 	require.NoError(t, err)
@@ -108,6 +108,7 @@ func fixtureSets(t *testing.T, name string, c Codec) (sps, pps [][]byte) {
 	d := mpegts.NewDemux(f)
 	var video uint16
 	seen := map[string]bool{}
+	out := map[byte][][]byte{}
 	for {
 		ev, err := d.Next()
 		if errors.Is(err, io.EOF) {
@@ -129,22 +130,26 @@ func fixtureSets(t *testing.T, name string, c Codec) (sps, pps [][]byte) {
 			if len(n) < 2 || seen[string(n)] {
 				continue
 			}
-			var typ byte
-			if c == H264 {
-				typ = n[0] & 0x1f
-			} else {
+			seen[string(n)] = true
+			typ := n[0] & 0x1f
+			if c == H265 {
 				typ = (n[0] >> 1) & 0x3f
 			}
-			switch {
-			case (c == H264 && typ == 7) || (c == H265 && typ == 33):
-				sps = append(sps, n)
-			case (c == H264 && typ == 8) || (c == H265 && typ == 34):
-				pps = append(pps, n)
-			default:
-				continue
-			}
-			seen[string(n)] = true
+			out[typ] = append(out[typ], n)
 		}
+	}
+	return out
+}
+
+// fixtureSets returns the distinct SPS and PPS NAL units of a fixture's
+// video track, in order of appearance.
+func fixtureSets(t *testing.T, name string, c Codec) (sps, pps [][]byte) {
+	t.Helper()
+	nals := fixtureNALs(t, name, c)
+	if c == H264 {
+		sps, pps = nals[nalSPS264], nals[nalPPS264]
+	} else {
+		sps, pps = nals[nalSPS265], nals[nalPPS265]
 	}
 	require.NotEmpty(t, sps, name)
 	require.NotEmpty(t, pps, name)

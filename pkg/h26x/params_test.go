@@ -315,10 +315,11 @@ type h265Opts struct {
 	stRPS        func(w *bitWriter)
 	sepColour    bool
 	maxDecMinus1 uint64
+	ext          func(w *bitWriter) // from sps_extension_present_flag on; nil writes 0
 }
 
 // h265SPS builds an SPS; end is the bit position, NAL header included, after
-// the VUI (before sps_extension_present_flag).
+// the extension flags.
 func h265SPS(o h265Opts) (nalu []byte, end int) {
 	if o.subLayers == 0 {
 		o.subLayers = 1
@@ -445,8 +446,12 @@ func h265SPS(o h265Opts) (nalu []byte, end int) {
 		w.flag(true).flag(false).flag(true).flag(false)
 		w.ue(0).ue(2).ue(1).ue(15).ue(15)
 	}
+	if o.ext != nil {
+		o.ext(w)
+	} else {
+		w.flag(false) // sps_extension_present_flag
+	}
 	end = w.nbit + 16
-	w.flag(false) // sps_extension_present_flag
 	return w.nal(0x42, 0x01), end
 }
 
@@ -797,6 +802,26 @@ func TestParseSPSHostile(t *testing.T) {
 		_, err = ParseSPS(H265, n)
 		require.Error(t, err)
 
+		// An SCC extension with 2^40 palette predictor initializers.
+		n, _ = h265SPS(h265Opts{ext: sccExt})
+		got := allocPerRun(func() {
+			err := CheckSPS(H265, n)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "sps_scc_extension")
+		})
+		assert.Less(t, got, uint64(2*len(n)+4096))
+
+		// An inter-predicted set above sps_max_dec_pic_buffering_minus1:
+		// set 0 has 2+1 pictures with maxDec 2, set 1 adds deltaRps.
+		n, _ = h265SPS(h265Opts{maxDecMinus1: 3, numSTRPS: 2, stRPS: func(w *bitWriter) {
+			w.ue(2).ue(1).ue(0).flag(true).ue(0).flag(true).ue(0).flag(true)
+			w.flag(true).flag(true).ue(1) // inter, deltaRps = -2
+			w.flag(true).flag(true).flag(true).flag(true)
+		}})
+		_, err = ParseSPS(H265, n)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "sps_max_dec_pic_buffering_minus1")
+
 		// num_negative_pics above sps_max_dec_pic_buffering_minus1.
 		n, _ = h265SPS(h265Opts{numSTRPS: 1, stRPS: func(w *bitWriter) { w.ue(5).ue(0) }})
 		_, err = ParseSPS(H265, n)
@@ -982,6 +1007,12 @@ func TestParamSets(t *testing.T) {
 	require.Error(t, q.Update(H265, []byte{0x42}))
 	require.Error(t, q.Update(Codec(7), h))
 
+	// A bad set of another codec leaves the stored sets unchanged.
+	require.Error(t, q.Update(H264, h264POC1SPS(100000, make([]int64, 300))))
+	require.Error(t, q.Update(H264, ppsNAL))
+	require.NotNil(t, q.SPS(1))
+	require.NotNil(t, q.PPS(0))
+
 	// A codec change starts over.
 	require.NoError(t, q.Update(H264, spsNAL))
 	assert.Nil(t, q.SPS(1))
@@ -1004,4 +1035,171 @@ func FuzzParseSPS(f *testing.F) {
 		_ = p.Update(codec, n)
 		_, _ = ParsePPS(codec, n, map[uint32]*SPS{s.ID: s})
 	})
+}
+
+// sccExt writes sps_extension flags with sps_scc_extension_flag set and an
+// SCC extension whose sps_num_palette_predictor_initializers_minus1 is
+// 2^40, which a parser without bounds turns into a huge allocation.
+func sccExt(w *bitWriter) {
+	w.flag(true)                                     // sps_extension_present_flag
+	w.flag(false).flag(false).flag(false).flag(true) // range, multilayer, 3d, scc
+	w.u(4, 0)                                        // sps_extension_4bits
+	w.flag(false)                                    // sps_curr_pic_ref_enabled_flag
+	w.flag(true).ue(63).ue(64)                       // palette_mode_enabled_flag, palette_max_size, delta
+	w.flag(true).ue(1 << 40)                         // initializers present, count minus1
+	for range 64 {
+		w.u(8, 0x80)
+	}
+}
+
+func TestParseSPSH265Extensions(t *testing.T) {
+	// The range extension is accepted and skipped.
+	n, end := h265SPS(h265Opts{ext: func(w *bitWriter) {
+		w.flag(true).flag(true).flag(false).flag(false).flag(false).u(4, 0)
+		w.u(9, 0x1ff)
+	}})
+	_, info, err := parseSPS(H265, n)
+	require.NoError(t, err)
+	assert.Equal(t, end, info.endBit)
+
+	for name, ext := range map[string]func(w *bitWriter){
+		"multilayer": func(w *bitWriter) { w.flag(true).flag(false).flag(true).flag(false).flag(false).u(4, 0).flag(true) },
+		"3d":         func(w *bitWriter) { w.flag(true).flag(false).flag(false).flag(true).flag(false).u(4, 0).u(8, 0) },
+		"scc":        sccExt,
+		"4bits": func(w *bitWriter) {
+			w.flag(true).flag(true).flag(false).flag(false).flag(false).u(4, 2).u(9, 0).flag(true)
+		},
+	} {
+		n, _ := h265SPS(h265Opts{ext: ext})
+		_, err := ParseSPS(H265, n)
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "unsupported", name)
+		require.Error(t, CheckSPS(H265, n), name)
+	}
+
+	// The extension flags are required unless the VUI was cut short.
+	n, _ = h265SPS(h265Opts{})
+	cut := n[:len(n)-1] // drops the byte with sps_extension_present_flag and the stop bit
+	_, err = ParseSPS(H265, cut)
+	require.Error(t, err)
+}
+
+// h265VPS builds a VPS with three sub-layers, two layer sets over layer IDs
+// 0..3, timing information and two HRD parameter sets (the second without
+// common information); ext is vps_extension_flag. end is the bit position,
+// NAL header included, before vps_extension_flag.
+func h265VPS(numHRD uint64, ext bool) (nalu []byte, end int) {
+	w := &bitWriter{}
+	w.u(4, 0).flag(true).flag(true).u(6, 0).u(3, 2).flag(true).u(16, 0xffff)
+	// profile_tier_level(1, 2)
+	w.u(2, 0).flag(false).u(5, 1).u(32, 0x60000000).u(4, 0b1001).u(43, 0).u(1, 0).u(8, 93)
+	w.flag(true).flag(true).flag(false).flag(true)
+	for i := 2; i < 8; i++ {
+		w.u(2, 0)
+	}
+	w.u(88, 0).u(8, 90).u(8, 90)
+	w.flag(true)
+	for i := 0; i < 3; i++ {
+		w.ue(4).ue(uint64(i)).ue(0)
+	}
+	w.u(6, 3).ue(1).u(4, 0b1111) // vps_max_layer_id, num_layer_sets_minus1, flags of set 1
+	w.flag(true).u(32, 1).u(32, 25).flag(true).ue(0)
+	w.ue(numHRD)
+	for i := uint64(0); i < numHRD && i < 2; i++ {
+		w.ue(i) // hrd_layer_set_idx
+		if i > 0 {
+			w.flag(false) // cprms_present_flag: sub-layer part only
+		} else {
+			w.flag(true).flag(false).flag(false).u(8, 0x55).u(15, 0) // nal, vcl, sub_pic, scales, lengths
+		}
+		for s := 0; s < 3; s++ {
+			w.flag(true).ue(0).ue(1) // fixed general, elemental duration, cpb_cnt_minus1
+			if i == 0 {
+				for c := 0; c < 2; c++ {
+					w.ue(1000).ue(2000).flag(false)
+				}
+			}
+		}
+	}
+	end = w.nbit + 16
+	w.flag(ext)
+	return w.nal(0x40, 0x01), end
+}
+
+func TestCheckVPS(t *testing.T) {
+	vps := fixtureNALs(t, "h265_aac51.ts", H265)[nalVPS265]
+	require.NotEmpty(t, vps)
+	for _, n := range vps {
+		require.NoError(t, CheckVPS(n))
+		_, err := hevc.ParseVPSNALUnit(n)
+		require.NoError(t, err)
+	}
+
+	n, end := h265VPS(2, true)
+	got, err := checkVPS(n)
+	require.NoError(t, err)
+	assert.Equal(t, end, got)
+	mp, err := hevc.ParseVPSNALUnit(n)
+	require.NoError(t, err)
+	require.NotNil(t, mp.TimingInfo)
+	assert.Equal(t, uint(2), mp.TimingInfo.NumHrdParameters)
+	assert.True(t, mp.ExtensionFlag, "mp4ff reads vps_extension_flag where h26x stopped")
+
+	t.Run("hostile", func(t *testing.T) {
+		huge, _ := h265VPS(0xfffffffe, false)
+		err := CheckVPS(huge)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "vps_num_hrd_parameters")
+		assert.True(t, strings.HasPrefix(err.Error(), "h26x: check vps: "), err.Error())
+
+		base := (&bitWriter{}).u(4, 0).flag(true).flag(true)
+		for name, c := range map[string]struct {
+			n    []byte
+			want string
+		}{
+			"max layers": {(&bitWriter{}).u(4, 0).flag(true).flag(true).u(6, 7).u(3, 0).nal(0x40, 0x01), "vps_max_layers_minus1"},
+			"sub layers": {(&bitWriter{}).u(4, 0).flag(true).flag(true).u(6, 0).u(3, 7).nal(0x40, 0x01), "vps_max_sub_layers_minus1"},
+			"layer id":   {vpsTail(func(w *bitWriter) { w.u(6, 63) }), "vps_max_layer_id"},
+			"layer sets": {vpsTail(func(w *bitWriter) { w.u(6, 62).ue(0xfffffffe) }), "vps_num_layer_sets_minus1"},
+			"exp-Golomb": {vpsTail(func(w *bitWriter) { w.u(6, 62).u(40, 0).u(1, 1).u(40, 0) }), "exp-Golomb"},
+			"hrd idx":    {vpsTail(func(w *bitWriter) { w.u(6, 0).ue(0).flag(true).u(64, 0).flag(false).ue(1).ue(3) }), "hrd_layer_set_idx"},
+			"cpb count": {vpsTail(func(w *bitWriter) {
+				w.u(6, 0).ue(0).flag(true).u(64, 0).flag(false).ue(1).ue(0).flag(false).flag(false).flag(false).flag(false).flag(false).ue(32)
+			}), "cpb_cnt_minus1"},
+			"wrong nal":   {base.nal(0x42, 0x01), "nal type"},
+			"layer 1 vps": {(&bitWriter{}).u(8, 0).nal(0x40, 0x09), "nuh_layer_id"},
+		} {
+			err := CheckVPS(c.n)
+			require.Error(t, err, name)
+			assert.Contains(t, err.Error(), c.want, name)
+		}
+		got := allocPerRun(func() { _ = CheckVPS(huge) })
+		assert.Less(t, got, uint64(4096))
+	})
+
+	t.Run("truncated", func(t *testing.T) {
+		samples := [][]byte{vps[0], n}
+		for i, sm := range samples {
+			end, err := checkVPS(sm)
+			require.NoError(t, err)
+			for l := 0; l < len(sm); l++ {
+				var err error
+				require.NotPanics(t, func() { _, err = checkVPS(sm[:l]) }, "sample %d len %d", i, l)
+				if l*8 < end {
+					require.Error(t, err, "sample %d len %d", i, l)
+				}
+			}
+		}
+	})
+}
+
+// vpsTail builds a VPS with one sub-layer and no ordering info up to
+// vps_max_layer_id, which tail writes along with what follows.
+func vpsTail(tail func(w *bitWriter)) []byte {
+	w := &bitWriter{}
+	w.u(4, 0).flag(true).flag(true).u(6, 0).u(3, 0).flag(true).u(16, 0xffff)
+	w.u(2, 0).flag(false).u(5, 1).u(32, 0x60000000).u(4, 0b1001).u(43, 0).u(1, 0).u(8, 93)
+	w.flag(false).ue(4).ue(2).ue(0)
+	tail(w)
+	return w.nal(0x40, 0x01)
 }

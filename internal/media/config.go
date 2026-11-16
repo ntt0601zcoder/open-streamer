@@ -219,7 +219,7 @@ func paramSetID(codec Codec, nalu []byte) (uint32, error) {
 		}
 		switch (nalu[0] >> 1) & 0x3f {
 		case 32:
-			vps, err := hevc.ParseVPSNALUnit(nalu)
+			vps, err := parseHEVCVPS(nalu)
 			if err != nil {
 				return 0, err
 			}
@@ -258,6 +258,15 @@ func parseHEVCSPS(nalu []byte) (*hevc.SPS, error) {
 		return nil, err
 	}
 	return hevc.ParseSPSNALUnit(nalu)
+}
+
+// parseHEVCVPS hands an H.265 VPS to mp4ff once h26x has checked it: mp4ff
+// sizes its HRD table and layer-set loops from unchecked counts.
+func parseHEVCVPS(nalu []byte) (*hevc.VPS, error) {
+	if err := h26x.CheckVPS(nalu); err != nil {
+		return nil, err
+	}
+	return hevc.ParseVPSNALUnit(nalu)
 }
 
 // readFirstUE reads the first ue(v) after a header of hdr bytes, removing
