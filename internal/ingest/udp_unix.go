@@ -18,8 +18,5 @@ func effectiveReadBuffer(pc *net.UDPConn) uint64 {
 	_ = rc.Control(func(fd uintptr) {
 		v, _ = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF)
 	})
-	if v < 0 {
-		return 0
-	}
-	return uint64(v)
+	return uint64(max(v, 0))
 }
