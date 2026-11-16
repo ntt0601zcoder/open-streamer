@@ -301,8 +301,8 @@ produces violation-free frames; failover is exactly one epoch change; a PMT
 change is one epoch change; an H.264 open-GOP feed starts video at its first
 recovery point. The `TestM2a` scenarios in `internal/e2e` prove them.
 
-M2a also did HE-AAC in the TS muxer's ADTS writer, deferred from M3a to M2b:
-M2a's fMP4 HLS pull is the first HE-AAC input.
+HE-AAC in the TS muxer's ADTS writer was deferred from M3a to M2b, then
+done in M2a, whose fMP4 HLS pull is the first HE-AAC input.
 
 Out of M2a:
 
@@ -326,8 +326,10 @@ we pull from ffmpeg and from MediaMTX); each RTMP input fed by them produces
 violation-free frames; failover between an RTMP input and an M2a input is
 exactly one epoch change; H.265 over enhanced RTMP works end to end with an
 independent writer (an ffmpeg-made enhanced-FLV fixture, and MediaMTX). The
-`TestM2b` and `TestRTMPMediaMTX` scenarios in `internal/e2e` prove them; CI
-runs MediaMTX as a service container.
+`TestM2b` and `TestRTMPMediaMTX` scenarios in `internal/e2e` prove them, with
+`TestRTMPFFmpegServerPull` (`internal/ingest`) and `TestClientFFmpegServer`
+(`pkg/rtmp`) for the pull from ffmpeg; CI runs MediaMTX as a service
+container.
 
 Out of M2b:
 
