@@ -146,3 +146,21 @@ func TestParseSDPHostile(t *testing.T) {
 		t.Fatal("garbage accepted")
 	}
 }
+
+func TestParseSDPAACFlagsAndSize(t *testing.T) {
+	mk := func(f string) []byte {
+		return []byte(sdpHead + "m=audio 0 RTP/AVP 97\r\na=rtpmap:97 mpeg4-generic/48000/2\r\na=fmtp:97 mode=AAC-hbr;config=1190;" + f + "\r\n")
+	}
+	d, err := ParseSDP(mk("sizelength=13;RandomAccessIndication=1"), "rtsp://h/a")
+	if err != nil || d.Media[0].AAC == nil || d.Media[0].AAC.RAPLength != 1 {
+		t.Fatalf("%v %+v", err, d.Media[0])
+	}
+	d, _ = ParseSDP(mk("sizelength=13;RandomAccessIndication=2"), "rtsp://h/a")
+	if d.Media[0].Reason == "" {
+		t.Fatal("RAI=2 accepted")
+	}
+	d, _ = ParseSDP(mk("sizelength=0"), "rtsp://h/a")
+	if d.Media[0].Codec != CodecOther || !strings.Contains(d.Media[0].Reason, "sizelength") {
+		t.Fatalf("%+v", d.Media[0])
+	}
+}

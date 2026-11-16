@@ -35,7 +35,7 @@ type AACFormat struct {
 	IndexDeltaLength int
 	CTSDeltaLength   int
 	DTSDeltaLength   int
-	// RAPLength is 1 when random-access-indication is set, else 0.
+	// RAPLength is 1 when randomAccessIndication is set, else 0.
 	RAPLength int
 	AuxLength int
 }
@@ -240,8 +240,8 @@ func parseAAC(m Media, kind string, f map[string]string) Media {
 	if mode != "aac-hbr" && mode != "aac-lbr" {
 		return unsupported(m, "mpeg4-generic mode %q not supported", f["mode"])
 	}
-	if f["sizelength"] == "" {
-		return unsupported(m, "mpeg4-generic without sizelength")
+	if n, err := strconv.Atoi(f["sizelength"]); err != nil || n <= 0 {
+		return unsupported(m, "mpeg4-generic without a valid sizelength")
 	}
 	cfg, err := hex.DecodeString(f["config"])
 	if err != nil || len(cfg) == 0 {
@@ -257,7 +257,7 @@ func parseAAC(m Media, kind string, f map[string]string) Media {
 		{"indexdeltalength", &a.IndexDeltaLength},
 		{"ctsdeltalength", &a.CTSDeltaLength},
 		{"dtsdeltalength", &a.DTSDeltaLength},
-		{"random-access-indication", &a.RAPLength},
+		{"randomaccessindication", &a.RAPLength},
 		{"auxiliarydatasizelength", &a.AuxLength},
 	} {
 		v, ok := f[e.key]
@@ -265,7 +265,11 @@ func parseAAC(m Media, kind string, f map[string]string) Media {
 			continue
 		}
 		n, perr := strconv.Atoi(v)
-		if perr != nil || n < 0 || n > 32 {
+		limit := 32
+		if e.key == "randomaccessindication" {
+			limit = 1
+		}
+		if perr != nil || n < 0 || n > limit {
 			return unsupported(m, "mpeg4-generic invalid %s", e.key)
 		}
 		*e.dst = n
