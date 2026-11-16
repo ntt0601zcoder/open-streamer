@@ -8,14 +8,18 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/clock"
+	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/mux/fmp4"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/hls"
 )
@@ -279,4 +283,163 @@ func TestHLSPullTSRenditionWrap(t *testing.T) {
 	assert.Equal(t, countFrames(c.aSrc)-len(c.aSrc[lost]), got[1], "every audio frame but the lost segment's")
 	assert.EqualValues(t, countFrames(c.vSrc), got[0]+int(st["dropped_unaligned"]), "video delivered or dropped to realign")
 	assert.Less(t, int(st["dropped_unaligned"]), len(c.vSrc[lost]), "at most a segment of video dropped")
+}
+
+// mixedRendition is a tsRendition whose video (or audio) playlist is fMP4
+// instead: the same frames at the same stream time, DTS + muxOffset, which
+// tfdt carries in full while TS keeps it modulo 2^33.
+type mixedRendition struct {
+	tsRendition
+	vFMP4        bool   // the video is fMP4, the audio TS; else the reverse
+	vInit, aInit []byte // the fMP4 side's init segment
+}
+
+// mixedFixture builds a mixedRendition of 2 s segments; base is added to
+// every timestamp, 40 ms more to the audio's.
+func mixedFixture(t *testing.T, base int64, vFMP4 bool) mixedRendition {
+	t.Helper()
+	c := mixedRendition{tsRendition: tsRenditionFixture(t, base, 3600, 2), vFMP4: vFMP4}
+	src, segs, init := c.aSrc, &c.aSegs, &c.aInit
+	if vFMP4 {
+		src, segs, init = c.vSrc, &c.vSegs, &c.vInit
+	}
+	cfg := src[0][0].Config
+	var err error
+	*init, err = fmp4.Init(cfg)
+	require.NoError(t, err)
+	// On the track timescale's grid, as an fMP4 round trip leaves them.
+	rate := int(fmp4.Timescale(cfg))
+	grid := func(v int64) int64 { return media.SampleTime(media.Rescale(v+muxOffset, rate), rate) - muxOffset }
+	*segs = make([][]byte, len(src))
+	for k, g := range src {
+		shifted := make([]media.Frame, len(g))
+		for i := range g {
+			g[i].DTS, g[i].PTS = grid(g[i].DTS), grid(g[i].PTS)
+			f := g[i]
+			f.DTS += muxOffset
+			f.PTS += muxOffset
+			f.Track = 0
+			shifted[i] = f
+		}
+		(*segs)[k], _, err = fmp4.Segment(shifted, cfg, uint32(k+1))
+		require.NoError(t, err)
+	}
+	return c
+}
+
+// mixedPlaylist lists the segments of n 2 s segments, "<k>.m4s" under the
+// map init.mp4 when fMP4 is set, else "<k>.ts", and ends.
+func mixedPlaylist(n int, fMP4 bool) []byte {
+	if !fMP4 {
+		return tsPlaylist(0, n, 2)
+	}
+	pl := hls.MediaPlaylist{Version: 7, TargetDuration: 2, Ended: true}
+	for k := range n {
+		pl.Segments = append(pl.Segments, hls.Segment{URI: fmt.Sprintf("%d.m4s", k), Duration: 2 * time.Second, Map: "init.mp4"})
+	}
+	return pl.Encode()
+}
+
+// serveMixed serves renditionMaster over a mixedRendition; a nil segment
+// is a 404.
+func serveMixed(t *testing.T, c mixedRendition) *httptest.Server {
+	t.Helper()
+	n := len(c.vSegs)
+	video, audio := mixedPlaylist(n, c.vFMP4), mixedPlaylist(n, !c.vFMP4)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/master.m3u8", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(renditionMaster()) })
+	mux.HandleFunc("/video/index.m3u8", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(video) })
+	mux.HandleFunc("/audio/index.m3u8", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(audio) })
+	if c.vFMP4 {
+		mux.HandleFunc("/video/init.mp4", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(c.vInit) })
+	} else {
+		mux.HandleFunc("/audio/init.mp4", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(c.aInit) })
+	}
+	seg := func(segs [][]byte, ext string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			var k int
+			_, err := fmt.Sscanf(r.PathValue("n"), "%d."+ext, &k)
+			if err != nil || k >= len(segs) || segs[k] == nil {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(segs[k])
+		}
+	}
+	vExt, aExt := "ts", "m4s"
+	if c.vFMP4 {
+		vExt, aExt = "m4s", "ts"
+	}
+	mux.HandleFunc("/video/{n}", seg(c.vSegs, vExt))
+	mux.HandleFunc("/audio/{n}", seg(c.aSegs, aExt))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s", r.URL)
+		http.NotFound(w, r)
+	})
+	return httptest.NewServer(mux)
+}
+
+// An fMP4 playlist whose tfdt is past 2^33 (an epoch-based origin) merged
+// with a TS playlist, which carries the same time modulo 2^33: the TS side
+// is moved by a whole number of wraps onto the fMP4 timeline at the first
+// alignment, and stays there across a break of its own (a lost segment),
+// whose new run starts near the other side's last frame.
+func TestHLSPullMixedContainerRendition(t *testing.T) {
+	epoch := int64(1_763_000_000) * int64(media.ClockRate) // tfdt from a wallclock origin
+	for _, tc := range []struct {
+		name  string
+		base  int64
+		vFMP4 bool
+	}{
+		{"fmp4 video, ts audio", 3*ts33 + 1_000_000, true},
+		{"ts video, fmp4 audio", 3*ts33 + 1_000_000, false},
+		{"epoch origin", epoch - epoch%ts33 + 2_000_000, true},
+		// The TS side's raw timestamps wrap 5 s in, before the lost segment.
+		{"ts side wraps", 3*ts33 - muxOffset - 5*int64(media.ClockRate), true},
+		{"ts video wraps", 3*ts33 - muxOffset - 5*int64(media.ClockRate), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := mixedFixture(t, tc.base, tc.vFMP4)
+			lost := 3
+			lostSrc, otherSrc, lostTrack := c.aSrc, c.vSrc, 1 // the TS side loses a segment
+			if !tc.vFMP4 {
+				lostSrc, otherSrc, lostTrack = c.vSrc, c.aSrc, 0
+			}
+			if tc.vFMP4 {
+				c.aSegs[lost] = nil
+			} else {
+				c.vSegs[lost] = nil
+			}
+			srv := serveMixed(t, c)
+			defer srv.Close()
+
+			r, err := ingest.Open(context.Background(), srv.URL+"/master.m3u8", ingest.Env{})
+			require.NoError(t, err)
+			require.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
+			res := pullAll(r)
+			require.ErrorIs(t, res.err, io.EOF, "the input ends, it does not stall")
+			require.NoError(t, r.Close())
+			require.Len(t, res.breaks, 1)
+			requireDTSOrder(t, res)
+			requireSourceTimeline(t, res.frames, c.tsRendition)
+
+			st := r.Stats()
+			assert.EqualValues(t, 1, st["skipped_segments"])
+			got := trackCounts(res.frames)
+			assert.Equal(t, countFrames(lostSrc)-len(lostSrc[lost]), got[lostTrack], "every TS frame but the lost segment's")
+			assert.EqualValues(t, countFrames(otherSrc), got[1-lostTrack]+int(st["dropped_unaligned"]), "fMP4 frames delivered or dropped to realign")
+			assert.Less(t, int(st["dropped_unaligned"]), len(otherSrc[lost]), "at most a segment dropped")
+
+			cl := clock.New(clock.Options{Kinds: r.Kinds()})
+			out := make([]media.Frame, 0, len(res.frames))
+			for i, f := range res.frames {
+				if slices.Contains(res.breaks, i) {
+					cl.Break(false)
+				}
+				out = append(out, cl.PushAt(f.Frame, f.Arrival)...)
+			}
+			out = append(out, cl.Flush()...)
+			assert.Nil(t, conform.CheckFrames(out, conform.FrameOptions{}))
+		})
+	}
 }

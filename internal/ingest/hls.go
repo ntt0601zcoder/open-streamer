@@ -42,6 +42,8 @@ const (
 	// being dropped, and how far past the broken playlist's last frame the
 	// other playlist's frames still belong before the break.
 	alignSlack = int64(media.ClockRate) // 1 s
+	// tsWrap is the modulus of MPEG-TS timestamps, 2^33 ticks.
+	tsWrap = int64(1) << 33
 	// pumpQueue is how many frames a playlist loop reads ahead of the merge.
 	pumpQueue = 64
 	// variantKey is the query parameter selecting a variant (0-based).
@@ -69,8 +71,14 @@ const (
 // reader follows both media playlists, each in its own goroutine (pump), and
 // merges their frames in DTS order: both are on the presentation timeline
 // (RFC 8216 §6.2.4), which TS runs keep by not rebasing their timestamps
-// (see timeDecoder) and fMP4 runs by their absolute tfdt. The rendition's audio is the reader track after the
-// variant's own tracks.
+// (see timeDecoder) and fMP4 runs by their absolute tfdt. The rendition's
+// audio is the reader track after the variant's own tracks.
+//
+// TS carries that timeline modulo 2^33, tfdt in full, so an fMP4 playlist
+// with an epoch-based origin is a whole number of wraps above a TS one. When
+// the first heads to align are one TS and one fMP4 frame at least 2^32
+// ticks apart, the TS side is moved by the multiple of 2^33 that brings them
+// within half a wrap, and stays moved for the reader's life (tsOffset).
 //
 // A break on either playlist is one ErrDiscontinuity. Before it, the other
 // playlist's frames up to the broken one's last frame (plus alignSlack) are
@@ -97,8 +105,14 @@ type hlsReader struct {
 	// Merge state, Read goroutine only.
 	sides      [2]mergeSide // main, audio
 	aligning   bool         // after a break (and at the start): drop until aligned
-	aligned    bool         // discOffset is set
+	aligned    bool         // discOffset and tsOffset are set
 	discOffset uint64       // added to the audio's discontinuity sequence
+
+	// tsOffset, a multiple of 2^33, is added to every frame of a TS run to
+	// move it from the TS timeline onto the merged one; tsKnown says it is
+	// set. Written once by the Read goroutine, read by the pumps.
+	tsOffset atomic.Int64
+	tsKnown  atomic.Bool
 
 	unaligned, otherTracks atomic.Uint64
 	wg                     sync.WaitGroup // the pumps
@@ -357,6 +371,7 @@ func (r *hlsReader) mapAudio(f Frame) (Frame, bool) {
 type item struct {
 	f    Frame
 	disc uint64
+	ts   bool // f came from a TS run: on the TS timeline until the merge moves it
 	err  error
 }
 
@@ -381,6 +396,9 @@ func (r *hlsReader) fill(s *mergeSide) error {
 		case it := <-s.ch:
 			switch {
 			case it.err == nil:
+				if it.ts {
+					shift(&it.f, r.tsOffset.Load())
+				}
 				s.head = &it
 			case errors.Is(it.err, ErrDiscontinuity):
 				s.brk = true
@@ -457,6 +475,7 @@ func (r *hlsReader) dropUnaligned() bool {
 	}
 	if !r.aligned {
 		r.discOffset, r.aligned = m.head.disc-a.head.disc, true
+		r.learnTSOffset()
 	}
 	md, ad := m.head.disc, a.head.disc+r.discOffset
 	switch {
@@ -473,6 +492,32 @@ func (r *hlsReader) dropUnaligned() bool {
 	}
 	r.unaligned.Add(1)
 	return true
+}
+
+// learnTSOffset sets tsOffset from the first heads to align: when one is a
+// TS frame and the other an fMP4 frame at least 2^32 ticks away, it is the
+// multiple of 2^33 that brings the TS head within half a wrap of the other,
+// which it moves; else it is zero.
+func (r *hlsReader) learnTSOffset() {
+	m, a := &r.sides[0], &r.sides[1]
+	if m.head.ts != a.head.ts {
+		t, o := m.head, a.head
+		if a.head.ts {
+			t, o = a.head, m.head
+		}
+		if d := o.f.DTS - t.f.DTS; d >= tsWrap/2 || d <= -tsWrap/2 {
+			off := ((d + tsWrap/2) >> 33) << 33 // nearest multiple of 2^33
+			r.tsOffset.Store(off)
+			shift(&t.f, off)
+		}
+	}
+	r.tsKnown.Store(true)
+}
+
+// shift moves f by off ticks.
+func shift(f *Frame, off int64) {
+	f.DTS += off
+	f.PTS += off
 }
 
 // Kinds implements Reader.
@@ -690,9 +735,11 @@ type hlsSource struct {
 	discontinuities, restarts, stale  atomic.Uint64
 	badSegments                       atomic.Uint64
 
-	// The DTS of the last frame read, for the other playlist's next TS run.
-	lastDTS atomic.Int64
-	hasDTS  atomic.Bool
+	// The last frame read, for the next TS run of either playlist.
+	lastMu  sync.Mutex
+	lastDTS int64 // as read, before the merge's tsOffset
+	lastTS  bool  // lastDTS came from a TS run: it is on the TS timeline
+	hasDTS  bool
 
 	mu     sync.Mutex // guards the fields below
 	run    runner
@@ -816,10 +863,11 @@ func (s *hlsSource) startRun() error {
 // timeDecoder returns the timestamp decoder of a new TS run. A lone playlist
 // gets a private one (nil), whose timeline starts at 0. When two playlists
 // are merged, both must stay on the raw 33-bit timeline they share (RFC 8216
-// §6.2.4), not each rebased to its own first PES: a run starts on the raw
-// value, unwrapped near the last DTS read from the other playlist (else from
-// this one), so that a break on one side across a wrap of the counter does
-// not leave the sides 2^33 apart.
+// §6.2.4), not each rebased to its own first PES: every TS run of the reader
+// decodes onto one TS timeline, the raw value unwrapped, which the merge
+// then moves by tsOffset. A run starts near the last DTS read from the other
+// playlist (else from this one) on that timeline, so that a break on one
+// side across a wrap of the counter does not leave the sides 2^33 apart.
 func (s *hlsSource) timeDecoder() *mpegts.TimeDecoder {
 	if s.r.audio == nil {
 		return nil
@@ -829,15 +877,40 @@ func (s *hlsSource) timeDecoder() *mpegts.TimeDecoder {
 	if s == s.r.main {
 		other = s.r.audio
 	}
-	switch {
-	case other.hasDTS.Load():
-		dec.AnchorNear(other.lastDTS.Load())
-	case s.hasDTS.Load():
-		dec.AnchorNear(s.lastDTS.Load())
-	default:
+	if ref, ok := other.tsRef(); ok {
+		dec.AnchorNear(ref)
+	} else if ref, ok := s.tsRef(); ok {
+		dec.AnchorNear(ref)
+	} else {
 		dec.AnchorRaw()
 	}
 	return dec
+}
+
+// setLast records the DTS of a frame read from a TS run (ts) or an fMP4 one.
+func (s *hlsSource) setLast(dts int64, ts bool) {
+	s.lastMu.Lock()
+	s.lastDTS, s.lastTS, s.hasDTS = dts, ts, true
+	s.lastMu.Unlock()
+}
+
+// tsRef returns the DTS of the last frame read on the TS timeline: as read
+// from a TS run, less tsOffset from an fMP4 one. It reports false before the
+// first frame, and for an fMP4 frame while tsOffset is not known.
+func (s *hlsSource) tsRef() (int64, bool) {
+	s.lastMu.Lock()
+	dts, ts, ok := s.lastDTS, s.lastTS, s.hasDTS
+	s.lastMu.Unlock()
+	switch {
+	case !ok:
+		return 0, false
+	case ts:
+		return dts, true
+	case s.r.tsKnown.Load():
+		return dts - s.r.tsOffset.Load(), true
+	default:
+		return 0, false
+	}
 }
 
 // fetchInit returns the init segment of seg's EXT-X-MAP, fetching it unless
@@ -914,16 +987,16 @@ func (s *hlsSource) pump(ch chan<- item, keep func(Frame) (Frame, bool)) {
 	defer s.r.wg.Done()
 	for {
 		f, err := s.read()
+		ts := s.st.mapURI == ""
 		if err == nil {
-			s.lastDTS.Store(f.DTS)
-			s.hasDTS.Store(true)
+			s.setLast(f.DTS, ts)
 			var ok bool
 			if f, ok = keep(f); !ok {
 				continue
 			}
 		}
 		select {
-		case ch <- item{f: f, disc: s.st.disc, err: err}:
+		case ch <- item{f: f, disc: s.st.disc, ts: ts, err: err}:
 		case <-s.r.ctx.Done():
 			return
 		}
