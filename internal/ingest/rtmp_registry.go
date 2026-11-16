@@ -47,7 +47,8 @@ type rtmpSink interface {
 }
 
 // listenPolicy bounds the sessions of one TCP listener that have not
-// published yet. Zero fields take the defaults (64 and 4).
+// published yet. Zero fields take the defaults (64 and 4). The per-IP bound
+// counts an IPv6 peer by its /64.
 type listenPolicy struct {
 	MaxPrePublish, MaxPrePublishPerIP int
 }
@@ -100,9 +101,9 @@ type rtmpListener struct {
 
 	routes map[string]*rtmpRoute // registry mu
 
-	mu      sync.Mutex // guards pending and perIP
-	pending int        // sessions that have not published
-	perIP   map[string]int
+	mu      sync.Mutex     // guards pending and perIP
+	pending int            // sessions that have not published
+	perIP   map[string]int // by peerKey: an IPv4 address or an IPv6 /64
 
 	rejectedUnknown, rejectedBusy, rejectedFlood atomic.Uint64
 }
@@ -273,7 +274,7 @@ func (l *rtmpListener) acceptLoop() {
 			continue
 		}
 		backoff = 0
-		ip := remoteIP(c)
+		ip := peerKey(c.RemoteAddr())
 		l.mu.Lock()
 		if l.pending >= l.pol.MaxPrePublish || l.perIP[ip] >= l.pol.MaxPrePublishPerIP {
 			l.mu.Unlock()
@@ -289,12 +290,28 @@ func (l *rtmpListener) acceptLoop() {
 	}
 }
 
-func remoteIP(c net.Conn) string {
-	if a, ok := c.RemoteAddr().(*net.TCPAddr); ok {
-		return a.IP.String()
+// peerKey is the key the per-IP pre-publish count uses for a remote address:
+// an IPv4 address as is (an IPv4-mapped IPv6 address unmapped), and an IPv6
+// address by its /64, which one host normally owns. An address that is not
+// an IP falls back to its host part, or its whole string.
+func peerKey(a net.Addr) string {
+	var ip netip.Addr
+	if t, ok := a.(*net.TCPAddr); ok {
+		ip, _ = netip.AddrFromSlice(t.IP)
+	} else if host, _, err := net.SplitHostPort(a.String()); err == nil {
+		ip, _ = netip.ParseAddr(host)
+		if !ip.IsValid() {
+			return host
+		}
 	}
-	host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
-	return host
+	if !ip.IsValid() {
+		return a.String()
+	}
+	ip = ip.Unmap().WithZone("")
+	if ip.Is4() {
+		return ip.String()
+	}
+	return netip.PrefixFrom(ip, 64).Masked().String()
 }
 
 // serve runs the publish exchange on c and offers the publisher to the sink

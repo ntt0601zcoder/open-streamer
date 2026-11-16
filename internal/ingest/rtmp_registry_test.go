@@ -501,3 +501,43 @@ func TestRTMPRegistryReleaseAfterAcceptError(t *testing.T) {
 	// The route is free again.
 	mustPublish(t, "rtmp://"+addr+"/live/s")
 }
+
+// An IPv6 host normally owns a /64, so the per-IP pre-publish count keys it
+// by that prefix; an IPv4-mapped address counts as its IPv4 address.
+func TestPeerKey(t *testing.T) {
+	key := func(s string) string {
+		t.Helper()
+		return peerKey(&net.TCPAddr{IP: net.ParseIP(s), Port: 1935})
+	}
+	same := [][2]string{
+		{"2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:ffff"},
+		{"2001:db8:1:2::1", "2001:db8:1:2:abcd::9"},
+		{"::ffff:1.2.3.4", "1.2.3.4"},
+		{"fe80::1", "fe80::2"},
+	}
+	for _, p := range same {
+		if a, b := key(p[0]), key(p[1]); a != b {
+			t.Errorf("key(%s) = %q, key(%s) = %q, want equal", p[0], a, p[1], b)
+		}
+	}
+	differ := [][2]string{
+		{"2001:db8:1:2::1", "2001:db8:1:3::1"},
+		{"1.2.3.4", "1.2.3.5"},
+		{"::1.2.3.4", "1.2.3.4"}, // IPv4-compatible is not IPv4-mapped
+	}
+	for _, p := range differ {
+		if a, b := key(p[0]), key(p[1]); a == b {
+			t.Errorf("key(%s) = key(%s) = %q, want different", p[0], p[1], a)
+		}
+	}
+	if k := key("1.2.3.4"); k != "1.2.3.4" {
+		t.Errorf("IPv4 key %q, want 1.2.3.4", k)
+	}
+	if k := key("2001:db8:1:2::1"); k != "2001:db8:1:2::/64" {
+		t.Errorf("IPv6 key %q, want 2001:db8:1:2::/64", k)
+	}
+	// A non-TCP address falls back to its host string.
+	if k := peerKey(&net.UnixAddr{Name: "@x", Net: "unix"}); k == "" {
+		t.Error("empty key for a unix address")
+	}
+}
