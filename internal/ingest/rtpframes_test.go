@@ -800,3 +800,140 @@ func TestRTPFramesFrameDurationChange(t *testing.T) {
 	assert.Equal(t, uint64(1), r.stats()["reorder_assumed"])
 	assert.Equal(t, 2, v.reorder)
 }
+
+// shiftFrom returns frames with the PTS of those presented at or after from
+// moved by d; DTS, and so the arrival, is kept.
+func shiftFrom(frames []media.Frame, from, d int64) []media.Frame {
+	out := slices.Clone(frames)
+	for i := range out {
+		if out[i].DTS >= from {
+			out[i].PTS += d
+		}
+	}
+	return out
+}
+
+func TestRTPFramesAudioStepBack(t *testing.T) {
+	back := -2 * int64(media.ClockRate)
+	t.Run("audio steps back before video", func(t *testing.T) {
+		srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(27, 28)))
+		v, a := srcs[0], srcs[1]
+		cut := v.frames[len(v.frames)/2+3].DTS
+		v.frames = shiftFrom(v.frames, cut, back)
+		a.frames = shiftFrom(a.frames, cut-media.FromDuration(200*time.Millisecond), back)
+		r := newRTPFrames(desc, rtpInfo(srcs, v.origin), &media.ConfigCache{})
+		out, breaks := rtpRun(t, r, rtpAUs(t, srcs, srcArrival))
+		require.Len(t, breaks, 2, "the audio step, then the video DTSBreak")
+		require.Equal(t, 1, out[breaks[0]].Track, "the audio step comes first")
+		st := r.stats()
+		assert.Equal(t, uint64(1), st["timeline_breaks"])
+		assert.Equal(t, uint64(1), st["dts_breaks"])
+		// Both tracks are placed again by arrival: after the video step
+		// they are aligned again, within the video's reorder lead.
+		after := out[breaks[1]:]
+		vs := byTrack(after, 0)
+		as := byTrack(after, 1)
+		require.NotEmpty(t, vs)
+		require.NotEmpty(t, as)
+		gap := media.FromDuration(as[0].Arrival.Sub(vs[0].Arrival))
+		assert.InDelta(t, vs[0].PTS+gap, as[0].PTS, float64(media.FromDuration(200*time.Millisecond)))
+		rtpClock(t, r.kinds(), out, breaks)
+	})
+
+	audioOnly := func(t *testing.T, seed uint64) (*rtpSrc, rtsp.Description) {
+		t.Helper()
+		srcs, _ := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(seed, seed+1)))
+		a := srcs[1]
+		a.m.Index = 0
+		return a, rtsp.Description{Media: []rtsp.Media{a.m}}
+	}
+
+	t.Run("audio only", func(t *testing.T) {
+		a, desc := audioOnly(t, 29)
+		mid := a.frames[len(a.frames)/3].DTS
+		late := a.frames[2*len(a.frames)/3].DTS
+		a.frames = shiftFrom(a.frames, mid, back)
+		// Later, a forward step of 1.5 s: past the 1 s bound.
+		a.frames = shiftFrom(a.frames, late, 3*media.ClockRate/2)
+		r := newRTPFrames(desc, nil, &media.ConfigCache{})
+		out, breaks := rtpRun(t, r, rtpAUs(t, []*rtpSrc{a}, srcArrival))
+		require.Len(t, breaks, 2)
+		require.Len(t, out, len(a.frames))
+		for k := 1; k < len(out); k++ {
+			if !slices.Contains(breaks, k) {
+				require.Greater(t, out[k].PTS, out[k-1].PTS, "audio %d", k)
+			}
+		}
+		assert.Equal(t, uint64(2), r.stats()["timeline_breaks"])
+		rtpClock(t, r.kinds(), out, breaks)
+	})
+
+	t.Run("duplicate audio AU", func(t *testing.T) {
+		a, desc := audioOnly(t, 31)
+		aus := rtpAUs(t, []*rtpSrc{a}, srcArrival)
+		aus = slices.Insert(aus, 40, aus[39])
+		r := newRTPFrames(desc, nil, &media.ConfigCache{})
+		out, breaks := rtpRun(t, r, aus)
+		require.Empty(t, breaks)
+		require.Len(t, out, len(a.frames))
+		st := r.stats()
+		assert.Equal(t, uint64(1), st["duplicate_aus"])
+		assert.Zero(t, st["timeline_breaks"])
+		rtpClock(t, r.kinds(), out, breaks)
+	})
+}
+
+// Synthetic H.264 Baseline (profile 66, so R = 0, no VUI), 320x240, and its
+// PPS.
+var (
+	baselineSPS = []byte{0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x0A, 0x0F, 0xC8}
+	baselinePPS = []byte{0x68, 0xCE, 0x3C, 0x80}
+)
+
+func TestRTPFramesRestartKeepsReorder(t *testing.T) {
+	cfg, err := media.NewH264Config([][]byte{baselineSPS}, [][]byte{baselinePPS})
+	require.NoError(t, err)
+	m := rtsp.Media{Index: 0, Codec: rtsp.CodecH264, Payload: 96, ClockRate: 90000, ParamSets: [][]byte{baselineSPS, baselinePPS}}
+	segment := func(start int64, base uint32, ssrc uint32) *rtpSrc {
+		s := &rtpSrc{m: m, base: base, origin: start, ssrc: ssrc}
+		for k := range 30 {
+			pts := start + int64(k)*3600
+			data := [][]byte{nalP}
+			if k%10 == 0 {
+				data = [][]byte{nalIDR}
+			}
+			s.frames = append(s.frames, media.Frame{Config: cfg, PTS: pts, DTS: pts, Key: k%10 == 0, Data: data})
+		}
+		return s
+	}
+	r := newRTPFrames(rtsp.Description{Media: []rtsp.Media{m}}, nil, &media.ConfigCache{})
+	rng := rand.New(rand.NewPCG(33, 34))
+	var out []Frame
+	for i := range 3 {
+		if i > 0 {
+			require.True(t, r.restart(0))
+		}
+		got, breaks := rtpRun(t, r, rtpAUs(t, []*rtpSrc{segment(int64(i)*30*3600, rng.Uint32(), uint32(0x10+i))}, srcArrival))
+		require.Empty(t, breaks)
+		require.Len(t, got, 30, "segment %d", i)
+		out = append(out, got...)
+	}
+	for k, f := range out {
+		require.Equal(t, f.PTS, f.DTS, "frame %d: R stays the SPS's 0, no added delay", k)
+	}
+	st := r.stats()
+	assert.Equal(t, uint64(2), st["restarts"])
+	assert.Zero(t, st["dts_late"])
+	assert.Zero(t, st["reorder_assumed"])
+}
+
+func TestRTPFramesZeroNTPIgnored(t *testing.T) {
+	srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(35, 36)))
+	r := newRTPFrames(desc, nil, &media.ConfigCache{})
+	_, _ = rtpRun(t, r, rtpAUs(t, srcs, srcArrival)[:50])
+	assert.False(t, r.senderReport(0, rtsp.SenderReport{NTP: time.Unix(-2208988800, 0), RTP: srcs[0].base}))
+	assert.False(t, r.senderReport(1, rtsp.SenderReport{RTP: srcs[1].base}))
+	assert.False(t, r.tracks[0].sr.ok)
+	assert.False(t, r.tracks[1].sr.ok)
+	assert.Equal(t, uint64(2), r.stats()["sr_ignored"])
+}
