@@ -5,6 +5,7 @@ go 1.26.11
 require (
 	github.com/Eyevinn/mp4ff v0.52.0
 	github.com/datarhei/gosrt v0.13.0
+	github.com/pion/rtp v1.10.6
 	github.com/pion/sdp/v3 v3.0.20
 	github.com/stretchr/testify v1.12.1
 )
