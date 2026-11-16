@@ -621,9 +621,12 @@ type rowRun struct {
 //   - UDP over RTP: at most 10 audio frames short. ffmpeg's rtp_mpegts
 //     muxer never sends its last audio PES (about ten AAC frames; ffprobe
 //     on the payloads it sends counts the same).
-//   - SRT: at most 0.5 s short. ffmpeg closes the connection as soon as it
-//     has sent the clip, and the packets still inside the receiver's
-//     latency window are not delivered.
+//   - SRT: at most 0.75 s short; 0.512 s (24 audio frames, 9 video) on
+//     every run measured. ffmpeg closes the connection as soon as it has
+//     sent the clip: the packets still inside the receiver's latency window
+//     are not delivered, the demuxer's held-back video goes with them, and
+//     audio loses whole PES of several frames. 0.75 s stays under one GOP,
+//     so a lost GOP still fails.
 //   - Our outputs: at most 3 frames short, and at most one GOP over: they
 //     start with a burst of the GOP so far.
 //
@@ -703,7 +706,7 @@ func TestM2aEveryInput(t *testing.T) {
 		exact  rowBounds
 		tsTail = rowBounds{short: kindTol{3, 3}}
 		rtp    = rowBounds{short: kindTol{3, 10}}
-		srt    = rowBounds{short: within(500 * time.Millisecond)}
+		srt    = rowBounds{short: within(750 * time.Millisecond)}
 		burst  = rowBounds{short: kindTol{3, 3}, over: kindTol{gopVideo, gopAudio}}
 	)
 	rows := []everyRow{
