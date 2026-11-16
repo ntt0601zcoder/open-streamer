@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,12 +18,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/clock"
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
@@ -43,8 +46,14 @@ const (
 	// clipPasses is how many times the live clip repeats h264_aac.ts: 36 s,
 	// so that a row joining 3.5 s late still reads more than 30 s.
 	clipPasses = 6
-	gopVideo   = 25 // h264_aac.ts has closed GOPs of 25 frames at 25 fps
-	gopAudio   = 47 // AAC frames in one GOP: 1 s at 48 kHz, 1024 samples each
+	gopVideo   = 25          // h264_aac.ts has closed GOPs of 25 frames at 25 fps
+	gopAudio   = 47          // AAC frames in one GOP: 1 s at 48 kHz, 1024 samples each
+	gopSpan    = time.Second // one GOP of h264_aac.ts
+	videoRate  = 25.0
+	audioRate  = 48000.0 / 1024
+	// failoverSlack covers the demuxer's hold-back and scheduling in a
+	// failover's gap, beyond the stall timeout and the wait for a key.
+	failoverSlack = 500 * time.Millisecond
 	// liveSpan is how long a live row must read, so that the Clock's drift
 	// evaluation, which starts 10 s into an epoch, has 20 s to fire.
 	liveSpan = 30 * time.Second
@@ -104,6 +113,44 @@ func assertWithinGOP(t *testing.T, want, got kindMap) {
 	}
 }
 
+// kindTol is a number of frames per kind.
+type kindTol struct{ video, audio int }
+
+// within is the frames of each kind in d, rounded up.
+func within(d time.Duration) kindTol {
+	return kindTol{
+		video: int(math.Ceil(d.Seconds() * videoRate)),
+		audio: int(math.Ceil(d.Seconds() * audioRate)),
+	}
+}
+
+// rowBounds bounds the frames a row delivers against its source's, per
+// kind. A source frame is accounted for when it is delivered or dropped by a
+// Clock start rule (video before the first keyframe or RASL, audio presented
+// before the keyframe): at most short frames may be unaccounted for, and at
+// most over more frames than the source's may be accounted for (the burst of
+// a row joining mid-GOP, from before the join).
+type rowBounds struct{ short, over kindTol }
+
+// assertRowCounts checks got against want within b.
+func assertRowCounts(t *testing.T, want, got kindMap, st clock.Stats, b rowBounds) {
+	t.Helper()
+	for _, k := range []struct {
+		kind        media.Kind
+		dropped     uint64
+		short, over int
+	}{
+		{media.KindVideo, st.DroppedBeforeKey + st.DroppedRASL, b.short.video, b.over.video},
+		{media.KindAudio, st.DroppedEarlyAudio, b.short.audio, b.over.audio},
+	} {
+		key := epochKind{1, k.kind}
+		require.Positive(t, want[key], "source %v frames", k.kind)
+		accounted := got[key] + int(k.dropped)
+		assert.GreaterOrEqual(t, accounted, want[key]-k.short, "%v frames: want %s, got %s, dropped %d", k.kind, want, got, k.dropped)
+		assert.LessOrEqual(t, accounted, want[key]+k.over, "%v frames: want %s, got %s, dropped %d", k.kind, want, got, k.dropped)
+	}
+}
+
 func fileURL(path, query string) string {
 	return (&url.URL{Scheme: "file", Path: path, RawQuery: query}).String()
 }
@@ -114,7 +161,9 @@ var (
 )
 
 // freeUDPPort returns a UDP port that was free a moment ago and that no
-// other test of this package was given.
+// other test of this package was given. Another process can still bind it
+// between its release here and the bind by its user; that rare flake is
+// accepted.
 func freeUDPPort(t *testing.T) int {
 	t.Helper()
 	portsMu.Lock()
@@ -252,6 +301,25 @@ func (c *collector) counts() kindMap {
 	return flat(kindCounts(c.frames))
 }
 
+// sinceKey returns the video frames taken from the last video keyframe on,
+// that keyframe included; 0 before the first.
+func (c *collector) sinceKey() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for i := len(c.frames) - 1; i >= 0; i-- {
+		f := c.frames[i]
+		if f.Kind() != media.KindVideo {
+			continue
+		}
+		n++
+		if f.Key {
+			return n
+		}
+	}
+	return 0
+}
+
 // span is the time from the first frame taken to the last.
 func (c *collector) span() time.Duration {
 	c.mu.Lock()
@@ -274,7 +342,8 @@ type m2aRun struct {
 	done   chan error
 	ended  chan struct{}
 	endMu  sync.Once
-	active chan int // the input of each activation
+	stop   chan struct{} // closed once the run has ended
+	active chan int      // the input of each activation
 
 	mu     sync.Mutex
 	events []pipeline.Event
@@ -303,6 +372,7 @@ func startRun(t *testing.T, o runOptions) *m2aRun {
 		col:    collect(h, "e2e"),
 		done:   make(chan error, 1),
 		ended:  make(chan struct{}),
+		stop:   make(chan struct{}),
 		active: make(chan int, 64),
 	}
 	if o.prepare != nil {
@@ -348,11 +418,15 @@ func (r *m2aRun) onEvent(ev pipeline.Event) {
 // end marks the source ended.
 func (r *m2aRun) end() { r.endMu.Do(func() { close(r.ended) }) }
 
-// endWith marks the source ended once done is closed.
+// endWith marks the source ended once done is closed, unless the run ends
+// first (a failure path where the source never ends).
 func (r *m2aRun) endWith(done <-chan struct{}) {
 	go func() {
-		<-done
-		r.end()
+		select {
+		case <-done:
+			r.end()
+		case <-r.stop:
+		}
 	}()
 }
 
@@ -361,6 +435,7 @@ func (r *m2aRun) endWith(done <-chan struct{}) {
 func (r *m2aRun) wait() {
 	r.waitOnce.Do(func() {
 		r.err = <-r.done
+		close(r.stop)
 		r.stats = r.p.Stats()
 		r.h.Close()
 		<-r.col.done
@@ -453,6 +528,20 @@ func newJoinedSource(t *testing.T, clip string) *joinedSource {
 	return s
 }
 
+// waitMidGOP waits until lateJoin has passed since the source started and
+// the tap is in the middle of a GOP, so that a reader joining now starts
+// with a burst of part of a GOP however loaded the machine is: a join near a
+// keyframe could subscribe after the next one, missing frames counted from
+// the lookup on.
+func (s *joinedSource) waitMidGOP(t *testing.T) {
+	t.Helper()
+	time.Sleep(time.Until(s.started.Add(lateJoin)))
+	require.Eventually(t, func() bool {
+		n := s.tap.sinceKey()
+		return n >= gopVideo/4 && n <= gopVideo/2
+	}, 10*time.Second, time.Millisecond, "the source mid-GOP")
+}
+
 func (s *joinedSource) lookup(name string) (*hub.Hub, bool) {
 	if name != "src" {
 		return nil, false
@@ -480,18 +569,23 @@ func (s *joinedSource) afterJoin(t *testing.T) kindMap {
 	return out
 }
 
-// flushWriter flushes each write to the client.
+// flushWriter flushes each write to the client, and records whether a
+// write or flush failed: the client went away.
 type flushWriter struct {
-	w  io.Writer
-	rc *http.ResponseController
+	w      io.Writer
+	rc     *http.ResponseController
+	failed atomic.Bool
 }
 
-func (f flushWriter) Write(p []byte) (int, error) {
+func (f *flushWriter) Write(p []byte) (int, error) {
 	n, err := f.w.Write(p)
-	if err != nil {
-		return n, err //nolint:wrapcheck // io.Writer contract
+	if err == nil {
+		err = f.rc.Flush()
 	}
-	return n, f.rc.Flush() //nolint:wrapcheck // io.Writer contract
+	if err != nil {
+		f.failed.Store(true)
+	}
+	return n, err //nolint:wrapcheck // io.Writer contract
 }
 
 // everyRow is one input of TestM2aEveryInput. prepare starts the row's
@@ -502,6 +596,7 @@ type everyRow struct {
 	name    string
 	live    bool
 	burst   bool // the source starts the input with a burst from its GOP cache
+	bounds  rowBounds
 	prepare func() (start func() rowRun)
 }
 
@@ -514,25 +609,29 @@ type rowRun struct {
 
 // TestM2aEveryInput runs every M2a input once. The live rows read the
 // 36 s live clip from ffmpeg in real time, or join our outputs fed by it
-// 3.5 s in, and must read for liveSpan without a drift epoch. Each row
-// delivers one epoch of clean frames whose counts per kind are within one
-// GOP of the source's: the whole clip for the rows fed by ffmpeg and the file
-// row, and what the source hub received from the join on for the rows fed by
-// our outputs, which start with a burst of up to one GOP. Where the counts
-// fall short:
-//   - A TS demuxer holds back the last video frames at a source that goes
-//     quiet (Task 12), and the Clock drops one audio frame presented before
-//     the first keyframe.
-//   - The SRT rows lose about 0.4 s at the end: ffmpeg closes the
-//     connection as soon as it has sent the clip, and the packets still
-//     inside the receiver's latency window are not delivered.
-//   - ffmpeg's rtp_mpegts muxer never sends its last audio PES (about ten
-//     AAC frames; ffprobe on the payloads it sends counts the same).
+// 3.5 s in, mid-GOP, and must read for liveSpan with drift evaluated and
+// no drift epoch. Each row delivers one epoch of clean frames, counted
+// against the source's (the whole clip for the rows fed by ffmpeg and the
+// file row, what the source hub received from the join on for the rows fed
+// by our outputs) within the row's bounds (rowBounds; the Clock drops one
+// audio frame presented before the first keyframe, which is accounted for):
+//   - file: exact.
+//   - UDP, HTTP and HLS: at most 3 frames short. A TS demuxer holds back
+//     the last video frames at a source that goes quiet (Task 12).
+//   - UDP over RTP: at most 10 audio frames short. ffmpeg's rtp_mpegts
+//     muxer never sends its last audio PES (about ten AAC frames; ffprobe
+//     on the payloads it sends counts the same).
+//   - SRT: at most 0.5 s short. ffmpeg closes the connection as soon as it
+//     has sent the clip, and the packets still inside the receiver's
+//     latency window are not delivered.
+//   - Our outputs: at most 3 frames short, and at most one GOP over: they
+//     start with a burst of the GOP so far.
 //
 // The rows run at the same time (Ruling R-PF3). They are started from the
 // test itself rather than as parallel subtests, so that -parallel, which
 // defaults to the CPU count, does not queue rows that mostly wait on real
-// time; each row's checks then run in its own subtest.
+// time; each row's checks then run in its own subtest. So -run selecting
+// one row still starts every row; that is accepted.
 func TestM2aEveryInput(t *testing.T) {
 	t.Parallel()
 	ffmpeg := testpeer.Require(t, "ffmpeg", "udp", "rtp", "srt")
@@ -591,7 +690,7 @@ func TestM2aEveryInput(t *testing.T) {
 		return func() func() rowRun {
 			s := newJoinedSource(t, clip)
 			return func() rowRun {
-				time.Sleep(time.Until(s.started.Add(lateJoin)))
+				s.waitMidGOP(t)
 				u, env := input(s)
 				r := startRun(t, runOptions{inputs: []string{u}, env: env})
 				r.endWith(s.ended)
@@ -600,15 +699,22 @@ func TestM2aEveryInput(t *testing.T) {
 		}
 	}
 
+	var (
+		exact  rowBounds
+		tsTail = rowBounds{short: kindTol{3, 3}}
+		rtp    = rowBounds{short: kindTol{3, 10}}
+		srt    = rowBounds{short: within(500 * time.Millisecond)}
+		burst  = rowBounds{short: kindTol{3, 3}, over: kindTol{gopVideo, gopAudio}}
+	)
 	rows := []everyRow{
-		{"file", false, false, func() func() rowRun {
+		{"file", false, false, exact, func() func() rowRun {
 			return func() rowRun {
 				return rowRun{startRun(t, runOptions{inputs: []string{fileURL(clip, "pace=0")}}), whole}
 			}
 		}},
-		{"udp", true, false, udpRow(false)},
-		{"udp-rtp", true, false, udpRow(true)},
-		{"srt-caller", true, false, func() func() rowRun {
+		{"udp", true, false, tsTail, udpRow(false)},
+		{"udp-rtp", true, false, rtp, udpRow(true)},
+		{"srt-caller", true, false, srt, func() func() rowRun {
 			port := freeUDPPort(t)
 			f := startFFmpeg(t, ffmpeg, slices.Concat(ffIn, []string{
 				"-f", "mpegts", fmt.Sprintf("srt://127.0.0.1:%d?mode=listener&latency=200000", port),
@@ -620,7 +726,7 @@ func TestM2aEveryInput(t *testing.T) {
 				return rowRun{r, ffSource(f)}
 			}
 		}},
-		{"srt-listener", true, false, func() func() rowRun {
+		{"srt-listener", true, false, srt, func() func() rowRun {
 			port := freeUDPPort(t)
 			r := startRun(t, runOptions{inputs: []string{
 				fmt.Sprintf("srt://127.0.0.1:%d?mode=listener&streamid=cam&latency=200", port),
@@ -634,9 +740,10 @@ func TestM2aEveryInput(t *testing.T) {
 				return rowRun{r, ffSource(f)}
 			}
 		}},
-		{"http-ts", true, false, func() func() rowRun {
+		{"http-ts", true, false, tsTail, func() func() rowRun {
 			// The handler streams ffmpeg's output; ended closes before the
-			// response ends.
+			// response ends. A client that goes away first (the run
+			// cancelled on a failure path) kills ffmpeg: no error then.
 			ended := make(chan struct{})
 			var once sync.Once
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -645,15 +752,18 @@ func TestM2aEveryInput(t *testing.T) {
 				rc := http.NewResponseController(w)
 				w.WriteHeader(http.StatusOK)
 				if err := rc.Flush(); err != nil {
-					t.Errorf("flush: %v", err)
+					if req.Context().Err() == nil {
+						t.Errorf("flush: %v", err)
+					}
 					return
 				}
 				cmd := exec.CommandContext(req.Context(), ffmpeg, slices.Concat(
 					[]string{"-hide_banner", "-loglevel", "error", "-nostdin"}, ffIn,
 					[]string{"-flush_packets", "1", "-f", "mpegts", "pipe:1"})...)
 				var stderr bytes.Buffer
-				cmd.Stdout, cmd.Stderr = flushWriter{w: w, rc: rc}, &stderr
-				if err := cmd.Run(); err != nil {
+				out := &flushWriter{w: w, rc: rc}
+				cmd.Stdout, cmd.Stderr = out, &stderr
+				if err := cmd.Run(); err != nil && req.Context().Err() == nil && !out.failed.Load() {
 					t.Errorf("ffmpeg: %v: %s", err, stderr.String())
 				}
 			}))
@@ -661,21 +771,29 @@ func TestM2aEveryInput(t *testing.T) {
 			return func() rowRun {
 				r := startRun(t, runOptions{inputs: []string{srv.URL + "/live.ts"}})
 				r.endWith(ended)
-				return rowRun{r, func(*testing.T) kindMap { <-ended; return src }}
+				return rowRun{r, func(t *testing.T) kindMap {
+					t.Helper()
+					select {
+					case <-ended:
+					case <-time.After(10 * time.Second):
+						t.Fatal("the http-ts source did not end")
+					}
+					return src
+				}}
 			}
 		}},
-		{"http-ts-ours", true, true, ourRow(func(s *joinedSource) (string, ingest.Env) {
+		{"http-ts-ours", true, true, burst, ourRow(func(s *joinedSource) (string, ingest.Env) {
 			srv := httptest.NewServer(httpts.Handler(s.lookup, 0))
 			t.Cleanup(srv.Close)
 			return srv.URL + "/live/src/stream.ts", ingest.Env{}
 		})},
-		{"hls-ts", true, false, hlsRow("index.m3u8", "index.m3u8", []string{"index.m3u8"}, "-c", "copy")},
-		{"hls-fmp4-audio-rendition", true, false, hlsRow("master.m3u8", "stream_%v.m3u8",
+		{"hls-ts", true, false, tsTail, hlsRow("index.m3u8", "index.m3u8", []string{"index.m3u8"}, "-c", "copy")},
+		{"hls-fmp4-audio-rendition", true, false, tsTail, hlsRow("master.m3u8", "stream_%v.m3u8",
 			[]string{"master.m3u8", "stream_0.m3u8", "stream_1.m3u8"},
 			"-map", "0:v", "-map", "0:a", "-c", "copy", "-bsf:a", "aac_adtstoasc",
 			"-hls_segment_type", "fmp4", "-master_pl_name", "master.m3u8",
 			"-var_stream_map", "v:0,agroup:aud a:0,agroup:aud,default:yes")},
-		{"copy", true, true, ourRow(func(s *joinedSource) (string, ingest.Env) {
+		{"copy", true, true, burst, ourRow(func(s *joinedSource) (string, ingest.Env) {
 			return "copy://src", ingest.Env{Lookup: s.lookup}
 		})},
 	}
@@ -694,10 +812,12 @@ func TestM2aEveryInput(t *testing.T) {
 			rr.r.check(t, []uint32{1})
 			want := rr.source(t)
 			got := rr.r.col.counts()
-			assertWithinGOP(t, want, got)
+			assertRowCounts(t, want, got, rr.r.stats.Clock, row.bounds)
 			assert.Zero(t, rr.r.stats.Switches)
 			if row.live {
 				assert.GreaterOrEqual(t, rr.r.col.span(), liveSpan, "read time")
+				// DriftBreaks == 0 means something only if drift was judged.
+				assert.Positive(t, rr.r.stats.Clock.DriftEvaluations, "drift evaluated")
 			}
 			if row.burst {
 				video := epochKind{1, media.KindVideo}
@@ -780,9 +900,8 @@ func TestM2aFailoverSRTtoUDP(t *testing.T) {
 	}
 	require.Positive(t, first2)
 	gap := recv[first2].Sub(recv[first2-1])
-	lostVideo := int(gap.Seconds()*25) - 1
-	const stall = 4 * time.Second // the pipeline's default StallTimeout
-	bound := int((stall + time.Second + 500*time.Millisecond).Seconds() * 25)
+	lostVideo := int(gap.Seconds()*videoRate) - 1
+	bound := int((pipeline.DefaultStallTimeout + gopSpan + failoverSlack).Seconds() * videoRate)
 	assert.LessOrEqual(t, lostVideo, bound, "video frames lost in a %v gap", gap)
 	for _, f := range frames[first2:] {
 		require.Equal(t, uint32(2), f.Epoch, "epoch 2 runs to the end")

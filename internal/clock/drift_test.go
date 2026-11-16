@@ -237,6 +237,7 @@ func TestDriftJitterIgnored(t *testing.T) {
 	assert.Zero(t, c.Stats().DriftBreaks)
 	assert.Len(t, c.Epochs(), 1)
 	requireNearZero(t, r)
+	assert.EqualValues(t, len(r.drifts[1]), c.Stats().DriftEvaluations, "one evaluation per second of arrivals")
 }
 
 // requireNearZero checks that every drift evaluated in epoch 1 is near 0: the
@@ -384,6 +385,7 @@ func TestDriftDisabled(t *testing.T) {
 		feed(c, videoRun(0, halfHour), source(s))
 		assert.Zero(t, c.Stats().DriftBreaks)
 		assert.Zero(t, c.Stats().DroppedDrift)
+		assert.Zero(t, c.Stats().DriftEvaluations)
 		assert.Len(t, c.Epochs(), 1)
 	}
 }

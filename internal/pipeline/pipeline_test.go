@@ -766,6 +766,8 @@ func TestPipelineBurstNoDrift(t *testing.T) {
 
 	st := p.Stats()
 	assert.Zero(t, st.Clock.DriftBreaks)
+	assert.Positive(t, st.Clock.DriftEvaluations, "drift judged")
+	st.Clock.DriftEvaluations = 0
 	assert.Equal(t, clock.Stats{}, st.Clock, "no frame dropped")
 	assert.Len(t, drain(sub), len(steps), "every frame delivered")
 	assert.Equal(t, -1, st.Active, "the ended input is no longer active")

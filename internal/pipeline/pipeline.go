@@ -18,9 +18,13 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
 
+// DefaultStallTimeout is Options.StallTimeout when it is zero; exported for
+// tests that bound a failover.
+const DefaultStallTimeout = 4 * time.Second
+
 const (
 	defaultStartTimeout  = 10 * time.Second
-	defaultStallTimeout  = 4 * time.Second
+	defaultStallTimeout  = DefaultStallTimeout
 	defaultRetryInterval = 10 * time.Second
 	defaultFailbackHold  = 10 * time.Second
 	firstRetry           = 500 * time.Millisecond // the first retry wait, doubled up to RetryInterval
