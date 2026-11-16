@@ -185,11 +185,12 @@ func videoFrames(t *testing.T, name string) []media.Frame {
 // first PES also carries the parameter sets: frames hold none.
 func repackAUs(t *testing.T, stype uint8, frames []media.Frame, per int) []byte {
 	t.Helper()
-	return repackAUsLate(t, stype, frames, per, 0)
+	return repackAUsAdj(t, stype, frames, per, func(int) int64 { return 0 })
 }
 
-// repackAUsLate is repackAUs with every PES DTS late by late ticks.
-func repackAUsLate(t *testing.T, stype uint8, frames []media.Frame, per int, late int64) []byte {
+// repackAUsAdj is repackAUs with adj(i) ticks added to the DTS of the PES
+// whose first unit is frames[i].
+func repackAUsAdj(t *testing.T, stype uint8, frames []media.Frame, per int, adj func(i int) int64) []byte {
 	t.Helper()
 	const off = 900000
 	cfg := frames[0].Config
@@ -203,7 +204,7 @@ func repackAUsLate(t *testing.T, stype uint8, frames []media.Frame, per int, lat
 		for _, f := range frames[i:min(i+per, len(frames))] {
 			nalus = append(nalus, f.Data...)
 		}
-		b.videoPES(videoPID, frames[i].PTS+off, frames[i].DTS+off+late, joinNALUs(nalus...))
+		b.videoPES(videoPID, frames[i].PTS+off, frames[i].DTS+off+adj(i), joinNALUs(nalus...))
 	}
 	return b.buf.Bytes()
 }
@@ -318,13 +319,15 @@ func TestVideoPESManyAUsPOCReset(t *testing.T) {
 	assertRecovered(t, d, src, out, 3, []int{1, 2, 25, 26, 50, 76, 77, 101})
 }
 
-// TestVideoPESManyAUsPTSBelowDTS makes every PES DTS 5400 ticks late: a
-// split unit whose PTS from its POC falls below its DTS is dropped. In
-// h264_aac.ts those are the units with PTS - DTS == 3600.
+// TestVideoPESManyAUsPTSBelowDTS makes every PES DTS 6000 ticks late (no
+// PES then has PTS == DTS): a split unit whose PTS from its POC falls below
+// its DTS by half a frame (1800) or more is dropped. In h264_aac.ts those
+// are the units with PTS - DTS == 3600, short by 2400; none falls short by
+// less.
 func TestVideoPESManyAUsPTSBelowDTS(t *testing.T) {
-	const late = 5400
+	const late, halfFrame = 6000, 1800
 	src := videoFrames(t, "h264_aac.ts")[:33]
-	d, out := demuxAll(t, repackAUsLate(t, typeH264, src, 3, late))
+	d, out := demuxAll(t, repackAUsAdj(t, typeH264, src, 3, func(int) int64 { return late }))
 	shift := out[0].PTS - src[0].PTS
 	want, got := make([]int, 0, len(src)), make([]int, 0, len(out))
 	below := 0
@@ -333,9 +336,11 @@ func TestVideoPESManyAUsPTSBelowDTS(t *testing.T) {
 		case i%3 == 0:
 		case i < 3 || i == 25 || i == 26: // before calibration; POC reset
 			continue
-		case f.PTS < f.DTS+late:
+		case f.DTS+late-f.PTS >= halfFrame:
 			below++
 			continue
+		default:
+			require.LessOrEqual(t, f.DTS+late-f.PTS, int64(0), "unit %d would be clamped", i)
 		}
 		want = append(want, i)
 	}
@@ -351,6 +356,101 @@ func TestVideoPESManyAUsPTSBelowDTS(t *testing.T) {
 	}
 	assert.Equal(t, want, got)
 	assert.Equal(t, uint64(4+below), d.Stats().SplitAUsReordered)
+}
+
+// TestVideoPESManyAUsJitterClamp gives the PES of h264_pyramid.ts unit 12 a
+// DTS 2 ticks late. Spacing the group of unit 9 over the longer gap puts the
+// DTS of unit 11, a B frame with PTS == DTS, one tick above the PTS its POC
+// gives: short by less than half a frame, it is raised to its DTS, not
+// dropped.
+func TestVideoPESManyAUsJitterClamp(t *testing.T) {
+	src := videoFrames(t, "h264_pyramid.ts")[:30]
+	require.Equal(t, src[11].PTS, src[11].DTS)
+	d, out := demuxAll(t, repackAUsAdj(t, typeH264, src, 3, func(i int) int64 {
+		if i == 12 {
+			return 2
+		}
+		return 0
+	}))
+	dtsAdj := map[int]int64{11: 1, 12: 2, 13: 1}
+	var want []int
+	for i := range src {
+		if !slices.Contains([]int{1, 2, 25, 26}, i) { // before calibration; POC reset
+			want = append(want, i)
+		}
+	}
+	require.Len(t, out, len(want))
+	shift := out[0].PTS - src[0].PTS
+	for k, f := range out {
+		i := want[k]
+		wantPTS := src[i].PTS
+		if i == 11 {
+			wantPTS = src[i].DTS + 1 // clamped
+		}
+		assert.Equal(t, src[i].DTS+dtsAdj[i], f.DTS-shift, "unit %d", i)
+		assert.Equal(t, wantPTS, f.PTS-shift, "unit %d", i)
+		assert.Equal(t, src[i].Data, f.Data, "unit %d", i)
+	}
+	assert.Equal(t, uint64(4), d.Stats().SplitAUsReordered)
+}
+
+// TestVideoPESManyAUsNotReordered keeps the I and P pictures of h264_aac.ts
+// (each PTS above every earlier one: decode order is presentation order),
+// retimes them at 23.976 fps (3753.75 ticks per frame, so the PES of three
+// units are 11261 or 11262 ticks apart) with PTS == DTS, and packs three per
+// PES. Their slices are dated and the POC calibrates, but every unit keeps
+// PTS = DTS, spaced evenly as before; none is dropped, the IDRs inside
+// groups included.
+func TestVideoPESManyAUsNotReordered(t *testing.T) {
+	var src []media.Frame
+	top := int64(-1 << 62)
+	for _, f := range videoFrames(t, "h264_aac.ts") {
+		if f.PTS > top {
+			top = f.PTS
+			f.PTS = int64(len(src)) * 90000 * 1001 / 24000
+			f.DTS = f.PTS
+			src = append(src, f)
+		}
+	}
+	require.Greater(t, len(src), 30)
+	d, out := demuxAll(t, repackAUs(t, typeH264, src, 3))
+	require.Len(t, out, len(src))
+	shift := out[0].DTS - src[0].DTS
+	lastG := (len(src) - 1) / 3 * 3
+	lastStep := (src[lastG].DTS - src[lastG-3].DTS) / 3 // times the last group
+	for k, f := range out {
+		g := k / 3 * 3
+		dts := src[g].DTS + int64(k-g)*lastStep
+		if g < lastG {
+			dts = src[g].DTS + int64(k-g)*(src[g+3].DTS-src[g].DTS)/3
+		}
+		assert.Equal(t, dts, f.DTS-shift, "unit %d", k)
+		assert.Equal(t, f.DTS, f.PTS, "unit %d", k)
+		assert.Equal(t, src[k].Data, f.Data, "unit %d", k)
+	}
+	st := d.Stats()
+	assert.Zero(t, st.SplitAUsReordered)
+	assert.Zero(t, st.SplitAUsNoRoom)
+	assert.Zero(t, st.SplitAUsPOC)
+	assert.Equal(t, uint64(len(src)-(len(src)+2)/3), st.SplitAUs)
+	tr := d.tracks[0]
+	assert.Positive(t, tr.calDen, "POC timing was available")
+	assert.False(t, tr.reorders)
+}
+
+// TestPOCCounterNeedsMultiAUPES starts a stream with a PES without PTS that
+// starts an access unit with nothing pending: no PES holds two units, so
+// the track never starts a POC counter.
+func TestPOCCounterNeedsMultiAUPES(t *testing.T) {
+	sps, pps := h264Params(t)
+	b := newTSBuilder(t)
+	b.program(h264Stream)
+	b.pesNoPTS(videoPID, joinNALUs(nalAUD, sps, pps, idrSlice(true, 30)))
+	b.videoPES(videoPID, 0, 0, joinNALUs(nalAUD, sps, pps, idrSlice(true, 30)))
+	b.videoPES(videoPID, 3600, 3600, joinNALUs(nalAUD, pSlice(true, 30)))
+	d, frames := demuxAll(t, b.buf.Bytes())
+	assert.Len(t, frames, 2)
+	assert.Nil(t, d.tracks[0].poc)
 }
 
 // withPPSID1 returns an H.264 PPS rewritten with pic_parameter_set_id 1 in
