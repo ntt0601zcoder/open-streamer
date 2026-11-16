@@ -381,6 +381,7 @@ func TestClientCommands(t *testing.T) {
 		{Key: "audioCodecs", Value: 4095.0},
 		{Key: "videoCodecs", Value: 255.0},
 		{Key: "videoFunction", Value: 1.0},
+		{Key: "fourCcList", Value: []any{"hvc1"}},
 	}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("connect %#v, want %#v", got, want)
