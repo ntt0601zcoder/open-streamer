@@ -158,3 +158,100 @@ func TestTrackConfigEqual(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, a.Equal(aac))
 }
+
+// hostilePOC1SPS returns a Main-profile H.264 SPS with pic_order_cnt_type 1
+// and num_ref_frames_in_pic_order_cnt_cycle set to cycle, followed by ones
+// zero-valued offsets (one bit each) and a valid tail, so that a parser
+// without a range check accepts it.
+func hostilePOC1SPS(cycle uint64, ones int) []byte {
+	var bitsOut []bool
+	put := func(n int, v uint64) {
+		for i := n - 1; i >= 0; i-- {
+			bitsOut = append(bitsOut, v>>uint(i)&1 == 1)
+		}
+	}
+	ue := func(v uint64) {
+		v++
+		n := 0
+		for x := v; x > 1; x >>= 1 {
+			n++
+		}
+		put(n, 0)
+		put(n+1, v)
+	}
+	put(8, 77)
+	put(8, 0)
+	put(8, 30)
+	ue(0)     // seq_parameter_set_id
+	ue(0)     // log2_max_frame_num_minus4
+	ue(1)     // pic_order_cnt_type
+	put(1, 0) // delta_pic_order_always_zero_flag
+	put(1, 1) // offset_for_non_ref_pic = 0
+	put(1, 1) // offset_for_top_to_bottom_field = 0
+	ue(cycle)
+	for i := 0; i < ones; i++ {
+		put(1, 1) // offset_for_ref_frame[i] = 0
+	}
+	ue(1)     // max_num_ref_frames
+	put(1, 0) // gaps
+	ue(19)    // 320
+	ue(14)    // 240
+	put(1, 1) // frame_mbs_only_flag
+	put(1, 1) // direct_8x8_inference_flag
+	put(1, 0) // frame_cropping_flag
+	put(1, 0) // vui_parameters_present_flag
+	put(1, 1) // rbsp_stop_one_bit
+	for len(bitsOut)%8 != 0 {
+		bitsOut = append(bitsOut, false)
+	}
+	out := []byte{0x67}
+	zeros := 0
+	for i := 0; i < len(bitsOut); i += 8 {
+		var b byte
+		for j := 0; j < 8; j++ {
+			if bitsOut[i+j] {
+				b |= 0x80 >> uint(j)
+			}
+		}
+		if zeros >= 2 && b <= 3 {
+			out = append(out, 3) // emulation_prevention_three_byte
+			zeros = 0
+		}
+		out = append(out, b)
+		if b == 0 {
+			zeros++
+		} else {
+			zeros = 0
+		}
+	}
+	return out
+}
+
+func TestMediaRejectsHostileSPS(t *testing.T) {
+	pps := unhex(t, h264PPSHex)
+	t.Run("cycle 100000", func(t *testing.T) {
+		sps := hostilePOC1SPS(100000, 100000)
+		_, err := NewH264Config([][]byte{sps}, [][]byte{pps})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "media: h264 config")
+		_, err = ParamSetID(CodecH264, sps)
+		require.Error(t, err)
+		_, err = CodecString(&TrackConfig{Codec: CodecH264, SPS: [][]byte{sps}, PPS: [][]byte{pps}})
+		require.Error(t, err)
+	})
+	t.Run("cycle huge", func(t *testing.T) {
+		// A count near 2^32 used to make mp4ff allocate tens of gigabytes.
+		sps := hostilePOC1SPS(0xfffffffe, 64)
+		_, err := NewH264Config([][]byte{sps}, [][]byte{pps})
+		require.Error(t, err)
+		_, err = CodecString(&TrackConfig{Codec: CodecH264, SPS: [][]byte{sps}, PPS: [][]byte{pps}})
+		require.Error(t, err)
+	})
+	t.Run("h265", func(t *testing.T) {
+		sps := unhex(t, h265SPSHex)
+		_, err := NewH265Config([][]byte{unhex(t, h265VPSHex)}, [][]byte{sps[:12]}, [][]byte{unhex(t, h265PPSHex)})
+		require.Error(t, err)
+		_, err = CodecString(&TrackConfig{Codec: CodecH265, SPS: [][]byte{sps[:12]}})
+		require.Error(t, err)
+	})
+}
