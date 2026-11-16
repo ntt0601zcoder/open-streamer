@@ -65,12 +65,13 @@ func joinNonEmpty(sep string, parts ...string) string {
 }
 
 // ServerConn is an accepted publisher. ReadMedia must be called from one
-// goroutine; Request, LastInbound, UnknownCommands and Close are safe from
-// any.
+// goroutine; Request, LastInbound, UnknownCommands, BadCommands and Close are
+// safe from any.
 type ServerConn struct {
 	s       *session
 	req     PublishRequest
 	unknown atomic.Uint64
+	bad     atomic.Uint64
 	err     error // terminal ReadMedia error
 }
 
@@ -300,8 +301,9 @@ func (sc *ServerConn) Request() PublishRequest {
 // "@setDataFrame" is removed from data messages, so metadata reads as the
 // onMetaData tag body. deleteStream, FCUnpublish and closeStream end the
 // stream with io.EOF. Unknown commands, and every type-17 (AMF3) command,
-// are counted and skipped. Any error is
-// terminal and is returned again by later calls; the caller then Closes.
+// are counted and skipped, and so are AMF0 commands that do not decode,
+// which BadCommands counts. Any error is terminal and is returned again by
+// later calls; the caller then Closes.
 func (sc *ServerConn) ReadMedia() (Media, error) {
 	if sc.err != nil {
 		return Media{}, sc.err
@@ -327,8 +329,8 @@ func (sc *ServerConn) ReadMedia() (Media, error) {
 		}
 		name, _, _, err := parseCommand(m.Payload)
 		if err != nil {
-			sc.err = fmt.Errorf("rtmp: server: %w", err)
-			return Media{}, sc.err
+			sc.bad.Add(1)
+			continue
 		}
 		switch name {
 		case "deleteStream", "FCUnpublish", "closeStream":
@@ -351,6 +353,12 @@ func (sc *ServerConn) LastInbound() time.Time {
 // type-17 (AMF3) command other than a connect, which is rejected.
 func (sc *ServerConn) UnknownCommands() uint64 {
 	return sc.unknown.Load()
+}
+
+// BadCommands counts the AMF0 commands from the publisher that did not
+// decode after publish was accepted, and were skipped.
+func (sc *ServerConn) BadCommands() uint64 {
+	return sc.bad.Load()
 }
 
 // Close closes the connection, unblocking a pending ReadMedia. It never

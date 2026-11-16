@@ -341,6 +341,7 @@ func (l *rtmpListen) retire() {
 		l.doneStat[k] += n
 	}
 	l.doneStat["unknown_commands"] += s.conn.UnknownCommands()
+	l.doneStat["bad_commands"] += s.conn.BadCommands()
 	if l.opened {
 		l.video = l.video || v
 		l.audio = l.audio || a
@@ -394,8 +395,9 @@ func (l *rtmpListen) Kinds() []media.Kind {
 func (l *rtmpListen) Spec() Spec { return l.spec }
 
 // Stats implements Reader: the flvFrames counters of every publisher, the
-// publishers accepted and taken over, and the rejections of the shared TCP
-// listener (for every path on it).
+// commands its publishers sent that were unknown (unknown_commands) or did
+// not decode (bad_commands), the publishers accepted and taken over, and the
+// rejections of the shared TCP listener (for every path on it).
 func (l *rtmpListen) Stats() map[string]uint64 {
 	l.mu.Lock()
 	out := make(map[string]uint64, len(l.doneStat)+8)
@@ -407,6 +409,7 @@ func (l *rtmpListen) Stats() map[string]uint64 {
 			out[k] += v
 		}
 		out["unknown_commands"] += s.conn.UnknownCommands()
+		out["bad_commands"] += s.conn.BadCommands()
 	}
 	l.mu.Unlock()
 	out["publishers"] = l.publishers.Load()

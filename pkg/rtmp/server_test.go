@@ -476,6 +476,29 @@ func TestServerUnknownCommandsIgnored(t *testing.T) {
 	}
 }
 
+// An undecodable AMF0 command after publish is counted and skipped; the
+// session goes on.
+func TestServerSkipsBadCommand(t *testing.T) {
+	c := startRaw(t, context.Background(), rtmp.Config{}, nil, true)
+	sc := c.publishTo(t, "live", "s")
+	c.write(t, 3, rtmp.Message{Type: rtmp.MsgCommandAMF0, StreamID: 1, Payload: []byte{0xFF, 0x01}})                   // unknown AMF0 marker
+	c.write(t, 3, rtmp.Message{Type: rtmp.MsgCommandAMF0, StreamID: 1, Payload: []byte{0x00, 0, 0, 0, 0, 0, 0, 0, 0}}) // a number, not a name
+	c.write(t, 4, rtmp.Message{Type: rtmp.MsgAudio, StreamID: 1, Timestamp: 7, Payload: []byte{0xAF, 1, 2}})
+	if m, err := readMedia(t, sc); err != nil || m.Type != rtmp.MsgAudio || m.Timestamp != 7 {
+		t.Fatalf("ReadMedia after bad commands: %v %+v, want the audio message", err, m)
+	}
+	if n := sc.BadCommands(); n != 2 {
+		t.Fatalf("BadCommands %d, want 2", n)
+	}
+	if n := sc.UnknownCommands(); n != 0 {
+		t.Fatalf("UnknownCommands %d, want 0", n)
+	}
+	c.command(t, 1, "deleteStream", 0, nil, 1)
+	if _, err := readMedia(t, sc); !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadMedia: %v, want io.EOF", err)
+	}
+}
+
 func TestServerMediaAndEnd(t *testing.T) {
 	for _, end := range []string{"deleteStream", "FCUnpublish", "closeStream"} {
 		t.Run(end, func(t *testing.T) {
