@@ -21,6 +21,14 @@
 //
 // In OBS set the server to rtmp://<host>:1935/live and the stream key to
 // <stream-key>. Several listen streams on one port share its listener.
+//
+// Set -layout explicitly to the tracks your publishers send, such as
+// -layout audio for an audio-only encoder: the layout (video,audio by
+// default) is fixed for the life of the stream, whatever a publisher sends,
+// so a publisher's tracks outside it are dropped and layout tracks it lacks
+// stay empty. Use a long random stream key: until authentication
+// arrives, the key in the path is the only thing that keeps others from
+// publishing to the stream.
 package main
 
 import (
@@ -66,6 +74,8 @@ Accept an RTMP publisher (OBS or ffmpeg):
   osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen
   ffmpeg -re -i in.mp4 -c copy -f flv rtmp://<host>:1935/live/<stream-key>
   OBS: server rtmp://<host>:1935/live, stream key <stream-key>
+  Set -layout to the tracks the publisher sends (e.g. -layout audio), and
+  use a long random stream key: it is the only gate on who may publish.
 `
 
 // streamFlags collects repeated -stream name=path values.
