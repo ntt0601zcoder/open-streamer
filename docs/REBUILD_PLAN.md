@@ -226,9 +226,9 @@ Our own libraries:
 | Package | Contents | Milestone |
 |---|---|---|
 | `pkg/mpegts` | 33-bit timestamp unwrapping and ADTS parsing (M1); TS packet reader that resynchronises after loss or garbage, PAT/PMT with CRC and versions, PES assembly, and a TS writer (M3a). It replaces go-astits, whose behaviour on lossy and non-seekable input needed a workaround per case | M1, M3a |
-| `pkg/unwrap` | Timestamp unwrapping for any bit width: 32-bit RTMP milliseconds, 32-bit RTP | M2 |
+| `pkg/unwrap` | Timestamp unwrapping for any bit width: 32-bit RTMP milliseconds, 32-bit RTP | M2 (delivered in M2b) |
 | `pkg/h26x` | DTS from picture order count, for RTP sources, which carry PTS only | M2 |
-| `pkg/rtmp` | Handshake, chunk stream, client and server sessions, FLV tags, enhanced RTMP | M2 (ingest), M3 (play, push) |
+| `pkg/rtmp` | Handshake, chunk stream, client and server sessions, FLV tags, enhanced RTMP | M2 (ingest, delivered in M2b), M3 (play, push) |
 | `pkg/rtsp` | RTSP client and server, TCP interleaved and UDP, RFC 3640 AAC | M2 (client), M3 (server) |
 | `pkg/hls` | Media and multivariant playlist parsing and writing | M3 (first), used by M2's HLS pull |
 | `pkg/dash` | MPD writing (live, multi-period, SegmentTimeline) and parsing for `osconform` | M3 |
@@ -293,13 +293,16 @@ output) follows M2b and M2c. M2 is split in three parts:
 | Part | Contents |
 |---|---|
 | M2a ([plan](superpowers/plans/2026-11-12-m2a-ts-inputs-failover.md), done) | TS-family inputs (file, UDP and RTP-wrapped UDP, SRT caller and listener, HTTP-TS pull), HLS pull (TS and fMP4 segments, separate audio rendition), `copy://`, failover and fail-back, TS demuxer completion, fMP4 demuxer, HE-AAC in the TS muxer's ADTS writer, the Clock's carried fixes, ingest CPU measurement |
-| M2b | `pkg/unwrap`, `pkg/rtmp` (handshake, chunk stream, AMF0, server and client sessions, FLV, enhanced RTMP), RTMP push and pull inputs |
+| M2b ([plan](superpowers/plans/2026-11-16-m2b-rtmp.md), done) | `pkg/unwrap`, `pkg/rtmp` (handshake, chunk stream, AMF0, server and client sessions, FLV, enhanced RTMP), RTMP push and pull inputs |
 | M2c | `pkg/h26x` (DTS from POC, which also fixes reordered access units packed in one PES), `pkg/rtsp` client (TCP interleaved and UDP, RFC 3640 AAC, `pion/rtp` depacketisers, `pion/sdp`), RTSP pull input |
 
 M2a's exit criteria are the M2 row's, for its inputs: each, fed by ffmpeg,
 produces violation-free frames; failover is exactly one epoch change; a PMT
 change is one epoch change; an H.264 open-GOP feed starts video at its first
 recovery point. The `TestM2a` scenarios in `internal/e2e` prove them.
+
+M2a also did HE-AAC in the TS muxer's ADTS writer, deferred from M3a to M2b:
+M2a's fMP4 HLS pull is the first HE-AAC input.
 
 Out of M2a:
 
@@ -316,6 +319,26 @@ Out of M2a:
 | Dropping video to the next keyframe after a TS loss | Frames after the lost one pass through: decoders conceal, and a lossy feed would otherwise freeze |
 | A late join with an inter-track skew above the 2 s backward-jump limit | Loses one GOP once, at start-up |
 | Live-source epochs placed by the chain lead (R10) | Stay as ruled: bounded, and they do not accumulate |
+
+M2b's exit criteria are the M2 row's, for RTMP: our RTMP library
+interoperates with ffmpeg and MediaMTX as peers (we accept ffmpeg's publish;
+we pull from ffmpeg and from MediaMTX); each RTMP input fed by them produces
+violation-free frames; failover between an RTMP input and an M2a input is
+exactly one epoch change; H.265 over enhanced RTMP works end to end with an
+independent writer (an ffmpeg-made enhanced-FLV fixture, and MediaMTX). The
+`TestM2b` and `TestRTMPMediaMTX` scenarios in `internal/e2e` prove them; CI
+runs MediaMTX as a service container.
+
+Out of M2b:
+
+| Item | Reason |
+|---|---|
+| RTMPS (RTMP over TLS) | Needs certificates and their configuration: M5 |
+| RTMPT and RTMPE | Obsolete |
+| Enhanced RTMP v2 multitrack, and codecs other than H.264, H.265 and AAC (AV1, VP9, Opus, MP3) | Outside §2's codec scope |
+| AMF3 command encoding | Clients that ask for `objectEncoding` 3 are refused |
+| Publish authentication beyond an exact path match | M6 sessions and tokens |
+| Server play and client publish | M3b, on the same session core |
 
 ### Carried from M1
 
@@ -335,8 +358,6 @@ The M2 items are done in M2a.
   tests.
 - **M2, Clock (done):** a track that joins an epoch after its `AlignWindow`
   release opens a late-join epoch (§3.2).
-- **HE-AAC in the TS muxer's ADTS writer (done):** deferred from M3a to M2b,
-  then done in M2a, whose fMP4 HLS pull is the first HE-AAC input.
 - **M4, transcoder:** rendition epoch numbers never collide (§3.5).
 
 ### Conformance checks
