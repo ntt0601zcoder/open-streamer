@@ -648,11 +648,9 @@ func TestClientIdleTimeout(t *testing.T) {
 }
 
 func TestClientUnsupportedTransport(t *testing.T) {
-	for _, tr := range []string{"udp", "auto", "sctp"} {
-		_, err := rtsp.Dial(context.Background(), "rtsp://127.0.0.1:1/x", rtsp.Config{Transport: tr})
-		require.Error(t, err, tr)
-	}
-	_, err := rtsp.Dial(context.Background(), "http://127.0.0.1:1/x", rtsp.Config{})
+	_, err := rtsp.Dial(context.Background(), "rtsp://127.0.0.1:1/x", rtsp.Config{Transport: "sctp"})
+	require.ErrorContains(t, err, "unknown transport")
+	_, err = rtsp.Dial(context.Background(), "http://127.0.0.1:1/x", rtsp.Config{})
 	require.Error(t, err)
 }
 

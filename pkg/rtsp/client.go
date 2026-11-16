@@ -26,6 +26,7 @@ const (
 	defaultReportInterval = 5 * time.Second
 	defaultSessionTimeout = 60 * time.Second
 	defaultMaxAU          = 8 << 20
+	defaultUDPFallback    = 3 * time.Second
 	defaultPort           = "554"
 	packetQueue           = 1024
 	teardownWait          = 100 * time.Millisecond
@@ -46,7 +47,9 @@ type Config struct {
 	// IdleTimeout ends the session when no RTP packet arrives on any track
 	// for that long (default 10 s).
 	IdleTimeout time.Duration
-	// Transport is "tcp" (the default, interleaved), "udp" or "auto".
+	// Transport is "tcp" (the default, interleaved), "udp" or "auto" (UDP,
+	// falling back to a new session over TCP when the server refuses UDP or
+	// no RTP arrives within UDPFallback; Dial waits for that).
 	Transport string
 	Limits    Limits
 	// MaxAU is the access-unit bound for the depacketizers the caller
@@ -55,6 +58,9 @@ type Config struct {
 	// ReportInterval is the RTCP receiver report period per track
 	// (default 5 s).
 	ReportInterval time.Duration
+	// UDPFallback is how long "auto" waits for the first RTP packet over
+	// UDP before it tears the session down and plays over TCP (default 3 s).
+	UDPFallback time.Duration
 	// Now stamps packet arrivals (default time.Now).
 	Now func() time.Time
 }
@@ -75,6 +81,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ReportInterval <= 0 {
 		c.ReportInterval = defaultReportInterval
+	}
+	if c.UDPFallback <= 0 {
+		c.UDPFallback = defaultUDPFallback
 	}
 	if c.Now == nil {
 		c.Now = time.Now
@@ -101,10 +110,12 @@ type ClientStats struct {
 	UnknownChannels uint64
 	// ServerRequests counts requests the server sent to the client.
 	ServerRequests uint64
-	// DupPackets and Reordered are UDP counters.
+	// DupPackets counts duplicate UDP packets dropped; Reordered counts UDP
+	// packets that arrived after a later one and were put back in order.
 	DupPackets, Reordered uint64
 	// Dropped counts malformed RTP packets and, over UDP, packets dropped
-	// because the queue was full.
+	// because the queue was full or because they arrived after their
+	// sequence number was skipped.
 	Dropped uint64
 	// FallbackTCP counts automatic switches from UDP to TCP.
 	FallbackTCP uint64
@@ -125,11 +136,12 @@ func (e *StatusError) Error() string {
 	return "rtsp: " + strings.ToLower(e.Method) + ": status " + strconv.Itoa(e.Code)
 }
 
-// clientTrack is one set-up media and its transport. index, rtpCh and
-// rtcpCh are fixed once SETUP returns; rx is guarded by Client.rrMu.
+// clientTrack is one set-up media and its transport. index, rtpCh, rtcpCh
+// and link are fixed once SETUP returns; rx is guarded by Client.rrMu.
 type clientTrack struct {
 	index         int // Media.Index
-	rtpCh, rtcpCh int
+	rtpCh, rtcpCh int // interleaved channels (TCP)
+	link          *udpLink
 	rx            rxState
 }
 
@@ -155,6 +167,7 @@ type chanEntry struct {
 // goroutine; Stats, Description, RTPInfo and Close may be called from any.
 type Client struct {
 	cfg     Config
+	udp     bool
 	conn    net.Conn
 	br      *bufio.Reader
 	auth    *Auth
@@ -193,6 +206,24 @@ type Client struct {
 	closeBy    atomic.Int64 // close deadline in Unix nanoseconds, 0 before Close
 
 	nResyncs, nUnknown, nServerReqs, nDropped, nReauth atomic.Uint64
+	nDup, nReordered, nFallback                        atomic.Uint64
+
+	// UDP sockets, closed when the session ends.
+	sockMu      sync.Mutex
+	socks       []*net.UDPConn
+	socksClosed bool
+	firstRTP    chan struct{} // closed on the first RTP packet over UDP
+	firstOnce   sync.Once
+
+	// UDP reordering, used by ReadPacket only.
+	ro    map[int]*reorder
+	out   []Packet
+	timer *time.Timer
+}
+
+// target is where Dial connects and what it requests.
+type target struct {
+	addr, url, user, pass string
 }
 
 // Dial connects to an rtsp:// URL and starts playing: OPTIONS, DESCRIBE,
@@ -202,9 +233,7 @@ type Client struct {
 func Dial(ctx context.Context, rawURL string, cfg Config) (*Client, error) {
 	cfg = cfg.withDefaults()
 	switch cfg.Transport {
-	case "tcp":
-	case "udp", "auto":
-		return nil, fmt.Errorf("rtsp: dial: transport %s not implemented yet", cfg.Transport)
+	case "tcp", "udp", "auto":
 	default:
 		return nil, errors.New("rtsp: dial: unknown transport")
 	}
@@ -223,16 +252,25 @@ func Dial(ctx context.Context, rawURL string, cfg Config) (*Client, error) {
 	if port == "" {
 		port = defaultPort
 	}
+	tg := target{addr: net.JoinHostPort(u.Hostname(), port), url: clean, user: user, pass: pass}
+	if cfg.Transport == "auto" {
+		return dialAuto(ctx, cfg, tg)
+	}
+	return dialSession(ctx, cfg, tg, cfg.Transport == "udp")
+}
+
+// dialSession connects and plays one session over UDP or TCP.
+func dialSession(ctx context.Context, cfg Config, tg target, udp bool) (*Client, error) {
 	dctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	conn, err := (&net.Dialer{}).DialContext(dctx, "tcp", net.JoinHostPort(u.Hostname(), port))
+	conn, err := (&net.Dialer{}).DialContext(dctx, "tcp", tg.addr)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("rtsp: dial: %w", err)
 	}
 	c := &Client{
-		cfg: cfg, conn: conn, br: bufio.NewReaderSize(conn, 64<<10), auth: NewAuth(user, pass),
-		base: clean, pending: map[int]chan *Response{}, pkts: make(chan Packet, packetQueue),
-		done: make(chan struct{}), epoch: time.Now(), ssrc: randomSSRC(),
+		cfg: cfg, udp: udp, conn: conn, br: bufio.NewReaderSize(conn, 64<<10), auth: NewAuth(tg.user, tg.pass),
+		base: tg.url, pending: map[int]chan *Response{}, pkts: make(chan Packet, packetQueue),
+		done: make(chan struct{}), epoch: time.Now(), ssrc: randomSSRC(), firstRTP: make(chan struct{}),
 	}
 	c.byChan.Store(&[256]chanEntry{})
 	c.wg.Add(1)
@@ -246,6 +284,9 @@ func Dial(ctx context.Context, rawURL string, cfg Config) (*Client, error) {
 		c.fail(err)
 		c.wg.Wait()
 		return nil, err
+	}
+	if udp {
+		c.initReorder()
 	}
 	c.touch()
 	c.wg.Add(1)
@@ -307,7 +348,11 @@ func (c *Client) handshake(ctx context.Context) error {
 		if m.Reason != "" {
 			continue
 		}
-		if err := c.setup(ctx, m); err != nil {
+		setup := c.setup
+		if c.udp {
+			setup = c.setupUDP
+		}
+		if err := setup(ctx, m); err != nil {
 			return err
 		}
 	}
@@ -349,15 +394,8 @@ func (c *Client) setup(ctx context.Context, m Media) error {
 	if !ok2xx(resp) {
 		return &StatusError{Method: "SETUP", Code: resp.StatusCode}
 	}
-	if c.sessionID() == "" {
-		s, err := ParseSession(resp.Header.Get("Session"))
-		if err != nil {
-			return fmt.Errorf("rtsp: setup: %w", err)
-		}
-		c.mu.Lock()
-		c.session = s.ID
-		c.mu.Unlock()
-		c.sessionTimeout = s.Timeout
+	if err := c.adoptSession(resp); err != nil {
+		return err
 	}
 	ch := want
 	if rt, err := ParseTransport(resp.Header.Get("Transport")); err == nil && rt.Interleaved != [2]int{} {
@@ -372,6 +410,22 @@ func (c *Client) setup(ctx context.Context, m Media) error {
 	table[ch[1]] = chanEntry{t: t, rtcp: true}
 	c.byChan.Store(&table)
 	c.tracks = append(c.tracks, t)
+	return nil
+}
+
+// adoptSession takes the session from the first SETUP reply.
+func (c *Client) adoptSession(resp *Response) error {
+	if c.sessionID() != "" {
+		return nil
+	}
+	s, err := ParseSession(resp.Header.Get("Session"))
+	if err != nil {
+		return fmt.Errorf("rtsp: setup: %w", err)
+	}
+	c.mu.Lock()
+	c.session = s.ID
+	c.mu.Unlock()
+	c.sessionTimeout = s.Timeout
 	return nil
 }
 
@@ -587,6 +641,7 @@ func (c *Client) fail(err error) {
 		c.err = err
 		close(c.done)
 		_ = c.conn.Close()
+		c.closeSockets()
 	})
 }
 
@@ -645,17 +700,24 @@ func (c *Client) Stats() ClientStats {
 		Resyncs:         c.nResyncs.Load(),
 		UnknownChannels: c.nUnknown.Load(),
 		ServerRequests:  c.nServerReqs.Load(),
+		DupPackets:      c.nDup.Load(),
+		Reordered:       c.nReordered.Load(),
 		Dropped:         c.nDropped.Load(),
+		FallbackTCP:     c.nFallback.Load(),
 		Reauth:          c.nReauth.Load(),
 	}
 }
 
 // ReadPacket returns the next packet. After the session ends it returns the
 // packets still queued, then the error that ended it (ErrClosed after
-// Close).
+// Close). Over UDP the RTP packets of each track come in sequence order,
+// held back at most 200 ms (or 64 packets) behind a missing one.
 func (c *Client) ReadPacket() (Packet, error) {
 	if c.closed.Load() {
 		return Packet{}, ErrClosed
+	}
+	if c.udp {
+		return c.readUDP()
 	}
 	select {
 	case p := <-c.pkts:
@@ -675,15 +737,21 @@ func (c *Client) ReadPacket() (Packet, error) {
 // Close sends TEARDOWN (waiting at most 100 ms), closes the connection and
 // waits for the client's goroutines. It is idempotent.
 func (c *Client) Close() error {
+	c.shutdown(context.Background())
+	return nil
+}
+
+// shutdown is Close with the context the TEARDOWN wait is bound by (besides
+// its own 100 ms).
+func (c *Client) shutdown(ctx context.Context) {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
 		select {
 		case <-c.done:
 		default:
-			c.teardown(context.Background())
+			c.teardown(ctx)
 		}
 		c.fail(ErrClosed)
 		c.wg.Wait()
 	})
-	return nil
 }
