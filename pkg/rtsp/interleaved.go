@@ -383,15 +383,24 @@ func (c *Client) checkKeepalives(waiting []*keepalive, now time.Time) ([]*keepal
 	return keep, nil
 }
 
-// sendReports sends a receiver report on the RTCP channel of every track
-// that has received RTP.
+// sendReports sends a receiver report on the RTCP channel or to the RTCP
+// port of every track that has received RTP. Over UDP a track whose server
+// named no ports gets none.
 func (c *Client) sendReports() error {
 	for _, t := range c.tracks {
 		b, ok := c.reportBlock(t)
 		if !ok {
 			continue
 		}
-		if err := c.writeFrame(t.rtcpCh, ReceiverReport(c.ssrc, []ReportBlock{b})); err != nil {
+		rr := ReceiverReport(c.ssrc, []ReportBlock{b})
+		var err error
+		switch {
+		case t.link == nil:
+			err = c.writeFrame(t.rtcpCh, rr)
+		case t.link.srvPorts[1] != 0:
+			err = c.writeUDP(t.link.rtcp, t.link.srvAddr(1), rr)
+		}
+		if err != nil {
 			return err
 		}
 	}

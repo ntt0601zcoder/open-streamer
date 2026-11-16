@@ -1,7 +1,8 @@
 // Package rtsptest provides a scripted RTSP server for tests. It serves the
-// given access units over TCP interleaved RTP in real time, with switches for
-// the authentication, control-URL, channel, keepalive and framing quirks of
-// real cameras. It imports nothing from internal/.
+// given access units in real time over TCP interleaved RTP or over UDP, with
+// switches for the authentication, control-URL, channel, keepalive and
+// framing quirks of real cameras and for UDP loss, reordering and
+// duplicates. It imports nothing from internal/.
 package rtsptest
 
 import (
@@ -99,9 +100,17 @@ type ServerOptions struct {
 	// KeepaliveStatus, when set, answers keepalives (GET_PARAMETER, and
 	// OPTIONS carrying a Session) with this status.
 	KeepaliveStatus int
-	// UDP options; UDP is not served yet (SETUP over UDP is answered 461).
-	DropUDP                  bool
+	// NoUDP answers a SETUP over UDP with 461 (Unsupported Transport).
+	NoUDP bool
+	// DropUDP accepts a SETUP over UDP but sends nothing over UDP.
+	DropUDP bool
+	// UDPLoss, UDPSwap and UDPDup are the probabilities, drawn per RTP
+	// packet from the seeded generator, that a UDP packet is not sent, is
+	// sent after the next packet of its track, or is sent twice.
 	UDPLoss, UDPSwap, UDPDup float64
+	// UDPGap > 0 sends no UDP RTP packet from UDPGapAfter after PLAY for
+	// UDPGap; the sequence numbers run on, so the packets are lost.
+	UDPGapAfter, UDPGap time.Duration
 	// Seed seeds the session's random sequence numbers, timestamps and SSRCs.
 	Seed  int64
 	Media []TrackSource
@@ -111,6 +120,25 @@ type ServerOptions struct {
 type Frame struct {
 	Channel int
 	Data    []byte
+}
+
+// InjectKind names a UDP impairment.
+type InjectKind string
+
+// The UDP impairments the server records.
+const (
+	InjectLoss InjectKind = "loss"
+	InjectGap  InjectKind = "gap"
+	InjectSwap InjectKind = "swap"
+	InjectDup  InjectKind = "dup"
+)
+
+// Injection is one impaired UDP RTP packet: Track is the media index and Seq
+// the packet's sequence number.
+type Injection struct {
+	Track int
+	Seq   uint16
+	Kind  InjectKind
 }
 
 // ClientResponse is a client's answer to a server-initiated request.
@@ -136,6 +164,8 @@ type Server struct {
 	requests  []rtsp.Request
 	frames    []Frame
 	responses []ClientResponse
+	injected  []Injection
+	punches   int
 	nonces    map[string]time.Time
 	closed    bool
 	sessions  int
@@ -218,6 +248,26 @@ func (s *Server) ClientResponses() []ClientResponse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]ClientResponse(nil), s.responses...)
+}
+
+// Injected returns the UDP impairments applied so far, in order.
+func (s *Server) Injected() []Injection {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Injection(nil), s.injected...)
+}
+
+// Punches returns the number of empty UDP datagrams received from clients.
+func (s *Server) Punches() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.punches
+}
+
+func (s *Server) inject(track int, seq uint16, k InjectKind) {
+	s.mu.Lock()
+	s.injected = append(s.injected, Injection{Track: track, Seq: seq, Kind: k})
+	s.mu.Unlock()
 }
 
 func prepareTrack(t testing.TB, i int, m TrackSource) *track {
@@ -308,6 +358,7 @@ type session struct {
 	base     string // Content-Base, userinfo removed ("" for absolute)
 	setup    []int  // track index per SETUP
 	chans    []int  // RTP channel per track (-1 not set up)
+	udp      []*udpPair
 	seq0     []uint16
 	ts0      []uint32
 	ssrc     []uint32
@@ -328,6 +379,7 @@ func (s *Server) serve(c net.Conn, n int) {
 		stop: make(chan struct{}), lastReq: time.Now(), pending: map[int]string{}, serverCS: 1000,
 	}
 	ss.chans = make([]int, len(s.tracks))
+	ss.udp = make([]*udpPair, len(s.tracks))
 	for i := range ss.chans {
 		ss.chans[i] = -1
 		ss.seq0 = append(ss.seq0, uint16(ss.rng.Uint32()))
@@ -338,6 +390,12 @@ func (s *Server) serve(c net.Conn, n int) {
 	ss.loop()
 	ss.stopOnce.Do(func() { close(ss.stop) })
 	_ = c.Close()
+	for _, p := range ss.udp {
+		if p != nil {
+			_ = p.rtp.Close()
+			_ = p.rtcp.Close()
+		}
+	}
 	ss.wg.Wait()
 	s.mu.Lock()
 	delete(s.conns, c)
@@ -434,6 +492,8 @@ func reason(code int) string {
 		return "Session Not Found"
 	case 461:
 		return "Unsupported Transport"
+	case 500:
+		return "Internal Server Error"
 	case 501:
 		return "Not Implemented"
 	}
@@ -608,7 +668,14 @@ func (ss *session) setupTrack(req *rtsp.Request) bool {
 		return ss.respond(req, 454, nil, nil)
 	}
 	tr, err := rtsp.ParseTransport(req.Header.Get("Transport"))
-	if err != nil || tr.Protocol != "RTP/AVP/TCP" {
+	if err != nil {
+		return ss.respond(req, 461, nil, nil)
+	}
+	switch tr.Protocol {
+	case "RTP/AVP/TCP":
+	case "RTP/AVP", "RTP/AVP/UDP":
+		return ss.setupUDP(req, idx, tr)
+	default:
 		return ss.respond(req, 461, nil, nil)
 	}
 	ch := tr.Interleaved[0]
@@ -621,6 +688,93 @@ func (ss *session) setupTrack(req *rtsp.Request) bool {
 	h := ss.sessionHeader()
 	h.Set("Transport", reply.String())
 	return ss.respond(req, 200, h, nil)
+}
+
+// udpPair is the server side of a UDP track: its sockets and the client's.
+type udpPair struct {
+	rtp, rtcp       *net.UDPConn
+	dstRTP, dstRTCP *net.UDPAddr
+}
+
+// setupUDP sets up a track over UDP: the server binds an even/odd port pair
+// on its own address and sends to the client's ports.
+func (ss *session) setupUDP(req *rtsp.Request, idx int, tr rtsp.Transport) bool {
+	if ss.s.opt.NoUDP || tr.ClientPort[0] == 0 {
+		return ss.respond(req, 461, nil, nil)
+	}
+	local := ss.conn.LocalAddr().(*net.TCPAddr)
+	remote := ss.conn.RemoteAddr().(*net.TCPAddr)
+	rtpC, rtcpC, err := listenPair(local.IP)
+	if err != nil {
+		ss.s.t.Errorf("rtsptest: %v", err)
+		return ss.respond(req, 500, nil, nil)
+	}
+	p := &udpPair{
+		rtp: rtpC, rtcp: rtcpC,
+		dstRTP:  &net.UDPAddr{IP: remote.IP, Port: tr.ClientPort[0]},
+		dstRTCP: &net.UDPAddr{IP: remote.IP, Port: tr.ClientPort[1]},
+	}
+	ss.udp[idx] = p
+	ss.chans[idx] = 2 * idx
+	ss.setup = append(ss.setup, idx)
+	ss.wg.Add(2)
+	go ss.readUDP(rtpC, 2*idx)
+	go ss.readUDP(rtcpC, 2*idx+1)
+	sp := rtpC.LocalAddr().(*net.UDPAddr).Port
+	reply := rtsp.Transport{
+		Protocol: "RTP/AVP", Unicast: true, ClientPort: tr.ClientPort, ServerPort: [2]int{sp, sp + 1},
+		SSRC: ss.ssrc[idx], HasSSRC: true,
+	}
+	h := ss.sessionHeader()
+	h.Set("Transport", reply.String())
+	return ss.respond(req, 200, h, nil)
+}
+
+// listenPair binds an even RTP port and the odd RTCP port after it.
+func listenPair(ip net.IP) (*net.UDPConn, *net.UDPConn, error) {
+	bind := func(port int) (*net.UDPConn, error) {
+		pc, err := (&net.ListenConfig{}).ListenPacket(context.Background(), "udp", (&net.UDPAddr{IP: ip, Port: port}).String())
+		if err != nil {
+			return nil, err
+		}
+		return pc.(*net.UDPConn), nil
+	}
+	for range 64 {
+		a, err := bind(0)
+		if err != nil {
+			return nil, nil, fmt.Errorf("listen udp: %w", err)
+		}
+		port := a.LocalAddr().(*net.UDPAddr).Port
+		if port%2 == 1 {
+			if b, err := bind(port - 1); err == nil {
+				return b, a, nil
+			}
+		} else if b, err := bind(port + 1); err == nil {
+			return a, b, nil
+		}
+		_ = a.Close()
+	}
+	return nil, nil, errors.New("listen udp: no free port pair")
+}
+
+// readUDP records what a client sends to a server UDP socket: empty
+// datagrams count as punches, the rest is recorded as a Frame on ch.
+func (ss *session) readUDP(c *net.UDPConn, ch int) {
+	defer ss.wg.Done()
+	buf := make([]byte, 65536)
+	for {
+		n, _, err := c.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		ss.s.mu.Lock()
+		if n == 0 {
+			ss.s.punches++
+		} else {
+			ss.s.frames = append(ss.s.frames, Frame{Channel: ch, Data: append([]byte(nil), buf[:n]...)})
+		}
+		ss.s.mu.Unlock()
+	}
 }
 
 func (ss *session) play(req *rtsp.Request) bool {
@@ -669,6 +823,9 @@ type sendState struct {
 	srSent int
 	octets uint32
 	pkts   uint32
+	// held is a UDP packet being swapped with the next one.
+	held    []byte
+	heldSeq uint16
 }
 
 // stream sends the set-up tracks in real time. When playResp is set it is
@@ -737,7 +894,7 @@ func (ss *session) stream(playResp func() bool) {
 				st.seq = uint16(ss.rng.Uint32())
 			}
 		}
-		n, ok := ss.sendAU(next)
+		n, ok := ss.sendAU(next, time.Since(start))
 		if !ok {
 			return
 		}
@@ -764,12 +921,14 @@ func (ss *session) frame(ch int, data []byte) []byte {
 	return append(b, data...)
 }
 
-// sendAU sends the next AU of st and advances it.
-func (ss *session) sendAU(st *sendState) (int, bool) {
+// sendAU sends the next AU of st and advances it. elapsed is the time since
+// PLAY.
+func (ss *session) sendAU(st *sendState, elapsed time.Duration) (int, bool) {
 	tr := ss.s.tracks[st.track]
 	au := tr.aus[st.au]
 	base := ss.ts0[st.track] + st.loop*tr.period + au.ts
 	var buf []byte
+	pair := ss.udp[st.track]
 	for _, p := range au.pkts {
 		pkt := rtp.Packet{Header: rtp.Header{
 			Version: 2, PayloadType: tr.pt, SequenceNumber: st.seq, Timestamp: base + p.tsOff,
@@ -779,13 +938,19 @@ func (ss *session) sendAU(st *sendState) (int, bool) {
 		if err != nil {
 			return 0, false
 		}
-		buf = append(buf, ss.frame(ss.chans[st.track], raw)...)
+		if pair != nil {
+			ss.sendUDP(st, pair, raw, elapsed)
+		} else {
+			buf = append(buf, ss.frame(ss.chans[st.track], raw)...)
+		}
 		st.seq++
 		st.pkts++
 		st.octets += uint32(len(p.payload))
 	}
-	if err := ss.write(buf); err != nil {
-		return 0, false
+	if pair == nil {
+		if err := ss.write(buf); err != nil {
+			return 0, false
+		}
 	}
 	st.au++
 	if st.au == len(tr.aus) {
@@ -797,6 +962,42 @@ func (ss *session) sendAU(st *sendState) (int, bool) {
 	units := uint64(st.loop)*uint64(tr.period) + uint64(nxt.ts)
 	st.at = max(st.at, time.Duration(units*uint64(time.Second)/clock))
 	return len(au.pkts), true
+}
+
+// sendUDP sends one RTP packet of st over UDP with the configured
+// impairments. Write errors are ignored: UDP has no connection to lose.
+func (ss *session) sendUDP(st *sendState, pair *udpPair, raw []byte, elapsed time.Duration) {
+	o := ss.s.opt
+	if o.DropUDP {
+		return
+	}
+	send := func(b []byte) { _, _ = pair.rtp.WriteToUDP(b, pair.dstRTP) }
+	if o.UDPGap > 0 && elapsed >= o.UDPGapAfter && elapsed < o.UDPGapAfter+o.UDPGap {
+		if st.held != nil {
+			ss.s.inject(st.track, st.heldSeq, InjectGap)
+			st.held = nil
+		}
+		ss.s.inject(st.track, st.seq, InjectGap)
+		return
+	}
+	if o.UDPLoss > 0 && ss.rng.Float64() < o.UDPLoss {
+		ss.s.inject(st.track, st.seq, InjectLoss)
+		return
+	}
+	if st.held == nil && o.UDPSwap > 0 && ss.rng.Float64() < o.UDPSwap {
+		st.held, st.heldSeq = raw, st.seq
+		ss.s.inject(st.track, st.seq, InjectSwap)
+		return
+	}
+	send(raw)
+	if o.UDPDup > 0 && ss.rng.Float64() < o.UDPDup {
+		send(raw)
+		ss.s.inject(st.track, st.seq, InjectDup)
+	}
+	if st.held != nil {
+		send(st.held)
+		st.held = nil
+	}
 }
 
 // sendSRs sends a sender report on every streaming track. The NTP time of RTP
@@ -824,6 +1025,12 @@ func (ss *session) sendSRs(start time.Time, states []*sendState) bool {
 		binary.BigEndian.PutUint32(b[16:], rtpTS)
 		binary.BigEndian.PutUint32(b[20:], st.pkts)
 		binary.BigEndian.PutUint32(b[24:], st.octets)
+		if pair := ss.udp[st.track]; pair != nil {
+			if !ss.s.opt.DropUDP {
+				_, _ = pair.rtcp.WriteToUDP(b, pair.dstRTCP)
+			}
+			continue
+		}
 		if err := ss.write(ss.frame(ss.chans[st.track]+1, b)); err != nil {
 			return false
 		}
