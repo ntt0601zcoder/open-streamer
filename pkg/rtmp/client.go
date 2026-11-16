@@ -256,6 +256,10 @@ func (c *ClientConn) open(t playTarget) error {
 		{Key: "audioCodecs", Value: 0x0FFF},
 		{Key: "videoCodecs", Value: 0x00FF},
 		{Key: "videoFunction", Value: 1},
+		// Enhanced RTMP: the FourCC codecs we read beyond the legacy codec
+		// ids. A server that honours the list (MediaMTX does) omits an
+		// H.265 track from a client that does not announce hvc1.
+		{Key: "fourCcList", Value: []any{"hvc1"}},
 	}); err != nil {
 		return fmt.Errorf("rtmp: client: %w", err)
 	}
