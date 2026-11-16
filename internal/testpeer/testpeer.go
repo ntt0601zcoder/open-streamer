@@ -12,6 +12,15 @@ import (
 // skip into a failure. CI sets it to "1".
 const EnvRequire = "OS_REQUIRE_PEERS"
 
+// EnvMediaMTX names the environment variable that holds the host:port of a
+// MediaMTX RTMP listener for tests, and EnvRequireMediaMTX the one that turns
+// its absence from a skip into a failure. CI sets them to "127.0.0.1:1935"
+// and "1".
+const (
+	EnvMediaMTX        = "OS_MEDIAMTX_RTMP"
+	EnvRequireMediaMTX = "OS_REQUIRE_MEDIAMTX"
+)
+
 // Require returns the path of binary, which must support every listed
 // protocol (checked with "-hide_banner -protocols", so it applies to ffmpeg
 // and ffprobe). When the binary or a protocol is missing the test is skipped,
@@ -42,6 +51,23 @@ func Require(t testing.TB, binary string, protocols ...string) string {
 		}
 	}
 	return path
+}
+
+// MediaMTX returns the host:port of the MediaMTX RTMP listener named by
+// OS_MEDIAMTX_RTMP. When it is unset the test is skipped, or failed when
+// OS_REQUIRE_MEDIAMTX=1. MediaMTX is a running server, not a binary, so
+// OS_REQUIRE_PEERS does not apply to it.
+func MediaMTX(t testing.TB) (rtmpAddr string) {
+	t.Helper()
+	if addr := os.Getenv(EnvMediaMTX); addr != "" {
+		return addr
+	}
+	if os.Getenv(EnvRequireMediaMTX) == "1" {
+		t.Fatalf("peer MediaMTX: %s is not set", EnvMediaMTX)
+		return ""
+	}
+	t.Skipf("peer MediaMTX: %s is not set", EnvMediaMTX)
+	return ""
 }
 
 func missing(t testing.TB, format string, args ...any) {

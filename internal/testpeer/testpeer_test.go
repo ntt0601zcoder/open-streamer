@@ -52,3 +52,25 @@ func TestRequireProtocols(t *testing.T) {
 	Require(rec, "ffmpeg", "no-such-protocol")
 	assert.True(t, rec.skipped)
 }
+
+func TestMediaMTX(t *testing.T) {
+	for _, tt := range []struct {
+		addr, require      string
+		wantSkip, wantFail bool
+	}{
+		{"", "", true, false},
+		{"", "1", false, true},
+		{"127.0.0.1:1935", "", false, false},
+		{"127.0.0.1:1935", "1", false, false},
+	} {
+		t.Run(fmt.Sprintf("%q/%q", tt.addr, tt.require), func(t *testing.T) {
+			t.Setenv(EnvMediaMTX, tt.addr)
+			t.Setenv(EnvRequireMediaMTX, tt.require)
+			rec := &recorder{TB: t}
+			got := MediaMTX(rec)
+			assert.Equal(t, tt.wantSkip, rec.skipped)
+			assert.Equal(t, tt.wantFail, rec.failed)
+			assert.Equal(t, tt.addr, got)
+		})
+	}
+}

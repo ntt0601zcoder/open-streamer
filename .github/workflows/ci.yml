@@ -30,6 +30,15 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    services:
+      # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
+      # 1.21.3, which reads and writes H.265 over enhanced RTMP (FourCC hvc1,
+      # sent to clients that announce it in connect's fourCcList), so that a
+      # new release cannot change the peer under the tests.
+      mediamtx:
+        image: bluenviron/mediamtx:1.21.3
+        ports:
+          - 1935:1935
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -42,9 +51,20 @@ jobs:
       - run: make test
         env:
           OS_REQUIRE_PEERS: "1"
+          OS_MEDIAMTX_RTMP: 127.0.0.1:1935
+          OS_REQUIRE_MEDIAMTX: "1"
 
   coverage:
     runs-on: ubuntu-latest
+    services:
+      # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
+      # 1.21.3, which reads and writes H.265 over enhanced RTMP (FourCC hvc1,
+      # sent to clients that announce it in connect's fourCcList), so that a
+      # new release cannot change the peer under the tests.
+      mediamtx:
+        image: bluenviron/mediamtx:1.21.3
+        ports:
+          - 1935:1935
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -57,6 +77,8 @@ jobs:
       - run: make cover covercheck
         env:
           OS_REQUIRE_PEERS: "1"
+          OS_MEDIAMTX_RTMP: 127.0.0.1:1935
+          OS_REQUIRE_MEDIAMTX: "1"
 
   govulncheck:
     runs-on: ubuntu-latest
