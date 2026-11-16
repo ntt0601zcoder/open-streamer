@@ -22,6 +22,8 @@ const (
 	defaultIdleTimeout          = 30 * time.Second
 	defaultPingInterval         = 10 * time.Second
 	defaultMaxPrePublishMessage = 64 << 10
+	defaultMaxPrePublishStreams = 8
+	defaultMaxPrePublishPending = 256 << 10
 
 	// idleGrace is the shortest read deadline: a read issued after the idle
 	// limit has passed still collects the bytes already waiting.
@@ -43,11 +45,18 @@ type Config struct {
 	// ping. Default 10 s.
 	PingInterval time.Duration
 	// MaxMessage is the largest message accepted once publish is accepted,
-	// and by clients. Default 8 MiB.
+	// and by clients. Default 8 MiB. Once publish is accepted a server also
+	// allows 64 chunk streams and 16 MiB of partial messages, as clients do.
 	MaxMessage int
 	// MaxPrePublishMessage is the largest message a server accepts before
 	// publish is accepted. Default 64 KiB.
 	MaxPrePublishMessage int
+	// MaxPrePublishStreams is the most chunk stream ids a server lets the
+	// peer use before publish is accepted. Default 8.
+	MaxPrePublishStreams int
+	// MaxPrePublishPending bounds the bytes of partial messages a server
+	// holds for the peer before publish is accepted. Default 256 KiB.
+	MaxPrePublishPending int
 	// Now is the clock for timeouts, pings and LastInbound. Default time.Now.
 	// It must advance with real time: it stamps LastInbound and decides when
 	// a phase, the idle limit or a ping is due, while the deadlines set on
@@ -73,6 +82,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxPrePublishMessage <= 0 {
 		c.MaxPrePublishMessage = defaultMaxPrePublishMessage
+	}
+	if c.MaxPrePublishStreams <= 0 {
+		c.MaxPrePublishStreams = defaultMaxPrePublishStreams
+	}
+	if c.MaxPrePublishPending <= 0 {
+		c.MaxPrePublishPending = defaultMaxPrePublishPending
 	}
 	if c.Now == nil {
 		c.Now = time.Now
@@ -152,11 +167,16 @@ func newSession(conn net.Conn, cfg Config, r role) *session {
 	s := &session{conn: conn, cfg: cfg, role: r, start: now}
 	s.touch(now)
 	s.br = bufio.NewReader(sessionReader{s})
-	limit := cfg.MaxMessage
+	lim := s.postPublishLimits()
 	if r == roleServer {
-		limit = cfg.MaxPrePublishMessage
+		// An unauthenticated peer may hold only a little memory.
+		lim = ChunkLimits{
+			MaxMessage: cfg.MaxPrePublishMessage,
+			MaxStreams: cfg.MaxPrePublishStreams,
+			MaxPending: cfg.MaxPrePublishPending,
+		}
 	}
-	s.cr = NewChunkReader(s.br, ChunkLimits{MaxMessage: limit})
+	s.cr = NewChunkReader(s.br, lim)
 	s.cw = NewChunkWriter(sessionWriter{s})
 	return s
 }
@@ -198,10 +218,16 @@ func (s *session) endPhase() {
 	s.phase = ""
 }
 
-// raiseMessageLimit lets messages up to MaxMessage through, once a server has
-// accepted publish.
+// raiseMessageLimit lifts the pre-publish limits to the post-publish ones,
+// once a server has accepted publish.
 func (s *session) raiseMessageLimit() {
-	s.cr.SetLimits(ChunkLimits{MaxMessage: s.cfg.MaxMessage})
+	s.cr.SetLimits(s.postPublishLimits())
+}
+
+// postPublishLimits are the chunk limits of a client, and of a server once
+// publish is accepted: MaxMessage, 64 chunk streams, 16 MiB pending.
+func (s *session) postPublishLimits() ChunkLimits {
+	return ChunkLimits{MaxMessage: s.cfg.MaxMessage, MaxStreams: defaultMaxStreams, MaxPending: defaultMaxPending}
 }
 
 // LastInbound is when the last byte arrived from the peer. It is safe to call
