@@ -14,8 +14,8 @@ const EnvRequire = "OS_REQUIRE_PEERS"
 
 // EnvMediaMTX names the environment variable that holds the host:port of a
 // MediaMTX RTMP listener for tests, and EnvRequireMediaMTX the one that turns
-// its absence from a skip into a failure. CI sets them to "127.0.0.1:1935"
-// and "1".
+// its absence from a skip into a failure. CI sets them to "127.0.0.1:19350"
+// and "1", keeping port 1935 free for tests of the RTMP default port.
 const (
 	EnvMediaMTX        = "OS_MEDIAMTX_RTMP"
 	EnvRequireMediaMTX = "OS_REQUIRE_MEDIAMTX"

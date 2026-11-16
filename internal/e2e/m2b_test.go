@@ -37,10 +37,16 @@ import (
 // enhanced-FLV H.265 replayed by our publisher) through a pipeline into a
 // hub, and check the frames that a hub subscriber collects.
 
-// mtxReady bounds the wait for a MediaMTX pull to deliver: MediaMTX makes a
-// path ready 2 to 2.5 s after its publisher connects, once it knows the
-// tracks, and the clips run 6 s at least.
-const mtxReady = 6 * time.Second
+// mtxReady bounds the wait for a MediaMTX pull of the live clip to
+// deliver: MediaMTX makes a path ready 2 to 2.5 s after its publisher
+// connects, once it knows the tracks. mtxReadyHEVC is the tighter bound for
+// the 6 s h265_aac.flv, so that the pull still reads its last two GOPs
+// (keys every second from 0.08 s): a later join would leave the row's
+// counts nearly unchecked.
+const (
+	mtxReady     = 6 * time.Second
+	mtxReadyHEVC = 3500 * time.Millisecond
+)
 
 // ffmpegBurst is how far ahead of real time ffmpeg -re sends at its start
 // (its -readrate_initial_burst default, 0.5 s since ffmpeg 6.1).
@@ -264,11 +270,40 @@ func mtxOpen(ended <-chan struct{}) func(ctx context.Context, u string) (ingest.
 }
 
 // joinBounds bounds a pull row that joins a live source after join: the
-// frames the source sent before then (ffmpeg's start burst included, where
-// ffmpeg publishes) and up to one GOP more, while MediaMTX waits for a key,
-// may be missing.
-func joinBounds(join time.Duration) rowBounds {
-	return rowBounds{short: within(join + ffmpegBurst + gopSpan + failoverSlack)}
+// frames the source sent before then (burst is how far ahead of real time
+// the publisher started: ffmpegBurst for ffmpeg, 0 for our publisher) and up
+// to one GOP more, while MediaMTX waits for a key, may be missing.
+func joinBounds(join, burst time.Duration) rowBounds {
+	return rowBounds{short: within(join + burst + gopSpan + failoverSlack)}
+}
+
+// videoFromKey counts the coded video frames of tags from the first
+// keyframe at or after the source time after (from the first tag) on, and
+// the keyframes among them.
+func videoFromKey(t *testing.T, tags []rtmp.FLVTag, after time.Duration) (frames, keys int) {
+	t.Helper()
+	from := false
+	for _, tg := range tags {
+		if tg.Type != rtmp.FLVVideo {
+			continue
+		}
+		v, err := rtmp.ParseVideoTag(tg.Data)
+		require.NoError(t, err)
+		if v.Kind != rtmp.VideoCodedFrames {
+			continue
+		}
+		at := time.Duration(tg.Timestamp-tags[0].Timestamp) * time.Millisecond
+		if v.Key && at >= after {
+			from = true
+		}
+		if from {
+			frames++
+			if v.Key {
+				keys++
+			}
+		}
+	}
+	return frames, keys
 }
 
 // TestM2bRTMPListenFFmpeg has ffmpeg publish the 36 s live clip into our
@@ -356,7 +391,7 @@ func TestRTMPMediaMTX(t *testing.T) {
 	r.check(t, []uint32{1})
 	f.requireExited(t)
 	got, st := r.col.counts(), rl.stats()
-	b := joinBounds(join)
+	b := joinBounds(join, ffmpegBurst)
 	assertRTMPCounts(t, src, got, r, st, b)
 	assertCodecs(t, r.col.frames, media.CodecH264, media.CodecAAC)
 	assert.Zero(t, r.stats.Switches)
@@ -371,12 +406,15 @@ func TestRTMPMediaMTX(t *testing.T) {
 // our publisher, and our RTMP pull plays them back once the path is ready:
 // MediaMTX's enhanced-RTMP writer is the independent peer. One epoch of
 // clean H.265 and AAC frames, short of the file by at most what was sent
-// before the join.
+// before the join, which comes within mtxReadyHEVC; so at least the file's
+// GOPs from its first keyframe after mtxReadyHEVC on (two) are delivered.
 func TestRTMPMediaMTXHEVC(t *testing.T) {
 	t.Parallel()
 	mtx := testpeer.MediaMTX(t)
 	tags := flvTags(t, "h265_aac.flv")
 	src := tagCounts(t, tags)
+	minVideo, minKeys := videoFromKey(t, tags, mtxReadyHEVC)
+	require.GreaterOrEqual(t, minKeys, 2, "GOPs after the join limit")
 	url := "rtmp://" + mtx + "/" + mtxPath("h265")
 
 	done, perr := publishTags(t, url, tags)
@@ -385,15 +423,16 @@ func TestRTMPMediaMTXHEVC(t *testing.T) {
 	var rl readerLog
 	r := startRun(t, runOptions{inputs: []string{url}, open: rl.wrap(mtxOpen(ended))})
 	mtxEnd(r, done, ended)
-	r.waitActive(t, 0, mtxReady)
+	r.waitActive(t, 0, mtxReadyHEVC)
 	join := time.Since(started)
 
 	r.check(t, []uint32{1})
 	<-done
 	require.NoError(t, *perr)
 	got, st := r.col.counts(), rl.stats()
-	b := joinBounds(join)
+	b := joinBounds(join, 0)
 	assertRTMPCounts(t, src, got, r, st, b)
+	assert.GreaterOrEqual(t, got[epochKind{1, media.KindVideo}], minVideo, "video frames from the first key after %v", mtxReadyHEVC)
 	assertCodecs(t, r.col.frames, media.CodecH265, media.CodecAAC)
 	t.Logf("joined %v after the publish (bound %+v); source %s, delivered %s; clock %+v; reader %v",
 		join.Round(time.Millisecond), b, src, got, r.stats.Clock, st)
@@ -519,6 +558,12 @@ func TestM2bRTMPReconnect(t *testing.T) {
 	// Sample the listening socket until the second publisher has exited.
 	var samples, down atomic.Int64
 	stopSampling, sampled := make(chan struct{}), make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() { close(stopSampling) })
+		<-sampled
+	}
+	t.Cleanup(stop) // a publish that fails the test stops it too
 	_, procfs := tcpListening(port)
 	go func() {
 		defer close(sampled)
@@ -545,8 +590,7 @@ func TestM2bRTMPReconnect(t *testing.T) {
 	restart := time.Now()
 	publish()
 	second := time.Since(restart)
-	close(stopSampling)
-	<-sampled
+	stop()
 	assert.Empty(t, r.failures(), "no stall between the publishers")
 	r.end()
 
