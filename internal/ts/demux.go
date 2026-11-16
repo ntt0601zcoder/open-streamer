@@ -135,6 +135,11 @@ type track struct {
 	era   uint64          // POC periods started since the counter started
 	grp   pocMark         // the group's unit 0
 	prev  pocMark         // unit 0 of an earlier group: calibration
+	last  pocMark         // the last dated unit
+	// reorders: a dated unit had a POC not above the last dated unit's in
+	// the same period, so decode order is not presentation order. Sticky.
+	reorders bool
+	pocStep  int64 // smallest POC step between dated units of a period; 0 if none
 	// calNum/calDen is the PTS ticks per POC unit; calDen is 0 until
 	// calibrated.
 	calNum, calDen int64
@@ -893,6 +898,17 @@ func (t *track) datePOC(au *videoAU) {
 	if !ok {
 		return
 	}
+	if l := t.last; l.ok && l.era == t.era {
+		step := int64(poc) - int64(l.poc)
+		if step <= 0 {
+			t.reorders = true
+		}
+		step = max(step, -step)
+		if step > 0 && (t.pocStep == 0 || step < t.pocStep) {
+			t.pocStep = step
+		}
+	}
+	t.last = pocMark{ok: true, poc: poc, era: t.era}
 	if au.idx > 0 {
 		au.dated, au.poc = true, poc
 		return
@@ -908,6 +924,15 @@ func (t *track) datePOC(au *videoAU) {
 		}
 	}
 	t.grp, t.prev = m, m
+}
+
+// withinHalfFrame reports a PTS shortfall below half a frame: half of
+// calNum/calDen times the smallest POC step. Unknown without a POC step.
+func (t *track) withinHalfFrame(short int64) bool {
+	if t.pocStep == 0 || short > maxCalibGap {
+		return false // also keeps the products below far from overflow
+	}
+	return 2*short*t.calDen < t.calNum*t.pocStep
 }
 
 // roundDiv returns n/d rounded half away from zero, for d > 0.
@@ -929,12 +954,16 @@ func roundDiv(n, d int64) int64 {
 // pass the last DTS queued on the track, has no room and is dropped
 // (SplitAUsNoRoom).
 //
-// PTS: when unit 0 and the unit are dated (datePOC) and the track is
-// calibrated, PTS = PTS0 + (POC - POC0)*calNum/calDen, rounded once; a unit
-// after a POC reset in the group, or whose PTS falls below its DTS, is
-// dropped. Without POC timing, PTS = DTS when the group's PES had
-// PTS == DTS, and the unit is dropped otherwise. Drops of either kind count
-// as SplitAUsReordered.
+// PTS: when the group's PES had PTS == DTS and the track's dated units never
+// went back in POC within a period (decode order is presentation order),
+// PTS = DTS. Otherwise, when unit 0 and the unit are dated (datePOC) and the
+// track is calibrated, PTS = PTS0 + (POC - POC0)*calNum/calDen, rounded
+// once; a unit after a POC reset in the group is dropped, and a PTS below
+// its DTS is raised to the DTS when short by less than half a frame
+// (calNum/calDen times the smallest POC step, halved: DTS spacing truncates
+// and PES timestamps jitter) and dropped otherwise. Without POC timing,
+// PTS = DTS when the group's PES had PTS == DTS, and the unit is dropped
+// otherwise. Drops of either kind count as SplitAUsReordered.
 //
 // A group that was not evenly spaced (a loss or a timestamp jump) ends the
 // calibration pair: the next group's unit 0 does not calibrate against this
@@ -952,7 +981,10 @@ func (d *Demuxer) releaseGroup(t *track, next int64, haveNext, even bool) {
 	if step <= 0 {
 		step = defaultFrameStep
 	}
-	byPOC := t.grp.ok && t.calDen > 0
+	// A PES with PTS == DTS on a track whose decode order is presentation
+	// order keeps PTS = DTS.
+	inOrder := t.ptsIsDTS && !t.reorders
+	byPOC := t.grp.ok && t.calDen > 0 && !inOrder
 	for _, au := range t.group {
 		poc := byPOC && au.dated
 		switch {
@@ -980,8 +1012,11 @@ func (d *Demuxer) releaseGroup(t *track, next int64, haveNext, even bool) {
 		if poc {
 			pts = t.grp.pts + roundDiv((int64(au.poc)-int64(t.grp.poc))*t.calNum, t.calDen)
 			if pts < dts {
-				d.stats.SplitAUsReordered++
-				continue
+				if !t.withinHalfFrame(dts - pts) {
+					d.stats.SplitAUsReordered++
+					continue
+				}
+				pts = dts
 			}
 			d.stats.SplitAUsPOC++
 		}
@@ -1000,7 +1035,7 @@ func (d *Demuxer) addNAL(t *track, n []byte) {
 	aud := t.isAUD(typ)
 	vcl := t.isVCL(typ)
 	if t.startsAU(typ, n) && (t.au == nil || t.au.slice) {
-		if t.poc == nil {
+		if t.poc == nil && t.au != nil {
 			// A group gets a second access unit: date units from the one
 			// completing now.
 			t.startPOC()
@@ -1008,7 +1043,10 @@ func (d *Demuxer) addNAL(t *track, n []byte) {
 		held := t.held
 		t.held = nil
 		if aud {
-			// Units before an AUD end the pending access unit.
+			// Units before an AUD end the pending access unit. Parameter
+			// sets among them are stored before finishAU dates it: only a
+			// non-conformant layout (sets after the last slice, before the
+			// AUD) is affected.
 			d.commit(t, held)
 			held = nil
 		}
