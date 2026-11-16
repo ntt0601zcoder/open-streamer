@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
 
@@ -473,4 +474,152 @@ func TestDriftWindow(t *testing.T) {
 	c := New(Options{Kinds: vOnly})
 	c.SetDrift(driftMax, true, 6*time.Second)
 	assert.Equal(t, int64(24), c.pend.drift.window, "SetDrift applies to the pending epoch")
+}
+
+// A jump or a config change that restarts a pending drift epoch drops its
+// reset (ruled in M2a): the epoch is placed by the ordinary rule at its
+// first held frame's arrival, not re-anchored with the previous epoch's
+// constant offset b. A 2 s burst at the start makes b −1.96 s, so the two
+// placements differ by that much.
+func TestDriftPendingEpochRestart(t *testing.T) {
+	const s = 0.02 // 2 s of drift after 100 s
+	const n = 150 * 25
+	const b = -(2*videoGOP - 1) * frameDur
+	at := burst(2*videoGOP, s)
+	h264b := &media.TrackConfig{Codec: media.CodecH264}
+	for name, perturb := range map[string]func(f media.Frame) media.Frame{
+		"none": nil,
+		"jump": func(f media.Frame) media.Frame {
+			f.DTS += 10 * media.ClockRate
+			f.PTS += 10 * media.ClockRate
+			return f
+		},
+		"config": func(f media.Frame) media.Frame {
+			f.Config = h264b
+			return f
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Video alone under a video and audio layout: each epoch holds
+			// one second of video before it releases, so a pending drift
+			// epoch can be restarted.
+			c := New(Options{Kinds: av, MaxDrift: driftMax})
+			frames := videoRun(0, n)
+			key := -1 // the frame that opened the drift epoch
+			for i, f := range frames {
+				if key >= 0 && i >= key+5 && perturb != nil {
+					f = perturb(f)
+				}
+				c.PushAt(f, at(i))
+				switch {
+				case key < 0 && c.pend != nil && c.pend.cause == causeDrift:
+					require.True(t, c.pend.reset)
+					key = i
+				case key >= 0 && i == key+5 && perturb != nil:
+					require.NotNil(t, c.pend, "still pending at the restart")
+					assert.Equal(t, causeDrift, c.pend.cause)
+					assert.False(t, c.pend.reset, "the restart drops the reset")
+					assert.EqualValues(t, 5, c.Stats().DroppedStale, "the held frames")
+				}
+				if key >= 0 && i == key+3*videoGOP {
+					break
+				}
+			}
+			require.Positive(t, key, "a drift epoch opened")
+			require.Zero(t, key%videoGOP, "at a keyframe")
+			assert.EqualValues(t, 1, c.Stats().DriftBreaks)
+			eps := c.Epochs()
+			require.Len(t, eps, 2)
+			if perturb == nil {
+				assert.Equal(t, ceilMS(at(key).Add(-b)), eps[1].Wall, "drift placement keeps b")
+				return
+			}
+			first := key + videoGOP // the next keyframe starts the restarted epoch
+			assert.Equal(t, ceilMS(at(first)), eps[1].Wall, "ordinary placement at its first frame's arrival")
+		})
+	}
+}
+
+// A late track's keyframe that arrives while the released epoch is due
+// opens the drift epoch, not a late-join epoch (ruled in M2a); the running
+// track joins it at its own next keyframe.
+func TestDriftLateKeyDuringDueBreak(t *testing.T) {
+	const s = 0.05 // 2 s of drift after 40 s
+	two := []media.Kind{media.KindVideo, media.KindVideo}
+	h264late := &media.TrackConfig{Codec: media.CodecH264}
+	late := func(dts int64, key bool) media.Frame {
+		return media.Frame{Track: 1, Config: h264late, PTS: dts, DTS: dts, Key: key}
+	}
+	at := func(dts int64) time.Time { return skewed(driftT0, media.ToDuration(dts), s) }
+	c := New(Options{Kinds: two, MaxDrift: driftMax})
+	var out []media.Frame
+	joined := -1 // index of the track 0 frame after which track 1 starts
+	for i, f := range videoRun(0, 60*25) {
+		out = append(out, c.PushAt(f, at(f.DTS))...)
+		if joined < 0 && c.cur != nil && c.cur.drift.due {
+			require.NotZero(t, (i+1)%videoGOP, "track 0's next frame is no keyframe")
+			joined = i
+		}
+		if joined >= 0 {
+			l := late(f.DTS, (i-joined)%videoGOP == 0)
+			out = append(out, c.PushAt(l, at(l.DTS))...)
+			if i == joined {
+				require.NotNil(t, c.pend, "the late keyframe opened an epoch")
+				assert.Equal(t, causeDrift, c.pend.cause)
+			}
+		}
+	}
+	out = append(out, c.Flush()...)
+	require.Positive(t, joined, "drift became due")
+	st := c.Stats()
+	assert.EqualValues(t, 1, st.DriftBreaks)
+	assert.Zero(t, st.LateJoins)
+	assert.Zero(t, st.LateTracks)
+	require.Len(t, c.Epochs(), 2)
+	lateOut := onTrack(out, 1)
+	require.NotEmpty(t, lateOut)
+	assert.Len(t, inEpoch(lateOut, 2), len(lateOut), "the late track is in the drift epoch only")
+	e1 := onTrack(inEpoch(out, 1), 0)
+	assert.Zero(t, (e1[len(e1)-1].DTS/vDur+1)%videoGOP, "track 0 leaves epoch 1 right before its keyframe")
+	requireConform(t, out, conform.RuleStartOffset) // track 0 joins epoch 2 at its own keyframe
+}
+
+// An epoch released audio-only (no video within VideoWait) whose drift is
+// due opens no drift epoch on audio frames while video is expected: the
+// first video keyframe opens a new epoch by rule 6 instead, not counted as
+// drift, and the drift measurement starts again in it.
+func TestDriftAudioOnlyReleaseDue(t *testing.T) {
+	const s = 0.05
+	const audioFor = 80 * media.ClockRate / aDur // 80 s of audio alone
+	c := New(Options{Kinds: av, MaxDrift: driftMax})
+	r := newDriftResult()
+	at := byDTS(s, 0)
+	var dueAt int64 = -1
+	for _, f := range audioRun(0, audioFor) {
+		r.push(c, f, at(f))
+		if dueAt < 0 && c.cur != nil && c.cur.drift.due {
+			dueAt = f.DTS
+		}
+	}
+	require.NotNil(t, c.cur)
+	require.True(t, c.cur.audioOnly)
+	require.GreaterOrEqual(t, dueAt, int64(0), "drift became due")
+	assert.Less(t, dueAt, int64(audioFor*aDur)-20*media.ClockRate, "due for at least 20 s of audio")
+	assert.Zero(t, c.Stats().DriftBreaks, "audio opens no drift epoch while video is expected")
+	assert.Len(t, c.Epochs(), 1)
+
+	from := int64(audioFor * aDur)
+	v := videoRun(from, 20*25)
+	a := audioRun(from, 20*media.ClockRate/aDur)
+	for _, f := range mux(0, v, a) {
+		r.push(c, f, at(f))
+	}
+	st := c.Stats()
+	assert.Zero(t, st.DriftBreaks)
+	require.Len(t, c.Epochs(), 2, "the first keyframe opened an epoch")
+	assert.False(t, c.cur.audioOnly)
+	assert.False(t, c.cur.drift.due)
+	require.NotEmpty(t, r.drifts[2], "drift measured again")
+	assert.Less(t, r.drifts[2][0].Abs(), 50*time.Millisecond, "from a new baseline")
+	requireConform(t, r.out)
 }

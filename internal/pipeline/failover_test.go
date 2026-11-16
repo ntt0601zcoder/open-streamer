@@ -501,6 +501,47 @@ func TestFailoverDriftFollowsInput(t *testing.T) {
 	assert.Positive(t, p.Stats().Clock.DriftBreaks, "drift re-anchoring on the live backup")
 }
 
+// The reverse of TestFailoverDriftFollowsInput: drift is on for the live
+// primary and must be switched off when the not-live backup (a file)
+// becomes active, although both arrive 10 % slower than their source.
+func TestFailoverLiveToFileNoDrift(t *testing.T) {
+	ft, ev := newFakeTime(), newEvents()
+	boom := errors.New("boom")
+	const skew = 0.1
+	slow := func(base time.Time, start int64) func(int64) time.Time {
+		return func(dts int64) time.Time {
+			return base.Add(time.Duration(float64(media.ToDuration(dts-start)) * (1 + skew)))
+		}
+	}
+	const span0 = 60 * media.ClockRate
+	steps0 := av{video: 0, audio: -1, gop: 25, span: span0, arrival: slow(fakeT0, 0)}.steps()
+	r0 := newFakeReader(videoOnly, ingest.Spec{Live: true}, append(steps0, step{err: boom}), false)
+	base1 := fakeT0.Add(70 * time.Second)
+	steps1 := av{video: 0, audio: -1, gop: 25, start: span0, span: 60 * media.ClockRate, arrival: slow(base1, span0)}.steps()
+	m := byURL{
+		"fake://0": one(r0),
+		"fake://1": standby(videoOnly, func(int) (ingest.Reader, error) {
+			return newFakeReader(videoOnly, ingest.Spec{}, steps1, true), nil
+		}),
+	}
+	opt := multiOptions(ft, m, ev, "fake://0", "fake://1")
+	opt.EndOnEOF = true
+	var p *Pipeline
+	var atFailure clock.Stats
+	opt.OnEvent = func(e Event) {
+		if e.Kind == EventFailed {
+			atFailure = p.Stats().Clock
+		}
+		ev.on(e)
+	}
+	p = New(hub.New(hub.Options{}), opt)
+	require.NoError(t, p.Run(timeout(t)))
+	require.Equal(t, []EventKind{EventActive, EventFailed, EventActive}, ev.kinds())
+	require.Positive(t, atFailure.DriftBreaks, "drift re-anchoring on the live primary")
+	st := p.Stats().Clock
+	assert.Equal(t, atFailure.DriftBreaks, st.DriftBreaks, "no drift re-anchoring on the file")
+}
+
 func TestPipelinePassiveReconnect(t *testing.T) {
 	ft, ev := newFakeTime(), newEvents()
 	const pause = 2 * time.Second

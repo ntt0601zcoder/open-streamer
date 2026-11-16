@@ -448,7 +448,17 @@ func TestHLSPullOurCMAF(t *testing.T) {
 	out = append(out, c.Flush()...)
 	require.GreaterOrEqual(t, counts[0], 7*25, "read seven seconds of video in time")
 	assert.Greater(t, counts[1], 6*40, "and the audio rendition alongside")
-	assert.NotEmpty(t, res.breaks, "the loop is an EXT-X-DISCONTINUITY")
+	// Breaks only at loop points: seven seconds of a 6 s loop cross one or
+	// two, the first within a pass of video, and two breaks are exactly one
+	// pass of video apart.
+	pass := fixtureTrackCounts(t, httpFixture(t))[0]
+	require.NotEmpty(t, res.breaks, "the loop is an EXT-X-DISCONTINUITY")
+	require.LessOrEqual(t, len(res.breaks), 2, "at most two loop points in seven seconds")
+	videoBefore := func(i int) int { return trackCounts(res.frames[:i])[0] }
+	assert.LessOrEqual(t, videoBefore(res.breaks[0]), pass, "the first break is a loop point")
+	for k := 1; k < len(res.breaks); k++ {
+		assert.Equal(t, pass, videoBefore(res.breaks[k])-videoBefore(res.breaks[k-1]), "one pass between loop points")
+	}
 	requireDTSOrder(t, res)
 	assert.Nil(t, conform.CheckFrames(out, conform.FrameOptions{}))
 	st := r.Stats()
@@ -568,4 +578,58 @@ func TestHLSPullFMP4BadSegment(t *testing.T) {
 	require.Len(t, res.breaks, 1)
 	assert.Equal(t, want, trackCounts(res.frames))
 	assert.EqualValues(t, 1, r.Stats()["bad_segments"])
+}
+
+// A new EXT-X-MAP URI alone, with no EXT-X-DISCONTINUITY, starts a new run:
+// one break, and the second init segment is fetched.
+func TestHLSPullMapChangeIsBreak(t *testing.T) {
+	init, frags := splitFMP4(t, fixtureFile(t, "h264_aac_frag.mp4"))
+	d, err := fmp4.NewDemuxer(init)
+	require.NoError(t, err)
+	want := map[int]int{}
+	for _, f := range frags {
+		out, err := d.Segment(f)
+		require.NoError(t, err)
+		for _, fr := range out {
+			want[fr.Track]++
+		}
+	}
+	pl := hls.MediaPlaylist{Version: 7, TargetDuration: 2, Ended: true}
+	for _, m := range []string{"a/init.mp4", "b/init.mp4"} {
+		for k := range frags {
+			pl.Segments = append(pl.Segments, hls.Segment{URI: fmt.Sprintf("f%d.m4s", k), Duration: time.Second, Map: m})
+		}
+	}
+	var mu sync.Mutex
+	inits := map[string]int{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(pl.Encode()) })
+	mux.HandleFunc("/{dir}/init.mp4", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		inits[r.PathValue("dir")]++
+		mu.Unlock()
+		_, _ = w.Write(init)
+	})
+	mux.HandleFunc("/{n}", func(w http.ResponseWriter, r *http.Request) {
+		var k int
+		if _, err := fmt.Sscanf(r.PathValue("n"), "f%d.m4s", &k); err != nil || k >= len(frags) {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(frags[k])
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	r, err := ingest.Open(context.Background(), srv.URL+"/index.m3u8", ingest.Env{})
+	require.NoError(t, err)
+	res := pullAll(r)
+	require.ErrorIs(t, res.err, io.EOF)
+	require.NoError(t, r.Close())
+	require.Len(t, res.breaks, 1, "the map change is the only break")
+	assert.Equal(t, want, trackCounts(res.frames[:res.breaks[0]]))
+	assert.Equal(t, want, trackCounts(res.frames[res.breaks[0]:]))
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, map[string]int{"a": 1, "b": 1}, inits, "each init fetched once")
 }

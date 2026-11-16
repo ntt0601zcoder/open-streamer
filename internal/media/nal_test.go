@@ -145,3 +145,85 @@ func BenchmarkClassifyH264LargeSlice(b *testing.B) {
 		c.Classify(au, 0)
 	}
 }
+
+// ueBits is the exp-Golomb code of v as a string of bits.
+func ueBits(v uint) string {
+	x := v + 1
+	n := 0
+	for y := x; y > 1; y >>= 1 {
+		n++
+	}
+	s := ""
+	for range n {
+		s += "0"
+	}
+	for i := n; i >= 0; i-- {
+		if x&(1<<uint(i)) != 0 {
+			s += "1"
+		} else {
+			s += "0"
+		}
+	}
+	return s
+}
+
+// Only slice types 2 and 7 (I) with a recovery point make a key; P, B, SP
+// and SI slices do not, and a P or B slice is never RASL before a key.
+func TestClassifyH264SliceTypes(t *testing.T) {
+	assert.Equal(t, "1", ueBits(0))
+	assert.Equal(t, "0001000", ueBits(7))
+	for st := range uint(10) {
+		c := NewNALClassifier(CodecH264)
+		k, r := c.Classify([][]byte{recoverySEI("1"), slice(ueBits(st))}, 100)
+		assert.Equal(t, st == 2 || st == 7, k, "slice_type %d", st)
+		assert.False(t, r, "slice_type %d", st)
+	}
+}
+
+// SEI payload types and sizes over 254 use 0xFF extension bytes: a payload
+// with a long size is skipped whole, and a type whose last byte is 6 but
+// whose value is 261 is not a recovery point.
+func TestClassifyH264SEIExtension(t *testing.T) {
+	long := make([]byte, 300) // user data, size 300 = FF 2D
+	for i := range long {
+		long[i] = 0x06 // bytes that would read as a recovery point if misparsed
+	}
+	recovery0 := append([]byte{0x06, 0x01}, packBits("1"+"1000")...)
+	sei := append(append([]byte{0x06, 0x05, 0xff, 0x2d}, long...), recovery0...)
+	assert.True(t, h264RecoveryPoint0(sei), "recovery point after a payload with an extended size")
+
+	sei = append([]byte{0x06, 0xff, 0x06, 0x01}, packBits("1"+"1000")...)
+	assert.False(t, h264RecoveryPoint0(sei), "payload type 261 is not a recovery point")
+
+	sei = append([]byte{0x06, 0xff, 0x06, 0x01, 0x80}, recovery0...)
+	assert.True(t, h264RecoveryPoint0(sei), "recovery point after a payload with an extended type")
+}
+
+// The recovery point need not be the first SEI message, nor in the first
+// SEI NAL unit; its own recovery_frame_cnt decides.
+func TestClassifyH264SEINotFirst(t *testing.T) {
+	userData := append([]byte{0x05, 0x10}, make([]byte, 16)...)
+	msg := func(cnt string) []byte { return append([]byte{0x06, 0x01}, packBits(cnt+"1000")...) }
+	sei := func(msgs ...[]byte) []byte {
+		out := []byte{0x06}
+		for _, m := range msgs {
+			out = append(out, m...)
+		}
+		return out
+	}
+	i := slice(ueBits(7))
+	for name, tc := range map[string]struct {
+		au  [][]byte
+		key bool
+	}{
+		"second message, cnt 0":   {au: [][]byte{sei(userData, msg("1")), i}, key: true},
+		"second message, cnt 2":   {au: [][]byte{sei(userData, msg("011")), i}, key: false},
+		"second SEI NAL, cnt 0":   {au: [][]byte{sei(userData), sei(msg("1")), i}, key: true},
+		"second SEI NAL, cnt 2":   {au: [][]byte{sei(userData), sei(msg("011")), i}, key: false},
+		"third message after two": {au: [][]byte{sei(userData, userData, msg("1")), i}, key: true},
+	} {
+		c := NewNALClassifier(CodecH264)
+		k, _ := c.Classify(tc.au, 0)
+		assert.Equal(t, tc.key, k, name)
+	}
+}

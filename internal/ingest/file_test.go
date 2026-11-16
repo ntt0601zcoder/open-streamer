@@ -99,18 +99,64 @@ func TestFileLoop(t *testing.T) {
 		assert.Equal(t, first[i].DTS, f.DTS)
 	}
 	assert.EqualValues(t, 2, r.Stats()["passes"])
+}
 
-	// Close during Read returns promptly and unblocks the reader.
+// stallFile serves data, then blocks Read until Close, like a FIFO whose
+// writer went quiet. blocked is closed when a Read first blocks.
+type stallFile struct {
+	data    []byte
+	blocked chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+	close   sync.Once
+}
+
+func newStallFile(data []byte) *stallFile {
+	return &stallFile{data: data, blocked: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (f *stallFile) Read(p []byte) (int, error) {
+	if len(f.data) > 0 {
+		n := copy(p, f.data)
+		f.data = f.data[n:]
+		return n, nil
+	}
+	f.once.Do(func() { close(f.blocked) })
+	<-f.closed
+	return 0, os.ErrClosed
+}
+
+func (f *stallFile) Close() error {
+	f.close.Do(func() { close(f.closed) })
+	return nil
+}
+
+func TestFileCloseDuringBlockedRead(t *testing.T) {
+	b, err := os.ReadFile(fixturePath("h264_aac.ts"))
+	require.NoError(t, err)
+	sf := newStallFile(b)
+	r := &fileReader{
+		path: "stall.ts", loop: true, done: map[string]uint64{}, now: time.Now,
+		open: func(string) (io.ReadCloser, error) { return sf, nil },
+	}
+	require.NoError(t, r.openPass(context.Background()))
+
 	done := make(chan error, 1)
 	go func() {
 		for {
-			if _, err := r.Read(); err != nil && err != ErrDiscontinuity {
+			if _, err := r.Read(); err != nil {
 				done <- err
 				return
 			}
 		}
 	}()
-	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-sf.blocked:
+	case err := <-done:
+		t.Fatalf("Read ended before blocking: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read never blocked")
+	}
 	start := time.Now()
 	require.NoError(t, r.Close())
 	select {
