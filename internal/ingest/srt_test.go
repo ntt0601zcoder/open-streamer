@@ -375,12 +375,20 @@ func TestSRTCallerDisconnectErrors(t *testing.T) {
 // The caller path delivers every frame of the fixture, then fails when the
 // listener hangs up.
 func TestSRTCallerFrameCount(t *testing.T) {
+	want := map[int]int{}
+	for _, f := range demuxFrames(t, "h264_aac.ts") {
+		want[f.Track]++
+	}
 	port := freeUDPPort(t)
 	ln, err := srt.Listen("srt", "127.0.0.1:"+strconv.Itoa(port), srt.DefaultConfig())
 	require.NoError(t, err)
 	defer ln.Close()
 	data, err := os.ReadFile(fixturePath("h264_aac.ts"))
 	require.NoError(t, err)
+	hangUp := make(chan struct{})
+	var hangUpOnce sync.Once
+	closeHangUp := func() { hangUpOnce.Do(func() { close(hangUp) }) }
+	defer closeHangUp()
 	served := make(chan error, 1)
 	go func() {
 		served <- func() error {
@@ -399,7 +407,7 @@ func TestSRTCallerFrameCount(t *testing.T) {
 				}
 				time.Sleep(time.Millisecond)
 			}
-			time.Sleep(500 * time.Millisecond) // let the tail drain before closing
+			<-hangUp
 			return nil
 		}()
 	}()
@@ -407,6 +415,16 @@ func TestSRTCallerFrameCount(t *testing.T) {
 	require.NoError(t, err)
 	defer r.Close()
 	res, wg, mu := drain(r)
+	// The fixture ends with an audio packet, and a sized audio PES is
+	// emitted as soon as it is complete: once every audio frame is in, the
+	// reader has every byte. Only the video frames the demuxer holds back
+	// wait for the end of the input.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return res.counts[1] == want[1]
+	}, 5*time.Second, 5*time.Millisecond, "every audio frame read before the hang-up")
+	closeHangUp()
 	require.NoError(t, <-served)
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
@@ -417,10 +435,6 @@ func TestSRTCallerFrameCount(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	want := map[int]int{}
-	for _, f := range demuxFrames(t, "h264_aac.ts") {
-		want[f.Track]++
-	}
 	assert.Equal(t, want, res.counts)
 	assert.Zero(t, res.breaks)
 	require.Error(t, res.err)
