@@ -136,6 +136,9 @@ type Stats struct {
 	// DriftBreaks counts drift epochs. DroppedDrift counts the frames a drift
 	// epoch dropped so as not to overlap the previous epoch.
 	DriftBreaks, DroppedDrift uint64
+	// DriftEvaluations counts drift evaluations (see Epoch): zero when drift
+	// is disabled or no window held enough arrivals to judge.
+	DriftEvaluations uint64
 }
 
 // gate is a video track's start-of-epoch gate (rule 5).
@@ -1125,7 +1128,11 @@ func (c *Clock) emit(f media.Frame, t *track, ep *epoch, at time.Time) {
 	f.PTS += off
 	f.DTS += off
 	f.Epoch = ep.id
+	evals := ep.drift.evals
 	ep.drift.observe(at, at.Add(-media.ToDuration(f.DTS-ep.start)))
+	if ep.drift.evals != evals { // observe evaluates at most once
+		c.stats.DriftEvaluations++
+	}
 	if !ep.hasDTS || f.DTS > ep.maxDTS {
 		ep.hasDTS, ep.maxDTS = true, f.DTS
 	}

@@ -540,6 +540,8 @@ func TestFailoverLiveToFileNoDrift(t *testing.T) {
 	require.Positive(t, atFailure.DriftBreaks, "drift re-anchoring on the live primary")
 	st := p.Stats().Clock
 	assert.Equal(t, atFailure.DriftBreaks, st.DriftBreaks, "no drift re-anchoring on the file")
+	require.Positive(t, atFailure.DriftEvaluations)
+	assert.Equal(t, atFailure.DriftEvaluations, st.DriftEvaluations, "drift not evaluated on the file")
 }
 
 func TestPipelinePassiveReconnect(t *testing.T) {
