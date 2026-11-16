@@ -93,6 +93,12 @@ type ServerOptions struct {
 	// SRJump shifts the NTP time of the last track's sender reports by
 	// SRJump from the second report on.
 	SRJump time.Duration
+	// SSRCChangeAfter > 0 restarts every track once that long after PLAY:
+	// a new SSRC and a new sequence base, as a rebooting camera does.
+	SSRCChangeAfter time.Duration
+	// KeepaliveStatus, when set, answers keepalives (GET_PARAMETER, and
+	// OPTIONS carrying a Session) with this status.
+	KeepaliveStatus int
 	// UDP options; UDP is not served yet (SETUP over UDP is answered 461).
 	DropUDP                  bool
 	UDPLoss, UDPSwap, UDPDup float64
@@ -445,6 +451,10 @@ func (ss *session) handle(req *rtsp.Request) bool {
 	if h, ok := ss.s.authorize(req); !ok {
 		return ss.respond(req, 401, h, nil)
 	}
+	if code := ss.s.opt.KeepaliveStatus; code != 0 &&
+		(req.Method == "GET_PARAMETER" || req.Method == "OPTIONS" && req.Header.Get("Session") != "") {
+		return ss.respond(req, code, nil, nil)
+	}
 	switch req.Method {
 	case "OPTIONS":
 		pub := "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"
@@ -673,7 +683,7 @@ func (ss *session) stream(playResp func() bool) {
 		}
 	}
 	sent := 0
-	injected := false
+	injected, restarted := false, false
 	nextSR := ss.s.opt.SRAfter
 	for {
 		if playResp == nil && len(states) == 0 {
@@ -719,6 +729,13 @@ func (ss *session) stream(playResp func() bool) {
 			}
 			playResp = nil
 			continue
+		}
+		if d := ss.s.opt.SSRCChangeAfter; d > 0 && !restarted && time.Since(start) >= d {
+			restarted = true
+			for _, st := range states {
+				ss.ssrc[st.track] = ss.rng.Uint32()
+				st.seq = uint16(ss.rng.Uint32())
+			}
 		}
 		n, ok := ss.sendAU(next)
 		if !ok {
