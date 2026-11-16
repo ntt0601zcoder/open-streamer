@@ -29,10 +29,6 @@ const (
 	// rtpMaxMedia bounds the media indexes taken from a description, as
 	// pkg/rtsp bounds the media of an SDP.
 	rtpMaxMedia = 16
-	// rtpAudioMaxStep is the largest forward step between consecutive audio
-	// AUs, in 90 kHz ticks, that continues the timeline: 1 s, the DTS
-	// extractor's smallest break.
-	rtpAudioMaxStep = media.ClockRate
 )
 
 // ntpEpoch is an NTP timestamp of zero, which cameras send before their
@@ -65,8 +61,7 @@ var ntpEpoch = time.Unix(-2208988800, 0)
 // a zero NTP time are ignored (sr_ignored).
 //
 // Timeline breaks. A track whose RTP timestamp steps by more than 10 s, an
-// audio track whose timestamp steps back or forward by more than 1 s
-// (timeline_breaks), or a track that restart reports as restarted (a new
+// audio track whose timestamp steps back (timeline_breaks), or a track that restart reports as restarted (a new
 // SSRC), drops its SR, has its DTS extractor reset and is placed again by
 // arrival; when it is the reference, every other track's next SR pair
 // counts as a first pair again. An audio AU with the timestamp of the
@@ -489,7 +484,9 @@ func (r *rtpFrames) push(au rtsp.AU) (frames []Frame, discontinuity bool, err er
 		case ts == t.prevAU:
 			r.n.duplicates.Add(1)
 			return nil, false, nil
-		case ts < t.prevAU || t.to90(ts)-t.to90(t.prevAU) > rtpAudioMaxStep:
+		case ts < t.prevAU:
+			// A forward step up to 10 s is a gap (loss): the RTP clock
+			// keeps the PTS right, and the SR alignment holds.
 			broken = true
 		}
 	}

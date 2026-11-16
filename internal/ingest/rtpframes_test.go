@@ -521,6 +521,30 @@ func TestRTPFramesSync(t *testing.T) {
 		})
 	}
 
+	t.Run("audio loss gap keeps the SR alignment", func(t *testing.T) {
+		srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(37, 38)))
+		// 2 s of audio is lost: the RTP timestamps step forward by 2 s.
+		a := srcs[1]
+		from, to := a.frames[len(a.frames)/2].PTS, a.frames[len(a.frames)/2].PTS+2*media.ClockRate
+		a.frames = slices.DeleteFunc(a.frames, func(f media.Frame) bool { return f.PTS >= from && f.PTS < to })
+		r, out, breaks := run(t, srcs, desc, nil, []step{
+			// The SRs come first, so the audio offset is the SR's (45 ms
+			// off arrival), small enough for the Clock's start alignment.
+			{at: 0, srcs: []int{0, 1}, skew: []time.Duration{0, 45 * ms}, want: false},
+		})
+		require.Empty(t, breaks, "a forward gap is no discontinuity")
+		gotA := byTrack(out, 1)
+		require.Len(t, gotA, len(a.frames))
+		v := shiftOf(byTrack(out, 0), srcs[0].frames)[0]
+		for k, s := range shiftOf(gotA, a.frames) {
+			require.InDelta(t, v+tick(45*ms), s, 1, "audio %d keeps the SR offset", k)
+		}
+		st := r.stats()
+		assert.Zero(t, st["timeline_breaks"])
+		assert.Zero(t, st["sync_corrected"])
+		rtpClock(t, r.kinds(), out, breaks)
+	})
+
 	t.Run("HE-AAC at the SBR clock", func(t *testing.T) {
 		srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(11, 12)))
 		heAACSource(srcs, srcs[0].frames[len(srcs[0].frames)-1].PTS)
@@ -853,8 +877,8 @@ func TestRTPFramesAudioStepBack(t *testing.T) {
 		mid := a.frames[len(a.frames)/3].DTS
 		late := a.frames[2*len(a.frames)/3].DTS
 		a.frames = shiftFrom(a.frames, mid, back)
-		// Later, a forward step of 1.5 s: past the 1 s bound.
-		a.frames = shiftFrom(a.frames, late, 3*media.ClockRate/2)
+		// Later, a forward step of 12 s: past the 10 s bound.
+		a.frames = shiftFrom(a.frames, late, 12*media.ClockRate)
 		r := newRTPFrames(desc, nil, &media.ConfigCache{})
 		out, breaks := rtpRun(t, r, rtpAUs(t, []*rtpSrc{a}, srcArrival))
 		require.Len(t, breaks, 2)
