@@ -191,3 +191,41 @@ func TestPacketizeAACRoundTrip(t *testing.T) {
 }
 
 var _ = rtp.Packet{}
+
+func TestAACTailFragmentAfterGap(t *testing.T) {
+	d, err := NewDepacketizer(aacMedia(hbr([]byte{0x11, 0x90}), 48000), 1<<20)
+	require.NoError(t, err)
+	frame := frameOf(100, 7)
+	hdr := func(size int) []byte { v := size << 3; return []byte{0, 16, byte(v >> 8), byte(v)} }
+	d.Push(pkt(1, 900, false, append(hdr(100), frame[:40]...)), testT0)
+	d.Gap()
+	// the tail has the dropped AU's timestamp: ignored, and the next AU is clean.
+	assert.Empty(t, d.Push(pkt(3, 900, true, append(hdr(100), frame[80:]...)), testT0))
+	out := d.Push(pkt(4, 1924, true, rawAAC(frameOf(9, 1))), testT0)
+	require.Len(t, out, 1)
+	assert.False(t, out[0].Lost)
+}
+
+func TestNewDepacketizerAACFormat(t *testing.T) {
+	for _, f := range []*AACFormat{
+		{Config: []byte{0x11, 0x90}},
+		{Config: []byte{0x11, 0x90}, SizeLength: 33},
+		{Config: []byte{0x11, 0x90}, SizeLength: 13, IndexLength: 33},
+		{Config: []byte{0x11, 0x90}, SizeLength: 13, AuxLength: -1},
+	} {
+		_, err := NewDepacketizer(aacMedia(f, 48000), 1)
+		require.Error(t, err)
+	}
+}
+
+func TestAACAuxBounds(t *testing.T) {
+	f := &AACFormat{Config: []byte{0x11, 0x90}, SizeLength: 13, IndexLength: 3, IndexDeltaLength: 3, AuxLength: 32}
+	d, err := NewDepacketizer(aacMedia(f, 48000), 1<<20)
+	require.NoError(t, err)
+	pl := []byte{0, 16, 0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 1}
+	assert.NotPanics(t, func() { assert.Empty(t, d.Push(pkt(1, 0, true, pl), testT0)) })
+}
+
+func TestSamplesPerAUHighClock(t *testing.T) {
+	assert.Equal(t, uint32(1024*8000000/44100), samplesPerAU(hbr([]byte{0x12, 0x10}), 8000000))
+}

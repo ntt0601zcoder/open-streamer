@@ -203,7 +203,6 @@ func TestDepackLostFragment(t *testing.T) {
 	require.Len(t, out, 2)
 	assert.True(t, out[0].Lost)
 	assert.Equal(t, uint32(200), out[0].Timestamp)
-	assert.True(t, out[0].Lost, "AU started after a gap with a new timestamp is lost")
 	assert.False(t, out[1].Lost)
 	assert.Equal(t, nal264(1, 60), out[1].NALUs[0])
 }
@@ -215,12 +214,95 @@ func TestDepackLostFragmentNoGapCall(t *testing.T) {
 	out := make([]AU, 0, 8)
 	out = append(out, d.Push(pkt(1, 100, false, fuA(0x60, 5, true, false, idr[1:1000])), testT0)...)
 	out = append(out, d.Push(pkt(2, 200, true, nal264(1, 50)), testT0)...)
+	out = append(out, d.Push(pkt(3, 300, true, nal264(1, 51)), testT0)...)
 	out = append(out, d.Flush()...)
-	// the unfinished fragment yields no slice, so the AU carries nothing;
-	// the next AU is complete and clean.
-	require.Len(t, out, 1)
-	assert.False(t, out[0].Lost)
+	// the IDR never completed, so its Lost flag moves to the next AU.
+	require.Len(t, out, 2)
+	assert.True(t, out[0].Lost)
 	assert.Equal(t, uint32(200), out[0].Timestamp)
+	assert.False(t, out[1].Lost)
+}
+
+func TestDepackInvalidNALs(t *testing.T) {
+	good := nal264(1, 20)
+	stap := func(inner ...[]byte) []byte {
+		pl := []byte{0x78}
+		for _, n := range inner {
+			pl = append(pl, byte(len(n)>>8), byte(len(n)))
+			pl = append(pl, n...)
+		}
+		return pl
+	}
+	nestedSTAP := stap(good, stap(nal264(1, 8)))
+	nestedFU := stap(good, fuA(0x60, 5, true, false, []byte{1, 2}))
+	for name, pl := range map[string][]byte{
+		"nested STAP-A": nestedSTAP,
+		"FU in STAP-A":  nestedFU,
+		"type 0":        stap(good, []byte{0x60, 1, 2}),
+	} {
+		d, err := NewDepacketizer(videoMedia(CodecH264), 1<<20)
+		require.NoError(t, err)
+		d.Push(pkt(1, 100, true, pl), testT0)
+		out := d.Flush()
+		require.Len(t, out, 1, name)
+		assert.True(t, out[0].Lost, name)
+		assert.Equal(t, [][]byte{good}, out[0].NALUs, name)
+	}
+	// an FU whose inner type is 28 or 0 is rejected.
+	for _, typ := range []byte{28, 0, 24} {
+		d, _ := NewDepacketizer(videoMedia(CodecH264), 1<<20)
+		d.Push(pkt(1, 100, false, good), testT0)
+		d.Push(pkt(2, 100, false, fuA(0x60, typ, true, false, []byte{1, 2})), testT0)
+		d.Push(pkt(3, 100, true, fuA(0x60, typ, false, true, []byte{3})), testT0)
+		out := d.Flush()
+		require.Len(t, out, 1)
+		assert.True(t, out[0].Lost)
+		assert.Equal(t, [][]byte{good}, out[0].NALUs)
+	}
+	// H.265: type 48+ and a 1-byte unit inside an AP.
+	g := h265nal(1, 10)
+	ap := func(inner ...[]byte) []byte {
+		pl := []byte{48 << 1, 1}
+		for _, n := range inner {
+			pl = append(pl, byte(len(n)>>8), byte(len(n)))
+			pl = append(pl, n...)
+		}
+		return pl
+	}
+	for name, pl := range map[string][]byte{
+		"nested AP":  ap(g, ap(h265nal(1, 6))),
+		"type 63":    ap(g, []byte{63 << 1, 1, 9}),
+		"one byte":   ap(g, []byte{2}),
+		"FU in AP":   ap(g, []byte{49 << 1, 1, 0x93, 5}),
+		"type 50 FU": nil,
+	} {
+		d, _ := NewDepacketizer(videoMedia(CodecH265), 1<<20)
+		if pl == nil {
+			d.Push(pkt(1, 100, false, g), testT0)
+			d.Push(pkt(2, 100, false, []byte{49 << 1, 1, 0x80 | 50, 1, 2}), testT0)
+		} else {
+			d.Push(pkt(1, 100, true, pl), testT0)
+		}
+		out := d.Flush()
+		require.Len(t, out, 1, name)
+		assert.True(t, out[0].Lost, name)
+		assert.Equal(t, [][]byte{g}, out[0].NALUs, name)
+	}
+}
+
+func TestDepackCarryCapped(t *testing.T) {
+	d, err := NewDepacketizer(videoMedia(CodecH264), 8<<20)
+	require.NoError(t, err)
+	sps := nal264(7, 30000)
+	for i := uint32(0); i < 10; i++ {
+		d.Push(pkt(uint16(i), 100+i, true, sps), testT0)
+	}
+	d.Push(pkt(20, 200, true, nal264(5, 50)), testT0)
+	out := d.Flush()
+	require.Len(t, out, 1)
+	// at most two 30000-byte sets (60000 < 64 KiB) plus the slice survive.
+	assert.LessOrEqual(t, len(out[0].NALUs), 3)
+	assert.Equal(t, nal264(5, 50), out[0].NALUs[len(out[0].NALUs)-1])
 }
 
 func TestDepackGapWithinAU(t *testing.T) {

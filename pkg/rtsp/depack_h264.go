@@ -20,6 +20,12 @@ func isSlice264(n []byte) bool {
 	return t >= h264SliceMin && t <= h264SliceMax
 }
 
+// valid264 accepts the NAL unit types that may be a stored unit: 1..23.
+func valid264(n []byte) bool {
+	t := n[0] & 0x1f
+	return t >= 1 && t < h264STAPA
+}
+
 func isAUD264(n []byte) bool { return n[0]&0x1f == h264AUD }
 
 // h264Depack implements RFC 6184: single NAL unit, STAP-A and FU-A.
