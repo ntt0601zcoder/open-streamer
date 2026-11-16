@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"testing/iotest"
 
@@ -388,4 +389,77 @@ func TestReaderTimeoutIsNotSticky(t *testing.T) {
 	assert.Same(t, boom, err)
 	_, err = r.Next()
 	assert.Same(t, boom, err)
+}
+
+// scriptReader serves its steps in order: a nil step is one timeout, any
+// other is data (served over as many reads as it takes). It returns io.EOF
+// at the end.
+type scriptReader struct{ steps [][]byte }
+
+func (s *scriptReader) Read(p []byte) (int, error) {
+	if len(s.steps) == 0 {
+		return 0, io.EOF
+	}
+	if s.steps[0] == nil {
+		s.steps = s.steps[1:]
+		return 0, timeoutErr{}
+	}
+	n := copy(p, s.steps[0])
+	s.steps[0] = s.steps[0][n:]
+	if len(s.steps[0]) == 0 {
+		s.steps = s.steps[1:]
+	}
+	return n, nil
+}
+
+// readThroughTimeouts reads r to io.EOF, counting the timeouts.
+func readThroughTimeouts(t *testing.T, r *Reader) ([]gotPacket, int) {
+	t.Helper()
+	var out []gotPacket
+	timeouts := 0
+	for {
+		p, err := r.Next()
+		if errors.Is(err, io.EOF) {
+			return out, timeouts
+		}
+		if isTimeout(err) {
+			timeouts++
+			continue
+		}
+		require.NoError(t, err)
+		out = append(out, gotPacket{PID: p.PID, CC: p.CC, PUSI: p.PUSI, Payload: append([]byte(nil), p.Payload...)})
+	}
+}
+
+// A timeout inside the lock scan or inside its confirmation is returned,
+// and the next call resumes the scan where it stopped: the lock lands where
+// it would have without the timeout.
+func TestReaderTimeoutDuringLock(t *testing.T) {
+	raw := readH264AAC(t)[:20*PacketSize]
+	want := readAll(t, NewReader(bytes.NewReader(raw)))
+	junk := make([]byte, 60)
+	falseSync := slices.Clone(junk)
+	falseSync[10] = syncByte // fails confirmation: 188 bytes on is raw[138]
+	require.NotEqual(t, syncByte, raw[138])
+	for name, tc := range map[string]struct {
+		prefix []byte
+		cut    int // the timeout comes after this many bytes
+	}{
+		"scanning junk":            {prefix: junk, cut: 30},
+		"confirming a false sync":  {prefix: falseSync, cut: 100},
+		"confirming the true sync": {prefix: nil, cut: 100},
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := append(slices.Clone(tc.prefix), raw...)
+			r := NewReader(&scriptReader{steps: [][]byte{in[:tc.cut], nil, in[tc.cut:]}})
+			_, err := r.Next()
+			require.True(t, isTimeout(err), "the first Next returns the timeout: %v", err)
+			got, timeouts := readThroughTimeouts(t, r)
+			assert.Zero(t, timeouts)
+			assert.Equal(t, want, got)
+			// Resyncs may count the interrupted scan twice (a known M2a
+			// minor); the skipped bytes are exact.
+			assert.EqualValues(t, len(tc.prefix), r.Stats().SkippedBytes)
+		})
+	}
 }

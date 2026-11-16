@@ -24,6 +24,9 @@ type fileReader struct {
 	loop bool
 	spec Spec
 	now  func() time.Time
+	// open opens the file for a pass; nil means os.Open. Tests inject a
+	// reader that blocks.
+	open func(name string) (io.ReadCloser, error)
 
 	cache  media.ConfigCache
 	frames int // frames of the current pass; Read goroutine only
@@ -46,7 +49,11 @@ func openFile(ctx context.Context, p parsed, env Env) (Reader, error) {
 
 // openPass opens the file for a new pass.
 func (r *fileReader) openPass(ctx context.Context) error {
-	f, err := os.Open(r.path)
+	open := r.open
+	if open == nil {
+		open = func(name string) (io.ReadCloser, error) { return os.Open(name) }
+	}
+	f, err := open(r.path)
 	if err != nil {
 		return fmt.Errorf("ingest: file: open: %w", err)
 	}

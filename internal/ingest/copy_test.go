@@ -3,6 +3,8 @@ package ingest
 import (
 	"context"
 	"io"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,16 +149,15 @@ func TestCopyClose(t *testing.T) {
 	require.Len(t, h.Stats(), 1)
 	assert.Equal(t, "copy:copy://src", h.Stats()[0].Name)
 
+	f, err := r.Read()
+	require.NoError(t, err, "the buffered key")
+	require.True(t, f.Key)
 	done := make(chan error, 1)
 	go func() {
-		for {
-			if _, err := r.Read(); err != nil {
-				done <- err
-				return
-			}
-		}
+		_, err := r.Read()
+		done <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	waitBlockedIn(t, "ingest.(*copyReader).next(")
 	require.NoError(t, r.Close())
 	select {
 	case err := <-done:
@@ -166,6 +167,24 @@ func TestCopyClose(t *testing.T) {
 	}
 	assert.Empty(t, h.Stats())
 	require.NoError(t, r.Close())
+}
+
+// waitBlockedIn waits until a goroutine is parked in a select or channel
+// operation inside fn (a stack frame prefix such as "pkg.(*T).m(").
+func waitBlockedIn(t *testing.T, fn string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		buf := make([]byte, 1<<20)
+		buf = buf[:runtime.Stack(buf, true)]
+		for _, g := range strings.Split(string(buf), "\n\n") {
+			header, _, _ := strings.Cut(g, "\n")
+			parked := strings.Contains(header, "[select") || strings.Contains(header, "[chan receive")
+			if parked && strings.Contains(g, fn) {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, time.Millisecond, "no goroutine blocked in %s", fn)
 }
 
 func TestCopyHubClosedIsEOF(t *testing.T) {

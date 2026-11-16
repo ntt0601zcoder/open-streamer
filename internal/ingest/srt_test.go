@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -40,11 +41,13 @@ func udpPortBound(port int) bool {
 }
 
 // srtPublish dials the listener and writes the fixture paced over about d,
-// then closes.
-func srtPublish(t *testing.T, port int, streamID string, d time.Duration) error {
-	t.Helper()
+// then closes. It runs in its own goroutine, so it returns its errors
+// instead of failing the test.
+func srtPublish(port int, streamID string, d time.Duration) error {
 	data, err := os.ReadFile(fixturePath("h264_aac.ts"))
-	require.NoError(t, err)
+	if err != nil {
+		return err
+	}
 	cfg := srt.DefaultConfig()
 	cfg.StreamId = streamID
 	conn, err := srt.Dial("srt", "127.0.0.1:"+strconv.Itoa(port), cfg)
@@ -126,7 +129,7 @@ func TestSRTCallerListenerInProcess(t *testing.T) {
 		opened <- err
 	}()
 	time.Sleep(200 * time.Millisecond)
-	go func() { pubErr <- srtPublish(t, port, "", 2*time.Second) }()
+	go func() { pubErr <- srtPublish(port, "", 2*time.Second) }()
 	require.NoError(t, <-opened)
 	assert.Equal(t, Spec{Live: true, Passive: true}, r.Spec())
 	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
@@ -151,19 +154,13 @@ func TestSRTCallerListenerInProcess(t *testing.T) {
 
 func TestSRTListenerRejectsSecond(t *testing.T) {
 	port := freeUDPPort(t)
-	opened := make(chan Reader, 1)
-	go func() {
-		r, err := Open(context.Background(), listenerURL(port, ""), Env{})
-		if err != nil {
-			t.Error(err)
-		}
-		opened <- r
-	}()
+	opened := openAsync(t, context.Background(), listenerURL(port, ""), Env{})
 	time.Sleep(200 * time.Millisecond)
 	first := make(chan error, 1)
-	go func() { first <- srtPublish(t, port, "", 2*time.Second) }()
-	r := <-opened
-	require.NotNil(t, r)
+	go func() { first <- srtPublish(port, "", 2*time.Second) }()
+	o := <-opened
+	require.NoError(t, o.err)
+	r := o.r
 	defer r.Close()
 	_, wg, _ := drain(r)
 	time.Sleep(500 * time.Millisecond)
@@ -177,44 +174,44 @@ func TestSRTListenerRejectsSecond(t *testing.T) {
 
 func TestSRTListenerStreamID(t *testing.T) {
 	port := freeUDPPort(t)
-	opened := make(chan Reader, 1)
-	go func() {
-		r, err := Open(context.Background(), listenerURL(port, "&streamid=live"), Env{})
-		if err != nil {
-			t.Error(err)
-		}
-		opened <- r
-	}()
+	opened := openAsync(t, context.Background(), listenerURL(port, "&streamid=live"), Env{})
 	time.Sleep(200 * time.Millisecond)
 	cfg := srt.DefaultConfig()
 	cfg.StreamId = "other"
 	_, err := srt.Dial("srt", "127.0.0.1:"+strconv.Itoa(port), cfg)
 	require.Error(t, err)
-	go func() { _ = srtPublish(t, port, "live", time.Second) }()
-	r := <-opened
-	require.NotNil(t, r)
-	require.NoError(t, r.Close())
+	pub := make(chan error, 1)
+	go func() { pub <- srtPublish(port, "live", time.Second) }()
+	o := <-opened
+	require.NoError(t, o.err)
+	require.NoError(t, o.r.Close())
+	<-pub // fails once the listener is gone; only its end matters
 }
 
 func TestSRTListenerReconnect(t *testing.T) {
 	port := freeUDPPort(t)
-	opened := make(chan Reader, 1)
-	go func() {
-		r, err := Open(context.Background(), listenerURL(port, ""), Env{})
-		if err != nil {
-			t.Error(err)
-		}
-		opened <- r
-	}()
+	opened := openAsync(t, context.Background(), listenerURL(port, ""), Env{})
 	time.Sleep(200 * time.Millisecond)
+	pub := make(chan error, 1)
 	go func() {
-		_ = srtPublish(t, port, "", time.Second)
+		if err := srtPublish(port, "", time.Second); err != nil {
+			pub <- fmt.Errorf("first publisher: %w", err)
+			return
+		}
 		time.Sleep(time.Second)
-		assert.True(t, udpPortBound(port), "the listener port stays bound between publishers")
-		_ = srtPublish(t, port, "", time.Second)
+		if !udpPortBound(port) {
+			pub <- errors.New("the listener port was released between publishers")
+			return
+		}
+		if err := srtPublish(port, "", time.Second); err != nil {
+			pub <- fmt.Errorf("second publisher: %w", err)
+			return
+		}
+		pub <- nil
 	}()
-	r := <-opened
-	require.NotNil(t, r)
+	o := <-opened
+	require.NoError(t, o.err)
+	r := o.r
 	res, wg, mu := drain(r)
 	want := fixtureCounts(t, "h264_aac.ts")
 	require.Eventually(t, func() bool {
@@ -222,6 +219,7 @@ func TestSRTListenerReconnect(t *testing.T) {
 		defer mu.Unlock()
 		return res.counts[0] >= 2*want[0] && res.counts[1] >= 2*want[1]
 	}, 10*time.Second, 50*time.Millisecond)
+	require.NoError(t, <-pub)
 	require.NoError(t, r.Close())
 	wg.Wait()
 	mu.Lock()
@@ -244,17 +242,16 @@ func TestSRTListenerReconnect(t *testing.T) {
 
 func TestSRTListenerCloseUnblocks(t *testing.T) {
 	port := freeUDPPort(t)
-	opened := make(chan Reader, 1)
-	go func() {
-		r, _ := Open(context.Background(), listenerURL(port, ""), Env{})
-		opened <- r
-	}()
+	opened := openAsync(t, context.Background(), listenerURL(port, ""), Env{})
 	time.Sleep(200 * time.Millisecond)
-	go func() { _ = srtPublish(t, port, "", 500*time.Millisecond) }()
-	r := <-opened
-	require.NotNil(t, r)
+	pub := make(chan error, 1)
+	go func() { pub <- srtPublish(port, "", 500*time.Millisecond) }()
+	o := <-opened
+	require.NoError(t, o.err)
+	r := o.r
 	_, wg, _ := drain(r)
-	time.Sleep(1500 * time.Millisecond) // the publisher is gone; Read waits
+	require.NoError(t, <-pub)
+	time.Sleep(time.Second) // the publisher is gone; Read waits
 	require.NoError(t, r.Close())
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
@@ -375,6 +372,61 @@ func TestSRTCallerDisconnectErrors(t *testing.T) {
 	}
 }
 
+// The caller path delivers every frame of the fixture, then fails when the
+// listener hangs up.
+func TestSRTCallerFrameCount(t *testing.T) {
+	port := freeUDPPort(t)
+	ln, err := srt.Listen("srt", "127.0.0.1:"+strconv.Itoa(port), srt.DefaultConfig())
+	require.NoError(t, err)
+	defer ln.Close()
+	data, err := os.ReadFile(fixturePath("h264_aac.ts"))
+	require.NoError(t, err)
+	served := make(chan error, 1)
+	go func() {
+		served <- func() error {
+			req, err := ln.Accept2()
+			if err != nil {
+				return err
+			}
+			conn, err := req.Accept()
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+			for off := 0; off < len(data); off += 1316 {
+				if _, err := conn.Write(data[off:min(off+1316, len(data))]); err != nil {
+					return err
+				}
+				time.Sleep(time.Millisecond)
+			}
+			time.Sleep(500 * time.Millisecond) // let the tail drain before closing
+			return nil
+		}()
+	}()
+	r, err := Open(context.Background(), fmt.Sprintf("srt://127.0.0.1:%d?mode=caller", port), Env{})
+	require.NoError(t, err)
+	defer r.Close()
+	res, wg, mu := drain(r)
+	require.NoError(t, <-served)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read did not fail after the listener hung up")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := map[int]int{}
+	for _, f := range demuxFrames(t, "h264_aac.ts") {
+		want[f.Track]++
+	}
+	assert.Equal(t, want, res.counts)
+	assert.Zero(t, res.breaks)
+	require.Error(t, res.err)
+	assert.NotErrorIs(t, res.err, ErrDiscontinuity)
+}
+
 func TestOpenSRT(t *testing.T) {
 	// Caller row.
 	port := freeUDPPort(t)
@@ -438,15 +490,7 @@ func TestSRTWithFFmpeg(t *testing.T) {
 
 	t.Run("ffmpeg caller into our listener", func(t *testing.T) {
 		port := freeUDPPort(t)
-		type opened struct {
-			r   Reader
-			err error
-		}
-		ch := make(chan opened, 1)
-		go func() {
-			r, err := Open(context.Background(), listenerURL(port, "&streamid=cam&latency=200"), Env{})
-			ch <- opened{r, err}
-		}()
+		ch := openAsync(t, context.Background(), listenerURL(port, "&streamid=cam&latency=200"), Env{})
 		time.Sleep(300 * time.Millisecond)
 		cmd := exec.CommandContext(t.Context(), ffmpeg, "-hide_banner", "-loglevel", "error", "-re",
 			"-i", fixturePath("h264_aac.ts"), "-c", "copy", "-f", "mpegts",

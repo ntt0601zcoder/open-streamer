@@ -133,21 +133,26 @@ func writeProgram(t *testing.T, w *mpegts.Writer, pcr uint16, streams ...mpegts.
 	require.NoError(t, w.WriteTables())
 }
 
-func TestRemapIdenticalPMT(t *testing.T) {
-	pes := func() []*mpegts.PES {
-		d := mpegts.NewDemux(bytes.NewReader(fixtureBytes(t, "h264_aac.ts")))
-		var out []*mpegts.PES
-		for {
-			ev, err := d.Next()
-			if errors.Is(err, io.EOF) {
-				return out
-			}
-			require.NoError(t, err)
-			if ev.PES != nil {
-				out = append(out, ev.PES)
-			}
+// fixturePES returns the PES packets of h264_aac.ts: video on PID 256,
+// audio on PID 257.
+func fixturePES(t *testing.T) []*mpegts.PES {
+	t.Helper()
+	d := mpegts.NewDemux(bytes.NewReader(fixtureBytes(t, "h264_aac.ts")))
+	var out []*mpegts.PES
+	for {
+		ev, err := d.Next()
+		if errors.Is(err, io.EOF) {
+			return out
 		}
-	}()
+		require.NoError(t, err)
+		if ev.PES != nil {
+			out = append(out, ev.PES)
+		}
+	}
+}
+
+func TestRemapIdenticalPMT(t *testing.T) {
+	pes := fixturePES(t)
 	video := mpegts.Stream{PID: 256, Type: 0x1B}
 	audio := mpegts.Stream{PID: 257, Type: 0x0F}
 	var buf bytes.Buffer
@@ -229,4 +234,220 @@ func TestReadGenTagsFlushedFramesWithOldGeneration(t *testing.T) {
 	assert.Equal(t, []int{0, 1}, d.TakeRemapped(1))
 	assert.Nil(t, d.TakeRemapped(1), "taken once")
 	assert.Nil(t, d.TakeRemapped(5))
+}
+
+// Fixture PIDs and the stream types the remap tests use.
+const (
+	fixVideo = uint16(256)
+	fixAudio = uint16(257)
+	typeH264 = uint8(0x1B)
+	typeAAC  = uint8(0x0F)
+)
+
+// pmtPhase is one PMT and the fixture PES written under it: route maps a
+// fixture PID to the PIDs it is written on (none: dropped).
+type pmtPhase struct {
+	streams []mpegts.Stream
+	route   map[uint16][]uint16
+}
+
+// writePhases writes the fixture's PES split evenly over the phases, each
+// phase opening with its PMT.
+func writePhases(t *testing.T, phases ...pmtPhase) []byte {
+	t.Helper()
+	pes := fixturePES(t)
+	var buf bytes.Buffer
+	w := mpegts.NewWriter(&buf)
+	per := (len(pes) + len(phases) - 1) / len(phases)
+	for i, p := range pes {
+		ph := phases[i/per]
+		if i%per == 0 {
+			writeProgram(t, w, ph.streams[0].PID, ph.streams...)
+		}
+		for _, pid := range ph.route[p.PID] {
+			video := false
+			for _, s := range ph.streams {
+				if s.PID == pid {
+					video = s.Type == typeH264
+				}
+			}
+			require.NoError(t, w.WritePES(pid, p.Data, mpegts.PESOptions{
+				PTS: p.PTS, DTS: p.DTS, HasDTS: p.DTS != p.PTS,
+				RandomAccess: p.RandomAccess, PCR: -1, Video: video,
+			}))
+		}
+	}
+	return buf.Bytes()
+}
+
+// genFrame is a frame and the PMT generation it was read under.
+type genFrame struct {
+	media.Frame
+	gen uint32
+}
+
+func readGens(t *testing.T, d *ts.Demuxer) []genFrame {
+	t.Helper()
+	var out []genFrame
+	for {
+		f, g, err := d.ReadGen()
+		if errors.Is(err, io.EOF) {
+			return out
+		}
+		require.NoError(t, err)
+		out = append(out, genFrame{f, g})
+	}
+}
+
+// genConfigs returns the distinct Configs of a track per generation.
+func genConfigs(frames []genFrame, track int) map[uint32][]*media.TrackConfig {
+	out := map[uint32][]*media.TrackConfig{}
+	for _, f := range frames {
+		if f.Track != track {
+			continue
+		}
+		if c := out[f.gen]; len(c) == 0 || c[len(c)-1] != f.Config {
+			out[f.gen] = append(c, f.Config)
+		}
+	}
+	return out
+}
+
+func genCounts(frames []genFrame) map[uint32]map[int]int {
+	out := map[uint32]map[int]int{}
+	for _, f := range frames {
+		if out[f.gen] == nil {
+			out[f.gen] = map[int]int{}
+		}
+		out[f.gen][f.Track]++
+	}
+	return out
+}
+
+var (
+	streamVideo = mpegts.Stream{PID: fixVideo, Type: typeH264}
+	streamAudio = mpegts.Stream{PID: fixAudio, Type: typeAAC}
+	routeBoth   = map[uint16][]uint16{fixVideo: {fixVideo}, fixAudio: {fixAudio}}
+	routeVideo  = map[uint16][]uint16{fixVideo: {fixVideo}}
+)
+
+// A PMT that gains a stream appends a slot: the existing slot keeps its
+// state, nothing is remapped, and the new slot delivers.
+func TestRemapPMTGainsStream(t *testing.T) {
+	data := writePhases(t,
+		pmtPhase{streams: []mpegts.Stream{streamVideo}, route: routeVideo},
+		pmtPhase{streams: []mpegts.Stream{streamVideo, streamAudio}, route: routeBoth})
+	d, err := ts.NewDemuxerWithOptions(bytes.NewReader(data), ts.DemuxOptions{Remap: true})
+	require.NoError(t, err)
+	assert.Equal(t, 1, d.NumTracks())
+	frames := readGens(t, d)
+	assert.EqualValues(t, 1, d.Stats().PMTChanges)
+	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, d.TrackKinds())
+	assert.Nil(t, d.TakeRemapped(1), "an appended slot is no remap")
+	counts := genCounts(frames)
+	assert.Zero(t, counts[0][1], "no audio before the PMT has it")
+	assert.Positive(t, counts[1][1], "the appended slot delivers")
+	video := genConfigs(frames, 0)
+	require.Len(t, video[0], 1)
+	require.Len(t, video[1], 1)
+	assert.Same(t, video[0][0], video[1][0], "video keeps its state")
+}
+
+// The track cap applies to slots a later PMT appends: the streams over it
+// are skipped and reported, the others delivered.
+func TestRemapCapHitByLaterAppend(t *testing.T) {
+	audio2 := mpegts.Stream{PID: 0x300, Type: typeAAC}
+	data := writePhases(t,
+		pmtPhase{streams: []mpegts.Stream{streamVideo}, route: routeVideo},
+		pmtPhase{
+			streams: []mpegts.Stream{streamVideo, streamAudio, audio2},
+			route:   map[uint16][]uint16{fixVideo: {fixVideo}, fixAudio: {fixAudio, audio2.PID}},
+		})
+	d, err := ts.NewDemuxerWithOptions(bytes.NewReader(data), ts.DemuxOptions{Remap: true, MaxTracks: 2})
+	require.NoError(t, err)
+	assert.Empty(t, d.Skipped(), "under the cap at the first PMT")
+	frames := readGens(t, d)
+	assert.Equal(t, 2, d.NumTracks())
+	assert.Equal(t, []uint16{fixVideo, fixAudio}, d.TrackPIDs())
+	require.Len(t, d.Skipped(), 1)
+	assert.Contains(t, d.Skipped()[0], "track limit 2")
+	assert.Contains(t, d.Skipped()[0], "pid 768")
+	counts := genCounts(frames)
+	assert.Positive(t, counts[1][1], "the appended slot under the cap delivers")
+	for _, f := range frames {
+		assert.Less(t, f.Track, 2)
+	}
+}
+
+// A slot whose stream leaves the PMT produces nothing; when the same PID and
+// type come back, the slot starts fresh with a new Config, and neither
+// change is a remap of an active slot.
+func TestRemapOrdinalDisappearsAndReturns(t *testing.T) {
+	data := writePhases(t,
+		pmtPhase{streams: []mpegts.Stream{streamVideo, streamAudio}, route: routeBoth},
+		pmtPhase{streams: []mpegts.Stream{streamVideo}, route: routeVideo},
+		pmtPhase{streams: []mpegts.Stream{streamVideo, streamAudio}, route: routeBoth})
+	d, err := ts.NewDemuxerWithOptions(bytes.NewReader(data), ts.DemuxOptions{Remap: true})
+	require.NoError(t, err)
+	frames := readGens(t, d)
+	assert.EqualValues(t, 2, d.Stats().PMTChanges)
+	assert.Equal(t, 2, d.NumTracks(), "the slot stays while absent")
+	assert.Nil(t, d.TakeRemapped(1), "dropping a slot is no remap")
+	assert.Nil(t, d.TakeRemapped(2), "an absent slot returning is no remap")
+	counts := genCounts(frames)
+	assert.Positive(t, counts[0][1])
+	assert.Zero(t, counts[1][1], "nothing from the absent slot")
+	assert.Positive(t, counts[2][1])
+	audio := genConfigs(frames, 1)
+	require.Len(t, audio[0], 1)
+	require.Len(t, audio[2], 1)
+	assert.NotSame(t, audio[0][0], audio[2][0], "the returning slot starts fresh")
+	assert.True(t, audio[0][0].Equal(audio[2][0]))
+	video := genConfigs(frames, 0)
+	assert.Same(t, video[0][0], video[2][0], "video keeps its state throughout")
+}
+
+// PIDs reused with new types (video and audio swap PIDs) remap both slots:
+// each starts fresh and the data follows the new PMT.
+func TestRemapPIDReusedWithNewType(t *testing.T) {
+	data := writePhases(t,
+		pmtPhase{streams: []mpegts.Stream{streamVideo, streamAudio}, route: routeBoth},
+		pmtPhase{
+			streams: []mpegts.Stream{{PID: fixAudio, Type: typeH264}, {PID: fixVideo, Type: typeAAC}},
+			route:   map[uint16][]uint16{fixVideo: {fixAudio}, fixAudio: {fixVideo}},
+		})
+	d, err := ts.NewDemuxerWithOptions(bytes.NewReader(data), ts.DemuxOptions{Remap: true})
+	require.NoError(t, err)
+	frames := readGens(t, d)
+	assert.EqualValues(t, 1, d.Stats().PMTChanges)
+	assert.Equal(t, []uint16{fixAudio, fixVideo}, d.TrackPIDs())
+	assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, d.TrackKinds())
+	assert.Equal(t, []int{0, 1}, d.TakeRemapped(1))
+	for _, f := range frames {
+		want := media.CodecH264
+		if f.Track == 1 {
+			want = media.CodecAAC
+		}
+		require.Equal(t, want, f.Config.Codec, "track %d gen %d", f.Track, f.gen)
+	}
+	counts := genCounts(frames)
+	all := map[int]int{}
+	for _, f := range demuxAll(t, fixtureBytes(t, "h264_aac.ts")) {
+		all[f.Track]++
+	}
+	assert.Positive(t, counts[1][0])
+	assert.Equal(t, all[1], counts[0][1]+counts[1][1], "every audio frame, on either PID")
+	for tr := range 2 {
+		c := genConfigs(frames, tr)
+		require.Len(t, c[0], 1)
+		require.Len(t, c[1], 1)
+		assert.NotSame(t, c[0][0], c[1][0], "track %d starts fresh", tr)
+	}
+}
+
+func demuxAll(t *testing.T, data []byte) []media.Frame {
+	t.Helper()
+	d, err := ts.NewDemuxer(bytes.NewReader(data))
+	require.NoError(t, err)
+	return readOnly(t, d)
 }

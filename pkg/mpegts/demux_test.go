@@ -1120,3 +1120,34 @@ func FuzzDemux(f *testing.F) {
 		t.Fatal("demux does not terminate")
 	})
 }
+
+// A timeout in the middle of a multi-packet PES is returned once, keeps the
+// partial PES, and the next call completes it: the events are those of a
+// read without the timeout.
+func TestDemuxTimeoutMidPES(t *testing.T) {
+	raw := readFixture(t, "h264_aac.ts")
+	want, _ := demuxBytes(t, raw)
+	// Packet 10 continues the video PES that packet 3 starts; the timeout
+	// lands 50 bytes into it.
+	cut := 10*PacketSize + 50
+	d := NewDemux(&scriptReader{steps: [][]byte{raw[:cut], nil, raw[cut:]}})
+	var got []Event
+	timeouts := 0
+	for {
+		ev, err := d.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if isTimeout(err) {
+			timeouts++
+			assert.Len(t, got, 1, "only the PMT before the timeout")
+			continue
+		}
+		require.NoError(t, err)
+		got = append(got, ev)
+	}
+	assert.Equal(t, 1, timeouts)
+	assert.Equal(t, want, got)
+	assert.Zero(t, d.Stats().PESErrors)
+	assert.Zero(t, d.Stats().CCErrors)
+}
