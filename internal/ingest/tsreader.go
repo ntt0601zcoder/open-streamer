@@ -172,6 +172,7 @@ func (r *tsReader) Stats() map[string]uint64 {
 		"lost_frames":         s.LostFrames,
 		"pmt_changes":         s.PMTChanges,
 		"split_aus":           s.SplitAUs,
+		"split_aus_poc":       s.SplitAUsPOC,
 		"split_aus_reordered": s.SplitAUsReordered,
 		"split_aus_no_room":   s.SplitAUsNoRoom,
 		"continued":           s.Continued,

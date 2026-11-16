@@ -44,10 +44,15 @@ type DemuxStats struct {
 	LostFrames uint64
 	// SplitAUs counts access units found after the first one inside one PES
 	// (or starting in a PES without PTS) and given interpolated or
-	// extrapolated timestamps.
+	// extrapolated timestamps (see releaseGroup).
 	SplitAUs uint64
-	// SplitAUsReordered counts such access units dropped because the PES had
-	// PTS != DTS.
+	// SplitAUsPOC counts the split access units among them given a PTS from
+	// their picture order count (see releaseGroup).
+	SplitAUsPOC uint64
+	// SplitAUsReordered counts such access units dropped because their
+	// presentation order is unknown: the PES had PTS != DTS and no POC timing
+	// was available, a POC reset came earlier in the group, or the PTS from
+	// the POC was below the DTS.
 	SplitAUsReordered uint64
 	// SplitAUsNoRoom counts such access units dropped because no DTS was
 	// left for them: below the next PES's DTS and above the track's last.
@@ -123,6 +128,16 @@ type track struct {
 	haveOut   bool
 	// fieldSPS holds the IDs of H.264 SPS that allow field coding.
 	fieldSPS map[uint32]bool
+	// POC timing of split units (see startPOC): nil until the track's first
+	// group with more than one access unit.
+	poc   *h26x.POCCounter
+	pocPS *h26x.ParamSets // the counter's parameter sets, fed by commitNAL
+	era   uint64          // POC periods started since the counter started
+	grp   pocMark         // the group's unit 0
+	prev  pocMark         // unit 0 of an earlier group: calibration
+	// calNum/calDen is the PTS ticks per POC unit; calDen is 0 until
+	// calibrated.
+	calNum, calDen int64
 	// cls decides Key and RASL for each timed access unit; nil for audio.
 	cls *media.NALClassifier
 
@@ -140,10 +155,21 @@ type track struct {
 	aRate    int
 }
 
+// pocMark is the picture order count of a group's unit 0.
+type pocMark struct {
+	ok  bool // dated
+	pts int64
+	poc int32
+	era uint64
+}
+
 // videoAU is a video access unit under assembly.
 type videoAU struct {
 	pts, dts int64
-	idx      int // position in its group; 0 is the PES's own unit
+	idx      int    // position in its group; 0 is the PES's own unit
+	dated    bool   // poc is valid
+	poc      int32  // picture order count
+	era      uint64 // the track's POC period when it completed
 	config   *media.TrackConfig
 	data     [][]byte
 	size     int  // bytes of its NAL units, held ones included
@@ -794,41 +820,151 @@ func (t *track) startPES(pts, dts int64, ptsIsDTS bool) {
 }
 
 // startSplitAU starts a split access unit: one found inside a PES after its
-// first, or in a PES without PTS. Its presentation order is known only when
-// the last PES with a PTS had PTS == DTS; otherwise it is dropped.
+// first, or in a PES without PTS. releaseGroup times it.
 func (d *Demuxer) startSplitAU(t *track) {
 	au := &videoAU{idx: t.pesAUs}
 	t.pesAUs++
-	switch {
-	case !t.timed:
+	if !t.timed {
 		au.drop = true // Counted with the PES that continues nothing.
-	case !t.ptsIsDTS:
-		au.drop = true
-		d.stats.SplitAUsReordered++
 	}
 	t.au = au
 }
 
+// maxCalibGap bounds the PTS distance of the two units a POC calibration
+// uses (10 s), which keeps the PTS products of releaseGroup far from
+// overflow.
+const maxCalibGap = 900000
+
+// startPOC starts the track's POC counter, on its parameter sets so far.
+// From then on every access unit is dated in decode order (datePOC), which
+// parses its first slice header, so only tracks that pack several access
+// units in one PES pay for it.
+func (t *track) startPOC() {
+	c := t.h26xCodec()
+	t.pocPS = &h26x.ParamSets{}
+	for _, sps := range t.sps {
+		_ = t.pocPS.Update(c, sps) // one that does not parse dates nothing
+	}
+	for _, pps := range t.pps {
+		_ = t.pocPS.Update(c, pps)
+	}
+	t.poc = h26x.NewPOCCounter(c, t.pocPS)
+}
+
+// h26xCodec returns the track's video codec for pkg/h26x.
+func (t *track) h26xCodec() h26x.Codec {
+	if t.codec == media.CodecH265 {
+		return h26x.H265
+	}
+	return h26x.H264
+}
+
+// notePOCSet passes a new or changed SPS or PPS to the POC counter. A
+// changed SPS also re-sends the PPS, which may not have parsed without it.
+func (t *track) notePOCSet(typ uint8, n []byte) {
+	if t.pocPS == nil {
+		return
+	}
+	c := t.h26xCodec()
+	_ = t.pocPS.Update(c, n) // one that does not parse dates nothing
+	if (t.codec == media.CodecH265 && typ == 33) || (t.codec == media.CodecH264 && typ == 7) {
+		for _, pps := range t.pps {
+			_ = t.pocPS.Update(c, pps)
+		}
+	}
+}
+
+// datePOC dates an access unit as it completes, once the track's POC counter
+// runs. Unit 0 of a group becomes the group's mark and, with the previous
+// group's mark in the same POC period, calibrates the PTS ticks per POC
+// unit: ΔPTS/ΔPOC, kept as a fraction.
+func (t *track) datePOC(au *videoAU) {
+	if au.idx == 0 {
+		t.grp = pocMark{}
+	}
+	if t.poc == nil || len(au.data) == 0 {
+		return
+	}
+	poc, reset, ok := t.poc.POC(au.data)
+	if ok && reset {
+		t.era++
+	}
+	au.era = t.era
+	if !ok {
+		return
+	}
+	if au.idx > 0 {
+		au.dated, au.poc = true, poc
+		return
+	}
+	m := pocMark{ok: true, pts: au.pts, poc: poc, era: t.era}
+	if p := t.prev; p.ok && p.era == m.era {
+		dPTS, dPOC := m.pts-p.pts, int64(m.poc)-int64(p.poc)
+		if dPOC < 0 {
+			dPTS, dPOC = -dPTS, -dPOC
+		}
+		if dPOC != 0 && dPTS > 0 && dPTS <= maxCalibGap {
+			t.calNum, t.calDen = dPTS, dPOC
+		}
+	}
+	t.grp, t.prev = m, m
+}
+
+// roundDiv returns n/d rounded half away from zero, for d > 0.
+func roundDiv(n, d int64) int64 {
+	if n < 0 {
+		return -((-n + d/2) / d)
+	}
+	return (n + d/2) / d
+}
+
 // releaseGroup times and queues the completed split units of the group that
 // started at the last PES with a PTS (pesDTS, pesAUs units). next is the DTS
-// of the next PES with a PTS when haveNext. Unit i of N gets
-// pesDTS + i*(next-pesDTS)/N when even spacing is allowed (no loss between)
-// and the gap per unit is within maxSplitStep; that gap becomes the track's
-// step. Otherwise unit i gets pesDTS + i*step (defaultFrameStep if none),
-// and a unit whose DTS would reach next, or not pass the last DTS queued on
-// the track, has no room and is dropped (SplitAUsNoRoom). PTS = DTS.
+// of the next PES with a PTS when haveNext.
+//
+// DTS: unit i of N gets pesDTS + i*(next-pesDTS)/N when even spacing is
+// allowed (no loss between) and the gap per unit is within maxSplitStep;
+// that gap becomes the track's step. Otherwise unit i gets pesDTS + i*step
+// (defaultFrameStep if none), and a unit whose DTS would reach next, or not
+// pass the last DTS queued on the track, has no room and is dropped
+// (SplitAUsNoRoom).
+//
+// PTS: when unit 0 and the unit are dated (datePOC) and the track is
+// calibrated, PTS = PTS0 + (POC - POC0)*calNum/calDen, rounded once; a unit
+// after a POC reset in the group, or whose PTS falls below its DTS, is
+// dropped. Without POC timing, PTS = DTS when the group's PES had
+// PTS == DTS, and the unit is dropped otherwise. Drops of either kind count
+// as SplitAUsReordered.
+//
+// A group that was not evenly spaced (a loss or a timestamp jump) ends the
+// calibration pair: the next group's unit 0 does not calibrate against this
+// one's.
 func (d *Demuxer) releaseGroup(t *track, next int64, haveNext, even bool) {
 	n := int64(t.pesAUs)
 	gap := next - t.pesDTS
 	spaced := even && haveNext && t.timed && n > 0 && gap > 0 && gap/n <= maxSplitStep
 	if spaced {
 		t.step = gap / n
+	} else {
+		t.prev.ok = false
 	}
 	step := t.step
 	if step <= 0 {
 		step = defaultFrameStep
 	}
+	byPOC := t.grp.ok && t.calDen > 0
 	for _, au := range t.group {
+		poc := byPOC && au.dated
+		switch {
+		case byPOC && au.era != t.grp.era:
+			// A POC reset came inside the group: the POC no longer
+			// relates to unit 0's.
+			d.stats.SplitAUsReordered++
+			continue
+		case !poc && !t.ptsIsDTS:
+			d.stats.SplitAUsReordered++
+			continue
+		}
 		i := int64(au.idx)
 		var dts int64
 		if spaced {
@@ -840,7 +976,16 @@ func (d *Demuxer) releaseGroup(t *track, next int64, haveNext, even bool) {
 			d.stats.SplitAUsNoRoom++
 			continue
 		}
-		au.pts, au.dts = dts, dts
+		pts := dts
+		if poc {
+			pts = t.grp.pts + roundDiv((int64(au.poc)-int64(t.grp.poc))*t.calNum, t.calDen)
+			if pts < dts {
+				d.stats.SplitAUsReordered++
+				continue
+			}
+			d.stats.SplitAUsPOC++
+		}
+		au.pts, au.dts = pts, dts
 		d.stats.SplitAUs++
 		d.queueAU(t, au)
 	}
@@ -855,6 +1000,11 @@ func (d *Demuxer) addNAL(t *track, n []byte) {
 	aud := t.isAUD(typ)
 	vcl := t.isVCL(typ)
 	if t.startsAU(typ, n) && (t.au == nil || t.au.slice) {
+		if t.poc == nil {
+			// A group gets a second access unit: date units from the one
+			// completing now.
+			t.startPOC()
+		}
 		held := t.held
 		t.held = nil
 		if aud {
@@ -918,6 +1068,7 @@ func (d *Demuxer) commitNAL(t *track, n []byte) {
 			if t.codec == media.CodecH264 && typ == 7 {
 				t.noteFieldCoding(id, n)
 			}
+			t.notePOCSet(typ, n)
 		}
 		if t.config == nil {
 			t.dirty = true // Retry the rebuild whenever a set arrives while invalid.
@@ -960,6 +1111,9 @@ func (d *Demuxer) finishAU(t *track, emit bool) (discarded bool) {
 	if au == nil {
 		return false
 	}
+	// Dated before the held parameter sets, which belong to the next unit,
+	// are stored.
+	t.datePOC(au)
 	d.commit(t, t.held)
 	t.held = nil
 	t.au = nil
