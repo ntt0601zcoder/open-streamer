@@ -468,6 +468,42 @@ func TestDepackH265APFUAndPACI(t *testing.T) {
 	assert.False(t, out[0].Lost)
 }
 
+func TestDepackH265Edges(t *testing.T) {
+	d, err := NewDepacketizer(videoMedia(CodecH265), 1<<20)
+	require.NoError(t, err)
+	oc, ok := d.(OversizeCounter)
+	require.True(t, ok)
+	assert.Zero(t, oc.Oversize())
+	g := h265nal(1, 10)
+
+	// A payload shorter than the NAL header is ignored.
+	d.Push(pkt(1, 100, false, g), testT0)
+	d.Push(pkt(2, 100, false, []byte{2}), testT0)
+	out := d.Flush()
+	require.Len(t, out, 1)
+	assert.False(t, out[0].Lost)
+	assert.Equal(t, [][]byte{g}, out[0].NALUs)
+
+	for name, bad := range map[string][]byte{
+		"truncated FU":     {49 << 1, 1},
+		"FU start and end": {49 << 1, 1, 0xc0 | 1, 5, 6},
+	} {
+		d.Push(pkt(3, 200, false, g), testT0)
+		d.Push(pkt(4, 200, false, bad), testT0)
+		out = d.Flush()
+		require.Len(t, out, 1, name)
+		assert.True(t, out[0].Lost, name)
+		assert.Equal(t, [][]byte{g}, out[0].NALUs, name)
+	}
+
+	// Gap marks the pending AU lost.
+	d.Push(pkt(5, 300, false, g), testT0)
+	d.Gap()
+	out = d.Flush()
+	require.Len(t, out, 1)
+	assert.True(t, out[0].Lost)
+}
+
 func TestDepackOwnership(t *testing.T) {
 	d, _ := NewDepacketizer(videoMedia(CodecH264), 1<<20)
 	buf := nal264(1, 20)

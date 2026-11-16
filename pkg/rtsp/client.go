@@ -108,8 +108,9 @@ type ClientStats struct {
 	Dropped uint64
 	// FallbackTCP counts automatic switches from UDP to TCP.
 	FallbackTCP uint64
-	// Reauth counts re-challenges after the first one (a 401 mid-session,
-	// including stale nonces).
+	// Reauth counts re-challenges after the first challenge, such as a 401
+	// mid-session or a stale nonce; the 401 that starts authentication is
+	// not counted.
 	Reauth uint64
 }
 
@@ -124,12 +125,16 @@ func (e *StatusError) Error() string {
 	return "rtsp: " + strings.ToLower(e.Method) + ": status " + strconv.Itoa(e.Code)
 }
 
-// clientTrack is one set-up media and its transport.
+// clientTrack is one set-up media and its transport. index, rtpCh and
+// rtcpCh are fixed once SETUP returns; rx is guarded by Client.rrMu.
 type clientTrack struct {
 	index         int // Media.Index
 	rtpCh, rtcpCh int
+	rx            rxState
+}
 
-	// Reception state for receiver reports, guarded by Client.rrMu.
+// rxState is the reception state of a track for receiver reports.
+type rxState struct {
 	has                 bool
 	ssrc                uint32
 	baseSeq, maxSeq     uint16
@@ -185,6 +190,7 @@ type Client struct {
 	epoch      time.Time
 	lastPacket atomic.Int64 // nanoseconds since epoch
 	blocked    atomic.Bool  // the reader waits on a full packet queue
+	closeBy    atomic.Int64 // close deadline in Unix nanoseconds, 0 before Close
 
 	nResyncs, nUnknown, nServerReqs, nDropped, nReauth atomic.Uint64
 }
@@ -262,6 +268,10 @@ func (c *Client) sessionID() string {
 
 func ok2xx(r *Response) bool { return r.StatusCode >= 200 && r.StatusCode < 300 }
 
+// handshake runs OPTIONS, DESCRIBE, SETUP and PLAY. Its waits are bounded by
+// ctx and Timeout and are not paused while the reader is blocked on a full
+// packet queue: a server that sends more than 1024 interleaved frames before
+// the PLAY response makes Dial time out.
 func (c *Client) handshake(ctx context.Context) error {
 	resp, err := c.request(ctx, "OPTIONS", c.base, nil)
 	if err != nil {
@@ -462,6 +472,17 @@ func (c *Client) rechallenge(h Header) error {
 // send writes a request and registers its CSeq; the response arrives on the
 // returned channel.
 func (c *Client) send(method, uri string, extra Header, deadline time.Time) (chan *Response, int, error) {
+	req, ch, cs := c.prepare(method, uri, extra)
+	if err := c.writeMsg(req, deadline); err != nil {
+		c.forget(cs)
+		return nil, 0, fmt.Errorf("rtsp: %s: %w", strings.ToLower(method), err)
+	}
+	return ch, cs, nil
+}
+
+// prepare builds a request with its CSeq, Session and Authorization and
+// registers the CSeq for the response.
+func (c *Client) prepare(method, uri string, extra Header) (*Request, chan *Response, int) {
 	ch := make(chan *Response, 1)
 	c.mu.Lock()
 	c.cseq++
@@ -482,12 +503,7 @@ func (c *Client) send(method, uri string, extra Header, deadline time.Time) (cha
 	if a := c.auth.Authorize(method, uri); a != "" {
 		h.Set("Authorization", a)
 	}
-	req := &Request{Method: method, URL: uri, Header: h}
-	if err := c.writeMsg(req, deadline); err != nil {
-		c.forget(cs)
-		return nil, 0, fmt.Errorf("rtsp: %s: %w", strings.ToLower(method), err)
-	}
-	return ch, cs, nil
+	return &Request{Method: method, URL: uri, Header: h}, ch, cs
 }
 
 func (c *Client) forget(cs int) {
@@ -520,8 +536,33 @@ type message interface{ Write(w io.Writer) error }
 func (c *Client) writeMsg(m message, deadline time.Time) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	_ = c.conn.SetWriteDeadline(deadline)
+	_ = c.conn.SetWriteDeadline(c.clampDeadline(deadline))
 	return m.Write(c.conn)
+}
+
+// clampDeadline shortens a write deadline to the close deadline once Close
+// has started, so no write outlives the 100 ms teardown bound.
+func (c *Client) clampDeadline(d time.Time) time.Time {
+	if n := c.closeBy.Load(); n != 0 {
+		if cb := time.Unix(0, n); cb.Before(d) {
+			return cb
+		}
+	}
+	return d
+}
+
+// lockWriteBy takes the write mutex by the deadline. While it waits it
+// keeps cutting the current writer's deadline to it, which ends a write
+// stuck on a full send buffer.
+func (c *Client) lockWriteBy(deadline time.Time) bool {
+	for !c.wmu.TryLock() {
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		_ = c.conn.SetWriteDeadline(deadline)
+		time.Sleep(time.Millisecond)
+	}
+	return true
 }
 
 // writeFrame writes one interleaved frame under the write mutex.
@@ -532,7 +573,7 @@ func (c *Client) writeFrame(ch int, data []byte) error {
 	copy(b[4:], data)
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	_ = c.conn.SetWriteDeadline(time.Now().Add(c.cfg.Timeout))
+	_ = c.conn.SetWriteDeadline(c.clampDeadline(time.Now().Add(c.cfg.Timeout)))
 	if _, err := c.conn.Write(b); err != nil {
 		return fmt.Errorf("rtsp: write rtcp: %w", err)
 	}
@@ -551,13 +592,22 @@ func (c *Client) fail(err error) {
 
 func (c *Client) touch() { c.lastPacket.Store(int64(time.Since(c.epoch))) }
 
-// teardown sends TEARDOWN and waits briefly for the answer.
+// teardown sends TEARDOWN and waits for the answer, all within 100 ms:
+// later writes are clamped to that deadline and a writer holding the write
+// mutex is cut short; if the mutex is still not free, TEARDOWN is skipped.
 func (c *Client) teardown(ctx context.Context) {
 	deadline := time.Now().Add(teardownWait)
-	// Unblock a writer stuck on a full send buffer.
+	c.closeBy.Store(deadline.UnixNano())
+	req, ch, cs := c.prepare("TEARDOWN", c.desc.Control, nil)
+	if !c.lockWriteBy(deadline) {
+		c.forget(cs)
+		return
+	}
 	_ = c.conn.SetWriteDeadline(deadline)
-	ch, cs, err := c.send("TEARDOWN", c.desc.Control, nil, deadline)
+	err := req.Write(c.conn)
+	c.wmu.Unlock()
 	if err != nil {
+		c.forget(cs)
 		return
 	}
 	_, _ = c.await(ctx, "TEARDOWN", ch, cs, time.Until(deadline))

@@ -201,21 +201,21 @@ func (c *Client) onRTP(t *clientTrack, p *rtp.Packet) {
 	c.rrMu.Lock()
 	defer c.rrMu.Unlock()
 	seq := p.SequenceNumber
-	if !t.has || p.SSRC != t.ssrc {
-		*t = clientTrack{index: t.index, rtpCh: t.rtpCh, rtcpCh: t.rtcpCh, has: true, ssrc: p.SSRC, baseSeq: seq, maxSeq: seq, received: 1}
+	if !t.rx.has || p.SSRC != t.rx.ssrc {
+		t.rx = rxState{has: true, ssrc: p.SSRC, baseSeq: seq, maxSeq: seq, received: 1}
 		return
 	}
-	t.received++
-	switch d := seq - t.maxSeq; {
+	t.rx.received++
+	switch d := seq - t.rx.maxSeq; {
 	case d == 0 || d >= 1<<15:
 		// duplicate or late
 	case d < seqWindow:
-		if seq < t.maxSeq {
-			t.cycles += 1 << 16
+		if seq < t.rx.maxSeq {
+			t.rx.cycles += 1 << 16
 		}
-		t.maxSeq = seq
+		t.rx.maxSeq = seq
 	default:
-		t.baseSeq, t.maxSeq, t.cycles, t.received, t.expPrior, t.recvPrior = seq, seq, 0, 1, 0, 0
+		t.rx.baseSeq, t.rx.maxSeq, t.rx.cycles, t.rx.received, t.rx.expPrior, t.rx.recvPrior = seq, seq, 0, 1, 0, 0
 	}
 }
 
@@ -227,8 +227,8 @@ func (c *Client) onRTCP(t *clientTrack, data []byte) {
 	}
 	sr := srs[len(srs)-1]
 	c.rrMu.Lock()
-	t.lsr = ntpMiddle(sr.NTP)
-	t.lsrAt = time.Now()
+	t.rx.lsr = ntpMiddle(sr.NTP)
+	t.rx.lsrAt = time.Now()
 	c.rrMu.Unlock()
 }
 
@@ -244,21 +244,21 @@ func ntpMiddle(t time.Time) uint32 {
 func (c *Client) reportBlock(t *clientTrack) (ReportBlock, bool) {
 	c.rrMu.Lock()
 	defer c.rrMu.Unlock()
-	if !t.has {
+	if !t.rx.has {
 		return ReportBlock{}, false
 	}
-	ext := t.cycles + uint32(t.maxSeq)
-	expected := ext - uint32(t.baseSeq) + 1
-	lost := max(int64(expected)-int64(t.received), 0)
-	expInt, recvInt := expected-t.expPrior, t.received-t.recvPrior
-	t.expPrior, t.recvPrior = expected, t.received
+	ext := t.rx.cycles + uint32(t.rx.maxSeq)
+	expected := ext - uint32(t.rx.baseSeq) + 1
+	lost := max(int64(expected)-int64(t.rx.received), 0)
+	expInt, recvInt := expected-t.rx.expPrior, t.rx.received-t.rx.recvPrior
+	t.rx.expPrior, t.rx.recvPrior = expected, t.rx.received
 	var frac uint8
 	if lostInt := int64(expInt) - int64(recvInt); expInt > 0 && lostInt > 0 {
 		frac = uint8(min(lostInt<<8/int64(expInt), 255))
 	}
-	b := ReportBlock{SSRC: t.ssrc, FractionLost: frac, Lost: uint32(min(lost, maxLost24)), HighestSeq: ext, LSR: t.lsr}
-	if !t.lsrAt.IsZero() {
-		b.DLSR = uint32(time.Since(t.lsrAt).Seconds() * 65536)
+	b := ReportBlock{SSRC: t.rx.ssrc, FractionLost: frac, Lost: uint32(min(lost, maxLost24)), HighestSeq: ext, LSR: t.rx.lsr}
+	if !t.rx.lsrAt.IsZero() {
+		b.DLSR = uint32(time.Since(t.rx.lsrAt).Seconds() * 65536)
 	}
 	return b, true
 }
@@ -345,14 +345,18 @@ func (c *Client) sendKeepalive(retried bool) (*keepalive, error) {
 	return &keepalive{cs: cs, ch: ch, deadline: time.Now().Add(c.cfg.Timeout), retried: retried}, nil
 }
 
-// checkKeepalives consumes answered keepalives. A 401 re-challenges and
-// retries once; other statuses are accepted, since any answer proves the
-// connection alive.
+// checkKeepalives consumes answered keepalives. A 454 (Session Not Found)
+// ends the session; a 401 re-challenges and retries once; other statuses are
+// accepted, since any answer proves the connection alive.
 func (c *Client) checkKeepalives(waiting []*keepalive, now time.Time) ([]*keepalive, error) {
 	var keep []*keepalive
 	for _, k := range waiting {
 		select {
 		case r := <-k.ch:
+			if r.StatusCode == 454 {
+				// Session Not Found: the session is gone.
+				return nil, &StatusError{Method: c.keepaliveMethod(), Code: r.StatusCode}
+			}
 			if r.StatusCode != 401 {
 				continue
 			}

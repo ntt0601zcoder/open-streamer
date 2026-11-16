@@ -521,6 +521,61 @@ func TestClientReceiverReports(t *testing.T) {
 	}
 }
 
+func TestClientSSRCChange(t *testing.T) {
+	s := newServer(t, rtsptest.ServerOptions{SSRCChangeAfter: 300 * time.Millisecond})
+	cfg := testConfig()
+	cfg.ReportInterval = 20 * time.Millisecond
+	c := dial(t, s.URL("/stream"), cfg)
+	seen := map[int][]uint32{}
+	for _, p := range readFor(t, c, 700*time.Millisecond) {
+		if p.RTP == nil {
+			continue
+		}
+		if l := seen[p.Track]; len(l) == 0 || l[len(l)-1] != p.RTP.SSRC {
+			seen[p.Track] = append(seen[p.Track], p.RTP.SSRC)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	last := map[int]uint32{}
+	for _, f := range s.FromClient() {
+		last[f.Channel/2] = binary.BigEndian.Uint32(f.Data[8:])
+	}
+	for track := 0; track < 2; track++ {
+		require.Len(t, seen[track], 2, "track %d restarts once", track)
+		assert.Equal(t, seen[track][1], last[track], "track %d reports the new SSRC", track)
+	}
+}
+
+func TestClientKeepaliveStatus(t *testing.T) {
+	t.Run("454 ends the session", func(t *testing.T) {
+		s := newServer(t, rtsptest.ServerOptions{SessionTimeout: time.Second, KeepaliveStatus: 454})
+		c := dial(t, s.URL("/stream"), testConfig())
+		errc := make(chan error, 1)
+		go func() {
+			for {
+				if _, err := c.ReadPacket(); err != nil {
+					errc <- err
+					return
+				}
+			}
+		}()
+		select {
+		case err := <-errc:
+			var se *rtsp.StatusError
+			require.ErrorAs(t, err, &se)
+			assert.Equal(t, 454, se.Code)
+		case <-time.After(2 * time.Second):
+			t.Fatal("454 keepalive did not end the session")
+		}
+	})
+	t.Run("other errors are alive", func(t *testing.T) {
+		s := newServer(t, rtsptest.ServerOptions{SessionTimeout: time.Second, KeepaliveStatus: 500})
+		c := dial(t, s.URL("/stream"), testConfig())
+		readFor(t, c, 1200*time.Millisecond)
+		assert.GreaterOrEqual(t, len(requestsOf(s, "GET_PARAMETER")), 2)
+	})
+}
+
 func TestClientTeardownOnClose(t *testing.T) {
 	s := newServer(t, rtsptest.ServerOptions{})
 	c := dial(t, s.URL("/stream"), testConfig())
