@@ -12,6 +12,15 @@
 // failed. Every 30 s, and at shutdown, osdev reports on stderr each stream's
 // active input, switches, drift breaks and reader counters when they changed,
 // and the packager's mux errors and fallback anchors while they grow.
+//
+// To accept an RTMP publisher (OBS, ffmpeg), serve a listen input and point
+// the publisher at it, with a stream key of your choice:
+//
+//	osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen
+//	ffmpeg -re -i in.mp4 -c copy -f flv rtmp://<host>:1935/live/<stream-key>
+//
+// In OBS set the server to rtmp://<host>:1935/live and the stream key to
+// <stream-key>. Several listen streams on one port share its listener.
 package main
 
 import (
@@ -50,6 +59,14 @@ func main() {
 	stop()
 	os.Exit(code)
 }
+
+const usageText = `usage: osdev -stream name=URL [-stream ...] [-listen addr] [-layout video,audio] [-loop]
+
+Accept an RTMP publisher (OBS or ffmpeg):
+  osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen
+  ffmpeg -re -i in.mp4 -c copy -f flv rtmp://<host>:1935/live/<stream-key>
+  OBS: server rtmp://<host>:1935/live, stream key <stream-key>
+`
 
 // streamFlags collects repeated -stream name=path values.
 type streamFlags []string
@@ -206,6 +223,7 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	}
 	if len(streams) == 0 {
 		_, _ = fmt.Fprintln(stderr, "osdev: at least one -stream name=URL is required")
+		_, _ = fmt.Fprint(stderr, usageText)
 		return nil, 2
 	}
 	cfg := &config{listen: *listen, layout: layout}

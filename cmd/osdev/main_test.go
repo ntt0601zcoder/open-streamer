@@ -22,6 +22,8 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
 )
 
 const fixture = "../../testdata/fixtures/h264_aac.ts"
@@ -399,3 +401,63 @@ const (
 	vS      = "s"
 	vXyz    = "x" + "yz"
 )
+
+// Two RTMP listen streams share one port; each publisher reaches its own
+// stream, and the pipeline report shows the RTMP counters.
+func TestOsdevRTMPStream(t *testing.T) {
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, ln.Close())
+
+	raw, err := os.ReadFile("../../testdata/fixtures/h264_aac.flv")
+	require.NoError(t, err)
+	tags, err := rtmp.ReadFLV(strings.NewReader(string(raw)))
+	require.NoError(t, err)
+
+	var errw syncBuilder
+	addr, stop := startOsdev(t, []string{
+		"-stream", fmt.Sprintf("a=rtmp://:%d/live/a?mode=listen", port),
+		"-stream", fmt.Sprintf("b=rtmp://:%d/live/b?mode=listen", port),
+	}, &errw)
+
+	pubCtx, pubCancel := context.WithCancel(context.Background())
+	var pubWG sync.WaitGroup
+	for _, name := range []string{"a", "b"} {
+		pubWG.Add(1)
+		go func() {
+			defer pubWG.Done()
+			u := fmt.Sprintf("rtmp://127.0.0.1:%d/live/%s", port, name)
+			for pubCtx.Err() == nil {
+				if err := rtmptest.Publish(pubCtx, u, tags, true); err == nil {
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}()
+	}
+	for _, name := range []string{"a", "b"} {
+		require.Eventually(t, func() bool {
+			resp, err := httpGet("http://" + addr + "/live/" + name + "/hls/index.m3u8")
+			if err != nil {
+				return false
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			return resp.StatusCode == 200 && strings.Contains(string(b), ".ts")
+		}, 30*time.Second, 100*time.Millisecond, name)
+	}
+	pubCancel()
+	pubWG.Wait()
+	assert.Equal(t, 0, stop())
+	rep := errw.String()
+	assert.Regexp(t, `stream a: input 0 rtmp://:\d+/live/xxxxx\?mode=listen.* frames=\d+ .*publishers=1`, rep)
+	assert.NotContains(t, rep, "/live/a?")
+}
+
+func TestOsdevUsageExample(t *testing.T) {
+	var sb strings.Builder
+	assert.Equal(t, 2, run(context.Background(), nil, io.Discard, &sb))
+	assert.Contains(t, sb.String(), "rtmp://<host>:1935/live/<stream-key>")
+	assert.Contains(t, sb.String(), "mode=listen")
+}
