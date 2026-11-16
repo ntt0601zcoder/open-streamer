@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -50,12 +51,15 @@ func NewDepacketizer(m Media, maxAU int) (Depacketizer, error) {
 	}
 	switch m.Codec {
 	case CodecH264:
-		return &h264Depack{asm: newAssembler(m.Index, maxAU, isSlice264, isAUD264)}, nil
+		return &h264Depack{asm: newAssembler(m.Index, maxAU, isSlice264, isAUD264, valid264)}, nil
 	case CodecH265:
-		return &h265Depack{asm: newAssembler(m.Index, maxAU, isSlice265, isAUD265)}, nil
+		return &h265Depack{asm: newAssembler(m.Index, maxAU, isSlice265, isAUD265, valid265)}, nil
 	case CodecAAC:
 		if m.AAC == nil || m.ClockRate == 0 {
 			return nil, fmt.Errorf("rtsp: depacketizer: media %d: missing AAC format", m.Index)
+		}
+		if err := checkAACFormat(m.AAC); err != nil {
+			return nil, fmt.Errorf("rtsp: depacketizer: media %d: %w", m.Index, err)
 		}
 		return newAACDepack(m, maxAU), nil
 	case CodecOther:
@@ -65,11 +69,28 @@ func NewDepacketizer(m Media, maxAU int) (Depacketizer, error) {
 	}
 }
 
+// maxCarry bounds the NAL units of slice-less AUs carried into the next AU.
+const maxCarry = 64 << 10
+
+// checkAACFormat rejects length fields the depacketizer cannot honour.
+func checkAACFormat(f *AACFormat) error {
+	if f.SizeLength <= 0 || f.SizeLength > 32 {
+		return errors.New("invalid AAC sizelength")
+	}
+	for _, n := range []int{f.IndexLength, f.IndexDeltaLength, f.CTSDeltaLength, f.DTSDeltaLength, f.RAPLength, f.AuxLength} {
+		if n < 0 || n > 32 {
+			return errors.New("invalid AAC field length")
+		}
+	}
+	return nil
+}
+
 // assembler builds video AUs by RTP timestamp. The marker bit is ignored.
 type assembler struct {
 	track, maxAU int
 	isSlice      func(nal []byte) bool
 	isAUD        func(nal []byte) bool
+	valid        func(nal []byte) bool
 
 	started  bool
 	ts       uint32
@@ -82,6 +103,9 @@ type assembler struct {
 
 	carry     [][]byte // NAL units of slice-less AUs, prepended to the next AU
 	carrySize int
+	carryLost bool // a carried slice-less AU was damaged
+	ownStart  int  // NAL units of the pending AU that came from the carry
+	ownSize   int
 	gapNext   bool
 
 	frag    []byte
@@ -89,8 +113,8 @@ type assembler struct {
 	oversze uint64
 }
 
-func newAssembler(track, maxAU int, slice, aud func([]byte) bool) *assembler {
-	return &assembler{track: track, maxAU: maxAU, isSlice: slice, isAUD: aud}
+func newAssembler(track, maxAU int, slice, aud, valid func([]byte) bool) *assembler {
+	return &assembler{track: track, maxAU: maxAU, isSlice: slice, isAUD: aud, valid: valid}
 }
 
 // Oversize returns the AUs dropped for exceeding the size bound.
@@ -107,9 +131,11 @@ func (a *assembler) advance(ts uint32, arrival time.Time) []AU {
 		a.started = true
 		a.ts = ts
 		a.nalus, a.size = a.carry, a.carrySize
+		a.ownStart, a.ownSize = len(a.carry), a.carrySize
 		a.carry, a.carrySize = nil, 0
 		a.hasSlice = false
-		a.lost = a.gapNext
+		a.lost = a.gapNext || a.carryLost
+		a.carryLost = false
 		a.over = false
 	}
 	a.gapNext = false
@@ -124,10 +150,19 @@ func (a *assembler) finish() []AU {
 	}
 	if a.over {
 		a.oversze++
+		a.carryLost = false
 		return nil
 	}
 	if !a.hasSlice {
 		a.carry, a.carrySize = a.nalus, a.size
+		if a.carrySize > maxCarry {
+			// Keep only the latest slice-less AU.
+			a.carry, a.carrySize = a.nalus[a.ownStart:], a.size-a.ownSize
+			if a.carrySize > maxCarry {
+				a.carry, a.carrySize = nil, 0
+			}
+		}
+		a.carryLost = a.carryLost || a.lost
 		return nil
 	}
 	return []AU{{Track: a.track, Timestamp: a.ts, NALUs: a.nalus, Lost: a.lost, Arrival: a.arrival}}
@@ -153,7 +188,7 @@ func (a *assembler) Gap() {
 
 // add appends a copy of nal to the pending AU.
 func (a *assembler) add(nal []byte) {
-	if len(nal) == 0 || a.isAUD(nal) {
+	if len(nal) == 0 {
 		return
 	}
 	a.addOwned(append([]byte(nil), nal...))
@@ -161,7 +196,14 @@ func (a *assembler) add(nal []byte) {
 
 // addOwned appends nal, which the assembler now owns.
 func (a *assembler) addOwned(nal []byte) {
-	if a.over || len(nal) == 0 || a.isAUD(nal) {
+	if a.over || len(nal) == 0 {
+		return
+	}
+	if !a.valid(nal) {
+		a.lost = true
+		return
+	}
+	if a.isAUD(nal) {
 		return
 	}
 	if a.size+len(nal) > a.maxAU {
@@ -183,6 +225,10 @@ func (a *assembler) fragStart(prefix, data []byte) {
 	}
 	a.frag, a.fragOn = nil, false
 	if a.over {
+		return
+	}
+	if !a.valid(prefix) {
+		a.lost = true
 		return
 	}
 	if a.size+len(prefix)+len(data) > a.maxAU {

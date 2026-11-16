@@ -15,8 +15,6 @@ const (
 	aacFrameSamples = 1024
 	aacOTEscape     = 31
 	aacFreqExplicit = 15
-	aacOTSBR        = 5
-	aacOTPS         = 29
 )
 
 // samplesPerAU returns the RTP clock ticks one AAC frame lasts: 1024 samples
@@ -28,7 +26,7 @@ func samplesPerAU(f *AACFormat, clock uint32) uint32 {
 	if rate == 0 || clock == 0 {
 		return aacFrameSamples
 	}
-	n := aacFrameSamples * clock / rate
+	n := uint32(uint64(aacFrameSamples) * uint64(clock) / uint64(rate))
 	if n == 0 {
 		return aacFrameSamples
 	}
@@ -116,7 +114,10 @@ type aacDepack struct {
 	maxAU   int
 	step    uint32
 	lost    bool
+	gapNext bool
 	oversze uint64
+	dropTS  uint32 // timestamp of the dropped fragmented AU
+	dropOn  bool
 
 	frag     []byte
 	fragOn   bool
@@ -136,8 +137,17 @@ func (d *aacDepack) Flush() []AU { return nil }
 
 // Gap implements Depacketizer.
 func (d *aacDepack) Gap() {
+	d.dropFrag()
+	d.gapNext = true
+}
+
+// dropFrag discards the fragmented AU in progress; the rest of its packets
+// are ignored.
+func (d *aacDepack) dropFrag() {
+	if d.fragOn {
+		d.dropTS, d.dropOn = d.fragTS, true
+	}
 	d.frag, d.fragOn = nil, false
-	d.lost = true
 }
 
 type aacHeader struct {
@@ -180,14 +190,15 @@ func (d *aacDepack) parseHeaders(pl []byte) (hs []aacHeader, dataOff int, ok boo
 	off := 2 + nbytes
 	if f.AuxLength > 0 {
 		ar := bitReader{b: pl[off:], n: (len(pl) - off) * 8}
-		auxBits := int(ar.read(f.AuxLength))
+		auxBits := int64(ar.read(f.AuxLength))
 		if ar.err {
 			return nil, 0, false
 		}
-		off += (f.AuxLength + auxBits + 7) / 8
-		if off > len(pl) {
+		need := (int64(f.AuxLength) + auxBits + 7) / 8
+		if need > int64(len(pl)-off) {
 			return nil, 0, false
 		}
+		off += int(need)
 	}
 	return hs, off, len(hs) > 0
 }
@@ -196,8 +207,22 @@ func (d *aacDepack) parseHeaders(pl []byte) (hs []aacHeader, dataOff int, ok boo
 func (d *aacDepack) Push(p *rtp.Packet, arrival time.Time) []AU {
 	hs, off, ok := d.parseHeaders(p.Payload)
 	if !ok {
-		d.lost = true
+		d.Gap()
 		return nil
+	}
+	if d.gapNext {
+		d.gapNext = false
+		// A tail fragment of the dropped AU does not start a new one.
+		if !d.dropOn || p.Timestamp != d.dropTS {
+			d.lost = true
+		}
+	}
+	if d.dropOn {
+		d.dropOn = false
+		if p.Timestamp == d.dropTS && len(hs) == 1 {
+			d.dropOn = true
+			return nil
+		}
 	}
 	data := p.Payload[off:]
 	if d.fragOn {
@@ -214,7 +239,7 @@ func (d *aacDepack) Push(p *rtp.Packet, arrival time.Time) []AU {
 		total += h.size
 	}
 	if total > len(data) {
-		d.lost = true
+		d.Gap()
 		return nil
 	}
 	var out []AU
@@ -244,7 +269,7 @@ func (d *aacDepack) emit(ts uint32, frame []byte, arrival time.Time) AU {
 func (d *aacDepack) continueFrag(p *rtp.Packet, hs []aacHeader, data []byte, arrival time.Time) (out []AU, handled bool) {
 	if len(hs) != 1 || p.Timestamp != d.fragTS || hs[0].size != d.fragSize ||
 		len(d.frag)+len(data) > d.fragSize {
-		d.frag, d.fragOn = nil, false
+		d.dropFrag()
 		d.lost = true
 		return nil, false
 	}

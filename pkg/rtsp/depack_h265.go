@@ -18,6 +18,11 @@ func isSlice265(n []byte) bool {
 	return len(n) >= 2 && (n[0]>>1)&0x3f <= h265VCLMax
 }
 
+// valid265 accepts NAL unit types 0..47 with a full two-byte header.
+func valid265(n []byte) bool {
+	return len(n) >= 2 && (n[0]>>1)&0x3f < h265AP
+}
+
 func isAUD265(n []byte) bool { return (n[0]>>1)&0x3f == h265AUD }
 
 // h265Depack implements RFC 7798 without DONL: single NAL unit, AP and FU.
