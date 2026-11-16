@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -622,6 +624,60 @@ func TestChunkHostile(t *testing.T) {
 		if c.pending > 1000 {
 			t.Fatalf("pending %d over the limit", c.pending)
 		}
+	})
+
+	// A server session holds an unauthenticated peer to few chunk streams
+	// and little partial data until publish is accepted, then lifts both.
+	t.Run("server session pre-publish", func(t *testing.T) {
+		streams := func(n int) []byte {
+			var b raw
+			for csid := uint32(3); csid < 3+uint32(n); csid++ {
+				b.fmt0(csid, 0, 1, MsgAudio, 1).u8(1)
+			}
+			return b.Bytes()
+		}
+		t.Run("streams", func(t *testing.T) {
+			s, p := newSessionPair(t, Config{}, roleServer, false)
+			p.write(streams(9))
+			drain(t, s, 8)
+			_, err := s.next()
+			isLimit(t, err)
+
+			s2, p2 := newSessionPair(t, Config{}, roleServer, false)
+			s2.raiseMessageLimit()
+			p2.write(streams(64))
+			drain(t, s2, 64)
+		})
+		t.Run("pending", func(t *testing.T) {
+			var b raw
+			b.fmt0(2, 0, 4, MsgSetChunkSize, 0).u32(60000)
+			// Five 60000-byte partials on five chunk streams: 300000 bytes.
+			for csid := uint32(3); csid < 8; csid++ {
+				b.fmt0(csid, 0, 60001, MsgVideo, 1).data(fill(60000, byte(csid)))
+			}
+			s, p := newSessionPair(t, Config{}, roleServer, false)
+			p.write(b.Bytes())
+			_, err := s.next()
+			isLimit(t, err)
+			if !strings.Contains(fmt.Sprint(err), "partial messages exceed") {
+				t.Fatalf("got %v, want the pending limit", err)
+			}
+
+			s2, p2 := newSessionPair(t, Config{}, roleServer, false)
+			s2.raiseMessageLimit()
+			b.fmt0(8, 0, 1, MsgAudio, 1).u8(1)
+			p2.write(b.Bytes())
+			if m := drain(t, s2, 1)[0]; m.Type != MsgAudio {
+				t.Fatalf("got type %d, want the audio message", m.Type)
+			}
+		})
+		t.Run("configured", func(t *testing.T) {
+			s, p := newSessionPair(t, Config{MaxPrePublishStreams: 2}, roleServer, false)
+			p.write(streams(3))
+			drain(t, s, 2)
+			_, err := s.next()
+			isLimit(t, err)
+		})
 	})
 
 	t.Run("buffers grow as data arrives", func(t *testing.T) {

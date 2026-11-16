@@ -582,7 +582,8 @@ func TestConfigDefaults(t *testing.T) {
 	c := Config{}.withDefaults()
 	if c.HandshakeTimeout != 5*time.Second || c.CommandTimeout != 10*time.Second ||
 		c.IdleTimeout != 30*time.Second || c.PingInterval != 10*time.Second ||
-		c.MaxMessage != 8<<20 || c.MaxPrePublishMessage != 64<<10 || c.Now == nil {
+		c.MaxMessage != 8<<20 || c.MaxPrePublishMessage != 64<<10 ||
+		c.MaxPrePublishStreams != 8 || c.MaxPrePublishPending != 256<<10 || c.Now == nil {
 		t.Fatalf("defaults: %+v", c)
 	}
 }
