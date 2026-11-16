@@ -1,6 +1,9 @@
 package rtsp
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestControlURLs(t *testing.T) {
 	cases := []struct{ name, base, ctl, want string }{
@@ -12,6 +15,8 @@ func TestControlURLs(t *testing.T) {
 		{"dahua query no slash", "rtsp://h/cam/realmonitor?channel=1&subtype=0", "trackID=0", "rtsp://h/cam/realmonitor?channel=1&subtype=0/trackID=0"},
 		{"absolute", "rtsp://h/a", "rtsp://other:8554/x/track1", "rtsp://other:8554/x/track1"},
 		{"absolute creds", "rtsp://h/a", "rtsp://u:p@other/x", "rtsp://other/x"},
+		{"absolute rtsps", "rtsp://h/a", "rtsps://u:p@h2:322/x", "rtsps://h2:322/x"},
+		{"absolute upper", "rtsp://h/a", "RTSP://u:p@H2/x", "RTSP://H2/x"},
 		{"leading slash", "rtsp://h/a/", "/track1", "rtsp://h/a/track1"},
 		{"base creds", "rtsp://u:p@h/a", "t1", "rtsp://h/a/t1"},
 	}
@@ -38,16 +43,7 @@ func TestStripUserinfo(t *testing.T) {
 	}
 	// The error must not leak the password.
 	_, _, _, err = StripUserinfo("rtsp://u:secret@[bad/")
-	if err == nil || contains(err.Error(), "secret") {
+	if err == nil || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("leak or nil: %v", err)
 	}
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

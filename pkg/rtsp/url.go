@@ -50,8 +50,26 @@ func ResolveControl(base, control string) string {
 	switch {
 	case control == "" || control == "*":
 		return base
-	case strings.HasPrefix(strings.ToLower(control), "rtsp://"):
+	case hasScheme(control):
 		return stripUserinfoString(control)
 	}
 	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(control, "/")
+}
+
+// hasScheme reports whether s starts with an RFC 3986 scheme followed by "://".
+func hasScheme(s string) bool {
+	i := strings.Index(s, "://")
+	if i <= 0 {
+		return false
+	}
+	for j := 0; j < i; j++ {
+		c := s[j]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case j > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return true
 }
