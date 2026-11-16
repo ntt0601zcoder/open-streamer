@@ -11,6 +11,7 @@ import (
 	"github.com/Eyevinn/mp4ff/avc"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/pkg/h26x"
 	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 )
 
@@ -939,8 +940,8 @@ func (d *Demuxer) commitNAL(t *track, n []byte) {
 // that does not parse is treated as field-coded, the safe side for
 // splitsOnSlice.
 func (t *track) noteFieldCoding(id uint32, sps []byte) {
-	parsed, err := avc.ParseSPSNALUnit(sps, false)
-	if err == nil && parsed.FrameMbsOnlyFlag {
+	parsed, err := h26x.ParseSPS(h26x.H264, sps)
+	if err == nil && parsed.FrameMbsOnly {
 		delete(t.fieldSPS, id)
 		return
 	}

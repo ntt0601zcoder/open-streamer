@@ -9,6 +9,8 @@ import (
 	"github.com/Eyevinn/mp4ff/avc"
 	"github.com/Eyevinn/mp4ff/bits"
 	"github.com/Eyevinn/mp4ff/hevc"
+
+	"github.com/ntt0601zcoder/open-streamer/pkg/h26x"
 )
 
 // TrackConfig describes a track's codec parameters. It is immutable once built.
@@ -74,7 +76,7 @@ func newH264Config(sps, pps [][]byte) (*TrackConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	parsed, err := avc.ParseSPSNALUnit(spsSets[0].data, false)
+	parsed, err := parseAVCSPS(spsSets[0].data)
 	if err != nil {
 		return nil, fmt.Errorf("parse sps: %w", err)
 	}
@@ -109,7 +111,7 @@ func newH265Config(vps, sps, pps [][]byte) (*TrackConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	parsed, err := hevc.ParseSPSNALUnit(spsSets[0].data)
+	parsed, err := parseHEVCSPS(spsSets[0].data)
 	if err != nil {
 		return nil, fmt.Errorf("parse sps: %w", err)
 	}
@@ -201,11 +203,11 @@ func paramSetID(codec Codec, nalu []byte) (uint32, error) {
 		}
 		switch nalu[0] & 0x1f {
 		case 7:
-			sps, err := avc.ParseSPSNALUnit(nalu, false)
+			sps, err := h26x.ParseSPS(h26x.H264, nalu)
 			if err != nil {
 				return 0, err
 			}
-			return sps.ParameterID, nil
+			return sps.ID, nil
 		case 8:
 			return readFirstUE(nalu, 1)
 		default:
@@ -223,11 +225,11 @@ func paramSetID(codec Codec, nalu []byte) (uint32, error) {
 			}
 			return uint32(vps.VpsID), nil
 		case 33:
-			sps, err := hevc.ParseSPSNALUnit(nalu)
+			sps, err := h26x.ParseSPS(h26x.H265, nalu)
 			if err != nil {
 				return 0, err
 			}
-			return uint32(sps.SpsID), nil
+			return sps.ID, nil
 		case 34:
 			return readFirstUE(nalu, 2)
 		default:
@@ -238,6 +240,24 @@ func paramSetID(codec Codec, nalu []byte) (uint32, error) {
 	default:
 		return 0, fmt.Errorf("unknown codec %d", codec)
 	}
+}
+
+// parseAVCSPS hands an H.264 SPS to mp4ff once h26x has checked it: mp4ff
+// does not bound the counts it reads, so a hostile set could make it
+// allocate without limit.
+func parseAVCSPS(nalu []byte) (*avc.SPS, error) {
+	if err := h26x.CheckSPS(h26x.H264, nalu); err != nil {
+		return nil, err
+	}
+	return avc.ParseSPSNALUnit(nalu, false)
+}
+
+// parseHEVCSPS hands an H.265 SPS to mp4ff once h26x has checked it.
+func parseHEVCSPS(nalu []byte) (*hevc.SPS, error) {
+	if err := h26x.CheckSPS(h26x.H265, nalu); err != nil {
+		return nil, err
+	}
+	return hevc.ParseSPSNALUnit(nalu)
 }
 
 // readFirstUE reads the first ue(v) after a header of hdr bytes, removing

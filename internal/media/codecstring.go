@@ -29,7 +29,7 @@ func codecString(c *TrackConfig) (string, error) {
 		if len(c.SPS) == 0 {
 			return "", errors.New("h264: no sps")
 		}
-		sps, err := avc.ParseSPSNALUnit(c.SPS[0], false)
+		sps, err := parseAVCSPS(c.SPS[0])
 		if err != nil {
 			return "", fmt.Errorf("h264: parse sps: %w", err)
 		}
@@ -38,7 +38,7 @@ func codecString(c *TrackConfig) (string, error) {
 		if len(c.SPS) == 0 {
 			return "", errors.New("h265: no sps")
 		}
-		sps, err := hevc.ParseSPSNALUnit(c.SPS[0])
+		sps, err := parseHEVCSPS(c.SPS[0])
 		if err != nil {
 			return "", fmt.Errorf("h265: parse sps: %w", err)
 		}
