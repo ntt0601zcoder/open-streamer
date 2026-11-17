@@ -91,6 +91,8 @@ type rtpFrames struct {
 	cache  *media.ConfigCache
 	tracks []*rtpTrack // by media index; nil when not converted
 	ref    *rtpTrack
+	// skipReason says why a media index is not converted.
+	skipReason map[int]string
 
 	// The latest AU's arrival and session-timeline PTS, for placing a track
 	// by arrival.
@@ -185,15 +187,27 @@ func newRTPFrames(desc rtsp.Description, info []rtsp.RTPInfo, cache *media.Confi
 }
 
 // newTrack returns the state of a media, nil when it is not converted.
+// A media that is not converted gets its reason in r.skipReason.
 func (r *rtpFrames) newTrack(m rtsp.Media) *rtpTrack {
+	t, reason := r.buildTrack(m)
+	if t == nil {
+		if r.skipReason == nil {
+			r.skipReason = map[int]string{}
+		}
+		r.skipReason[m.Index] = reason
+	}
+	return t
+}
+
+func (r *rtpFrames) buildTrack(m rtsp.Media) (*rtpTrack, string) {
 	if m.Reason != "" {
-		return nil
+		return nil, m.Reason
 	}
 	t := &rtpTrack{index: m.Index, clock: int64(m.ClockRate), unw: unwrap.New(32)}
 	switch m.Codec {
 	case rtsp.CodecH264, rtsp.CodecH265:
 		if m.ClockRate != rtpVideoClock {
-			return nil
+			return nil, fmt.Sprintf("video clock %d", m.ClockRate)
 		}
 		t.kind = media.KindVideo
 		t.v = &rtpVideo{codec: media.CodecH264, hcodec: h26x.H264, sets: newParamSets()}
@@ -211,21 +225,21 @@ func (r *rtpFrames) newTrack(m rtsp.Media) *rtpTrack {
 		}
 	case rtsp.CodecAAC:
 		if m.AAC == nil || m.ClockRate == 0 {
-			return nil
+			return nil, "AAC without a format or clock"
 		}
 		cfg, err := media.NewAACConfig(m.AAC.Config)
 		if err != nil {
-			return nil
+			return nil, "invalid AAC config"
 		}
 		t.kind = media.KindAudio
 		t.acfg = r.cache.Stable(m.Index, cfg)
 		t.spa = max(1, aacFrameSamples*t.clock/int64(cfg.SampleRate))
 	case rtsp.CodecOther:
-		return nil
+		return nil, "codec not supported"
 	default:
-		return nil
+		return nil, "unknown codec"
 	}
-	return t
+	return t, ""
 }
 
 // applyRTPInfo seeds each track's unwrapper with its rtptime and sets the

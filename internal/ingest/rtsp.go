@@ -22,6 +22,8 @@ const (
 	// rtspMaxOpenPackets bounds the RTP packets queued while Open waits for
 	// sender reports.
 	rtspMaxOpenPackets = 2048
+	// rtspMaxOpenBytes bounds the RTP payload bytes queued meanwhile.
+	rtspMaxOpenBytes = 16 << 20
 )
 
 // rtspSyncWait is how long Open waits for a sender report on every track
@@ -43,6 +45,9 @@ func parseRTSP(u *url.URL, q url.Values) (Spec, error) {
 		}
 	}
 	if v, ok := q["transport"]; ok {
+		if len(v) > 1 {
+			return Spec{}, errors.New("transport given more than once")
+		}
 		if _, err := rtspTransport(v[0]); err != nil {
 			return Spec{}, err
 		}
@@ -73,8 +78,11 @@ func rtspDialURL(rawURL string) (dial, transport string) {
 				k = name
 			}
 			if k == "transport" {
-				if tr, err := rtspTransport(v); err == nil {
-					transport = tr
+				// The same decoded value parse checked.
+				if dv, err := url.QueryUnescape(v); err == nil {
+					if tr, err := rtspTransport(dv); err == nil {
+						transport = tr
+					}
 				}
 				continue
 			}
@@ -111,7 +119,7 @@ type rtspEvent struct {
 }
 
 type rtspCounters struct {
-	lost, dups, resets, skippedPackets, foreignSR atomic.Uint64
+	lost, dups, resets, skippedPackets, foreignSR, restartDropped atomic.Uint64
 }
 
 // rtspPull is an RTSP pull input: one session for the reader's life. It
@@ -126,6 +134,7 @@ type rtspCounters struct {
 type rtspPull struct {
 	rawURL string
 	spec   Spec
+	now    func() time.Time // the Env clock
 	cl     *rtsp.Client
 	frames *rtpFrames
 	tracks []*rtspTrack // by media index; nil when not converted
@@ -133,11 +142,15 @@ type rtspPull struct {
 
 	// skipped maps a stats key to 1 for each media that is not converted.
 	skipped map[string]uint64
+	// restarted holds the tracks that restarted in the current camera
+	// restart.
+	restarted map[int]bool
 
 	// The reading goroutine's own state.
-	pending []rtsp.Packet // RTP read while Open waited, in order
-	events  []rtspEvent
-	err     error // the end of the session, returned once the events are out
+	pending      []rtsp.Packet // RTP read while Open waited, in order
+	pendingBytes int
+	events       []rtspEvent
+	err          error // the end of the session, returned once the events are out
 
 	n      rtspCounters
 	closed atomic.Bool
@@ -149,7 +162,7 @@ func openRTSP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, er
 	if err != nil {
 		return nil, fmt.Errorf("ingest: rtsp: open %s: %w", Redact(rawURL), err)
 	}
-	r := &rtspPull{rawURL: rawURL, spec: p.spec, cl: cl}
+	r := &rtspPull{rawURL: rawURL, spec: p.spec, now: env.now(), cl: cl}
 	if err := r.setup(); err != nil {
 		_ = cl.Close() //nolint:contextcheck // Close bounds its own TEARDOWN wait; the open ctx does not apply to it.
 		return nil, fmt.Errorf("ingest: rtsp: open %s: %w", Redact(rawURL), err)
@@ -158,7 +171,7 @@ func openRTSP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, er
 	// The sender reports, bounded by ctx and the wait; the RTP read meanwhile
 	// stays queued.
 	stop := context.AfterFunc(ctx, func() { _ = cl.Close() }) //nolint:contextcheck // Close bounds its own TEARDOWN wait; the open ctx does not apply to it.
-	err = r.awaitSync(time.Now().Add(rtspSyncWait))
+	err = r.awaitSync(r.now().Add(rtspSyncWait))
 	if err != nil {
 		err = fmt.Errorf("the session ended before it was in sync: %w", err)
 	}
@@ -179,16 +192,14 @@ func (r *rtspPull) setup() error {
 	r.kinds = r.frames.kinds()
 	r.tracks = make([]*rtspTrack, len(r.kinds))
 	r.skipped = map[string]uint64{}
+	r.restarted = map[int]bool{}
 	converted := 0
 	for _, m := range desc.Media {
 		if m.Index < 0 || m.Index >= len(r.kinds) {
 			continue
 		}
 		if r.kinds[m.Index] == 0 {
-			reason := m.Reason
-			if reason == "" {
-				reason = fmt.Sprintf("video clock %d", m.ClockRate)
-			}
+			reason := r.frames.skipReason[m.Index]
 			r.skipped[fmt.Sprintf("skipped_track_%d_%s", m.Index, snake(reason))] = 1
 			continue
 		}
@@ -230,7 +241,8 @@ func snake(s string) string {
 // between packets: a silent source holds it until the client's idle timeout
 // or the open ctx.
 func (r *rtspPull) awaitSync(deadline time.Time) error {
-	for !r.synced() && len(r.pending) < rtspMaxOpenPackets && time.Now().Before(deadline) {
+	for !r.synced() && len(r.pending) < rtspMaxOpenPackets &&
+		r.pendingBytes < rtspMaxOpenBytes && r.now().Before(deadline) {
 		p, err := r.cl.ReadPacket()
 		if err != nil {
 			return err
@@ -241,6 +253,7 @@ func (r *rtspPull) awaitSync(deadline time.Time) error {
 			continue
 		}
 		r.pending = append(r.pending, p)
+		r.pendingBytes += len(p.RTP.Payload)
 	}
 	return nil
 }
@@ -271,8 +284,9 @@ func (r *rtspPull) observe(p rtsp.Packet) {
 }
 
 // srTrack maps a sender report to its track: the track whose RTP carries the
-// SR's SSRC, else the track the report came on when that track has not
-// shown another SSRC.
+// SR's SSRC; failing that, the track the report came on, but only until
+// that track has shown an RTP SSRC (after which a report with another SSRC
+// is a stale or foreign one and is not applied).
 func (r *rtspPull) srTrack(p rtsp.Packet, sr rtsp.SenderReport) (int, bool) {
 	for i, t := range r.tracks {
 		if t != nil && t.hasSSRC && t.ssrc == sr.SSRC {
@@ -326,22 +340,43 @@ func (r *rtspPull) handleRTP(p rtsp.Packet) {
 	if gap > 0 {
 		r.n.lost.Add(uint64(gap))
 	}
-	if gap > 0 || reset {
-		t.dep.Gap()
-	}
+	restarted := reset && t.hasHandled && t.handled != p.RTP.SSRC
 	if reset {
 		r.n.resets.Add(1)
-		if t.hasHandled && t.handled != p.RTP.SSRC {
-			// The pending AU belongs to the old timeline: it goes out
-			// (marked lost by Gap) before the track is placed again.
-			r.pushAUs(t.dep.Flush())
-			if r.frames.restart(p.Track) {
-				r.disc()
-			}
+	}
+	switch {
+	case restarted:
+		// A new SSRC is a restart, not a loss: the pending AU belongs to the
+		// old timeline and goes out (an unfinished fragment is lost by
+		// Flush itself), and the new stream's first AU is not marked.
+		old := t.dep.Flush()
+		if r.joinsRestart(p.Track) {
+			// Another track restarted just before, and its discontinuity
+			// is out: this track's old AU would land after it.
+			r.n.restartDropped.Add(uint64(len(old)))
+		} else {
+			r.pushAUs(old)
 		}
+		if r.frames.restart(p.Track) {
+			r.disc()
+		}
+	case gap > 0 || reset:
+		t.dep.Gap()
 	}
 	t.handled, t.hasHandled = p.RTP.SSRC, true
 	r.pushAUs(t.dep.Push(p.RTP, p.Arrival))
+}
+
+// joinsRestart records that track restarted and reports whether another
+// track had restarted before it in the same camera restart, a restart of a
+// track already recorded starting a new one.
+func (r *rtspPull) joinsRestart(track int) bool {
+	if r.restarted[track] {
+		clear(r.restarted)
+	}
+	joins := len(r.restarted) > 0
+	r.restarted[track] = true
+	return joins
 }
 
 // pushAUs converts access units and queues their frames. A bad AU is
@@ -368,6 +403,9 @@ func (r *rtspPull) step() {
 		p = r.pending[0]
 		r.pending[0] = rtsp.Packet{}
 		r.pending = r.pending[1:]
+		if p.RTP != nil {
+			r.pendingBytes -= len(p.RTP.Payload)
+		}
 	} else {
 		var err error
 		if p, err = r.cl.ReadPacket(); err != nil {
@@ -435,6 +473,7 @@ func (r *rtspPull) Stats() map[string]uint64 {
 	out["reordered_packets"] = cs.Reordered
 	out["dropped_packets"] = cs.Dropped
 	out["skipped_packets"] = r.n.skippedPackets.Load()
+	out["restart_dropped_aus"] = r.n.restartDropped.Load()
 	out["foreign_sr"] = r.n.foreignSR.Load()
 	out["fallback_tcp"] = cs.FallbackTCP
 	out["reauth"] = cs.Reauth
