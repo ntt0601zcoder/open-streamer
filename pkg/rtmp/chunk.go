@@ -335,6 +335,7 @@ type outStream struct {
 	typ       uint8
 	extended  bool
 	extValue  uint32
+	format    byte // header format of the last message
 }
 
 // ChunkWriter splits messages into chunks with header compression. It is not
@@ -369,7 +370,7 @@ func (c *ChunkWriter) SetChunkSize(n int) error {
 // WriteMessage writes m on chunk stream csid (2..65599). The header is type 0
 // for the stream's first message, a new message stream id or a backwards
 // timestamp; type 1 when the length or type changes; type 2 when only the
-// delta changes; type 3 otherwise.
+// delta changes or the previous header was type 0; type 3 otherwise.
 func (c *ChunkWriter) WriteMessage(csid uint32, m Message) error {
 	if csid < minCSID || csid > maxCSID {
 		return fmt.Errorf("rtmp: chunk: invalid csid %d", csid)
@@ -406,7 +407,9 @@ func (c *ChunkWriter) encode(csid uint32, m Message) {
 		switch {
 		case length != st.length || m.Type != st.typ:
 			format = 1
-		case delta != st.delta:
+		case delta != st.delta, st.format == 0:
+			// ffmpeg adds the previous timestamp field to a type 3 header that
+			// starts a message, so a type 0 header is never followed by one.
 			format = 2
 		}
 		if format != 3 {
@@ -418,6 +421,7 @@ func (c *ChunkWriter) encode(csid uint32, m Message) {
 		st.extended = field >= extendedTimestamp
 		st.extValue = field
 	}
+	st.format = format
 	st.started = true
 	st.timestamp = m.Timestamp
 	st.length = length

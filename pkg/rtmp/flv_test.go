@@ -44,7 +44,10 @@ func TestFLVVideoRoundTrip(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			b := AppendVideoTag(nil, c.tag, c.enhanced)
+			b, err := AppendVideoTag(nil, c.tag, c.enhanced)
+			if err != nil {
+				t.Fatal(err)
+			}
 			got, err := ParseVideoTag(b)
 			if err != nil {
 				t.Fatal(err)
@@ -59,7 +62,10 @@ func TestFLVVideoRoundTrip(t *testing.T) {
 		})
 	}
 	// Legacy bytes are as the FLV specification lays them out.
-	b := AppendVideoTag(nil, VideoTag{Codec: VideoAVC, Kind: VideoCodedFrames, CompTime: -2, Data: []byte{9}}, false)
+	b, err := AppendVideoTag(nil, VideoTag{Codec: VideoAVC, Kind: VideoCodedFrames, CompTime: -2, Data: []byte{9}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if want := []byte{0x27, 1, 0xFF, 0xFF, 0xFE, 9}; !bytes.Equal(b, want) {
 		t.Fatalf("% x", b)
 	}
@@ -83,7 +89,10 @@ func TestFLVAudioRoundTrip(t *testing.T) {
 }
 
 func TestFLVDataIsOwned(t *testing.T) {
-	b := AppendVideoTag(nil, VideoTag{Codec: VideoAVC, Kind: VideoCodedFrames, Data: []byte{1, 2}}, false)
+	b, err := AppendVideoTag(nil, VideoTag{Codec: VideoAVC, Kind: VideoCodedFrames, Data: []byte{1, 2}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	v, _ := ParseVideoTag(b)
 	b[len(b)-1] = 99
 	if v.Data[1] != 2 {
@@ -247,5 +256,33 @@ func TestFLVFixtureAVC(t *testing.T) {
 	}
 	if video != 150 || hdr != 2 || audio != 283 {
 		t.Fatalf("video %d hdr %d audio %d", video, hdr, audio)
+	}
+}
+
+func TestAppendVideoTagCompTimeRange(t *testing.T) {
+	for _, enhanced := range []bool{false, true} {
+		for _, ct := range []int32{-1 << 23, 1<<23 - 1, 0, -1} {
+			b, err := AppendVideoTag(nil, VideoTag{Codec: VideoAVC, Kind: VideoCodedFrames, CompTime: ct, Data: []byte{1}}, enhanced)
+			if err != nil {
+				t.Fatalf("enhanced=%v ct=%d: %v", enhanced, ct, err)
+			}
+			if got, err := ParseVideoTag(b); err != nil || got.CompTime != ct {
+				t.Fatalf("enhanced=%v ct=%d: got %+v, %v", enhanced, ct, got, err)
+			}
+		}
+		for _, ct := range []int32{1 << 23, -1<<23 - 1, 1 << 30} {
+			dst := []byte{7}
+			b, err := AppendVideoTag(dst, VideoTag{Codec: VideoAVC, Kind: VideoCodedFrames, CompTime: ct, Data: []byte{1}}, enhanced)
+			if err == nil {
+				t.Fatalf("enhanced=%v ct=%d: accepted", enhanced, ct)
+			}
+			if !bytes.Equal(b, dst) {
+				t.Fatalf("enhanced=%v ct=%d: dst changed to % x", enhanced, ct, b)
+			}
+		}
+	}
+	// Kinds that carry no composition time ignore the field.
+	if _, err := AppendVideoTag(nil, VideoTag{Codec: VideoAVC, Kind: VideoSequenceStart, CompTime: 1 << 30}, false); err != nil {
+		t.Fatalf("sequence start: %v", err)
 	}
 }

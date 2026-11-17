@@ -240,7 +240,10 @@ func (s *PlayServer) exchange(p *playConn, cr *rtmp.ChunkReader) bool {
 				return p.status("error", "NetStream.Play.StreamNotFound", "stream "+name+" not found") == nil
 			}
 			return p.userControl(0) == nil && // StreamBegin
-				p.status("status", "NetStream.Play.Start", "Started playing") == nil
+				p.status("status", "NetStream.Play.Reset", "Playing and resetting "+name) == nil &&
+				p.status("status", "NetStream.Play.Start", "Started playing "+name) == nil &&
+				p.command(playStreamID, "|RtmpSampleAccess", true, true) == nil &&
+				s.sendMetaData(p) == nil
 		}
 	}
 }
@@ -267,6 +270,19 @@ func (p *playConn) connected(txn any) error {
 			{Key: "description", Value: "Connection succeeded."},
 			{Key: "objectEncoding", Value: 0},
 		})
+}
+
+// sendMetaData sends an onMetaData data message when tags is not empty and
+// does not start with its own script tag, so media never comes first.
+func (s *PlayServer) sendMetaData(p *playConn) error {
+	if len(s.tags) == 0 || s.tags[0].Type == rtmp.FLVScript {
+		return nil
+	}
+	b, err := rtmp.EncodeAMF0("onMetaData", rtmp.ECMAArray{{Key: "duration", Value: 0}})
+	if err != nil {
+		return err
+	}
+	return p.write(csidData, rtmp.Message{Type: rtmp.MsgDataAMF0, StreamID: playStreamID, Payload: b})
 }
 
 // sendTags sends the tags one message each, or grouped into aggregates.

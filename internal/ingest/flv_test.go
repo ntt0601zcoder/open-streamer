@@ -78,7 +78,11 @@ func lengthPrefixed(nalus ...[]byte) []byte {
 }
 
 func videoMedia(ms uint32, tag rtmp.VideoTag) rtmp.Media {
-	return rtmp.Media{Type: rtmp.MsgVideo, Timestamp: ms, Payload: rtmp.AppendVideoTag(nil, tag, false)}
+	b, err := rtmp.AppendVideoTag(nil, tag, false)
+	if err != nil {
+		panic(err)
+	}
+	return rtmp.Media{Type: rtmp.MsgVideo, Timestamp: ms, Payload: b}
 }
 
 func avcHeader(t *testing.T, ms uint32, cfg *media.TrackConfig) rtmp.Media {
