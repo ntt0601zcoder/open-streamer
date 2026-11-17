@@ -33,6 +33,12 @@ const (
 	// rtpMaxMedia bounds the media indexes taken from a description, as
 	// pkg/rtsp bounds the media of an SDP.
 	rtpMaxMedia = 16
+	// rtpMaxVPS, rtpMaxSPS and rtpMaxPPS bound the parameter sets kept
+	// per track: the spec id ranges, which media.ParamSetID enforces, held
+	// again here so a hostile source cannot grow the maps.
+	rtpMaxVPS = 16
+	rtpMaxSPS = 32
+	rtpMaxPPS = 256
 )
 
 // ntpEpoch is an NTP timestamp of zero, which cameras send before their
@@ -74,8 +80,9 @@ var ntpEpoch = time.Unix(-2208988800, 0)
 // does not confirm is counted (sync_unconfirmed). A track whose offset is
 // still unknown when a pair is known takes the SR offset directly; so does
 // the reference, from another track's offset, when that track was placed
-// before the reference had an offset. Sender reports with a zero NTP time
-// are ignored (sr_ignored).
+// before the reference had an offset. Sender reports with a zero NTP time,
+// or with an RTP timestamp more than 10 s from the track's latest, are
+// ignored (sr_ignored).
 //
 // Timeline breaks. A track whose RTP timestamp steps by more than 10 s, an
 // audio track whose timestamp steps back (timeline_breaks), or a track that
@@ -350,7 +357,9 @@ func (r *rtpFrames) report(t *rtpTrack) bool {
 
 // senderReport applies an RTCP sender report of a track (the caller maps
 // the SSRC to the track) and reports whether it moved an offset of a track
-// that has returned frames (see rtpFrames).
+// that has returned frames (see rtpFrames). A report with a zero NTP time,
+// or with an RTP timestamp more than 10 s from the track's latest, is
+// ignored (sr_ignored).
 func (r *rtpFrames) senderReport(track int, sr rtsp.SenderReport) (discontinuity bool) {
 	t := r.track(track)
 	if t == nil {
@@ -363,6 +372,12 @@ func (r *rtpFrames) senderReport(track int, sr rtsp.SenderReport) (discontinuity
 	var ts int64
 	if t.hasLast {
 		ts = t.last + int64(int32(sr.RTP-uint32(t.last)))
+		if absInt(ts-t.last) > rtpMaxJump*t.clock {
+			// Another timeline: a restart the packets have not shown
+			// yet, or a bad sender. The pair would misplace the track.
+			r.n.srIgnored.Add(1)
+			return false
+		}
 	} else {
 		ts = t.unw.Unwrap(uint64(sr.RTP))
 		t.last, t.hasLast = ts, true
@@ -551,6 +566,9 @@ func (r *rtpFrames) push(au rtsp.AU) (frames []Frame, discontinuity bool, err er
 		return nil, false, nil
 	}
 	ts := t.unw.Unwrap(uint64(au.Timestamp))
+	// A step over 10 s either way breaks the timeline. A forward step up
+	// to 10 s is a gap (loss): the RTP clock keeps the PTS right, and the
+	// SR alignment holds.
 	broken := t.hasLast && absInt(ts-t.last) > rtpMaxJump*t.clock
 	if t.kind == media.KindAudio && t.hasPrevAU {
 		// Audio has no DTS extractor to catch a step back, and its PTS
@@ -561,8 +579,6 @@ func (r *rtpFrames) push(au rtsp.AU) (frames []Frame, discontinuity bool, err er
 			r.n.duplicates.Add(1)
 			return nil, false, nil
 		case ts < t.prevAU:
-			// A forward step up to 10 s is a gap (loss): the RTP clock
-			// keeps the PTS right, and the SR alignment holds.
 			broken = true
 		}
 	}
@@ -719,6 +735,10 @@ func (r *rtpFrames) updateSets(t *rtpTrack, nalus [][]byte) ([][]byte, error) {
 		if bytes.Equal(m[id], n) {
 			continue
 		}
+		if _, known := m[id]; !known && len(m) >= maxSetsOf(role) {
+			badSet = fmt.Errorf("too many parameter sets (%d)", len(m))
+			continue
+		}
 		if !changed {
 			sets, changed = sets.clone(), true
 			m = sets.of(role)
@@ -746,6 +766,18 @@ func (r *rtpFrames) updateSets(t *rtpTrack, nalus [][]byte) ([][]byte, error) {
 		v.cfg = r.cache.Stable(t.index, cfg)
 	}
 	return data, nil
+}
+
+// maxSetsOf returns how many parameter sets of a role a track keeps.
+func maxSetsOf(role nalRole) int {
+	switch role {
+	case nalVPS:
+		return rtpMaxVPS
+	case nalSPS:
+		return rtpMaxSPS
+	case nalPPS, nalOther, nalAUD:
+	}
+	return rtpMaxPPS
 }
 
 func buildVideoConfig(codec media.Codec, sets paramSets) (*media.TrackConfig, error) {

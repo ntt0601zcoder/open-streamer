@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -665,20 +664,37 @@ func TestOpenRTSP(t *testing.T) {
 		}
 	})
 	t.Run("port 554 is implied", func(t *testing.T) {
-		// Probe only; the port is never bound.
-		d := net.Dialer{Timeout: 200 * time.Millisecond}
-		if c, err := d.DialContext(context.Background(), "tcp", "127.0.0.1:554"); err == nil {
-			_ = c.Close()
-			t.Skip("something listens on 127.0.0.1:554")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		r, err := Open(ctx, "rtsp://127.0.0.1/stream", Env{})
-		if err == nil {
-			_ = r.Close()
-			t.Fatal("Open succeeded")
-		}
-		assert.Contains(t, err.Error(), "ingest: rtsp: open rtsp://127.0.0.1/stream")
-		assert.Contains(t, err.Error(), "127.0.0.1:554")
+		// A unit check: no connection is made. The URL handed to the
+		// client keeps no port, and pkg/rtsp dials 554 for it
+		// (TestNewTargetDefaultPort).
+		dial, tr := rtspDialURL("rtsp://127.0.0.1/stream?transport=udp")
+		assert.Equal(t, "rtsp://127.0.0.1/stream", dial)
+		assert.Equal(t, "udp", tr)
+		_, err := Parse("rtsp://127.0.0.1/stream")
+		require.NoError(t, err)
 	})
+}
+
+// TestRTSPPullClientStats checks that the depacketizers' oversize counts and
+// the client's unknown-channel and server-request counts reach Stats.
+func TestRTSPPullClientStats(t *testing.T) {
+	src := rtspFixture(t)
+	med := append([]rtsptest.TrackSource(nil), src...)
+	video := med[0]
+	video.AUs = append([]rtsptest.TestAU(nil), video.AUs...)
+	// One AU with more NAL units than an AU may hold.
+	flood := append([][]byte(nil), video.AUs[5].NALUs...)
+	for range 4100 {
+		flood = append(flood, []byte{0x06, 0x80})
+	}
+	video.AUs[5].NALUs = flood
+	med[0] = video
+	s := newRTSPServer(t, rtsptest.ServerOptions{Media: med, Garbage: true, SendRTPInfo: true, Seed: 4})
+	r := rtspOpenT(t, s.URL("/stream"))
+	got := readRTSP(t, r, 60)
+	require.NoError(t, got.err)
+	st := r.Stats()
+	assert.GreaterOrEqual(t, st["oversize_aus"], uint64(1))
+	assert.Positive(t, st["unknown_channels"])
+	assert.Equal(t, uint64(3), st["server_requests"])
 }

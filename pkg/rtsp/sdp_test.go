@@ -164,3 +164,23 @@ func TestParseSDPAACFlagsAndSize(t *testing.T) {
 		t.Fatalf("%+v", d.Media[0])
 	}
 }
+
+// TestParseSDPErrorNoLeak checks that a syntax error does not carry the
+// parser's text, which may quote a server-echoed URL with credentials.
+func TestParseSDPErrorNoLeak(t *testing.T) {
+	for _, body := range []string{
+		"v=0\r\nz=rtsp://user:secret@cam/stream\r\n",
+		"v=0\r\no=- 0 0 IN IP4 rtsp://user:secret@cam\r\ns=x\r\nm=video 0 RTP/AVP rtsp://user:secret@cam\r\n",
+		"v=0\r\nq=rtsp://user:secret@cam/x\r\n",
+		sdpHead + "m=video user:secret@cam RTP/AVP 96\r\n",
+		sdpHead + "m=video 0 RTP/AVP 96\r\nc=IN IP4 x\r\nb=AS:rtsp-user:secret@cam\r\n",
+	} {
+		_, err := ParseSDP([]byte(body), "rtsp://cam/stream")
+		if err == nil {
+			t.Fatalf("%q: no error", body)
+		}
+		if msg := err.Error(); strings.Contains(msg, "secret") || !strings.HasPrefix(msg, "rtsp: parse sdp") {
+			t.Errorf("%q: error %q", body, msg)
+		}
+	}
+}

@@ -226,6 +226,27 @@ type target struct {
 	addr, url, user, pass string
 }
 
+// newTarget returns the address and the credential-free URL of an rtsp://
+// URL; the port defaults to 554.
+func newTarget(rawURL string) (target, error) {
+	clean, user, pass, err := StripUserinfo(rawURL)
+	if err != nil {
+		return target{}, errors.New("rtsp: dial: invalid URL")
+	}
+	u, err := url.Parse(clean)
+	if err != nil || u.Host == "" {
+		return target{}, errors.New("rtsp: dial: invalid URL")
+	}
+	if !strings.EqualFold(u.Scheme, "rtsp") {
+		return target{}, errors.New("rtsp: dial: unsupported scheme")
+	}
+	port := u.Port()
+	if port == "" {
+		port = defaultPort
+	}
+	return target{addr: net.JoinHostPort(u.Hostname(), port), url: clean, user: user, pass: pass}, nil
+}
+
 // Dial connects to an rtsp:// URL and starts playing: OPTIONS, DESCRIBE,
 // SETUP for every supported media and PLAY. Userinfo in the URL is used for
 // authentication and removed from everything sent or stored. ctx bounds only
@@ -237,22 +258,10 @@ func Dial(ctx context.Context, rawURL string, cfg Config) (*Client, error) {
 	default:
 		return nil, errors.New("rtsp: dial: unknown transport")
 	}
-	clean, user, pass, err := StripUserinfo(rawURL)
+	tg, err := newTarget(rawURL)
 	if err != nil {
-		return nil, errors.New("rtsp: dial: invalid URL")
+		return nil, err
 	}
-	u, err := url.Parse(clean)
-	if err != nil || u.Host == "" {
-		return nil, errors.New("rtsp: dial: invalid URL")
-	}
-	if !strings.EqualFold(u.Scheme, "rtsp") {
-		return nil, errors.New("rtsp: dial: unsupported scheme")
-	}
-	port := u.Port()
-	if port == "" {
-		port = defaultPort
-	}
-	tg := target{addr: net.JoinHostPort(u.Hostname(), port), url: clean, user: user, pass: pass}
 	if cfg.Transport == "auto" {
 		return dialAuto(ctx, cfg, tg)
 	}

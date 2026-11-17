@@ -93,7 +93,8 @@ type SPS struct {
 	ReorderFrames int
 	// FrameDuration is the frame duration in 90 kHz units from the VUI timing
 	// information, rounded to the nearest unit (H.264: 2·num_units_in_tick /
-	// time_scale; H.265: num_units_in_tick / time_scale); 0 when absent.
+	// time_scale; H.265: num_units_in_tick / time_scale); 0 when absent or
+	// above 10 s.
 	FrameDuration int64
 }
 
@@ -461,12 +462,17 @@ func hrd264(r *bitReader) {
 }
 
 // frameDuration converts a tick of num/scale seconds to 90 kHz, rounded; 0
-// when either value is zero.
+// when either value is zero or the duration is above 10 s (absurd timing
+// is treated as absent).
 func frameDuration(num int64, scale uint32) int64 {
 	if num <= 0 || scale == 0 {
 		return 0
 	}
-	return (num*90000 + int64(scale)/2) / int64(scale)
+	d := (num*90000 + int64(scale)/2) / int64(scale)
+	if d > maxFrameDuration {
+		return 0
+	}
+	return d
 }
 
 // parseSPS265 parses seq_parameter_set_rbsp (H.265 §7.3.2.2.1) through the

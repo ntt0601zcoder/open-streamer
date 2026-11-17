@@ -91,13 +91,45 @@ func TestAACFragmented(t *testing.T) {
 	assert.Equal(t, uint32(900), out[0].Timestamp)
 	assert.False(t, out[0].Lost)
 
-	// a lost tail: the fragment is dropped on Gap and the next AU is Lost.
+	// a lost tail: the fragment is dropped on Gap; the next AU is complete,
+	// hence self-delimiting and not Lost.
 	out = d.Push(pkt(4, 2000, false, append(hdr(100), frame[:40]...)), testT0)
 	d.Gap()
 	out = append(out, d.Push(pkt(6, 3024, true, rawAAC(frameOf(9, 1))), testT0)...)
 	require.Len(t, out, 1)
-	assert.True(t, out[0].Lost)
+	assert.False(t, out[0].Lost)
 	assert.Equal(t, frameOf(9, 1), out[0].Frames[0])
+}
+
+// TestAACGapMarksPartialOnly checks that after a Gap only an AU started by
+// a partial fragment is Lost (its head may be missing); complete AUs are
+// self-delimiting.
+func TestAACGapMarksPartialOnly(t *testing.T) {
+	d, err := NewDepacketizer(aacMedia(hbr([]byte{0x11, 0x90}), 48000), 1<<20)
+	require.NoError(t, err)
+	frame := frameOf(100, 7)
+	hdr := func(size int) []byte { v := size << 3; return []byte{0, 16, byte(v >> 8), byte(v)} }
+
+	d.Gap()
+	out := d.Push(pkt(3, 1000, true, rawAAC(frameOf(9, 1), frameOf(9, 2))), testT0)
+	require.Len(t, out, 2)
+	assert.False(t, out[0].Lost, "complete AUs after a gap are intact")
+	assert.False(t, out[1].Lost)
+
+	d.Gap()
+	assert.Empty(t, d.Push(pkt(5, 3048, false, append(hdr(100), frame[40:80]...)), testT0))
+	out = d.Push(pkt(6, 3048, true, append(hdr(100), frame[80:]...)), testT0)
+	assert.Empty(t, out, "a fragment shorter than its header cannot complete from the middle")
+	out = d.Push(pkt(7, 4072, true, rawAAC(frameOf(9, 3))), testT0)
+	require.Len(t, out, 1)
+	assert.True(t, out[0].Lost, "the AU after a partial start carries the loss mark")
+
+	d.Gap()
+	out = d.Push(pkt(9, 6000, false, append(hdr(100), frame[:40]...)), testT0)
+	out = append(out, d.Push(pkt(10, 6000, false, append(hdr(100), frame[40:80]...)), testT0)...)
+	out = append(out, d.Push(pkt(11, 6000, true, append(hdr(100), frame[80:]...)), testT0)...)
+	require.Len(t, out, 1)
+	assert.True(t, out[0].Lost, "a partial start after a gap may lack its head")
 }
 
 func TestAACInterleavedDropped(t *testing.T) {

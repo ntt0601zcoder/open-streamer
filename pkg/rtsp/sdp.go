@@ -82,7 +82,9 @@ func ParseSDP(body []byte, base string) (Description, error) {
 	}
 	var sd sdp.SessionDescription
 	if err := sd.Unmarshal(body); err != nil {
-		return Description{}, fmt.Errorf("rtsp: parse sdp: %w", err)
+		// The parser's text may quote server-echoed values, such as a URL
+		// with credentials: it is not passed on.
+		return Description{}, errors.New("rtsp: parse sdp: invalid syntax")
 	}
 	d := Description{Control: ResolveControl(base, attr(sd.Attributes, "control"))}
 	for i, md := range sd.MediaDescriptions {

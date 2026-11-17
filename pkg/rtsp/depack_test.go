@@ -555,3 +555,57 @@ func TestSeqTracker(t *testing.T) {
 	assert.False(t, dup)
 	assert.Equal(t, 0, gap)
 }
+
+// TestDepackNALFlood sends aggregation packets full of tiny NAL units: the
+// AU bound must count a per-NAL overhead and the NAL count, so the flood
+// is dropped as oversize with the pending AU kept small.
+func TestDepackNALFlood(t *testing.T) {
+	for _, tc := range []struct {
+		codec Codec
+		head  []byte // aggregation packet header
+		nal   []byte // one tiny NAL unit
+		slice []byte
+	}{
+		{CodecH264, []byte{24}, []byte{6}, nal264(5, 20)},
+		{CodecH265, []byte{48 << 1, 1}, []byte{39 << 1, 1}, h265nal(19, 20)},
+	} {
+		d, err := NewDepacketizer(videoMedia(tc.codec), 0)
+		require.NoError(t, err)
+		pl := append([]byte(nil), tc.head...)
+		for len(pl)+2+len(tc.nal) <= 65000 {
+			pl = append(pl, 0, byte(len(tc.nal)))
+			pl = append(pl, tc.nal...)
+		}
+		var asm *assembler
+		switch dd := d.(type) {
+		case *h264Depack:
+			asm = dd.asm
+		case *h265Depack:
+			asm = dd.asm
+		}
+		require.NotNil(t, asm)
+		d.Push(pkt(0, 1, false, tc.slice), testT0)
+		for i := 1; i <= 380; i++ {
+			d.Push(pkt(uint16(i), 1, false, pl), testT0)
+			require.LessOrEqual(t, len(asm.nalus), maxNALsPerAU, "codec %d", tc.codec)
+		}
+		out := d.Push(pkt(381, 2, true, tc.slice), testT0)
+		assert.Empty(t, out, "codec %d: the flooded AU is dropped", tc.codec)
+		assert.Equal(t, uint64(1), d.(OversizeCounter).Oversize(), "codec %d", tc.codec)
+		out = d.Flush()
+		require.Len(t, out, 1, "codec %d: the next AU passes", tc.codec)
+	}
+
+	// The per-NAL overhead counts against the byte bound too.
+	d, err := NewDepacketizer(videoMedia(CodecH264), 1000)
+	require.NoError(t, err)
+	pl := make([]byte, 1, 121)
+	pl[0] = 24
+	for range 40 { // 40 × (2+1) wire bytes, 40 × (1+32) accounted
+		pl = append(pl, 0, 1, 6)
+	}
+	d.Push(pkt(1, 1, false, pl), testT0)
+	d.Push(pkt(2, 1, false, nal264(5, 20)), testT0)
+	assert.Empty(t, d.Push(pkt(3, 2, true, nal264(5, 20)), testT0))
+	assert.Equal(t, uint64(1), d.(OversizeCounter).Oversize())
+}

@@ -473,8 +473,8 @@ func (r *rtspPull) Spec() Spec { return r.spec }
 
 // Stats implements Reader: the rtpFrames counters, the packet counters
 // (loss is counted here, from the sequence numbers, and nowhere else), the
-// client's, and one skipped_track_<index>_<reason> per media that is not
-// converted.
+// client's, the AUs the depacketizers dropped for size (oversize_aus), and
+// one skipped_track_<index>_<reason> per media that is not converted.
 func (r *rtspPull) Stats() map[string]uint64 {
 	out := r.frames.stats()
 	cs := r.cl.Stats()
@@ -489,6 +489,18 @@ func (r *rtspPull) Stats() map[string]uint64 {
 	out["fallback_tcp"] = cs.FallbackTCP
 	out["reauth"] = cs.Reauth
 	out["resyncs"] = cs.Resyncs
+	out["unknown_channels"] = cs.UnknownChannels
+	out["server_requests"] = cs.ServerRequests
+	var oversize uint64
+	for _, t := range r.tracks {
+		if t == nil {
+			continue
+		}
+		if oc, ok := t.dep.(rtsp.OversizeCounter); ok {
+			oversize += oc.Oversize()
+		}
+	}
+	out["oversize_aus"] = oversize
 	out["skipped_tracks"] = uint64(len(r.skipped))
 	for k, v := range r.skipped {
 		out[k] = v

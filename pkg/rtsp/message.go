@@ -386,6 +386,15 @@ func parseRange(v string, max int, single func(int) [2]int) ([2]int, error) {
 	return [2]int{x, y}, nil
 }
 
+// singlePort returns the RTP/RTCP pair of a single server port x: x and
+// x+1, or x alone when there is no next port (or x is 0, "none").
+func singlePort(x int) [2]int {
+	if x == 0 || x == 65535 {
+		return [2]int{x, x}
+	}
+	return [2]int{x, x + 1}
+}
+
 // ParseTransport parses the first entry of a Transport header value.
 func ParseTransport(v string) (Transport, error) {
 	first, _, _ := strings.Cut(v, ",")
@@ -408,7 +417,9 @@ func ParseTransport(v string) (Transport, error) {
 		case "client_port":
 			t.ClientPort, err = parseRange(val, 65535, func(x int) [2]int { return [2]int{x, x} })
 		case "server_port":
-			t.ServerPort, err = parseRange(val, 65535, func(x int) [2]int { return [2]int{x, x} })
+			// A single server port means RTCP on the next one, as for
+			// interleaved channels (RFC 2326 12.39).
+			t.ServerPort, err = parseRange(val, 65535, singlePort)
 		case "source":
 			t.Source = val
 		case "ssrc":

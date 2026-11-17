@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// ErrNotUDP reports that the server answered a UDP SETUP with a transport
+// other than UDP, such as TCP interleaved.
+var ErrNotUDP = errors.New("rtsp: setup: server did not choose UDP")
+
 // pairAttempts bounds the tries to bind an even/odd UDP port pair.
 const pairAttempts = 64
 
@@ -125,14 +129,11 @@ func (c *Client) setupUDP(ctx context.Context, m Media) error {
 		return fmt.Errorf("rtsp: setup: %w", err)
 	}
 	if p := strings.ToUpper(rt.Protocol); p != "RTP/AVP" && p != "RTP/AVP/UDP" || rt.Interleaved != [2]int{} {
-		return errors.New("rtsp: setup: server did not choose UDP")
+		return ErrNotUDP
 	}
 	link := &udpLink{rtp: rtpC, rtcp: rtcpC, srvIP: remote.IP, srvPorts: rt.ServerPort}
 	if ip := net.ParseIP(rt.Source); ip != nil {
 		link.srvIP = ip
-	}
-	if link.srvPorts[1] == 0 {
-		link.srvPorts[1] = link.srvPorts[0]
 	}
 	t := &clientTrack{index: m.Index, link: link}
 	c.tracks = append(c.tracks, t)
@@ -340,7 +341,8 @@ func (c *Client) awaitRTP(ctx context.Context, d time.Duration) bool {
 }
 
 // dialAuto plays over UDP and falls back to a new session over TCP when the
-// server refuses UDP (461) or no RTP arrives within UDPFallback.
+// server refuses UDP (any non-2xx SETUP status), answers it with another
+// transport (ErrNotUDP), or no RTP arrives within UDPFallback.
 func dialAuto(ctx context.Context, cfg Config, tg target) (*Client, error) {
 	c, err := dialSession(ctx, cfg, tg, true)
 	if err == nil {
@@ -352,7 +354,7 @@ func dialAuto(ctx context.Context, cfg Config, tg target) (*Client, error) {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("rtsp: dial: %w", ctx.Err())
 		}
-	} else if se := (*StatusError)(nil); !errors.As(err, &se) || se.Method != "SETUP" || se.Code != 461 {
+	} else if se := (*StatusError)(nil); !errors.Is(err, ErrNotUDP) && (!errors.As(err, &se) || se.Method != "SETUP") {
 		return nil, err
 	}
 	c, err = dialSession(ctx, cfg, tg, false)
