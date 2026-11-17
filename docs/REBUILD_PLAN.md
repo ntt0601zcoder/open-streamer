@@ -288,7 +288,15 @@ outputs follow M2's `pkg/rtmp` and `pkg/rtsp`.
 
 M3 runs in two parts: M3a ([plan](superpowers/plans/2026-11-11-m3a-hls-dash.md),
 done) serves HLS, DASH and HTTP-TS; M3b (RTMP play and push, RTSP server, SRT
-output) follows M2b and M2c. M2 is split in three parts:
+output) follows M2b and M2c. M3b is split in three parts:
+
+| Part | Contents |
+|---|---|
+| M3b1 ([plan](superpowers/plans/2026-11-17-m3b1-rtmp-out.md)) | `pkg/rtmp` server play and client publish, an RTMP listener shared by publish inputs and play outputs (players address a stream by its name, never by a publish key), the FLV muxer, RTMP play and RTMP push-out outputs, `osconform` for `rtmp://`, M2b's items carried to M3b |
+| M3b2 | `pkg/rtsp` server, RTP packetisers with parameter sets before keyframes, RTCP sender reports, the RTSP play output, `osconform` for `rtsp://` |
+| M3b3 | The SRT output, EXT-X-GAP (or per-track placeholders) for the R4/R9 rendition alignment, the VLC-class client check and the M3 row's remaining scenarios for every output; M3 done |
+
+M2 is split in three parts:
 
 | Part | Contents |
 |---|---|
@@ -381,6 +389,21 @@ Out of M2c:
 | Credentials in the URL path or query (`?user=&password=`) | Noted for M5's redaction work |
 | The RTSP server | M3b |
 | ONVIF | Outside M2c |
+
+### Backlog
+
+Items accepted for later, not yet placed in a milestone:
+
+- **Per-input RTSP sync mode** (`?sync=sr|initial`): `sr` (the default) keeps
+  M2c's confirmed sender-report rule; `initial` uses sender reports only for
+  the first alignment and then trusts the RTP clocks, for relays whose
+  arrival-based sender reports move with their publisher's pacing (a client
+  that joins MediaMTX while its publisher starts gets one discontinuity; the
+  e2e scenarios that pull from MediaMTX join after it settles, see
+  `TestM2cRTSPMediaMTXH264` and M3b1's `TestM3b1MediaMTXPull`).
+- **M2c leftovers:** an abandoned AAC fragment marks the next complete AU
+  lost; the sync threshold's reorder lead uses the SPS reorder depth rather
+  than the measured one.
 
 ### Carried from M1
 
