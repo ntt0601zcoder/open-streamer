@@ -338,6 +338,8 @@ func TestRTSPSyncBySR(t *testing.T) {
 		assert.Zero(t, r.Stats()["sync_corrected"])
 	})
 	t.Run("sender reports after the wait", func(t *testing.T) {
+		// SR rounds every 500 ms: a correction needs two fresh pairs (1 s),
+		// inside the 80 video frames (3.2 s) read.
 		setRTSPSyncWait(t, 0)
 		s := newRTSPServer(t, rtsptest.ServerOptions{SRAfter: 500 * time.Millisecond, Seed: 5})
 		r := rtspOpenT(t, s.URL("/stream"))
@@ -357,13 +359,22 @@ func TestRTSPSyncBySR(t *testing.T) {
 		require.LessOrEqual(t, spread(v, a), spa, "aligned after the first SR")
 	})
 	t.Run("an SR that jumps by 5 s", func(t *testing.T) {
+		// SR rounds every 150 ms: the first places the tracks, the second
+		// (the jump) is a candidate, the third confirms it, about 450 ms
+		// after PLAY, well inside the 60 video frames (2.4 s) read.
+		const period = 150 * time.Millisecond
 		setRTSPSyncWait(t, time.Second)
-		s := newRTSPServer(t, rtsptest.ServerOptions{SRAfter: 150 * time.Millisecond, SRJump: 5 * time.Second, Seed: 6})
+		s := newRTSPServer(t, rtsptest.ServerOptions{SRAfter: period, SRJump: 5 * time.Second, Seed: 6})
 		r := rtspOpenT(t, s.URL("/stream"))
 		got := readRTSP(t, r, 60)
 		require.NoError(t, got.err)
-		assert.Len(t, got.breaks, 1)
-		assert.Equal(t, uint64(1), r.Stats()["sync_jumps"])
+		require.Len(t, got.breaks, 1)
+		st := r.Stats()
+		assert.Equal(t, uint64(1), st["sync_jumps"])
+		assert.Zero(t, st["sync_unconfirmed"])
+		require.Less(t, got.breaks[0], len(got.frames))
+		at := got.frames[got.breaks[0]].Arrival.Sub(got.frames[0].Arrival)
+		assert.GreaterOrEqual(t, at, 2*period-50*time.Millisecond, "the jump applies once a second fresh pair confirms it")
 	})
 }
 

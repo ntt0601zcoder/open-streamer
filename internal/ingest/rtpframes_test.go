@@ -180,9 +180,6 @@ func rtpInfo(srcs []*rtpSrc, pts int64) []rtsp.RTPInfo {
 // srcArrival stamps a source frame at its decode time after rtpT0.
 func srcArrival(f media.Frame) time.Time { return rtpT0.Add(media.ToDuration(f.DTS)) }
 
-// ptsArrival stamps a source frame at its presentation time after rtpT0.
-func ptsArrival(f media.Frame) time.Time { return rtpT0.Add(media.ToDuration(f.PTS)) }
-
 // rtpRun pushes AUs and returns the frames and the indexes in out at which a
 // discontinuity was reported (the frame at that index is the first after it).
 func rtpRun(t *testing.T, r *rtpFrames, aus []rtsp.AU) (out []Frame, breaks []int) {
@@ -364,16 +361,9 @@ func TestRTPFramesSync(t *testing.T) {
 	}
 	run := func(t *testing.T, srcs []*rtpSrc, desc rtsp.Description, prep func([]rtsp.AU) []rtsp.AU, steps []step) (*rtpFrames, []Frame, []int) {
 		t.Helper()
-		// Video is sent in decode order, at its DTS plus the first frame's
-		// composition offset, so that placing a track by arrival at its
-		// first AU is exact; audio at its PTS.
-		lead := srcs[0].frames[0].PTS - srcs[0].frames[0].DTS
-		aus := rtpAUs(t, srcs, func(f media.Frame) time.Time {
-			if f.Kind() == media.KindVideo {
-				return rtpT0.Add(media.ToDuration(f.DTS + lead))
-			}
-			return ptsArrival(f)
-		})
+		// Video is sent in decode order at its DTS, audio at its PTS: a
+		// track placed by arrival is then exact.
+		aus := rtpAUs(t, srcs, srcArrival)
 		if prep != nil {
 			aus = prep(aus)
 		}
@@ -429,13 +419,18 @@ func TestRTPFramesSync(t *testing.T) {
 
 	t.Run("SR 200 ms off, drift, jump", func(t *testing.T) {
 		srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(7, 8)))
-		// Audio SR first: it pairs when the reference's SR arrives.
+		// Audio SR first: the pair is fresh when the reference's SR
+		// arrives. Each change needs a second fresh pair to confirm it
+		// (thresholds 130 ms, then 180 ms, with the 80 ms reorder lead).
 		r, out, breaks := run(t, srcs, desc, nil, []step{
 			{at: 60, srcs: []int{1}, skew: []time.Duration{200 * ms}, want: false},
-			{at: 80, srcs: []int{0}, skew: []time.Duration{0}, want: true},
+			{at: 80, srcs: []int{0}, skew: []time.Duration{0}, want: false},
+			{at: 100, srcs: []int{0}, skew: []time.Duration{0}, want: false}, // stale: audio not updated
+			{at: 110, srcs: []int{1, 0}, skew: []time.Duration{210 * ms, 0}, want: true},
 			{at: 120, srcs: []int{1, 0}, skew: []time.Duration{230 * ms, 0}, want: false},
-			{at: 200, srcs: []int{1}, skew: []time.Duration{5200 * ms}, want: true},
-			{at: 240, srcs: []int{1}, skew: []time.Duration{5170 * ms}, want: false},
+			{at: 200, srcs: []int{1, 0}, skew: []time.Duration{5200 * ms, 0}, want: false},
+			{at: 220, srcs: []int{1, 0}, skew: []time.Duration{5210 * ms, 0}, want: true},
+			{at: 240, srcs: []int{1, 0}, skew: []time.Duration{5170 * ms, 0}, want: false},
 		})
 		require.Len(t, breaks, 2)
 		gotV, gotA := byTrack(out, 0), byTrack(out, 1)
@@ -461,15 +456,16 @@ func TestRTPFramesSync(t *testing.T) {
 			want := v[0]
 			switch {
 			case k >= b2:
-				want += tick(5200 * ms)
+				want += tick(5210 * ms)
 			case k >= b1:
-				want += tick(200 * ms)
+				want += tick(210 * ms)
 			}
 			require.InDelta(t, want, s, 2, "audio %d", k)
 		}
 		st := r.stats()
 		assert.Equal(t, uint64(1), st["sync_corrected"])
 		assert.Equal(t, uint64(1), st["sync_jumps"])
+		assert.Zero(t, st["sync_unconfirmed"])
 		rtpClock(t, r.kinds(), out, breaks)
 	})
 
@@ -545,13 +541,69 @@ func TestRTPFramesSync(t *testing.T) {
 		rtpClock(t, r.kinds(), out, breaks)
 	})
 
+	t.Run("noisy SRs", func(t *testing.T) {
+		srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(39, 40)))
+		// Video with B frames (R 2, 40 ms frames). The video SRs map RTP to
+		// NTP with up to ±150 ms of jitter, as SRs built from arrival do;
+		// the audio SRs are exact. Six rounds.
+		rng := rand.New(rand.NewPCG(41, 42))
+		steps := make([]step, 0, 6)
+		for k := range 6 {
+			j := time.Duration(rng.IntN(301)-150) * ms
+			if k < 2 {
+				j = []time.Duration{150 * ms, -150 * ms}[k] // the extremes, opposite sides
+			}
+			steps = append(steps, step{at: 30 + 30*k, srcs: []int{0, 1}, skew: []time.Duration{j, 0}, want: false})
+		}
+		r, out, breaks := run(t, srcs, desc, nil, steps)
+		require.Empty(t, breaks)
+		v := shiftOf(byTrack(out, 0), srcs[0].frames)[0]
+		for k, s := range shiftOf(byTrack(out, 1), srcs[1].frames) {
+			require.InDelta(t, v, s, 1, "audio %d keeps its offset", k)
+		}
+		st := r.stats()
+		assert.Zero(t, st["sync_corrected"])
+		assert.Zero(t, st["sync_jumps"])
+		// +150 ms is a candidate, −150 ms replaces it (beyond, other side),
+		// and the next pair, within the threshold, drops that one.
+		assert.Equal(t, uint64(2), st["sync_unconfirmed"])
+	})
+
+	t.Run("stale pairs are not evaluated", func(t *testing.T) {
+		srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(43, 44)))
+		off := []time.Duration{0, 300 * ms}
+		jump := []time.Duration{0, 5300 * ms}
+		r, _, breaks := run(t, srcs, desc, nil, []step{
+			{at: 40, srcs: []int{0, 1}, skew: off, want: false}, // a candidate
+			// Only the reference is fresh: no evaluation, so no confirmation.
+			{at: 50, srcs: []int{0}, skew: off[:1], want: false},
+			{at: 60, srcs: []int{0}, skew: off[:1], want: false},
+			// The audio SR makes the pair fresh: the candidate is confirmed.
+			{at: 70, srcs: []int{1}, skew: off[1:], want: true},
+			// A 5 s jump on audio only: the reference is stale, so the
+			// audio SRs are not evaluated.
+			{at: 80, srcs: []int{1}, skew: jump[1:], want: false},
+			{at: 90, srcs: []int{1}, skew: jump[1:], want: false},
+			// The reference's SR makes one fresh pair (a candidate), the
+			// next both-fresh pair confirms it.
+			{at: 100, srcs: []int{0}, skew: jump[:1], want: false},
+			{at: 110, srcs: []int{0, 1}, skew: jump, want: true},
+		})
+		require.Len(t, breaks, 2)
+		st := r.stats()
+		assert.Equal(t, uint64(1), st["sync_jumps"])
+		assert.Equal(t, uint64(1), st["sync_corrected"])
+		assert.Zero(t, st["sync_unconfirmed"])
+	})
+
 	t.Run("HE-AAC at the SBR clock", func(t *testing.T) {
 		srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(11, 12)))
 		heAACSource(srcs, srcs[0].frames[len(srcs[0].frames)-1].PTS)
 		desc.Media[1] = srcs[1].m
 		r, out, breaks := run(t, srcs, desc, nil, []step{
 			{at: 80, srcs: []int{0, 1}, skew: []time.Duration{0, -40 * ms}, want: false},
-			{at: 160, srcs: []int{1}, skew: []time.Duration{-150 * ms}, want: true},
+			{at: 140, srcs: []int{0, 1}, skew: []time.Duration{0, -250 * ms}, want: false},
+			{at: 160, srcs: []int{0, 1}, skew: []time.Duration{0, -250 * ms}, want: true},
 		})
 		require.Len(t, breaks, 1)
 		gotA := byTrack(out, 1)
@@ -559,15 +611,45 @@ func TestRTPFramesSync(t *testing.T) {
 		for k := 1; k < len(gotA); k++ {
 			d := gotA[k].PTS - gotA[k-1].PTS
 			if d != 3840 {
-				require.Equal(t, int64(3840-tick(150*ms)), d, "audio %d: only at the jump", k)
+				require.Equal(t, int64(3840-tick(250*ms)), d, "audio %d: only at the jump", k)
 			}
 		}
 		v := shiftOf(byTrack(out, 0), srcs[0].frames)[0]
 		a := shiftOf(gotA, srcs[1].frames)
 		require.InDelta(t, v, a[0], 1)
-		require.InDelta(t, v-tick(150*ms), a[len(a)-1], 1)
+		require.InDelta(t, v-tick(250*ms), a[len(a)-1], 1)
 		assert.Equal(t, uint64(1), r.stats()["sync_jumps"])
 	})
+}
+
+func TestRTPFramesArrivalPlacement(t *testing.T) {
+	// B-frame video and audio, sent interleaved in decode order (video at
+	// its DTS, audio at its PTS), without RTP-Info or SRs: placing by the
+	// video DTS starts the tracks within one audio frame plus 10 ms.
+	for i, name := range []string{"h264_aac.ts", "h264_pyramid.ts"} {
+		t.Run(name, func(t *testing.T) {
+			srcs, desc := rtpFixture(t, name, false, true, rand.New(rand.NewPCG(uint64(45+i), 46)))
+			// The video joins at its second keyframe, so the audio track is
+			// placed first and the video is placed against it.
+			v := srcs[0]
+			second := slices.IndexFunc(v.frames[1:], func(f media.Frame) bool { return f.Key }) + 1
+			require.Positive(t, second)
+			v.frames = v.frames[second:]
+			r := newRTPFrames(desc, nil, &media.ConfigCache{})
+			out, breaks := rtpRun(t, r, rtpAUs(t, srcs, srcArrival))
+			require.Empty(t, breaks)
+			gotV, gotA := byTrack(out, 0), byTrack(out, 1)
+			require.Len(t, gotV, len(srcs[0].frames))
+			require.Len(t, gotA, len(srcs[1].frames))
+			require.Equal(t, 1, out[0].Track, "audio first")
+			vs := shiftOf(gotV, srcs[0].frames)
+			a := shiftOf(gotA, srcs[1].frames)
+			bound := media.SampleTime(1024, int(srcs[1].m.ClockRate)) + media.FromDuration(10*time.Millisecond)
+			assert.LessOrEqual(t, absInt(a[0]-vs[0]), bound)
+			assert.Equal(t, uint64(2), r.stats()["sync_by_arrival"])
+			rtpClock(t, r.kinds(), out, breaks)
+		})
+	}
 }
 
 func TestRTPFramesRestart(t *testing.T) {
