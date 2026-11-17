@@ -350,7 +350,8 @@ change; `pkg/h26x`'s DTS equals ffmpeg's minus one constant on the fixtures;
 the TS demuxer recovers reordered access units packed in one PES. The
 `TestM2c` scenarios in `internal/e2e` prove them (CI runs a second MediaMTX
 on the host network for RTSP, so that UDP works), with `pkg/h26x`'s DTS
-tests against ffmpeg for the DTS criterion. MediaMTX sends no RTP-Info and
+tests against ffmpeg for the DTS criterion. MediaMTX's RTP-Info carries
+`rtptime` over UDP but only URLs over TCP, it
 builds its sender reports from packet arrival, and video with B-frames has RTP
 timestamps that lead their arrival by the reorder depth. The RTSP input
 therefore places video by DTS on arrival, evaluates sender-report offsets only
