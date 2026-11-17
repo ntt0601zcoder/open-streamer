@@ -19,11 +19,15 @@ const (
 	// beyond which a track's timeline is taken as broken.
 	rtpMaxJump = 10
 	// rtpFirstSRTolerance is how far the first sender-report offset of a
-	// track may be from its provisional offset and still keep it: 50 ms.
+	// track may be from its provisional offset and still keep it: 50 ms,
+	// plus the reference's reorder lead.
 	rtpFirstSRTolerance = media.ClockRate / 20
-	// rtpSRMove is how far a later sender report must move a track's offset
-	// for it to change: 100 ms.
+	// rtpSRMove is how far later sender reports must move a track's offset
+	// for it to change: 100 ms, plus the reference's reorder lead.
 	rtpSRMove = media.ClockRate / 10
+	// rtpDefaultFrameDur is the frame duration assumed for the reorder lead
+	// when the SPS has no timing, as h26x.DTSExtractor assumes.
+	rtpDefaultFrameDur = 3000
 	// aacFrameSamples is the samples of one AAC frame at the core rate.
 	aacFrameSamples = 1024
 	// rtpMaxMedia bounds the media indexes taken from a description, as
@@ -47,24 +51,38 @@ var ntpEpoch = time.Unix(-2208988800, 0)
 // frames. Offsets come, provisionally, from RTP-Info, when the PLAY response
 // gave an rtptime for every converted track (those instants coincide), or
 // else from arrival: a track without an offset is placed so that its first
-// AU's PTS sits where the latest AU of any track puts its arrival
-// (sync_by_arrival). Video PTS lead their arrival by up to the reorder
-// depth (R frames, about 100 ms), so a track placed against a video AU
-// inherits that lead until an SR corrects it. The reference track is the first video track, else
-// the first converted track; sender reports align every other track to it.
-// The first SR pair of a track (its own SR and the reference's) replaces a
-// provisional offset that differs by more than 50 ms (sync_corrected); after
-// that an SR moves the offset only by more than 100 ms (sync_jumps). A track
-// whose offset is still unknown when the pair is known takes the SR offset
-// directly; so does the reference, from another track's offset, when that
-// track was placed before the reference had an offset. Sender reports with
-// a zero NTP time are ignored (sr_ignored).
+// frame's DTS (an audio frame's PTS, a video frame's DTS from the
+// extractor) sits where the latest frame of any track puts its arrival
+// (sync_by_arrival); the anchor is that frame's arrival and DTS. Senders
+// send in decode order, so arrival follows the DTS, which video PTS lead by
+// up to the reorder depth. A video AU that yields no frame neither places
+// its track nor moves the anchor.
+//
+// Sender reports. The reference track is the first video track, else the
+// first converted track; sender reports align every other track to it. A
+// track's SR offset is evaluated only on a fresh pair: both the reference's
+// SR and its own were updated since its last evaluation. Senders such as
+// MediaMTX build SRs from packet arrival, so each pair carries the video
+// reorder lead as jitter (up to R frames). The thresholds are 50 ms for the
+// first evaluation after the track was placed provisionally and 100 ms
+// after that, each plus the lead: the reference's R times its frame
+// duration, 0 for an audio reference. A pair beyond the threshold is a
+// candidate; the offset changes only when the next fresh pair is beyond it
+// too, on the same side, and within the threshold of the candidate: then
+// the latest pair's offset applies (sync_corrected for the first change,
+// sync_jumps after), one discontinuity. A candidate the next fresh pair
+// does not confirm is counted (sync_unconfirmed). A track whose offset is
+// still unknown when a pair is known takes the SR offset directly; so does
+// the reference, from another track's offset, when that track was placed
+// before the reference had an offset. Sender reports with a zero NTP time
+// are ignored (sr_ignored).
 //
 // Timeline breaks. A track whose RTP timestamp steps by more than 10 s, an
-// audio track whose timestamp steps back (timeline_breaks), or a track that restart reports as restarted (a new
-// SSRC), drops its SR, has its DTS extractor reset and is placed again by
-// arrival; when it is the reference, every other track's next SR pair
-// counts as a first pair again. An audio AU with the timestamp of the
+// audio track whose timestamp steps back (timeline_breaks), or a track that
+// restart reports as restarted (a new SSRC), drops its SR and any pending
+// candidate, has its DTS extractor reset and is placed again by arrival;
+// when it is the reference, every other track's next SR evaluation counts
+// as a first one again. An audio AU with the timestamp of the
 // previous one is a duplicate: it is dropped (duplicate_aus). A DTSBreak
 // from the extractor (video stepping back past its bound, short of 10 s)
 // is a break too: the track drops its SR and is placed again by arrival,
@@ -94,10 +112,10 @@ type rtpFrames struct {
 	// skipReason says why a media index is not converted.
 	skipReason map[int]string
 
-	// The latest AU's arrival and session-timeline PTS, for placing a track
-	// by arrival.
+	// The latest frame's arrival and session-timeline DTS, for placing a
+	// track by arrival.
 	anchorWall time.Time
-	anchorPTS  int64
+	anchorDTS  int64
 	anchored   bool
 
 	n rtpCounters
@@ -105,7 +123,7 @@ type rtpFrames struct {
 
 type rtpCounters struct {
 	frames, lostAUs, noConfig, badAUs, unknownTrack, syncByArrival,
-	syncCorrected, syncJumps, srIgnored, timelineBreaks, restarts,
+	syncCorrected, syncJumps, syncUnconfirmed, srIgnored, timelineBreaks, restarts,
 	duplicates, reorderAssumed,
 	dtsLeading, dtsLate, dtsBreaks, dtsReorderRaised atomic.Uint64
 }
@@ -128,10 +146,16 @@ type rtpTrack struct {
 	// off maps the track's 90 kHz time onto the session timeline.
 	off    int64
 	hasOff bool
-	// sr is the latest sender report; paired tells whether the track's
-	// first SR pair was applied.
+	// sr is the latest sender report and srSeq counts them; paired tells
+	// whether the track's first SR evaluation is behind it.
 	sr     rtpSR
+	srSeq  uint64
 	paired bool
+	// evalOwn and evalRef are the track's and the reference's srSeq at the
+	// track's last SR evaluation; cand is a pending SR offset.
+	evalOwn, evalRef uint64
+	cand             int64
+	hasCand          bool
 	// live: a frame of this track went out since the last reported
 	// discontinuity.
 	live bool
@@ -344,6 +368,7 @@ func (r *rtpFrames) senderReport(track int, sr rtsp.SenderReport) (discontinuity
 		t.last, t.hasLast = ts, true
 	}
 	t.sr = rtpSR{ok: true, ntp: sr.NTP, rtp: ts}
+	t.srSeq++
 	if t != r.ref {
 		disc := r.alignSR(t)
 		return r.syncRef() || disc
@@ -361,31 +386,66 @@ func (r *rtpFrames) srOffset(t *rtpTrack) (int64, bool) {
 	return ref.off + ref.to90(ref.sr.rtp) - t.to90(t.sr.rtp) + media.FromDuration(t.sr.ntp.Sub(ref.sr.ntp)), true
 }
 
-// alignSR applies t's SR pair to its offset by the first-pair and later-SR
-// rules, and reports whether that is a discontinuity.
+// alignSR applies t's SR pair to its offset: a track without an offset
+// takes it; otherwise a fresh pair is evaluated by the confirmation rule
+// (see rtpFrames). It reports whether that is a discontinuity.
 func (r *rtpFrames) alignSR(t *rtpTrack) bool {
 	want, ok := r.srOffset(t)
 	if !ok {
 		return false
 	}
-	switch {
-	case !t.hasOff:
+	ref := r.ref
+	if !t.hasOff {
 		t.off, t.hasOff, t.paired = want, true, true
+		t.evalOwn, t.evalRef, t.hasCand = t.srSeq, ref.srSeq, false
 		return false
-	case !t.paired:
-		t.paired = true
-		if absInt(want-t.off) <= rtpFirstSRTolerance {
-			return false
-		}
-		t.off = want
-		r.n.syncCorrected.Add(1)
-		return r.report(t)
-	case absInt(want-t.off) > rtpSRMove:
-		t.off = want
-		r.n.syncJumps.Add(1)
-		return r.report(t)
 	}
-	return false
+	if t.srSeq == t.evalOwn || ref.srSeq == t.evalRef {
+		return false // a stale pair
+	}
+	t.evalOwn, t.evalRef = t.srSeq, ref.srSeq
+	thr := int64(rtpSRMove)
+	if !t.paired {
+		thr = rtpFirstSRTolerance
+	}
+	thr += r.lead()
+	d := want - t.off
+	if absInt(d) <= thr {
+		if t.hasCand {
+			r.n.syncUnconfirmed.Add(1)
+		}
+		t.hasCand, t.paired = false, true
+		return false
+	}
+	if !t.hasCand || (t.cand-t.off > 0) != (d > 0) || absInt(want-t.cand) > thr {
+		if t.hasCand {
+			r.n.syncUnconfirmed.Add(1)
+		}
+		t.cand, t.hasCand = want, true
+		return false
+	}
+	if t.paired {
+		r.n.syncJumps.Add(1)
+	} else {
+		r.n.syncCorrected.Add(1)
+	}
+	t.off, t.hasCand, t.paired = want, false, true
+	return r.report(t)
+}
+
+// lead is the reference's reorder lead in 90 kHz ticks: R frame durations,
+// the jitter that SRs built from video arrival carry. It is 0 for an audio
+// reference.
+func (r *rtpFrames) lead() int64 {
+	v := r.ref.v
+	if v == nil {
+		return 0
+	}
+	dur := v.frameDur
+	if dur <= 0 {
+		dur = rtpDefaultFrameDur
+	}
+	return int64(v.reorder) * dur
 }
 
 // alignOthers applies the SR pair of every track but the reference.
@@ -412,6 +472,7 @@ func (r *rtpFrames) syncRef() bool {
 		}
 		ref.off = o.off + o.to90(o.sr.rtp) - ref.to90(ref.sr.rtp) + media.FromDuration(ref.sr.ntp.Sub(o.sr.ntp))
 		ref.hasOff, o.paired = true, true
+		o.evalOwn, o.evalRef, o.hasCand = o.srSeq, ref.srSeq, false
 		return r.alignOthers()
 	}
 	return false
@@ -445,27 +506,28 @@ func (r *rtpFrames) breakTimeline(t *rtpTrack) {
 
 // unbind drops t's offset and SR, so that it is placed again.
 func (r *rtpFrames) unbind(t *rtpTrack) {
-	t.hasOff, t.sr, t.paired = false, rtpSR{}, false
+	t.hasOff, t.sr, t.paired, t.hasCand = false, rtpSR{}, false, false
 	if t == r.ref {
 		for _, o := range r.tracks {
 			if o != nil {
-				o.paired = false
+				o.paired, o.hasCand = false, false
 			}
 		}
 	}
 }
 
 // place gives t, which has no offset, one: from its SR pair when it can,
-// else by arrival. It reports whether that moved another track's offset
-// while that track had returned frames.
-func (r *rtpFrames) place(t *rtpTrack, ts int64, arrival time.Time) bool {
+// else by arrival, dts (track time, 90 kHz) being the DTS of its first
+// frame. It reports whether that moved another track's offset while that
+// track had returned frames.
+func (r *rtpFrames) place(t *rtpTrack, dts int64, arrival time.Time) bool {
 	if t != r.ref {
 		r.alignSR(t)
 	}
 	if !t.hasOff {
 		t.off = 0
 		if r.anchored {
-			t.off = r.anchorPTS + media.FromDuration(arrival.Sub(r.anchorWall)) - t.to90(ts)
+			t.off = r.anchorDTS + media.FromDuration(arrival.Sub(r.anchorWall)) - dts
 		}
 		t.hasOff = true
 		r.n.syncByArrival.Add(1)
@@ -512,12 +574,14 @@ func (r *rtpFrames) push(au rtsp.AU) (frames []Frame, discontinuity bool, err er
 	}
 	t.last, t.hasLast = ts, true
 	t.prevAU, t.hasPrevAU = ts, true
-	if !t.hasOff {
-		disc = r.place(t, ts, au.Arrival) || disc
-	}
 	pts := t.to90(ts)
+	if t.kind == media.KindAudio && !t.hasOff {
+		disc = r.place(t, pts, au.Arrival) || disc
+	}
 	if au.Lost {
-		r.setAnchor(au.Arrival, pts+t.off)
+		if t.kind == media.KindAudio {
+			r.setAnchor(au.Arrival, pts+t.off)
+		}
 		r.n.lostAUs.Add(1)
 		return nil, disc, nil
 	}
@@ -530,16 +594,21 @@ func (r *rtpFrames) push(au rtsp.AU) (frames []Frame, discontinuity bool, err er
 			// of the new timeline; the track is placed again by arrival.
 			disc = r.report(t) || disc
 			r.unbind(t)
-			disc = r.place(t, ts, au.Arrival) || disc
 		}
-		for i := range frames {
-			frames[i].PTS += t.off
-			frames[i].DTS += t.off
+		if len(frames) > 0 {
+			if !t.hasOff {
+				disc = r.place(t, frames[0].DTS, au.Arrival) || disc
+			}
+			for i := range frames {
+				frames[i].PTS += t.off
+				frames[i].DTS += t.off
+			}
+			r.setAnchor(au.Arrival, frames[0].DTS)
 		}
 	case media.KindAudio:
 		frames = r.audio(t, au, ts)
+		r.setAnchor(au.Arrival, pts+t.off)
 	}
-	r.setAnchor(au.Arrival, pts+t.off)
 	if err != nil {
 		r.n.badAUs.Add(1)
 		return nil, disc, err
@@ -551,8 +620,8 @@ func (r *rtpFrames) push(au rtsp.AU) (frames []Frame, discontinuity bool, err er
 	return frames, disc, nil
 }
 
-func (r *rtpFrames) setAnchor(wall time.Time, pts int64) {
-	r.anchorWall, r.anchorPTS, r.anchored = wall, pts, true
+func (r *rtpFrames) setAnchor(wall time.Time, dts int64) {
+	r.anchorWall, r.anchorDTS, r.anchored = wall, dts, true
 }
 
 func (r *rtpFrames) audio(t *rtpTrack, au rtsp.AU, ts int64) []Frame {
@@ -753,6 +822,7 @@ func (r *rtpFrames) stats() map[string]uint64 {
 		"sync_by_arrival":    r.n.syncByArrival.Load(),
 		"sync_corrected":     r.n.syncCorrected.Load(),
 		"sync_jumps":         r.n.syncJumps.Load(),
+		"sync_unconfirmed":   r.n.syncUnconfirmed.Load(),
 		"sr_ignored":         r.n.srIgnored.Load(),
 		"duplicate_aus":      r.n.duplicates.Load(),
 		"timeline_breaks":    r.n.timelineBreaks.Load(),
