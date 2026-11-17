@@ -42,7 +42,7 @@ import (
 // once its publisher's tracks are known, 2 to 2.5 s after it connects.
 const (
 	rtspReady = 8 * time.Second
-	spanH264  = 32 * time.Second
+	spanH264  = 34 * time.Second
 )
 
 // ffmpegRTSP returns ffmpeg once it is known to publish RTSP over TCP.
@@ -149,6 +149,21 @@ func checkRTSP(t *testing.T, r *m2aRun, wantEpochs ...uint32) {
 	r.check(t, wantEpochs)
 }
 
+// settleRTSP waits until the path at u answers DESCRIBE (a probe session that
+// is closed at once), then one second more.
+func settleRTSP(t *testing.T, u string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		r, err := ingest.Open(t.Context(), u, ingest.Env{})
+		if err != nil {
+			return false
+		}
+		_ = r.Close()
+		return true
+	}, rtspReady, 50*time.Millisecond, "path answers DESCRIBE")
+	time.Sleep(time.Second)
+}
+
 // mtxRTSP runs one MediaMTX row: ffmpeg publishes span of the fixture name
 // (looped as needed) into MediaMTX over TCP, and our RTSP pull plays it over
 // transport once the path is ready. It returns the run, the source's frame
@@ -166,6 +181,16 @@ func mtxRTSP(t *testing.T, name, transport string, span time.Duration) (r *m2aRu
 
 	f := rtspPublish(t, ffmpeg, clip, "rtsp://"+mtx+"/"+path)
 	started := time.Now()
+	// The reader joins after the relay's A/V mapping has settled. MediaMTX
+	// builds its sender reports from the arrival of the publisher's packets,
+	// and for about a second after the publish starts that mapping moves
+	// once, persistently: by 155 to 176 ms with ffmpeg 8 and by about 230 ms
+	// with ffmpeg 6.1, which ignores -readrate_initial_burst 0 and sends a
+	// 0.5 s burst. A reader that joins inside that window takes its first
+	// sender reports from before the move and, correctly, follows the move as
+	// one confirmed jump; no publisher flag avoids it. So wait until the path
+	// answers DESCRIBE, then one second more.
+	settleRTSP(t, "rtsp://"+mtx+"/"+path+"?transport="+transport)
 	ended := make(chan struct{})
 	rl = &readerLog{}
 	r = startRun(t, runOptions{
@@ -181,7 +206,7 @@ func mtxRTSP(t *testing.T, name, transport string, span time.Duration) (r *m2aRu
 }
 
 // TestM2cRTSPMediaMTXH264 has ffmpeg publish h264_pyramid.ts (a B-pyramid
-// with AAC), looped, into MediaMTX for 32 s, and plays it over TCP
+// with AAC), looped, into MediaMTX for 34 s, and plays it over TCP
 // interleaved: one epoch of clean frames (the default 40 ms start-offset
 // rule included), nothing lost over TCP, no offset jump, drift evaluated and
 // no drift epoch. MediaMTX sends sender reports every 10 s, so 32 s covers
