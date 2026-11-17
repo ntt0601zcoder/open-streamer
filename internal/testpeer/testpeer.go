@@ -21,6 +21,12 @@ const (
 	EnvRequireMediaMTX = "OS_REQUIRE_MEDIAMTX"
 )
 
+// EnvMediaMTXRTSP names the environment variable that holds the host:port of
+// a MediaMTX RTSP listener for tests. CI sets it to "127.0.0.1:18554"; that
+// MediaMTX runs on the host network, so that UDP transport works, with the
+// RTP and RTCP ports 18000 and 18001.
+const EnvMediaMTXRTSP = "OS_MEDIAMTX_RTSP"
+
 // Require returns the path of binary, which must support every listed
 // protocol (checked with "-hide_banner -protocols", so it applies to ffmpeg
 // and ffprobe). When the binary or a protocol is missing the test is skipped,
@@ -68,6 +74,46 @@ func MediaMTX(t testing.TB) (rtmpAddr string) {
 	}
 	t.Skipf("peer MediaMTX: %s is not set", EnvMediaMTX)
 	return ""
+}
+
+// MediaMTXRTSP returns the host:port of the MediaMTX RTSP listener named by
+// OS_MEDIAMTX_RTSP. When it is unset the test is skipped, or failed when
+// OS_REQUIRE_MEDIAMTX=1.
+func MediaMTXRTSP(t testing.TB) (rtspAddr string) {
+	t.Helper()
+	if addr := os.Getenv(EnvMediaMTXRTSP); addr != "" {
+		return addr
+	}
+	if os.Getenv(EnvRequireMediaMTX) == "1" {
+		t.Fatalf("peer MediaMTX: %s is not set", EnvMediaMTXRTSP)
+		return ""
+	}
+	t.Skipf("peer MediaMTX: %s is not set", EnvMediaMTXRTSP)
+	return ""
+}
+
+// RequireMuxer checks that binary (ffmpeg) lists the output format muxer
+// ("-hide_banner -muxers"). When it does not the test is skipped, or failed
+// when OS_REQUIRE_PEERS=1.
+func RequireMuxer(t testing.TB, binary, muxer string) {
+	t.Helper()
+	path, err := exec.LookPath(binary)
+	if err != nil {
+		missing(t, "peer %s not found: %v", binary, err)
+		return
+	}
+	out, err := exec.CommandContext(t.Context(), path, "-hide_banner", "-muxers").CombinedOutput()
+	if err != nil {
+		missing(t, "peer %s: listing muxers: %v", binary, err)
+		return
+	}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		// " E  rtsp            RTSP output": flags, then the name.
+		if f := strings.Fields(line); len(f) > 2 && strings.Contains(f[0], "E") && f[1] == muxer {
+			return
+		}
+	}
+	missing(t, "peer %s lacks muxer %s", binary, muxer)
 }
 
 func missing(t testing.TB, format string, args ...any) {

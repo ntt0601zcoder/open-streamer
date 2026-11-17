@@ -49,11 +49,31 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Check ffmpeg has SRT
         run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
+      # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
+      # network, so that RTSP over UDP works, on private ports (RTSP 18554,
+      # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
+      - name: Start MediaMTX for RTSP
+        run: |
+          docker run -d --rm --name osv2-mtx-m2c --network host \
+            -e MTX_RTSPADDRESS=:18554 -e MTX_RTPADDRESS=:18000 -e MTX_RTCPADDRESS=:18001 \
+            -e MTX_RTMP=no -e MTX_HLS=no -e MTX_WEBRTC=no -e MTX_SRT=no -e MTX_API=no \
+            -e MTX_METRICS=no -e MTX_PPROF=no -e MTX_PLAYBACK=no -e MTX_MOQ=no \
+            bluenviron/mediamtx:1.21.3
+          for _ in $(seq 50); do
+            nc -z 127.0.0.1 18554 && exit 0
+            sleep 0.2
+          done
+          docker logs osv2-mtx-m2c
+          exit 1
       - run: make test
         env:
           OS_REQUIRE_PEERS: "1"
           OS_MEDIAMTX_RTMP: 127.0.0.1:19350
+          OS_MEDIAMTX_RTSP: 127.0.0.1:18554
           OS_REQUIRE_MEDIAMTX: "1"
+      - name: Stop MediaMTX for RTSP
+        if: always()
+        run: docker stop osv2-mtx-m2c || true
 
   coverage:
     runs-on: ubuntu-latest
@@ -76,11 +96,31 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Check ffmpeg has SRT
         run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
+      # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
+      # network, so that RTSP over UDP works, on private ports (RTSP 18554,
+      # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
+      - name: Start MediaMTX for RTSP
+        run: |
+          docker run -d --rm --name osv2-mtx-m2c --network host \
+            -e MTX_RTSPADDRESS=:18554 -e MTX_RTPADDRESS=:18000 -e MTX_RTCPADDRESS=:18001 \
+            -e MTX_RTMP=no -e MTX_HLS=no -e MTX_WEBRTC=no -e MTX_SRT=no -e MTX_API=no \
+            -e MTX_METRICS=no -e MTX_PPROF=no -e MTX_PLAYBACK=no -e MTX_MOQ=no \
+            bluenviron/mediamtx:1.21.3
+          for _ in $(seq 50); do
+            nc -z 127.0.0.1 18554 && exit 0
+            sleep 0.2
+          done
+          docker logs osv2-mtx-m2c
+          exit 1
       - run: make cover covercheck
         env:
           OS_REQUIRE_PEERS: "1"
           OS_MEDIAMTX_RTMP: 127.0.0.1:19350
+          OS_MEDIAMTX_RTSP: 127.0.0.1:18554
           OS_REQUIRE_MEDIAMTX: "1"
+      - name: Stop MediaMTX for RTSP
+        if: always()
+        run: docker stop osv2-mtx-m2c || true
 
   govulncheck:
     runs-on: ubuntu-latest

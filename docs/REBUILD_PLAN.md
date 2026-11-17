@@ -215,7 +215,7 @@ never as dependencies.
 | Concern | Library |
 |---|---|
 | H.264, H.265, AAC parsing (SPS, PPS, VPS, ASC, ADTS); fMP4 boxes | `Eyevinn/mp4ff` |
-| RTP packets and H.264/H.265 packetisers; SDP | `pion/rtp`, `pion/sdp` |
+| RTP packets and H.264/H.265 packetisers; SDP | `pion/rtp`, `pion/sdp/v3`; used from M2c by `pkg/rtsp` (`pion/rtp` parses RTP everywhere; its payloaders only in tests and `rtsptest`) |
 | SRT | `datarhei/gosrt` (approved: a standalone library repository); used from M2a by the SRT caller and listener inputs |
 | Transcoding | `asticode/go-astiav` |
 | Transcoder protocol messages | `google.golang.org/protobuf` (M4) |
@@ -227,9 +227,9 @@ Our own libraries:
 |---|---|---|
 | `pkg/mpegts` | 33-bit timestamp unwrapping and ADTS parsing (M1); TS packet reader that resynchronises after loss or garbage, PAT/PMT with CRC and versions, PES assembly, and a TS writer (M3a). It replaces go-astits, whose behaviour on lossy and non-seekable input needed a workaround per case | M1, M3a |
 | `pkg/unwrap` | Timestamp unwrapping for any bit width: 32-bit RTMP milliseconds, 32-bit RTP | M2 (delivered in M2b) |
-| `pkg/h26x` | DTS from picture order count, for RTP sources, which carry PTS only | M2 |
+| `pkg/h26x` | Bounded bit reader and our own H.264/H.265 parameter-set and slice-header parsing (it does not use `mp4ff` for them); picture order counts; DTS from PTS and the reorder depth, for RTP sources, which carry PTS only (POC times the reordered access units packed in one PES in the TS demuxer) | M2 (delivered in M2c) |
 | `pkg/rtmp` | Handshake, chunk stream, client and server sessions, FLV tags, enhanced RTMP | M2 (ingest, delivered in M2b), M3 (play, push) |
-| `pkg/rtsp` | RTSP client and server, TCP interleaved and UDP, RFC 3640 AAC | M2 (client), M3 (server) |
+| `pkg/rtsp` | RTSP client and server, TCP interleaved and UDP, Basic and Digest authentication, RTCP, RFC 3640 AAC, and `rtsptest`, a scripted server for tests | M2 (client, delivered in M2c), M3 (server) |
 | `pkg/hls` | Media and multivariant playlist parsing and writing | M3 (first), used by M2's HLS pull |
 | `pkg/dash` | MPD writing (live, multi-period, SegmentTimeline) and parsing for `osconform` | M3 |
 
@@ -273,7 +273,7 @@ before the code they check.
 | | Milestone | Depends on | Exit criteria |
 |---|---|---|---|
 | M1 | Media core: Frame, TS demuxer, Clock, hub, frame checks, fixtures | – | Every fixture goes demux → Clock → hub with no check violation, including the PTS-wrap and looped-source fixtures |
-| M2 | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change remaps the demuxer's tracks as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
+| M2 (done) | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change remaps the demuxer's tracks as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
 | M3 | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg, VLC-class clients and MediaMTX play every output; for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it |
 | M4 | Transcoder, watermark, thumbnails | M1, M3 | In CI (no GPU, builder image restored): a 3-rung software ladder and passthrough pass M3's scenarios. On the GPU host: the same with 3 NVENC rungs, run by a make target and recorded in the PR; a killed subprocess comes back as one new epoch; the watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
@@ -294,7 +294,7 @@ output) follows M2b and M2c. M2 is split in three parts:
 |---|---|
 | M2a ([plan](superpowers/plans/2026-11-12-m2a-ts-inputs-failover.md), done) | TS-family inputs (file, UDP and RTP-wrapped UDP, SRT caller and listener, HTTP-TS pull), HLS pull (TS and fMP4 segments, separate audio rendition), `copy://`, failover and fail-back, TS demuxer completion, fMP4 demuxer, HE-AAC in the TS muxer's ADTS writer, the Clock's carried fixes, ingest CPU measurement |
 | M2b ([plan](superpowers/plans/2026-11-16-m2b-rtmp.md), done) | `pkg/unwrap`, `pkg/rtmp` (handshake, chunk stream, AMF0, server and client sessions, FLV, enhanced RTMP), RTMP push and pull inputs |
-| M2c | `pkg/h26x` (DTS from POC, which also fixes reordered access units packed in one PES), `pkg/rtsp` client (TCP interleaved and UDP, RFC 3640 AAC, `pion/rtp` depacketisers, `pion/sdp`), RTSP pull input |
+| M2c ([plan](superpowers/plans/2026-11-17-m2c-rtsp.md), done) | `pkg/h26x` (DTS from PTS and the reorder depth; POC also recovers reordered access units packed in one PES), `pkg/rtsp` client (TCP interleaved and UDP, Basic and Digest, RTCP, RFC 3640 AAC, `pion/rtp` depacketisers, `pion/sdp`), RTSP pull input |
 
 M2a's exit criteria are the M2 row's, for its inputs: each, fed by ffmpeg,
 produces violation-free frames; failover is exactly one epoch change; a PMT
@@ -315,7 +315,7 @@ Out of M2a:
 | Single-file fMP4 HLS | `EXT-X-MAP` with `BYTERANGE` |
 | A video-only mode when an HLS audio rendition stalls | The stall fails the whole input |
 | Changing a running pipeline's inputs in place | §3.6; M5's supervisor adds it |
-| Reordered access units packed in one PES | Dropped until M2c's `pkg/h26x` gives DTS from POC |
+| Reordered access units packed in one PES | Dropped until M2c's `pkg/h26x` gives their picture order counts (done in M2c) |
 | Dropping video to the next keyframe after a TS loss | Frames after the lost one pass through: decoders conceal, and a lossy feed would otherwise freeze |
 | A late join with an inter-track skew above the 2 s backward-jump limit | Loses one GOP once, at start-up |
 | Live-source epochs placed by the chain lead (R10) | Stay as ruled: bounded, and they do not accumulate |
@@ -341,6 +341,38 @@ Out of M2b:
 | AMF3 command encoding | Clients that ask for `objectEncoding` 3 are refused |
 | Publish authentication beyond an exact path match | M6 sessions and tokens |
 | Server play and client publish | M3b, on the same session core |
+
+M2c's exit criteria are the M2 row's, for RTSP: our RTSP client
+interoperates with MediaMTX over TCP and UDP, fed by ffmpeg; RTSP inputs
+produce violation-free frames for H.264 with B-pyramids, H.265 open GOP and
+AAC; failover between an RTSP input and an RTMP input is exactly one epoch
+change; `pkg/h26x`'s DTS equals ffmpeg's minus one constant on the fixtures;
+the TS demuxer recovers reordered access units packed in one PES. The
+`TestM2c` scenarios in `internal/e2e` prove them (CI runs a second MediaMTX
+on the host network for RTSP, so that UDP works), with `pkg/h26x`'s DTS
+tests against ffmpeg for the DTS criterion. Against MediaMTX the tracks
+align within 250 ms rather than 40 ms: it sends no RTP-Info and builds its
+sender reports from packet arrival, so that video with B-frames, whose RTP
+timestamps lead their arrival by the reorder depth, is placed that much off;
+its first sender report round, 10 s in, then moves an offset and opens a new
+epoch (`sync_jumps`).
+
+The M2 row's DTS ruling changed in M2c: DTS is derived from the PTS and the
+reorder depth, not from the picture order count (RTP carries the PTS, and the extractor
+follows the reorder depth); POC is used for the TS case of several access
+units in one PES, which has no per-unit timestamps.
+
+Out of M2c:
+
+| Item | Reason |
+|---|---|
+| RTSP 2.0; RTSPS and SRTP | TLS is M5, like RTMPS; `rtsps://` is rejected with a clear error |
+| UDP multicast transport; RTSP over HTTP tunnelling | Rare for pull |
+| MP4A-LATM, G.711, Opus, PCM | Outside §2's codec scope; such tracks are skipped with a reason |
+| H.264 packetization-mode 2; H.265 with `sprop-max-don-diff` above 0 | Interleaved, DON reordering; skipped with a reason |
+| Credentials in the URL path or query (`?user=&password=`) | Noted for M5's redaction work |
+| The RTSP server | M3b |
+| ONVIF | Outside M2c |
 
 ### Carried from M1
 

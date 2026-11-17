@@ -217,7 +217,7 @@ func publishTags(t *testing.T, url string, tags []rtmp.FLVTag) (done <-chan stru
 
 // assertCodecs checks that frames has both kinds, and that every frame of
 // each kind carries the codec.
-func assertCodecs(t *testing.T, frames []media.Frame, video, audio media.Codec) {
+func assertCodecs(t *testing.T, frames []media.Frame, video, audio media.Codec) { //nolint:unparam // every scenario carries AAC audio; the parameter names what is checked
 	t.Helper()
 	want := map[media.Kind]media.Codec{media.KindVideo: video, media.KindAudio: audio}
 	seen := map[media.Kind]bool{}

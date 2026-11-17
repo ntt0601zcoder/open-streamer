@@ -74,3 +74,49 @@ func TestMediaMTX(t *testing.T) {
 		})
 	}
 }
+
+func TestMediaMTXRTSP(t *testing.T) {
+	for _, tt := range []struct {
+		addr, require      string
+		wantSkip, wantFail bool
+	}{
+		{"", "", true, false},
+		{"", "1", false, true},
+		{"127.0.0.1:18554", "", false, false},
+		{"127.0.0.1:18554", "1", false, false},
+	} {
+		t.Run(fmt.Sprintf("%q/%q", tt.addr, tt.require), func(t *testing.T) {
+			t.Setenv(EnvMediaMTXRTSP, tt.addr)
+			t.Setenv(EnvRequireMediaMTX, tt.require)
+			rec := &recorder{TB: t}
+			got := MediaMTXRTSP(rec)
+			assert.Equal(t, tt.wantSkip, rec.skipped)
+			assert.Equal(t, tt.wantFail, rec.failed)
+			assert.Equal(t, tt.addr, got)
+		})
+	}
+}
+
+func TestRequireMuxer(t *testing.T) {
+	RequireMuxer(t, "ffmpeg", "mpegts") // every build has it
+
+	for _, tt := range []struct {
+		env, binary, muxer string
+		wantSkip, wantFail bool
+	}{
+		{"", "ffmpeg", "no-such-muxer", true, false},
+		{"1", "ffmpeg", "no-such-muxer", false, true},
+		{"", "no-such-binary-xyz", "rtsp", true, false},
+		{"1", "no-such-binary-xyz", "rtsp", false, true},
+		{"", "false", "rtsp", true, false}, // exits with an error
+		{"1", "false", "rtsp", false, true},
+	} {
+		t.Run(fmt.Sprintf("%s/%s/%s", tt.env, tt.binary, tt.muxer), func(t *testing.T) {
+			t.Setenv(EnvRequire, tt.env)
+			rec := &recorder{TB: t}
+			RequireMuxer(rec, tt.binary, tt.muxer)
+			assert.Equal(t, tt.wantSkip, rec.skipped)
+			assert.Equal(t, tt.wantFail, rec.failed)
+		})
+	}
+}
