@@ -76,6 +76,10 @@ Accept an RTMP publisher (OBS or ffmpeg):
   OBS: server rtmp://<host>:1935/live, stream key <stream-key>
   Set -layout to the tracks the publisher sends (e.g. -layout audio), and
   use a long random stream key: it is the only gate on who may publish.
+
+Pull from an IP camera or an RTSP server (TCP by default; UDP and auto
+with ?transport=udp or ?transport=auto; the port defaults to 554):
+  osdev -stream cam=rtsp://user:pass@<host>/<path>
 `
 
 // streamFlags collects repeated -stream name=path values.
