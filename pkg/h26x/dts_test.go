@@ -473,3 +473,31 @@ func TestDTSReset(t *testing.T) {
 	assert.Equal(t, int64(7200), dts)
 	assert.Equal(t, DTSStats{Leading: 2}, d.Stats())
 }
+
+// TestDTSAbsurdFrameDuration checks that a frame duration that is not
+// positive or above 10 s is taken as unknown: it would otherwise widen the
+// break threshold until no backward jump is ever a break.
+func TestDTSAbsurdFrameDuration(t *testing.T) {
+	for _, dur := range []int64{-5, 0, maxFrameDuration + 1, 1 << 40} {
+		d := NewDTSExtractor(0, dur)
+		_, st := d.Extract(1_000_000, true)
+		require.Equal(t, DTSOK, st)
+		assert.Equal(t, int64(defaultFrameDuration), d.dur, "duration %d", dur)
+		_, st = d.Extract(1_003_000, false)
+		require.Equal(t, DTSOK, st)
+		_, st = d.Extract(1_003_000-200_000, false)
+		assert.Equal(t, DTSBreak, st, "duration %d", dur)
+	}
+	d := NewDTSExtractor(0, maxFrameDuration)
+	d.Extract(0, true)
+	assert.Equal(t, int64(maxFrameDuration), d.dur, "10 s is still a duration")
+}
+
+func TestFrameDurationBound(t *testing.T) {
+	assert.Equal(t, int64(3003), frameDuration(1001, 30000))
+	assert.Equal(t, int64(maxFrameDuration), frameDuration(10, 1))
+	assert.Zero(t, frameDuration(11, 1), "above 10 s is absent")
+	assert.Zero(t, frameDuration(1<<33, 1))
+	assert.Zero(t, frameDuration(0, 1))
+	assert.Zero(t, frameDuration(1, 0))
+}

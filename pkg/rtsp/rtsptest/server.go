@@ -102,6 +102,14 @@ type ServerOptions struct {
 	KeepaliveStatus int
 	// NoUDP answers a SETUP over UDP with 461 (Unsupported Transport).
 	NoUDP bool
+	// UDPStatus, when set, answers a SETUP over UDP with this status.
+	UDPStatus int
+	// UDPAsTCP answers a SETUP over UDP with an interleaved TCP transport,
+	// as servers that ignore the requested transport do.
+	UDPAsTCP bool
+	// SingleServerPort names only the RTP port in a UDP SETUP reply
+	// (server_port=x); RTCP still uses x+1.
+	SingleServerPort bool
 	// DropUDP accepts a SETUP over UDP but sends nothing over UDP.
 	DropUDP bool
 	// UDPLoss, UDPSwap and UDPDup are the probabilities, drawn per RTP
@@ -490,6 +498,8 @@ func reason(code int) string {
 		return "Not Found"
 	case 454:
 		return "Session Not Found"
+	case 406:
+		return "Not Acceptable"
 	case 461:
 		return "Unsupported Transport"
 	case 500:
@@ -674,7 +684,10 @@ func (ss *session) setupTrack(req *rtsp.Request) bool {
 	switch tr.Protocol {
 	case "RTP/AVP/TCP":
 	case "RTP/AVP", "RTP/AVP/UDP":
-		return ss.setupUDP(req, idx, tr)
+		if !ss.s.opt.UDPAsTCP {
+			return ss.setupUDP(req, idx, tr)
+		}
+		tr.Interleaved = [2]int{2 * idx, 2*idx + 1}
 	default:
 		return ss.respond(req, 461, nil, nil)
 	}
@@ -702,6 +715,9 @@ func (ss *session) setupUDP(req *rtsp.Request, idx int, tr rtsp.Transport) bool 
 	if ss.s.opt.NoUDP || tr.ClientPort[0] == 0 {
 		return ss.respond(req, 461, nil, nil)
 	}
+	if code := ss.s.opt.UDPStatus; code != 0 {
+		return ss.respond(req, code, nil, nil)
+	}
 	local := ss.conn.LocalAddr().(*net.TCPAddr)
 	remote := ss.conn.RemoteAddr().(*net.TCPAddr)
 	rtpC, rtcpC, err := listenPair(local.IP)
@@ -725,8 +741,12 @@ func (ss *session) setupUDP(req *rtsp.Request, idx int, tr rtsp.Transport) bool 
 		Protocol: "RTP/AVP", Unicast: true, ClientPort: tr.ClientPort, ServerPort: [2]int{sp, sp + 1},
 		SSRC: ss.ssrc[idx], HasSSRC: true,
 	}
+	v := reply.String()
+	if ss.s.opt.SingleServerPort {
+		v = strings.Replace(v, fmt.Sprintf("server_port=%d-%d", sp, sp+1), fmt.Sprintf("server_port=%d", sp), 1)
+	}
 	h := ss.sessionHeader()
-	h.Set("Transport", reply.String())
+	h.Set("Transport", v)
 	return ss.respond(req, 200, h, nil)
 }
 

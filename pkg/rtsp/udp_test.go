@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"runtime"
 	"testing"
@@ -239,6 +240,27 @@ func TestAutoFallsBackToTCP(t *testing.T) {
 		assert.Equal(t, uint64(1), c.Stats().FallbackTCP)
 		assert.Equal(t, []string{"RTP/AVP", "RTP/AVP/TCP", "RTP/AVP/TCP"}, protocols(s))
 	})
+	t.Run("server answers with interleaved TCP", func(t *testing.T) {
+		s := newServer(t, rtsptest.ServerOptions{UDPAsTCP: true})
+		c := dial(t, s.URL("/stream"), autoConfig())
+		readUntil(t, c, 2*time.Second, func(p rtsp.Packet) bool { return p.RTP != nil })
+		assert.Equal(t, uint64(1), c.Stats().FallbackTCP)
+		assert.Equal(t, []string{"RTP/AVP", "RTP/AVP/TCP", "RTP/AVP/TCP"}, protocols(s))
+	})
+	for _, code := range []int{400, 406, 500} {
+		t.Run(fmt.Sprintf("UDP SETUP status %d", code), func(t *testing.T) {
+			s := newServer(t, rtsptest.ServerOptions{UDPStatus: code})
+			c := dial(t, s.URL("/stream"), autoConfig())
+			readUntil(t, c, 2*time.Second, func(p rtsp.Packet) bool { return p.RTP != nil })
+			assert.Equal(t, uint64(1), c.Stats().FallbackTCP)
+			assert.Equal(t, []string{"RTP/AVP", "RTP/AVP/TCP", "RTP/AVP/TCP"}, protocols(s))
+		})
+	}
+	t.Run("udp only reports the sentinel", func(t *testing.T) {
+		s := newServer(t, rtsptest.ServerOptions{UDPAsTCP: true})
+		_, err := rtsp.Dial(context.Background(), s.URL("/stream"), udpConfig())
+		require.ErrorIs(t, err, rtsp.ErrNotUDP)
+	})
 	t.Run("UDP works", func(t *testing.T) {
 		s := newServer(t, rtsptest.ServerOptions{})
 		c := dial(t, s.URL("/stream"), autoConfig())
@@ -323,4 +345,30 @@ func TestUDPSocketsClosed(t *testing.T) {
 	if n := runtime.NumGoroutine(); n > before {
 		t.Fatalf("goroutines: before %d, now %d\n%s", before, n, stacks())
 	}
+}
+
+// TestUDPSingleServerPort checks that server_port=x means RTCP on x+1:
+// sender reports from x+1 are accepted and receiver reports go there.
+func TestUDPSingleServerPort(t *testing.T) {
+	s := newServer(t, rtsptest.ServerOptions{SingleServerPort: true, SRAfter: 100 * time.Millisecond, Seed: 3})
+	cfg := udpConfig()
+	cfg.ReportInterval = 100 * time.Millisecond
+	c := dial(t, s.URL("/stream"), cfg)
+	srs := 0
+	readUntil(t, c, 3*time.Second, func(p rtsp.Packet) bool {
+		if p.RTCP != nil {
+			srs += len(rtsp.ParseSenderReports(p.RTCP))
+		}
+		return srs >= 2
+	})
+	require.Eventually(t, func() bool {
+		rrs := 0
+		for _, f := range s.FromClient() {
+			if f.Channel%2 == 1 && len(f.Data) >= 8 && f.Data[1] == 201 {
+				rrs++
+			}
+		}
+		return rrs >= 2
+	}, 2*time.Second, 20*time.Millisecond, "receiver reports reach the RTCP port x+1")
+	assert.Equal(t, 4, s.Punches(), "one punch per server port")
 }

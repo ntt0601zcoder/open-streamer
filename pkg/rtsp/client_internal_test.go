@@ -50,3 +50,23 @@ func TestWritesClampedAfterClose(t *testing.T) {
 	require.Error(t, c.writeMsg(&Response{StatusCode: 200, Reason: "OK", Header: Header{}}, time.Now().Add(10*time.Second)))
 	assert.Less(t, time.Since(start), time.Second)
 }
+
+// TestNewTargetDefaultPort checks the address Dial connects to: port 554
+// when the URL names none. No connection is made.
+func TestNewTargetDefaultPort(t *testing.T) {
+	for _, tc := range []struct{ in, addr, url string }{
+		{"rtsp://127.0.0.1/stream", "127.0.0.1:554", "rtsp://127.0.0.1/stream"},
+		{"rtsp://u:p@cam/stream?ch=1", "cam:554", "rtsp://cam/stream?ch=1"},
+		{"rtsp://[::1]/x", "[::1]:554", "rtsp://[::1]/x"},
+		{"rtsp://cam:8554/x", "cam:8554", "rtsp://cam:8554/x"},
+	} {
+		tg, err := newTarget(tc.in)
+		require.NoError(t, err, tc.in)
+		assert.Equal(t, tc.addr, tg.addr, tc.in)
+		assert.Equal(t, tc.url, tg.url, tc.in)
+	}
+	for _, bad := range []string{"http://cam/x", "rtsp:///x", "rtsp://%zz/x"} {
+		_, err := newTarget(bad)
+		assert.Error(t, err, bad)
+	}
+}

@@ -3,6 +3,7 @@ package rtsp
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtp"
@@ -30,12 +31,14 @@ type Depacketizer interface {
 	Flush() []AU
 	// Gap reports a sequence gap: pending fragments are dropped, the
 	// pending AU is marked Lost, and so is the AU the next packet starts
-	// when that packet has a new timestamp.
+	// when that packet has a new timestamp (for AAC, only when that packet
+	// starts a partial fragment: complete AAC AUs are self-delimiting).
 	Gap()
 }
 
 // OversizeCounter is implemented by the depacketizers; it counts the AUs
-// dropped for exceeding the size bound.
+// dropped for exceeding the size bound. Oversize is safe to call
+// concurrently with Push.
 type OversizeCounter interface {
 	Oversize() uint64
 }
@@ -69,8 +72,17 @@ func NewDepacketizer(m Media, maxAU int) (Depacketizer, error) {
 	}
 }
 
-// maxCarry bounds the NAL units of slice-less AUs carried into the next AU.
-const maxCarry = 64 << 10
+const (
+	// maxCarry bounds the NAL units of slice-less AUs carried into the
+	// next AU.
+	maxCarry = 64 << 10
+	// nalOverhead is the bytes each NAL unit counts against the AU bound
+	// beyond its payload (its slice header and allocation), so that an AU
+	// of tiny NAL units cannot hold far more memory than the bound.
+	nalOverhead = 32
+	// maxNALsPerAU bounds the NAL units of one AU; more make it oversize.
+	maxNALsPerAU = 4096
+)
 
 // checkAACFormat rejects length fields the depacketizer cannot honour.
 func checkAACFormat(f *AACFormat) error {
@@ -110,7 +122,7 @@ type assembler struct {
 
 	frag    []byte
 	fragOn  bool
-	oversze uint64
+	oversze atomic.Uint64
 }
 
 func newAssembler(track, maxAU int, slice, aud, valid func([]byte) bool) *assembler {
@@ -118,7 +130,7 @@ func newAssembler(track, maxAU int, slice, aud, valid func([]byte) bool) *assemb
 }
 
 // Oversize returns the AUs dropped for exceeding the size bound.
-func (a *assembler) Oversize() uint64 { return a.oversze }
+func (a *assembler) Oversize() uint64 { return a.oversze.Load() }
 
 // advance closes the pending AU when ts differs and opens the AU of ts.
 func (a *assembler) advance(ts uint32, arrival time.Time) []AU {
@@ -149,7 +161,7 @@ func (a *assembler) finish() []AU {
 		a.frag, a.fragOn = nil, false
 	}
 	if a.over {
-		a.oversze++
+		a.oversze.Add(1)
 		a.carryLost = false
 		return nil
 	}
@@ -206,16 +218,22 @@ func (a *assembler) addOwned(nal []byte) {
 	if a.isAUD(nal) {
 		return
 	}
-	if a.size+len(nal) > a.maxAU {
-		a.over = true
-		a.nalus, a.size = nil, 0
+	if a.size+len(nal)+nalOverhead > a.maxAU || len(a.nalus) >= maxNALsPerAU {
+		a.setOver()
 		return
 	}
 	if a.isSlice(nal) {
 		a.hasSlice = true
 	}
 	a.nalus = append(a.nalus, nal)
-	a.size += len(nal)
+	a.size += len(nal) + nalOverhead
+}
+
+// setOver marks the pending AU oversize and releases what it holds.
+func (a *assembler) setOver() {
+	a.over = true
+	a.nalus, a.size = nil, 0
+	a.frag, a.fragOn = nil, false
 }
 
 // fragStart begins a fragmented NAL unit made of prefix and data.
@@ -231,9 +249,8 @@ func (a *assembler) fragStart(prefix, data []byte) {
 		a.lost = true
 		return
 	}
-	if a.size+len(prefix)+len(data) > a.maxAU {
-		a.over = true
-		a.nalus, a.size = nil, 0
+	if a.size+len(prefix)+len(data)+nalOverhead > a.maxAU {
+		a.setOver()
 		return
 	}
 	a.frag = append(append(make([]byte, 0, len(prefix)+len(data)), prefix...), data...)
@@ -247,10 +264,8 @@ func (a *assembler) fragNext(data []byte, end bool) {
 		a.lost = true
 		return
 	}
-	if a.size+len(a.frag)+len(data) > a.maxAU {
-		a.over = true
-		a.nalus, a.size = nil, 0
-		a.frag, a.fragOn = nil, false
+	if a.size+len(a.frag)+len(data)+nalOverhead > a.maxAU {
+		a.setOver()
 		return
 	}
 	a.frag = append(a.frag, data...)
@@ -264,7 +279,7 @@ func (a *assembler) fragNext(data []byte, end bool) {
 // aggregate splits an aggregation packet body (16-bit size, NAL unit,
 // repeated) into the assembler. A truncated unit marks the AU lost.
 func (a *assembler) aggregate(b []byte) {
-	for len(b) > 0 {
+	for len(b) > 0 && !a.over {
 		if len(b) < 2 {
 			a.lost = true
 			return

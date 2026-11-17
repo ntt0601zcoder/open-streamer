@@ -313,3 +313,40 @@ func TestMediaRejectsHostileSPS(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+// TestParamSetIDRange checks that PPS ids beyond the spec range are
+// rejected: a hostile source sending a fresh id per AU would otherwise grow
+// the parameter-set maps without bound.
+func TestParamSetIDRange(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		codec Codec
+		hdr   []byte
+		id    uint64
+		ok    bool
+	}{
+		{"h264 pps 255", CodecH264, []byte{0x68}, 255, true},
+		{"h264 pps 256", CodecH264, []byte{0x68}, 256, false},
+		{"h264 pps 1<<20", CodecH264, []byte{0x68}, 1 << 20, false},
+		{"h264 pps 4000000", CodecH264, []byte{0x68}, 4000000, false},
+		{"h265 pps 63", CodecH265, []byte{0x44, 0x01}, 63, true},
+		{"h265 pps 64", CodecH265, []byte{0x44, 0x01}, 64, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := (&bitWriter{}).ue(tc.id).ue(0).nal(tc.hdr...)
+			id, err := ParamSetID(tc.codec, p)
+			if !tc.ok {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "out of range")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, uint32(tc.id), id)
+		})
+	}
+
+	sps := unhex(t, h264SPSHex)
+	hostile := (&bitWriter{}).ue(1 << 20).ue(0).nal(0x68)
+	_, err := NewH264Config([][]byte{sps}, [][]byte{hostile})
+	require.Error(t, err)
+}

@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtp"
@@ -115,7 +116,7 @@ type aacDepack struct {
 	step    uint32
 	lost    bool
 	gapNext bool
-	oversze uint64
+	oversze atomic.Uint64
 	dropTS  uint32 // timestamp of the dropped fragmented AU
 	dropOn  bool
 
@@ -130,7 +131,7 @@ func newAACDepack(m Media, maxAU int) *aacDepack {
 }
 
 // Oversize implements OversizeCounter.
-func (d *aacDepack) Oversize() uint64 { return d.oversze }
+func (d *aacDepack) Oversize() uint64 { return d.oversze.Load() }
 
 // Flush implements Depacketizer; AAC frames are emitted as they complete.
 func (d *aacDepack) Flush() []AU { return nil }
@@ -210,10 +211,14 @@ func (d *aacDepack) Push(p *rtp.Packet, arrival time.Time) []AU {
 		d.Gap()
 		return nil
 	}
+	data := p.Payload[off:]
+	partial := len(hs) == 1 && len(data) < hs[0].size
 	if d.gapNext {
 		d.gapNext = false
-		// A tail fragment of the dropped AU does not start a new one.
-		if !d.dropOn || p.Timestamp != d.dropTS {
+		// Complete AUs are self-delimiting; a partial fragment after a gap
+		// may lack its head, unless it is a tail of the dropped AU, which
+		// does not start a new one.
+		if partial && (!d.dropOn || p.Timestamp != d.dropTS) {
 			d.lost = true
 		}
 	}
@@ -224,13 +229,12 @@ func (d *aacDepack) Push(p *rtp.Packet, arrival time.Time) []AU {
 			return nil
 		}
 	}
-	data := p.Payload[off:]
 	if d.fragOn {
 		if out, handled := d.continueFrag(p, hs, data, arrival); handled {
 			return out
 		}
 	}
-	if len(hs) == 1 && len(data) < hs[0].size {
+	if partial {
 		d.startFrag(p, hs[0], data)
 		return nil
 	}
@@ -250,7 +254,7 @@ func (d *aacDepack) Push(p *rtp.Packet, arrival time.Time) []AU {
 			continue
 		}
 		if h.size > d.maxAU {
-			d.oversze++
+			d.oversze.Add(1)
 			continue
 		}
 		out = append(out, d.emit(p.Timestamp+uint32(i)*d.step, append([]byte(nil), fr...), arrival))
@@ -287,7 +291,7 @@ func (d *aacDepack) startFrag(p *rtp.Packet, h aacHeader, data []byte) {
 		return
 	}
 	if h.size > d.maxAU {
-		d.oversze++
+		d.oversze.Add(1)
 		return
 	}
 	d.frag = append(make([]byte, 0, h.size), data...)

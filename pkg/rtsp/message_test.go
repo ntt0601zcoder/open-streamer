@@ -241,6 +241,21 @@ func TestParseTransport(t *testing.T) {
 			"RTP/AVP/TCP;unicast;interleaved=4-5",
 		},
 		{
+			"RTP/AVP;unicast;client_port=5000-5001;server_port=6970",
+			Transport{Protocol: "RTP/AVP", Unicast: true, ClientPort: [2]int{5000, 5001}, ServerPort: [2]int{6970, 6971}},
+			"RTP/AVP;unicast;client_port=5000-5001;server_port=6970-6971",
+		},
+		{
+			"RTP/AVP;unicast;server_port=0",
+			Transport{Protocol: "RTP/AVP", Unicast: true},
+			"RTP/AVP;unicast",
+		},
+		{
+			"RTP/AVP;unicast;server_port=65535",
+			Transport{Protocol: "RTP/AVP", Unicast: true, ServerPort: [2]int{65535, 65535}},
+			"RTP/AVP;unicast;server_port=65535-65535",
+		},
+		{
 			"RTP/AVP;unicast;ssrc=1A2B",
 			Transport{Protocol: "RTP/AVP", Unicast: true, SSRC: 0x1A2B, HasSSRC: true},
 			"RTP/AVP;unicast;ssrc=00001A2B",

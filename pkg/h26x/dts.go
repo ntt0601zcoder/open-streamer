@@ -9,6 +9,10 @@ const maxReorder = 16
 // SPS carries no timing information. Any positive value keeps the DTS valid.
 const defaultFrameDuration = 3000
 
+// maxFrameDuration is the longest frame duration, in 90 kHz units (10 s),
+// taken from an SPS; a longer one is treated as absent.
+const maxFrameDuration = 900000
+
 // minBreak is the smallest backward PTS jump, in 90 kHz units, that is a
 // timeline break rather than a late frame.
 const minBreak = 90000
@@ -66,8 +70,12 @@ type DTSExtractor struct {
 
 // NewDTSExtractor returns an extractor for reorder depth reorder (from
 // ReorderOf, clamped to [0, 16]) and frameDuration in 90 kHz units (from
-// SPS.FrameDuration; 0 when unknown).
+// SPS.FrameDuration; 0 when unknown). A duration that is not positive or
+// is above 10 s is treated as unknown.
 func NewDTSExtractor(reorder int, frameDuration int64) *DTSExtractor {
+	if frameDuration <= 0 || frameDuration > maxFrameDuration {
+		frameDuration = 0
+	}
 	return &DTSExtractor{
 		reorder:  clampReorder(reorder),
 		pending:  -1,

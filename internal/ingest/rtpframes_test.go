@@ -1043,3 +1043,108 @@ func TestRTPFramesZeroNTPIgnored(t *testing.T) {
 	assert.False(t, r.tracks[1].sr.ok)
 	assert.Equal(t, uint64(2), r.stats()["sr_ignored"])
 }
+
+// h264PPS returns an H.264 PPS NAL unit with the given id referencing SPS 0
+// (the rest of the PPS is not read by the converter).
+func h264PPS(id uint64) []byte {
+	var bits []bool
+	ue := func(v uint64) {
+		v++
+		n := 0
+		for x := v; x > 1; x >>= 1 {
+			n++
+		}
+		for i := 0; i < n; i++ {
+			bits = append(bits, false)
+		}
+		for i := n; i >= 0; i-- {
+			bits = append(bits, v>>uint(i)&1 == 1)
+		}
+	}
+	ue(id)
+	ue(0)
+	bits = append(bits, true)
+	for len(bits)%8 != 0 {
+		bits = append(bits, false)
+	}
+	out, zeros := []byte{0x68}, 0
+	for i := 0; i < len(bits); i += 8 {
+		var b byte
+		for j := 0; j < 8; j++ {
+			if bits[i+j] {
+				b |= 0x80 >> uint(j)
+			}
+		}
+		if zeros >= 2 && b <= 3 {
+			out, zeros = append(out, 3), 0
+		}
+		out = append(out, b)
+		if b == 0 {
+			zeros++
+		} else {
+			zeros = 0
+		}
+	}
+	return out
+}
+
+// TestRTPFramesHostilePPS checks that PPS ids beyond the spec range are
+// rejected and counted, and that the parameter-set maps stay bounded.
+func TestRTPFramesHostilePPS(t *testing.T) {
+	srcs, desc := rtpFixture(t, "h264_aac.ts", true, false, rand.New(rand.NewPCG(41, 42)))
+	aus := rtpAUs(t, srcs, srcArrival)
+	r := newRTPFrames(desc, nil, &media.ConfigCache{})
+	hostile := 0
+	for k, au := range aus {
+		if k > 10 {
+			au.NALUs = append([][]byte{h264PPS(1<<20 + uint64(k))}, au.NALUs...)
+			hostile++
+		}
+		_, _, err := r.push(au)
+		if k > 10 {
+			require.ErrorContains(t, err, "out of range", "au %d", k)
+		}
+	}
+	require.Positive(t, hostile)
+	assert.Equal(t, uint64(hostile), r.stats()["bad_aus"])
+	assert.LessOrEqual(t, len(r.tracks[0].v.sets.pps), 256)
+
+	t.Run("map cap", func(t *testing.T) {
+		r := newRTPFrames(desc, nil, &media.ConfigCache{})
+		v := r.tracks[0].v
+		for id := range uint32(rtpMaxPPS) {
+			v.sets.pps[1000+id] = []byte{0x68}
+		}
+		_, err := r.updateSets(r.tracks[0], [][]byte{h264PPS(3)})
+		require.ErrorContains(t, err, "too many")
+		assert.Len(t, v.sets.pps, rtpMaxPPS)
+		// A known id still replaces its set.
+		v.sets.pps[3] = []byte{0x68}
+		delete(v.sets.pps, 1000)
+		_, err = r.updateSets(r.tracks[0], [][]byte{h264PPS(3)})
+		require.NotContains(t, fmt.Sprint(err), "too many")
+		assert.Equal(t, []int{rtpMaxVPS, rtpMaxSPS, rtpMaxPPS}, []int{maxSetsOf(nalVPS), maxSetsOf(nalSPS), maxSetsOf(nalPPS)})
+	})
+}
+
+// TestRTPFramesFarSRIgnored checks that a sender report whose RTP timestamp
+// is more than 10 s from the track's recent RTP time is ignored and counted:
+// it belongs to another timeline (a restart the packets have not shown yet,
+// or a lying sender) and would misplace the track.
+func TestRTPFramesFarSRIgnored(t *testing.T) {
+	srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(43, 44)))
+	r := newRTPFrames(desc, rtpInfo(srcs, srcs[0].origin), &media.ConfigCache{})
+	aus := rtpAUs(t, srcs, srcArrival)
+	_, _ = rtpRun(t, r, aus[:50])
+	a := srcs[1]
+	now := a.origin + 90000 // within the first 50 AUs' span
+	for _, d := range []int64{11 * 90000, -11 * 90000} {
+		sr := a.sr(now+d, 0)
+		assert.False(t, r.senderReport(1, sr))
+		assert.False(t, r.tracks[1].sr.ok, "offset %d", d)
+	}
+	assert.Equal(t, uint64(2), r.stats()["sr_ignored"])
+	r.senderReport(1, a.sr(now, 0))
+	assert.True(t, r.tracks[1].sr.ok, "a near SR is taken")
+	assert.Equal(t, uint64(2), r.stats()["sr_ignored"])
+}

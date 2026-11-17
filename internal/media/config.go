@@ -209,7 +209,7 @@ func paramSetID(codec Codec, nalu []byte) (uint32, error) {
 			}
 			return sps.ID, nil
 		case 8:
-			return readFirstUE(nalu, 1)
+			return readFirstUE(nalu, 1, maxH264PPSID)
 		default:
 			return 0, fmt.Errorf("h264 nal type %d is not a parameter set", nalu[0]&0x1f)
 		}
@@ -231,7 +231,7 @@ func paramSetID(codec Codec, nalu []byte) (uint32, error) {
 			}
 			return sps.ID, nil
 		case 34:
-			return readFirstUE(nalu, 2)
+			return readFirstUE(nalu, 2, maxH265PPSID)
 		default:
 			return 0, fmt.Errorf("h265 nal type %d is not a parameter set", (nalu[0]>>1)&0x3f)
 		}
@@ -269,9 +269,16 @@ func parseHEVCVPS(nalu []byte) (*hevc.VPS, error) {
 	return hevc.ParseVPSNALUnit(nalu)
 }
 
+// Spec ranges of pic_parameter_set_id (H.264 7.4.2.2, H.265 7.4.3.3.1).
+// SPS and VPS ids are range-checked by h26x and by their 4-bit field.
+const (
+	maxH264PPSID = 255
+	maxH265PPSID = 63
+)
+
 // readFirstUE reads the first ue(v) after a header of hdr bytes, removing
-// emulation prevention bytes.
-func readFirstUE(nalu []byte, hdr int) (uint32, error) {
+// emulation prevention bytes, and checks it is at most maxID.
+func readFirstUE(nalu []byte, hdr int, maxID uint) (uint32, error) {
 	r := bits.NewEBSPReader(bytes.NewReader(nalu))
 	for i := 0; i < hdr; i++ {
 		r.Read(8)
@@ -279,6 +286,9 @@ func readFirstUE(nalu []byte, hdr int) (uint32, error) {
 	v := r.ReadExpGolomb()
 	if err := r.AccError(); err != nil {
 		return 0, fmt.Errorf("read pps id: %w", err)
+	}
+	if v > maxID {
+		return 0, fmt.Errorf("pps id %d out of range [0, %d]", v, maxID)
 	}
 	return uint32(v), nil
 }
