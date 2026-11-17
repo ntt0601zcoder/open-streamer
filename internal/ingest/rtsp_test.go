@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -347,9 +348,7 @@ func TestRTSPSyncBySR(t *testing.T) {
 			from = got.breaks[0]
 		}
 		v, a := offsets(got.frames, from)
-		if len(v) > 0 && len(a) > 0 {
-			assert.LessOrEqual(t, spread(v, a), spa, "aligned after the first SR")
-		}
+		assert.LessOrEqual(t, spread(v, a), spa, "aligned after the first SR")
 	})
 	t.Run("an SR that jumps by 5 s", func(t *testing.T) {
 		setRTSPSyncWait(t, time.Second)
@@ -475,6 +474,28 @@ func TestRTSPPullSSRCChange(t *testing.T) {
 	assert.Equal(t, uint64(2), st["resets"])
 	assert.Len(t, got.breaks, 1, "the restarts of both tracks give one discontinuity")
 	assert.Zero(t, st["lost_packets"])
+	// A restart is not a loss: only the old pending AU may be lost, never
+	// the new stream's first one (the IDR with in-band sets).
+	assert.LessOrEqual(t, st["lost_aus"], uint64(1))
+	require.Len(t, got.breaks, 1)
+	firstVideo := false
+	for _, f := range got.frames[got.breaks[0]:] {
+		if f.Kind() == media.KindVideo {
+			firstVideo = true
+			break
+		}
+	}
+	assert.True(t, firstVideo, "the new stream's first video AU is emitted")
+}
+
+func TestRTSPParseTransportTwice(t *testing.T) {
+	_, err := Parse("rtsp://cam/s?transport=udp&transport=tcp")
+	require.Error(t, err)
+	_, err = Parse("rtsp://cam/s?transport=%75dp")
+	require.NoError(t, err)
+	d, tr := rtspDialURL("rtsp://cam/s?a=1&transport=%75dp&b=2")
+	assert.Equal(t, "rtsp://cam/s?a=1&b=2", d)
+	assert.Equal(t, "udp", tr)
 }
 
 func TestOpenRTSP(t *testing.T) {
@@ -521,10 +542,20 @@ func TestOpenRTSP(t *testing.T) {
 		}
 	})
 	t.Run("port 554 is implied", func(t *testing.T) {
+		// Probe only; the port is never bound.
+		d := net.Dialer{Timeout: 200 * time.Millisecond}
+		if c, err := d.DialContext(context.Background(), "tcp", "127.0.0.1:554"); err == nil {
+			_ = c.Close()
+			t.Skip("something listens on 127.0.0.1:554")
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_, err := Open(ctx, "rtsp://127.0.0.1/stream", Env{})
-		require.Error(t, err)
+		r, err := Open(ctx, "rtsp://127.0.0.1/stream", Env{})
+		if err == nil {
+			_ = r.Close()
+			t.Fatal("Open succeeded")
+		}
 		assert.Contains(t, err.Error(), "ingest: rtsp: open rtsp://127.0.0.1/stream")
+		assert.Contains(t, err.Error(), "127.0.0.1:554")
 	})
 }
