@@ -190,6 +190,14 @@ func parse(rawURL string) (parsed, error) {
 			return fail("%v", err)
 		}
 		p.spec = spec
+	case schemeRTSP:
+		spec, err := parseRTSP(u, q)
+		if err != nil {
+			return fail("%v", err)
+		}
+		p.spec = spec
+	case schemeRTSPS:
+		return fail("rtsps is not supported")
 	default:
 		return fail("unsupported scheme %q", u.Scheme)
 	}
@@ -273,6 +281,8 @@ func Open(ctx context.Context, rawURL string, env Env) (Reader, error) {
 			return openRTMPListen(ctx, rawURL, p, env)
 		}
 		return openRTMPPull(ctx, rawURL, p, env)
+	case schemeRTSP:
+		return openRTSP(ctx, rawURL, p, env)
 	default:
 		return nil, fmt.Errorf("ingest: open %s: %s inputs are not available yet", Redact(rawURL), p.scheme)
 	}
