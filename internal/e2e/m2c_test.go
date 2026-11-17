@@ -78,9 +78,21 @@ func loopClip(t *testing.T, ffmpeg, name string, passes int, span time.Duration)
 }
 
 var (
-	catchupOnce sync.Once
-	catchupOK   bool
+	helpOnce sync.Once
+	helpText []byte
 )
+
+// ffmpegHelp returns ffmpeg's full help, read once (the tests use one
+// ffmpeg); nil when it cannot be read.
+func ffmpegHelp(ffmpeg string) []byte {
+	helpOnce.Do(func() {
+		out, err := exec.CommandContext(context.Background(), ffmpeg, "-hide_banner", "-h", "full").CombinedOutput()
+		if err == nil {
+			helpText = out
+		}
+	})
+	return helpText
+}
 
 // rateArgs paces ffmpeg at real time with no initial burst, and, where ffmpeg
 // has the option (7.1 and later), no catch-up: the default catch-up of 1.05
@@ -88,19 +100,29 @@ var (
 // reports.
 func rateArgs(t *testing.T, ffmpeg string) []string {
 	t.Helper()
-	catchupOnce.Do(func() {
-		out, err := exec.CommandContext(context.Background(), ffmpeg, "-hide_banner", "-h", "full").CombinedOutput()
-		catchupOK = err == nil && bytes.Contains(out, []byte("readrate_catchup"))
-	})
 	args := []string{"-readrate", "1", "-readrate_initial_burst", "0"}
-	if catchupOK {
+	if bytes.Contains(ffmpegHelp(ffmpeg), []byte("readrate_catchup")) {
 		args = append(args, "-readrate_catchup", "1")
 	}
 	return args
 }
 
+// delayArgs returns the option that sets the muxer's maximum delay to 0
+// (see rtspPublish).
+func delayArgs(ffmpeg string) []string { return delayArgsFrom(ffmpegHelp(ffmpeg)) }
+
+// delayArgsFrom picks "-max_delay 0" when ffmpeg's help lists it, else the
+// older "-muxdelay 0", which sets the same field.
+func delayArgsFrom(help []byte) []string {
+	if bytes.Contains(help, []byte("-max_delay")) {
+		return []string{"-max_delay", "0"}
+	}
+	return []string{"-muxdelay", "0"}
+}
+
 // rtspPublish starts ffmpeg publishing the TS clip, in real time, to
-// MediaMTX at url. "-max_delay 0" matters: ffmpeg's RTP muxer holds AAC
+// MediaMTX at url. "-max_delay 0" (or "-muxdelay 0" on an ffmpeg without
+// it, delayArgs) matters: ffmpeg's RTP muxer holds AAC
 // frames back, aggregating them into one packet for up to the muxer's
 // max_delay (0.7 s for RTSP), which makes the audio arrive 120 to 200 ms
 // behind its video; a pull of the relay cannot know that, since MediaMTX
@@ -114,7 +136,9 @@ func rtspPublish(t *testing.T, ffmpeg, clip, url string) *ffmpegProc {
 	b, err := exec.CommandContext(t.Context(), ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
 		"-i", clip, "-c", "copy", "-f", "mp4", mp4).CombinedOutput()
 	require.NoError(t, err, string(b))
-	return startFFmpeg(t, ffmpeg, append(rateArgs(t, ffmpeg), "-i", mp4, "-c", "copy", "-max_delay", "0", "-f", "rtsp", "-rtsp_transport", "tcp", url)...)
+	args := append(rateArgs(t, ffmpeg), "-i", mp4, "-c", "copy")
+	args = append(args, delayArgs(ffmpeg)...)
+	return startFFmpeg(t, ffmpeg, append(args, "-f", "rtsp", "-rtsp_transport", "tcp", url)...)
 }
 
 // checkRTSP waits for the run to end and checks that the frames are clean
@@ -557,4 +581,12 @@ func TestM2cTSReorderedPES(t *testing.T) {
 	assert.LessOrEqual(t, len(missing), dropped+heldAtEnd, "units missing: %v", missing)
 	assert.Equal(t, got[epochKind{1, media.KindVideo}], len(idx))
 	t.Logf("source %d video units, delivered %s; clock %+v; reader %v", len(src), got, r.stats.Clock, st)
+}
+
+func TestDelayArgs(t *testing.T) {
+	assert.Equal(t, []string{"-max_delay", "0"},
+		delayArgsFrom([]byte("  -max_delay         <int>        ED......... maximum muxing or demuxing delay")))
+	assert.Equal(t, []string{"-muxdelay", "0"},
+		delayArgsFrom([]byte("-muxdelay <seconds>  set the maximum demux-decode delay")))
+	assert.Equal(t, []string{"-muxdelay", "0"}, delayArgsFrom(nil))
 }
