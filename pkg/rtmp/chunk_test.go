@@ -123,7 +123,7 @@ func roundTripPlan(tag byte) []plannedMsg {
 		{0x12345678, 2, MsgVideo, 5000, 2}, // extended delta
 		{0x2368ACF0, 2, MsgVideo, 5000, 3}, // repeated extended delta
 		{0x2368ACF0, 3, MsgVideo, 5000, 0}, // extended absolute
-		{0x2368ACF0, 3, MsgVideo, 5000, 3}, // delta 0 after type 0
+		{0x2368ACF0, 3, MsgVideo, 5000, 2}, // delta 0 after type 0 is type 2, never 3
 		{0xFFFFFFF0, 3, MsgDataAMF0, 7, 1},
 		{0x00000010, 3, MsgDataAMF0, 7, 0}, // wrapped, so backwards
 	}
@@ -370,18 +370,26 @@ func TestChunkExtendedTimestampFmt3(t *testing.T) {
 		}
 	}
 
-	// The writer repeats the extended field on every type 3 chunk.
+	// The writer repeats the extended field on every type 3 chunk of the
+	// first message; the second, equal message follows a type 0 header, so
+	// it starts with type 2 (delta 0, no extended field).
 	var out bytes.Buffer
 	w := NewChunkWriter(&out)
 	m := Message{Type: MsgVideo, StreamID: 1, Timestamp: abs, Payload: payload}
 	if err := w.WriteMessage(3, m); err != nil {
 		t.Fatal(err)
 	}
+	first := out.Len()
 	if err := w.WriteMessage(3, m); err != nil {
 		t.Fatal(err)
 	}
-	if want := build(true); !bytes.HasPrefix(want, out.Bytes()) {
-		t.Fatalf("writer output differs from the repeated-extended form:\n got %x\nwant %x", out.Bytes(), want[:out.Len()])
+	want := build(true)
+	if got := out.Bytes()[:first]; !bytes.HasPrefix(want, got) {
+		t.Fatalf("writer output differs from the repeated-extended form:\n got %x\nwant %x", got, want[:first])
+	}
+	second := out.Bytes()[first:]
+	if !bytes.HasPrefix(second, []byte{0x83, 0, 0, 0}) || second[4+128] != 0xC3 || second[4+128+1] == 0x01 && second[4+128+2] == 0 && second[4+128+3] == 0 && second[4+128+4] == 0 {
+		t.Fatalf("second message header %x", second[:8])
 	}
 }
 
@@ -881,4 +889,53 @@ func FuzzChunkReader(f *testing.F) {
 			t.Fatalf("BytesRead %d > input %d", c.BytesRead(), len(data))
 		}
 	})
+}
+
+func TestChunkWriterNoType3AfterType0(t *testing.T) {
+	var out bytes.Buffer
+	w := NewChunkWriter(&out)
+	var formats []byte
+	write := func(m Message) {
+		t.Helper()
+		start := out.Len()
+		if err := w.WriteMessage(4, m); err != nil {
+			t.Fatal(err)
+		}
+		formats = append(formats, out.Bytes()[start]>>6)
+	}
+	m := Message{Type: MsgAudio, StreamID: 1, Timestamp: 100, Payload: []byte("aaaa")}
+	write(m)                     // type 0
+	write(m)                     // same timestamp: would be type 3 after type 0
+	write(m)                     // type 3 is fine after type 2
+	m.Timestamp = 50             // backwards: type 0 again
+	write(m)                     // type 0
+	write(m)                     // must not be type 3
+	m.Payload = []byte("aaaaaa") // longer message, long enough to chunk
+	m.Timestamp = 50
+	write(m)
+	if want := []byte{0, 2, 3, 0, 2, 1}; !bytes.Equal(formats, want) {
+		t.Fatalf("formats %v, want %v", formats, want)
+	}
+	// Continuation chunks of one message stay type 3.
+	out.Reset()
+	w2 := NewChunkWriter(&out)
+	if err := w2.WriteMessage(4, Message{Type: MsgVideo, StreamID: 1, Payload: make([]byte, 300)}); err != nil {
+		t.Fatal(err)
+	}
+	b := out.Bytes()
+	if b[0]>>6 != 0 || b[12+128]>>6 != 3 {
+		t.Fatalf("continuation formats %d %d", b[0]>>6, b[12+128]>>6)
+	}
+	// The reader still decodes it.
+	var s bytes.Buffer
+	w3 := NewChunkWriter(&s)
+	for range 3 {
+		if err := w3.WriteMessage(4, Message{Type: MsgAudio, StreamID: 1, Timestamp: 7, Payload: []byte("zz")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msgs := readAll(t, newReader(s.Bytes(), ChunkLimits{}))
+	if got := timestamps(msgs); !equalU32(got, []uint32{7, 7, 7}) {
+		t.Fatalf("timestamps %v", got)
+	}
 }

@@ -225,3 +225,71 @@ func TestAMF0ValueLimit(t *testing.T) {
 		t.Fatalf("4096 values rejected: %v", err)
 	}
 }
+
+func TestAMF0EncodeGolden(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		val  any
+		want []byte
+	}{
+		{"number", float64(1), []byte{0x00, 0x3F, 0xF0, 0, 0, 0, 0, 0, 0}},
+		{"int", 2, []byte{0x00, 0x40, 0, 0, 0, 0, 0, 0, 0}},
+		{"true", true, []byte{0x01, 0x01}},
+		{"false", false, []byte{0x01, 0x00}},
+		{"string", "ab", []byte{0x02, 0, 2, 'a', 'b'}},
+		{"empty string", "", []byte{0x02, 0, 0}},
+		{"null", nil, []byte{0x05}},
+		{"Null", Null{}, []byte{0x05}},
+		{"undefined", Undefined{}, []byte{0x06}},
+		{"object", Object{{Key: "a", Value: true}}, []byte{0x03, 0, 1, 'a', 0x01, 0x01, 0, 0, 0x09}},
+		{"empty object", Object{}, []byte{0x03, 0, 0, 0x09}},
+		{"ecma array", ECMAArray{{Key: "k", Value: "v"}}, []byte{0x08, 0, 0, 0, 1, 0, 1, 'k', 0x02, 0, 1, 'v', 0, 0, 0x09}},
+		{"strict array", []any{float64(0), Null{}}, []byte{0x0A, 0, 0, 0, 2, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x05}},
+		{"date", time.UnixMilli(1000).UTC(), []byte{0x0B, 0x40, 0x8F, 0x40, 0, 0, 0, 0, 0, 0, 0}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := EncodeAMF0(c.val)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, c.want) {
+				t.Fatalf("got % x\nwant % x", got, c.want)
+			}
+		})
+	}
+	long := strings.Repeat("x", 0x10000)
+	got, err := EncodeAMF0(long)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(got, []byte{0x0C, 0, 1, 0, 0}) || len(got) != 5+len(long) {
+		t.Fatalf("long string header % x len %d", got[:5], len(got))
+	}
+}
+
+func TestAMF0EncodeErrors(t *testing.T) {
+	deep := any(float64(1))
+	for range amfMaxDepth + 2 {
+		deep = []any{deep}
+	}
+	for _, c := range []struct {
+		name string
+		val  any
+	}{
+		{"unsupported type", struct{}{}},
+		{"unsupported int64", int64(1)},
+		{"too deep", deep},
+		{"long key", Object{{Key: strings.Repeat("k", 0x10000), Value: true}}},
+		{"unsupported in object", Object{{Key: "a", Value: 'x'}}},
+		{"unsupported in array", []any{make(chan int)}},
+		{"unsupported in ecma", ECMAArray{{Key: "a", Value: 1.5 + 0i}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if b, err := EncodeAMF0(float64(1), c.val); err == nil || b != nil {
+				t.Fatalf("got % x, %v; want nil and an error", b, err)
+			} else if !strings.HasPrefix(err.Error(), "rtmp: amf0: encode: ") {
+				t.Fatalf("error %q lacks the prefix", err)
+			}
+		})
+	}
+}

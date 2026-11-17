@@ -218,7 +218,12 @@ func ParseAudioTag(b []byte) (AudioTag, error) {
 // AppendVideoTag appends the VIDEODATA body for t. enhanced selects the enhanced
 // RTMP layout (FourCC, CodedFramesX for a zero composition time); otherwise the
 // legacy layout is used, where VideoMetadata has no representation and is omitted.
-func AppendVideoTag(dst []byte, t VideoTag, enhanced bool) []byte {
+// A coded frame whose CompTime does not fit a signed 24-bit field is an error
+// and dst is returned unchanged.
+func AppendVideoTag(dst []byte, t VideoTag, enhanced bool) ([]byte, error) {
+	if t.Kind == VideoCodedFrames && (t.CompTime < -1<<23 || t.CompTime >= 1<<23) {
+		return dst, fmt.Errorf("rtmp: flv: composition time %d outside the signed 24-bit range", t.CompTime)
+	}
 	frame := byte(2)
 	if t.Key {
 		frame = frameKey
@@ -228,7 +233,7 @@ func AppendVideoTag(dst []byte, t VideoTag, enhanced bool) []byte {
 	}
 	if enhanced {
 		if t.Kind == VideoCommand {
-			return append(append(dst, 0x80|frame<<4), t.Data...)
+			return append(append(dst, 0x80|frame<<4), t.Data...), nil
 		}
 		var pkt byte
 		switch t.Kind {
@@ -254,7 +259,7 @@ func AppendVideoTag(dst []byte, t VideoTag, enhanced bool) []byte {
 		if pkt == exCoded {
 			dst = appendSI24(dst, t.CompTime)
 		}
-		return append(dst, t.Data...)
+		return append(dst, t.Data...), nil
 	}
 	id := byte(codecIDAVC)
 	if t.Codec == VideoHEVC {
@@ -262,9 +267,9 @@ func AppendVideoTag(dst []byte, t VideoTag, enhanced bool) []byte {
 	}
 	switch t.Kind {
 	case VideoCommand:
-		return append(append(dst, frame<<4|id), t.Data...)
+		return append(append(dst, frame<<4|id), t.Data...), nil
 	case VideoMetadata:
-		return dst
+		return dst, nil
 	case VideoSequenceStart:
 		dst = append(dst, frame<<4|id, 0, 0, 0, 0)
 	case VideoCodedFrames:
@@ -272,7 +277,7 @@ func AppendVideoTag(dst []byte, t VideoTag, enhanced bool) []byte {
 	case VideoSequenceEnd:
 		dst = append(dst, frame<<4|id, 2, 0, 0, 0)
 	}
-	return append(dst, t.Data...)
+	return append(dst, t.Data...), nil
 }
 
 func appendSI24(dst []byte, v int32) []byte {

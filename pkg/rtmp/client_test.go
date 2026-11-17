@@ -839,3 +839,96 @@ func TestClientFFmpegServer(t *testing.T) {
 		}
 	}
 }
+
+func TestClientRejectsFirstChunkNotType0(t *testing.T) {
+	base, peers := acceptPeers(t)
+	res := startPlay(context.Background(), base+"/live/s", rtmp.Config{})
+	p := awaitPeer(t, peers)
+	p.toPlay(t)
+	// A type 1 header (basic header 0x40|9) opens a csid the client never saw.
+	if _, err := p.conn.Write([]byte{0x40 | 9, 0, 0, 0, 0, 0, 1, rtmp.MsgAudio, 0xAF}); err != nil {
+		t.Fatal(err)
+	}
+	r := awaitPlay(t, res, 2*time.Second)
+	if r.err == nil {
+		_, err := readMedia(t, r.c)
+		if err == nil {
+			t.Fatal("the client accepted a first chunk that is not type 0")
+		}
+		_ = r.c.Close()
+	}
+}
+
+func TestPlayServerSequence(t *testing.T) {
+	tags := loadFLV(t, "h264_aac.flv")
+	srv := rtmptest.NewPlayServer(t, tags, rtmptest.PlayOptions{})
+	conn, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(context.Background(), "tcp", srv.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(conn)
+	if err := rtmp.ClientHandshake(struct {
+		io.Reader
+		io.Writer
+	}{br, conn}, rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	cw := rtmp.NewChunkWriter(conn)
+	cr := rtmp.NewChunkReader(br, rtmp.ChunkLimits{})
+	send := func(streamID uint32, vals ...any) {
+		b, err := rtmp.EncodeAMF0(vals...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cw.WriteMessage(3, rtmp.Message{Type: rtmp.MsgCommandAMF0, StreamID: streamID, Payload: b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send(0, "connect", 1, rtmp.Object{{Key: "app", Value: "live"}})
+	send(0, "createStream", 2, nil)
+	send(1, "play", 3, nil, "s")
+
+	var seq []string
+	sawPlay := false
+	for len(seq) < 12 {
+		m, err := cr.ReadMessage()
+		if err != nil {
+			t.Fatalf("after %v: %v", seq, err)
+		}
+		switch m.Type {
+		case rtmp.MsgUserControl:
+			if sawPlay && len(m.Payload) >= 2 {
+				seq = append(seq, "uc"+strconv.Itoa(int(m.Payload[1])))
+			}
+		case rtmp.MsgCommandAMF0, rtmp.MsgDataAMF0:
+			vals, err := rtmp.DecodeAMF0(m.Payload)
+			if err != nil || len(vals) == 0 {
+				t.Fatalf("decode: %v", err)
+			}
+			name, _ := vals[0].(string)
+			switch {
+			case name == "_result" && len(vals) > 1 && vals[1] == float64(2):
+				sawPlay = true // createStream answered; the play sequence follows
+			case name == "onStatus":
+				obj, _ := vals[len(vals)-1].(rtmp.Object)
+				code, _ := obj.Get("code")
+				seq = append(seq, "status:"+code.(string))
+			case name == "|RtmpSampleAccess":
+				seq = append(seq, "sampleaccess:"+strconv.FormatBool(vals[1] == true && vals[2] == true))
+			case name == "onMetaData":
+				seq = append(seq, "onMetaData")
+			}
+		case rtmp.MsgAudio, rtmp.MsgVideo:
+			seq = append(seq, "media")
+		}
+		if len(seq) > 0 && seq[len(seq)-1] == "media" {
+			break
+		}
+	}
+	want := []string{"uc0", "status:NetStream.Play.Reset", "status:NetStream.Play.Start", "sampleaccess:true", "onMetaData", "media"}
+	if !reflect.DeepEqual(seq, want) {
+		t.Fatalf("play sequence\n got %v\nwant %v", seq, want)
+	}
+}
