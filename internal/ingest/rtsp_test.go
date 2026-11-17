@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -330,7 +332,9 @@ func TestRTSPSyncBySR(t *testing.T) {
 		require.NoError(t, got.err)
 		assert.Empty(t, got.breaks)
 		v, a := offsets(got.frames, 0)
-		assert.LessOrEqual(t, spread(v, a), spa)
+		require.NotEmpty(t, v)
+		require.NotEmpty(t, a)
+		require.LessOrEqual(t, spread(v, a), spa)
 		assert.Zero(t, r.Stats()["sync_corrected"])
 	})
 	t.Run("sender reports after the wait", func(t *testing.T) {
@@ -348,7 +352,9 @@ func TestRTSPSyncBySR(t *testing.T) {
 			from = got.breaks[0]
 		}
 		v, a := offsets(got.frames, from)
-		assert.LessOrEqual(t, spread(v, a), spa, "aligned after the first SR")
+		require.NotEmpty(t, v)
+		require.NotEmpty(t, a)
+		require.LessOrEqual(t, spread(v, a), spa, "aligned after the first SR")
 	})
 	t.Run("an SR that jumps by 5 s", func(t *testing.T) {
 		setRTSPSyncWait(t, time.Second)
@@ -477,6 +483,7 @@ func TestRTSPPullSSRCChange(t *testing.T) {
 	// A restart is not a loss: only the old pending AU may be lost, never
 	// the new stream's first one (the IDR with in-band sets).
 	assert.LessOrEqual(t, st["lost_aus"], uint64(1))
+	assert.Equal(t, uint64(1), st["restart_dropped_aus"], "the second track's old pending AU")
 	require.Len(t, got.breaks, 1)
 	firstVideo := false
 	for _, f := range got.frames[got.breaks[0]:] {
@@ -486,6 +493,111 @@ func TestRTSPPullSSRCChange(t *testing.T) {
 		}
 	}
 	assert.True(t, firstVideo, "the new stream's first video AU is emitted")
+}
+
+// restartPull builds an rtspPull of an AAC track 0 and an H.264 track 1
+// without a client, for driving handleRTP with chosen packets.
+type restartPull struct {
+	r        *rtspPull
+	src      []rtsptest.TrackSource
+	vseq     uint16
+	aseq     uint16
+	h264     codecs.H264Payloader
+	arrival  time.Time
+	vi, ai   int
+	vts, ats uint32
+}
+
+func newRestartPull(t *testing.T) *restartPull {
+	t.Helper()
+	src := rtspFixture(t)
+	desc := rtsp.Description{Media: []rtsp.Media{
+		{Index: 0, Codec: rtsp.CodecAAC, Payload: 97, ClockRate: src[1].ClockRate, AAC: src[1].AAC},
+		{Index: 1, Codec: rtsp.CodecH264, Payload: 96, ClockRate: 90000, ParamSets: src[0].ParamSets},
+	}}
+	r := &rtspPull{frames: newRTPFrames(desc, nil, &media.ConfigCache{}), restarted: map[int]bool{}}
+	r.tracks = make([]*rtspTrack, 2)
+	for _, m := range desc.Media {
+		d, err := rtsp.NewDepacketizer(m, 0)
+		require.NoError(t, err)
+		r.tracks[m.Index] = &rtspTrack{dep: d}
+	}
+	return &restartPull{r: r, src: src, arrival: rtpT0}
+}
+
+// video sends the next video AU of the fixture with ssrc.
+func (p *restartPull) video(ssrc uint32) {
+	au := p.src[0].AUs[p.vi%len(p.src[0].AUs)]
+	p.vi++
+	var ab []byte
+	for _, n := range au.NALUs {
+		ab = append(ab, 0, 0, 0, 1)
+		ab = append(ab, n...)
+	}
+	pls := p.h264.Payload(1200, ab)
+	for j, pl := range pls {
+		p.arrival = p.arrival.Add(time.Millisecond)
+		p.r.handleRTP(rtsp.Packet{Track: 1, Arrival: p.arrival, RTP: &rtp.Packet{
+			Header:  rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: p.vseq, Timestamp: p.vts, SSRC: ssrc, Marker: j == len(pls)-1},
+			Payload: pl,
+		}})
+		p.vseq++
+	}
+	p.vts += 3600
+}
+
+// audio sends the next AAC AU with ssrc.
+func (p *restartPull) audio(ssrc uint32) {
+	au := p.src[1].AUs[p.ai%len(p.src[1].AUs)]
+	p.ai++
+	for _, pk := range rtsp.PacketizeAAC(au.Frames, p.ats, 1024, 1200, *p.src[1].AAC) {
+		pk.SequenceNumber, pk.SSRC, pk.PayloadType = p.aseq, ssrc, 97
+		p.aseq++
+		p.arrival = p.arrival.Add(time.Millisecond)
+		p.r.handleRTP(rtsp.Packet{Track: 0, Arrival: p.arrival, RTP: pk})
+	}
+	p.ats += 1024
+}
+
+func (p *restartPull) videoFrames() int {
+	n := 0
+	for _, e := range p.r.events {
+		if !e.disc && e.frame.Kind() == media.KindVideo {
+			n++
+		}
+	}
+	return n
+}
+
+// A track restarting alone, followed by normal flow, ends its restart
+// episode (here: by time): a later restart of the other track is a separate one and its old
+// pending AU is emitted, not dropped. Without the flow in between, the
+// second track joins the episode and drops it.
+func TestRTSPRestartEpisodes(t *testing.T) {
+	run := func(t *testing.T, flowBetween bool) (dropped uint64, videoBefore, videoAfter int) {
+		p := newRestartPull(t)
+		for range 3 {
+			p.video(100)
+			p.audio(200)
+		}
+		p.audio(201) // the audio track restarts alone
+		if flowBetween {
+			p.arrival = p.arrival.Add(2 * time.Second)
+			for range 4 {
+				p.audio(201)
+			}
+		}
+		videoBefore = p.videoFrames()
+		p.video(101) // the video track restarts: the AU pending since the old stream
+		videoAfter = p.videoFrames()
+		return p.r.n.restartDropped.Load(), videoBefore, videoAfter
+	}
+	dropped, before, after := run(t, true)
+	assert.Zero(t, dropped)
+	assert.Equal(t, before+1, after, "the old pending AU is emitted")
+	dropped, before, after = run(t, false)
+	assert.Equal(t, uint64(1), dropped)
+	assert.Equal(t, before, after, "it joins the audio restart and is dropped")
 }
 
 func TestRTSPParseTransportTwice(t *testing.T) {
