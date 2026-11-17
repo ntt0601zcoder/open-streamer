@@ -350,12 +350,19 @@ change; `pkg/h26x`'s DTS equals ffmpeg's minus one constant on the fixtures;
 the TS demuxer recovers reordered access units packed in one PES. The
 `TestM2c` scenarios in `internal/e2e` prove them (CI runs a second MediaMTX
 on the host network for RTSP, so that UDP works), with `pkg/h26x`'s DTS
-tests against ffmpeg for the DTS criterion. Against MediaMTX the tracks
-align within 250 ms rather than 40 ms: it sends no RTP-Info and builds its
-sender reports from packet arrival, so that video with B-frames, whose RTP
-timestamps lead their arrival by the reorder depth, is placed that much off;
-its first sender report round, 10 s in, then moves an offset and opens a new
-epoch (`sync_jumps`).
+tests against ffmpeg for the DTS criterion. MediaMTX sends no RTP-Info and
+builds its sender reports from packet arrival, and video with B-frames has RTP
+timestamps that lead their arrival by the reorder depth. The RTSP input
+therefore places video by DTS on arrival, evaluates sender-report offsets only
+on fresh pairs (each track's SR newer than the last pair), and moves an offset
+only when two consecutive fresh pairs confirm it, against 50 ms for the first
+correction and 100 ms for later moves, each plus the video reorder lead;
+unconfirmed candidates are counted (`sync_unconfirmed`). With that the tracks
+meet the 40 ms start-offset rule against MediaMTX, in one epoch, once the
+test publisher stops delaying audio (ffmpeg's RTP muxer aggregates AAC frames
+for up to its `max_delay`, 0.7 s for RTSP, which put audio 120 to 200 ms
+behind in the relay's arrival-based sender reports; the scenarios publish with
+`-max_delay 0`).
 
 The M2 row's DTS ruling changed in M2c: DTS is derived from the PTS and the
 reorder depth, not from the picture order count (RTP carries the PTS, and the extractor

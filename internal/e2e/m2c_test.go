@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ import (
 // once its publisher's tracks are known, 2 to 2.5 s after it connects.
 const (
 	rtspReady = 8 * time.Second
-	spanH264  = 24 * time.Second
+	spanH264  = 32 * time.Second
 )
 
 // ffmpegRTSP returns ffmpeg once it is known to publish RTSP over TCP.
@@ -76,8 +77,35 @@ func loopClip(t *testing.T, ffmpeg, name string, passes int, span time.Duration)
 	return out
 }
 
+var (
+	catchupOnce sync.Once
+	catchupOK   bool
+)
+
+// rateArgs paces ffmpeg at real time with no initial burst, and, where ffmpeg
+// has the option (7.1 and later), no catch-up: the default catch-up of 1.05
+// would send the first seconds 5 % fast, which skews a relay's sender
+// reports.
+func rateArgs(t *testing.T, ffmpeg string) []string {
+	t.Helper()
+	catchupOnce.Do(func() {
+		out, err := exec.CommandContext(context.Background(), ffmpeg, "-hide_banner", "-h", "full").CombinedOutput()
+		catchupOK = err == nil && bytes.Contains(out, []byte("readrate_catchup"))
+	})
+	args := []string{"-readrate", "1", "-readrate_initial_burst", "0"}
+	if catchupOK {
+		args = append(args, "-readrate_catchup", "1")
+	}
+	return args
+}
+
 // rtspPublish starts ffmpeg publishing the TS clip, in real time, to
-// MediaMTX at url. ffmpeg's RTSP muxer refuses AAC without global headers,
+// MediaMTX at url. "-max_delay 0" matters: ffmpeg's RTP muxer holds AAC
+// frames back, aggregating them into one packet for up to the muxer's
+// max_delay (0.7 s for RTSP), which makes the audio arrive 120 to 200 ms
+// behind its video; a pull of the relay cannot know that, since MediaMTX
+// builds its sender reports from arrival, and the tracks would start that
+// far apart. ffmpeg's RTSP muxer refuses AAC without global headers,
 // which a TS carries only as ADTS, so the clip is remuxed to MP4 first (a
 // copy of every packet).
 func rtspPublish(t *testing.T, ffmpeg, clip, url string) *ffmpegProc {
@@ -86,47 +114,15 @@ func rtspPublish(t *testing.T, ffmpeg, clip, url string) *ffmpegProc {
 	b, err := exec.CommandContext(t.Context(), ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
 		"-i", clip, "-c", "copy", "-f", "mp4", mp4).CombinedOutput()
 	require.NoError(t, err, string(b))
-	return startFFmpeg(t, ffmpeg, "-readrate", "1", "-readrate_initial_burst", "0", "-readrate_catchup", "1", "-i", mp4, "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", url)
+	return startFFmpeg(t, ffmpeg, append(rateArgs(t, ffmpeg), "-i", mp4, "-c", "copy", "-max_delay", "0", "-f", "rtsp", "-rtsp_transport", "tcp", url)...)
 }
 
-// rtspStartOffset is the largest offset, in 90 kHz ticks, that the rows
-// pulling from MediaMTX allow between the first PTS of their tracks in an
-// epoch (250 ms, where the rule's default is 40 ms). MediaMTX sends no
-// RTP-Info and makes its own sender reports from the arrival times of the
-// packets it relays, and the RTP timestamps of video with B-frames lead
-// their arrival by the reorder depth (up to four frames, 160 ms, for the
-// pyramid), so a pull aligns the tracks within that lead and an audio frame,
-// not within 40 ms.
-const rtspStartOffset = 22500
-
 // checkRTSP waits for the run to end and checks that the frames are clean
-// (see rtspStartOffset), with nothing lost in the hub and no drift epoch.
-// The epochs are consecutive from 1, and each change is a move of a track's
-// offset by a sender report that the reader counted (sync_corrected or
-// sync_jumps), unless exact epochs are given (the failover row, which ends
-// before the first sender report round).
-func checkRTSP(t *testing.T, r *m2aRun, rl *readerLog, exact ...uint32) {
+// (conform's default rules, the 40 ms start offset included), in the epochs
+// wantEpochs, with nothing lost in the hub and no drift epoch.
+func checkRTSP(t *testing.T, r *m2aRun, wantEpochs ...uint32) {
 	t.Helper()
-	r.wait()
-	require.NotErrorIs(t, r.err, context.DeadlineExceeded, "the run did not end within %v", runLimit)
-	if r.err != nil {
-		require.ErrorIs(t, r.err, context.Canceled)
-	}
-	require.NotEmpty(t, r.col.frames)
-	assert.Zero(t, r.col.lost)
-	assert.Nil(t, conform.CheckFrames(r.col.frames, conform.FrameOptions{MaxStartOffset: rtspStartOffset}))
-	ep := epochs(r.col.frames)
-	if exact != nil {
-		assert.Equal(t, exact, ep)
-	} else {
-		for i, e := range ep {
-			assert.Equal(t, uint32(i+1), e, "epochs %v", ep)
-		}
-		st := rl.stats()
-		assert.LessOrEqual(t, uint64(len(ep)-1), st["sync_corrected"]+st["sync_jumps"], "epoch changes %v against counted offset moves", ep)
-	}
-	assert.Zero(t, r.stats.Clock.DriftBreaks, "drift breaks")
-	assert.Zero(t, r.stats.Clock.DroppedDrift, "dropped by drift")
+	r.check(t, wantEpochs)
 }
 
 // mtxRTSP runs one MediaMTX row: ffmpeg publishes span of the fixture name
@@ -155,18 +151,17 @@ func mtxRTSP(t *testing.T, name, transport string, span time.Duration) (r *m2aRu
 	mtxEnd(r, f.done, ended)
 	r.waitActive(t, 0, rtspReady)
 	join = time.Since(started)
-	checkRTSP(t, r, rl)
+	checkRTSP(t, r, 1)
 	f.requireExited(t)
-	return r, src, rl, joinBounds(join, ffmpegBurst), join
+	return r, src, rl, joinBounds(join, 0), join
 }
 
 // TestM2cRTSPMediaMTXH264 has ffmpeg publish h264_pyramid.ts (a B-pyramid
-// with AAC), looped, into MediaMTX for 24 s, and plays it over TCP
-// interleaved: clean frames, every loss-free packet delivered, drift
-// evaluated and no drift epoch. MediaMTX's first sender report round, 10 s
-// in, moves an offset and so opens epoch 2; the Clock's drift evaluation
-// starts 10 s into an epoch, so it needs the 24 s (liveSpan's 30 s is for an
-// epoch that lasts).
+// with AAC), looped, into MediaMTX for 32 s, and plays it over TCP
+// interleaved: one epoch of clean frames (the default 40 ms start-offset
+// rule included), nothing lost over TCP, no offset jump, drift evaluated and
+// no drift epoch. MediaMTX sends sender reports every 10 s, so 32 s covers
+// three rounds.
 func TestM2cRTSPMediaMTXH264(t *testing.T) {
 	t.Parallel()
 	r, src, rl, b, join := mtxRTSP(t, "h264_pyramid.ts", "tcp", spanH264)
@@ -177,6 +172,8 @@ func TestM2cRTSPMediaMTXH264(t *testing.T) {
 	assert.Zero(t, st["lost_packets"], "lost packets over TCP")
 	assert.Zero(t, st["lost_aus"], "lost AUs over TCP")
 	assert.Zero(t, st["skipped_tracks"])
+	assert.Zero(t, st["sync_jumps"], "offset jumps")
+	assert.LessOrEqual(t, st["sync_corrected"], uint64(1), "first-pair corrections")
 	assert.Positive(t, r.stats.Clock.DriftEvaluations, "drift evaluated")
 	t.Logf("joined %v after the publish; source %s, delivered %s over %v; clock %+v; reader %v; failures %v",
 		join.Round(time.Millisecond), src, r.col.counts(), r.col.span().Round(time.Millisecond),
@@ -196,6 +193,7 @@ func TestM2cRTSPMediaMTXH265UDP(t *testing.T) {
 	assertCodecs(t, r.col.frames, media.CodecH265, media.CodecAAC)
 	assert.Zero(t, r.stats.Switches)
 	assert.Zero(t, st["skipped_tracks"])
+	assert.Zero(t, st["sync_jumps"], "offset jumps")
 	assert.Equal(t, uint64(0), st["fallback_tcp"], "UDP carried the media")
 	require.NotEmpty(t, r.col.frames)
 	assert.True(t, r.col.frames[0].Key, "first frame is a keyframe")
@@ -388,7 +386,7 @@ func TestM2cFailoverRTSPtoRTMP(t *testing.T) {
 	require.NoError(t, primary.cmd.Process.Kill())
 	r.waitActive(t, 1, 15*time.Second)
 	failover := time.Since(killed)
-	checkRTSP(t, r, &rl, 1, 2)
+	checkRTSP(t, r, 1, 2)
 	<-done
 	require.NoError(t, *perr)
 	assert.Equal(t, uint64(1), r.stats.Switches)
@@ -417,13 +415,7 @@ func TestM2cFailoverRTSPtoRTMP(t *testing.T) {
 	defer cancel()
 	c, err := conform.ReadHLS(ctx, base+"hls/index.m3u8", conform.ReadOptions{Once: true})
 	require.NoError(t, err)
-	// The read-back applies the 40 ms start-offset rule, which the primary's
-	// alignment through MediaMTX does not meet (see rtspStartOffset); every
-	// other rule must hold, and the frames meet the wider bound.
-	for _, v := range c.Violations {
-		assert.Equal(t, conform.RuleStartOffset, v.Rule, "%v", v)
-	}
-	assert.Nil(t, conform.CheckFrames(c.Frames, conform.FrameOptions{MaxStartOffset: rtspStartOffset}))
+	assert.Empty(t, c.Violations)
 	assert.NotEmpty(t, c.Frames)
 	assert.Equal(t, []uint32{1, 2}, epochs(c.Frames))
 	t.Logf("failover %v after the kill; delivered %s; HLS read back %s; failures %v; took %v",
