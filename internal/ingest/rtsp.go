@@ -145,6 +145,7 @@ type rtspPull struct {
 	// restarted holds the tracks that restarted in the current camera
 	// restart.
 	restarted map[int]bool
+	episode   time.Time // the arrival of the first restart in it
 
 	// The reading goroutine's own state.
 	pending      []rtsp.Packet // RTP read while Open waited, in order
@@ -350,7 +351,7 @@ func (r *rtspPull) handleRTP(p rtsp.Packet) {
 		// old timeline and goes out (an unfinished fragment is lost by
 		// Flush itself), and the new stream's first AU is not marked.
 		old := t.dep.Flush()
-		if r.joinsRestart(p.Track) {
+		if r.joinsRestart(p.Track, p.Arrival) {
 			// Another track restarted just before, and its discontinuity
 			// is out: this track's old AU would land after it.
 			r.n.restartDropped.Add(uint64(len(old)))
@@ -360,6 +361,10 @@ func (r *rtspPull) handleRTP(p rtsp.Packet) {
 		if r.frames.restart(p.Track) {
 			r.disc()
 		}
+		if len(r.restarted) == 0 {
+			r.episode = p.Arrival
+		}
+		r.restarted[p.Track] = true
 	case gap > 0 || reset:
 		t.dep.Gap()
 	}
@@ -367,16 +372,22 @@ func (r *rtspPull) handleRTP(p rtsp.Packet) {
 	r.pushAUs(t.dep.Push(p.RTP, p.Arrival))
 }
 
-// joinsRestart records that track restarted and reports whether another
-// track had restarted before it in the same camera restart, a restart of a
-// track already recorded starting a new one.
-func (r *rtspPull) joinsRestart(track int) bool {
-	if r.restarted[track] {
+// rtspRestartEpisode is how long after the first track restarted another
+// track's restart still counts as the same camera restart. The tracks of a
+// camera restart together, within the delivery skew of a few packets. Frames
+// cannot end an episode: the restarted track's first new AU is emitted at
+// once, and the old frames of the track still to restart are what it is
+// there to drop.
+const rtspRestartEpisode = 500 * time.Millisecond
+
+// joinsRestart reports whether another track restarted before track in the
+// same restart episode, by packet arrival time. A track restarting again
+// starts a new episode.
+func (r *rtspPull) joinsRestart(track int, at time.Time) bool {
+	if r.restarted[track] || at.Sub(r.episode) > rtspRestartEpisode {
 		clear(r.restarted)
 	}
-	joins := len(r.restarted) > 0
-	r.restarted[track] = true
-	return joins
+	return len(r.restarted) > 0
 }
 
 // pushAUs converts access units and queues their frames. A bad AU is
