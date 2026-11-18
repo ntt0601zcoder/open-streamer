@@ -21,6 +21,7 @@ const (
 	defaultCommandTimeout       = 10 * time.Second
 	defaultIdleTimeout          = 30 * time.Second
 	defaultPingInterval         = 10 * time.Second
+	defaultWriteTimeout         = 10 * time.Second
 	defaultMaxPrePublishMessage = 64 << 10
 	defaultMaxPrePublishStreams = 8
 	defaultMaxPrePublishPending = 256 << 10
@@ -44,6 +45,10 @@ type Config struct {
 	// PingInterval is how often a server sends PingRequest. Clients never
 	// ping. Default 10 s.
 	PingInterval time.Duration
+	// WriteTimeout bounds each media write, and every write once a reader
+	// goroutine runs (a play conn being served, a publish being sent). A
+	// write that misses it ends the session. Default 10 s.
+	WriteTimeout time.Duration
 	// MaxMessage is the largest message accepted once publish is accepted,
 	// and by clients. Default 8 MiB. Once publish is accepted a server also
 	// allows 64 chunk streams and 16 MiB of partial messages, as clients do.
@@ -76,6 +81,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.PingInterval <= 0 {
 		c.PingInterval = defaultPingInterval
+	}
+	if c.WriteTimeout <= 0 {
+		c.WriteTimeout = defaultWriteTimeout
 	}
 	if c.MaxMessage <= 0 {
 		c.MaxMessage = defaultMaxMessage
@@ -126,11 +134,19 @@ const (
 	roleClient
 )
 
-// session is the single-goroutine message loop shared by the server and the
-// client. It owns the buffered reader, the chunk reader and writer,
-// acknowledgements, pings, timeouts, inbound protocol control and aggregate
-// splitting. Every method except Close and LastInbound must be called from
-// one goroutine, which does all reads and all writes.
+// session is the message loop shared by the server and the client. It owns
+// the buffered reader, the chunk reader and writer, acknowledgements, pings,
+// timeouts, inbound protocol control and aggregate splitting.
+//
+// It runs in one of two modes. Until runReader, every method except Close,
+// LastInbound, Done and Err is called from one goroutine, which does all
+// reads and all writes; phase and handshake state is set only then. After
+// runReader, one reader goroutine owns next, and so every read and every
+// write a read causes (acks, pings, ping responses, Window Ack Size); any
+// other goroutine may call writeMedia. Every outbound message, media or
+// control, is written whole while holding wmu, so a control message never
+// lands inside a media message's chunks and the chunk writer's header state
+// is never shared.
 type session struct {
 	conn  net.Conn
 	cfg   Config
@@ -157,6 +173,17 @@ type session struct {
 	lastInbound atomic.Int64 // lastIn in Unix nanoseconds, for other goroutines
 	closeOnce   sync.Once
 	closeErr    error
+
+	// wmu is held for every outbound message, around the chunk writer, and
+	// guards writeTimeout, reading and writeLimit.
+	wmu          sync.Mutex
+	writeTimeout time.Duration // bound of media writes, and of all writes once reading
+	reading      bool          // runReader has started
+	writeLimit   time.Duration // bound of the write in progress
+
+	done  chan struct{} // closed when the reader goroutine exits
+	errMu sync.Mutex
+	err   error // first cause of the session's end
 }
 
 // newSession wraps conn. The caller runs handshake next, then the command
@@ -164,7 +191,11 @@ type session struct {
 func newSession(conn net.Conn, cfg Config, r role) *session {
 	cfg = cfg.withDefaults()
 	now := cfg.Now()
-	s := &session{conn: conn, cfg: cfg, role: r, start: now}
+	s := &session{
+		conn: conn, cfg: cfg, role: r, start: now,
+		writeTimeout: cfg.WriteTimeout,
+		done:         make(chan struct{}),
+	}
 	s.touch(now)
 	s.br = bufio.NewReader(sessionReader{s})
 	lim := s.postPublishLimits()
@@ -186,6 +217,10 @@ func newSession(conn net.Conn, cfg Config, r role) *session {
 func (s *session) handshake() error {
 	s.setPhase(s.cfg.HandshakeTimeout, "handshake")
 	defer s.endPhase()
+	// The handshake writes through sessionWriter, which runs under wmu.
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.writeLimit = s.cfg.IdleTimeout
 	rw := struct {
 		io.Reader
 		io.Writer
@@ -236,12 +271,107 @@ func (s *session) LastInbound() time.Time {
 	return time.Unix(0, s.lastInbound.Load())
 }
 
-// Close closes the connection, which unblocks a pending read. It never
-// writes, so it is safe to call from any goroutine, and only the first call
-// closes.
+// Close closes the connection, which unblocks a pending read or write and
+// stops the reader goroutine. It never writes, so it is safe to call from any
+// goroutine, and only the first call closes. When nothing ended the session
+// before, Err reports net.ErrClosed.
 func (s *session) Close() error {
+	s.setErr(fmt.Errorf("rtmp: session: %w", net.ErrClosed))
 	s.closeOnce.Do(func() { s.closeErr = s.conn.Close() })
 	return s.closeErr
+}
+
+// fail ends the session with err as its cause, unless one was set before,
+// and closes the connection.
+func (s *session) fail(err error) {
+	s.setErr(err)
+	_ = s.Close()
+}
+
+func (s *session) setErr(err error) {
+	s.errMu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.errMu.Unlock()
+}
+
+// Err is the first cause of the session's end: the reader's or a write's
+// error, the handler's error, or net.ErrClosed after Close. It is nil while
+// the session runs and is safe to call from any goroutine.
+func (s *session) Err() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.err
+}
+
+// Done is closed once the reader goroutine started by runReader has
+// exited; Err then reports why. Without runReader it never closes.
+func (s *session) Done() <-chan struct{} {
+	return s.done
+}
+
+// runReader starts the reader goroutine, once the command exchange is over
+// and no phase is set: it reads messages with next, which answers pings and
+// acknowledges as before, and passes every other message to handle. A read
+// error or a handle error ends the session with that cause and closes the
+// connection; Close stops the goroutine. From now on every write is bounded
+// by the write timeout. It must be called once, from the goroutine that ran
+// the exchange.
+func (s *session) runReader(handle func(Message) error) {
+	s.wmu.Lock()
+	s.reading = true
+	s.wmu.Unlock()
+	go func() {
+		defer close(s.done)
+		for {
+			m, err := s.next()
+			if err == nil {
+				err = handle(m)
+			}
+			if err != nil {
+				s.fail(err)
+				return
+			}
+		}
+	}()
+}
+
+// setWriteTimeout replaces Config.WriteTimeout for the writes that follow;
+// d <= 0 restores the default. It is safe to call from any goroutine.
+func (s *session) setWriteTimeout(d time.Duration) {
+	if d <= 0 {
+		d = defaultWriteTimeout
+	}
+	s.wmu.Lock()
+	s.writeTimeout = d
+	s.wmu.Unlock()
+}
+
+// write runs f on the chunk writer holding wmu. A media write, and every
+// write once the reader runs, is bounded by the write timeout; a control
+// write of the single-goroutine mode keeps IdleTimeout (or the phase end).
+func (s *session) write(media bool, f func(*ChunkWriter) error) error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.writeLimit = s.cfg.IdleTimeout
+	if media || s.reading {
+		s.writeLimit = s.writeTimeout
+	}
+	return f(s.cw)
+}
+
+// writeMedia writes one audio, video or data message on chunk stream csid
+// within the write timeout. It may be called from any goroutine once
+// runReader runs. A failed write leaves the chunk stream mid-message, so it
+// ends the session: the error is returned and becomes Err.
+func (s *session) writeMedia(csid uint32, m Message) error {
+	err := s.write(true, func(cw *ChunkWriter) error { return cw.WriteMessage(csid, m) })
+	if err != nil {
+		err = fmt.Errorf("rtmp: session: media: %w", err)
+		s.fail(err)
+	}
+	return err
 }
 
 func (s *session) touch(now time.Time) {
@@ -383,15 +513,16 @@ func (r sessionReader) Read(p []byte) (int, error) {
 	}
 }
 
-// sessionWriter writes to the conn with a deadline of IdleTimeout, or the
-// phase end when that is sooner.
+// sessionWriter writes to the conn with a deadline of writeLimit, or the
+// phase end when that is sooner. It runs only under wmu; the phase is set
+// only before the reader goroutine starts, and is zero after.
 type sessionWriter struct{ s *session }
 
 func (w sessionWriter) Write(p []byte) (int, error) {
 	s := w.s
 	now := s.cfg.Now()
-	d := now.Add(s.cfg.IdleTimeout)
-	if !s.phaseEnd.IsZero() && s.phaseEnd.Before(d) {
+	d := now.Add(s.writeLimit)
+	if !s.reading && !s.phaseEnd.IsZero() && s.phaseEnd.Before(d) {
 		d = s.phaseEnd
 	}
 	_ = s.conn.SetWriteDeadline(connDeadline(d, now))
