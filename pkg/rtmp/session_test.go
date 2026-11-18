@@ -583,7 +583,269 @@ func TestConfigDefaults(t *testing.T) {
 	if c.HandshakeTimeout != 5*time.Second || c.CommandTimeout != 10*time.Second ||
 		c.IdleTimeout != 30*time.Second || c.PingInterval != 10*time.Second ||
 		c.MaxMessage != 8<<20 || c.MaxPrePublishMessage != 64<<10 ||
-		c.MaxPrePublishStreams != 8 || c.MaxPrePublishPending != 256<<10 || c.Now == nil {
+		c.MaxPrePublishStreams != 8 || c.MaxPrePublishPending != 256<<10 ||
+		c.WriteTimeout != 10*time.Second || c.Now == nil {
 		t.Fatalf("defaults: %+v", c)
 	}
+}
+
+// wireMsg is a message the peer reassembled and the stream offset at its end.
+type wireMsg struct {
+	m   Message
+	end uint64
+}
+
+// concurrentPeer is the far end of a net.Pipe for a session that runs a reader
+// goroutine: a goroutine reassembles what the session writes, with the offset
+// at which each message ends, and the test writes the peer's stream itself.
+type concurrentPeer struct {
+	conn net.Conn
+	msgs chan wireMsg
+}
+
+func newConcurrentPair(t *testing.T) (*session, *concurrentPeer) {
+	t.Helper()
+	a, b := net.Pipe()
+	s := newSession(a, Config{}, roleClient)
+	p := &concurrentPeer{conn: b, msgs: make(chan wireMsg, 4096)}
+	t.Cleanup(func() {
+		_ = s.Close()
+		_ = b.Close()
+	})
+	go func() {
+		defer close(p.msgs)
+		cr := NewChunkReader(bufio.NewReader(b), ChunkLimits{MaxMessage: 4 << 20})
+		for {
+			m, err := cr.ReadMessage()
+			if err != nil {
+				return
+			}
+			p.msgs <- wireMsg{m: m, end: cr.BytesRead()}
+		}
+	}()
+	return s, p
+}
+
+// awaitDone waits for the session's reader to stop.
+func awaitDone(t *testing.T, s *session) {
+	t.Helper()
+	select {
+	case <-s.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the reader goroutine did not stop")
+	}
+}
+
+// A 1 MiB media message written in 128-byte chunks while the peer floods
+// pings: every ping is answered, and each media message arrives byte-identical
+// with no control chunk inside its chunks.
+func TestSessionConcurrentPingDuringWrite(t *testing.T) {
+	s, p := newConcurrentPair(t)
+	s.runReader(func(Message) error { return nil })
+
+	stop := make(chan struct{})
+	pinged := make(chan int, 1)
+	go func() {
+		w := NewChunkWriter(p.conn)
+		n := 0
+		defer func() { pinged <- n }()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ping := appendUserControl(nil, ucPingRequest, uint32(n))
+			if err := w.WriteMessage(controlCSID, Message{Type: MsgUserControl, Payload: ping}); err != nil {
+				return
+			}
+			n++
+		}
+	}()
+
+	const count = 4
+	payload := make([]byte, 1<<20)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	// The wire size of each media message: csid 6 keeps its own header state,
+	// so encoding the same sequence alone gives the same bytes.
+	ref := NewChunkWriter(io.Discard)
+	sizes := make([]int, count)
+	media := make([]Message, count)
+	for i := range count {
+		media[i] = Message{Type: MsgVideo, StreamID: 1, Timestamp: uint32(i * 40), Payload: payload}
+		ref.encode(6, media[i])
+		sizes[i] = len(ref.buf)
+	}
+	for i := range count {
+		if err := s.writeMedia(6, media[i]); err != nil {
+			t.Fatalf("media %d: %v", i, err)
+		}
+	}
+	close(stop)
+	sent := <-pinged
+	if sent == 0 {
+		t.Fatal("the peer sent no ping")
+	}
+
+	type span struct{ start, end uint64 }
+	var spans []span
+	var pongs []uint64
+	seen := make(map[uint32]bool)
+	deadline := time.After(5 * time.Second)
+	for len(seen) < sent || len(spans) < count {
+		var w wireMsg
+		select {
+		case m, ok := <-p.msgs:
+			if !ok {
+				t.Fatalf("peer stream ended: %d of %d pongs, %d of %d media", len(seen), sent, len(spans), count)
+			}
+			w = m
+		case <-deadline:
+			t.Fatalf("%d of %d pongs, %d of %d media", len(seen), sent, len(spans), count)
+		}
+		switch w.m.Type {
+		case MsgVideo:
+			i := len(spans)
+			if w.m.Timestamp != media[i].Timestamp || !bytes.Equal(w.m.Payload, payload) {
+				t.Fatalf("media %d: ts %d, %d bytes, not the payload sent", i, w.m.Timestamp, len(w.m.Payload))
+			}
+			spans = append(spans, span{w.end - uint64(sizes[i]), w.end})
+		case MsgUserControl:
+			ev, data, err := parseUserControl(w.m.Payload)
+			if err != nil || ev != ucPingResponse || len(data) != 4 {
+				t.Fatalf("got user control %x, want PingResponse", w.m.Payload)
+			}
+			seen[binary.BigEndian.Uint32(data)] = true
+			pongs = append(pongs, w.end)
+		default:
+			t.Fatalf("unexpected message type %d", w.m.Type)
+		}
+	}
+	for _, e := range pongs {
+		for i, sp := range spans {
+			if e > sp.start && e < sp.end {
+				t.Fatalf("a pong ends at %d, inside media %d [%d, %d]", e, i, sp.start, sp.end)
+			}
+		}
+	}
+	// The flood ran while media was being written.
+	between := 0
+	for _, e := range pongs {
+		if e > spans[0].end && e <= spans[count-1].start {
+			between++
+		}
+	}
+	if between == 0 {
+		t.Fatalf("no pong between the media messages (%d pongs): the writes did not overlap", len(pongs))
+	}
+}
+
+func TestSessionWriteTimeout(t *testing.T) {
+	big := Message{Type: MsgVideo, StreamID: 1, Payload: make([]byte, 1<<20)}
+
+	check := func(t *testing.T, s *session, want time.Duration) {
+		t.Helper()
+		s.runReader(func(Message) error { return nil })
+		start := time.Now()
+		err := s.writeMedia(6, big) // the peer never reads
+		elapsed := time.Since(start)
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("writeMedia: %v, want a write timeout", err)
+		}
+		if elapsed < want*3/4 || elapsed > want+time.Second {
+			t.Fatalf("writeMedia failed after %v, want about %v", elapsed, want)
+		}
+		awaitDone(t, s)
+		if !errors.Is(s.Err(), os.ErrDeadlineExceeded) {
+			t.Fatalf("Err %v, want the write timeout", s.Err())
+		}
+		// The session is closed: a later write fails at once.
+		start = time.Now()
+		if err := s.writeMedia(6, audio(0, 10)); err == nil || time.Since(start) > time.Second {
+			t.Fatalf("write after failure: %v after %v", err, time.Since(start))
+		}
+	}
+
+	t.Run("config", func(t *testing.T) {
+		a, b := net.Pipe()
+		defer b.Close()
+		s := newSession(a, Config{WriteTimeout: 200 * time.Millisecond}, roleServer)
+		defer s.Close()
+		check(t, s, 200*time.Millisecond)
+	})
+	t.Run("override", func(t *testing.T) {
+		a, b := net.Pipe()
+		defer b.Close()
+		s := newSession(a, Config{}, roleServer)
+		defer s.Close()
+		s.setWriteTimeout(150 * time.Millisecond)
+		check(t, s, 150*time.Millisecond)
+	})
+}
+
+func TestSessionReaderStopsOnClose(t *testing.T) {
+	t.Run("close", func(t *testing.T) {
+		s, p := newConcurrentPair(t)
+		got := make(chan Message, 1)
+		s.runReader(func(m Message) error {
+			got <- m
+			return nil
+		})
+		b, _ := stream(t, audio(5, 10))
+		go func() { _, _ = p.conn.Write(b) }()
+		select {
+		case m := <-got:
+			if m.Type != MsgAudio || m.Timestamp != 5 {
+				t.Fatalf("handled type %d ts %d", m.Type, m.Timestamp)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("the reader handled nothing")
+		}
+		select {
+		case <-s.Done():
+			t.Fatal("Done closed while the session is open")
+		default:
+		}
+		if s.Err() != nil {
+			t.Fatalf("Err %v while the session is open", s.Err())
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("second Close: %v", err)
+		}
+		awaitDone(t, s)
+		if !errors.Is(s.Err(), net.ErrClosed) {
+			t.Fatalf("Err %v, want net.ErrClosed", s.Err())
+		}
+	})
+
+	t.Run("handler error", func(t *testing.T) {
+		s, p := newConcurrentPair(t)
+		s.runReader(func(Message) error { return io.EOF })
+		b, _ := stream(t, audio(0, 10), audio(20, 10))
+		go func() { _, _ = p.conn.Write(b) }()
+		awaitDone(t, s)
+		if !errors.Is(s.Err(), io.EOF) {
+			t.Fatalf("Err %v, want the handler's io.EOF", s.Err())
+		}
+		// The first cause stays.
+		_ = s.Close()
+		if !errors.Is(s.Err(), io.EOF) {
+			t.Fatalf("Err after Close %v, want io.EOF", s.Err())
+		}
+	})
+
+	t.Run("read error", func(t *testing.T) {
+		s, p := newConcurrentPair(t)
+		s.runReader(func(Message) error { return nil })
+		_ = p.conn.Close()
+		awaitDone(t, s)
+		if s.Err() == nil {
+			t.Fatal("Err is nil after the peer closed")
+		}
+	})
 }

@@ -69,7 +69,9 @@ func controlUint32(m Message, what string) (uint32, error) {
 // writeControl writes a protocol control or user control message on chunk
 // stream 2, message stream 0.
 func (s *session) writeControl(typ uint8, payload []byte) error {
-	return s.cw.WriteMessage(controlCSID, Message{Type: typ, Payload: payload})
+	return s.write(false, func(cw *ChunkWriter) error {
+		return cw.WriteMessage(controlCSID, Message{Type: typ, Payload: payload})
+	})
 }
 
 // sendWindowAckSize tells the peer how many bytes it may send before it
@@ -89,7 +91,7 @@ func (s *session) sendPeerBandwidth(n uint32, limit uint8) error {
 
 // setChunkSize sends Set Chunk Size and uses n for our following chunks.
 func (s *session) setChunkSize(n int) error {
-	return s.cw.SetChunkSize(n)
+	return s.write(false, func(cw *ChunkWriter) error { return cw.SetChunkSize(n) })
 }
 
 // sendUserControl sends a user control event, such as StreamBegin(stream id)
@@ -105,7 +107,9 @@ func (s *session) writeCommand(streamID uint32, vals ...any) error {
 	if err != nil {
 		return fmt.Errorf("rtmp: session: encode command: %w", err)
 	}
-	return s.cw.WriteMessage(commandCSID, Message{Type: MsgCommandAMF0, StreamID: streamID, Payload: p})
+	return s.write(false, func(cw *ChunkWriter) error {
+		return cw.WriteMessage(commandCSID, Message{Type: MsgCommandAMF0, StreamID: streamID, Payload: p})
+	})
 }
 
 // handleControl consumes protocol control messages and ping user control
