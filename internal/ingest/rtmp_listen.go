@@ -407,7 +407,8 @@ func (l *rtmpListen) Spec() Spec { return l.spec }
 // Stats implements Reader: the flvFrames counters of every publisher, the
 // commands its publishers sent that were unknown (unknown_commands) or did
 // not decode (bad_commands), the publishers accepted and taken over, and the
-// rejections of the shared TCP listener (for every path on it).
+// rejections of the shared TCP listener, publishes and plays, for every path
+// on it (rtmpsrv.Stats.Counters).
 func (l *rtmpListen) Stats() map[string]uint64 {
 	l.mu.Lock()
 	out := make(map[string]uint64, len(l.doneStat)+8)

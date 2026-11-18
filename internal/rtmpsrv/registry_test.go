@@ -21,7 +21,8 @@ import (
 
 // fakeSink is a PublishSink that keeps every conn it is offered.
 type fakeSink struct {
-	isBusy atomic.Bool
+	isBusy    atomic.Bool
+	busyCalls atomic.Int32
 	// read makes offer read each conn's media in a goroutine until it ends,
 	// counting it in media, then close the conn.
 	read  bool
@@ -64,7 +65,10 @@ func (f *fakeSink) Offer(conn *rtmp.ServerConn) bool {
 	return true
 }
 
-func (f *fakeSink) Busy(time.Time) bool { return f.isBusy.Load() }
+func (f *fakeSink) Busy(time.Time) bool {
+	f.busyCalls.Add(1)
+	return f.isBusy.Load()
+}
 
 // close refuses later offers and closes the conns taken so far.
 func (f *fakeSink) close() {
@@ -483,8 +487,9 @@ func TestRegistryFloodCaps(t *testing.T) {
 		}
 	})
 	t.Run("defaults", func(t *testing.T) {
-		assert.Equal(t, Policy{MaxPrePublish: 64, MaxPrePublishPerIP: 4}, Policy{}.withDefaults())
-		assert.Equal(t, Policy{MaxPrePublish: 8, MaxPrePublishPerIP: 2}, Policy{MaxPrePublish: 8, MaxPrePublishPerIP: 2}.withDefaults())
+		p := Policy{MaxPrePublish: 8, MaxPrePublishPerIP: 2}.withDefaults()
+		assert.Equal(t, 8, p.MaxPrePublish, "set fields are kept")
+		assert.Equal(t, 2, p.MaxPrePublishPerIP, "set fields are kept")
 	})
 }
 
@@ -578,4 +583,427 @@ func TestPeerKey(t *testing.T) {
 	if k := peerKey(&net.UnixAddr{Name: "@x", Net: "unix"}); k == "" {
 		t.Error("empty key for a unix address")
 	}
+}
+
+// fakePlayer is a PlayHandler. Live is true for the names in live, or for
+// every name when live is nil. Serve writes one audio message, then waits
+// for ctx or the conn to end, and lingers before returning.
+type fakePlayer struct {
+	live   map[string]bool
+	block  chan struct{} // when set, Live waits until it is closed
+	linger time.Duration
+
+	mu     sync.Mutex
+	asked  []string
+	served chan *rtmp.ServerConn
+
+	serving, ended atomic.Int32
+}
+
+func newFakePlayer(live ...string) *fakePlayer {
+	h := &fakePlayer{served: make(chan *rtmp.ServerConn, 64)}
+	if len(live) > 0 {
+		h.live = map[string]bool{}
+		for _, n := range live {
+			h.live[n] = true
+		}
+	}
+	return h
+}
+
+func (h *fakePlayer) Live(name string) bool {
+	h.mu.Lock()
+	h.asked = append(h.asked, name)
+	h.mu.Unlock()
+	if h.block != nil {
+		<-h.block
+	}
+	return h.live == nil || h.live[name]
+}
+
+func (h *fakePlayer) Serve(ctx context.Context, conn *rtmp.ServerConn) {
+	h.serving.Add(1)
+	defer h.serving.Add(-1)
+	defer h.ended.Add(1)
+	h.served <- conn
+	_ = conn.WriteMedia(rtmp.Media{Type: rtmp.MsgAudio, Payload: []byte{0xAF, 0x00, 0x12, 0x10}})
+	select {
+	case <-ctx.Done():
+	case <-conn.Done():
+	}
+	time.Sleep(h.linger)
+}
+
+func (h *fakePlayer) askedFor() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.asked...)
+}
+
+func (h *fakePlayer) next(t *testing.T) *rtmp.ServerConn {
+	t.Helper()
+	select {
+	case c := <-h.served:
+		return c
+	case <-time.After(5 * time.Second):
+		t.Fatal("no player served")
+		return nil
+	}
+}
+
+// mustRegisterPlay registers h for app and unregisters it when the test
+// ends.
+func mustRegisterPlay(t *testing.T, r *Registry, addr, app string, h PlayHandler, pol Policy) func() {
+	t.Helper()
+	unregister, err := r.RegisterPlay(addr, app, h, rtmp.Config{}, pol)
+	require.NoError(t, err)
+	t.Cleanup(unregister)
+	return unregister
+}
+
+// fromIP dials from the local address ip (a loopback address other than
+// 127.0.0.1 counts as another peer).
+func fromIP(ip string) rtmp.Config {
+	return rtmp.Config{Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		d := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP(ip)}}
+		return d.DialContext(ctx, network, addr)
+	}}
+}
+
+// mustPlay plays url, reads the message Serve writes and returns the
+// player, which is closed when the test ends.
+func mustPlay(t *testing.T, url string, cfg rtmp.Config) *rtmp.ClientConn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := rtmp.PlayWith(ctx, url, cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	for { // |RtmpSampleAccess comes first
+		m, err := c.ReadMedia()
+		require.NoError(t, err)
+		if m.Type == rtmp.MsgAudio {
+			return c
+		}
+	}
+}
+
+// mustNotPlay plays url and expects NetStream.Play.StreamNotFound with
+// "stream not available"; it returns the client's error.
+func mustNotPlay(t *testing.T, url string) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := rtmp.Play(ctx, url)
+	if c != nil {
+		_ = c.Close()
+	}
+	var st *rtmp.StatusError
+	require.ErrorAs(t, err, &st)
+	assert.Equal(t, "NetStream.Play.StreamNotFound", st.Code)
+	assert.Equal(t, "stream not available", st.Description)
+	return err
+}
+
+// ended reports whether the server ended the player c within d.
+func ended(c *rtmp.ClientConn, d time.Duration) bool {
+	errc := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := c.ReadMedia(); err != nil {
+				errc <- err
+				return
+			}
+		}
+	}()
+	select {
+	case <-errc:
+		return true
+	case <-time.After(d):
+		_ = c.Close()
+		<-errc
+		return false
+	}
+}
+
+// Publishers and players share one port: publishers reach the sink of their
+// path, players the handler of their app with the stream name, and the
+// connection hook sees every connection.
+func TestServerPublishAndPlayRouting(t *testing.T) {
+	var hooked atomic.Int32
+	r := &Registry{ConnHook: func(net.Conn) { hooked.Add(1) }}
+	addr := "127.0.0.1:" + freeTCPPort(t)
+	sink := newFakeSink()
+	t.Cleanup(sink.close)
+	live, other := newFakePlayer(), newFakePlayer()
+	mustRegisterPlay(t, r, addr, "/live/", live, Policy{})
+	mustRegister(t, r, addr, "ingest/"+vKey, sink, Policy{})
+	mustRegisterPlay(t, r, addr, "other", other, Policy{})
+	r.mu.Lock()
+	n := len(r.listeners)
+	r.mu.Unlock()
+	assert.Equal(t, 1, n, "one TCP listener for publish and play")
+
+	mustPublish(t, "rtmp://"+addr+"/ingest/"+vKey)
+	assert.Equal(t, "ingest/"+vKey, sink.next(t).Request().Path())
+
+	mustPlay(t, "rtmp://"+addr+"/live/a?token=x", rtmp.Config{})
+	c := live.next(t)
+	assert.True(t, c.IsPlay())
+	assert.Equal(t, "a", c.Request().Stream, "the handler gets the stream name")
+	mustPlay(t, "rtmp://"+addr+"/live/a", rtmp.Config{})
+	live.next(t)
+	mustPlay(t, "rtmp://"+addr+"/other/b", rtmp.Config{})
+	assert.Equal(t, "b", other.next(t).Request().Stream)
+	assert.Equal(t, []string{"a", "a"}, live.askedFor())
+	assert.Equal(t, []string{"b"}, other.askedFor())
+
+	// An app nobody registered is rejected.
+	mustNotPlay(t, "rtmp://"+addr+"/nope/a")
+	st := r.Stats(addr)
+	assert.Equal(t, 3, st.Players)
+	assert.Equal(t, map[string]int{"live/a": 2, "other/b": 1}, st.StreamPlayers)
+	assert.EqualValues(t, 1, st.RejectedPlayUnknown)
+	assert.Zero(t, st.RejectedUnknown, "plays do not count as publishes")
+	assert.EqualValues(t, 5, hooked.Load())
+	waitPrePublish(t, r, addr, 0) // players are no longer pre-publish
+
+	// Registration errors: no app, a duplicate app, a bad address.
+	for _, app := range []string{"", "/", "?x=1"} {
+		_, err := r.RegisterPlay(addr, app, newFakePlayer(), rtmp.Config{}, Policy{})
+		assert.Error(t, err, "app %q", app)
+	}
+	_, err := r.RegisterPlay(addr, "live", newFakePlayer(), rtmp.Config{}, Policy{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rtmpsrv:")
+	_, err = r.RegisterPlay("nope", "live", newFakePlayer(), rtmp.Config{}, Policy{})
+	assert.Error(t, err)
+}
+
+// vKey is a fake stream key.
+const vKey = "sk" + "_4b1d9e" + "07aa"
+
+// A play of a publish path is rejected before any reservation: the
+// publisher goes on, the sink is never asked, the route stays free, and the
+// key reaches neither the handler nor the client's error.
+func TestPlayPathIsNotPublishKey(t *testing.T) {
+	r := &Registry{}
+	addr := "127.0.0.1:" + freeTCPPort(t)
+	sink := newFakeSink()
+	sink.read = true
+	t.Cleanup(sink.close)
+	mustRegister(t, r, addr, "live/"+vKey, sink, Policy{})
+	h := newFakePlayer() // every name is live
+	mustRegisterPlay(t, r, addr, "live", h, Policy{})
+
+	p := mustPublish(t, "rtmp://"+addr+"/live/"+vKey)
+	sink.next(t)
+	tags := registryTags()
+	require.NoError(t, p.WriteTag(tags[0]))
+	require.Eventually(t, func() bool { return sink.media.Load() == 1 }, 5*time.Second, 5*time.Millisecond)
+
+	busy := sink.busyCalls.Load() // the publish's
+	for _, url := range []string{
+		"rtmp://" + addr + "/live/" + vKey,
+		"rtmp://" + addr + "/live/" + vKey + "?token=x",
+		"rtmp://" + addr + "/live/" + vKey + "/",
+	} {
+		err := mustNotPlay(t, url)
+		assert.NotContains(t, err.Error(), vKey)
+	}
+	assert.Empty(t, h.askedFor(), "the handler never sees the key")
+	assert.Equal(t, busy, sink.busyCalls.Load(), "a play never reserves the route")
+	select {
+	case <-sink.offered:
+		t.Fatal("a player was offered to the sink")
+	default:
+	}
+	st := r.Stats(addr)
+	assert.EqualValues(t, 3, st.RejectedPlayPublishPath)
+	assert.Zero(t, st.RejectedUnknown)
+	assert.Zero(t, st.RejectedBusy)
+	assert.Zero(t, st.Players)
+
+	// The publisher is unaffected.
+	for _, tag := range tags[1:] {
+		require.NoError(t, p.WriteTag(tag))
+	}
+	require.Eventually(t, func() bool { return sink.media.Load() == 3 }, 5*time.Second, 5*time.Millisecond)
+
+	// With no play handler on the address, the answer and the count are
+	// the same.
+	r2 := &Registry{}
+	addr2 := "127.0.0.1:" + freeTCPPort(t)
+	mustRegister(t, r2, addr2, "live/"+vKey, newFakeSink(), Policy{})
+	mustNotPlay(t, "rtmp://"+addr2+"/live/"+vKey)
+	assert.EqualValues(t, 1, r2.Stats(addr2).RejectedPlayPublishPath)
+	assert.Zero(t, r2.Stats(addr2).RejectedUnknown)
+}
+
+// An unknown app, a stream that is not live, a publish path and a cap all
+// get the same answer.
+func TestPlayUnknownPath(t *testing.T) {
+	r := &Registry{}
+	addr := "127.0.0.1:" + freeTCPPort(t)
+	pol := Policy{MaxPlayersPerStream: 1} // the first registrant's counts
+	mustRegister(t, r, addr, "live/"+vKey, newFakeSink(), pol)
+	h := newFakePlayer("on")
+	mustRegisterPlay(t, r, addr, "live", h, Policy{})
+	mustPlay(t, "rtmp://"+addr+"/live/on", rtmp.Config{})
+
+	answers := make([]string, 0, 5)
+	for _, path := range []string{"other/on", "live/off", "live/inst/on", "live/" + vKey, "live/on"} {
+		err := mustNotPlay(t, "rtmp://"+addr+"/"+path)
+		var st *rtmp.StatusError
+		require.ErrorAs(t, err, &st)
+		answers = append(answers, st.Error())
+	}
+	for _, a := range answers {
+		assert.Equal(t, answers[0], a)
+	}
+	st := r.Stats(addr)
+	// live/inst/on asks for app live/inst, which has no handler.
+	assert.EqualValues(t, 3, st.RejectedPlayUnknown, "two unknown apps and a stream that is not live")
+	assert.EqualValues(t, 1, st.RejectedPlayPublishPath)
+	assert.EqualValues(t, 1, st.RejectedPlayCaps)
+	assert.Equal(t, 1, st.Players)
+	assert.Equal(t, []string{"on", "off", "on"}, h.askedFor())
+}
+
+// Players are capped per stream, per listener and per IP; a player that
+// leaves frees its slots. Players connect one at a time, so the pre-publish
+// cap of 4 per IP is never reached.
+func TestPlayFloodCaps(t *testing.T) {
+	t.Run("per stream and listener", func(t *testing.T) {
+		r := &Registry{}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		mustRegisterPlay(t, r, addr, "live", newFakePlayer(), Policy{MaxPlayersPerStream: 3, MaxPlayers: 5})
+		a := make([]*rtmp.ClientConn, 0, 3)
+		for range 3 {
+			a = append(a, mustPlay(t, "rtmp://"+addr+"/live/a", rtmp.Config{}))
+		}
+		mustNotPlay(t, "rtmp://"+addr+"/live/a")
+		mustPlay(t, "rtmp://"+addr+"/live/b", rtmp.Config{})
+		mustPlay(t, "rtmp://"+addr+"/live/b", rtmp.Config{})
+		mustNotPlay(t, "rtmp://"+addr+"/live/c")
+		st := r.Stats(addr)
+		assert.EqualValues(t, 2, st.RejectedPlayCaps)
+		assert.Equal(t, 5, st.Players)
+		assert.Equal(t, map[string]int{"live/a": 3, "live/b": 2}, st.StreamPlayers)
+
+		require.NoError(t, a[0].Close())
+		require.Eventually(t, func() bool { return r.Stats(addr).Players == 4 }, 5*time.Second, 5*time.Millisecond)
+		mustPlay(t, "rtmp://"+addr+"/live/c", rtmp.Config{})
+		mustNotPlay(t, "rtmp://"+addr+"/live/a")
+		assert.Equal(t, map[string]int{"live/a": 2, "live/b": 2, "live/c": 1}, r.Stats(addr).StreamPlayers)
+	})
+	t.Run("per IP", func(t *testing.T) {
+		r := &Registry{}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		mustRegisterPlay(t, r, addr, "live", newFakePlayer(), Policy{MaxPlayersPerIP: 6})
+		for range 6 {
+			mustPlay(t, "rtmp://"+addr+"/live/a", rtmp.Config{})
+		}
+		mustNotPlay(t, "rtmp://"+addr+"/live/b")
+		mustPlay(t, "rtmp://"+addr+"/live/a", fromIP("127.0.0.2")) // another peer
+		st := r.Stats(addr)
+		assert.EqualValues(t, 1, st.RejectedPlayCaps)
+		assert.Zero(t, st.RejectedFlood, "established players are not pre-publish")
+		assert.Equal(t, 7, st.Players)
+	})
+	t.Run("defaults", func(t *testing.T) {
+		assert.Equal(t, Policy{
+			MaxPrePublish: 64, MaxPrePublishPerIP: 4,
+			MaxPlayersPerStream: 256, MaxPlayers: 1024, MaxPlayersPerIP: 64,
+		}, Policy{}.withDefaults())
+	})
+}
+
+// Unregistering a play handler ends its players and waits for Serve to
+// return; the listener stays while a publish route is registered, and the
+// last unregister closes it.
+func TestPlayHandlerUnregister(t *testing.T) {
+	r := &Registry{}
+	addr := "127.0.0.1:" + freeTCPPort(t)
+	sink := newFakeSink()
+	t.Cleanup(sink.close)
+	unpublish := mustRegister(t, r, addr, "ingest/s", sink, Policy{})
+	h := newFakePlayer()
+	h.linger = 100 * time.Millisecond
+	unplay := mustRegisterPlay(t, r, addr, "live", h, Policy{})
+	players := make([]*rtmp.ClientConn, 0, 3)
+	for _, name := range []string{"a", "a", "b"} {
+		players = append(players, mustPlay(t, "rtmp://"+addr+"/live/"+name, rtmp.Config{}))
+		h.next(t)
+	}
+	id := r.Stats(addr).ID
+
+	unplay()
+	assert.Zero(t, h.serving.Load(), "unregister returned before Serve did")
+	assert.EqualValues(t, 3, h.ended.Load())
+	for _, p := range players {
+		assert.True(t, ended(p, 2*time.Second), "a player was not ended")
+	}
+	unplay() // idempotent
+	st := r.Stats(addr)
+	assert.Equal(t, id, st.ID, "the publish route keeps the listener")
+	assert.Zero(t, st.Players)
+	assert.Empty(t, st.StreamPlayers)
+	mustNotPlay(t, "rtmp://"+addr+"/live/a")
+	mustPublish(t, "rtmp://"+addr+"/ingest/s")
+	sink.next(t)
+
+	// A play in its decision when the handler leaves is waited for and
+	// never served.
+	h2 := newFakePlayer()
+	h2.block = make(chan struct{})
+	unplay2 := mustRegisterPlay(t, r, addr, "live", h2, Policy{})
+	errc := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := rtmp.Play(ctx, "rtmp://"+addr+"/live/x")
+		if c != nil {
+			_ = c.Close()
+		}
+		errc <- err
+	}()
+	require.Eventually(t, func() bool { return len(h2.askedFor()) == 1 }, 5*time.Second, 5*time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		unplay2()
+	}()
+	select {
+	case <-done:
+		t.Fatal("unregister did not wait for Live")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(h2.block)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unregister did not return")
+	}
+	assert.Error(t, <-errc)
+	assert.Zero(t, h2.ended.Load(), "served after unregister")
+	assert.Zero(t, r.Stats(addr).Players)
+
+	// The last unregister closes the listener and frees the port.
+	unpublish()
+	assert.Zero(t, r.Stats(addr).ID)
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", addr)
+	require.NoError(t, err)
+	require.NoError(t, ln.Close())
+
+	// A play handler alone holds the listener too.
+	h3 := newFakePlayer()
+	unplay3 := mustRegisterPlay(t, r, addr, "live", h3, Policy{})
+	p := mustPlay(t, "rtmp://"+addr+"/live/a", rtmp.Config{})
+	unplay3()
+	assert.True(t, ended(p, 2*time.Second))
+	assert.Zero(t, r.Stats(addr).ID)
+	ln, err = new(net.ListenConfig).Listen(context.Background(), "tcp", addr)
+	require.NoError(t, err)
+	require.NoError(t, ln.Close())
 }
