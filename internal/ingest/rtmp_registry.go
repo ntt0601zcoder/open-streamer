@@ -315,11 +315,17 @@ func peerKey(a net.Addr) string {
 }
 
 // serve runs the publish exchange on c and offers the publisher to the sink
-// of its path.
+// of its path. A play request is rejected like an unknown path.
 func (l *rtmpListener) serve(c net.Conn, ip string) {
 	defer l.wg.Done()
 	var rt *rtmpRoute
-	sc, err := l.accept(l.ctx, c, l.cfg, func(req rtmp.PublishRequest) error {
+	sc, err := l.accept(l.ctx, c, l.cfg, func(req rtmp.Request) error {
+		if req.Play {
+			// Ingest has no players; a play on a publish path must never
+			// reserve the route or reach the sink as a publisher.
+			l.rejectedUnknown.Add(1)
+			return errStreamNotAvailable
+		}
 		var err error
 		rt, err = l.reserve(req)
 		return err

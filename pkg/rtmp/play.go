@@ -30,7 +30,10 @@ const (
 // errNotPlay is the error of WriteMedia and EndOfStream on a publish conn.
 var errNotPlay = errors.New("rtmp: server: not a play conn")
 
-// onPlay asks decide and answers play, transaction txn: Set Chunk Size,
+// onPlay asks decide and answers play, transaction txn. play is expected on
+// the stream createStream returned (1); the replies go on the message stream
+// play arrived on, and media always goes on stream 1 whatever that was. On
+// success it sends Set Chunk Size,
 // StreamBegin, onStatus NetStream.Play.Reset and NetStream.Play.Start, and
 // |RtmpSampleAccess. A rejection is NetStream.Play.StreamNotFound with the
 // fixed description.
@@ -94,8 +97,9 @@ func (sc *ServerConn) handlePlayer(m Message) error {
 	return nil
 }
 
-// WriteMedia sends one audio, video or data message to a player, on message
-// stream 1 and chunk stream 4 (audio), 6 (video) or 5 (data), with
+// WriteMedia sends one audio, video or data message to a player, always on
+// message stream 1 (the one createStream returns; play is expected on it)
+// and chunk stream 4 (audio), 6 (video) or 5 (data), with
 // m.Timestamp as is. It must finish within the write timeout of the call
 // (Config.WriteTimeout or SetWriteTimeout), the wait behind another write
 // included; a write that misses it, or fails, ends the conn and its error
