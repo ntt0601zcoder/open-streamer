@@ -15,7 +15,10 @@ type OutStream struct {
 
 // OutStreams returns, per chunk stream, what sc last wrote on it.
 func OutStreams(sc *ServerConn) map[uint32]OutStream {
-	s := sc.s
+	return outStreams(sc.s)
+}
+
+func outStreams(s *session) map[uint32]OutStream {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	out := make(map[uint32]OutStream, len(s.cw.streams))
@@ -23,4 +26,9 @@ func OutStreams(sc *ServerConn) map[uint32]OutStream {
 		out[csid] = OutStream{Type: st.typ, StreamID: st.streamID}
 	}
 	return out
+}
+
+// PublishOutStreams returns, per chunk stream, what p last wrote on it.
+func PublishOutStreams(p *PublishConn) map[uint32]OutStream {
+	return outStreams(p.s)
 }

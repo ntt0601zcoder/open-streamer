@@ -191,8 +191,13 @@ type ClientConn struct {
 
 // status is statusOf with the play name redacted from the description.
 func (c *ClientConn) status(args []any) (level string, st *StatusError) {
+	return redactedStatus(c.redact, args)
+}
+
+// redactedStatus is statusOf with r applied to the description.
+func redactedStatus(r *strings.Replacer, args []any) (level string, st *StatusError) {
 	level, st = statusOf(args)
-	st.Description = c.redact.Replace(st.Description)
+	st.Description = r.Replace(st.Description)
 	return level, st
 }
 
@@ -214,8 +219,7 @@ func PlayWith(ctx context.Context, rawURL string, cfg Config) (*ClientConn, erro
 	if err != nil {
 		return nil, err
 	}
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", t.addr)
+	conn, err := cfg.dial(ctx, t.addr)
 	if err != nil {
 		return nil, fmt.Errorf("rtmp: client: dial: %w", err)
 	}
@@ -266,15 +270,8 @@ func (c *ClientConn) open(t playTarget) error {
 	if _, err := c.awaitResult(txnConnect, "connect"); err != nil {
 		return err
 	}
-	if err := s.setChunkSize(); err != nil {
-		return fmt.Errorf("rtmp: client: %w", err)
-	}
-	// A hard Set Peer Bandwidth may already have made the session announce
-	// a window of the server's size; keep that one.
-	if s.sentWindow == 0 {
-		if err := s.sendWindowAckSize(defaultWindowAckSize); err != nil {
-			return fmt.Errorf("rtmp: client: %w", err)
-		}
+	if err := s.clientConnected(); err != nil {
+		return err
 	}
 	if err := s.writeCommand(0, "createStream", txnCreate, nil); err != nil {
 		return fmt.Errorf("rtmp: client: %w", err)
@@ -283,14 +280,9 @@ func (c *ClientConn) open(t playTarget) error {
 	if err != nil {
 		return err
 	}
-	var id float64
-	if len(res) > 0 {
-		id, _ = res[len(res)-1].(float64)
+	if c.streamID, err = streamIDOf(res); err != nil {
+		return err
 	}
-	if id < 1 || id > math.MaxUint32 || id != math.Trunc(id) {
-		return errors.New("rtmp: client: createStream: no stream id in the result")
-	}
-	c.streamID = uint32(id)
 	if err := s.writeCommand(c.streamID, "play", txnPlay, nil, t.stream, playLive); err != nil {
 		return fmt.Errorf("rtmp: client: %w", err)
 	}
@@ -301,16 +293,26 @@ func (c *ClientConn) open(t playTarget) error {
 }
 
 // awaitResult waits for the _result or _error of transaction txn and
-// returns the _result's arguments. An onStatus of level "error" fails at
-// once, since a server that sends one may never answer the transaction.
+// returns the _result's arguments.
 func (c *ClientConn) awaitResult(txn float64, what string) ([]any, error) {
-	for {
+	return awaitResult(func() (command, error) {
 		cmd, _, err := c.openCommand(false)
+		return cmd, err
+	}, c.redact, txn, what)
+}
+
+// awaitResult reads commands with next until the _result or _error of
+// transaction txn, and returns the _result's arguments. An onStatus of level
+// "error" fails at once, since a server that sends one may never answer the
+// transaction. Descriptions are redacted with r.
+func awaitResult(next func() (command, error), r *strings.Replacer, txn float64, what string) ([]any, error) {
+	for {
+		cmd, err := next()
 		if err != nil {
 			return nil, err
 		}
 		if cmd.name == "onStatus" {
-			if level, st := c.status(cmd.args); level == "error" {
+			if level, st := redactedStatus(r, cmd.args); level == "error" {
 				return nil, fmt.Errorf("rtmp: client: %s: %w", what, st)
 			}
 			continue
@@ -322,10 +324,38 @@ func (c *ClientConn) awaitResult(txn float64, what string) ([]any, error) {
 		case "_result":
 			return cmd.args, nil
 		case "_error":
-			_, st := c.status(cmd.args)
+			_, st := redactedStatus(r, cmd.args)
 			return nil, fmt.Errorf("rtmp: client: %s: %w", what, st)
 		}
 	}
+}
+
+// clientConnected follows a client's accepted connect: Set Chunk Size 4096,
+// then Window Ack Size, unless a hard Set Peer Bandwidth already made the
+// session announce a window of the server's size, which is kept.
+func (s *session) clientConnected() error {
+	if err := s.setChunkSize(); err != nil {
+		return fmt.Errorf("rtmp: client: %w", err)
+	}
+	if s.sentWindow == 0 {
+		if err := s.sendWindowAckSize(defaultWindowAckSize); err != nil {
+			return fmt.Errorf("rtmp: client: %w", err)
+		}
+	}
+	return nil
+}
+
+// streamIDOf reads the stream id of a createStream _result, its last
+// argument.
+func streamIDOf(res []any) (uint32, error) {
+	var id float64
+	if len(res) > 0 {
+		id, _ = res[len(res)-1].(float64)
+	}
+	if id < 1 || id > math.MaxUint32 || id != math.Trunc(id) {
+		return 0, errors.New("rtmp: client: createStream: no stream id in the result")
+	}
+	return uint32(id), nil
 }
 
 // awaitPlayStart waits for onStatus NetStream.Play.Start, or the first audio
