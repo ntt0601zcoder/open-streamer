@@ -1,3 +1,4 @@
-// Package flv turns hub frames into RTMP/FLV messages. It currently holds the
-// decoder configuration records; the muxer follows in a later task.
+// Package flv turns hub frames into RTMP/FLV messages: the decoder
+// configuration records of the sequence headers, and the per-connection
+// Muxer that rebases timestamps and sends onMetaData and headers per epoch.
 package flv
