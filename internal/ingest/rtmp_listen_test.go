@@ -435,6 +435,56 @@ func TestRTMPListenTakeoverHalfOpen(t *testing.T) {
 	assert.EqualValues(t, rejected, st["rejected_busy"])
 }
 
+// mustNotPlay plays url and expects NetStream.Play.StreamNotFound with
+// "stream not available": a publish path is never playable.
+func mustNotPlay(t *testing.T, url string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := rtmp.Play(ctx, url)
+	if c != nil {
+		_ = c.Close()
+	}
+	var st *rtmp.StatusError
+	require.ErrorAs(t, err, &st)
+	assert.Equal(t, "NetStream.Play.StreamNotFound", st.Code)
+	assert.Equal(t, "stream not available", st.Description)
+}
+
+// A play on a publish path is rejected before any reservation: it neither
+// counts as a publisher nor takes over a quiet one, and the route stays free.
+func TestRTMPListenPlayIsNotPublish(t *testing.T) {
+	port := freeTCPPort(t)
+	url := "rtmp://127.0.0.1:" + port + "/live/s"
+	ch := openAsync(t, context.Background(), rtmpListenURL(port, "live/s"), Env{})
+	waitListening(t, "127.0.0.1:"+port)
+
+	mustNotPlay(t, url) // the route is idle
+	tags := fixtureTags(t, "h264_aac.flv")
+	p1 := dialPublisher(t, url)
+	for _, tg := range tags[:40] {
+		require.NoError(t, p1.WriteTag(tg))
+	}
+	r := awaitOpen(t, ch)
+	log := readAll(r)
+	log.waitCount(t, 10)
+	p1.Abandon()
+	time.Sleep(takeoverIdle + 300*time.Millisecond) // p1 is now quiet
+
+	mustNotPlay(t, url)
+	st := r.Stats()
+	assert.EqualValues(t, 1, st["publishers"])
+	assert.Zero(t, st["takeovers"])
+	assert.EqualValues(t, 2, st["rejected_unknown"])
+	assert.Empty(t, log.breaks, "the quiet publisher was not taken over")
+
+	// The route was left unreserved: a real publisher still takes over.
+	dialPublisher(t, url)
+	require.Eventually(t, func() bool { return r.Stats()["takeovers"] == 1 }, 2*time.Second, 20*time.Millisecond)
+	assert.EqualValues(t, 2, r.Stats()["publishers"])
+	log.stop(t, r)
+}
+
 // A second publisher is rejected with BadName while the first is sending,
 // and the rejection does not echo the stream key.
 func TestRTMPListenRejectsSecond(t *testing.T) {

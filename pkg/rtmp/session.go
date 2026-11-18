@@ -178,10 +178,13 @@ type session struct {
 	// read before wmu is taken, so the wait for the mutex counts.
 	writeTimeout atomic.Int64
 
+	// reading is set once runReader starts, by the goroutine that ran the
+	// exchange, before the reader exists.
+	reading atomic.Bool
+
 	// wmu is held for every outbound message, around the chunk writer, and
-	// guards reading and writeDeadline.
-	wmu     sync.Mutex
-	reading bool // runReader has started
+	// guards writeDeadline.
+	wmu sync.Mutex
 	// writeDeadline is the absolute deadline, on the Config clock, of the
 	// write in progress; zero gives each conn write IdleTimeout from its
 	// start (the handshake and the control writes before runReader).
@@ -328,9 +331,7 @@ func (s *session) Done() <-chan struct{} {
 // and the idle limit can end the session.
 func (s *session) runReader(handle func(Message) error) {
 	s.readerOnce.Do(func() {
-		s.wmu.Lock()
-		s.reading = true
-		s.wmu.Unlock()
+		s.reading.Store(true)
 		go func() {
 			defer close(s.done)
 			for {
@@ -363,13 +364,15 @@ func (s *session) setWriteTimeout(d time.Duration) {
 // with os.ErrDeadlineExceeded before writing anything. A control write of
 // the single-goroutine mode keeps IdleTimeout (or the phase end).
 func (s *session) write(media bool, f func(*ChunkWriter) error) error {
-	deadline := s.cfg.Now().Add(time.Duration(s.writeTimeout.Load()))
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
-	if !media && !s.reading {
+	if !media && !s.reading.Load() {
+		s.wmu.Lock()
+		defer s.wmu.Unlock()
 		s.writeDeadline = time.Time{}
 		return f(s.cw)
 	}
+	deadline := s.cfg.Now().Add(time.Duration(s.writeTimeout.Load()))
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
 	if !s.cfg.Now().Before(deadline) {
 		return fmt.Errorf("rtmp: session: write: waited out the write timeout: %w", os.ErrDeadlineExceeded)
 	}
@@ -544,7 +547,7 @@ func (w sessionWriter) Write(p []byte) (int, error) {
 	if d.IsZero() {
 		d = now.Add(s.cfg.IdleTimeout)
 	}
-	if !s.reading && !s.phaseEnd.IsZero() && s.phaseEnd.Before(d) {
+	if !s.reading.Load() && !s.phaseEnd.IsZero() && s.phaseEnd.Before(d) {
 		d = s.phaseEnd
 	}
 	_ = s.conn.SetWriteDeadline(connDeadline(d, now))
