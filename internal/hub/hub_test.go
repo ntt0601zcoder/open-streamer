@@ -635,3 +635,63 @@ func TestHubConcurrentChurn(t *testing.T) {
 	}
 	assert.Len(t, stats, len(readers), "every churn subscriber was removed")
 }
+
+// Live is set by the first video keyframe written, or by audio while the hub
+// has seen no video, and stays set (the cache emptying does not clear it)
+// until Close.
+func TestHubLive(t *testing.T) {
+	h := New(Options{GOPCacheFrames: 4})
+	assert.False(t, h.Live(), "empty hub")
+	h.Write(vid(0, 0, false))
+	assert.False(t, h.Live(), "a delta frame is not a start")
+	h.Write(aud(1, 0))
+	assert.False(t, h.Live(), "audio does not make a video hub live")
+	h.Write(vid(0, vDur, true))
+	assert.True(t, h.Live(), "first keyframe")
+	// An over-long GOP empties the cache; the hub stays live.
+	for i := 2; i < 10; i++ {
+		h.Write(vid(0, int64(i)*vDur, false))
+	}
+	assert.True(t, h.Live(), "live since the keyframe, not while it is cached")
+	h.Close()
+	assert.False(t, h.Live(), "closed")
+
+	a := New(Options{})
+	defer a.Close()
+	assert.False(t, a.Live())
+	a.Write(aud(0, 0))
+	assert.True(t, a.Live(), "audio-only hub")
+}
+
+// SubscribeCached sizes the queue to hold the whole cache plus 64, or min
+// when that is larger, so the cache is always replayed.
+func TestHubSubscribeCached(t *testing.T) {
+	h := New(Options{})
+	defer h.Close()
+	writeGOP(h, 0, 300)
+
+	small := h.Subscribe("small", 32)
+	requireEmpty(t, small) // the cache does not fit: no replay
+	small.Close()
+
+	s := h.SubscribeCached("cached", 32)
+	defer s.Close()
+	assert.Equal(t, 300+64, cap(s.ch))
+	got := drain(t, s, 300)
+	assert.True(t, got[0].Frame.Key)
+	assert.Equal(t, int64(0), got[0].Frame.DTS)
+
+	big := h.SubscribeCached("big", 1000)
+	defer big.Close()
+	assert.Equal(t, 1000, cap(big.ch))
+	drain(t, big, 300)
+
+	def := h.SubscribeCached("default", 0)
+	defer def.Close()
+	assert.Equal(t, 1024, cap(def.ch), "0 means the Subscribe default")
+
+	h.Close()
+	closed := h.SubscribeCached("late", 32)
+	_, ok := <-closed.C()
+	assert.False(t, ok, "closed hub: closed channel")
+}

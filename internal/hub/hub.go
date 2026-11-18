@@ -72,6 +72,9 @@ const (
 	defaultAudioCacheTicks = media.ClockRate
 	defaultQueue           = 1024
 	maxAnchors             = 64
+	// cachedHeadroom is the room SubscribeCached leaves past the cache, for
+	// the frames written while the subscriber drains its replay.
+	cachedHeadroom = 64
 )
 
 // Options tunes a Hub. Zero values select the defaults.
@@ -128,6 +131,8 @@ type Hub struct {
 	video   map[int]*videoTrack
 	latest  int64 // stream time: the largest DTS written
 	started bool  // latest is set
+	keyed   bool  // a video keyframe was written
+	audio   bool  // an audio frame was written
 	anchor  int   // track the cache is anchored on, or -1 for the audio cache
 	cache   []media.Frame
 	anchors []media.Anchor // oldest first, at most maxAnchors
@@ -177,13 +182,18 @@ func (h *Hub) Write(f media.Frame) {
 		h.latest = f.DTS
 		h.started = true
 	}
-	if f.Kind() == media.KindVideo {
+	switch f.Kind() {
+	case media.KindVideo:
 		vt := h.video[f.Track]
 		if vt == nil {
 			vt = &videoTrack{}
 			h.video[f.Track] = vt
 		}
 		vt.lastDTS = f.DTS
+		h.keyed = h.keyed || f.Key
+	case media.KindAudio:
+		h.audio = true
+	default:
 	}
 	h.updateCache(f)
 	for _, s := range h.subs {
@@ -198,9 +208,36 @@ func (h *Hub) Subscribe(name string, queue int) *Sub {
 	if queue <= 0 {
 		queue = defaultQueue
 	}
-	s := &Sub{h: h, name: name, ch: make(chan Delivery, queue), gates: map[int]trackGate{}}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.subscribe(name, queue)
+}
+
+// SubscribeCached is Subscribe with a queue of max(minQueue, cached frames +
+// 64) (minQueue 0 means 1024), sized under the hub's lock, so the whole cache is
+// always replayed with room for the frames that follow it.
+func (h *Hub) SubscribeCached(name string, minQueue int) *Sub {
+	if minQueue <= 0 {
+		minQueue = defaultQueue
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.subscribe(name, max(minQueue, len(h.cache)+cachedHeadroom))
+}
+
+// Live reports whether the hub can start a subscriber: a video keyframe has
+// been written since it opened, or, while it has seen no video, an audio
+// frame. It is false once the hub is closed.
+func (h *Hub) Live() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.closed && (h.keyed || h.audio && len(h.video) == 0)
+}
+
+// subscribe adds a subscriber with a queue of length queue. Called with h.mu
+// held.
+func (h *Hub) subscribe(name string, queue int) *Sub {
+	s := &Sub{h: h, name: name, ch: make(chan Delivery, queue), gates: map[int]trackGate{}}
 	if h.closed {
 		s.closed = true
 		close(s.ch)

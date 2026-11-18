@@ -29,6 +29,18 @@
 // stay empty. Use a long random stream key: until authentication
 // arrives, the key in the path is the only thing that keeps others from
 // publishing to the stream.
+//
+// To serve every stream to RTMP players, give -rtmp-play an address (it may
+// be the port of RTMP listen inputs, whose listener it then shares); a
+// player plays rtmp://<host>:<port>/<app>/<name>, where app is
+// -rtmp-play-app (default live) and name is the stream's -stream name:
+//
+//	osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen -rtmp-play :1935
+//	ffplay rtmp://<host>:1935/live/cam
+//
+// A publish path is never playable, so a stream whose listen path is its
+// own play path (<app>/<name>) cannot be played over RTMP; osdev warns about
+// it at startup. Publish under a long random key instead.
 package main
 
 import (
@@ -53,7 +65,10 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/httpts"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
+	"github.com/ntt0601zcoder/open-streamer/internal/output/rtmpplay"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
+	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 )
 
 const (
@@ -69,6 +84,7 @@ func main() {
 }
 
 const usageText = `usage: osdev -stream name=URL [-stream ...] [-listen addr] [-layout video,audio] [-loop]
+             [-rtmp-play addr [-rtmp-play-app live]]
 
 Accept an RTMP publisher (OBS or ffmpeg):
   osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen
@@ -80,6 +96,14 @@ Accept an RTMP publisher (OBS or ffmpeg):
 Pull from an IP camera or an RTSP server (TCP by default; UDP and auto
 with ?transport=udp or ?transport=auto; the port defaults to 554):
   osdev -stream cam=rtsp://user:pass@<host>/<path>
+
+Serve every stream to RTMP players (ffplay, VLC, ffmpeg) with -rtmp-play;
+it may share the port of RTMP listen inputs. The play URL is
+rtmp://<host>:<port>/<app>/<name>, app from -rtmp-play-app (default live):
+  osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen -rtmp-play :1935
+  ffplay rtmp://<host>:1935/live/<name>
+  A publish path is never playable: a stream published at <app>/<name>
+  cannot be played (osdev warns), so publish under a long random key.
 `
 
 // streamFlags collects repeated -stream name=path values.
@@ -173,6 +197,9 @@ type config struct {
 	listen  string
 	sources []*source // in order of first appearance
 	layout  []media.Kind
+	// rtmpPlay is the RTMP play address, empty when RTMP play is off;
+	// rtmpPlayApp the play app, normalised.
+	rtmpPlay, rtmpPlayApp string
 }
 
 // parseLayout parses a comma-separated list of video and audio.
@@ -220,6 +247,8 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	listen := fs.String("listen", ":8080", "address to listen on")
 	loop := fs.Bool("loop", false, "replay each file at its end")
 	layoutFlag := fs.String("layout", "video,audio", "track layout of every stream: video and audio, comma-separated")
+	rtmpPlay := fs.String("rtmp-play", "", "serve every stream to RTMP players on this address (host:port)")
+	rtmpPlayApp := fs.String("rtmp-play-app", "live", "the app of RTMP play URLs: rtmp://host:port/<app>/<name>")
 	var streams streamFlags
 	fs.Var(&streams, "stream", "name=URL (or name=path.ts) to serve; repeat a name to add a lower-priority input")
 	if err := fs.Parse(args); err != nil {
@@ -240,7 +269,18 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 		_, _ = fmt.Fprint(stderr, usageText)
 		return nil, 2
 	}
-	cfg := &config{listen: *listen, layout: layout}
+	app, _ := rtmp.NormalizePath(*rtmpPlayApp, "")
+	if *rtmpPlay != "" {
+		if _, err := rtmpsrv.AddrKey(*rtmpPlay); err != nil {
+			_, _ = fmt.Fprintf(stderr, "osdev: -rtmp-play: %v\n", err)
+			return nil, 2
+		}
+		if app == "" {
+			_, _ = fmt.Fprintln(stderr, "osdev: -rtmp-play-app: empty app")
+			return nil, 2
+		}
+	}
+	cfg := &config{listen: *listen, layout: layout, rtmpPlay: *rtmpPlay, rtmpPlayApp: app}
 	byName := map[string]*source{}
 	for _, s := range streams {
 		name, input, ok := strings.Cut(s, "=")
@@ -330,12 +370,63 @@ func checkCopyCycles(srcs []*source) error {
 	return nil
 }
 
+// rtmpListenKey returns the listener key and the publish path of an RTMP
+// listen input; ok is false for any other input.
+func rtmpListenKey(input string) (addr, path string, ok bool) {
+	u, err := url.Parse(input)
+	if err != nil || !strings.EqualFold(u.Scheme, "rtmp") {
+		return "", "", false
+	}
+	if mode := u.Query().Get("mode"); mode != "listen" && mode != "listener" {
+		return "", "", false
+	}
+	port := u.Port()
+	if port == "" {
+		port = "1935"
+	}
+	addr, err = rtmpsrv.AddrKey(net.JoinHostPort(u.Hostname(), port))
+	if err != nil {
+		return "", "", false
+	}
+	path, _ = rtmp.NormalizePath(u.Path, "")
+	return addr, path, true
+}
+
+// warnPublishPaths reports each stream whose RTMP play path is a publish
+// path of an RTMP listen input on the play listener: the registry never
+// plays a publish path, so that stream cannot be played over RTMP. The
+// publish paths are not printed; the play path is public.
+func warnPublishPaths(w io.Writer, cfg *config) {
+	if cfg.rtmpPlay == "" {
+		return
+	}
+	playAddr, err := rtmpsrv.AddrKey(cfg.rtmpPlay)
+	if err != nil {
+		return
+	}
+	publish := map[string]bool{}
+	for _, s := range cfg.sources {
+		for _, in := range s.inputs {
+			if addr, path, ok := rtmpListenKey(in); ok && addr == playAddr {
+				publish[path] = true
+			}
+		}
+	}
+	for _, s := range cfg.sources {
+		if path, _ := rtmp.NormalizePath(cfg.rtmpPlayApp, s.name); publish[path] {
+			_, _ = fmt.Fprintf(w, "osdev: warning: stream %s cannot be played over RTMP: its play path %s is a publish path on %s; publish under another key\n",
+				s.name, path, playAddr)
+		}
+	}
+}
+
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	stderr = &lockedWriter{w: stderr}
 	cfg, code := parseArgs(args, stderr)
 	if cfg == nil {
 		return code
 	}
+	warnPublishPaths(stderr, cfg)
 	order := cfg.sources
 	srcs := map[string]*source{}
 	for _, s := range order {
@@ -352,6 +443,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return 2
 	}
+	unregisterPlay := func() {}
+	if cfg.rtmpPlay != "" {
+		players := rtmpplay.New(hubLookup, rtmpplay.Options{})
+		//nolint:contextcheck // the shared listener lives until unregisterPlay, not with ctx
+		unregisterPlay, err = rtmpsrv.Default.RegisterPlay(cfg.rtmpPlay, cfg.rtmpPlayApp, players, rtmp.Config{}, rtmpsrv.Policy{})
+		if err != nil {
+			_ = ln.Close()
+			_, _ = fmt.Fprintf(stderr, "osdev: -rtmp-play: %v\n", err)
+			return 2
+		}
+	}
+	defer unregisterPlay() // idempotent; shutdown calls it first
 	addr := ln.Addr().String()
 	_, _ = fmt.Fprintf(stdout, "listening on %s\n", addr)
 	base := "http://" + addr
@@ -361,6 +464,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	for _, s := range order {
 		for _, p := range []string{"hls/index.m3u8", "cmaf/master.m3u8", "cmaf/index.mpd", "stream.ts"} {
 			_, _ = fmt.Fprintf(stdout, "%s/live/%s/%s\n", base, s.name, p)
+		}
+	}
+	if cfg.rtmpPlay != "" {
+		host, port, _ := net.SplitHostPort(cfg.rtmpPlay)
+		if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
+			host = "127.0.0.1"
+		}
+		for _, s := range order {
+			_, _ = fmt.Fprintf(stdout, "rtmp://%s/%s/%s\n", net.JoinHostPort(host, port), cfg.rtmpPlayApp, s.name)
 		}
 	}
 
@@ -465,6 +577,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	for _, s := range order {
 		s.hub.Close()
 	}
+	unregisterPlay() // the players got end of stream; this waits for them
 	sd, done := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer done()
 	if err := srv.Shutdown(sd); err != nil {
