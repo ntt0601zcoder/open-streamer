@@ -461,3 +461,95 @@ func TestOsdevUsageExample(t *testing.T) {
 	assert.Contains(t, sb.String(), "rtmp://<host>:1935/live/<stream-key>")
 	assert.Contains(t, sb.String(), "mode=listen")
 }
+
+func TestOsdevRTMPPlayFlags(t *testing.T) {
+	cfg, code := parseArgs([]string{"-stream", "a=" + fixture}, io.Discard)
+	require.NotNil(t, cfg, code)
+	assert.Empty(t, cfg.rtmpPlay, "off by default")
+	assert.Equal(t, "live", cfg.rtmpPlayApp)
+
+	cfg, code = parseArgs([]string{"-rtmp-play", ":19351", "-rtmp-play-app", "/tv/", "-stream", "a=" + fixture}, io.Discard)
+	require.NotNil(t, cfg, code)
+	assert.Equal(t, ":19351", cfg.rtmpPlay)
+	assert.Equal(t, "tv", cfg.rtmpPlayApp)
+
+	for name, args := range map[string][]string{
+		"no port":   {"-rtmp-play", "127.0.0.1", "-stream", "a=" + fixture},
+		"bad port":  {"-rtmp-play", ":0", "-stream", "a=" + fixture},
+		"empty app": {"-rtmp-play", ":19351", "-rtmp-play-app", "/", "-stream", "a=" + fixture},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var errw strings.Builder
+			cfg, code := parseArgs(args, &errw)
+			assert.Nil(t, cfg)
+			assert.Equal(t, 2, code)
+			assert.Contains(t, errw.String(), "-rtmp-play")
+		})
+	}
+
+	var sb strings.Builder
+	assert.Equal(t, 2, run(context.Background(), nil, io.Discard, &sb))
+	assert.Contains(t, sb.String(), "-rtmp-play")
+	assert.Contains(t, sb.String(), "rtmp://<host>:1935/live/<name>")
+}
+
+// A stream whose RTMP listen path is its own play path is reported: the
+// registry never plays a publish path.
+func TestOsdevRTMPPlayPathWarning(t *testing.T) {
+	var errw strings.Builder
+	warnPublishPaths(&errw, &config{
+		rtmpPlay: ":19351", rtmpPlayApp: "live",
+		sources: []*source{
+			{name: "cam", inputs: []string{"rtmp://:19351/live/cam?mode=listen"}},
+			{name: "ok", inputs: []string{"rtmp://:19351/live/" + vSekrit + "?mode=listen"}},
+			{name: "other", inputs: []string{"rtmp://:19352/live/other?mode=listen"}},
+			{name: "pull", inputs: []string{"rtmp://example.com/live/pull"}},
+		},
+	})
+	out := errw.String()
+	assert.Contains(t, out, "osdev: warning: stream cam cannot be played over RTMP")
+	assert.Equal(t, 1, strings.Count(out, "\n"), out)
+	assert.NotContains(t, out, vSekrit)
+}
+
+// Every stream is served to RTMP players on -rtmp-play, on the port of the
+// RTMP listen inputs too, and a publish path is never playable.
+func TestOsdevRTMPPlay(t *testing.T) {
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, ln.Close())
+
+	var errw syncBuilder
+	_, stop := startOsdev(t, []string{
+		"-rtmp-play", fmt.Sprintf(":%d", port),
+		"-stream", "demo=" + fixture, "-loop",
+		"-stream", fmt.Sprintf("cam=rtmp://:%d/live/cam?mode=listen", port),
+	}, &errw)
+	assert.Contains(t, errw.String(), "osdev: warning: stream cam cannot be played over RTMP")
+
+	var c *rtmp.ClientConn
+	require.Eventually(t, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err = rtmp.Play(ctx, fmt.Sprintf("rtmp://127.0.0.1:%d/live/demo", port))
+		return err == nil
+	}, 15*time.Second, 100*time.Millisecond)
+	video := 0
+	for video < 10 {
+		m, err := c.ReadMedia()
+		require.NoError(t, err)
+		if m.Type == rtmp.MsgVideo {
+			video++
+		}
+	}
+	_ = c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = rtmp.Play(ctx, fmt.Sprintf("rtmp://127.0.0.1:%d/live/cam", port))
+	var st *rtmp.StatusError
+	require.ErrorAs(t, err, &st)
+	assert.Equal(t, "NetStream.Play.StreamNotFound", st.Code)
+	assert.Equal(t, 0, stop())
+}
