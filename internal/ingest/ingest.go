@@ -13,13 +13,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 )
 
@@ -288,54 +288,9 @@ func Open(ctx context.Context, rawURL string, env Env) (Reader, error) {
 	}
 }
 
-// redactedKeys are the query parameters whose values never appear in errors
-// or logs.
-var redactedKeys = []string{"passphrase", "password", "token", "secret", "key"}
-
 // Redact returns rawURL with its password and secret query values hidden,
 // and for rtmp:// its stream name (the last path segment, the stream key)
-// cut to its first 2 characters.
+// cut to its first 2 characters. It is redact.URL.
 func Redact(rawURL string) string {
-	if !strings.Contains(rawURL, "://") {
-		return rawURL
-	}
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "<invalid url>"
-	}
-	if u.User != nil {
-		pw, hasPW := u.User.Password()
-		switch {
-		case hasPW:
-			u.User = url.UserPassword(u.User.Username(), "xxxxx")
-		case u.User.Username() != "" || pw != "":
-			u.User = url.User("xxxxx")
-		}
-	}
-	if u.RawQuery != "" {
-		pairs := strings.Split(u.RawQuery, "&")
-		for i, pair := range pairs {
-			k, _, ok := strings.Cut(pair, "=")
-			if !ok {
-				continue
-			}
-			if name, err := url.QueryUnescape(k); err == nil {
-				k = name
-			}
-			if slices.Contains(redactedKeys, strings.ToLower(k)) {
-				pairs[i] = pair[:strings.IndexByte(pair, '=')+1] + "xxxxx"
-			}
-		}
-		u.RawQuery = strings.Join(pairs, "&")
-	}
-	if strings.EqualFold(u.Scheme, schemeRTMP) {
-		u.Scheme = schemeRTMP
-		if p := strings.TrimRight(u.Path, "/"); p != "" {
-			u.Path, u.RawPath = redactRTMPPath(p), ""
-		}
-		if u.Opaque != "" {
-			u.Opaque = redactRTMPPath(u.Opaque)
-		}
-	}
-	return u.String()
+	return redact.URL(rawURL)
 }

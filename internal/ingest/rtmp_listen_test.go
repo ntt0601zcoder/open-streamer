@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
 	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
@@ -60,8 +63,59 @@ func rtmpListenURL(port, path string) string {
 // waitListening waits until a listen input has bound addr.
 func waitListening(t *testing.T, addr string) {
 	t.Helper()
-	require.Eventually(t, func() bool { return rtmpListeners.lookup(addr) != nil },
+	require.Eventually(t, func() bool { return rtmpListeners.Stats(addr).ID != 0 },
 		5*time.Second, 5*time.Millisecond, "nothing listens on %s", addr)
+}
+
+// waitPrePublish waits until the listener on addr has n sessions that have
+// not published.
+func waitPrePublish(t *testing.T, addr string, n int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		st := rtmpListeners.Stats(addr)
+		return st.ID != 0 && st.PrePublish == n
+	}, 5*time.Second, 5*time.Millisecond, "want %d pre-publish sessions", n)
+}
+
+// freeTCPPort returns a TCP port that was free a moment ago.
+func freeTCPPort(t *testing.T) string {
+	t.Helper()
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	return strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+}
+
+// mustReject publishes to url and expects BadName with "stream not
+// available".
+func mustReject(t *testing.T, url string) {
+	t.Helper()
+	p, code, err := rtmptest.Dial(context.Background(), url)
+	require.Nil(t, p)
+	require.Error(t, err)
+	assert.Equal(t, "NetStream.Publish.BadName", code)
+	assert.Contains(t, err.Error(), "stream not available")
+}
+
+// idleTCP opens a TCP connection that sends nothing.
+func idleTCP(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	var d net.Dialer
+	c, err := d.DialContext(context.Background(), "tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// closedByPeer reports whether the server closed c within d.
+func closedByPeer(c net.Conn, d time.Duration) bool {
+	_ = c.SetReadDeadline(time.Now().Add(d))
+	_, err := c.Read(make([]byte, 1))
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	return errors.Is(err, io.EOF) || !errors.As(err, &ne) || !ne.Timeout()
 }
 
 func fixtureTags(t *testing.T, name string) []rtmp.FLVTag {
@@ -251,7 +305,7 @@ func TestRTMPListenReconnect(t *testing.T) {
 	addr := "127.0.0.1:" + port
 	ch := openAsync(t, context.Background(), rtmpListenURL(port, "live/s"), Env{})
 	waitListening(t, addr)
-	ln := rtmpListeners.lookup(addr)
+	ln := rtmpListeners.Stats(addr).ID
 	tags := fixtureTags(t, "h264_aac.flv")
 	want := sourceFrames(t, tags)
 
@@ -260,7 +314,7 @@ func TestRTMPListenReconnect(t *testing.T) {
 	log := readAll(r)
 	log.waitCount(t, len(want))
 	ended() // the server closed the first publisher
-	assert.Same(t, ln, rtmpListeners.lookup(addr), "the listener stays up between publishers")
+	assert.Equal(t, ln, rtmpListeners.Stats(addr).ID, "the listener stays up between publishers")
 
 	publishTags(t, "rtmp://"+addr+"/live/s", tags)
 	log.waitCount(t, 2*len(want))
@@ -341,15 +395,12 @@ func TestRTMPListenDropsPublisherBeforeTracks(t *testing.T) {
 func TestRTMPListenBusy(t *testing.T) {
 	port := freeTCPPort(t)
 	addr := "127.0.0.1:" + port
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ch := openAsync(t, ctx, rtmpListenURL(port, "live/s"), Env{})
-	waitListening(t, addr)
-	ln := rtmpListeners.lookup(addr)
-	ln.reg.mu.Lock()
-	sink := ln.routes["live/s"].sink.(*rtmpListen)
-	ln.reg.mu.Unlock()
-	assert.False(t, sink.busy(time.Now()), "no publisher")
+	sink := newRTMPListen(Spec{Live: true, Passive: true}, addr, time.Now)
+	unregister, err := rtmpListeners.RegisterPublish(addr, "live/s", sink, rtmp.Config{}, rtmpsrv.Policy{})
+	require.NoError(t, err)
+	sink.unregister = unregister
+	t.Cleanup(func() { _ = sink.Close() })
+	assert.False(t, sink.Busy(time.Now()), "no publisher")
 
 	p := dialPublisher(t, "rtmp://"+addr+"/live/s") // sends nothing after publish
 	var cur *rtmpSession
@@ -362,19 +413,15 @@ func TestRTMPListenBusy(t *testing.T) {
 	last := cur.conn.LastInbound()
 	require.False(t, cur.offered.Before(last))
 	from := cur.offered
-	assert.True(t, sink.busy(from.Add(1900*time.Millisecond)))
-	assert.False(t, sink.busy(from.Add(2100*time.Millisecond)))
+	assert.True(t, sink.Busy(from.Add(1900*time.Millisecond)))
+	assert.False(t, sink.Busy(from.Add(2100*time.Millisecond)))
 	// A slow handoff: the offer time counts as the last inbound byte.
 	sink.mu.Lock()
 	cur.offered = last.Add(5 * time.Second)
 	sink.mu.Unlock()
-	assert.True(t, sink.busy(last.Add(6*time.Second)))
-	assert.False(t, sink.busy(last.Add(7100*time.Millisecond)))
-
+	assert.True(t, sink.Busy(last.Add(6*time.Second)))
+	assert.False(t, sink.Busy(last.Add(7100*time.Millisecond)))
 	_ = p
-	cancel() // no tracks were announced: Open is still waiting
-	o := <-ch
-	require.ErrorIs(t, o.err, context.Canceled)
 }
 
 // A publisher that goes silent without closing is taken over by a new one
@@ -518,53 +565,16 @@ func TestRTMPListenRejectsSecond(t *testing.T) {
 	assert.Empty(t, log.breaks)
 }
 
-// Publishers are routed on the joined, normalised path; an empty app or
-// stream never matches.
+// Publishers are routed on the joined, normalised path (the rules are
+// rtmpsrv's TestRegistryRouting).
 func TestRTMPListenRouting(t *testing.T) {
 	port := freeTCPPort(t)
 	addr := "127.0.0.1:" + port
 	chS := openAsync(t, context.Background(), rtmpListenURL(port, "live/s"), Env{})
 	chInst := openAsync(t, context.Background(), "rtmp://127.0.0.1:"+port+"/live/inst/s?mode=listener", Env{})
 	waitListening(t, addr)
-	l := rtmpListeners.lookup(addr)
-	require.Eventually(t, func() bool {
-		l.reg.mu.Lock()
-		defer l.reg.mu.Unlock()
-		return len(l.routes) == 2
-	}, 5*time.Second, 5*time.Millisecond)
-	l.reg.mu.Lock()
-	routeS, routeInst := l.routes["live/s"], l.routes["live/inst/s"]
-	l.reg.mu.Unlock()
-	require.NotNil(t, routeS)
-	require.NotNil(t, routeInst)
-
-	for _, c := range []struct {
-		req  rtmp.PublishRequest
-		want *rtmpRoute
-	}{
-		{rtmp.PublishRequest{App: "live", Stream: "s"}, routeS},
-		{rtmp.PublishRequest{App: "live?token=x", Stream: "s"}, routeS},
-		{rtmp.PublishRequest{App: "live", Stream: "s?token=x"}, routeS},
-		{rtmp.PublishRequest{App: "/live/", Stream: "/s/"}, routeS},
-		{rtmp.PublishRequest{App: "live/inst", Stream: "s"}, routeInst},
-		{rtmp.PublishRequest{App: "live", Stream: "inst/s"}, routeInst},
-		{rtmp.PublishRequest{App: "live/inst?token=x", Stream: "s"}, routeInst},
-		{rtmp.PublishRequest{App: "live", Stream: ""}, nil},
-		{rtmp.PublishRequest{App: "live/s", Stream: ""}, nil},
-		{rtmp.PublishRequest{App: "live/s", Stream: "?token=x"}, nil},
-		{rtmp.PublishRequest{App: "", Stream: "live/s"}, nil},
-		{rtmp.PublishRequest{App: "live", Stream: "zz"}, nil},
-	} {
-		rt, err := l.reserve(c.req)
-		if c.want == nil {
-			assert.Error(t, err, "%+v", c.req)
-			assert.Nil(t, rt, "%+v", c.req)
-			continue
-		}
-		require.NoError(t, err, "%+v", c.req)
-		assert.Same(t, c.want, rt, "%+v", c.req)
-		l.release(rt)
-	}
+	require.Eventually(t, func() bool { return rtmpListeners.Stats(addr).Routes == 2 },
+		5*time.Second, 5*time.Millisecond)
 
 	tags := fixtureTags(t, "h264_aac.flv")
 	want := sourceFrames(t, tags)
@@ -758,7 +768,7 @@ func TestRTMPOpenQueue(t *testing.T) {
 // publisher gets in once a slot frees.
 // Not parallel: it sets the package's listen policy.
 func TestRTMPListenFlood(t *testing.T) {
-	setRTMPListenPolicy(t, listenPolicy{MaxPrePublish: 16, MaxPrePublishPerIP: 16})
+	setRTMPListenPolicy(t, rtmpsrv.Policy{MaxPrePublish: 16, MaxPrePublishPerIP: 16})
 	port := freeTCPPort(t)
 	addr := "127.0.0.1:" + port
 	ch := openAsync(t, context.Background(), rtmpListenURL(port, "live/s"), Env{})
@@ -768,9 +778,9 @@ func TestRTMPListenFlood(t *testing.T) {
 	for i := range conns {
 		conns[i] = idleTCP(t, addr)
 	}
-	require.Eventually(t, func() bool { return rtmpListeners.stats(addr)["rejected_flood"] == 184 },
-		5*time.Second, 5*time.Millisecond, "rejected_flood=%d", rtmpListeners.stats(addr)["rejected_flood"])
-	waitPrePublish(t, rtmpListeners, addr, 16)
+	require.Eventually(t, func() bool { return rtmpListeners.Stats(addr).RejectedFlood == 184 },
+		5*time.Second, 5*time.Millisecond, "rejected_flood=%d", rtmpListeners.Stats(addr).RejectedFlood)
+	waitPrePublish(t, addr, 16)
 	var open []net.Conn
 	closed := 0
 	for _, c := range conns {
@@ -789,7 +799,7 @@ func TestRTMPListenFlood(t *testing.T) {
 	require.Error(t, err)
 	require.Nil(t, p)
 	require.NoError(t, open[0].Close())
-	waitPrePublish(t, rtmpListeners, addr, 15)
+	waitPrePublish(t, addr, 15)
 	tags := fixtureTags(t, "h264_aac.flv")
 	pub := dialPublisher(t, "rtmp://"+addr+"/live/s")
 	for _, tg := range tags[:20] {
@@ -882,7 +892,7 @@ func TestRTMPListenCloseUnblocks(t *testing.T) {
 		_, err = r.r.Read()
 		assert.ErrorIs(t, err, errRTMPClosed, "Read after Close")
 		require.NoError(t, r.r.Close(), "Close is idempotent")
-		assert.Nil(t, rtmpListeners.lookup(addr))
+		assert.Zero(t, rtmpListeners.Stats(addr).ID)
 		ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", addr)
 		require.NoError(t, err, "Close frees the port")
 		require.NoError(t, ln.Close())
@@ -941,7 +951,7 @@ func TestOpenRTMPListen(t *testing.T) {
 		p, err := parse(u)
 		require.NoError(t, err)
 		addr, path := rtmpListenTarget(p)
-		key, err := rtmpAddrKey(addr)
+		key, err := rtmpsrv.AddrKey(addr)
 		require.NoError(t, err)
 		assert.Equal(t, ":1935", key, u)
 		assert.Equal(t, "/live/s", path, u)
@@ -971,7 +981,7 @@ func TestOpenRTMPListen(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.NotContains(t, err.Error(), vStreamKey)
-	assert.Nil(t, rtmpListeners.lookup("127.0.0.1:"+port))
+	assert.Zero(t, rtmpListeners.Stats("127.0.0.1:"+port).ID)
 	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:"+port)
 	require.NoError(t, err)
 	require.NoError(t, ln.Close())
@@ -987,28 +997,8 @@ func TestOpenRTMPListen(t *testing.T) {
 	awaitOpen(t, ch)
 }
 
+// Rejections, open errors and stats never carry the stream key.
 func TestRedactRTMPStreamKey(t *testing.T) {
-	for _, c := range []struct{ in, want string }{
-		{"rtmp://h/live/" + vStreamKey, "rtmp://h/live/skxxxxx"},
-		{"rtmp://h/live/inst/" + vStreamKey, "rtmp://h/live/inst/skxxxxx"},
-		{"rtmp://h/live/" + vStreamKey + "/", "rtmp://h/live/skxxxxx"},
-		{"rtmp://h/live/s", "rtmp://h/live/xxxxx"},
-		{"rtmp://h/live/ab", "rtmp://h/live/xxxxx"},
-		{"rtmp://h/live/abc", "rtmp://h/live/abxxxxx"},
-		{"RTMP://h/live/" + vStreamKey, "rtmp://h/live/skxxxxx"},
-		{"rtmp://:1935/live/" + vStreamKey + "?mode=listen", "rtmp://:1935/live/skxxxxx?mode=listen"},
-		{"rtmp://u:" + vPW + "@h:1935/live/" + vStreamKey + "?token=" + vSecret + "&mode=pull", "rtmp://u:xxxxx@h:1935/live/skxxxxx?token=xxxxx&mode=pull"},
-		{"rtmp://h/", "rtmp://h/"},
-		{"rtmp://h", "rtmp://h"},
-	} {
-		assert.Equal(t, c.want, Redact(c.in), c.in)
-	}
-	// Escaped characters in the key do not leak either.
-	assert.NotContains(t, Redact("rtmp://h/live/sk%20"+vStreamKey), vStreamKey)
-	// Other schemes keep their paths.
-	assert.Equal(t, "http://h/live/"+vStreamKey, Redact("http://h/live/"+vStreamKey))
-
-	// Rejections, open errors and stats never carry the key.
 	port := freeTCPPort(t)
 	addr := "127.0.0.1:" + port
 	ch := openAsync(t, context.Background(), rtmpListenURL(port, "live/"+vStreamKey), Env{})
