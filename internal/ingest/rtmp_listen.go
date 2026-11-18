@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 )
 
@@ -103,7 +104,10 @@ func rtmpKinds(video, audio bool) []media.Kind {
 
 // rtmpListenPolicy is the listener policy that Open passes to the registry;
 // tests lower it.
-var rtmpListenPolicy listenPolicy
+var rtmpListenPolicy rtmpsrv.Policy
+
+// rtmpListeners is the registry of the shared RTMP listeners.
+var rtmpListeners = rtmpsrv.Default
 
 // errRTMPClosed is returned by Read after Close.
 var errRTMPClosed = errors.New("ingest: rtmp: closed")
@@ -129,7 +133,7 @@ type rtmpSession struct {
 }
 
 // rtmpListen is an RTMP listen input: the sink of one path on a shared TCP
-// listener (see rtmpRegistry). It has at most one publisher. A new one is
+// listener (see rtmpsrv.Registry). It has at most one publisher. A new one is
 // accepted when there is none, or when the current one has received no byte
 // for 2 s (a half-open peer): it takes over and the old session is closed.
 // While the current one is sending, a new one is rejected with the same
@@ -167,25 +171,31 @@ type rtmpListen struct {
 	audio    bool
 	doneStat map[string]uint64 // counters of finished publishers
 
-	// listener is the shared TCP listener, for its counters.
-	listener              *rtmpListener
+	// addr is the shared TCP listener's address, for its counters, and
+	// lastListener its counters when Close began; guarded by mu.
+	addr                  string
+	lastListener          map[string]uint64
 	closing               atomic.Bool // Close has begun
 	publishers, takeovers atomic.Uint64
 }
 
-func openRTMPListen(ctx context.Context, rawURL string, p parsed, env Env) (Reader, error) {
-	addr, path := rtmpListenTarget(p)
-	l := &rtmpListen{
-		spec: p.spec, now: env.now(),
+// newRTMPListen returns an unregistered listen input for addr.
+func newRTMPListen(spec Spec, addr string, now func() time.Time) *rtmpListen {
+	return &rtmpListen{
+		spec: spec, now: now, addr: addr,
 		wake: make(chan struct{}, 1), done: make(chan struct{}), doneStat: map[string]uint64{},
 	}
+}
+
+func openRTMPListen(ctx context.Context, rawURL string, p parsed, env Env) (Reader, error) {
+	addr, path := rtmpListenTarget(p)
+	l := newRTMPListen(p.spec, addr, env.now())
 	//nolint:contextcheck // the shared listener outlives the open ctx, which bounds only the open
-	unregister, err := rtmpListeners.register(addr, path, l, rtmp.Config{}, rtmpListenPolicy)
+	unregister, err := rtmpListeners.RegisterPublish(addr, path, l, rtmp.Config{}, rtmpListenPolicy)
 	if err != nil {
 		return nil, fmt.Errorf("ingest: rtmp: open %s: %w", Redact(rawURL), err)
 	}
 	l.unregister = unregister
-	l.listener = rtmpListeners.lookup(addr) // ours while the route is registered
 
 	// The first publisher and its tracks, bounded by ctx.
 	stop := context.AfterFunc(ctx, func() { _ = l.Close() })
@@ -216,9 +226,9 @@ func (l *rtmpListen) awaitTracks() error {
 	return nil
 }
 
-// offer implements rtmpSink. The new publisher replaces the current one,
-// whose session is closed.
-func (l *rtmpListen) offer(conn *rtmp.ServerConn) bool {
+// Offer implements rtmpsrv.PublishSink. The new publisher replaces the
+// current one, whose session is closed.
+func (l *rtmpListen) Offer(conn *rtmp.ServerConn) bool {
 	s := &rtmpSession{conn: conn, offered: time.Now(), flv: newFLVFrames(&l.cache, l.now)}
 	l.mu.Lock()
 	if l.closed {
@@ -241,15 +251,15 @@ func (l *rtmpListen) offer(conn *rtmp.ServerConn) bool {
 	return true
 }
 
-// busy implements rtmpSink: the current publisher received a byte within
-// takeoverIdle. A publisher just offered counts from its offer, so a second
-// one cannot take it over before it has had time to send.
+// Busy implements rtmpsrv.PublishSink: the current publisher received a
+// byte within takeoverIdle. A publisher just offered counts from its offer,
+// so a second one cannot take it over before it has had time to send.
 //
 // LastInbound measures bytes read from the connection, and only the reader
 // reads it: a consumer that stalls for takeoverIdle (and lets the TCP
 // window fill) makes a live publisher look idle, so a new one may take it
 // over, and the old session's unread data is lost with it.
-func (l *rtmpListen) busy(now time.Time) bool {
+func (l *rtmpListen) Busy(now time.Time) bool {
 	l.mu.Lock()
 	s := l.cur
 	l.mu.Unlock()
@@ -411,13 +421,15 @@ func (l *rtmpListen) Stats() map[string]uint64 {
 		out["unknown_commands"] += s.conn.UnknownCommands()
 		out["bad_commands"] += s.conn.BadCommands()
 	}
+	listener := l.lastListener
 	l.mu.Unlock()
 	out["publishers"] = l.publishers.Load()
 	out["takeovers"] = l.takeovers.Load()
-	if l.listener != nil {
-		for k, v := range l.listener.counters() {
-			out[k] = v
-		}
+	if listener == nil {
+		listener = rtmpListeners.Stats(l.addr).Counters()
+	}
+	for k, v := range listener {
+		out[k] = v
 	}
 	return out
 }
@@ -434,6 +446,12 @@ func (l *rtmpListen) Close() error {
 	l.closing.Store(true)
 	close(l.done)
 	cur, active := l.cur, l.active
+	l.mu.Unlock()
+	// The listener's counters as they stand while the route is still ours;
+	// after the unregister another listener may take the address.
+	last := rtmpListeners.Stats(l.addr).Counters()
+	l.mu.Lock()
+	l.lastListener = last
 	l.mu.Unlock()
 	// Not under l.mu: unregister may wait for a session calling offer.
 	l.unregister()

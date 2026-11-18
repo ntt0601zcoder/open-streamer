@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
 
 func TestParse(t *testing.T) {
@@ -50,21 +52,14 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// Redact is redact.URL (its tests are there).
 func TestRedact(t *testing.T) {
-	r := Redact("srt://u:p@h:1?" + kPass + "=" + vS + "&streamid=x")
-	assert.NotContains(t, r, "p@")
-	assert.NotContains(t, r, kPass+"="+vS)
-	assert.NotContains(t, r, "=s&")
-	assert.Contains(t, r, "streamid=x")
-	assert.Contains(t, r, "h:1")
-	assert.Equal(t, "srt://h:1?b=1&"+kPass+"=xxxxx&a=2", Redact("srt://h:1?b=1&"+kPass+"="+vS+"&a=2"), "order is kept")
-	assert.Equal(t, "srt://h:1?PassPhrase=xxxxx", Redact("srt://h:1?PassPhrase="+vS), "keys are case-insensitive")
-	assert.Equal(t, "udp://@:5000", Redact("udp://@:5000"))
-	assert.Equal(t, "/tmp/a.ts", Redact("/tmp/a.ts"))
-	assert.Equal(t, "http://h/x", Redact("http://h/x"))
-	assert.NotContains(t, Redact("http://h/x?token=abc"), "abc")
-	assert.NotContains(t, Redact("http://u@h/x"), "u@")
-	assert.NotContains(t, Redact("http://[::1"), "::1")
+	for _, u := range []string{
+		"srt://u:p@h:1?" + kPass + "=" + vS + "&streamid=x", "rtmp://h/live/" + vStreamKey, "/tmp/a.ts", "http://[::1",
+	} {
+		assert.Equal(t, redact.URL(u), Redact(u), u)
+	}
+	assert.Equal(t, "rtmp://h/live/skxxxxx", Redact("rtmp://h/live/"+vStreamKey))
 }
 
 func TestOpenFile(t *testing.T) {

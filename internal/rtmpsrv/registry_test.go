@@ -1,4 +1,4 @@
-package ingest
+package rtmpsrv
 
 import (
 	"context"
@@ -19,7 +19,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
 )
 
-// fakeSink is an rtmpSink that keeps every conn it is offered.
+// fakeSink is a PublishSink that keeps every conn it is offered.
 type fakeSink struct {
 	isBusy atomic.Bool
 	// read makes offer read each conn's media in a goroutine until it ends,
@@ -39,7 +39,7 @@ func newFakeSink() *fakeSink {
 	return &fakeSink{offered: make(chan *rtmp.ServerConn, 16)}
 }
 
-func (f *fakeSink) offer(conn *rtmp.ServerConn) bool {
+func (f *fakeSink) Offer(conn *rtmp.ServerConn) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
@@ -64,7 +64,7 @@ func (f *fakeSink) offer(conn *rtmp.ServerConn) bool {
 	return true
 }
 
-func (f *fakeSink) busy(time.Time) bool { return f.isBusy.Load() }
+func (f *fakeSink) Busy(time.Time) bool { return f.isBusy.Load() }
 
 // close refuses later offers and closes the conns taken so far.
 func (f *fakeSink) close() {
@@ -99,9 +99,9 @@ func freeTCPPort(t *testing.T) string {
 }
 
 // mustRegister registers sink and unregisters it when the test ends.
-func mustRegister(t *testing.T, r *rtmpRegistry, addr, path string, sink rtmpSink, pol listenPolicy) func() {
+func mustRegister(t *testing.T, r *Registry, addr, path string, sink PublishSink, pol Policy) func() {
 	t.Helper()
-	unregister, err := r.register(addr, path, sink, rtmp.Config{}, pol)
+	unregister, err := r.RegisterPublish(addr, path, sink, rtmp.Config{}, pol)
 	require.NoError(t, err)
 	t.Cleanup(unregister)
 	return unregister
@@ -153,11 +153,11 @@ func closedByPeer(c net.Conn, d time.Duration) bool {
 	return errors.Is(err, io.EOF) || !errors.As(err, &ne) || !ne.Timeout()
 }
 
-func waitPrePublish(t *testing.T, r *rtmpRegistry, addr string, n int) {
+func waitPrePublish(t *testing.T, r *Registry, addr string, n int) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		l := r.lookup(addr)
-		return l != nil && l.prePublish() == n
+		st := r.Stats(addr)
+		return st.ID != 0 && st.PrePublish == n
 	}, 5*time.Second, 5*time.Millisecond, "want %d pre-publish sessions", n)
 }
 
@@ -171,15 +171,15 @@ func registryTags() []rtmp.FLVTag {
 
 // Two paths on one port share one TCP listener; each publisher reaches its
 // own sink.
-func TestRTMPRegistrySharedPort(t *testing.T) {
-	r := &rtmpRegistry{}
+func TestRegistrySharedPort(t *testing.T) {
+	r := &Registry{}
 	addr := "127.0.0.1:" + freeTCPPort(t)
 	a, b := newFakeSink(), newFakeSink()
 	a.read, b.read = true, true
 	t.Cleanup(a.close)
 	t.Cleanup(b.close)
-	mustRegister(t, r, addr, "/live/a", a, listenPolicy{})
-	mustRegister(t, r, addr, "live/b?ignored=1", b, listenPolicy{})
+	mustRegister(t, r, addr, "/live/a", a, Policy{})
+	mustRegister(t, r, addr, "live/b?ignored=1", b, Policy{})
 
 	r.mu.Lock()
 	n := len(r.listeners)
@@ -206,7 +206,7 @@ func TestRTMPRegistrySharedPort(t *testing.T) {
 	// one and two.
 	c := newFakeSink()
 	t.Cleanup(c.close)
-	mustRegister(t, r, addr, "live/inst/s", c, listenPolicy{})
+	mustRegister(t, r, addr, "live/inst/s", c, Policy{})
 	mustPublish(t, "rtmp://"+addr+"/live/inst/s")
 	c.next(t)
 
@@ -216,10 +216,10 @@ func TestRTMPRegistrySharedPort(t *testing.T) {
 	mustReject(t, "rtmp://"+addr+"/other/a")
 	a.isBusy.Store(true)
 	mustReject(t, "rtmp://"+addr+"/live/a")
-	st := r.stats(addr)
-	assert.EqualValues(t, 2, st["rejected_unknown"])
-	assert.EqualValues(t, 1, st["rejected_busy"])
-	assert.Zero(t, st["rejected_flood"])
+	st := r.Stats(addr)
+	assert.EqualValues(t, 2, st.RejectedUnknown)
+	assert.EqualValues(t, 1, st.RejectedBusy)
+	assert.Zero(t, st.RejectedFlood)
 	// Published sessions do not count as pre-publish; a rejected one leaves
 	// just after the client reads the rejection.
 	waitPrePublish(t, r, addr, 0)
@@ -227,11 +227,11 @@ func TestRTMPRegistrySharedPort(t *testing.T) {
 
 // The registry's decide rejects an empty app or stream instead of letting
 // NormalizePath fold them into another route.
-func TestRTMPRegistryEmptyAppOrStream(t *testing.T) {
-	r := &rtmpRegistry{}
+func TestRegistryEmptyAppOrStream(t *testing.T) {
+	r := &Registry{}
 	sink := newFakeSink()
 	t.Cleanup(sink.close)
-	l := &rtmpListener{reg: r, routes: map[string]*rtmpRoute{"live/s": {sink: sink}}, now: time.Now}
+	l := &listener{reg: r, routes: map[string]*route{"live/s": {sink: sink}}, now: time.Now}
 	for _, req := range []rtmp.PublishRequest{
 		{App: "live/s", Stream: ""},
 		{App: "", Stream: "live/s"},
@@ -240,7 +240,8 @@ func TestRTMPRegistryEmptyAppOrStream(t *testing.T) {
 		rt, err := l.reserve(req)
 		assert.Nil(t, rt, "%+v", req)
 		require.Error(t, err, "%+v", req)
-		assert.Equal(t, "ingest: rtmp: stream not available", err.Error())
+		assert.Equal(t, "rtmpsrv: rtmp: stream not available", err.Error())
+		assert.ErrorIs(t, err, rtmp.ErrStreamNotAvailable)
 	}
 	assert.EqualValues(t, 3, l.rejectedUnknown.Load())
 	rt, err := l.reserve(rtmp.PublishRequest{App: "live", Stream: "s?token=x"})
@@ -256,29 +257,66 @@ func TestRTMPRegistryEmptyAppOrStream(t *testing.T) {
 	l.release(rt)
 }
 
-func TestRTMPRegistryDuplicatePath(t *testing.T) {
-	r := &rtmpRegistry{}
+// Publishers are routed on the joined, normalised path: the query is
+// dropped, slashes are trimmed, and an app of two segments with a stream of
+// one meets an app of one with a stream of two. An empty app or stream
+// never matches.
+func TestRegistryRouting(t *testing.T) {
+	r := &Registry{}
+	routeS, routeInst := &route{sink: newFakeSink()}, &route{sink: newFakeSink()}
+	l := &listener{reg: r, routes: map[string]*route{"live/s": routeS, "live/inst/s": routeInst}, now: time.Now}
+	for _, c := range []struct {
+		req  rtmp.Request
+		want *route
+	}{
+		{rtmp.Request{App: "live", Stream: "s"}, routeS},
+		{rtmp.Request{App: "live?token=x", Stream: "s"}, routeS},
+		{rtmp.Request{App: "live", Stream: "s?token=x"}, routeS},
+		{rtmp.Request{App: "/live/", Stream: "/s/"}, routeS},
+		{rtmp.Request{App: "live/inst", Stream: "s"}, routeInst},
+		{rtmp.Request{App: "live", Stream: "inst/s"}, routeInst},
+		{rtmp.Request{App: "live/inst?token=x", Stream: "s"}, routeInst},
+		{rtmp.Request{App: "live", Stream: ""}, nil},
+		{rtmp.Request{App: "live/s", Stream: ""}, nil},
+		{rtmp.Request{App: "live/s", Stream: "?token=x"}, nil},
+		{rtmp.Request{App: "", Stream: "live/s"}, nil},
+		{rtmp.Request{App: "live", Stream: "zz"}, nil},
+	} {
+		rt, err := l.reserve(c.req)
+		if c.want == nil {
+			assert.Error(t, err, "%+v", c.req)
+			assert.Nil(t, rt, "%+v", c.req)
+			continue
+		}
+		require.NoError(t, err, "%+v", c.req)
+		assert.Same(t, c.want, rt, "%+v", c.req)
+		l.release(rt)
+	}
+}
+
+func TestRegistryDuplicatePath(t *testing.T) {
+	r := &Registry{}
 	addr := "127.0.0.1:" + freeTCPPort(t)
-	mustRegister(t, r, addr, "live/secretkey", newFakeSink(), listenPolicy{})
-	_, err := r.register(addr, "/live/secretkey/", newFakeSink(), rtmp.Config{}, listenPolicy{})
+	mustRegister(t, r, addr, "live/secretkey", newFakeSink(), Policy{})
+	_, err := r.RegisterPublish(addr, "/live/secretkey/", newFakeSink(), rtmp.Config{}, Policy{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "ingest: rtmp:")
+	assert.Contains(t, err.Error(), "rtmpsrv:")
 	assert.NotContains(t, err.Error(), "secretkey", "the stream key is redacted")
 	assert.Contains(t, err.Error(), "live/sexxxxx")
 
 	// A path without both an app and a stream is refused.
 	for _, p := range []string{"", "/", "live", "/live/"} {
-		_, err := r.register(addr, p, newFakeSink(), rtmp.Config{}, listenPolicy{})
+		_, err := r.RegisterPublish(addr, p, newFakeSink(), rtmp.Config{}, Policy{})
 		assert.Error(t, err, "path %q", p)
 	}
 	// A bad address is refused.
-	_, err = r.register("nope", "live/s", newFakeSink(), rtmp.Config{}, listenPolicy{})
+	_, err = r.RegisterPublish("nope", "live/s", newFakeSink(), rtmp.Config{}, Policy{})
 	assert.Error(t, err)
 }
 
 // An empty host, 0.0.0.0 and [::] with the same port are one listener; a
 // specific host is a bind of its own.
-func TestRTMPRegistryAddrNormalised(t *testing.T) {
+func TestRegistryAddrNormalised(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{":1935", ":1935"},
 		{"0.0.0.0:1935", ":1935"},
@@ -294,21 +332,21 @@ func TestRTMPRegistryAddrNormalised(t *testing.T) {
 		{"[0:0::0]:1935", ":1935"},
 		{"[0:0::1]:1935", "[::1]:1935"},
 	} {
-		got, err := rtmpAddrKey(tc.in)
+		got, err := AddrKey(tc.in)
 		require.NoError(t, err, tc.in)
 		assert.Equal(t, tc.want, got, tc.in)
 	}
 	for _, bad := range []string{"", "1935", ":", "host:", ":abc", ":70000", ":0", "0.0.0.0:0", ":-1"} {
-		_, err := rtmpAddrKey(bad)
+		_, err := AddrKey(bad)
 		assert.Error(t, err, "%q", bad)
 	}
 
-	r := &rtmpRegistry{}
+	r := &Registry{}
 	port := freeTCPPort(t)
 	sinks := []*fakeSink{newFakeSink(), newFakeSink(), newFakeSink()}
 	for i, addr := range []string{":" + port, "0.0.0.0:" + port, "[::]:" + port} {
 		t.Cleanup(sinks[i].close)
-		mustRegister(t, r, addr, "live/s"+strconv.Itoa(i), sinks[i], listenPolicy{})
+		mustRegister(t, r, addr, "live/s"+strconv.Itoa(i), sinks[i], Policy{})
 	}
 	r.mu.Lock()
 	n := len(r.listeners)
@@ -320,18 +358,18 @@ func TestRTMPRegistryAddrNormalised(t *testing.T) {
 	}
 	// The wildcard holds the port, so a specific host is its own bind and
 	// fails.
-	_, err := r.register("127.0.0.1:"+port, "live/x", newFakeSink(), rtmp.Config{}, listenPolicy{})
+	_, err := r.RegisterPublish("127.0.0.1:"+port, "live/x", newFakeSink(), rtmp.Config{}, Policy{})
 	assert.Error(t, err)
 }
 
 // After the last unregister the port is free again at once, for the registry
 // and for anyone else.
-func TestRTMPRegistryReopenSameAddr(t *testing.T) {
-	r := &rtmpRegistry{}
+func TestRegistryReopenSameAddr(t *testing.T) {
+	r := &Registry{}
 	addr := "127.0.0.1:" + freeTCPPort(t)
 	for range 20 {
 		sink := newFakeSink()
-		unregister, err := r.register(addr, "live/s", sink, rtmp.Config{}, listenPolicy{})
+		unregister, err := r.RegisterPublish(addr, "live/s", sink, rtmp.Config{}, Policy{})
 		require.NoError(t, err)
 		idleTCP(t, addr) // a session in flight
 		unregister()
@@ -345,14 +383,14 @@ func TestRTMPRegistryReopenSameAddr(t *testing.T) {
 
 	// Unregister racing a register of another path never fails the register.
 	for range 20 {
-		un1, err := r.register(addr, "live/a", newFakeSink(), rtmp.Config{}, listenPolicy{})
+		un1, err := r.RegisterPublish(addr, "live/a", newFakeSink(), rtmp.Config{}, Policy{})
 		require.NoError(t, err)
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
 			un1()
 		}()
-		un2, err := r.register(addr, "live/b", newFakeSink(), rtmp.Config{}, listenPolicy{})
+		un2, err := r.RegisterPublish(addr, "live/b", newFakeSink(), rtmp.Config{}, Policy{})
 		require.NoError(t, err)
 		<-done
 		un2()
@@ -365,13 +403,13 @@ func TestRTMPRegistryReopenSameAddr(t *testing.T) {
 // Unregistering while a publisher is mid-handshake ends its session at once
 // and leaves no goroutine behind.
 // Not parallel: it counts goroutines.
-func TestRTMPRegistryCloseDuringAccept(t *testing.T) {
+func TestRegistryCloseDuringAccept(t *testing.T) {
 	addr := "127.0.0.1:" + freeTCPPort(t)
 	cycle := func() {
-		r := &rtmpRegistry{}
+		r := &Registry{}
 		sink := newFakeSink()
 		defer sink.close()
-		unregister, err := r.register(addr, "live/s", sink, rtmp.Config{HandshakeTimeout: time.Minute}, listenPolicy{})
+		unregister, err := r.RegisterPublish(addr, "live/s", sink, rtmp.Config{HandshakeTimeout: time.Minute}, Policy{})
 		require.NoError(t, err)
 		c := idleTCP(t, addr)
 		_, err = c.Write([]byte{0x03}) // C0, then nothing
@@ -402,13 +440,13 @@ func TestRTMPRegistryCloseDuringAccept(t *testing.T) {
 
 // Connections over the per-listener or per-IP pre-publish cap are closed
 // right after accept and counted; a freed slot takes a publisher again.
-func TestRTMPRegistryFloodCaps(t *testing.T) {
+func TestRegistryFloodCaps(t *testing.T) {
 	t.Run("per listener", func(t *testing.T) {
-		r := &rtmpRegistry{}
+		r := &Registry{}
 		addr := "127.0.0.1:" + freeTCPPort(t)
 		sink := newFakeSink()
 		t.Cleanup(sink.close)
-		mustRegister(t, r, addr, "live/s", sink, listenPolicy{MaxPrePublish: 8, MaxPrePublishPerIP: 100})
+		mustRegister(t, r, addr, "live/s", sink, Policy{MaxPrePublish: 8, MaxPrePublishPerIP: 100})
 		conns := make([]net.Conn, 8)
 		for i := range conns {
 			conns[i] = idleTCP(t, addr)
@@ -416,7 +454,7 @@ func TestRTMPRegistryFloodCaps(t *testing.T) {
 		waitPrePublish(t, r, addr, 8)
 		ninth := idleTCP(t, addr)
 		assert.True(t, closedByPeer(ninth, 2*time.Second), "the 9th conn was not closed")
-		assert.EqualValues(t, 1, r.stats(addr)["rejected_flood"])
+		assert.EqualValues(t, 1, r.Stats(addr).RejectedFlood)
 		for _, c := range conns {
 			assert.False(t, closedByPeer(c, 10*time.Millisecond), "a conn under the cap was closed")
 		}
@@ -429,9 +467,9 @@ func TestRTMPRegistryFloodCaps(t *testing.T) {
 		waitPrePublish(t, r, addr, 7)
 	})
 	t.Run("per IP", func(t *testing.T) {
-		r := &rtmpRegistry{}
+		r := &Registry{}
 		addr := "127.0.0.1:" + freeTCPPort(t)
-		mustRegister(t, r, addr, "live/s", newFakeSink(), listenPolicy{MaxPrePublish: 100, MaxPrePublishPerIP: 4})
+		mustRegister(t, r, addr, "live/s", newFakeSink(), Policy{MaxPrePublish: 100, MaxPrePublishPerIP: 4})
 		conns := make([]net.Conn, 4)
 		for i := range conns {
 			conns[i] = idleTCP(t, addr)
@@ -439,22 +477,22 @@ func TestRTMPRegistryFloodCaps(t *testing.T) {
 		waitPrePublish(t, r, addr, 4)
 		fifth := idleTCP(t, addr)
 		assert.True(t, closedByPeer(fifth, 2*time.Second), "the 5th conn was not closed")
-		assert.EqualValues(t, 1, r.stats(addr)["rejected_flood"])
+		assert.EqualValues(t, 1, r.Stats(addr).RejectedFlood)
 		for _, c := range conns {
 			assert.False(t, closedByPeer(c, 10*time.Millisecond), "a conn under the cap was closed")
 		}
 	})
 	t.Run("defaults", func(t *testing.T) {
-		assert.Equal(t, listenPolicy{MaxPrePublish: 64, MaxPrePublishPerIP: 4}, listenPolicy{}.withDefaults())
-		assert.Equal(t, listenPolicy{MaxPrePublish: 8, MaxPrePublishPerIP: 2}, listenPolicy{MaxPrePublish: 8, MaxPrePublishPerIP: 2}.withDefaults())
+		assert.Equal(t, Policy{MaxPrePublish: 64, MaxPrePublishPerIP: 4}, Policy{}.withDefaults())
+		assert.Equal(t, Policy{MaxPrePublish: 8, MaxPrePublishPerIP: 2}, Policy{MaxPrePublish: 8, MaxPrePublishPerIP: 2}.withDefaults())
 	})
 }
 
 // A publisher accepted by decide whose Accept then fails releases the route,
 // and one offered to a closed sink is closed.
-func TestRTMPRegistryReleaseAfterAcceptError(t *testing.T) {
+func TestRegistryReleaseAfterAcceptError(t *testing.T) {
 	var failed atomic.Bool
-	r := &rtmpRegistry{accept: func(ctx context.Context, c net.Conn, cfg rtmp.Config, decide func(rtmp.PublishRequest) error) (*rtmp.ServerConn, error) {
+	r := &Registry{accept: func(ctx context.Context, c net.Conn, cfg rtmp.Config, decide func(rtmp.PublishRequest) error) (*rtmp.ServerConn, error) {
 		sc, err := rtmp.Accept(ctx, c, cfg, decide)
 		if err == nil && failed.CompareAndSwap(false, true) {
 			_ = sc.Close()
@@ -465,14 +503,14 @@ func TestRTMPRegistryReleaseAfterAcceptError(t *testing.T) {
 	addr := "127.0.0.1:" + freeTCPPort(t)
 	sink := newFakeSink()
 	t.Cleanup(sink.close)
-	mustRegister(t, r, addr, "live/s", sink, listenPolicy{})
+	mustRegister(t, r, addr, "live/s", sink, Policy{})
 
 	mustPublish(t, "rtmp://"+addr+"/live/s") // the client saw Publish.Start, the server failed
 	require.Eventually(t, failed.Load, 5*time.Second, 5*time.Millisecond)
 	waitPrePublish(t, r, addr, 0)
 	mustPublish(t, "rtmp://"+addr+"/live/s") // not rejected as busy
 	sink.next(t)
-	assert.Zero(t, r.stats(addr)["rejected_busy"])
+	assert.Zero(t, r.Stats(addr).RejectedBusy)
 
 	// A sink closed between decide and offer refuses the conn, which the
 	// registry closes.
