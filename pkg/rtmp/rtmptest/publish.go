@@ -1,6 +1,7 @@
 // Package rtmptest provides RTMP peers for tests: a publisher that pushes FLV
-// tags to an RTMP server, and a scripted server that clients play FLV tags
-// from. It imports nothing from internal/.
+// tags to an RTMP server, a scripted server that clients play FLV tags from,
+// and a server that records what clients publish to it. It imports nothing
+// from internal/.
 package rtmptest
 
 import (

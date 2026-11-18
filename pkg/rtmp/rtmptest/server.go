@@ -2,6 +2,7 @@ package rtmptest
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -332,4 +333,163 @@ func appendAggregateTag(b []byte, t rtmp.FLVTag) []byte {
 		byte(ts>>16), byte(ts>>8), byte(ts), byte(ts>>24), 0, 0, 0)
 	b = append(b, t.Data...)
 	return binary.BigEndian.AppendUint32(b, uint32(11+n))
+}
+
+// PublishServerOptions script a PublishServer.
+type PublishServerOptions struct {
+	// Reject refuses every publish: the client gets
+	// NetStream.Publish.BadName "stream not available".
+	Reject bool
+	// CloseAfter, when positive, closes each connection once it has
+	// received that many media messages.
+	CloseAfter int
+	// AckOnly makes the server send nothing once publishing but the
+	// acknowledgements of the client's window: no pings.
+	AckOnly bool
+	// Config is the server's session Config (rtmp.Accept's). AckOnly
+	// overrides its PingInterval.
+	Config rtmp.Config
+}
+
+// PublishServer is an RTMP server on 127.0.0.1 that every client may publish
+// to, built on rtmp.Accept. It records each publish request and every media
+// message received (copies), in order across connections, and how each
+// connection's stream ended.
+type PublishServer struct {
+	// Addr is the host:port the server listens on.
+	Addr string
+
+	opt PublishServerOptions
+	ln  net.Listener
+	wg  sync.WaitGroup
+
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	closed bool
+	reqs   []rtmp.Request
+	media  []rtmp.Media
+	ends   []error
+}
+
+// NewPublishServer starts a publish server. It is closed when the test ends,
+// closing its connections and waiting for their goroutines.
+func NewPublishServer(t testing.TB, opt PublishServerOptions) *PublishServer {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("rtmptest: publish server: %v", err)
+	}
+	if opt.AckOnly {
+		// Longer than any test.
+		opt.Config.PingInterval = 24 * time.Hour
+	}
+	s := &PublishServer{Addr: ln.Addr().String(), opt: opt, ln: ln, conns: make(map[net.Conn]struct{})}
+	s.wg.Add(1)
+	go s.acceptLoop()
+	t.Cleanup(s.close)
+	return s
+}
+
+// URL returns rtmp://Addr/path.
+func (s *PublishServer) URL(path string) string {
+	return "rtmp://" + s.Addr + "/" + path
+}
+
+// Requests returns the publish requests received so far, in order, rejected
+// ones included.
+func (s *PublishServer) Requests() []rtmp.Request {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]rtmp.Request(nil), s.reqs...)
+}
+
+// Media returns the media messages received so far, in order. Data messages
+// have their "@setDataFrame" removed, as rtmp.ServerConn.ReadMedia does.
+func (s *PublishServer) Media() []rtmp.Media {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]rtmp.Media(nil), s.media...)
+}
+
+// Ends returns, for each accepted publish that has ended, ReadMedia's
+// terminal error (io.EOF when the client ended the stream), or nil when the
+// server closed the connection itself (CloseAfter).
+func (s *PublishServer) Ends() []error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]error(nil), s.ends...)
+}
+
+func (s *PublishServer) close() {
+	_ = s.ln.Close()
+	s.mu.Lock()
+	s.closed = true
+	for c := range s.conns {
+		_ = c.Close()
+	}
+	s.mu.Unlock()
+	s.wg.Wait()
+}
+
+func (s *PublishServer) acceptLoop() {
+	defer s.wg.Done()
+	for {
+		c, err := s.ln.Accept()
+		if err != nil {
+			return
+		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = c.Close()
+			return
+		}
+		s.conns[c] = struct{}{}
+		s.wg.Add(1)
+		s.mu.Unlock()
+		go func() {
+			defer s.wg.Done()
+			defer func() {
+				s.mu.Lock()
+				delete(s.conns, c)
+				s.mu.Unlock()
+				_ = c.Close()
+			}()
+			s.serve(c)
+		}()
+	}
+}
+
+// serve runs one connection; Accept closes c on error.
+func (s *PublishServer) serve(c net.Conn) {
+	sc, err := rtmp.Accept(context.Background(), c, s.opt.Config, func(r rtmp.Request) error {
+		s.mu.Lock()
+		s.reqs = append(s.reqs, r)
+		s.mu.Unlock()
+		if s.opt.Reject || r.Play {
+			return rtmp.ErrStreamNotAvailable
+		}
+		return nil
+	})
+	if err != nil {
+		return
+	}
+	defer func() { _ = sc.Close() }()
+	for n := 0; s.opt.CloseAfter <= 0 || n < s.opt.CloseAfter; n++ {
+		m, err := sc.ReadMedia()
+		if err != nil {
+			s.mu.Lock()
+			s.ends = append(s.ends, err)
+			s.mu.Unlock()
+			return
+		}
+		m.Payload = bytes.Clone(m.Payload)
+		s.mu.Lock()
+		s.media = append(s.media, m)
+		s.mu.Unlock()
+	}
+	s.mu.Lock()
+	s.ends = append(s.ends, nil)
+	s.mu.Unlock()
 }

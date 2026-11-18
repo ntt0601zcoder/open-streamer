@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// Chunk streams of a played stream's messages, all on message stream
-// mediaStreamID.
+// Chunk streams of a played or published stream's messages; a played
+// stream's are all on message stream mediaStreamID.
 const (
 	audioCSID = 4
 	dataCSID  = 5
@@ -110,15 +110,8 @@ func (sc *ServerConn) WriteMedia(m Media) error {
 	if !sc.req.Play {
 		return errNotPlay
 	}
-	var csid uint32
-	switch m.Type {
-	case MsgAudio:
-		csid = audioCSID
-	case MsgVideo:
-		csid = videoCSID
-	case MsgDataAMF0:
-		csid = dataCSID
-	default:
+	csid, ok := mediaCSID(m.Type)
+	if !ok {
 		return fmt.Errorf("rtmp: server: WriteMedia: message type %d is not audio, video or data", m.Type)
 	}
 	err := sc.s.writeMedia(csid, Message{Type: m.Type, StreamID: mediaStreamID, Timestamp: m.Timestamp, Payload: m.Payload})
@@ -126,6 +119,20 @@ func (sc *ServerConn) WriteMedia(m Media) error {
 		return fmt.Errorf("rtmp: server: %w", err)
 	}
 	return nil
+}
+
+// mediaCSID is the chunk stream of an outgoing audio (4), video (6) or data
+// (5) message; ok is false for any other type.
+func mediaCSID(typ uint8) (csid uint32, ok bool) {
+	switch typ {
+	case MsgAudio:
+		return audioCSID, true
+	case MsgVideo:
+		return videoCSID, true
+	case MsgDataAMF0:
+		return dataCSID, true
+	}
+	return 0, false
 }
 
 // SetWriteTimeout replaces Config.WriteTimeout for the writes of a play conn

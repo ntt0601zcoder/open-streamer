@@ -2,6 +2,7 @@ package rtmp
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -40,7 +41,8 @@ type Config struct {
 	// (connect to publish, or connect to play). Default 10 s.
 	CommandTimeout time.Duration
 	// IdleTimeout fails a session that receives no byte for this long.
-	// Default 30 s.
+	// Default 30 s. A publishing client has no idle limit once it
+	// publishes: servers send only acknowledgements, once per window.
 	IdleTimeout time.Duration
 	// PingInterval is how often a server sends PingRequest. Clients never
 	// ping. Default 10 s.
@@ -67,6 +69,20 @@ type Config struct {
 	// a phase, the idle limit or a ping is due, while the deadlines set on
 	// the conn are durations on the real clock.
 	Now func() time.Time
+	// Dial opens a client's connection (Play, PlayWith, Publish), network
+	// "tcp". Default: a net.Dialer, with its TCP keepalive, which is a
+	// publishing client's liveness check besides its write deadlines. Tests
+	// use it to shrink socket buffers.
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// dial opens a client's connection to addr with Dial, or a net.Dialer.
+func (c Config) dial(ctx context.Context, addr string) (net.Conn, error) {
+	if c.Dial != nil {
+		return c.Dial(ctx, "tcp", addr)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr)
 }
 
 func (c Config) withDefaults() Config {
@@ -181,6 +197,10 @@ type session struct {
 	// reading is set once runReader starts, by the goroutine that ran the
 	// exchange, before the reader exists.
 	reading atomic.Bool
+
+	// noIdle turns the idle limit off. It is set before runReader, by the
+	// goroutine that ran the exchange, and read only by the reader.
+	noIdle bool
 
 	// wmu is held for every outbound message, around the chunk writer, and
 	// guards writeDeadline.
@@ -336,10 +356,11 @@ func (s *session) runReader(handle func(Message) error) {
 			defer close(s.done)
 			for {
 				m, err := s.next()
-				if err == nil {
-					err = handle(m)
-				}
 				if err != nil {
+					s.fail(fmt.Errorf("rtmp: session: read: %w", err))
+					return
+				}
+				if err := handle(m); err != nil {
 					s.fail(err)
 					return
 				}
@@ -466,33 +487,42 @@ func (s *session) tick(now time.Time) error {
 	return nil
 }
 
-// checkIdle fails a session whose last inbound byte is IdleTimeout old.
+// checkIdle fails a session whose last inbound byte is IdleTimeout old,
+// unless noIdle is set.
 func (s *session) checkIdle(now time.Time) error {
-	if !now.Before(s.lastIn.Add(s.cfg.IdleTimeout)) {
+	if !s.noIdle && !now.Before(s.lastIn.Add(s.cfg.IdleTimeout)) {
 		return fmt.Errorf("rtmp: session: no inbound data for %v: %w", s.cfg.IdleTimeout, os.ErrDeadlineExceeded)
 	}
 	return nil
 }
 
 // readDeadline is the earliest of the idle limit, the next ping and the
-// phase end. The idle limit counts as at least idleGrace from now, so a
-// consumer that comes back late still reads the bytes that are waiting.
+// phase end, or zero when there is none of them (noIdle, no ping, no phase).
+// The idle limit counts as at least idleGrace from now, so a consumer that
+// comes back late still reads the bytes that are waiting.
 func (s *session) readDeadline(now time.Time) time.Time {
-	d := s.lastIn.Add(s.cfg.IdleTimeout)
-	if floor := now.Add(idleGrace); d.Before(floor) {
-		d = floor
+	var d time.Time
+	if !s.noIdle {
+		d = s.lastIn.Add(s.cfg.IdleTimeout)
+		if floor := now.Add(idleGrace); d.Before(floor) {
+			d = floor
+		}
 	}
-	if !s.nextPing.IsZero() && s.nextPing.Before(d) {
+	if !s.nextPing.IsZero() && (d.IsZero() || s.nextPing.Before(d)) {
 		d = s.nextPing
 	}
-	if !s.phaseEnd.IsZero() && s.phaseEnd.Before(d) {
+	if !s.phaseEnd.IsZero() && (d.IsZero() || s.phaseEnd.Before(d)) {
 		d = s.phaseEnd
 	}
 	return d
 }
 
 // connDeadline converts a time on the Config clock to one on the conn's.
+// The zero time stays zero: no deadline.
 func connDeadline(at, now time.Time) time.Time {
+	if at.IsZero() {
+		return time.Time{}
+	}
 	return time.Now().Add(at.Sub(now))
 }
 
@@ -505,7 +535,9 @@ func isTimeout(err error) bool {
 // deadline that expires on a ping slot sends PingRequest and reads on, so the
 // chunk reader above never sees a timeout in the middle of a message; one
 // past the phase end fails, and so does a read that times out with nothing
-// received when the last inbound byte is IdleTimeout old.
+// received when the last inbound byte is IdleTimeout old (unless noIdle).
+// With noIdle, no ping and no phase, a read waits without a deadline until
+// data arrives or the conn is closed.
 type sessionReader struct{ s *session }
 
 func (r sessionReader) Read(p []byte) (int, error) {
