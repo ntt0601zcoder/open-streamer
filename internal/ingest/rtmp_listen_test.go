@@ -522,7 +522,9 @@ func TestRTMPListenPlayIsNotPublish(t *testing.T) {
 	st := r.Stats()
 	assert.EqualValues(t, 1, st["publishers"])
 	assert.Zero(t, st["takeovers"])
-	assert.EqualValues(t, 2, st["rejected_unknown"])
+	assert.EqualValues(t, 2, st["rejected_play_publish_path"])
+	assert.Zero(t, st["rejected_unknown"], "plays have their own counters")
+	assert.Zero(t, st["rejected_busy"])
 	assert.Empty(t, log.breaks, "the quiet publisher was not taken over")
 
 	// The route was left unreserved: a real publisher still takes over.

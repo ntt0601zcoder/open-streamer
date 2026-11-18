@@ -1,12 +1,15 @@
 // Package rtmpsrv shares one RTMP TCP listener per address between the
-// inputs that take publishers on it and routes each publisher to the input
-// of its path.
+// inputs that take publishers on it and the outputs that serve players from
+// it. A publisher is routed by its path, which is its stream key and stays
+// secret; a player by the app its handler registered, with the rest of its
+// path as the stream name. Every rejection reads the same to the client.
 package rtmpsrv
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"strconv"
@@ -21,15 +24,20 @@ import (
 
 // Default listener policy.
 const (
-	defaultMaxPrePublish      = 64
-	defaultMaxPrePublishPerIP = 4
+	defaultMaxPrePublish       = 64
+	defaultMaxPrePublishPerIP  = 4
+	defaultMaxPlayersPerStream = 256
+	defaultMaxPlayers          = 1024
+	defaultMaxPlayersPerIP     = 64
 	// maxAcceptBackoff caps the pause after a failing TCP accept (for
 	// example out of file descriptors).
 	maxAcceptBackoff = time.Second
 )
 
-// errStreamNotAvailable rejects a publish to an unknown path and to a busy
-// one alike, so a client cannot probe which stream keys exist.
+// errStreamNotAvailable rejects every request the registry turns away: an
+// unknown or busy publish path, an unknown play, a publish path played, a
+// stream that is not live and every cap, so a client cannot probe which
+// stream keys exist.
 var errStreamNotAvailable = fmt.Errorf("rtmpsrv: %w", rtmp.ErrStreamNotAvailable)
 
 // PublishSink receives the publishers of one listen path.
@@ -50,34 +58,68 @@ type PublishSink interface {
 	Busy(now time.Time) bool
 }
 
-// Policy bounds the sessions of one TCP listener that have not published
-// yet. Zero fields take the defaults (64 and 4). The per-IP bound counts an
-// IPv6 peer by its /64.
+// PlayHandler serves the players of one app. A player's request names the
+// app exactly (rtmp://host/<app>/<name>); the stream name is the rest,
+// conn.Request().Stream. Neither method is called after the handler's
+// unregister has returned, and the handler must never call unregister while
+// holding a lock that Live or Serve needs, since unregister waits for them.
+type PlayHandler interface {
+	// Live reports whether name can be played now; false rejects the
+	// player. It is part of the play decision and must not block for long:
+	// the session waits for it, and so does unregistering.
+	Live(name string) bool
+	// Serve plays the stream to conn, in the session's goroutine. It must
+	// return once ctx ends or conn.Done closes; the registry then closes
+	// conn. ctx ends when the handler is unregistered.
+	Serve(ctx context.Context, conn *rtmp.ServerConn)
+}
+
+// Policy bounds the sessions of one TCP listener. MaxPrePublish and
+// MaxPrePublishPerIP bound the sessions that have neither published nor
+// started to play (default 64 and 4); MaxPlayersPerStream, MaxPlayers and
+// MaxPlayersPerIP bound the players of one stream, of the listener and of
+// one peer (default 256, 1024 and 64). A zero field takes its default. A
+// per-IP bound counts an IPv6 peer by its /64.
 type Policy struct {
-	MaxPrePublish, MaxPrePublishPerIP int
+	MaxPrePublish, MaxPrePublishPerIP                int
+	MaxPlayersPerStream, MaxPlayers, MaxPlayersPerIP int
 }
 
 func (p Policy) withDefaults() Policy {
-	if p.MaxPrePublish <= 0 {
-		p.MaxPrePublish = defaultMaxPrePublish
-	}
-	if p.MaxPrePublishPerIP <= 0 {
-		p.MaxPrePublishPerIP = defaultMaxPrePublishPerIP
+	for _, f := range []struct {
+		v   *int
+		def int
+	}{
+		{&p.MaxPrePublish, defaultMaxPrePublish},
+		{&p.MaxPrePublishPerIP, defaultMaxPrePublishPerIP},
+		{&p.MaxPlayersPerStream, defaultMaxPlayersPerStream},
+		{&p.MaxPlayers, defaultMaxPlayers},
+		{&p.MaxPlayersPerIP, defaultMaxPlayersPerIP},
+	} {
+		if *f.v <= 0 {
+			*f.v = f.def
+		}
 	}
 	return p
 }
 
 // acceptFunc is rtmp.Accept; tests replace it.
-type acceptFunc func(ctx context.Context, c net.Conn, cfg rtmp.Config, decide func(rtmp.PublishRequest) error) (*rtmp.ServerConn, error)
+type acceptFunc func(ctx context.Context, c net.Conn, cfg rtmp.Config, decide func(rtmp.Request) error) (*rtmp.ServerConn, error)
 
-// Registry shares one TCP listener per address between every RTMP listen
-// input on it and routes each publisher to the input of its path. The zero
-// value is ready to use.
+// Registry shares one TCP listener per address between every publish route
+// and play handler on it. The zero value is ready to use; ConnHook is set
+// before the first register.
 type Registry struct {
+	// ConnHook, when set, is called with every connection a listener takes
+	// a session for, before the handshake, in the session's goroutine.
+	// Tests use it to shrink socket buffers.
+	ConnHook func(net.Conn)
+
 	accept acceptFunc // nil means rtmp.Accept
 
-	// mu guards listeners, seq and every listener's routes. It is never held
-	// while calling a sink.
+	// mu guards listeners, seq and every listener's routes and plays. It is
+	// never held while calling a sink or a handler, nor while taking a
+	// listener's mu.
 	mu        sync.Mutex
 	listeners map[string]*listener
 	seq       uint64 // the last listener id
@@ -90,6 +132,27 @@ var Default = &Registry{}
 type route struct {
 	sink     PublishSink
 	reserved bool // a publisher passed decide and is not offered yet; registry mu
+}
+
+// playRoute is a registered play handler.
+type playRoute struct {
+	h      PlayHandler
+	ctx    context.Context // Serve's; ends at unregister
+	cancel context.CancelFunc
+	// wg counts the sessions that found the route in their decision, until
+	// they end; unregister waits for it.
+	wg sync.WaitGroup
+
+	closed bool                          // unregistered; registry mu
+	conns  map[*rtmp.ServerConn]struct{} // being served; registry mu
+}
+
+// playSlot is a player's admission: its route, and the slots it holds in
+// the player counts.
+type playSlot struct {
+	rt       *playRoute
+	path, ip string
+	stop     func() bool // stops closing the raw conn when rt ends
 }
 
 // listener is one TCP listener and its sessions.
@@ -105,22 +168,28 @@ type listener struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup // the accept loop and every session
 
-	id     uint64            // its number in the registry, from 1
-	routes map[string]*route // registry mu
+	id     uint64                // its number in the registry, from 1
+	routes map[string]*route     // publish routes by path; registry mu
+	plays  map[string]*playRoute // play handlers by app; registry mu
 
-	mu      sync.Mutex     // guards pending and perIP
-	pending int            // sessions that have not published
-	perIP   map[string]int // by peerKey: an IPv4 address or an IPv6 /64
+	mu      sync.Mutex     // guards the counts below
+	pending int            // sessions that have neither published nor started to play
+	perIP   map[string]int // pending by peerKey: an IPv4 address or an IPv6 /64
+	players int
+	streams map[string]int // players by play path
+	ipPlay  map[string]int // players by peerKey
 
-	rejectedUnknown, rejectedBusy, rejectedFlood atomic.Uint64
+	rejectedUnknown, rejectedBusy, rejectedFlood                   atomic.Uint64
+	rejectedPlayUnknown, rejectedPlayPublishPath, rejectedPlayCaps atomic.Uint64
 }
 
 // RegisterPublish routes publishers of path on addr to sink. The first
-// register on an address opens its TCP listener with cfg and pol; later ones
-// share it and their cfg and pol are ignored. The returned unregister
-// removes the route; the last one closes the listener and waits for its
-// sessions to end. It is idempotent. unregister must not be called while
-// holding a lock that the sink's Offer or Busy takes (see PublishSink).
+// register on an address, publish or play, opens its TCP listener with cfg
+// and pol; later ones share it and their cfg and pol are ignored. The
+// returned unregister removes the route; the last one on the address closes
+// the listener and waits for its sessions to end. It is idempotent.
+// unregister must not be called while holding a lock that the sink's Offer
+// or Busy takes (see PublishSink).
 func (r *Registry) RegisterPublish(addr, path string, sink PublishSink, cfg rtmp.Config, pol Policy) (unregister func(), err error) {
 	key, err := AddrKey(addr)
 	if err != nil {
@@ -130,29 +199,111 @@ func (r *Registry) RegisterPublish(addr, path string, sink PublishSink, cfg rtmp
 	if app, stream, ok := strings.Cut(path, "/"); !ok || app == "" || stream == "" {
 		return nil, fmt.Errorf("rtmpsrv: listen %s: path %q needs an app and a stream name", key, redact.RTMPKey(path))
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	l := r.listeners[key]
-	if l == nil {
-		if l, err = r.listen(key, cfg, pol); err != nil {
-			return nil, err
+	l, err := r.attach(key, cfg, pol, func(l *listener) error {
+		if _, dup := l.routes[path]; dup {
+			return fmt.Errorf("rtmpsrv: listen %s: path %s is already registered", key, redact.RTMPKey(path))
 		}
-		if r.listeners == nil {
-			r.listeners = map[string]*listener{}
-		}
-		r.listeners[key] = l
+		l.routes[path] = &route{sink: sink}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	if _, dup := l.routes[path]; dup {
-		return nil, fmt.Errorf("rtmpsrv: listen %s: path %s is already registered", key, redact.RTMPKey(path))
-	}
-	l.routes[path] = &route{sink: sink}
 	var once sync.Once
-	return func() { once.Do(func() { r.unregister(l, path) }) }, nil
+	return func() {
+		once.Do(func() {
+			r.detach(l, func() func() {
+				delete(l.routes, path)
+				return nil
+			})
+		})
+	}, nil
 }
 
-// listen opens the TCP listener for key and starts its accept loop. r.mu is
-// held.
-func (r *Registry) listen(key string, cfg rtmp.Config, pol Policy) (*listener, error) {
+// RegisterPlay hands the players of app on addr to h: a play whose app is
+// app (rtmp://host/<app>/<name>) reaches h with the stream name <name>. app
+// is the only source of the play app. A play whose path is a registered
+// publish path is rejected before h is asked, so a publish key is never
+// playable. The listener is shared as with RegisterPublish. The returned
+// unregister cancels the ctx of every Serve, closes the players, waits for
+// every session that reached h, and closes the listener when it was the
+// address's last registration. It is idempotent.
+func (r *Registry) RegisterPlay(addr, app string, h PlayHandler, cfg rtmp.Config, pol Policy) (unregister func(), err error) {
+	key, err := AddrKey(addr)
+	if err != nil {
+		return nil, err
+	}
+	app, _ = rtmp.NormalizePath(app, "")
+	if app == "" {
+		return nil, fmt.Errorf("rtmpsrv: listen %s: play needs an app", key)
+	}
+	var pr *playRoute
+	l, err := r.attach(key, cfg, pol, func(l *listener) error {
+		if _, dup := l.plays[app]; dup {
+			return fmt.Errorf("rtmpsrv: listen %s: play app %q is already registered", key, app)
+		}
+		ctx, cancel := context.WithCancel(l.ctx)
+		pr = &playRoute{h: h, ctx: ctx, cancel: cancel, conns: map[*rtmp.ServerConn]struct{}{}}
+		l.plays[app] = pr
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.detach(l, func() func() {
+				delete(l.plays, app)
+				pr.closed = true
+				conns := make([]*rtmp.ServerConn, 0, len(pr.conns))
+				for c := range pr.conns {
+					conns = append(conns, c)
+				}
+				return func() {
+					pr.cancel()
+					for _, c := range conns {
+						_ = c.Close()
+					}
+					pr.wg.Wait()
+				}
+			})
+		})
+	}, nil
+}
+
+// attach runs add on the listener for key, opening it with cfg and pol when
+// there is none. A listener opened for an add that fails is closed again.
+func (r *Registry) attach(key string, cfg rtmp.Config, pol Policy, add func(*listener) error) (*listener, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l := r.listeners[key]; l != nil {
+		if err := add(l); err != nil {
+			return nil, err
+		}
+		return l, nil
+	}
+	l, err := r.bind(key, cfg, pol)
+	if err != nil {
+		return nil, err
+	}
+	if err := add(l); err != nil {
+		l.cancel()
+		_ = l.ln.Close()
+		return nil, err
+	}
+	if r.listeners == nil {
+		r.listeners = map[string]*listener{}
+	}
+	r.listeners[key] = l
+	l.wg.Add(1)
+	go l.acceptLoop()
+	return l, nil
+}
+
+// bind opens the TCP listener for key; attach starts its accept loop. r.mu
+// is held.
+func (r *Registry) bind(key string, cfg rtmp.Config, pol Policy) (*listener, error) {
 	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", key)
 	if err != nil {
 		return nil, fmt.Errorf("rtmpsrv: listen %s: %w", key, err)
@@ -167,27 +318,29 @@ func (r *Registry) listen(key string, cfg rtmp.Config, pol Policy) (*listener, e
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r.seq++
-	l := &listener{
+	return &listener{
 		reg: r, key: key, id: r.seq, ln: ln, cfg: cfg, pol: pol.withDefaults(), accept: accept, now: now,
-		ctx: ctx, cancel: cancel, routes: map[string]*route{}, perIP: map[string]int{},
-	}
-	l.wg.Add(1)
-	go l.acceptLoop()
-	return l, nil
+		ctx: ctx, cancel: cancel, routes: map[string]*route{}, plays: map[string]*playRoute{},
+		perIP: map[string]int{}, streams: map[string]int{}, ipPlay: map[string]int{},
+	}, nil
 }
 
-// unregister removes path from l. The last route removes l and closes its
-// TCP listener under r.mu, so a register racing it binds the port afresh,
-// then waits outside the lock for the accept loop and every session.
-func (r *Registry) unregister(l *listener, path string) {
+// detach runs remove under r.mu, then the function it returns, if any,
+// outside it. The last registration removes l and closes its TCP listener
+// under r.mu, so a register racing it binds the port afresh, then waits
+// outside the lock for the accept loop and every session.
+func (r *Registry) detach(l *listener, remove func() (after func())) {
 	r.mu.Lock()
-	delete(l.routes, path)
-	last := len(l.routes) == 0
+	after := remove()
+	last := len(l.routes) == 0 && len(l.plays) == 0
 	if last {
 		delete(r.listeners, l.key)
 		_ = l.ln.Close()
 	}
 	r.mu.Unlock()
+	if after != nil {
+		after()
+	}
 	if last {
 		l.cancel()
 		l.wg.Wait()
@@ -210,22 +363,35 @@ type Stats struct {
 	// ID is the listener's number in its registry, from 1, so a test can
 	// tell a listener from its successor; 0 when nothing listens.
 	ID uint64
-	// Routes is the number of publish paths registered.
-	Routes int
-	// PrePublish is the number of sessions that have not published.
+	// Routes is the number of publish paths registered, Apps the number of
+	// play handlers.
+	Routes, Apps int
+	// PrePublish is the number of sessions that have neither published nor
+	// started to play.
 	PrePublish int
-	// RejectedUnknown counts requests for an unknown path, RejectedBusy
+	// RejectedUnknown counts publishes to an unknown path, RejectedBusy
 	// publishes to a path whose publisher is live, and RejectedFlood
 	// connections closed at accept over the pre-publish caps.
 	RejectedUnknown, RejectedBusy, RejectedFlood uint64
+	// RejectedPlayUnknown counts plays of an app no handler serves or of a
+	// stream that is not live, RejectedPlayPublishPath plays of a publish
+	// path, and RejectedPlayCaps plays over a player cap.
+	RejectedPlayUnknown, RejectedPlayPublishPath, RejectedPlayCaps uint64
+	// Players is the number of players admitted and not ended;
+	// StreamPlayers counts them by play path (<app>/<name>).
+	Players       int
+	StreamPlayers map[string]int
 }
 
 // Counters returns the rejection counters by their stats names.
 func (s Stats) Counters() map[string]uint64 {
 	return map[string]uint64{
-		"rejected_unknown": s.RejectedUnknown,
-		"rejected_busy":    s.RejectedBusy,
-		"rejected_flood":   s.RejectedFlood,
+		"rejected_unknown":           s.RejectedUnknown,
+		"rejected_busy":              s.RejectedBusy,
+		"rejected_flood":             s.RejectedFlood,
+		"rejected_play_unknown":      s.RejectedPlayUnknown,
+		"rejected_play_publish_path": s.RejectedPlayPublishPath,
+		"rejected_play_caps":         s.RejectedPlayCaps,
 	}
 }
 
@@ -237,16 +403,20 @@ func (r *Registry) Stats(addr string) Stats {
 		return Stats{}
 	}
 	r.mu.Lock()
-	routes := len(l.routes)
+	st := Stats{ID: l.id, Routes: len(l.routes), Apps: len(l.plays)}
 	r.mu.Unlock()
-	return Stats{
-		ID:              l.id,
-		Routes:          routes,
-		PrePublish:      l.prePublish(),
-		RejectedUnknown: l.rejectedUnknown.Load(),
-		RejectedBusy:    l.rejectedBusy.Load(),
-		RejectedFlood:   l.rejectedFlood.Load(),
-	}
+	l.mu.Lock()
+	st.PrePublish = l.pending
+	st.Players = l.players
+	st.StreamPlayers = maps.Clone(l.streams)
+	l.mu.Unlock()
+	st.RejectedUnknown = l.rejectedUnknown.Load()
+	st.RejectedBusy = l.rejectedBusy.Load()
+	st.RejectedFlood = l.rejectedFlood.Load()
+	st.RejectedPlayUnknown = l.rejectedPlayUnknown.Load()
+	st.RejectedPlayPublishPath = l.rejectedPlayPublishPath.Load()
+	st.RejectedPlayCaps = l.rejectedPlayCaps.Load()
+	return st
 }
 
 // AddrKey normalises a listen address to one key per bind: the port is
@@ -334,34 +504,128 @@ func peerKey(a net.Addr) string {
 	return netip.PrefixFrom(ip, 64).Masked().String()
 }
 
-// serve runs the publish exchange on c and offers the publisher to the sink
-// of its path. A play request is rejected like an unknown path.
+// serve runs the command exchange on c, then offers a publisher to the
+// sink of its path or plays a player through the handler of its app.
 func (l *listener) serve(c net.Conn, ip string) {
 	defer l.wg.Done()
-	var rt *route
+	if hook := l.reg.ConnHook; hook != nil {
+		hook(c)
+	}
+	var (
+		rt   *route
+		slot *playSlot
+	)
 	sc, err := l.accept(l.ctx, c, l.cfg, func(req rtmp.Request) error {
-		if req.Play {
-			// Ingest has no players; a play on a publish path must never
-			// reserve the route or reach the sink as a publisher.
-			l.rejectedUnknown.Add(1)
-			return errStreamNotAvailable
-		}
 		var err error
-		rt, err = l.reserve(req)
+		if req.Play {
+			slot, err = l.admit(c, req, ip)
+		} else {
+			rt, err = l.reserve(req)
+		}
 		return err
 	})
+	l.leave(ip)
 	if err != nil {
+		// decide may have accepted, then the replies or ctx failed.
 		if rt != nil {
-			l.release(rt) // decide accepted, then the replies or ctx failed
+			l.release(rt)
 		}
-		l.leave(ip)
+		if slot != nil {
+			l.endPlay(slot)
+		}
 		return
 	}
-	l.leave(ip)
+	if slot != nil {
+		l.play(slot, sc)
+		return
+	}
 	if l.ctx.Err() != nil || !rt.sink.Offer(sc) {
 		_ = sc.Close()
 	}
 	l.release(rt)
+}
+
+// admit is the play decision. It rejects, all with the same error, a play
+// of a publish path (before anything else, so the key reaches no handler),
+// of an app with no handler or an empty name, of a stream that is not Live,
+// and one over a player cap. An admitted player holds its route (the
+// route's wg) and its player slots until endPlay, and its raw conn is
+// closed if the route is unregistered meanwhile.
+func (l *listener) admit(c net.Conn, req rtmp.Request, ip string) (*playSlot, error) {
+	path, _ := rtmp.NormalizePath(req.App, req.Stream)
+	app, _ := rtmp.NormalizePath(req.App, "")
+	name, _ := rtmp.NormalizePath(req.Stream, "")
+	l.reg.mu.Lock()
+	if _, ok := l.routes[path]; ok {
+		l.reg.mu.Unlock()
+		l.rejectedPlayPublishPath.Add(1)
+		return nil, errStreamNotAvailable
+	}
+	rt := l.plays[app]
+	if rt == nil || name == "" {
+		l.reg.mu.Unlock()
+		l.rejectedPlayUnknown.Add(1)
+		return nil, errStreamNotAvailable
+	}
+	rt.wg.Add(1) // before unregister's Wait: it marks rt closed under this lock
+	l.reg.mu.Unlock()
+	stop := context.AfterFunc(rt.ctx, func() { _ = c.Close() })
+	if !rt.h.Live(name) { // outside the lock: the handler takes its own
+		stop()
+		rt.wg.Done()
+		l.rejectedPlayUnknown.Add(1)
+		return nil, errStreamNotAvailable
+	}
+	l.mu.Lock()
+	if l.players >= l.pol.MaxPlayers || l.streams[path] >= l.pol.MaxPlayersPerStream ||
+		l.ipPlay[ip] >= l.pol.MaxPlayersPerIP {
+		l.mu.Unlock()
+		stop()
+		rt.wg.Done()
+		l.rejectedPlayCaps.Add(1)
+		return nil, errStreamNotAvailable
+	}
+	l.players++
+	l.streams[path]++
+	l.ipPlay[ip]++
+	l.mu.Unlock()
+	return &playSlot{rt: rt, path: path, ip: ip, stop: stop}, nil
+}
+
+// play serves an admitted player until Serve returns, unless its route was
+// unregistered meanwhile, then closes it and frees its slots.
+func (l *listener) play(s *playSlot, sc *rtmp.ServerConn) {
+	defer l.endPlay(s)
+	rt := s.rt
+	s.stop() // the route's unregister now closes sc instead
+	l.reg.mu.Lock()
+	if rt.closed {
+		l.reg.mu.Unlock()
+		_ = sc.Close()
+		return
+	}
+	rt.conns[sc] = struct{}{}
+	l.reg.mu.Unlock()
+	rt.h.Serve(rt.ctx, sc)
+	_ = sc.Close()
+	l.reg.mu.Lock()
+	delete(rt.conns, sc)
+	l.reg.mu.Unlock()
+}
+
+// endPlay frees the player slots of s and releases its route.
+func (l *listener) endPlay(s *playSlot) {
+	s.stop()
+	l.mu.Lock()
+	l.players--
+	if l.streams[s.path]--; l.streams[s.path] <= 0 {
+		delete(l.streams, s.path)
+	}
+	if l.ipPlay[s.ip]--; l.ipPlay[s.ip] <= 0 {
+		delete(l.ipPlay, s.ip)
+	}
+	l.mu.Unlock()
+	s.rt.wg.Done()
 }
 
 // leave frees the pre-publish slot of a session from ip.
@@ -413,11 +677,4 @@ func (l *listener) release(rt *route) {
 	l.reg.mu.Lock()
 	rt.reserved = false
 	l.reg.mu.Unlock()
-}
-
-// prePublish is the number of sessions that have not published.
-func (l *listener) prePublish() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.pending
 }
