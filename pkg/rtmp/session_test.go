@@ -506,7 +506,7 @@ func TestSessionWrites(t *testing.T) {
 	if err := s.sendPeerBandwidth(defaultWindowAckSize, limitDynamic); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.setChunkSize(defaultOutChunkSize); err != nil {
+	if err := s.setChunkSize(); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.sendUserControl(ucStreamBegin, 1); err != nil {
@@ -783,6 +783,96 @@ func TestSessionWriteTimeout(t *testing.T) {
 		s.setWriteTimeout(150 * time.Millisecond)
 		check(t, s, 150*time.Millisecond)
 	})
+	t.Run("restore", func(t *testing.T) {
+		a, b := net.Pipe()
+		defer b.Close()
+		s := newSession(a, Config{WriteTimeout: 200 * time.Millisecond}, roleServer)
+		defer s.Close()
+		s.setWriteTimeout(time.Minute)
+		s.setWriteTimeout(0) // back to Config.WriteTimeout, not the package default
+		check(t, s, 200*time.Millisecond)
+	})
+}
+
+// The write timeout bounds a media write from the call, the wait for the
+// write mutex included.
+func TestSessionWriteDeadlineIncludesLockWait(t *testing.T) {
+	t.Run("expired while waiting", func(t *testing.T) {
+		s, p := newConcurrentPair(t)
+		s.runReader(func(Message) error { return nil })
+		s.setWriteTimeout(100 * time.Millisecond)
+		s.wmu.Lock() // a slow write holds the mutex
+		res := make(chan error, 1)
+		go func() { res <- s.writeMedia(6, audio(0, 10)) }()
+		time.Sleep(250 * time.Millisecond)
+		s.wmu.Unlock()
+		select {
+		case err := <-res:
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("writeMedia: %v, want a write timeout", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("writeMedia did not return")
+		}
+		awaitDone(t, s)
+		for w := range p.msgs {
+			if w.m.Type == MsgAudio {
+				t.Fatal("the late media message was written")
+			}
+		}
+	})
+	t.Run("remaining time", func(t *testing.T) {
+		a, b := net.Pipe() // the peer never reads
+		defer b.Close()
+		s := newSession(a, Config{WriteTimeout: 600 * time.Millisecond}, roleServer)
+		defer s.Close()
+		s.runReader(func(Message) error { return nil })
+		s.wmu.Lock()
+		res := make(chan error, 1)
+		start := time.Now()
+		go func() { res <- s.writeMedia(6, Message{Type: MsgVideo, StreamID: 1, Payload: make([]byte, 1<<20)}) }()
+		time.Sleep(400 * time.Millisecond)
+		s.wmu.Unlock()
+		var err error
+		select {
+		case err = <-res:
+		case <-time.After(2 * time.Second):
+			t.Fatal("writeMedia did not return")
+		}
+		if elapsed := time.Since(start); !errors.Is(err, os.ErrDeadlineExceeded) || elapsed > 900*time.Millisecond {
+			t.Fatalf("writeMedia: %v after %v, want a write timeout about 600ms after the call", err, elapsed)
+		}
+	})
+}
+
+// A second runReader call starts no second reader.
+func TestSessionRunReaderOnce(t *testing.T) {
+	s, p := newConcurrentPair(t)
+	got := make(chan uint32, 4)
+	s.runReader(func(m Message) error {
+		got <- m.Timestamp
+		return nil
+	})
+	s.runReader(func(Message) error {
+		t.Error("the second handler ran")
+		return nil
+	})
+	b, _ := stream(t, audio(1, 10), audio(2, 10), audio(3, 10))
+	go func() { _, _ = p.conn.Write(b) }()
+	for want := uint32(1); want <= 3; want++ {
+		select {
+		case ts := <-got:
+			if ts != want {
+				t.Fatalf("handled ts %d, want %d", ts, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("the reader handled nothing")
+		}
+	}
+	_ = s.Close()
+	awaitDone(t, s)
+	// A second reader would close done again and panic.
+	time.Sleep(20 * time.Millisecond)
 }
 
 func TestSessionReaderStopsOnClose(t *testing.T) {

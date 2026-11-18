@@ -139,14 +139,14 @@ const (
 // timeouts, inbound protocol control and aggregate splitting.
 //
 // It runs in one of two modes. Until runReader, every method except Close,
-// LastInbound, Done and Err is called from one goroutine, which does all
-// reads and all writes; phase and handshake state is set only then. After
-// runReader, one reader goroutine owns next, and so every read and every
-// write a read causes (acks, pings, ping responses, Window Ack Size); any
-// other goroutine may call writeMedia. Every outbound message, media or
-// control, is written whole while holding wmu, so a control message never
-// lands inside a media message's chunks and the chunk writer's header state
-// is never shared.
+// LastInbound, Done, Err and setWriteTimeout is called from one goroutine,
+// which does all reads and all writes; phase and handshake state is set only
+// then. After runReader, one reader goroutine owns next, and so every read
+// and every write a read causes (acks, pings, ping responses, Window Ack
+// Size); any other goroutine may call writeMedia and the control writes of
+// its role. Every outbound message, media or control, is written whole while
+// holding wmu, so a control message never lands inside a media message's
+// chunks and the chunk writer's header state is never shared.
 type session struct {
 	conn  net.Conn
 	cfg   Config
@@ -174,16 +174,23 @@ type session struct {
 	closeOnce   sync.Once
 	closeErr    error
 
-	// wmu is held for every outbound message, around the chunk writer, and
-	// guards writeTimeout, reading and writeLimit.
-	wmu          sync.Mutex
-	writeTimeout time.Duration // bound of media writes, and of all writes once reading
-	reading      bool          // runReader has started
-	writeLimit   time.Duration // bound of the write in progress
+	// writeTimeout bounds media writes, and every write once reading. It is
+	// read before wmu is taken, so the wait for the mutex counts.
+	writeTimeout atomic.Int64
 
-	done  chan struct{} // closed when the reader goroutine exits
-	errMu sync.Mutex
-	err   error // first cause of the session's end
+	// wmu is held for every outbound message, around the chunk writer, and
+	// guards reading and writeDeadline.
+	wmu     sync.Mutex
+	reading bool // runReader has started
+	// writeDeadline is the absolute deadline, on the Config clock, of the
+	// write in progress; zero gives each conn write IdleTimeout from its
+	// start (the handshake and the control writes before runReader).
+	writeDeadline time.Time
+
+	readerOnce sync.Once
+	done       chan struct{} // closed when the reader goroutine exits
+	errMu      sync.Mutex
+	err        error // first cause of the session's end
 }
 
 // newSession wraps conn. The caller runs handshake next, then the command
@@ -191,11 +198,8 @@ type session struct {
 func newSession(conn net.Conn, cfg Config, r role) *session {
 	cfg = cfg.withDefaults()
 	now := cfg.Now()
-	s := &session{
-		conn: conn, cfg: cfg, role: r, start: now,
-		writeTimeout: cfg.WriteTimeout,
-		done:         make(chan struct{}),
-	}
+	s := &session{conn: conn, cfg: cfg, role: r, start: now, done: make(chan struct{})}
+	s.writeTimeout.Store(int64(cfg.WriteTimeout))
 	s.touch(now)
 	s.br = bufio.NewReader(sessionReader{s})
 	lim := s.postPublishLimits()
@@ -220,7 +224,7 @@ func (s *session) handshake() error {
 	// The handshake writes through sessionWriter, which runs under wmu.
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
-	s.writeLimit = s.cfg.IdleTimeout
+	s.writeDeadline = time.Time{}
 	rw := struct {
 		io.Reader
 		io.Writer
@@ -316,55 +320,69 @@ func (s *session) Done() <-chan struct{} {
 // acknowledges as before, and passes every other message to handle. A read
 // error or a handle error ends the session with that cause and closes the
 // connection; Close stops the goroutine. From now on every write is bounded
-// by the write timeout. It must be called once, from the goroutine that ran
-// the exchange.
+// by the write timeout. It is called from the goroutine that ran the
+// exchange; only the first call starts a reader, later ones do nothing.
+//
+// handle runs on the reader goroutine, which also answers pings and sends
+// acknowledgements: it must not block, or the peer's pings go unanswered
+// and the idle limit can end the session.
 func (s *session) runReader(handle func(Message) error) {
-	s.wmu.Lock()
-	s.reading = true
-	s.wmu.Unlock()
-	go func() {
-		defer close(s.done)
-		for {
-			m, err := s.next()
-			if err == nil {
-				err = handle(m)
+	s.readerOnce.Do(func() {
+		s.wmu.Lock()
+		s.reading = true
+		s.wmu.Unlock()
+		go func() {
+			defer close(s.done)
+			for {
+				m, err := s.next()
+				if err == nil {
+					err = handle(m)
+				}
+				if err != nil {
+					s.fail(err)
+					return
+				}
 			}
-			if err != nil {
-				s.fail(err)
-				return
-			}
-		}
-	}()
+		}()
+	})
 }
 
 // setWriteTimeout replaces Config.WriteTimeout for the writes that follow;
-// d <= 0 restores the default. It is safe to call from any goroutine.
+// d <= 0 restores Config.WriteTimeout. It is safe to call from any
+// goroutine.
 func (s *session) setWriteTimeout(d time.Duration) {
 	if d <= 0 {
-		d = defaultWriteTimeout
+		d = s.cfg.WriteTimeout
 	}
-	s.wmu.Lock()
-	s.writeTimeout = d
-	s.wmu.Unlock()
+	s.writeTimeout.Store(int64(d))
 }
 
 // write runs f on the chunk writer holding wmu. A media write, and every
-// write once the reader runs, is bounded by the write timeout; a control
-// write of the single-goroutine mode keeps IdleTimeout (or the phase end).
+// write once the reader runs, must end within the write timeout of the call,
+// the wait for wmu included: one whose deadline passed while waiting fails
+// with os.ErrDeadlineExceeded before writing anything. A control write of
+// the single-goroutine mode keeps IdleTimeout (or the phase end).
 func (s *session) write(media bool, f func(*ChunkWriter) error) error {
+	deadline := s.cfg.Now().Add(time.Duration(s.writeTimeout.Load()))
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
-	s.writeLimit = s.cfg.IdleTimeout
-	if media || s.reading {
-		s.writeLimit = s.writeTimeout
+	if !media && !s.reading {
+		s.writeDeadline = time.Time{}
+		return f(s.cw)
 	}
+	if !s.cfg.Now().Before(deadline) {
+		return fmt.Errorf("rtmp: session: write: waited out the write timeout: %w", os.ErrDeadlineExceeded)
+	}
+	s.writeDeadline = deadline
 	return f(s.cw)
 }
 
 // writeMedia writes one audio, video or data message on chunk stream csid
-// within the write timeout. It may be called from any goroutine once
-// runReader runs. A failed write leaves the chunk stream mid-message, so it
-// ends the session: the error is returned and becomes Err.
+// within the write timeout of the call. It may be called from any goroutine
+// once runReader runs. A failed write may leave the chunk stream
+// mid-message, and one that waited out its timeout means the peer is not
+// keeping up, so either ends the session: the error is returned and becomes
+// Err.
 func (s *session) writeMedia(csid uint32, m Message) error {
 	err := s.write(true, func(cw *ChunkWriter) error { return cw.WriteMessage(csid, m) })
 	if err != nil {
@@ -513,15 +531,19 @@ func (r sessionReader) Read(p []byte) (int, error) {
 	}
 }
 
-// sessionWriter writes to the conn with a deadline of writeLimit, or the
-// phase end when that is sooner. It runs only under wmu; the phase is set
-// only before the reader goroutine starts, and is zero after.
+// sessionWriter writes to the conn with a deadline of writeDeadline (or
+// IdleTimeout from now when that is zero), or the phase end when that is
+// sooner. It runs only under wmu; the phase is set only before the reader
+// goroutine starts, and is zero after.
 type sessionWriter struct{ s *session }
 
 func (w sessionWriter) Write(p []byte) (int, error) {
 	s := w.s
 	now := s.cfg.Now()
-	d := now.Add(s.writeLimit)
+	d := s.writeDeadline
+	if d.IsZero() {
+		d = now.Add(s.cfg.IdleTimeout)
+	}
 	if !s.reading && !s.phaseEnd.IsZero() && s.phaseEnd.Before(d) {
 		d = s.phaseEnd
 	}

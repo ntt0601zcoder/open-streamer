@@ -88,6 +88,15 @@ type rawClient struct {
 	out  chan []byte
 	msgs chan rtmp.Message
 	res  chan acceptResult
+	// stall, once closed, stops the reading goroutine before its next
+	// message, until the test ends.
+	stall chan struct{}
+}
+
+// stopReading makes the client stop reading the server's messages, as a
+// player that stalls; the message being read may still complete.
+func (c *rawClient) stopReading() {
+	close(c.stall)
 }
 
 // queue hands each chunk writer output to the writing goroutine.
@@ -104,8 +113,14 @@ func startRaw(t *testing.T, ctx context.Context, cfg rtmp.Config, decide func(rt
 	t.Helper()
 	a, b := net.Pipe()
 	out := make(chan []byte, 64)
-	c := &rawClient{conn: b, cw: rtmp.NewChunkWriter(queue(out)), out: out, msgs: make(chan rtmp.Message, 256), res: make(chan acceptResult, 1)}
+	c := &rawClient{
+		conn: b, cw: rtmp.NewChunkWriter(queue(out)), out: out,
+		msgs: make(chan rtmp.Message, 256), res: make(chan acceptResult, 1),
+		stall: make(chan struct{}),
+	}
+	ended := make(chan struct{})
 	t.Cleanup(func() {
+		close(ended)
 		_ = a.Close()
 		_ = b.Close()
 	})
@@ -136,11 +151,21 @@ func startRaw(t *testing.T, ctx context.Context, cfg rtmp.Config, decide func(rt
 		defer close(c.msgs)
 		cr := rtmp.NewChunkReader(br, rtmp.ChunkLimits{})
 		for {
+			select {
+			case <-c.stall:
+				<-ended
+				return
+			default:
+			}
 			m, err := cr.ReadMessage()
 			if err != nil {
 				return
 			}
-			c.msgs <- m
+			select {
+			case c.msgs <- m:
+			case <-ended:
+				return
+			}
 		}
 	}()
 	return c
@@ -372,8 +397,8 @@ func TestServerRejectDescription(t *testing.T) {
 	code, _ := info.Get("code")
 	desc, _ := info.Get("description")
 	level, _ := info.Get("level")
-	if last[0] != "onStatus" || code != "NetStream.Publish.BadName" || desc != "stream not available" || level != "error" {
-		t.Fatalf("last command %v, want onStatus BadName \"stream not available\"", last)
+	if last[0] != "onStatus" || last[1] != 3.0 || code != "NetStream.Publish.BadName" || desc != "stream not available" || level != "error" {
+		t.Fatalf("last command %v, want onStatus 3 BadName \"stream not available\"", last)
 	}
 	if r := await(t, c.res, time.Second); r.err == nil {
 		t.Fatal("Accept accepted a rejected publish")
@@ -427,8 +452,8 @@ func TestServerReplies(t *testing.T) {
 	}
 	got := c.nextCommand(t)
 	info, _ := got[len(got)-1].(rtmp.Object)
-	if code, _ := info.Get("code"); got[0] != "onStatus" || code != "NetStream.Publish.Start" {
-		t.Fatalf("got %v, want onStatus NetStream.Publish.Start", got)
+	if code, _ := info.Get("code"); got[0] != "onStatus" || got[1] != 5.0 || code != "NetStream.Publish.Start" {
+		t.Fatalf("got %v, want onStatus 5 NetStream.Publish.Start", got)
 	}
 	if r := await(t, c.res, time.Second); r.err != nil {
 		t.Fatalf("Accept: %v", r.err)
@@ -447,24 +472,26 @@ func TestServerUnknownCommandsIgnored(t *testing.T) {
 	if r.err != nil {
 		t.Fatalf("Accept: %v", r.err)
 	}
-	names := make([]string, 0, 3)
-	for _, w := range []string{"_result", "_result", "onStatus"} {
+	// connect, getStreamLength (a live stream's length, 0), createStream,
+	// publish.
+	names := make([]string, 0, 4)
+	for _, w := range []string{"_result 1", "_result 3", "_result 5", "onStatus 6"} {
 		got := c.nextCommand(t)
-		names = append(names, fmt.Sprint(got[0]))
-		if got[0] != w {
-			t.Fatalf("commands %v, want _result, _result, onStatus", names)
+		names = append(names, fmt.Sprint(got[0], " ", got[1]))
+		if names[len(names)-1] != w {
+			t.Fatalf("commands %v, want _result 1, _result 3, _result 5, onStatus 6", names)
 		}
 	}
-	if n := r.sc.UnknownCommands(); n != 3 {
-		t.Fatalf("UnknownCommands %d, want 3", n)
+	if n := r.sc.UnknownCommands(); n != 2 {
+		t.Fatalf("UnknownCommands %d, want 2", n)
 	}
 	c.command(t, 1, "someVendorCommand", 0, nil)
 	c.write(t, 4, rtmp.Message{Type: rtmp.MsgAudio, StreamID: 1, Timestamp: 7, Payload: []byte{0xAF, 1, 2}})
 	if m, err := readMedia(t, r.sc); err != nil || m.Type != rtmp.MsgAudio {
 		t.Fatalf("ReadMedia: %v type %d", err, m.Type)
 	}
-	if n := r.sc.UnknownCommands(); n != 4 {
-		t.Fatalf("UnknownCommands %d, want 4", n)
+	if n := r.sc.UnknownCommands(); n != 3 {
+		t.Fatalf("UnknownCommands %d, want 3", n)
 	}
 	select {
 	case m := <-c.msgs:

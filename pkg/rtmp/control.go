@@ -89,9 +89,10 @@ func (s *session) sendPeerBandwidth(n uint32, limit uint8) error {
 	return s.writeControl(MsgSetPeerBandwidth, append(binary.BigEndian.AppendUint32(nil, n), limit))
 }
 
-// setChunkSize sends Set Chunk Size and uses n for our following chunks.
-func (s *session) setChunkSize(n int) error {
-	return s.write(false, func(cw *ChunkWriter) error { return cw.SetChunkSize(n) })
+// setChunkSize sends Set Chunk Size defaultOutChunkSize and uses it for our
+// following chunks.
+func (s *session) setChunkSize() error {
+	return s.write(false, func(cw *ChunkWriter) error { return cw.SetChunkSize(defaultOutChunkSize) })
 }
 
 // sendUserControl sends a user control event, such as StreamBegin(stream id)

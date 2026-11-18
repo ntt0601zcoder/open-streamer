@@ -266,7 +266,7 @@ func (c *ClientConn) open(t playTarget) error {
 	if _, err := c.awaitResult(txnConnect, "connect"); err != nil {
 		return err
 	}
-	if err := s.setChunkSize(defaultOutChunkSize); err != nil {
+	if err := s.setChunkSize(); err != nil {
 		return fmt.Errorf("rtmp: client: %w", err)
 	}
 	// A hard Set Peer Bandwidth may already have made the session announce
