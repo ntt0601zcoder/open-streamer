@@ -160,9 +160,12 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 - **TS muxer** (our `pkg/mpegts` writer), **fMP4 writer** (mp4ff `mp4`), **FLV tag
   codec** with enhanced RTMP for H.265 (`pkg/rtmp`), **RTP** packetisers
   (pion/rtp for H.264 and H.265, our own RFC 3640 for AAC in `pkg/rtsp`).
-- **Epoch helper:** one function that tells an output what to do at an epoch
-  change or `Lost > 0`: discontinuity tag, new period or init segment, sequence
-  headers resent.
+- **Epoch handling:** what an output does at an epoch change or `Lost > 0`
+  (discontinuity tag, new period or init segment, sequence headers resent)
+  lives in each muxer rather than in one shared helper, since the actions
+  differ per container. The FLV muxer (`internal/mux/flv`, M3b1) sends one
+  `onMetaData` and each carried track's sequence header per epoch and after
+  every resync, and resumes after a loss at the next video keyframe.
 - **Parameter sets:** TS, RTP and FLV writers re-insert every parameter set
   from `Config` before each keyframe. No muxer or packetiser library does this
   for us.
@@ -254,9 +257,12 @@ internal/ts/           the only MPEG-TS demuxer and muxer, on pkg/mpegts
 internal/e2e/          end-to-end tests across packages (tests only)
 internal/conform/      property checks and container readers for tests and the CLI
 internal/ingest/...    readers, one package per protocol
+internal/rtmpsrv/      the RTMP listener shared by publish inputs and play outputs
+internal/redact/       credential and stream-key redaction for URLs and errors
 internal/segment/      segmenter
-internal/mux/...       fMP4 writer on mp4ff
-internal/output/...    one package per output protocol
+internal/mux/...       fMP4 writer on mp4ff; internal/mux/flv: hub frames to RTMP messages
+internal/output/...    one package per output protocol (rtmpplay: RTMP players;
+                       rtmppush: RTMP push-out)
 internal/transcode/    subprocess supervisor and protocol
 internal/stream/       supervisor and failover
 internal/store/        spec storage
@@ -292,9 +298,38 @@ output) follows M2b and M2c. M3b is split in three parts:
 
 | Part | Contents |
 |---|---|
-| M3b1 ([plan](superpowers/plans/2026-11-17-m3b1-rtmp-out.md)) | `pkg/rtmp` server play and client publish, an RTMP listener shared by publish inputs and play outputs (players address a stream by its name, never by a publish key), the FLV muxer, RTMP play and RTMP push-out outputs, `osconform` for `rtmp://`, M2b's items carried to M3b |
+| M3b1 ([plan](superpowers/plans/2026-11-17-m3b1-rtmp-out.md), done) | `pkg/rtmp` server play and client publish, an RTMP listener shared by publish inputs and play outputs (players address a stream by its name, never by a publish key), the FLV muxer, RTMP play and RTMP push-out outputs, `osconform` for `rtmp://`, M2b's items carried to M3b |
 | M3b2 | `pkg/rtsp` server, RTP packetisers with parameter sets before keyframes, RTCP sender reports, the RTSP play output, `osconform` for `rtsp://` |
 | M3b3 | The SRT output, EXT-X-GAP (or per-track placeholders) for the R4/R9 rendition alignment, the VLC-class client check and the M3 row's remaining scenarios for every output; M3 done |
+
+M3b1's exit criteria are the M3 row's, for RTMP (VLC-class clients are
+checked in M3b3 for every output): ffmpeg/ffprobe and MediaMTX (as a puller)
+play our RTMP output for H.264+AAC and H.265+AAC; our push-out is accepted by
+ffmpeg's RTMP listener and by MediaMTX; for the RTMP play output and the
+push-out, `osconform`/`ReadRTMP` passes the steady-state, epoch-change,
+slow-consumer and B-frame scenarios and ffprobe reads it; publishers and
+players share one port without exposing publish keys. The `TestM3b1`
+scenarios in `internal/e2e` prove them, with `TestServerPlayFFmpeg` and
+`TestPublishFFmpegListener`/`TestPublishMediaMTX` (`pkg/rtmp`) and
+`TestPushFFmpegListener` (`internal/output/rtmppush`) for the exchanges with
+each peer. `ReadRTMP` reads only our own output; what passed through MediaMTX
+is read back with our RTMP and RTSP inputs and checked as frames (MediaMTX's
+RTMP output may resend headers or relay H.265 in the legacy form, which the
+strict RTMP rules would flag). CI's host-network RTSP MediaMTX also pulls our
+play output on demand from port 19361.
+
+Out of M3b1:
+
+| Item | Reason |
+|---|---|
+| RTMPS (TLS) | Needs certificates and their configuration: M5 |
+| Play authentication and tokens | M6 sessions and tokens |
+| Seek, pause, `receiveAudio` and `receiveVideo` | Live only: acknowledged and ignored |
+| AMF3 | Clients that ask for `objectEncoding` 3 are refused, as in M2b |
+| Legacy H.265 with FLV codec ID 12 | Non-standard; enhanced RTMP only |
+| More than one target per push-out | Configure several push-outs |
+| A mid-session video or audio codec change | Players and push targets cannot follow one: the play session ends with end of stream (players reconnect) and the push republishes |
+| VLC-class client checks | M3b3, for every output |
 
 M2 is split in three parts:
 

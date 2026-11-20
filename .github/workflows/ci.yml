@@ -52,12 +52,19 @@ jobs:
       # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
       # network, so that RTSP over UDP works, on private ports (RTSP 18554,
       # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
+      # TestM3b1MediaMTXPull (OS_MEDIAMTX_PULL) has it pull our RTMP play
+      # output, on demand, from the fixed port 19361 into the paths m3b1pull
+      # (H.264+AAC) and m3b1pullhevc (H.265+AAC).
       - name: Start MediaMTX for RTSP
         run: |
           docker run -d --rm --name osv2-mtx-m2c --network host \
             -e MTX_RTSPADDRESS=:18554 -e MTX_RTPADDRESS=:18000 -e MTX_RTCPADDRESS=:18001 \
             -e MTX_RTMP=no -e MTX_HLS=no -e MTX_WEBRTC=no -e MTX_SRT=no -e MTX_API=no \
             -e MTX_METRICS=no -e MTX_PPROF=no -e MTX_PLAYBACK=no -e MTX_MOQ=no \
+            -e MTX_PATHS_M3B1PULL_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pull \
+            -e MTX_PATHS_M3B1PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pullhevc \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCEONDEMAND=yes \
             bluenviron/mediamtx:1.21.3
           for _ in $(seq 50); do
             nc -z 127.0.0.1 18554 && exit 0
@@ -70,6 +77,7 @@ jobs:
           OS_REQUIRE_PEERS: "1"
           OS_MEDIAMTX_RTMP: 127.0.0.1:19350
           OS_MEDIAMTX_RTSP: 127.0.0.1:18554
+          OS_MEDIAMTX_PULL: "1"
           OS_REQUIRE_MEDIAMTX: "1"
       - name: Stop MediaMTX for RTSP
         if: always()
@@ -99,12 +107,19 @@ jobs:
       # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
       # network, so that RTSP over UDP works, on private ports (RTSP 18554,
       # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
+      # TestM3b1MediaMTXPull (OS_MEDIAMTX_PULL) has it pull our RTMP play
+      # output, on demand, from the fixed port 19361 into the paths m3b1pull
+      # (H.264+AAC) and m3b1pullhevc (H.265+AAC).
       - name: Start MediaMTX for RTSP
         run: |
           docker run -d --rm --name osv2-mtx-m2c --network host \
             -e MTX_RTSPADDRESS=:18554 -e MTX_RTPADDRESS=:18000 -e MTX_RTCPADDRESS=:18001 \
             -e MTX_RTMP=no -e MTX_HLS=no -e MTX_WEBRTC=no -e MTX_SRT=no -e MTX_API=no \
             -e MTX_METRICS=no -e MTX_PPROF=no -e MTX_PLAYBACK=no -e MTX_MOQ=no \
+            -e MTX_PATHS_M3B1PULL_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pull \
+            -e MTX_PATHS_M3B1PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pullhevc \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCEONDEMAND=yes \
             bluenviron/mediamtx:1.21.3
           for _ in $(seq 50); do
             nc -z 127.0.0.1 18554 && exit 0
@@ -117,6 +132,7 @@ jobs:
           OS_REQUIRE_PEERS: "1"
           OS_MEDIAMTX_RTMP: 127.0.0.1:19350
           OS_MEDIAMTX_RTSP: 127.0.0.1:18554
+          OS_MEDIAMTX_PULL: "1"
           OS_REQUIRE_MEDIAMTX: "1"
       - name: Stop MediaMTX for RTSP
         if: always()
