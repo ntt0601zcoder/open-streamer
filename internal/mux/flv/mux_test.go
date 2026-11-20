@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
@@ -687,4 +688,179 @@ func TestMuxEpochStartsAtKeyframe(t *testing.T) {
 		}
 	}
 	t.Fatal("no video in the epoch")
+}
+
+// audioRun returns n audio frames copied from src[0], 1024 samples at 48 kHz
+// apart, starting at DTS from.
+func audioRun(src []media.Frame, from int64, n int) []media.Frame {
+	out := make([]media.Frame, n)
+	for i := range out {
+		f := src[0]
+		f.DTS = from + int64(i)*1920
+		f.PTS = f.DTS
+		out[i] = f
+	}
+	return out
+}
+
+// A connection carrying video whose input lost its video (failover to an
+// audio-only source) resumes on audio once no video keyframe came within
+// hub.LiveWindow of a Resync, and a later video keyframe resumes video with
+// its header.
+func TestMuxResyncAfterVideoEnds(t *testing.T) {
+	frames := fromKey(demux(t, "h264_aac.ts"))
+	m := NewMuxer()
+	feed(t, m, frames)
+	m.Resync()
+	from := maxDTS(frames) + 3600
+	audio := audioRun(audioOf(frames), from, 600)
+	out := make([]msg, 0, len(audio)+2)
+	firstOut := -1
+	for i, f := range audio {
+		msgs, err := m.Frame(f)
+		require.NoError(t, err)
+		if len(msgs) > 0 && firstOut < 0 {
+			firstOut = i
+		}
+		out = append(out, parse(t, msgs)...)
+	}
+	require.GreaterOrEqual(t, firstOut, 0, "audio resumes")
+	require.GreaterOrEqual(t, audio[firstOut].DTS-from, int64(hub.LiveWindow), "not before the live window")
+	require.Less(t, audio[firstOut].DTS-from, int64(hub.LiveWindow)+1920)
+	require.Equal(t, dropsBefore(t, frames)+uint64(firstOut), m.Stats().DroppedBeforeKey)
+	b := frames[0].DTS
+	require.Equal(t, uint8(rtmp.MsgDataAMF0), out[0].typ)
+	require.True(t, out[1].header() && out[1].typ == rtmp.MsgAudio)
+	require.Equal(t, uint32((audio[firstOut].DTS-b)/90), out[2].ts)
+	require.Len(t, out, 2+len(audio)-firstOut)
+
+	// Video comes back: a delta frame is dropped, a keyframe resumes video
+	// with its header.
+	last := audio[len(audio)-1].DTS
+	src := fromKey(demux(t, "h264_aac.ts"))
+	key, delta := src[0], src[1]
+	require.False(t, delta.Key)
+	delta.DTS, delta.PTS = last+100, last+100
+	key.DTS, key.PTS = last+3100, last+3100
+	before := m.Stats().DroppedBeforeKey
+	require.Empty(t, feed(t, m, []media.Frame{delta}))
+	require.Equal(t, before+1, m.Stats().DroppedBeforeKey)
+	vid := parse(t, feed(t, m, []media.Frame{key}))
+	require.Len(t, vid, 2)
+	require.True(t, vid[0].header() && vid[0].typ == rtmp.MsgVideo)
+	require.True(t, vid[1].coded() && vid[1].video.Key)
+}
+
+// dropsBefore returns the DroppedBeforeKey count of a fresh muxer fed frames.
+func dropsBefore(t *testing.T, frames []media.Frame) uint64 {
+	t.Helper()
+	m := NewMuxer()
+	feed(t, m, frames)
+	return m.Stats().DroppedBeforeKey
+}
+
+// A Resync during the start hold discards the held frames: the connection
+// starts again, based on the next keyframe.
+func TestMuxResyncDuringHold(t *testing.T) {
+	frames := fromKey(demux(t, "h264_aac.ts"))
+	m := NewMuxer()
+	require.Empty(t, feed(t, m, frames[:1]), "held")
+	m.Resync()
+	require.Equal(t, uint64(1), m.Stats().Resyncs)
+	next := 0
+	for i := 1; i < len(frames); i++ {
+		if frames[i].Kind() == media.KindVideo && frames[i].Key {
+			next = i
+			break
+		}
+	}
+	require.Positive(t, next, "the fixture has a second keyframe")
+	msgs := feed(t, m, frames[1:])
+	require.Equal(t, uint64(next-1), m.Stats().DroppedBeforeKey, "frames before the next keyframe dropped")
+	checkMux(t, frames[next:], msgs)
+}
+
+// The start hold of a video-only connection ends at 256 held frames even
+// within a second of decode time.
+func TestMuxHoldFrameCap(t *testing.T) {
+	v := fromKey(demux(t, "h264_640.ts"))
+	key, delta := v[0], v[1]
+	require.False(t, delta.Key)
+	frames := []media.Frame{key}
+	for i := 1; i <= holdFrames; i++ {
+		f := delta
+		f.DTS, f.PTS = key.DTS+int64(i), key.DTS+int64(i)
+		frames = append(frames, f)
+	}
+	m := NewMuxer()
+	for _, f := range frames[:holdFrames] {
+		msgs, err := m.Frame(f)
+		require.NoError(t, err)
+		require.Empty(t, msgs, "held")
+	}
+	out := parse(t, feed(t, m, frames[holdFrames:]))
+	require.Len(t, out, 2+holdFrames+1, "metadata, header and every frame")
+	require.Equal(t, uint8(rtmp.MsgDataAMF0), out[0].typ)
+	require.True(t, out[1].header())
+}
+
+// A composition time outside the signed 24-bit range is an error, not a
+// truncated value.
+func TestMuxCompositionTimeRange(t *testing.T) {
+	src := demux(t, "h264_aac.ts")
+	key := fromKey(src)[0]
+	key.PTS = key.DTS + (1<<23)*90
+	a := audioOf(src)[0]
+	a.DTS, a.PTS = key.DTS+90, key.PTS
+	m := NewMuxer()
+	require.Empty(t, feed(t, m, []media.Frame{key}))
+	_, err := m.Frame(a)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrCodecChanged)
+	require.Contains(t, err.Error(), "composition time")
+
+	key.PTS = key.DTS + (1<<23-1)*90
+	a.PTS = key.PTS
+	out := parse(t, feed(t, NewMuxer(), []media.Frame{key, a}))
+	require.Equal(t, int32(1<<23-1), out[2].video.CompTime)
+}
+
+// A new epoch whose first frame is audio gets onMetaData and the audio header
+// at that frame; video resumes at the epoch's first keyframe, with its
+// header.
+func TestMuxEpochAudioFirst(t *testing.T) {
+	ep1, ep2 := twoEpochs(t)
+	var first int
+	for i, f := range ep2 {
+		if f.Kind() == media.KindAudio {
+			first = i
+			break
+		}
+	}
+	a := ep2[first]
+	a.DTS, a.PTS = ep2[0].DTS-1920, ep2[0].DTS-1920
+	m := NewMuxer()
+	feed(t, m, ep1)
+	out := parse(t, feed(t, m, append([]media.Frame{a}, ep2...)))
+	require.Equal(t, uint64(1), m.Stats().Epochs)
+	require.Equal(t, uint8(rtmp.MsgDataAMF0), out[0].typ)
+	require.True(t, out[1].header() && out[1].typ == rtmp.MsgAudio)
+	require.True(t, out[2].coded() && out[2].typ == rtmp.MsgAudio)
+	require.Equal(t, uint32((a.DTS-ep1[0].DTS)/90), out[0].ts)
+	headers := map[uint8]int{}
+	sawVideo := false
+	for i, p := range out {
+		require.False(t, i > 0 && p.typ == rtmp.MsgDataAMF0, "one onMetaData")
+		if p.header() {
+			headers[p.typ]++
+			continue
+		}
+		if p.typ == rtmp.MsgVideo && !sawVideo {
+			sawVideo = true
+			require.True(t, p.video.Key)
+			require.True(t, out[i-1].header() && out[i-1].typ == rtmp.MsgVideo, "video header just before")
+		}
+	}
+	require.True(t, sawVideo)
+	require.Equal(t, map[uint8]int{rtmp.MsgAudio: 1, rtmp.MsgVideo: 1}, headers)
 }
