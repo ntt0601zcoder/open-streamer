@@ -133,6 +133,27 @@ func TestPublishFlow(t *testing.T) {
 	}
 }
 
+// With KeepQuery the URL's query reaches the server verbatim, a mode
+// parameter included: a push target's query is the target's own. Without
+// it, mode is dropped as for every input URL.
+func TestPublishKeepQuery(t *testing.T) {
+	srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{})
+	for _, tc := range []struct {
+		keep  bool
+		query string
+	}{{true, "mode=x&k=v&a=%2F"}, {false, "k=v&a=%2F"}} {
+		p := publish(t, srv.URL("live/key?mode=x&k=v&a=%2F"), rtmp.Config{KeepQuery: tc.keep})
+		if err := p.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		reqs := srv.Requests()
+		got := reqs[len(reqs)-1]
+		if got.App != "live" || got.Stream != "key" || got.Query != tc.query {
+			t.Fatalf("KeepQuery %v: request %+v, want stream key and query %q", tc.keep, got, tc.query)
+		}
+	}
+}
+
 // publishPeer answers the client's connect, releaseStream, FCPublish and
 // createStream (stream id 1) and returns the connect and publish commands;
 // sawChunkSize reports a Set Chunk Size 4096 before publish.

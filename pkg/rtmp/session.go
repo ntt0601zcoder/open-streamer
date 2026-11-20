@@ -74,6 +74,12 @@ type Config struct {
 	// publishing client's liveness check besides its write deadlines. Tests
 	// use it to shrink socket buffers.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// KeepQuery makes Publish send the URL's query verbatim, a "mode"
+	// parameter included, for a target whose query is its own (a push
+	// to a third-party server). By default Publish, like PlayWith, drops
+	// mode, which only means something to our input URLs. PlayWith and
+	// servers ignore it.
+	KeepQuery bool
 }
 
 // dial opens a client's connection to addr with Dial, or a net.Dialer.

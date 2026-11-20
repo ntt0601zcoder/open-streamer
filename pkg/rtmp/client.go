@@ -109,6 +109,12 @@ func (t playTarget) redactor() *strings.Replacer {
 // live/inst. The stream name keeps the query, without the mode parameter
 // that only means something to us. Errors never echo the URL.
 func splitPlayURL(rawURL string) (playTarget, error) {
+	return splitURL(rawURL, false)
+}
+
+// splitURL is splitPlayURL; with keepQuery the stream name keeps the query
+// verbatim, mode included.
+func splitURL(rawURL string, keepQuery bool) (playTarget, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return playTarget{}, errors.New("rtmp: client: invalid URL")
@@ -149,7 +155,11 @@ func splitPlayURL(rawURL string) (playTarget, error) {
 		stream: segs[len(segs)-1],
 		tcURL:  "rtmp://" + host + "/" + app,
 	}
-	if q := stripMode(u.RawQuery); q != "" {
+	q := u.RawQuery
+	if !keepQuery {
+		q = stripMode(q)
+	}
+	if q != "" {
 		t.stream += "?" + q
 	}
 	return t, nil
