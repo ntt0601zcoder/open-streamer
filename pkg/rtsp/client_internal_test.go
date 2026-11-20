@@ -1,0 +1,72 @@
+package rtsp
+
+import (
+	"context"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// pipeClient is a Client over one end of a net.Pipe nobody reads, so every
+// write blocks until its deadline.
+func pipeClient(t *testing.T) *Client {
+	t.Helper()
+	a, b := net.Pipe()
+	t.Cleanup(func() {
+		a.Close()
+		b.Close()
+	})
+	return &Client{
+		cfg: Config{Timeout: 10 * time.Second}.withDefaults(), conn: a, auth: NewAuth("", ""),
+		pending: map[int]chan *Response{}, done: make(chan struct{}),
+		desc: Description{Control: "rtsp://127.0.0.1/x"},
+	}
+}
+
+func TestTeardownCutsStuckWriter(t *testing.T) {
+	c := pipeClient(t)
+	errc := make(chan error, 1)
+	go func() { errc <- c.writeFrame(1, []byte{1, 2, 3}) }()
+	time.Sleep(50 * time.Millisecond) // the writer holds wmu, blocked
+	start := time.Now()
+	c.teardown(context.Background())
+	assert.Less(t, time.Since(start), 300*time.Millisecond)
+	select {
+	case err := <-errc:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("stuck writer not cut short")
+	}
+}
+
+func TestWritesClampedAfterClose(t *testing.T) {
+	c := pipeClient(t)
+	c.closeBy.Store(time.Now().Add(100 * time.Millisecond).UnixNano())
+	start := time.Now()
+	require.Error(t, c.writeFrame(1, []byte{1}))
+	require.Error(t, c.writeMsg(&Response{StatusCode: 200, Reason: "OK", Header: Header{}}, time.Now().Add(10*time.Second)))
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+// TestNewTargetDefaultPort checks the address Dial connects to: port 554
+// when the URL names none. No connection is made.
+func TestNewTargetDefaultPort(t *testing.T) {
+	for _, tc := range []struct{ in, addr, url string }{
+		{"rtsp://127.0.0.1/stream", "127.0.0.1:554", "rtsp://127.0.0.1/stream"},
+		{"rtsp://u:p@cam/stream?ch=1", "cam:554", "rtsp://cam/stream?ch=1"},
+		{"rtsp://[::1]/x", "[::1]:554", "rtsp://[::1]/x"},
+		{"rtsp://cam:8554/x", "cam:8554", "rtsp://cam:8554/x"},
+	} {
+		tg, err := newTarget(tc.in)
+		require.NoError(t, err, tc.in)
+		assert.Equal(t, tc.addr, tg.addr, tc.in)
+		assert.Equal(t, tc.url, tg.url, tc.in)
+	}
+	for _, bad := range []string{"http://cam/x", "rtsp:///x", "rtsp://%zz/x"} {
+		_, err := newTarget(bad)
+		assert.Error(t, err, bad)
+	}
+}

@@ -2,17 +2,11 @@ version: "2"
 
 linters:
   exclusions:
-    paths:
-      - api/docs
     rules:
-      # Allow fmt.Errorf without %w in test files
+      # Allow unchecked errors in test files
       - path: _test\.go
         linters:
           - errcheck
-      # Allow TODO comments in handlers/stores during scaffolding
-      - text: "TODO"
-        linters:
-          - godot
   enable:
     - errcheck
     - govet

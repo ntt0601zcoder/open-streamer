@@ -1,168 +1,161 @@
-# Continuous integration: build, test, lint, vulnerability scan.
-#
-# The native transcoder (internal/transcoder/native, cmd/open-streamer-transcoder)
-# is cgo against go-astiav → libav 8. FFmpeg 8 is not in any runner's apt, so
-# every job that COMPILES Go runs inside the prebuilt builder image
-# (ghcr.io/<owner>/open-streamer-builder:v1, published by builder-image.yml).
-# `go mod tidy` doesn't compile cgo, so it stays on a plain runner.
-#
-# Bootstrap note: the builder image must exist in GHCR before these jobs can
-# pull it — run the "Builder image" workflow once (it auto-runs when
-# Dockerfile.builder changes).
 name: CI
 
 on:
-  # PR-only: correctness is gated on pull requests into main/master.
-  # Pushes to main don't re-run CI (the PR already validated the commit);
-  # main is reserved for tag-triggered Release builds.
   pull_request:
-    branches: [main, master]
+    branches: [main, rebuild]
 
 permissions:
   contents: read
-  packages: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
-  mod-tidy:
+  tidy:
     name: go mod tidy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
-
-      - name: Ensure go.mod / go.sum are tidy
+      - name: go mod tidy drift check
         run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
+          go mod tidy && git diff --exit-code -- go.mod go.sum
+
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
 
   test:
-    name: test
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/open-streamer-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    services:
+      # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
+      # 1.21.3, which reads and writes H.265 over enhanced RTMP (FourCC hvc1,
+      # sent to clients that announce it in connect's fourCcList), so that a
+      # new release cannot change the peer under the tests. Host port 19350
+      # keeps 1935 free for internal/ingest's default-port check.
+      mediamtx:
+        image: bluenviron/mediamtx:1.21.3
+        ports:
+          - 19350:1935
     steps:
-      - uses: actions/checkout@v6
-
-      # The job runs as root inside the builder container while the workspace
-      # was checked out by the runner user → git reports "dubious ownership"
-      # and `go build`'s VCS stamping dies with "error obtaining VCS status:
-      # exit status 128". Trust the workspace so stamping (and any git use)
-      # works.
-      - name: Trust workspace for git
-        run: git config --global --add safe.directory '*'
-
-      - name: Cache Go build + module cache
-        uses: actions/cache@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          path: |
-            /root/.cache/go-build
-            /root/go/pkg/mod
-          key: ${{ runner.os }}-gocgo-${{ hashFiles('go.sum') }}
-          restore-keys: ${{ runner.os }}-gocgo-
-
-      - name: Toolchain stamp
+          go-version-file: go.mod
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Check ffmpeg has SRT
+        run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
+      # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
+      # network, so that RTSP over UDP works, on private ports (RTSP 18554,
+      # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
+      # TestM3b1MediaMTXPull (OS_MEDIAMTX_PULL) has it pull our RTMP play
+      # output, on demand, from the fixed port 19361 into the paths m3b1pull
+      # (H.264+AAC) and m3b1pullhevc (H.265+AAC).
+      - name: Start MediaMTX for RTSP
         run: |
-          go version
-          pkg-config --modversion libavcodec libavformat libavfilter libswscale libavutil
+          docker run -d --rm --name osv2-mtx-m2c --network host \
+            -e MTX_RTSPADDRESS=:18554 -e MTX_RTPADDRESS=:18000 -e MTX_RTCPADDRESS=:18001 \
+            -e MTX_RTMP=no -e MTX_HLS=no -e MTX_WEBRTC=no -e MTX_SRT=no -e MTX_API=no \
+            -e MTX_METRICS=no -e MTX_PPROF=no -e MTX_PLAYBACK=no -e MTX_MOQ=no \
+            -e MTX_PATHS_M3B1PULL_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pull \
+            -e MTX_PATHS_M3B1PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pullhevc \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCEONDEMAND=yes \
+            bluenviron/mediamtx:1.21.3
+          for _ in $(seq 50); do
+            nc -z 127.0.0.1 18554 && exit 0
+            sleep 0.2
+          done
+          docker logs osv2-mtx-m2c
+          exit 1
+      - run: make test
+        env:
+          OS_REQUIRE_PEERS: "1"
+          OS_MEDIAMTX_RTMP: 127.0.0.1:19350
+          OS_MEDIAMTX_RTSP: 127.0.0.1:18554
+          OS_MEDIAMTX_PULL: "1"
+          OS_REQUIRE_MEDIAMTX: "1"
+      - name: Stop MediaMTX for RTSP
+        if: always()
+        run: docker stop osv2-mtx-m2c || true
 
-      - name: Download modules
-        run: go mod download
-
-      - name: Verify modules
-        run: go mod verify
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Build
-        run: go build -o /dev/null ./...
-
-      - name: Test
-        run: go test -race -shuffle=on -count=1 -timeout=5m -coverprofile=coverage.out -covermode=atomic ./...
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+  coverage:
+    runs-on: ubuntu-latest
+    services:
+      # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
+      # 1.21.3, which reads and writes H.265 over enhanced RTMP (FourCC hvc1,
+      # sent to clients that announce it in connect's fourCcList), so that a
+      # new release cannot change the peer under the tests. Host port 19350
+      # keeps 1935 free for internal/ingest's default-port check.
+      mediamtx:
+        image: bluenviron/mediamtx:1.21.3
+        ports:
+          - 19350:1935
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          files: coverage.out
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          go-version-file: go.mod
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Check ffmpeg has SRT
+        run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
+      # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
+      # network, so that RTSP over UDP works, on private ports (RTSP 18554,
+      # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
+      # TestM3b1MediaMTXPull (OS_MEDIAMTX_PULL) has it pull our RTMP play
+      # output, on demand, from the fixed port 19361 into the paths m3b1pull
+      # (H.264+AAC) and m3b1pullhevc (H.265+AAC).
+      - name: Start MediaMTX for RTSP
+        run: |
+          docker run -d --rm --name osv2-mtx-m2c --network host \
+            -e MTX_RTSPADDRESS=:18554 -e MTX_RTPADDRESS=:18000 -e MTX_RTCPADDRESS=:18001 \
+            -e MTX_RTMP=no -e MTX_HLS=no -e MTX_WEBRTC=no -e MTX_SRT=no -e MTX_API=no \
+            -e MTX_METRICS=no -e MTX_PPROF=no -e MTX_PLAYBACK=no -e MTX_MOQ=no \
+            -e MTX_PATHS_M3B1PULL_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pull \
+            -e MTX_PATHS_M3B1PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pullhevc \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCEONDEMAND=yes \
+            bluenviron/mediamtx:1.21.3
+          for _ in $(seq 50); do
+            nc -z 127.0.0.1 18554 && exit 0
+            sleep 0.2
+          done
+          docker logs osv2-mtx-m2c
+          exit 1
+      - run: make cover covercheck
+        env:
+          OS_REQUIRE_PEERS: "1"
+          OS_MEDIAMTX_RTMP: 127.0.0.1:19350
+          OS_MEDIAMTX_RTSP: 127.0.0.1:18554
+          OS_MEDIAMTX_PULL: "1"
+          OS_REQUIRE_MEDIAMTX: "1"
+      - name: Stop MediaMTX for RTSP
+        if: always()
+        run: docker stop osv2-mtx-m2c || true
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
-    continue-on-error: true
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/open-streamer-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-
-      # The job runs as root inside the builder container while the workspace
-      # was checked out by the runner user → git reports "dubious ownership"
-      # and `go build`'s VCS stamping dies with "error obtaining VCS status:
-      # exit status 128". Trust the workspace so stamping (and any git use)
-      # works.
-      - name: Trust workspace for git
-        run: git config --global --add safe.directory '*'
-
-      - name: Cache Go build + module cache
-        uses: actions/cache@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          path: |
-            /root/.cache/go-build
-            /root/go/pkg/mod
-          key: ${{ runner.os }}-gocgo-${{ hashFiles('go.sum') }}
-          restore-keys: ${{ runner.os }}-gocgo-
-
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
-
-      - name: golangci-lint
-        run: golangci-lint run --timeout=5m ./...
-
-  govulncheck:
-    name: govulncheck
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/open-streamer-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v6
-
-      # The job runs as root inside the builder container while the workspace
-      # was checked out by the runner user → git reports "dubious ownership"
-      # and `go build`'s VCS stamping dies with "error obtaining VCS status:
-      # exit status 128". Trust the workspace so stamping (and any git use)
-      # works.
-      - name: Trust workspace for git
-        run: git config --global --add safe.directory '*'
-
-      - name: Cache Go build + module cache
-        uses: actions/cache@v5
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
         with:
-          path: |
-            /root/.cache/go-build
-            /root/go/pkg/mod
-          key: ${{ runner.os }}-gocgo-${{ hashFiles('go.sum') }}
-          restore-keys: ${{ runner.os }}-gocgo-
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
-      - name: Run govulncheck
-        run: govulncheck ./...
+          version: v2.14.0
