@@ -947,6 +947,31 @@ func TestPlayRoutingByFullPath(t *testing.T) {
 	assert.Equal(t, []string{"cam"}, h.servedNames())
 }
 
+// A play app of several segments routes the same way: the name is the last
+// segment of the path, whether the client splits it or sends it whole.
+func TestPlayRoutingMultiSegmentApp(t *testing.T) {
+	r := &Registry{}
+	addr := "127.0.0.1:" + freeTCPPort(t)
+	h := newFakePlayer()
+	mustRegisterPlay(t, r, addr, "a/b", h, Policy{})
+	l := r.lookup(addr)
+	require.NotNil(t, l)
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() { _ = c1.Close(); _ = c2.Close() })
+	for _, req := range []rtmp.Request{
+		{Play: true, App: "a/b", Stream: "cam"},
+		{Play: true, App: "a/b/cam", Stream: ""},
+	} {
+		slot, err := l.admit(c1, req, "127.0.0.1")
+		require.NoError(t, err, "%+v", req)
+		assert.Equal(t, "cam", slot.name, "%+v", req)
+		assert.Same(t, h, slot.rt.h, "%+v", req)
+		assert.Equal(t, "a/b/cam", slot.path, "%+v", req)
+		l.endPlay(slot)
+	}
+	assert.Equal(t, []string{"cam", "cam"}, h.askedFor())
+}
+
 // Players are capped per stream, per listener and per IP; a player that
 // leaves frees its slots. Players connect one at a time, so the pre-publish
 // cap of 4 per IP is never reached.

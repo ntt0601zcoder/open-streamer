@@ -233,10 +233,11 @@ func (r *Registry) RegisterPublish(addr, path string, sink PublishSink, cfg rtmp
 // contains "/" is not h's and is rejected with the usual
 // NetStream.Play.StreamNotFound. app is the only source of the play app. A
 // play whose path is a registered publish path is rejected before h is
-// asked, so a publish key is never playable. The listener is shared as with RegisterPublish. The returned
-// unregister cancels the ctx of every Serve, closes the players, waits for
-// every session that reached h, and closes the listener when it was the
-// address's last registration. It is idempotent.
+// asked, so a publish key is never playable. The listener is shared as with
+// RegisterPublish. The returned unregister cancels the ctx of every Serve,
+// closes the players, waits for every session that reached h, and closes
+// the listener when it was the address's last registration. It is
+// idempotent.
 func (r *Registry) RegisterPlay(addr, app string, h PlayHandler, cfg rtmp.Config, pol Policy) (unregister func(), err error) {
 	key, err := AddrKey(addr)
 	if err != nil {

@@ -121,6 +121,19 @@ func waitCapture(t *testing.T, ch <-chan capResult) conform.Capture {
 	}
 }
 
+// waitRaw returns the messages of a rawPlay, failing the test if the read
+// does not end within the run limit plus m3b1Read.
+func waitRaw(t *testing.T, ch <-chan []rtmp.Media) []rtmp.Media {
+	t.Helper()
+	select {
+	case msgs := <-ch:
+		return msgs
+	case <-time.After(runLimit + m3b1Read):
+		t.Fatal("the raw RTMP read did not end")
+		return nil
+	}
+}
+
 // rawPlay reads every message of u until the stream ends, in the
 // background.
 func rawPlay(u string) <-chan []rtmp.Media {
@@ -519,7 +532,7 @@ func TestM3b1EpochChange(t *testing.T) {
 			assert.Empty(t, c.Violations)
 			assert.Equal(t, []uint32{1, 2}, epochs(c.Frames))
 			assertMatchesHub(t, r.col.frames, c.Frames)
-			n := countMsgs(t, <-rawCh)
+			n := countMsgs(t, waitRaw(t, rawCh))
 			assert.Equal(t, 2, n.metas, "onMetaData per epoch")
 			assert.Equal(t, []any{float64(320), float64(640)}, n.widths, "onMetaData widths")
 			assert.Equal(t, 2, n.videoHeaders, "video headers")
