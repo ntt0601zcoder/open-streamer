@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   tidy:
+    name: go mod tidy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -148,6 +149,7 @@ jobs:
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
   lint:
+    name: golangci-lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
