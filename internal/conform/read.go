@@ -46,8 +46,8 @@ var maxSegments = 100000
 
 // ReadOptions configures the readers.
 type ReadOptions struct {
-	// Duration of media to capture when polling; for ReadTS, 0 means read
-	// until EOF.
+	// Duration of media to capture when polling; for ReadTS and ReadRTMP, 0
+	// means read until the end of the stream.
 	Duration time.Duration
 	// Once reads the current playlist or MPD once and fetches every listed
 	// segment, instead of polling. ReadTS ignores it.
@@ -57,7 +57,8 @@ type ReadOptions struct {
 	// Timeout bounds each playlist, manifest or segment request, body
 	// included, and for ReadTS the wait for the response headers and every
 	// stall between body reads, so a stalled server cannot hang a reader.
-	// 0 means 30 s.
+	// For ReadRTMP it bounds the connection set-up and every wait for the
+	// next message. 0 means 30 s.
 	Timeout time.Duration
 }
 
