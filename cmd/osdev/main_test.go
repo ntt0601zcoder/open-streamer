@@ -553,3 +553,68 @@ func TestOsdevRTMPPlay(t *testing.T) {
 	assert.Equal(t, "NetStream.Play.StreamNotFound", st.Code)
 	assert.Equal(t, 0, stop())
 }
+
+func TestOsdevRTMPPushFlags(t *testing.T) {
+	key := vSekrit + "pushkey"
+	cfg, code := parseArgs([]string{
+		"-stream", "a=" + fixture, "-stream", "b=" + fixture,
+		"-rtmp-push", "a=rtmp://127.0.0.1:19352/live/" + key + "?key=" + vHunter,
+		"-rtmp-push", "a=rtmp://127.0.0.1:19353/app/" + key,
+		"-rtmp-push", "b=rtmp://127.0.0.1:19352/live/" + key,
+	}, io.Discard)
+	require.NotNil(t, cfg, code)
+	require.Len(t, cfg.pushes, 3)
+	assert.Equal(t, "a", cfg.pushes[0].stream)
+	assert.Equal(t, "rtmp://127.0.0.1:19352/live/sexxxxx?key=xxxxx", cfg.pushes[0].pusher.String())
+	assert.Equal(t, "b", cfg.pushes[2].stream)
+
+	for name, args := range map[string][]string{
+		"unknown stream": {"-stream", "a=" + fixture, "-rtmp-push", "nope=rtmp://h/live/" + key},
+		"no stream":      {"-stream", "a=" + fixture, "-rtmp-push", "rtmp://h/live/" + key},
+		"not rtmp":       {"-stream", "a=" + fixture, "-rtmp-push", "a=srt://h:1?passphrase=" + key},
+		"no key":         {"-stream", "a=" + fixture, "-rtmp-push", "a=rtmp://h/" + key},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var errw strings.Builder
+			cfg, code := parseArgs(args, &errw)
+			assert.Nil(t, cfg)
+			assert.Equal(t, 2, code)
+			assert.Contains(t, errw.String(), "-rtmp-push")
+			assert.NotContains(t, errw.String(), key)
+		})
+	}
+
+	var sb strings.Builder
+	assert.Equal(t, 2, run(context.Background(), nil, io.Discard, &sb))
+	assert.Contains(t, sb.String(), "-rtmp-push")
+}
+
+// Each -rtmp-push publishes its stream to the target, which gets the key,
+// while osdev's output shows the target only redacted.
+func TestOsdevRTMPPush(t *testing.T) {
+	key := vSekrit + "pushkey"
+	srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{})
+	var errw syncBuilder
+	_, stop := startOsdev(t, []string{
+		"-stream", "demo=" + fixture, "-loop",
+		"-rtmp-push", "demo=" + srv.URL("live/"+key+"?mode=x"),
+	}, &errw)
+	require.Eventually(t, func() bool {
+		video := 0
+		for _, m := range srv.Media() {
+			if m.Type == rtmp.MsgVideo {
+				video++
+			}
+		}
+		return video >= 30
+	}, 15*time.Second, 50*time.Millisecond)
+	assert.Equal(t, 0, stop())
+	reqs := srv.Requests()
+	require.NotEmpty(t, reqs)
+	assert.Equal(t, key, reqs[0].Stream)
+	assert.Equal(t, "mode=x", reqs[0].Query)
+	out := errw.String()
+	assert.Contains(t, out, "osdev: stream demo: pushing to rtmp://"+srv.Addr+"/live/sexxxxx?mode=x")
+	assert.Contains(t, out, "push rtmp://"+srv.Addr+"/live/sexxxxx?mode=x: stopped, connects 1")
+	assert.NotContains(t, out, key)
+}

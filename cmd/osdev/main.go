@@ -41,6 +41,14 @@
 // A publish path is never playable, so a stream whose listen path is its
 // own play path (<app>/<name>) cannot be played over RTMP; osdev warns about
 // it at startup. Publish under a long random key instead.
+//
+// To push a stream to an RTMP server (a CDN ingest, a restreaming service),
+// give -rtmp-push name=URL, once per target; the URL's query goes to the
+// server as is. A target that fails is retried with a backoff of 1 s to
+// 30 s. The URL is a secret: osdev shows it only redacted, the stream key
+// cut to its first 2 characters:
+//
+//	osdev -stream cam=in.ts -loop -rtmp-push cam=rtmp://a.example.com/live2/<stream-key>
 package main
 
 import (
@@ -66,6 +74,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/output/httpts"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/rtmpplay"
+	"github.com/ntt0601zcoder/open-streamer/internal/output/rtmppush"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
@@ -84,7 +93,7 @@ func main() {
 }
 
 const usageText = `usage: osdev -stream name=URL [-stream ...] [-listen addr] [-layout video,audio] [-loop]
-             [-rtmp-play addr [-rtmp-play-app live]]
+             [-rtmp-play addr [-rtmp-play-app live]] [-rtmp-push name=rtmp://host/app/key ...]
 
 Accept an RTMP publisher (OBS or ffmpeg):
   osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen
@@ -104,6 +113,10 @@ rtmp://<host>:<port>/<app>/<name>, app from -rtmp-play-app (default live):
   ffplay rtmp://<host>:1935/live/<name>
   A publish path is never playable: a stream published at <app>/<name>
   cannot be played (osdev warns), so publish under a long random key.
+
+Push a stream to an RTMP server (repeat -rtmp-push for more targets; the
+URL is shown only redacted, and a failing target is retried):
+  osdev -stream cam=in.ts -loop -rtmp-push cam=rtmp://<host>/<app>/<stream-key>
 `
 
 // streamFlags collects repeated -stream name=path values.
@@ -192,6 +205,29 @@ func newServer(h http.Handler) *http.Server {
 	}
 }
 
+// push is one -rtmp-push: a stream and its pusher.
+type push struct {
+	stream   string
+	pusher   *rtmppush.Pusher
+	lastLine string // the last report line
+}
+
+// report writes the push's state when it differs from the last report: the
+// target (redacted), state, counters and last error.
+func (p *push) report(w io.Writer) {
+	st := p.pusher.Stats()
+	line := fmt.Sprintf("osdev: stream %s: push %s: %s, connects %d, failures %d, republishes %d, resyncs %d, messages %d",
+		p.stream, p.pusher, st.State, st.Connects, st.Failures, st.Republishes, st.Resyncs, st.Messages)
+	if st.LastError != "" {
+		line += ", last error: " + st.LastError
+	}
+	if line == p.lastLine {
+		return
+	}
+	p.lastLine = line
+	_, _ = fmt.Fprintln(w, line)
+}
+
 // config is the parsed command line.
 type config struct {
 	listen  string
@@ -200,6 +236,7 @@ type config struct {
 	// rtmpPlay is the RTMP play address, empty when RTMP play is off;
 	// rtmpPlayApp the play app, normalised.
 	rtmpPlay, rtmpPlayApp string
+	pushes                []*push // in flag order
 }
 
 // parseLayout parses a comma-separated list of video and audio.
@@ -249,8 +286,9 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	layoutFlag := fs.String("layout", "video,audio", "track layout of every stream: video and audio, comma-separated")
 	rtmpPlay := fs.String("rtmp-play", "", "serve every stream to RTMP players on this address (host:port)")
 	rtmpPlayApp := fs.String("rtmp-play-app", "live", "the app of RTMP play URLs: rtmp://host:port/<app>/<name>")
-	var streams streamFlags
+	var streams, pushes streamFlags
 	fs.Var(&streams, "stream", "name=URL (or name=path.ts) to serve; repeat a name to add a lower-priority input")
+	fs.Var(&pushes, "rtmp-push", "name=rtmp://host/app/key: push stream name to an RTMP server; repeatable")
 	if err := fs.Parse(args); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return nil, 2
@@ -284,7 +322,7 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	byName := map[string]*source{}
 	for _, s := range streams {
 		name, input, ok := strings.Cut(s, "=")
-		if !ok || name == "" || input == "" || strings.ContainsAny(name, "/?#% ") || name == "." || name == ".." {
+		if !ok || input == "" || !validName(name) {
 			_, _ = fmt.Fprintf(stderr, "osdev: malformed -stream %q, want name=URL\n", ingest.Redact(s))
 			return nil, 2
 		}
@@ -312,7 +350,31 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return nil, 2
 	}
+	for _, v := range pushes {
+		// The value holds a stream key: it is never echoed.
+		name, target, ok := strings.Cut(v, "=")
+		if !ok || target == "" || !validName(name) {
+			_, _ = fmt.Fprintln(stderr, "osdev: malformed -rtmp-push, want name=rtmp://host/app/key")
+			return nil, 2
+		}
+		src := byName[name]
+		if src == nil {
+			_, _ = fmt.Fprintf(stderr, "osdev: -rtmp-push: unknown stream %s\n", name)
+			return nil, 2
+		}
+		p, err := rtmppush.New(src.hub, target, rtmppush.Options{})
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "osdev: -rtmp-push for stream %s: %v\n", name, err)
+			return nil, 2
+		}
+		cfg.pushes = append(cfg.pushes, &push{stream: name, pusher: p})
+	}
 	return cfg, 0
+}
+
+// validName reports whether name can name a stream.
+func validName(name string) bool {
+	return name != "" && !strings.ContainsAny(name, "/?#% ") && name != "." && name != ".."
 }
 
 // copyTarget returns the stream a copy:// input reads.
@@ -539,6 +601,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}()
 	}
 
+	for _, p := range cfg.pushes {
+		_, _ = fmt.Fprintf(stderr, "osdev: stream %s: pushing to %s\n", p.stream, p.pusher)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if p.pusher.Run(ctx) == nil {
+				_, _ = fmt.Fprintf(stderr, "osdev: stream %s: push to %s ended with the stream\n", p.stream, p.pusher)
+			}
+		}()
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -550,6 +623,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 				return
 			case <-t.C:
 				report(stderr, order, false)
+				for _, p := range cfg.pushes {
+					p.report(stderr)
+				}
 			}
 		}
 	}()
@@ -585,6 +661,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	wg.Wait()
 	report(stderr, order, true)
+	for _, p := range cfg.pushes {
+		p.report(stderr)
+	}
 	if code == 0 && failed.Load() > 0 {
 		code = 1
 	}
