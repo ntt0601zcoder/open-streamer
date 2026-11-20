@@ -27,6 +27,12 @@ const (
 // RTP and RTCP ports 18000 and 18001.
 const EnvMediaMTXRTSP = "OS_MEDIAMTX_RTSP"
 
+// EnvMediaMTXPull names the environment variable that, set to "1", says that
+// the MediaMTX RTSP listener of OS_MEDIAMTX_RTSP was started with the paths
+// m3b1pull and m3b1pullhevc pulling, on demand, from
+// rtmp://127.0.0.1:19361/live/m3b1pull and …/live/m3b1pullhevc. CI sets it.
+const EnvMediaMTXPull = "OS_MEDIAMTX_PULL"
+
 // Require returns the path of binary, which must support every listed
 // protocol (checked with "-hide_banner -protocols", so it applies to ffmpeg
 // and ffprobe). When the binary or a protocol is missing the test is skipped,
@@ -89,6 +95,23 @@ func MediaMTXRTSP(t testing.TB) (rtspAddr string) {
 		return ""
 	}
 	t.Skipf("peer MediaMTX: %s is not set", EnvMediaMTXRTSP)
+	return ""
+}
+
+// MediaMTXPull returns the host:port of the MediaMTX RTSP listener whose
+// paths pull our RTMP play output (EnvMediaMTXPull). When OS_MEDIAMTX_PULL is
+// not "1", or OS_MEDIAMTX_RTSP is unset, the test is skipped, or failed when
+// OS_REQUIRE_MEDIAMTX=1.
+func MediaMTXPull(t testing.TB) (rtspHostPort string) {
+	t.Helper()
+	if os.Getenv(EnvMediaMTXPull) == "1" {
+		return MediaMTXRTSP(t)
+	}
+	if os.Getenv(EnvRequireMediaMTX) == "1" {
+		t.Fatalf("peer MediaMTX: %s is not 1", EnvMediaMTXPull)
+		return ""
+	}
+	t.Skipf("peer MediaMTX: %s is not 1", EnvMediaMTXPull)
 	return ""
 }
 

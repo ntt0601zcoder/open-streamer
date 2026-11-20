@@ -97,6 +97,32 @@ func TestMediaMTXRTSP(t *testing.T) {
 	}
 }
 
+func TestMediaMTXPull(t *testing.T) {
+	for _, tt := range []struct {
+		pull, addr, require string
+		wantSkip, wantFail  bool
+		want                string
+	}{
+		{"", "127.0.0.1:18554", "", true, false, ""},
+		{"", "127.0.0.1:18554", "1", false, true, ""},
+		{"1", "", "", true, false, ""},
+		{"1", "", "1", false, true, ""},
+		{"1", "127.0.0.1:18554", "", false, false, "127.0.0.1:18554"},
+		{"1", "127.0.0.1:18554", "1", false, false, "127.0.0.1:18554"},
+	} {
+		t.Run(fmt.Sprintf("%q/%q/%q", tt.pull, tt.addr, tt.require), func(t *testing.T) {
+			t.Setenv(EnvMediaMTXPull, tt.pull)
+			t.Setenv(EnvMediaMTXRTSP, tt.addr)
+			t.Setenv(EnvRequireMediaMTX, tt.require)
+			rec := &recorder{TB: t}
+			got := MediaMTXPull(rec)
+			assert.Equal(t, tt.wantSkip, rec.skipped)
+			assert.Equal(t, tt.wantFail, rec.failed)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestRequireMuxer(t *testing.T) {
 	RequireMuxer(t, "ffmpeg", "mpegts") // every build has it
 

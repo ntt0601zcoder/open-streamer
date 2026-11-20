@@ -18,6 +18,7 @@ $F $(v 320x240) $(a 44100) -t 6 $X265 -c:a aac -ac 6 -b:a 128k $BX h265_aac51.ts
 dts h265_aac51.ts h265_aac51_dts.txt
 $F $(v 320x240) $(a 44100) -t 6 $X264 -c:a aac -ac 1 -b:a 64k -output_ts_offset 95440 $BX h264_aacmono_wrap.ts
 $F $(v 640x360) -t 2 $X264 -an $BX h264_640.ts
+$F $(v 640x360) $(a 48000) -t 6 $X264 -c:a aac -ac 2 -b:a 64k $BX h264_aac_640.ts
 $F $(v 320x240) $(a 48000) -t 2 $X264 -c:a mp2 $BX h264_mp2.ts
 cat h264_aac.ts h264_aac.ts > h264_aac_loop.ts
 cat h264_aac.ts h264_640.ts > h264_aac_then_640.ts

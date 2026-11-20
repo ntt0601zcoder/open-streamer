@@ -15,6 +15,7 @@ make fixtures
 | `h265_aac51.ts` | 6 s, HEVC 320x240 25 fps, AAC 5.1 44.1 kHz | Open GOP (CRA plus RASL pictures); HEVC parameter sets; 6-channel AAC |
 | `h264_aacmono_wrap.ts` | 6 s, H.264 320x240, AAC mono 44.1 kHz, timestamps offset by 95440 s | PTS wrap about 2.4 s into the clip (33-bit 90 kHz rollover) |
 | `h264_640.ts` | 2 s, H.264 640x360, no audio | Video-only stream; second resolution |
+| `h264_aac_640.ts` | 6 s, H.264 Main 640x360 25 fps (same encoder settings as `h264_aac.ts`), AAC-LC stereo 48 kHz (ffmpeg 8.0.1) | A failover to a second resolution that keeps the audio track: the RTMP outputs resend onMetaData and both sequence headers |
 | `h264_mp2.ts` | 2 s, H.264 320x240, MP2 audio 48 kHz | Unsupported audio codec |
 | `h264_aac_loop.ts` | `h264_aac.ts` twice back to back | One backwards timestamp jump |
 | `h264_aac_then_640.ts` | `h264_aac.ts` then `h264_640.ts` | One resolution change plus a timestamp jump |
