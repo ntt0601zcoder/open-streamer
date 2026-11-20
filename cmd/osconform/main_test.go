@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,12 +16,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/clock"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
+	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/mux/flv"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
+	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/dash"
 	"github.com/ntt0601zcoder/open-streamer/pkg/hls"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
 )
 
 var t0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -145,6 +153,7 @@ func TestOsconformBadArgs(t *testing.T) {
 		"bad flag":    {"-nope"},
 		"extra arg":   {"-url", "http://x/a.ts", "y"},
 		"bad suffix":  {"-url", "http://x/a.txt"},
+		"bad scheme":  {"-url", "rtmps://x/live/s"},
 		"bad url":     {"-url", "http://a b/a.ts"},
 		"bad duratio": {"-url", "http://x/a.ts", "-duration", "soon"},
 		"bad timeout": {"-url", "http://x/a.ts", "-timeout", "soon"},
@@ -155,4 +164,68 @@ func TestOsconformBadArgs(t *testing.T) {
 			assert.Empty(t, out)
 		})
 	}
+}
+
+// rtmpTags returns the h264_aac fixture as our RTMP muxer sends it. When
+// dropKey is set, the first video keyframe is left out.
+func rtmpTags(t *testing.T, dropKey bool) []rtmp.FLVTag {
+	t.Helper()
+	b, err := os.ReadFile("../../testdata/fixtures/h264_aac.ts")
+	require.NoError(t, err)
+	d, err := ts.NewDemuxer(bytes.NewReader(b))
+	require.NoError(t, err)
+	c := clock.New(clock.Options{Kinds: d.TrackKinds()})
+	m := flv.NewMuxer()
+	var tags []rtmp.FLVTag
+	dropped := false
+	add := func(frames []media.Frame) {
+		for _, f := range frames {
+			msgs, err := m.Frame(f)
+			require.NoError(t, err)
+			for _, msg := range msgs {
+				if dropKey && !dropped && msg.Type == rtmp.MsgVideo {
+					v, err := rtmp.ParseVideoTag(msg.Payload)
+					require.NoError(t, err)
+					if v.Kind == rtmp.VideoCodedFrames && v.Key {
+						dropped = true
+						continue
+					}
+				}
+				tags = append(tags, rtmp.FLVTag{Type: msg.Type, Timestamp: msg.Timestamp, Data: msg.Payload})
+			}
+		}
+	}
+	for {
+		f, err := d.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		add(c.Push(f))
+	}
+	add(c.Flush())
+	return tags
+}
+
+func TestOsconformRTMP(t *testing.T) {
+	s := rtmptest.NewPlayServer(t, rtmpTags(t, false), rtmptest.PlayOptions{})
+	code, out := runConform(t, "-url", s.URL("live/s"))
+	assert.Equal(t, 0, code)
+	assert.Empty(t, out)
+
+	s = rtmptest.NewPlayServer(t, rtmpTags(t, true), rtmptest.PlayOptions{})
+	code, out = runConform(t, "-url", s.URL("live/s"))
+	assert.Equal(t, 1, code)
+	assert.Contains(t, out, "epoch-starts-on-key")
+
+	s = rtmptest.NewPlayServer(t, nil, rtmptest.PlayOptions{NotFound: true})
+	code, _ = runConform(t, "-url", s.URL("live/s"))
+	assert.Equal(t, 2, code)
+
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+	code, _ = runConform(t, "-url", "rtmp://"+addr+"/live/s")
+	assert.Equal(t, 2, code)
 }
