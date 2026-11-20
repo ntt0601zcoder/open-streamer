@@ -128,11 +128,11 @@ const (
 	endHubClosed
 )
 
-// Serve plays the stream conn asked for until ctx ends, the player leaves, a
-// write fails or misses its deadline, the codec changes or the hub closes.
-// The last two send end of stream first. The caller closes conn.
-func (s *Server) Serve(ctx context.Context, conn *rtmp.ServerConn) {
-	name, _ := rtmp.NormalizePath(conn.Request().Stream, "")
+// Serve plays the stream name, which the registry resolved from the play
+// path, until ctx ends, the player leaves, a write fails or misses its
+// deadline, the codec changes or the hub closes. The last two send end of
+// stream first. The caller closes conn.
+func (s *Server) Serve(ctx context.Context, conn *rtmp.ServerConn, name string) {
 	h, ok := s.lookup(name)
 	if !ok || h == nil {
 		_ = conn.EndOfStream() // the stream went away after the play decision
