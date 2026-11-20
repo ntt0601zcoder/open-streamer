@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 )
@@ -60,6 +61,12 @@ const (
 	stateWaitKey              // after Resync: dropping until the resume point
 )
 
+// maxKeyWait is how long, in stream time from the first frame dropped after
+// a Resync, a connection carrying video waits for a video keyframe before it
+// resumes on audio: the video track has ended (hub.LiveWindow), e.g. after a
+// failover to an audio-only source.
+const maxKeyWait = hub.LiveWindow
+
 // track is one carried track of a connection.
 type track struct {
 	id     int
@@ -98,6 +105,8 @@ type Muxer struct {
 	st           state
 	base         int64
 	keyPTS       int64 // PTS of the start or resume keyframe
+	waiting      bool  // a frame was dropped in stateWaitKey
+	waitFrom     int64 // its DTS
 	epoch        uint32
 	gen          uint64 // incremented with every onMetaData
 	metaDue      bool
@@ -119,7 +128,10 @@ func (m *Muxer) Stats() MuxStats { return m.stats }
 // Resync restarts the output after frames were lost: frames are dropped until
 // the next video keyframe (the next audio frame on a connection without
 // video), which gets onMetaData and every header again, and audio presented
-// before that keyframe is dropped. The base is kept.
+// before that keyframe is dropped. The base is kept. When no video keyframe
+// comes within hub.LiveWindow of stream time after the first frame dropped,
+// the video track has ended: the output resumes at the next audio frame,
+// and video at its next keyframe, with its header.
 func (m *Muxer) Resync() {
 	m.stats.Resyncs++
 	switch m.st {
@@ -128,8 +140,10 @@ func (m *Muxer) Resync() {
 		// Nothing was sent: start again at the next keyframe.
 		m.held = nil
 		m.st = stateIdle
-	case stateRun, stateWaitKey:
-		m.st = stateWaitKey
+	case stateRun:
+		m.st, m.waiting = stateWaitKey, false
+	case stateWaitKey:
+		// Keep waiting since the first frame dropped.
 	}
 }
 
@@ -195,15 +209,26 @@ func (m *Muxer) Frame(f media.Frame) ([]rtmp.Media, error) {
 			m.stats.DroppedBeforeBase++
 			return nil, nil
 		}
-		if m.video.active() {
-			if kind != media.KindVideo || !f.Key {
-				m.stats.DroppedBeforeKey++
-				return nil, nil
-			}
-			m.keyPTS = f.PTS
+		switch {
+		case !m.video.active():
+			// An audio-only connection resumes at its next frame.
+			m.st, m.metaDue = stateRun, true
+			return m.run(t, f)
+		case kind == media.KindVideo && f.Key:
 			t.needKey = false
+		case kind == media.KindAudio && m.waiting && f.DTS-m.waitFrom >= maxKeyWait:
+			// The video track ended: resume on audio, video at its next
+			// keyframe.
+			m.video.needKey = true
+		default:
+			if !m.waiting {
+				m.waiting, m.waitFrom = true, f.DTS
+			}
+			m.stats.DroppedBeforeKey++
+			return nil, nil
 		}
-		m.st, m.metaDue = stateRun, true
+		m.keyPTS = f.PTS
+		m.st, m.metaDue, m.waiting = stateRun, true, false
 		return m.run(t, f)
 	case stateRun:
 		return m.run(t, f)
