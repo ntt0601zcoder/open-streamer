@@ -457,7 +457,10 @@ func rtmpListenKey(input string) (addr, path string, ok bool) {
 // warnPublishPaths reports each stream whose RTMP play path is a publish
 // path of an RTMP listen input on the play listener: the registry never
 // plays a publish path, so that stream cannot be played over RTMP. The
-// publish paths are not printed; the play path is public.
+// warning prints the play path, which in this case equals that publish
+// path: it is <app>/<stream name>, built from the public stream name, so the
+// operator already chose to make it public. No other publish path is
+// printed.
 func warnPublishPaths(w io.Writer, cfg *config) {
 	if cfg.rtmpPlay == "" {
 		return

@@ -557,7 +557,7 @@ func steadyServer(t *testing.T, tags []rtmp.FLVTag) string {
 }
 
 // A stream whose timestamps never advance ends cleanly after Duration plus
-// Timeout of wall-clock time.
+// Timeout of wall-clock time, with a violation for the short capture.
 func TestReadRTMPBackstop(t *testing.T) {
 	u := steadyServer(t, muxedTags(t, "h264_aac.ts"))
 	start := time.Now()
@@ -566,6 +566,14 @@ func TestReadRTMPBackstop(t *testing.T) {
 	assert.GreaterOrEqual(t, time.Since(start), 1400*time.Millisecond)
 	assert.Less(t, time.Since(start), 5*time.Second)
 	assert.Positive(t, countKind(r.c.Frames, media.KindVideo))
+	var short []Violation
+	for _, v := range r.c.Violations {
+		if v.Rule == RuleRTMPCaptureShort {
+			short = append(short, v)
+		}
+	}
+	require.Len(t, short, 1, "a capture cut short by the backstop is a violation")
+	assert.Contains(t, short[0].Detail, "of 500ms in 1.5s of wall time")
 }
 
 // The second capture epoch opens at the second onMetaData.

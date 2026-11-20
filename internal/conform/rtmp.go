@@ -47,6 +47,9 @@ const (
 	// codec ID 7, H.265 ones the enhanced RTMP FourCC hvc1, and video
 	// sequence headers carry frame type key.
 	RuleRTMPForm = "rtmp-tag-form"
+	// RuleRTMPCaptureShort: a read with a Duration captures that span before
+	// the wall-clock backstop (Duration plus Timeout) ends it.
+	RuleRTMPCaptureShort = "rtmp-capture-short"
 )
 
 // rtmpTrack is the state of one kind (video or audio) of an RTMP capture.
@@ -97,7 +100,8 @@ type rtmpCapture struct {
 // of the stream (io.EOF, a clean end) or once the audio or the video coded
 // messages, frames built from them or not, span opt.Duration; as a
 // backstop for timestamps that do not advance, it also stops cleanly after
-// Duration plus Timeout of wall-clock time. Duration 0 means the end of the
+// Duration plus Timeout of wall-clock time, reporting RuleRTMPCaptureShort
+// when the span is still below Duration. Duration 0 means the end of the
 // stream. opt.Timeout bounds the connection set-up and every wait for the
 // next message; Once and Client are ignored.
 func ReadRTMP(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
@@ -156,6 +160,10 @@ func ReadRTMP(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 		if r.message(m) && limit > 0 && r.span() >= limit {
 			break
 		}
+	}
+	if ended.Load() && r.span() < limit {
+		r.b.violate(RuleRTMPCaptureShort, -1, "captured %v of %v in %v of wall time",
+			media.ToDuration(r.span()), opt.Duration, opt.Duration+timeout)
 	}
 	return r.b.finish(), nil
 }
