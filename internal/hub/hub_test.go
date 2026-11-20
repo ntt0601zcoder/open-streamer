@@ -695,3 +695,24 @@ func TestHubSubscribeCached(t *testing.T) {
 	_, ok := <-closed.C()
 	assert.False(t, ok, "closed hub: closed channel")
 }
+
+// Done is open while the hub runs, closed by Close (once, however often
+// Close is called), and stays closed.
+func TestHubDone(t *testing.T) {
+	h := New(Options{})
+	select {
+	case <-h.Done():
+		t.Fatal("Done closed on an open hub")
+	default:
+	}
+	assert.Equal(t, h.Done(), h.Done(), "one channel")
+	h.Write(vid(0, 0, true))
+	h.Close()
+	h.Close()
+	select {
+	case <-h.Done():
+	default:
+		t.Fatal("Done open after Close")
+	}
+	assert.False(t, h.Live())
+}

@@ -12,7 +12,8 @@
 // once; any other failure (refused, rejected, closed by the target, a write
 // that misses the write timeout) closes it and reconnects after an
 // exponential backoff, 1 s doubling to 30 s, that starts again at 1 s after
-// a connection that sent for 30 s.
+// a connection that was published for 30 s. The hub closing ends the push,
+// during a backoff too.
 //
 // The target's stream key, userinfo and query values are secrets: String,
 // Stats, errors and the hub subscriber name only ever show the target
@@ -61,8 +62,9 @@ type Options struct {
 	MinBackoff, MaxBackoff time.Duration
 	// After waits for a backoff. Default time.After.
 	After func(time.Duration) <-chan time.Time
-	// Now tells how long a connection has sent, to reset the backoff.
-	// Default time.Now.
+	// Now tells how long a connection was published: the backoff starts
+	// again at MinBackoff after a connection published for 30 s, whatever
+	// ended it. Default time.Now.
 	Now func() time.Time
 	// RTMP is the client Config of each connection (Dial and timeouts);
 	// WriteTimeout and KeepQuery are set by the Pusher.
@@ -272,8 +274,8 @@ const (
 
 // Run pushes until ctx ends, closing the connection (which unblocks a
 // pending write) and returning ctx's error, or until the hub closes, ending
-// the publish and returning nil. A hub that closes during a backoff is seen
-// at the next connection.
+// the publish (or the backoff) and returning nil. A hub already closed is
+// never pushed.
 func (p *Pusher) Run(ctx context.Context) error {
 	defer p.setState(StateStopped)
 	wait := p.opt.MinBackoff
@@ -282,7 +284,15 @@ func (p *Pusher) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("rtmppush: run: %w", err)
 		}
-		why, sent, err := p.connection(ctx, &rs)
+		select {
+		case <-p.h.Done():
+			return nil
+		default:
+		}
+		why, published, err := p.connection(ctx, &rs)
+		if published >= resetAfter {
+			wait = p.opt.MinBackoff
+		}
 		switch why {
 		case endHubClosed:
 			return nil
@@ -295,9 +305,6 @@ func (p *Pusher) Run(ctx context.Context) error {
 			continue
 		case endFailed:
 		}
-		if sent >= resetAfter {
-			wait = p.opt.MinBackoff
-		}
 		p.mu.Lock()
 		p.st.Failures++
 		p.st.LastError = p.scrub(err)
@@ -306,6 +313,8 @@ func (p *Pusher) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("rtmppush: run: %w", ctx.Err())
+		case <-p.h.Done():
+			return nil
 		case <-p.opt.After(wait):
 		}
 		wait = min(2*wait, p.opt.MaxBackoff)
@@ -313,8 +322,9 @@ func (p *Pusher) Run(ctx context.Context) error {
 }
 
 // connection publishes once and sends until the connection must end. It
-// reports why, how long it sent, and for endFailed the error. After a codec
-// change rs is set for the next connection.
+// reports why, how long the connection was published (0 when the publish
+// failed), and for endFailed the error. After a codec change rs is set for
+// the next connection.
 func (p *Pusher) connection(ctx context.Context, rs *resume) (end, time.Duration, error) {
 	p.setState(StateConnecting)
 	conn, err := rtmp.Publish(ctx, p.target, p.opt.RTMP)
@@ -338,29 +348,29 @@ func (p *Pusher) connection(ctx context.Context, rs *resume) (end, time.Duration
 	c := &pushConn{p: p, conn: conn, mux: flv.NewMuxer(), rs: rs}
 	defer c.finish()
 
-	failed := func(err error) (end, time.Duration, error) {
-		if ctx.Err() != nil {
+	ended := func(why end, err error) (end, time.Duration, error) {
+		if why == endFailed && ctx.Err() != nil {
 			// Our own Close failed the conn: err is no failure.
-			return endCanceled, 0, err
+			why = endCanceled
 		}
-		return endFailed, p.opt.Now().Sub(start), err
+		return why, p.opt.Now().Sub(start), err
 	}
 	for {
 		select {
 		case <-ctx.Done():
-			return endCanceled, 0, nil
+			return ended(endCanceled, nil)
 		case <-conn.Done():
-			return failed(fmt.Errorf("rtmppush: connection: %w", conn.Err()))
+			return ended(endFailed, fmt.Errorf("rtmppush: connection: %w", conn.Err()))
 		case d, ok := <-sub.C():
 			if !ok {
-				return endHubClosed, 0, nil
+				return ended(endHubClosed, nil)
 			}
 			codecChanged, err := c.deliver(d)
 			if err != nil {
-				return failed(err)
+				return ended(endFailed, err)
 			}
 			if codecChanged {
-				return endCodecChanged, 0, nil
+				return ended(endCodecChanged, nil)
 			}
 		}
 	}

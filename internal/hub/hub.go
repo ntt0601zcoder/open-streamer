@@ -125,6 +125,8 @@ type Hub struct {
 	gopCacheFrames  int
 	audioCacheTicks int64
 
+	done chan struct{} // closed by Close
+
 	mu      sync.Mutex
 	closed  bool
 	subs    []*Sub
@@ -160,6 +162,7 @@ func New(opt Options) *Hub {
 		audioCacheTicks: opt.AudioCacheTicks,
 		video:           map[int]*videoTrack{},
 		anchor:          -1,
+		done:            make(chan struct{}),
 	}
 	if h.gopCacheFrames <= 0 {
 		h.gopCacheFrames = defaultGOPCacheFrames
@@ -280,6 +283,7 @@ func (h *Hub) Close() {
 		return
 	}
 	h.closed = true
+	close(h.done)
 	for _, s := range h.subs {
 		s.closed = true
 		close(s.ch)
@@ -287,6 +291,10 @@ func (h *Hub) Close() {
 	h.subs = nil
 	h.resetCache()
 }
+
+// Done returns a channel that is closed when the hub closes; it is already
+// closed for a closed hub.
+func (h *Hub) Done() <-chan struct{} { return h.done }
 
 // C returns the subscriber's delivery channel. It is closed by Close on the
 // subscriber or the hub; deliveries already queued stay readable.
