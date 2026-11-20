@@ -2,18 +2,21 @@
 // target such as a CDN ingest or a restreaming service.
 //
 // A Pusher keeps one connection to its target at a time. Each connection
-// publishes (rtmp.Publish, with the target's query sent verbatim),
-// subscribes to the hub with a queue that holds the whole GOP cache
-// (hub.SubscribeCached), so it starts at once on the cached keyframe, and
-// keeps one flv.Muxer. A delivery that reports lost frames resyncs the
-// muxer, which resumes at the next keyframe with onMetaData and headers on
-// the same connection, so a slow target never holds up the hub. A codec
-// change (flv.ErrCodecChanged) closes the connection and publishes again at
-// once; any other failure (refused, rejected, closed by the target, a write
-// that misses the write timeout) closes it and reconnects after an
-// exponential backoff, 1 s doubling to 30 s, that starts again at 1 s after
-// a connection that was published for 30 s. The hub closing ends the push,
-// during a backoff too.
+// waits until the hub is live (hub.Live, polled), so no idle publish is
+// held on the target, then publishes (rtmp.Publish, with the target's
+// query sent verbatim), subscribes to the hub with a queue that holds the
+// whole GOP cache (hub.SubscribeCached), so it starts at once on the
+// cached keyframe, and keeps one flv.Muxer. A delivery that reports lost
+// frames resyncs the muxer, which resumes at the next keyframe with
+// onMetaData and headers on the same connection, so a slow target never
+// holds up the hub. A codec change (flv.ErrCodecChanged) closes the
+// connection and publishes again at once, unless 3 republishes came within
+// the last 60 s: then it waits the backoff first (counted in
+// RepublishBackoffs). Any other failure (refused, rejected, closed by the
+// target, a write that misses the write timeout) closes it and reconnects
+// after an exponential backoff, 1 s doubling to 30 s, that starts again at
+// 1 s after a connection that was published for 30 s. The hub closing ends
+// the push, during a backoff too.
 //
 // The target's stream key, userinfo and query values are secrets: String,
 // Stats, errors and the hub subscriber name only ever show the target
@@ -45,6 +48,13 @@ const (
 	// resetAfter is how long a connection must have sent for the backoff to
 	// start again at its minimum.
 	resetAfter = 30 * time.Second
+	// After maxRepublishes republishes within republishWindow, the next
+	// republish waits the backoff first, so a source that flips codecs
+	// does not hammer the target.
+	maxRepublishes  = 3
+	republishWindow = 60 * time.Second
+	// livePoll is how often a Pusher checks whether the hub went live.
+	livePoll = 100 * time.Millisecond
 	// mask replaces a secret in scrubbed text.
 	mask = "xxxxx"
 )
@@ -60,11 +70,12 @@ type Options struct {
 	// MinBackoff and MaxBackoff bound the wait before a reconnect, which
 	// doubles from MinBackoff up to MaxBackoff. 0 means 1 s and 30 s.
 	MinBackoff, MaxBackoff time.Duration
-	// After waits for a backoff. Default time.After.
+	// After waits for a backoff, and between checks of whether the hub is
+	// live. Default time.After.
 	After func(time.Duration) <-chan time.Time
-	// Now tells how long a connection was published: the backoff starts
+	// Now tells how long a connection was published (the backoff starts
 	// again at MinBackoff after a connection published for 30 s, whatever
-	// ended it. Default time.Now.
+	// ended it) and when each republish happened. Default time.Now.
 	Now func() time.Time
 	// RTMP is the client Config of each connection (Dial and timeouts);
 	// WriteTimeout and KeepQuery are set by the Pusher.
@@ -77,6 +88,7 @@ type State string
 // The states of a Pusher.
 const (
 	StateIdle       State = "idle"       // Run has not started
+	StateWaiting    State = "waiting"    // waiting for the hub to go live
 	StateConnecting State = "connecting" // publishing to the target
 	StatePublishing State = "publishing" // sending
 	StateBackoff    State = "backoff"    // waiting to reconnect after a failure
@@ -91,6 +103,9 @@ type Stats struct {
 	// the connections closed for a codec change and published again at
 	// once.
 	Connects, Failures, Republishes uint64
+	// RepublishBackoffs counts the republishes that waited the backoff
+	// first, because 3 republishes came within the last 60 s.
+	RepublishBackoffs uint64
 	// LastError is the latest failure, with the target redacted.
 	LastError string
 	// Frames counts the hub frames received, Messages the RTMP messages
@@ -279,7 +294,10 @@ const (
 func (p *Pusher) Run(ctx context.Context) error {
 	defer p.setState(StateStopped)
 	wait := p.opt.MinBackoff
-	var rs resume
+	var (
+		rs     resume
+		recent []time.Time // the republishes within republishWindow
+	)
 	for {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("rtmppush: run: %w", err)
@@ -299,17 +317,27 @@ func (p *Pusher) Run(ctx context.Context) error {
 		case endCanceled:
 			return fmt.Errorf("rtmppush: run: %w", ctx.Err())
 		case endCodecChanged:
+			now := p.opt.Now()
+			recent = slices.DeleteFunc(recent, func(at time.Time) bool { return now.Sub(at) >= republishWindow })
+			throttled := len(recent) >= maxRepublishes
+			recent = append(recent, now)
 			p.mu.Lock()
 			p.st.Republishes++
+			if throttled {
+				p.st.RepublishBackoffs++
+				p.st.State = StateBackoff
+			}
 			p.mu.Unlock()
-			continue
+			if !throttled {
+				continue
+			}
 		case endFailed:
+			p.mu.Lock()
+			p.st.Failures++
+			p.st.LastError = p.scrub(err)
+			p.st.State = StateBackoff
+			p.mu.Unlock()
 		}
-		p.mu.Lock()
-		p.st.Failures++
-		p.st.LastError = p.scrub(err)
-		p.st.State = StateBackoff
-		p.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("rtmppush: run: %w", ctx.Err())
@@ -321,11 +349,32 @@ func (p *Pusher) Run(ctx context.Context) error {
 	}
 }
 
-// connection publishes once and sends until the connection must end. It
-// reports why, how long the connection was published (0 when the publish
-// failed), and for endFailed the error. After a codec change rs is set for
-// the next connection.
+// awaitLive waits until the hub is live (hub.Live), polling it every
+// livePoll, so no idle publish is held on the target. It reports whether
+// the hub went live, and otherwise why the wait ended.
+func (p *Pusher) awaitLive(ctx context.Context) (end, bool) {
+	for !p.h.Live() {
+		p.setState(StateWaiting)
+		select {
+		case <-ctx.Done():
+			return endCanceled, false
+		case <-p.h.Done():
+			return endHubClosed, false
+		case <-p.opt.After(livePoll):
+		}
+	}
+	return 0, true
+}
+
+// connection waits for the hub to be live, publishes once and sends until
+// the connection must end. It reports why, how long the connection was
+// published (0 when the publish failed or was never made), and for
+// endFailed the error. After a codec change rs is set for the next
+// connection.
 func (p *Pusher) connection(ctx context.Context, rs *resume) (end, time.Duration, error) {
+	if why, live := p.awaitLive(ctx); !live {
+		return why, 0, nil
+	}
 	p.setState(StateConnecting)
 	conn, err := rtmp.Publish(ctx, p.target, p.opt.RTMP)
 	if err != nil {

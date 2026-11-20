@@ -456,7 +456,8 @@ func TestPlayEndOfStream(t *testing.T) {
 	assert.False(t, e.srv.Live("s"), "a closed hub is not live")
 }
 
-// Unregistering the handler ends Serve and unsubscribes its players.
+// Unregistering the handler ends Serve and unsubscribes its players, each
+// counted as ended by the shutdown.
 func TestPlayUnregisterEndsPlayers(t *testing.T) {
 	h := hub.New(hub.Options{})
 	defer h.Close()
@@ -470,14 +471,21 @@ func TestPlayUnregisterEndsPlayers(t *testing.T) {
 	for _, f := range gop {
 		h.Write(f)
 	}
-	c := play(t, "rtmp://"+addr+"/live/any", rtmp.Config{})
-	msgs := collect(c, nil)
-	require.Eventually(t, func() bool { return len(h.Stats()) == 1 }, waitFor, time.Millisecond)
+	const n = 8
+	chans := make([]<-chan result, n)
+	for i := range chans {
+		chans[i] = collect(play(t, "rtmp://"+addr+"/live/any", rtmp.Config{}), nil)
+	}
+	require.Eventually(t, func() bool { return len(h.Stats()) == n }, waitFor, time.Millisecond)
 	unregister()
 	assert.Empty(t, h.Stats())
-	assert.Equal(t, 0, srv.Stats().Players)
-	r := wait(t, msgs)
-	require.Error(t, r.err)
+	st := srv.Stats()
+	assert.Equal(t, 0, st.Players)
+	assert.Equal(t, uint64(n), st.EndedShutdown, "a shutdown is no player leaving")
+	assert.Zero(t, st.EndedLeft)
+	for _, ch := range chans {
+		require.Error(t, wait(t, ch).err)
+	}
 }
 
 // Fifty players joining one after the other all get the same messages.

@@ -110,6 +110,17 @@ func keyIndexes(frames []media.Frame) []int {
 	return out
 }
 
+// liveHub returns a hub holding one video keyframe: it is live, so a Pusher
+// publishes at once.
+func liveHub(t *testing.T) *hub.Hub {
+	t.Helper()
+	h := hub.New(hub.Options{})
+	frames := looped(t, "h264_aac.ts", 1)
+	h.Write(frames[keyIndexes(frames)[0]])
+	require.True(t, h.Live())
+	return h
+}
+
 // firstGOP returns the frames before the second video keyframe.
 func firstGOP(frames []media.Frame) (gop, rest []media.Frame) {
 	if k := keyIndexes(frames); len(k) >= 2 {
@@ -468,7 +479,7 @@ func TestPushReconnects(t *testing.T) {
 // A target that rejects the publish is retried with an exponential backoff
 // from 1 s to 30 s.
 func TestPushRejectedBackoff(t *testing.T) {
-	h := hub.New(hub.Options{})
+	h := liveHub(t)
 	defer h.Close()
 	srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{Reject: true})
 	w := &waits{}
@@ -485,6 +496,52 @@ func TestPushRejectedBackoff(t *testing.T) {
 	assert.Contains(t, st.LastError, "NetStream.Publish.BadName")
 	assert.Equal(t, StateStopped, st.State)
 	assert.Empty(t, h.Stats(), "a rejected publish never subscribes")
+}
+
+// No publish is made before the hub is live: the pusher polls it, and ends
+// without reaching the target when ctx ends or the hub closes first.
+func TestPushWaitsForLive(t *testing.T) {
+	srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{})
+	h := hub.New(hub.Options{})
+	defer h.Close()
+	w := &waits{}
+	p := newPusher(t, h, srv.URL("live/"+vKey), Options{After: w.After})
+	_, done := run(t, p)
+	require.Eventually(t, func() bool { return len(w.get()) >= 5 }, waitFor, time.Millisecond)
+	assert.Empty(t, srv.Requests(), "no publish before the hub is live")
+	assert.Equal(t, StateWaiting, p.Stats().State)
+	assert.Empty(t, h.Stats(), "no subscription either")
+	for _, d := range w.get() {
+		assert.Equal(t, livePoll, d)
+	}
+	frames := looped(t, "h264_aac.ts", 1)
+	gop, _ := firstGOP(frames)
+	for _, f := range gop {
+		h.Write(f)
+	}
+	require.Eventually(t, func() bool { return p.Stats().Connects == 1 }, waitFor, time.Millisecond)
+	h.Close()
+	require.NoError(t, waitRun(t, done))
+	assert.Len(t, srv.Requests(), 1)
+	assert.Zero(t, p.Stats().Failures)
+
+	// The hub closes, or ctx ends, while the pusher waits.
+	h = hub.New(hub.Options{})
+	w = &waits{}
+	p = newPusher(t, h, srv.URL("live/"+vKey), Options{After: w.After})
+	_, done = run(t, p)
+	require.Eventually(t, func() bool { return len(w.get()) >= 1 }, waitFor, time.Millisecond)
+	h.Close()
+	require.NoError(t, waitRun(t, done))
+	h = hub.New(hub.Options{})
+	defer h.Close()
+	p = newPusher(t, h, srv.URL("live/"+vKey), Options{After: func(time.Duration) <-chan time.Time { return nil }})
+	cancelRun, done := run(t, p)
+	require.Eventually(t, func() bool { return p.Stats().State == StateWaiting }, waitFor, time.Millisecond)
+	cancelRun()
+	require.ErrorIs(t, waitRun(t, done), context.Canceled)
+	assert.Len(t, srv.Requests(), 1, "no publish from a hub that never went live")
+	assert.Zero(t, p.Stats().Failures)
 }
 
 // The backoff starts again at its minimum after a connection that sent for
@@ -531,7 +588,7 @@ func TestPushBackoffResets(t *testing.T) {
 // backoff, without another attempt; a hub closed before Run never reaches
 // the target.
 func TestPushHubClosedWhileTargetDown(t *testing.T) {
-	h := hub.New(hub.Options{})
+	h := liveHub(t)
 	defer h.Close()
 	srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{Reject: true})
 	waiting := make(chan struct{}, 16)
@@ -671,7 +728,7 @@ func TestPushBackoffResetsOnRepublish(t *testing.T) {
 // the pusher's errors, stats, name or hub subscription, while the target
 // gets them verbatim.
 func TestPushRedactsKey(t *testing.T) {
-	h := hub.New(hub.Options{})
+	h := liveHub(t)
 	defer h.Close()
 	secrets := []string{vKey, vPass, vToken}
 	noSecrets := func(what, s string) {
@@ -784,6 +841,59 @@ func TestPushCodecChangeRepublishes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Codec changes republish at once, but after 3 republishes within 60 s the
+// next one waits the backoff first, and is counted.
+func TestPushRepublishRateLimited(t *testing.T) {
+	h := hub.New(hub.Options{})
+	defer h.Close()
+	srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{})
+	avc := looped(t, "h264_aac.ts", 1)
+	hevc := looped(t, "h265_aac51.ts", 1)
+	epochs := [][]media.Frame{avc}
+	for i := 1; i < 5; i++ {
+		src := avc
+		if i%2 == 1 {
+			src = hevc
+		}
+		prev := epochs[i-1]
+		epochs = append(epochs, shift(src, lastDTS(prev)+3600-src[0].DTS, prev[len(prev)-1].Epoch+1))
+	}
+	gop, rest := firstGOP(avc)
+	for _, f := range gop {
+		h.Write(f)
+	}
+	var mu sync.Mutex
+	now := time.Unix(1_000_000, 0)
+	w := &waits{}
+	p := newPusher(t, h, srv.URL("live/"+vKey), Options{
+		After: w.After,
+		// Every reading is 1 s after the last: every republish is within
+		// 60 s of the others.
+		Now: func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			now = now.Add(time.Second)
+			return now
+		},
+	})
+	_, done := run(t, p)
+	require.Eventually(t, func() bool { return p.Stats().Connects == 1 }, waitFor, time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	<-feed(ctx, h, rest, 8)
+	for i, ep := range epochs[1:] {
+		<-feed(ctx, h, ep, 8)
+		require.Eventually(t, func() bool { return p.Stats().Connects == uint64(i+2) }, waitFor, time.Millisecond)
+	}
+	h.Close()
+	require.NoError(t, waitRun(t, done))
+	st := p.Stats()
+	assert.Equal(t, uint64(4), st.Republishes)
+	assert.Equal(t, uint64(1), st.RepublishBackoffs)
+	assert.Zero(t, st.Failures)
+	assert.Equal(t, []time.Duration{time.Second}, w.get(), "the 4th republish waits the backoff")
 }
 
 // ffmpeg listening for a publisher receives the pushed stream and writes a
