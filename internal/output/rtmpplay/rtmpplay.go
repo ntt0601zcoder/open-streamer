@@ -191,19 +191,26 @@ type player struct {
 }
 
 // run moves deliveries from sub to the player until it must end, and
-// reports why.
+// reports why. A conn that ends or a write that fails once ctx has ended is
+// the shutdown closing the conn, not the player leaving.
 func (p *player) run(ctx context.Context, sub *hub.Sub) end {
 	for {
 		select {
 		case <-ctx.Done():
 			return endShutdown
 		case <-p.conn.Done():
+			if ctx.Err() != nil {
+				return endShutdown
+			}
 			return connEnd(p.conn.Err())
 		case d, ok := <-sub.C():
 			if !ok {
 				return endHubClosed
 			}
 			if why, done := p.deliver(d); done {
+				if why != endCodecChange && ctx.Err() != nil {
+					return endShutdown
+				}
 				return why
 			}
 		}
