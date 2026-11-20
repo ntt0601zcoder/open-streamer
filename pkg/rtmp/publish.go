@@ -52,14 +52,15 @@ type PublishConn struct {
 
 // Publish publishes to rtmp://host[:port]/app[/…]/stream[?query] (port 1935
 // by default; the app is every path segment but the last, and a "mode"
-// query parameter is dropped, as for PlayWith, unless cfg.KeepQuery). It dials with cfg.Dial, runs
-// the handshake within cfg.HandshakeTimeout, then within cfg.CommandTimeout
-// connect (announcing the Enhanced RTMP FourCCs hvc1 and avc1), Set Chunk
-// Size 4096, releaseStream, FCPublish, createStream and publish "live", and
-// returns once the server answers NetStream.Publish.Start. An _error reply
-// or an onStatus of level "error", at any step, returns a *StatusError with
-// the server's description (the stream name redacted). ctx bounds only
-// Publish. The caller must Close the conn.
+// query parameter is dropped, as for PlayWith, unless cfg.KeepQuery). It
+// dials with cfg.Dial, runs the handshake within cfg.HandshakeTimeout, then
+// within cfg.CommandTimeout connect (announcing the Enhanced RTMP FourCCs
+// hvc1 and avc1), Set Chunk Size 4096, releaseStream, FCPublish,
+// createStream and publish "live", and returns once the server answers
+// NetStream.Publish.Start. An _error reply or an onStatus of level "error",
+// at any step, returns a *StatusError with the server's description (the
+// stream name redacted). ctx bounds only Publish. The caller must Close the
+// conn.
 func Publish(ctx context.Context, rawURL string, cfg Config) (*PublishConn, error) {
 	t, err := splitURL(rawURL, cfg.KeepQuery)
 	if err != nil {

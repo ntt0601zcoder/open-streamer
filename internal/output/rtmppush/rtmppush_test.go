@@ -527,6 +527,146 @@ func TestPushBackoffResets(t *testing.T) {
 	}
 }
 
+// A hub that closes while the target keeps failing ends Run during the
+// backoff, without another attempt; a hub closed before Run never reaches
+// the target.
+func TestPushHubClosedWhileTargetDown(t *testing.T) {
+	h := hub.New(hub.Options{})
+	defer h.Close()
+	srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{Reject: true})
+	waiting := make(chan struct{}, 16)
+	never := make(chan time.Time) // the backoff never ends by itself
+	p := newPusher(t, h, srv.URL("live/"+vKey), Options{After: func(time.Duration) <-chan time.Time {
+		waiting <- struct{}{}
+		return never
+	}})
+	_, done := run(t, p)
+	select {
+	case <-waiting:
+	case <-time.After(waitFor):
+		t.Fatal("no backoff")
+	}
+	h.Close()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return when the hub closed")
+	}
+	assert.Len(t, srv.Requests(), 1, "no attempt after the hub closed")
+	assert.Equal(t, StateStopped, p.Stats().State)
+
+	p = newPusher(t, h, srv.URL("live/"+vKey), Options{After: func(time.Duration) <-chan time.Time { return never }})
+	_, done = run(t, p)
+	require.NoError(t, waitRun(t, done))
+	assert.Len(t, srv.Requests(), 1, "a closed hub is never pushed")
+	assert.Zero(t, p.Stats().Failures)
+}
+
+// scriptServer accepts publishers on 127.0.0.1 and accepts the n-th publish
+// (from 1) when accept(n) says so, rejecting it otherwise; an accepted
+// publish is read until it ends.
+func scriptServer(t *testing.T, accept func(n int) bool) string {
+	t.Helper()
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		n     int
+		conns []net.Conn
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer c.Close()
+				sc, err := rtmp.Accept(context.Background(), c, rtmp.Config{}, func(rtmp.Request) error {
+					mu.Lock()
+					n++
+					ok := accept(n)
+					mu.Unlock()
+					if !ok {
+						return rtmp.ErrStreamNotAvailable
+					}
+					return nil
+				})
+				if err != nil {
+					return
+				}
+				defer func() { _ = sc.Close() }()
+				for {
+					if _, err := sc.ReadMedia(); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		mu.Unlock()
+		wg.Wait()
+	})
+	return "rtmp://" + ln.Addr().String() + "/live/" + vKey
+}
+
+// The backoff starts again at its minimum after a connection published for
+// 30 s, whatever ended it: a republish after a codec change counts too.
+func TestPushBackoffResetsOnRepublish(t *testing.T) {
+	h := hub.New(hub.Options{})
+	defer h.Close()
+	// Publishes 1 and 2 are rejected (backoff 1 s, 2 s), 3 is accepted and
+	// republished after a codec change, 4 is rejected: its backoff is 1 s
+	// again, since connection 3 was published for 31 s.
+	target := scriptServer(t, func(n int) bool { return n == 3 || n >= 5 })
+	avc := looped(t, "h264_aac.ts", 1)
+	hevc := looped(t, "h265_aac51.ts", 1)
+	hevc = shift(hevc, lastDTS(avc)+3600-hevc[0].DTS, avc[len(avc)-1].Epoch+1)
+	gop, rest := firstGOP(avc)
+	for _, f := range gop {
+		h.Write(f)
+	}
+	var mu sync.Mutex
+	now := time.Unix(1_000_000, 0)
+	w := &waits{}
+	p := newPusher(t, h, target, Options{
+		After: w.After,
+		// Every reading is 31 s after the last; only a published
+		// connection reads it, at its start and its end.
+		Now: func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			now = now.Add(31 * time.Second)
+			return now
+		},
+	})
+	_, done := run(t, p)
+	require.Eventually(t, func() bool { return p.Stats().Connects == 1 }, waitFor, time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	<-feed(ctx, h, append(rest, hevc...), 8)
+	require.Eventually(t, func() bool { return len(w.get()) >= 3 }, waitFor, time.Millisecond)
+	h.Close()
+	require.NoError(t, waitRun(t, done))
+	assert.Equal(t, uint64(1), p.Stats().Republishes)
+	assert.Equal(t, []time.Duration{time.Second, 2 * time.Second, time.Second}, w.get()[:3])
+}
+
 // The stream key, the userinfo and secret query values never appear in
 // the pusher's errors, stats, name or hub subscription, while the target
 // gets them verbatim.
