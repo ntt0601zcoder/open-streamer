@@ -58,20 +58,25 @@ type PublishSink interface {
 	Busy(now time.Time) bool
 }
 
-// PlayHandler serves the players of one app. A player's request names the
-// app exactly (rtmp://host/<app>/<name>); the stream name is the rest,
-// conn.Request().Stream. Neither method is called after the handler's
-// unregister has returned, and the handler must never call unregister while
-// holding a lock that Live or Serve needs, since unregister waits for them.
+// PlayHandler serves the players of one app. A player is routed by its
+// full play path, rtmp.NormalizePath(Request.App, Request.Stream), so clients
+// that split rtmp://host/<app>/<name> as app and stream name (ffmpeg) and
+// clients that send the whole path as the app with an empty stream name
+// (MediaMTX) reach the same handler: the handler whose app is the path up to
+// its last "/", with the last segment as the stream name (see
+// RegisterPlay). Neither method is called after the handler's unregister has
+// returned, and the handler must never call unregister while holding a lock
+// that Live or Serve needs, since unregister waits for them.
 type PlayHandler interface {
 	// Live reports whether name can be played now; false rejects the
 	// player. It is part of the play decision and must not block for long:
 	// the session waits for it, and so does unregistering.
 	Live(name string) bool
-	// Serve plays the stream to conn, in the session's goroutine. It must
-	// return once ctx ends or conn.Done closes; the registry then closes
-	// conn. ctx ends when the handler is unregistered.
-	Serve(ctx context.Context, conn *rtmp.ServerConn)
+	// Serve plays the stream name to conn, in the session's goroutine; name
+	// is the one Live accepted. It must return once ctx ends or conn.Done
+	// closes; the registry then closes conn. ctx ends when the handler is
+	// unregistered.
+	Serve(ctx context.Context, conn *rtmp.ServerConn, name string)
 }
 
 // Policy bounds the sessions of one TCP listener. MaxPrePublish and
@@ -150,9 +155,9 @@ type playRoute struct {
 // playSlot is a player's admission: its route, and the slots it holds in
 // the player counts.
 type playSlot struct {
-	rt       *playRoute
-	path, ip string
-	stop     func() bool // stops closing the raw conn when rt ends
+	rt             *playRoute
+	path, name, ip string
+	stop           func() bool // stops closing the raw conn when rt ends
 }
 
 // listener is one TCP listener and its sessions.
@@ -220,11 +225,15 @@ func (r *Registry) RegisterPublish(addr, path string, sink PublishSink, cfg rtmp
 	}, nil
 }
 
-// RegisterPlay hands the players of app on addr to h: a play whose app is
-// app (rtmp://host/<app>/<name>) reaches h with the stream name <name>. app
-// is the only source of the play app. A play whose path is a registered
-// publish path is rejected before h is asked, so a publish key is never
-// playable. The listener is shared as with RegisterPublish. The returned
+// RegisterPlay hands the players of app on addr to h: a play of
+// rtmp://host/<app>/<name> reaches h with the stream name <name>, whether
+// the client sends app "<app>" and stream "<name>" or app "<app>/<name>" and
+// an empty stream. The play path is routed whole: its last segment is the
+// name and the rest the app, so a play whose remainder after app is empty or
+// contains "/" is not h's and is rejected with the usual
+// NetStream.Play.StreamNotFound. app is the only source of the play app. A
+// play whose path is a registered publish path is rejected before h is
+// asked, so a publish key is never playable. The listener is shared as with RegisterPublish. The returned
 // unregister cancels the ctx of every Serve, closes the players, waits for
 // every session that reached h, and closes the listener when it was the
 // address's last registration. It is idempotent.
@@ -545,16 +554,30 @@ func (l *listener) serve(c net.Conn, ip string) {
 	l.release(rt)
 }
 
-// admit is the play decision. It rejects, all with the same error, a play
-// of a publish path (before anything else, so the key reaches no handler),
-// of an app with no handler or an empty name, of a stream that is not Live,
-// and one over a player cap. An admitted player holds its route (the
-// route's wg) and its player slots until endPlay, and its raw conn is
-// closed if the route is unregistered meanwhile.
+// playTarget splits a normalised play path into the app that owns it and
+// the stream name: the name is the last segment and the app everything
+// before it, so a registered app owns the path only when the remainder
+// after it is one non-empty segment. ok is false for a path of one segment.
+func playTarget(path string) (app, name string, ok bool) {
+	i := strings.LastIndexByte(path, '/')
+	if i <= 0 || i == len(path)-1 {
+		return "", "", false
+	}
+	return path[:i], path[i+1:], true
+}
+
+// admit is the play decision, on the full play path (rtmp.NormalizePath of
+// the request's app and stream, whichever of the two carries the stream
+// name). It rejects, all with the same error, a play of a publish path
+// (before anything else, so the key reaches no handler), of a path that no
+// registered app owns with a one-segment remainder (no handler, an empty
+// name, or a name containing "/"), of a stream that is not Live, and one
+// over a player cap. An admitted player holds its route (the route's wg)
+// and its player slots until endPlay, and its raw conn is closed if the
+// route is unregistered meanwhile.
 func (l *listener) admit(c net.Conn, req rtmp.Request, ip string) (*playSlot, error) {
 	path, _ := rtmp.NormalizePath(req.App, req.Stream)
-	app, _ := rtmp.NormalizePath(req.App, "")
-	name, _ := rtmp.NormalizePath(req.Stream, "")
+	app, name, target := playTarget(path)
 	l.reg.mu.Lock()
 	if _, ok := l.routes[path]; ok {
 		l.reg.mu.Unlock()
@@ -562,7 +585,7 @@ func (l *listener) admit(c net.Conn, req rtmp.Request, ip string) (*playSlot, er
 		return nil, errStreamNotAvailable
 	}
 	rt := l.plays[app]
-	if rt == nil || name == "" {
+	if !target || rt == nil {
 		l.reg.mu.Unlock()
 		l.rejectedPlayUnknown.Add(1)
 		return nil, errStreamNotAvailable
@@ -589,7 +612,7 @@ func (l *listener) admit(c net.Conn, req rtmp.Request, ip string) (*playSlot, er
 	l.streams[path]++
 	l.ipPlay[ip]++
 	l.mu.Unlock()
-	return &playSlot{rt: rt, path: path, ip: ip, stop: stop}, nil
+	return &playSlot{rt: rt, path: path, name: name, ip: ip, stop: stop}, nil
 }
 
 // play serves an admitted player until Serve returns, unless its route was
@@ -606,7 +629,7 @@ func (l *listener) play(s *playSlot, sc *rtmp.ServerConn) {
 	}
 	rt.conns[sc] = struct{}{}
 	l.reg.mu.Unlock()
-	rt.h.Serve(rt.ctx, sc)
+	rt.h.Serve(rt.ctx, sc, s.name)
 	_ = sc.Close()
 	l.reg.mu.Lock()
 	delete(rt.conns, sc)

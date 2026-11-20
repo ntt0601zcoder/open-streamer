@@ -595,6 +595,7 @@ type fakePlayer struct {
 
 	mu     sync.Mutex
 	asked  []string
+	names  []string // the names Serve was given
 	served chan *rtmp.ServerConn
 
 	serving, ended atomic.Int32
@@ -621,7 +622,10 @@ func (h *fakePlayer) Live(name string) bool {
 	return h.live == nil || h.live[name]
 }
 
-func (h *fakePlayer) Serve(ctx context.Context, conn *rtmp.ServerConn) {
+func (h *fakePlayer) Serve(ctx context.Context, conn *rtmp.ServerConn, name string) {
+	h.mu.Lock()
+	h.names = append(h.names, name)
+	h.mu.Unlock()
 	h.serving.Add(1)
 	defer h.serving.Add(-1)
 	defer h.ended.Add(1)
@@ -632,6 +636,12 @@ func (h *fakePlayer) Serve(ctx context.Context, conn *rtmp.ServerConn) {
 	case <-conn.Done():
 	}
 	time.Sleep(h.linger)
+}
+
+func (h *fakePlayer) servedNames() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.names...)
 }
 
 func (h *fakePlayer) askedFor() []string {
@@ -750,13 +760,14 @@ func TestServerPublishAndPlayRouting(t *testing.T) {
 	mustPlay(t, "rtmp://"+addr+"/live/a?token=x", rtmp.Config{})
 	c := live.next(t)
 	assert.True(t, c.IsPlay())
-	assert.Equal(t, "a", c.Request().Stream, "the handler gets the stream name")
 	mustPlay(t, "rtmp://"+addr+"/live/a", rtmp.Config{})
 	live.next(t)
 	mustPlay(t, "rtmp://"+addr+"/other/b", rtmp.Config{})
-	assert.Equal(t, "b", other.next(t).Request().Stream)
+	other.next(t)
 	assert.Equal(t, []string{"a", "a"}, live.askedFor())
+	assert.Equal(t, []string{"a", "a"}, live.servedNames(), "the handler gets the stream name")
 	assert.Equal(t, []string{"b"}, other.askedFor())
+	assert.Equal(t, []string{"b"}, other.servedNames())
 
 	// An app nobody registered is rejected.
 	mustNotPlay(t, "rtmp://"+addr+"/nope/a")
@@ -868,6 +879,72 @@ func TestPlayUnknownPath(t *testing.T) {
 	assert.EqualValues(t, 1, st.RejectedPlayCaps)
 	assert.Equal(t, 1, st.Players)
 	assert.Equal(t, []string{"on", "off", "on"}, h.askedFor())
+}
+
+// Plays are routed by the full play path, whichever of app and stream
+// carries the stream name: ffmpeg sends app "live" and stream "cam",
+// MediaMTX app "live/cam" and an empty stream. The handler whose app is the
+// path up to its last segment gets that segment as the name. An app no
+// handler serves, an empty remainder, a remainder containing "/" and a
+// publish path in either form all get the same rejection.
+func TestPlayRoutingByFullPath(t *testing.T) {
+	r := &Registry{}
+	addr := "127.0.0.1:" + freeTCPPort(t)
+	mustRegister(t, r, addr, "live/"+vKey, newFakeSink(), Policy{})
+	h := newFakePlayer() // every name is live
+	mustRegisterPlay(t, r, addr, "live", h, Policy{})
+	l := r.lookup(addr)
+	require.NotNil(t, l)
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() { _ = c1.Close(); _ = c2.Close() })
+
+	for _, req := range []rtmp.Request{
+		{Play: true, App: "live", Stream: "cam"},
+		{Play: true, App: "live/cam", Stream: ""},
+		{Play: true, App: "/live/cam/", Stream: ""},
+		{Play: true, App: "live?token=x", Stream: "cam?x=1"},
+		{Play: true, App: "", Stream: "live/cam"},
+	} {
+		slot, err := l.admit(c1, req, "127.0.0.1")
+		require.NoError(t, err, "%+v", req)
+		assert.Equal(t, "cam", slot.name, "%+v", req)
+		assert.Same(t, h, slot.rt.h, "%+v", req)
+		assert.Equal(t, "live/cam", slot.path, "%+v", req)
+		l.endPlay(slot)
+	}
+	assert.Equal(t, []string{"cam", "cam", "cam", "cam", "cam"}, h.askedFor())
+
+	answers := make([]string, 0, 9)
+	for _, req := range []rtmp.Request{
+		{Play: true, App: "other", Stream: "cam"},      // no handler
+		{Play: true, App: "other/cam", Stream: ""},     // no handler, whole path in app
+		{Play: true, App: "live", Stream: ""},          // empty remainder
+		{Play: true, App: "live/", Stream: "/"},        // empty remainder
+		{Play: true, App: "live", Stream: "inst/cam"},  // remainder with "/"
+		{Play: true, App: "live/inst/cam", Stream: ""}, // remainder with "/"
+		{Play: true, App: "live", Stream: vKey},        // publish path, split
+		{Play: true, App: "live/" + vKey, Stream: ""},  // publish path, whole
+		{Play: true, App: "live/" + vKey + "?x=1", Stream: ""},
+	} {
+		slot, err := l.admit(c1, req, "127.0.0.1")
+		assert.Nil(t, slot, "%+v", req)
+		require.Error(t, err, "%+v", req)
+		assert.ErrorIs(t, err, rtmp.ErrStreamNotAvailable)
+		answers = append(answers, err.Error())
+	}
+	for _, a := range answers {
+		assert.Equal(t, answers[0], a)
+	}
+	st := r.Stats(addr)
+	assert.EqualValues(t, 6, st.RejectedPlayUnknown)
+	assert.EqualValues(t, 3, st.RejectedPlayPublishPath)
+	assert.Equal(t, []string{"cam", "cam", "cam", "cam", "cam"}, h.askedFor(), "no rejected name reaches the handler")
+	assert.Zero(t, st.Players)
+
+	// Over the wire, a player that splits the path is served the name.
+	mustPlay(t, "rtmp://"+addr+"/live/cam", rtmp.Config{})
+	h.next(t)
+	assert.Equal(t, []string{"cam"}, h.servedNames())
 }
 
 // Players are capped per stream, per listener and per IP; a player that
