@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -371,4 +372,37 @@ func TestUDPSingleServerPort(t *testing.T) {
 		return rrs >= 2
 	}, 2*time.Second, 20*time.Millisecond, "receiver reports reach the RTCP port x+1")
 	assert.Equal(t, 4, s.Punches(), "one punch per server port")
+}
+
+func TestListenUDPPair(t *testing.T) {
+	rtpC, rtcpC, err := rtsp.ListenUDPPair("127.0.0.1")
+	require.NoError(t, err)
+	defer rtpC.Close()
+	defer rtcpC.Close()
+	a, b := rtpC.LocalAddr().(*net.UDPAddr), rtcpC.LocalAddr().(*net.UDPAddr)
+	assert.True(t, a.IP.Equal(net.IPv4(127, 0, 0, 1)))
+	assert.Zero(t, a.Port%2, "RTP port even")
+	assert.Equal(t, a.Port+1, b.Port, "RTCP port next")
+
+	_, _, err = rtsp.ListenUDPPair("192.0.2.1")
+	assert.Error(t, err, "an address that is not local")
+}
+
+func TestClientDialHook(t *testing.T) {
+	s := newServer(t, rtsptest.ServerOptions{})
+	var calls []string
+	cfg := testConfig()
+	cfg.Dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		calls = append(calls, network+" "+addr)
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	c := dial(t, s.URL("/stream"), cfg)
+	readUntil(t, c, 2*time.Second, func(p rtsp.Packet) bool { return p.RTP != nil })
+	u := s.URL("/stream")
+	assert.Equal(t, []string{"tcp " + u[len("rtsp://"):len(u)-len("/stream")]}, calls)
+
+	boom := errors.New("boom")
+	cfg.Dial = func(context.Context, string, string) (net.Conn, error) { return nil, boom }
+	_, err := rtsp.Dial(context.Background(), s.URL("/stream"), cfg)
+	assert.ErrorIs(t, err, boom)
 }

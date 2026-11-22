@@ -303,6 +303,10 @@ func TestParseTransports(t *testing.T) {
 	if s := got[1].String(); s != "rtp/avp/tcp;unicast;interleaved=2-3;mode=record" {
 		t.Errorf("String %q", s)
 	}
+	// An offer naming no delivery type renders none.
+	if s := got[2].String(); s != "RTP/AVP;destination=10.0.0.9" {
+		t.Errorf("String %q", s)
+	}
 	for _, bad := range []string{"", "RTP/AVP/TCP;unicast,", "RTP/AVP;unicast, RTP/AVP;client_port=x"} {
 		if _, err := ParseTransports(bad); err == nil {
 			t.Errorf("accepted %q", bad)

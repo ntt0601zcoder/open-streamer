@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -82,7 +83,8 @@ type ServerConfig struct {
 	// session (default 30 s).
 	PendingLifetime time.Duration
 	// UDPHost, when non-empty, is where the server binds and owns one
-	// RTP/RTCP port pair for UDP sessions.
+	// even/odd RTP/RTCP port pair for UDP sessions: bound by the first
+	// Serve, closed by Close. Without it UDP SETUP is answered 461.
 	UDPHost string
 	// ConnHook, when set, is called on every accepted connection before it
 	// is served.
@@ -145,6 +147,9 @@ type ServerStats struct {
 	// Timeouts counts connections ended by the read timeout or the pending
 	// lifetime and sessions ended by the write or session timeout.
 	Timeouts uint64
+	// UDPStrangers counts datagrams on the RTCP socket of the UDP pair from
+	// an address that is no session's client RTCP port.
+	UDPStrangers uint64
 }
 
 // listenerState counts one listener's connections; guarded by Server.mu.
@@ -163,9 +168,11 @@ type Server struct {
 	pendingIP map[string]int
 	sessIP    map[string]int
 	sessPath  map[string]int
+	udp       *udpPair
+	udpPeers  map[netip.AddrPort]*ServerSession // client RTCP address → session
 	wg        sync.WaitGroup
 
-	nRejected, nProtocol, nTimeouts atomic.Uint64
+	nRejected, nProtocol, nTimeouts, nStrangers atomic.Uint64
 }
 
 // NewServer returns a server for h; Serve starts it.
@@ -174,17 +181,25 @@ func NewServer(h Handler, cfg ServerConfig) *Server {
 		h: h, cfg: cfg.withDefaults(),
 		listeners: map[net.Listener]struct{}{}, conns: map[*serverConn]struct{}{},
 		pendingIP: map[string]int{}, sessIP: map[string]int{}, sessPath: map[string]int{},
+		udpPeers: map[netip.AddrPort]*ServerSession{},
 	}
 }
 
 // Serve accepts connections on l until Close, then returns ErrServerClosed.
-// Transient accept errors are retried with a backoff; a listener closed by
-// someone else ends Serve with its error.
+// The first Serve binds the UDP pair when UDPHost is set and fails when it
+// cannot. Transient accept errors are retried with a backoff; a listener
+// closed by someone else ends Serve with its error.
 func (s *Server) Serve(l net.Listener) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return ErrServerClosed
+	}
+	if s.cfg.UDPHost != "" && s.udp == nil {
+		if err := s.bindUDP(); err != nil {
+			s.mu.Unlock()
+			return err
+		}
 	}
 	s.listeners[l] = struct{}{}
 	s.mu.Unlock()
@@ -260,8 +275,8 @@ func peerKey(a net.Addr) (net.IP, string) {
 }
 
 // Close stops every listener, closes every session (playing sessions with
-// BYE, best effort) and waits for every connection's goroutines. It is
-// idempotent.
+// BYE, best effort), waits for every connection's goroutines and then
+// closes the UDP pair and waits for its readers. It is idempotent.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -296,6 +311,7 @@ func (s *Server) Close() error {
 	}
 	wg.Wait()
 	s.wg.Wait()
+	s.closeUDP()
 	return nil
 }
 
@@ -312,6 +328,7 @@ func (s *Server) Stats() ServerStats {
 	st.Rejected = s.nRejected.Load()
 	st.ProtocolErrors = s.nProtocol.Load()
 	st.Timeouts = s.nTimeouts.Load()
+	st.UDPStrangers = s.nStrangers.Load()
 	return st
 }
 
@@ -339,6 +356,7 @@ func (s *Server) release(c *serverConn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.conns, c)
+	s.unclaimUDPLocked(c.sess)
 	if c.playing {
 		c.ls.sessions--
 		dec(s.sessIP, c.ipKey)
@@ -379,12 +397,16 @@ func (c *serverConn) serve() {
 	defer c.srv.wg.Done()
 	err := c.loop()
 	if c.sess != nil {
-		if errors.Is(err, errStop) {
-			err = ErrTeardown
-		} else {
-			err = fmt.Errorf("rtsp: session: connection ended: %w", err)
+		switch {
+		case c.sess.closing.Load():
+			// ServerSession.Close cut the connection: let it finish its
+			// BYE and end the session with ErrSessionClosed.
+			<-c.sess.done
+		case errors.Is(err, errStop):
+			c.sess.end(ErrTeardown)
+		default:
+			c.sess.end(fmt.Errorf("rtsp: session: connection ended: %w", err))
 		}
-		c.sess.end(err)
 	}
 	_ = c.nc.Close()
 	if c.playDone != nil {
@@ -401,7 +423,8 @@ func (c *serverConn) loop() error {
 		if err == nil {
 			continue
 		}
-		if isTimeout(err) {
+		// A write cut by ServerSession.Close is not a timeout.
+		if isTimeout(err) && (c.sess == nil || !c.sess.closing.Load()) {
 			if c.liveUDP() {
 				continue
 			}
@@ -738,23 +761,37 @@ func (c *serverConn) setup(req *Request, resp *Response) {
 		setStatus(resp, 461)
 		return
 	}
-	// UDP is offered only once the server owns an RTP/RTCP pair.
-	offer, kind, ok := selectTransport(offers, c.peer, false, current)
+	// UDP is offered only when the server owns a pair that reaches the peer.
+	pair := c.srv.udpFor(c.peer)
+	offer, kind, ok := selectTransport(offers, c.peer, pair != nil, current)
 	if !ok {
 		setStatus(resp, 461)
 		return
 	}
-	if sess == nil {
+	fresh := sess == nil
+	if fresh {
 		sess = newServerSession(c, tg.path, descs)
 	}
-	t := sess.addTrack(tg.track, req.URL, kind, offer.Interleaved)
+	var serverPorts [2]int
+	if kind == transportUDP {
+		// Inbound RTCP is matched to sessions by the client's RTCP address.
+		if !c.srv.claimUDP(udpAddr(c.peer, offer.ClientPort[1]), sess) {
+			if fresh {
+				sess.cancel()
+			}
+			setStatus(resp, 461)
+			return
+		}
+		sess.pair, serverPorts = pair, pair.ports
+	}
+	t := sess.addTrack(tg.track, req.URL, kind, offer)
 	if c.sess == nil {
 		c.srv.mu.Lock()
 		c.sess = sess
 		c.srv.mu.Unlock()
 	}
 	setStatus(resp, 200)
-	resp.Header.Set("Transport", transportReply(kind, offer, t.ch, [2]int{}, t.ssrc))
+	resp.Header.Set("Transport", transportReply(kind, offer, t.ch, serverPorts, t.ssrc))
 	resp.Header.Set("Session", sess.header())
 }
 

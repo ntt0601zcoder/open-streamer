@@ -1054,3 +1054,33 @@ func TestServerFFmpegEOFOnBye(t *testing.T) {
 	assert.Less(t, time.Since(start), 5*time.Second)
 	assert.Empty(t, stderr.String())
 }
+
+// TestServerWritePacketsNoGapOnError checks that a batch refused midway
+// consumes no sequence numbers.
+func TestServerWritePacketsNoGapOnError(t *testing.T) {
+	h := newHandler()
+	errc := make(chan error, 2)
+	h.play = func(ctx context.Context, s *rtsp.ServerSession) {
+		bad := []*rtp.Packet{
+			{Payload: []byte{0x65, 1}},
+			{Header: rtp.Header{Padding: true}, Payload: []byte{0x65, 2}},
+		}
+		errc <- s.WritePackets(0, bad)
+		errc <- s.WritePackets(0, []*rtp.Packet{{Header: rtp.Header{Marker: true}, Payload: []byte{0x65, 3}}})
+		<-ctx.Done()
+	}
+	_, addr := startServer(t, h, rtsp.ServerConfig{})
+	r := dialRaw(t, addr)
+	require.Equal(t, 200, r.setup(0, tcpOffer(0, 1)).StatusCode)
+	require.Equal(t, 200, r.play().StatusCode)
+	s := h.session(t)
+	require.Error(t, <-errc)
+	require.NoError(t, <-errc)
+	f, err := r.frame()
+	require.NoError(t, err)
+	var p rtp.Packet
+	require.NoError(t, p.Unmarshal(f.data))
+	_, seq, _ := s.Origin(0)
+	assert.Equal(t, seq, p.SequenceNumber, "the refused batch must not leave a gap")
+	assert.Equal(t, []byte{0x65, 3}, p.Payload)
+}

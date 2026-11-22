@@ -20,6 +20,10 @@ const pairAttempts = 64
 // packet to 64 KiB.
 const maxDatagram = 64 << 10
 
+// udpReadBuffer is the kernel receive buffer the client asks for on its
+// UDP sockets, so that a burst does not overflow it.
+const udpReadBuffer = 4 << 20
+
 // udpLink is the UDP transport of a track, fixed once SETUP returns.
 type udpLink struct {
 	rtp, rtcp *net.UDPConn
@@ -40,6 +44,21 @@ func (l *udpLink) accepts(a *net.UDPAddr) bool {
 
 func (l *udpLink) srvAddr(i int) *net.UDPAddr {
 	return &net.UDPAddr{IP: l.srvIP, Port: l.srvPorts[i]}
+}
+
+// ListenUDPPair binds an even RTP port and the odd RTCP port after it on
+// host (an IP address or a name; "" means every interface), retrying on
+// conflicts.
+func ListenUDPPair(host string) (rtp, rtcp *net.UDPConn, err error) {
+	a, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("rtsp: listen udp pair: %w", err)
+	}
+	rtp, rtcp, err = listenPair(context.Background(), a.IP, a.Zone)
+	if err != nil {
+		return nil, nil, fmt.Errorf("rtsp: listen udp pair: %w", err)
+	}
+	return rtp, rtcp, nil
 }
 
 // listenPair binds an even RTP port and the odd RTCP port after it on ip,
@@ -112,6 +131,9 @@ func (c *Client) setupUDP(ctx context.Context, m Media) error {
 	if err := c.addSockets(rtpC, rtcpC); err != nil {
 		return fmt.Errorf("rtsp: setup: %w", err)
 	}
+	// Best effort: net.core.rmem_max may cap it.
+	_ = rtpC.SetReadBuffer(udpReadBuffer)
+	_ = rtcpC.SetReadBuffer(udpReadBuffer)
 	port := rtpC.LocalAddr().(*net.UDPAddr).Port
 	tr := Transport{Protocol: "RTP/AVP", Unicast: true, ClientPort: [2]int{port, port + 1}}
 	resp, err := c.request(ctx, "SETUP", m.Control, Header{"Transport": {tr.String()}})

@@ -357,7 +357,8 @@ func ReadResponse(br *bufio.Reader, lim Limits) (*Response, error) {
 type Transport struct {
 	// Protocol is the transport spec, e.g. "RTP/AVP", "RTP/AVP/TCP".
 	Protocol string
-	// Unicast is true for "unicast", false for multicast.
+	// Unicast is true when the entry names "unicast". String renders a
+	// delivery type only when Unicast or Multicast is set.
 	Unicast bool
 	// Interleaved is the channel pair of an interleaved (TCP) transport.
 	Interleaved [2]int
@@ -471,9 +472,10 @@ func parseTransportEntry(entry string) (Transport, error) {
 func (t Transport) String() string {
 	var sb strings.Builder
 	sb.WriteString(t.Protocol)
-	if t.Unicast {
+	switch {
+	case t.Unicast:
 		sb.WriteString(";unicast")
-	} else {
+	case t.Multicast:
 		sb.WriteString(";multicast")
 	}
 	if t.Interleaved != [2]int{} {

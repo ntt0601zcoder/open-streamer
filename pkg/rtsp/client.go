@@ -63,6 +63,9 @@ type Config struct {
 	UDPFallback time.Duration
 	// Now stamps packet arrivals (default time.Now).
 	Now func() time.Time
+	// Dial opens the control connection ("tcp", host:port) (default a
+	// net.Dialer). Its context carries the Timeout.
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 func (c Config) withDefaults() Config {
@@ -87,6 +90,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Now == nil {
 		c.Now = time.Now
+	}
+	if c.Dial == nil {
+		c.Dial = (&net.Dialer{}).DialContext
 	}
 	return c
 }
@@ -271,8 +277,11 @@ func Dial(ctx context.Context, rawURL string, cfg Config) (*Client, error) {
 // dialSession connects and plays one session over UDP or TCP.
 func dialSession(ctx context.Context, cfg Config, tg target, udp bool) (*Client, error) {
 	dctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	conn, err := (&net.Dialer{}).DialContext(dctx, "tcp", tg.addr)
+	conn, err := cfg.Dial(dctx, "tcp", tg.addr)
 	cancel()
+	if err == nil && conn == nil {
+		err = errors.New("no connection")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("rtsp: dial: %w", err)
 	}

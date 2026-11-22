@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,12 +20,14 @@ import (
 // sessionCNAME is the SDES CNAME of the server's BYE compounds.
 const sessionCNAME = "open-streamer"
 
-// serverTrack is one set-up track: its RTP origin, its channels and its
-// sending state.
+// serverTrack is one set-up track: its RTP origin, its channels or client
+// addresses and its sending state.
 type serverTrack struct {
 	index  int
-	url    string // the SETUP request URL, byte for byte
-	ch     [2]int // interleaved RTP and RTCP channels (TCP)
+	url    string         // the SETUP request URL, byte for byte
+	ch     [2]int         // interleaved RTP and RTCP channels (TCP)
+	rtpTo  netip.AddrPort // the client's RTP address (UDP)
+	rtcpTo netip.AddrPort // the client's RTCP address (UDP)
 	ssrc   uint32
 	seq0   uint16
 	tsBase uint32
@@ -45,6 +48,7 @@ type ServerSession struct {
 	tracks []*serverTrack // by SDP index; nil when not set up
 	kind   transportKind
 	used   [256]bool // interleaved channels in use
+	pair   *udpPair  // the server's UDP pair (UDP)
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -99,8 +103,8 @@ func random32() uint32 {
 // addTrack sets up track index with a fresh random origin: an SSRC unique
 // in the session, a first sequence number and a timestamp base. Over TCP
 // it takes the client's channels when they are free, else the next free
-// even pair.
-func (s *ServerSession) addTrack(index int, rawURL string, kind transportKind, want [2]int) *serverTrack {
+// even pair; over UDP it sends to the client's ports on the peer IP.
+func (s *ServerSession) addTrack(index int, rawURL string, kind transportKind, offer Transport) *serverTrack {
 	t := &serverTrack{index: index, url: rawURL, tsBase: random32()}
 	t.seq0 = uint16(random32())
 	t.next = t.seq0
@@ -113,9 +117,13 @@ func (s *ServerSession) addTrack(index int, rawURL string, kind transportKind, w
 			}
 		}
 	}
-	if kind == transportTCP {
-		t.ch = s.freeChannels(want)
+	switch kind {
+	case transportTCP:
+		t.ch = s.freeChannels(offer.Interleaved)
 		s.used[t.ch[0]], s.used[t.ch[1]] = true, true
+	case transportUDP:
+		t.rtpTo, t.rtcpTo = udpAddr(s.c.peer, offer.ClientPort[0]), udpAddr(s.c.peer, offer.ClientPort[1])
+	case transportNone:
 	}
 	s.kind = kind
 	s.tracks[index] = t
@@ -231,13 +239,22 @@ func (s *ServerSession) Err() error {
 
 // WritePackets sends the packets of one frame on a set-up track: it stamps
 // version 2, the track's SSRC and payload type and the next sequence number
-// on every packet, and writes them as interleaved frames in one write
-// under one WriteTimeout deadline. A missed deadline or a failed write ends
-// the session. The packets are not retained.
+// on every packet, and writes them under one WriteTimeout deadline, as
+// interleaved frames in one write over TCP or as one datagram each to the
+// client's RTP port over UDP. A missed deadline or a failed write ends the
+// session; a batch that fails to marshal is refused whole and consumes no
+// sequence numbers. The stamps modify the caller's packets in place, so do
+// not share them across sessions or goroutines. The packets are not
+// retained.
 func (s *ServerSession) WritePackets(track int, ps []*rtp.Packet) error {
 	t := s.track(track)
 	if t == nil {
 		return fmt.Errorf("rtsp: write packets: track %d not set up", track)
+	}
+	udp := s.kind == transportUDP
+	hdr := 4 // the interleaved frame header
+	if udp {
+		hdr = 0
 	}
 	size := 0
 	for _, p := range ps {
@@ -245,7 +262,7 @@ func (s *ServerSession) WritePackets(track int, ps []*rtp.Packet) error {
 		if n > math.MaxUint16 {
 			return fmt.Errorf("rtsp: write packets: packet of %d bytes too large", n)
 		}
-		size += 4 + n
+		size += hdr + n
 	}
 	if size == 0 {
 		return nil
@@ -259,23 +276,38 @@ func (s *ServerSession) WritePackets(track int, ps []*rtp.Packet) error {
 		return fmt.Errorf("rtsp: write packets: %w", err)
 	}
 	off := 0
+	seq := t.next
+	var ends []int
+	if udp {
+		ends = make([]int, 0, len(ps))
+	}
 	for _, p := range ps {
-		p.Version, p.SSRC, p.PayloadType, p.SequenceNumber = 2, t.ssrc, pt, t.next
-		t.next++
-		n, err := p.MarshalTo(buf[off+4:])
+		p.Version, p.SSRC, p.PayloadType, p.SequenceNumber = 2, t.ssrc, pt, seq
+		n, err := p.MarshalTo(buf[off+hdr:])
 		if err != nil {
 			return fmt.Errorf("rtsp: write packets: %w", err)
 		}
-		buf[off], buf[off+1] = '$', byte(t.ch[0])
-		binary.BigEndian.PutUint16(buf[off+2:], uint16(n))
-		off += 4 + n
+		seq++
+		if udp {
+			ends = append(ends, off+n)
+		} else {
+			buf[off], buf[off+1] = '$', byte(t.ch[0])
+			binary.BigEndian.PutUint16(buf[off+2:], uint16(n))
+		}
+		off += hdr + n
+	}
+	// Sequence numbers are committed only once the whole batch marshalled.
+	t.next = seq
+	if udp {
+		return s.sendUDPLocked(s.pair.rtp, t.rtpTo, buf, ends, "write packets")
 	}
 	return s.writeLocked(buf[:off], "write packets")
 }
 
-// WriteRTCP sends an RTCP packet on a set-up track's RTCP channel under one
-// WriteTimeout deadline. A sender report is remembered for the BYE
-// compound of Close. b is not retained.
+// WriteRTCP sends an RTCP packet on a set-up track's RTCP channel, or to
+// the client's RTCP port over UDP, under one WriteTimeout deadline. A
+// sender report is remembered for the BYE compound of Close. b is not
+// retained.
 func (s *ServerSession) WriteRTCP(track int, b []byte) error {
 	t := s.track(track)
 	switch {
@@ -292,6 +324,9 @@ func (s *ServerSession) WriteRTCP(track int, b []byte) error {
 	}
 	if sr := firstSR(b); sr != nil {
 		t.lastSR = sr
+	}
+	if s.kind == transportUDP {
+		return s.sendUDPLocked(s.pair.rtcp, t.rtcpTo, b, []int{len(b)}, "write rtcp")
 	}
 	return s.writeLocked(interleave(t.ch[1], b), "write rtcp")
 }
@@ -322,23 +357,29 @@ func (s *ServerSession) writeLocked(b []byte, op string) error {
 	c := s.c
 	_ = c.nc.SetWriteDeadline(time.Now().Add(c.srv.cfg.WriteTimeout))
 	if _, err := c.nc.Write(b); err != nil {
-		err = fmt.Errorf("rtsp: %s: %w", op, err)
-		if !s.closing.Load() {
-			if isTimeout(err) {
-				c.srv.nTimeouts.Add(1)
-			}
-			s.end(err)
-		}
-		return err
+		return s.writeFailed(fmt.Errorf("rtsp: %s: %w", op, err))
 	}
 	return nil
+}
+
+// writeFailed ends the session with a write error, counting a missed
+// deadline as a timeout, unless Close is ending it; it returns err.
+func (s *ServerSession) writeFailed(err error) error {
+	if !s.closing.Load() {
+		if isTimeout(err) {
+			s.c.srv.nTimeouts.Add(1)
+		}
+		s.end(err)
+	}
+	return err
 }
 
 // Close ends the session: per set-up track it sends, best effort within
 // 500 ms (or the WriteTimeout when shorter), one compound RTCP packet of
 // the track's last sender report (or an empty receiver report) + SDES +
-// BYE on the track's RTCP channel, then closes the connection. A writer
-// blocked on a full send buffer is cut short. It is idempotent.
+// BYE on the track's RTCP channel or to the client's RTCP port, then
+// closes the connection. A writer blocked on a full send buffer is cut
+// short. It is idempotent.
 func (s *ServerSession) Close() {
 	s.closeOnce.Do(func() {
 		if s.Err() != nil {
@@ -351,18 +392,33 @@ func (s *ServerSession) Close() {
 		now := time.Now()
 		deadline := now.Add(budget)
 		if c.lockWriteBy(now.Add(budget/2), deadline) {
-			var buf []byte
-			for _, t := range s.tracks {
-				if t != nil {
-					buf = append(buf, interleave(t.ch[1], BuildBye(t.ssrc, sessionCNAME, t.lastSR))...)
-				}
-			}
 			if s.Err() == nil {
-				_ = c.nc.SetWriteDeadline(deadline)
-				_, _ = c.nc.Write(buf)
+				s.sendByeLocked(deadline)
 			}
 			c.wmu.Unlock()
 		}
 		s.end(ErrSessionClosed)
 	})
+}
+
+// sendByeLocked sends the BYE compound of every set-up track by deadline;
+// the caller holds the write mutex.
+func (s *ServerSession) sendByeLocked(deadline time.Time) {
+	var buf []byte
+	for _, t := range s.tracks {
+		if t == nil {
+			continue
+		}
+		bye := BuildBye(t.ssrc, sessionCNAME, t.lastSR)
+		if s.kind == transportUDP {
+			_ = s.pair.rtcp.SetWriteDeadline(deadline)
+			_, _ = s.pair.rtcp.WriteToUDPAddrPort(bye, t.rtcpTo)
+			continue
+		}
+		buf = append(buf, interleave(t.ch[1], bye)...)
+	}
+	if buf != nil {
+		_ = s.c.nc.SetWriteDeadline(deadline)
+		_, _ = s.c.nc.Write(buf)
+	}
 }

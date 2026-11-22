@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"bufio"
 	"errors"
 	"net"
 	"sync/atomic"
@@ -154,4 +155,51 @@ func TestUDPLiveness(t *testing.T) {
 	assert.False(t, c.liveUDP())
 	c.sess.kind = transportTCP
 	assert.True(t, c.readDeadline().IsZero(), "a playing TCP session has no read deadline")
+}
+
+func TestUDPReaches(t *testing.T) {
+	v4, v6 := net.IPv4(127, 0, 0, 1).To4(), net.ParseIP("::1")
+	cases := []struct {
+		local, peer net.IP
+		want        bool
+	}{
+		{net.IPv4zero, v4, true},
+		{net.IPv4zero, v6, true},
+		{net.IPv6unspecified, v6, true},
+		{nil, v4, true},
+		{v4, v4, true},
+		{v4, v6, false},
+		{v6, v4, false},
+		{v6, v6, true},
+		{v4, nil, false},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, udpReaches(c.local, c.peer), "%v -> %v", c.local, c.peer)
+	}
+}
+
+// TestCloseCutsResponseWrite checks that a response write cut by Close is
+// neither a timeout nor a "connection ended": the session ends with
+// ErrSessionClosed.
+func TestCloseCutsResponseWrite(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	srv := NewServer(nil, ServerConfig{WriteTimeout: 400 * time.Millisecond})
+	ls := &listenerState{sessions: 1}
+	c := &serverConn{srv: srv, ls: ls, nc: a, br: bufio.NewReader(a), peer: net.IPv4(127, 0, 0, 1).To4(), ipKey: "127.0.0.1", since: time.Now()}
+	sess := newServerSession(c, "live/cam", []TrackDesc{{Codec: CodecH264, Payload: 96, ClockRate: 90000}})
+	sess.addTrack(0, "rtsp://x/live/cam/trackID=0", transportTCP, Transport{Interleaved: [2]int{0, 1}})
+	c.sess, c.playing = sess, true
+	srv.conns[c] = struct{}{}
+	srv.sessIP[c.ipKey], srv.sessPath["live/cam"] = 1, 1
+	srv.wg.Add(1)
+	go c.serve()
+	// The request is read; nobody reads the response, so its write blocks.
+	_, err := b.Write([]byte("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n"))
+	require.NoError(t, err)
+	time.Sleep(50 * time.Millisecond)
+	sess.Close()
+	srv.wg.Wait()
+	assert.ErrorIs(t, sess.Err(), ErrSessionClosed)
+	assert.Zero(t, srv.nTimeouts.Load(), "a write cut by Close is not a timeout")
 }
