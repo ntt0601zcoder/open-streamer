@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 	"time"
@@ -96,4 +97,75 @@ func TestReceiverReport(t *testing.T) {
 	// the cumulative loss is clamped to 24 bits.
 	c := ReceiverReport(1, []ReportBlock{{Lost: 1 << 30}})
 	assert.Equal(t, []byte{0, 0xff, 0xff, 0xff}, c[12:16])
+}
+
+func TestSenderReportRoundTrip(t *testing.T) {
+	ntp := time.Unix(1_700_000_000, 250_000_000)
+	b := BuildSenderReport(0xdeadbeef, ntp, 12345, 10, 2000)
+	if len(b) != 28 {
+		t.Fatalf("len %d", len(b))
+	}
+	srs := ParseSenderReports(b)
+	if len(srs) != 1 || srs[0].SSRC != 0xdeadbeef || srs[0].RTP != 12345 {
+		t.Fatalf("%+v", srs)
+	}
+	if d := srs[0].NTP.Sub(ntp); d < -time.Microsecond || d > time.Microsecond {
+		t.Fatalf("ntp %v vs %v", srs[0].NTP, ntp)
+	}
+	if binary.BigEndian.Uint32(b[20:]) != 10 || binary.BigEndian.Uint32(b[24:]) != 2000 {
+		t.Fatalf("counts % x", b)
+	}
+}
+
+func TestByeCompound(t *testing.T) {
+	sr := BuildSenderReport(1, time.Unix(1_700_000_000, 0), 5, 1, 2)
+	b := BuildBye(1, "os", sr)
+	if !bytes.HasPrefix(b, sr) {
+		t.Fatalf("sr not first: % x", b)
+	}
+	rest := b[len(sr):]
+	// SDES: header 4 + SSRC 4 + CNAME item (2+2) + terminator, padded to 4.
+	if rest[0] != 0x81 || rest[1] != 202 {
+		t.Fatalf("sdes % x", rest)
+	}
+	n := (int(binary.BigEndian.Uint16(rest[2:])) + 1) * 4
+	if n%4 != 0 || rest[8] != 1 || rest[9] != 2 || string(rest[10:12]) != "os" || rest[12] != 0 {
+		t.Fatalf("sdes body % x", rest[:n])
+	}
+	bye := rest[n:]
+	if len(bye) != 8 || bye[0] != 0x81 || bye[1] != 203 || binary.BigEndian.Uint16(bye[2:]) != 1 ||
+		binary.BigEndian.Uint32(bye[4:]) != 1 {
+		t.Fatalf("bye % x", bye)
+	}
+	// No SR: empty RR first.
+	b = BuildBye(9, "abc", nil)
+	if b[0] != 0x80 || b[1] != 201 || binary.BigEndian.Uint32(b[4:]) != 9 || len(b) < 8 {
+		t.Fatalf("rr % x", b)
+	}
+	if got := ParseReceiverReports(b); len(got) != 1 || got[0] != 9 {
+		t.Fatalf("senders %v", got)
+	}
+	// Odd-length CNAME is padded to 32 bits.
+	if len(b)%4 != 0 {
+		t.Fatalf("len %d", len(b))
+	}
+}
+
+func TestParseReceiverReports(t *testing.T) {
+	sr := BuildSenderReport(11, time.Unix(1_700_000_000, 0), 5, 1, 2)
+	rr := ReceiverReport(22, []ReportBlock{{SSRC: 1}})
+	got := ParseReceiverReports(append(append([]byte{}, rr...), sr...))
+	if len(got) != 2 || got[0] != 22 || got[1] != 11 {
+		t.Fatalf("%v", got)
+	}
+	// Truncated and hostile inputs stop the walk without panicking.
+	if got := ParseReceiverReports(rr[:6]); len(got) != 0 {
+		t.Fatalf("%v", got)
+	}
+	if got := ParseReceiverReports([]byte{0x80, 201, 0xff, 0xff, 0, 0, 0, 1}); len(got) != 0 {
+		t.Fatalf("%v", got)
+	}
+	if got := ParseReceiverReports(nil); len(got) != 0 {
+		t.Fatalf("%v", got)
+	}
 }

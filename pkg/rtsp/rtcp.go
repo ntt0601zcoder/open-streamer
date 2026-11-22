@@ -89,3 +89,85 @@ func ReceiverReport(ssrc uint32, blocks []ReportBlock) []byte {
 	}
 	return b
 }
+
+const (
+	rtcpSDES = 202
+	rtcpBye  = 203
+
+	sdesCNAME  = 1
+	maxCNAME   = 255
+	ntpFracOne = 1 << 32
+)
+
+// BuildSenderReport builds an RTCP sender report without report blocks
+// (RFC 3550 section 6.4.1). ntp is converted to 32.32 fixed point seconds
+// since 1900.
+func BuildSenderReport(ssrc uint32, ntp time.Time, rtpTS, packets, octets uint32) []byte {
+	b := make([]byte, rtcpHeaderLen+srBodyLen)
+	b[0] = rtcpVersionTop << 6
+	b[1] = rtcpSR
+	binary.BigEndian.PutUint16(b[2:], uint16(len(b)/4-1))
+	binary.BigEndian.PutUint32(b[4:], ssrc)
+	sec := uint32(ntp.Unix() + ntpToUnixSecs)
+	frac := uint32((uint64(ntp.Nanosecond()) * ntpFracOne) / 1_000_000_000)
+	binary.BigEndian.PutUint32(b[8:], sec)
+	binary.BigEndian.PutUint32(b[12:], frac)
+	binary.BigEndian.PutUint32(b[16:], rtpTS)
+	binary.BigEndian.PutUint32(b[20:], packets)
+	binary.BigEndian.PutUint32(b[24:], octets)
+	return b
+}
+
+// BuildBye builds the compound packet that ends a session: sr when non-nil
+// (else an empty receiver report from ssrc), an SDES chunk with one CNAME
+// item padded to 32 bits, and a BYE for ssrc. A cname longer than 255 bytes
+// is truncated.
+func BuildBye(ssrc uint32, cname string, sr []byte) []byte {
+	if len(cname) > maxCNAME {
+		cname = cname[:maxCNAME]
+	}
+	b := make([]byte, 0, len(sr)+8+16+len(cname)+8)
+	if sr != nil {
+		b = append(b, sr...)
+	} else {
+		b = append(b, ReceiverReport(ssrc, nil)...)
+	}
+	// SDES: header, SSRC, CNAME item, a null item end, padding to 32 bits.
+	chunk := 4 + 2 + len(cname) + 1
+	chunk += (4 - chunk%4) % 4
+	start := len(b)
+	b = append(b, make([]byte, 4+chunk)...)
+	s := b[start:]
+	s[0] = rtcpVersionTop<<6 | 1
+	s[1] = rtcpSDES
+	binary.BigEndian.PutUint16(s[2:], uint16((4+chunk)/4-1))
+	binary.BigEndian.PutUint32(s[4:], ssrc)
+	s[8] = sdesCNAME
+	s[9] = byte(len(cname))
+	copy(s[10:], cname)
+	// BYE.
+	b = append(b, rtcpVersionTop<<6|1, rtcpBye, 0, 1, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(b[len(b)-4:], ssrc)
+	return b
+}
+
+// ParseReceiverReports returns the sender SSRC of every SR and RR in a
+// compound RTCP packet. The walk stops at the first element that is not
+// version 2 or runs past the buffer.
+func ParseReceiverReports(rtcp []byte) []uint32 {
+	var out []uint32
+	for len(rtcp) >= rtcpHeaderLen {
+		if rtcp[0]>>6 != rtcpVersionTop {
+			break
+		}
+		n := (int(binary.BigEndian.Uint16(rtcp[2:])) + 1) * 4
+		if n > len(rtcp) {
+			break
+		}
+		if (rtcp[1] == rtcpSR || rtcp[1] == rtcpRR) && n >= rtcpHeaderLen+4 {
+			out = append(out, binary.BigEndian.Uint32(rtcp[rtcpHeaderLen:]))
+		}
+		rtcp = rtcp[n:]
+	}
+	return out
+}
