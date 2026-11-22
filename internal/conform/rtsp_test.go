@@ -27,6 +27,7 @@ type rtspFaults struct {
 	skewSR      time.Duration // add to the NTP of the audio track's sender reports
 	startDelta  bool          // send a delta frame before the first keyframe
 	mtu         int
+	pace        time.Duration // wait after each frame; 0 means 1 ms
 }
 
 // rtspHandler plays a clip through our RTP muxer.
@@ -153,7 +154,11 @@ func (h *rtspHandler) Play(ctx context.Context, s *rtsp.ServerSession) {
 				return
 			}
 		}
-		time.Sleep(time.Millisecond)
+		pace := h.f.pace
+		if pace == 0 {
+			pace = time.Millisecond
+		}
+		time.Sleep(pace)
 	}
 	s.Close()
 }

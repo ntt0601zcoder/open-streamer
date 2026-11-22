@@ -75,6 +75,9 @@ const defaultTimeout = 30 * time.Second
 type Capture struct {
 	Frames     []media.Frame
 	Violations []Violation
+	// RTPLost counts the RTP packets ReadRTSP found missing from a track's
+	// sequence numbers, over UDP (not a violation) and TCP alike.
+	RTPLost uint64
 }
 
 // reader is the HTTP side shared by the readers.

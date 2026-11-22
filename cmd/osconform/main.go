@@ -71,6 +71,9 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	for _, v := range c.Violations {
 		_, _ = fmt.Fprintln(stdout, v.String())
 	}
+	if c.RTPLost > 0 {
+		fmt.Fprintf(os.Stderr, "osconform: %d RTP packets lost\n", c.RTPLost)
+	}
 	if len(c.Violations) > 0 {
 		return 1
 	}

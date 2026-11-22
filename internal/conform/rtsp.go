@@ -45,6 +45,9 @@ const (
 	RuleRTSPSRAlign = "rtsp-sr-aligned"
 	// RuleRTSPSDP: every SDP media is supported and valid.
 	RuleRTSPSDP = "rtsp-sdp-valid"
+	// RuleRTSPCaptureShort: a read with a Duration captures that span before
+	// the wall-clock backstop (Duration plus Timeout) ends it.
+	RuleRTSPCaptureShort = "rtsp-capture-short"
 )
 
 const (
@@ -66,6 +69,7 @@ type rtspVideo struct {
 	cls   *media.NALClassifier
 	dts   *h26x.DTSExtractor
 	seen  bool // a video AU was read
+	keyed bool // the extractor has seen a keyframe since its last reset
 	used  bool // the epoch holds a frame of this track
 }
 
@@ -93,28 +97,32 @@ type rtspTrack struct {
 	grpOpen, grpLost, nextLost bool
 	grpTS                      uint32
 	grpMarker                  bool
+	ssrc                       uint32
 
 	// Sender reports.
 	srUnw *unwrap.Unwrapper
 	nSR   int
 	srTS  int64 // lastTS at the latest SR
 	srArr time.Time
+	hasSR bool  // srTS and srArr are set
 	delta int64 // NTP minus stream time of the first SR, ns
 	bye   bool
 }
 
 // rtspCapture is the state of one ReadRTSP.
 type rtspCapture struct {
-	b       *builder
-	tracks  []*rtspTrack // by media index; nil when not read
-	udp     bool
-	mtu     int
-	epoch   uint32
-	used    bool
-	startAt int64 // PTS the current epoch starts at (video keyframe)
-	refSet  bool
-	refIdx  int
-	refD    int64
+	b      *builder
+	tracks []*rtspTrack // by media index; nil when not read
+	udp    bool
+	mtu    int
+	epoch  uint32
+	used   bool
+	starts []int64 // start PTS of epochs 2, 3, ...
+	audio  []media.Frame
+	lost   uint64
+	refSet bool
+	refIdx int
+	refD   int64
 }
 
 // ReadRTSP plays u with pkg/rtsp (TCP unless the URL has ?transport=udp,
@@ -141,18 +149,9 @@ func ReadRTSP(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	pu, err := url.Parse(u)
+	dialURL, transport, err := stripTransport(u)
 	if err != nil {
-		return Capture{}, errors.New("conform: read: rtsp: invalid URL")
-	}
-	transport := "tcp"
-	q := pu.Query()
-	if _, ok := q["transport"]; ok {
-		if strings.EqualFold(q.Get("transport"), "udp") {
-			transport = "udp"
-		}
-		q.Del("transport")
-		pu.RawQuery = q.Encode()
+		return Capture{}, fmt.Errorf("conform: read: rtsp: %w", err)
 	}
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -171,7 +170,7 @@ func ReadRTSP(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 		}
 		return fmt.Errorf("conform: read: rtsp: %w", err)
 	}
-	c, err := rtsp.Dial(rctx, pu.String(), rtsp.Config{
+	c, err := rtsp.Dial(rctx, dialURL, rtsp.Config{
 		Timeout: timeout, IdleTimeout: timeout, Transport: transport, Dial: opt.Dial,
 	})
 	if err != nil {
@@ -181,10 +180,11 @@ func ReadRTSP(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	defer closeClient()
 	stop := context.AfterFunc(rctx, closeClient)
 	defer stop()
-	var ended atomic.Bool
+	var ended, backstopped atomic.Bool
 	if opt.Duration > 0 {
 		backstop := time.AfterFunc(opt.Duration+timeout, func() {
 			ended.Store(true)
+			backstopped.Store(true)
 			closeClient()
 		})
 		defer backstop.Stop()
@@ -230,18 +230,57 @@ func ReadRTSP(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 			break
 		}
 	}
-	r.finish(atEOF || r.allBye())
-	return r.b.finish(), nil
+	if backstopped.Load() && r.span() < opt.Duration {
+		r.b.violate(RuleRTSPCaptureShort, -1, "captured %v of %v in %v of wall time",
+			r.span(), opt.Duration, opt.Duration+timeout)
+	}
+	return r.result(atEOF || r.allBye()), nil
+}
+
+// stripTransport removes the transport query parameter from u, leaving the
+// rest of the URL as given, and returns the transport it named: "udp" or
+// "tcp" (the default).
+func stripTransport(u string) (clean, transport string, err error) {
+	if _, err := url.Parse(u); err != nil {
+		return "", "", errors.New("invalid URL")
+	}
+	base, query, hasQuery := strings.Cut(u, "?")
+	if !hasQuery {
+		return u, "tcp", nil
+	}
+	transport = "tcp"
+	var keep []string
+	for _, part := range strings.Split(query, "&") {
+		key, val, _ := strings.Cut(part, "=")
+		if !strings.EqualFold(key, "transport") {
+			keep = append(keep, part)
+			continue
+		}
+		switch strings.ToLower(val) {
+		case "udp", "tcp":
+			transport = strings.ToLower(val)
+		default:
+			return "", "", fmt.Errorf("unsupported transport %q (want udp or tcp)", val)
+		}
+	}
+	if len(keep) == 0 {
+		return base, transport, nil
+	}
+	return base + "?" + strings.Join(keep, "&"), transport, nil
 }
 
 func newRTSPCapture(c *rtsp.Client, opt ReadOptions, udp bool) *rtspCapture {
+	return newRTSPCaptureFor(c.Description(), c.RTPInfo(), opt, udp)
+}
+
+// newRTSPCaptureFor starts a capture of a session with SDP desc and PLAY
+// RTP-Info info.
+func newRTSPCaptureFor(desc rtsp.Description, info []rtsp.RTPInfo, opt ReadOptions, udp bool) *rtspCapture {
 	r := &rtspCapture{b: newBuilder(), epoch: 1, mtu: opt.MTU, udp: udp}
 	if r.mtu <= 0 {
 		r.mtu = rtspDefaultMTU
 	}
 	r.b.start(1, true)
-	desc := c.Description()
-	info := c.RTPInfo()
 	for _, m := range desc.Media {
 		for len(r.tracks) <= m.Index {
 			r.tracks = append(r.tracks, nil)
@@ -336,20 +375,33 @@ func buildVideoConfig(v *rtspVideo) (cfg *media.TrackConfig) {
 	return cfg
 }
 
-// newExtractor returns a DTS extractor for the video's current SPS.
+// spsOf returns the video's first SPS, nil when there is none that parses.
+func spsOf(v *rtspVideo) *h26x.SPS {
+	if len(v.sets[1]) == 0 {
+		return nil
+	}
+	s, err := h26x.ParseSPS(v.hc, v.sets[1][0])
+	if err != nil {
+		return nil
+	}
+	return s
+}
+
+// reorderOf returns the reorder depth of the video's current SPS.
+func reorderOf(v *rtspVideo) int {
+	r, _ := h26x.ReorderOf(v.hc, spsOf(v))
+	return r
+}
+
+// newExtractor returns a DTS extractor for the video's current SPS. It
+// lives for the whole capture: a new SPS only SetReorders it, so the DTS
+// stays strictly increasing across epochs.
 func newExtractor(v *rtspVideo) *h26x.DTSExtractor {
-	var sps *h26x.SPS
-	if len(v.sets[1]) > 0 {
-		if s, err := h26x.ParseSPS(v.hc, v.sets[1][0]); err == nil {
-			sps = s
-		}
-	}
-	reorder, _ := h26x.ReorderOf(v.hc, sps)
 	var dur int64
-	if sps != nil {
-		dur = sps.FrameDuration
+	if s := spsOf(v); s != nil {
+		dur = s.FrameDuration
 	}
-	return h26x.NewDTSExtractor(reorder, dur)
+	return h26x.NewDTSExtractor(reorderOf(v), dur)
 }
 
 // arrival returns a packet's arrival, now when it has none.
@@ -416,10 +468,13 @@ func (r *rtspCapture) rtp(p rtsp.Packet) {
 			"payload of %d bytes (seq %d) exceeds the MTU %d", len(pk.Payload), pk.SequenceNumber, r.mtu)
 	}
 	first := t.npkts == 0
-	if first && t.info.HasSeq && pk.SequenceNumber != t.info.Seq {
+	// Over UDP the first packet may be lost or reordered: only TCP is exact.
+	if first && !r.udp && t.info.HasSeq && pk.SequenceNumber != t.info.Seq {
 		r.b.violate(RuleRTSPRTPInfo, t.track, "first packet has seq %d, RTP-Info says %d", pk.SequenceNumber, t.info.Seq)
 	}
 	gap, reset, dup := t.seq.Next(pk.SequenceNumber, pk.SSRC)
+	ssrcChanged := !first && pk.SSRC != t.ssrc
+	t.ssrc = pk.SSRC
 	switch {
 	case dup:
 		if !r.udp {
@@ -427,9 +482,12 @@ func (r *rtspCapture) rtp(p rtsp.Packet) {
 		}
 		return
 	case reset && !first:
-		r.b.violate(RuleRTSPSeq, t.track, "SSRC or sequence jump at seq %d", pk.SequenceNumber)
+		if !r.udp || ssrcChanged {
+			r.b.violate(RuleRTSPSeq, t.track, "SSRC or sequence jump at seq %d", pk.SequenceNumber)
+		}
 		t.dp.Gap()
 	case gap > 0:
+		r.lost += uint64(gap)
 		if !r.udp {
 			r.b.violate(RuleRTSPSeq, t.track, "%d packets missing before seq %d", gap, pk.SequenceNumber)
 		}
@@ -449,6 +507,10 @@ func (r *rtspCapture) rtp(p rtsp.Packet) {
 	}
 	t.npkts++
 	t.lastTS, t.lastArr = ts, arr
+	if first && t.nSR > 0 {
+		// Sender reports came before the first packet: the gaps run from it.
+		t.srTS, t.srArr, t.hasSR = ts, arr, true
+	}
 	if t.v != nil {
 		r.marker(t, pk)
 	}
@@ -514,13 +576,13 @@ func (r *rtspCapture) senderReport(t *rtspTrack, sr rtsp.SenderReport, arr time.
 		if t.nSR == 0 && mediaGap > rtspFirstSR && wallGap > rtspFirstSR {
 			r.b.violate(RuleRTSPSR, t.track, "first sender report %v after the first packet (limit %v)", mediaGap, rtspFirstSR)
 		}
-		if t.nSR > 0 {
+		if t.hasSR {
 			mg, wg := t.ticksToDur(t.lastTS-t.srTS), arr.Sub(t.srArr)
 			if mg > rtspSRGap && wg > rtspSRGap {
 				r.b.violate(RuleRTSPSR, t.track, "%v between sender reports (limit %v)", mg, rtspSRGap)
 			}
 		}
-		t.srTS, t.srArr = t.lastTS, arr
+		t.srTS, t.srArr, t.hasSR = t.lastTS, arr, true
 	}
 	t.nSR++
 	if !t.hasOrig {
@@ -553,6 +615,30 @@ func abs64(x int64) int64 {
 	return x
 }
 
+// result ends the capture and returns it: see finish.
+func (r *rtspCapture) result(ended bool) Capture {
+	r.finish(ended)
+	for _, f := range r.audio {
+		f.Epoch = r.epochAt(f.PTS)
+		r.b.add(f)
+	}
+	c := r.b.finish()
+	c.RTPLost = r.lost
+	return c
+}
+
+// epochAt returns the epoch a presentation time belongs to: the last epoch
+// whose start keyframe is presented at or before it.
+func (r *rtspCapture) epochAt(pts int64) uint32 {
+	ep := uint32(1)
+	for i, s := range r.starts {
+		if pts >= s {
+			ep = uint32(i) + 2
+		}
+	}
+	return ep
+}
+
 // finish flushes the depacketisers when the stream ended, closes the marker
 // groups it can and checks sender report presence.
 func (r *rtspCapture) finish(ended bool) {
@@ -575,7 +661,7 @@ func (r *rtspCapture) finish(ended bool) {
 		if t.nSR == 0 && last > rtspFirstSR {
 			r.b.violate(RuleRTSPSR, t.track, "no sender report within %v of the first packet (%v read)", rtspFirstSR, last)
 		}
-		if t.nSR > 0 {
+		if t.hasSR {
 			if mg := t.ticksToDur(t.lastTS - t.srTS); mg > rtspSRGap && t.lastArr.Sub(t.srArr) > rtspSRGap {
 				r.b.violate(RuleRTSPSR, t.track, "%v since the last sender report (limit %v)", mg, rtspSRGap)
 			}
@@ -594,11 +680,9 @@ func (r *rtspCapture) au(t *rtspTrack, au rtsp.AU) {
 	}
 	for i, fr := range au.Frames {
 		pts := t.pts90(au.Timestamp + uint32(i)*rtspAACSamples)
-		ep := r.epoch
-		if ep > 1 && pts < r.startAt {
-			ep--
-		}
-		r.add(media.Frame{Track: t.track, Config: t.acfg, PTS: pts, DTS: pts, Key: true, Data: [][]byte{fr}, Epoch: ep})
+		// The epoch is set at the end, by PTS: audio may come before or
+		// after the keyframe that starts its epoch.
+		r.audio = append(r.audio, media.Frame{Track: t.track, Config: t.acfg, PTS: pts, DTS: pts, Key: true, Data: [][]byte{fr}})
 	}
 }
 
@@ -649,9 +733,22 @@ func (r *rtspCapture) video(t *rtspTrack, au rtsp.AU) {
 	if key {
 		r.keySets(t, pts, lead)
 	}
+	before := v.dts.Stats()
 	dts, st := v.dts.Extract(pts, key)
 	if st == h26x.DTSBreak {
+		v.keyed = false
 		dts, st = v.dts.Extract(pts, key)
+	}
+	wasKeyed := v.keyed
+	v.keyed = v.keyed || key
+	if st == h26x.DTSDrop && wasKeyed {
+		after := v.dts.Stats()
+		switch {
+		case after.Leading > before.Leading:
+			r.b.violate(RuleRASL, t.track, "picture at PTS %d is presented before the epoch's start keyframe", pts)
+		case after.Late > before.Late:
+			r.b.violate(RuleDTS, t.track, "picture at PTS %d is at or below the previous DTS: its DTS cannot be derived", pts)
+		}
 	}
 	if st != h26x.DTSOK || v.cfg == nil {
 		return
@@ -682,12 +779,12 @@ func (r *rtspCapture) keySets(t *rtspTrack, pts int64, lead [][]byte) {
 		}
 		if v.used && r.used {
 			r.epoch++
+			r.starts = append(r.starts, pts)
 			r.used = false
 		}
 		v.used = false
-		r.startAt = pts
 		v.cfg = buildVideoConfig(v)
-		v.dts = newExtractor(v)
+		v.dts.SetReorder(reorderOf(v))
 		if v.cfg == nil {
 			r.b.violate(RuleRTSPInband, t.track, "keyframe at PTS %d: the parameter sets do not make a config", pts)
 		}
