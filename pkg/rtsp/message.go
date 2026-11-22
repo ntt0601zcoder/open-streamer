@@ -363,8 +363,15 @@ type Transport struct {
 	Interleaved [2]int
 	// ClientPort and ServerPort are the RTP/RTCP port pairs of a UDP transport.
 	ClientPort, ServerPort [2]int
+	// Multicast is true when the entry names "multicast" explicitly; an entry
+	// naming neither has Unicast and Multicast false.
+	Multicast bool
 	// Source is the "source" parameter.
 	Source string
+	// Destination is the "destination" parameter ("" when absent or empty).
+	Destination string
+	// Mode is the "mode" parameter without quotes, e.g. "PLAY" or "record".
+	Mode string
 	// SSRC is valid when HasSSRC is set.
 	SSRC    uint32
 	HasSSRC bool
@@ -398,7 +405,27 @@ func singlePort(x int) [2]int {
 // ParseTransport parses the first entry of a Transport header value.
 func ParseTransport(v string) (Transport, error) {
 	first, _, _ := strings.Cut(v, ",")
-	parts := strings.Split(first, ";")
+	return parseTransportEntry(first)
+}
+
+// ParseTransports parses every comma-separated entry of a Transport header
+// value, in order (RFC 2326 section 12.39: the client lists its offers by
+// preference). Any malformed entry fails the whole value.
+func ParseTransports(v string) ([]Transport, error) {
+	entries := strings.Split(v, ",")
+	out := make([]Transport, 0, len(entries))
+	for _, e := range entries {
+		t, err := parseTransportEntry(e)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
+
+func parseTransportEntry(entry string) (Transport, error) {
+	parts := strings.Split(entry, ";")
 	var t Transport
 	t.Protocol = strings.TrimSpace(parts[0])
 	if t.Protocol == "" || strings.ContainsAny(t.Protocol, " =") {
@@ -412,6 +439,8 @@ func ParseTransport(v string) (Transport, error) {
 		switch k {
 		case "unicast":
 			t.Unicast = true
+		case "multicast":
+			t.Multicast = true
 		case "interleaved":
 			t.Interleaved, err = parseRange(val, 255, func(x int) [2]int { return [2]int{x, x + 1} })
 		case "client_port":
@@ -422,6 +451,10 @@ func ParseTransport(v string) (Transport, error) {
 			t.ServerPort, err = parseRange(val, 65535, singlePort)
 		case "source":
 			t.Source = val
+		case "destination":
+			t.Destination = val
+		case "mode":
+			t.Mode = strings.Trim(val, `"`)
 		case "ssrc":
 			var n uint64
 			n, err = strconv.ParseUint(val, 16, 32)
@@ -452,8 +485,14 @@ func (t Transport) String() string {
 	if t.ServerPort != [2]int{} {
 		fmt.Fprintf(&sb, ";server_port=%d-%d", t.ServerPort[0], t.ServerPort[1])
 	}
+	if t.Destination != "" {
+		sb.WriteString(";destination=" + t.Destination)
+	}
 	if t.Source != "" {
 		sb.WriteString(";source=" + t.Source)
+	}
+	if t.Mode != "" {
+		sb.WriteString(";mode=" + t.Mode)
 	}
 	if t.HasSSRC {
 		fmt.Fprintf(&sb, ";ssrc=%08X", t.SSRC)

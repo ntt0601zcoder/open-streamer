@@ -232,8 +232,8 @@ func TestParseTransport(t *testing.T) {
 		},
 		{
 			"RTP/AVP;multicast;destination=239.1.1.1;port=5000-5001",
-			Transport{Protocol: "RTP/AVP"},
-			"RTP/AVP;multicast",
+			Transport{Protocol: "RTP/AVP", Multicast: true, Destination: "239.1.1.1"},
+			"RTP/AVP;multicast;destination=239.1.1.1",
 		},
 		{
 			"RTP/AVP/TCP;unicast;interleaved=4",
@@ -276,6 +276,35 @@ func TestParseTransport(t *testing.T) {
 	}
 	for _, bad := range []string{"", ";unicast", "RTP/AVP;interleaved=a-b", "RTP/AVP;interleaved=0-999", "RTP/AVP;client_port=70000-70001", "RTP/AVP;ssrc=zz", "RTP/AVP;ssrc=123456789"} {
 		if _, err := ParseTransport(bad); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}
+
+func TestParseTransports(t *testing.T) {
+	got, err := ParseTransports(`RTP/AVP/UDP;unicast;client_port=5000-5001;mode="PLAY", ` +
+		`rtp/avp/tcp;unicast;interleaved=2-3;mode=record,RTP/AVP;destination=10.0.0.9`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Transport{
+		{Protocol: "RTP/AVP/UDP", Unicast: true, ClientPort: [2]int{5000, 5001}, Mode: "PLAY"},
+		{Protocol: "rtp/avp/tcp", Unicast: true, Interleaved: [2]int{2, 3}, Mode: "record"},
+		{Protocol: "RTP/AVP", Destination: "10.0.0.9"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d offers, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("offer %d: got %+v want %+v", i, got[i], want[i])
+		}
+	}
+	if s := got[1].String(); s != "rtp/avp/tcp;unicast;interleaved=2-3;mode=record" {
+		t.Errorf("String %q", s)
+	}
+	for _, bad := range []string{"", "RTP/AVP/TCP;unicast,", "RTP/AVP;unicast, RTP/AVP;client_port=x"} {
+		if _, err := ParseTransports(bad); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
 	}
