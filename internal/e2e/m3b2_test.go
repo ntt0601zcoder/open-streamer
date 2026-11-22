@@ -667,11 +667,13 @@ func TestM3b2BFrames(t *testing.T) {
 			reordered++
 		}
 		if !pk.hasDTS {
+			// Only packets before the first with a dts may lack one.
+			require.Zero(t, withDTS, "packet %d has a dts: every packet after the first with one must", i)
 			continue
 		}
 		require.LessOrEqual(t, pk.dts, pk.pts, "packet %d dts at most its pts", i)
 		if withDTS > 0 {
-			require.Greater(t, pk.dts, prevDTS, "packet %d dts increasing", i)
+			require.GreaterOrEqual(t, pk.dts, prevDTS, "packet %d dts monotonic", i)
 		}
 		prevDTS = pk.dts
 		withDTS++
