@@ -443,6 +443,11 @@ func startRTSP(ctx context.Context, cfg *config, lookup func(string) (*hub.Hub, 
 	if cfg.rtspUDP {
 		host, _, _ := net.SplitHostPort(cfg.rtspPlay)
 		if host == "" {
+			// Every interface. Go binds the unspecified 0.0.0.0 as a
+			// dual-stack [::] socket where the system allows it, so the
+			// pair then serves IPv4 and IPv6 players; on a host without
+			// IPv6 (or with IPv4-mapped addresses disabled) it binds IPv4
+			// only.
 			host = "0.0.0.0"
 		}
 		opt.Server.UDPHost = host

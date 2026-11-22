@@ -5,7 +5,11 @@
 // A stream can be played once its hub is live (hub.Live) and has a live
 // track RTP can carry; DESCRIBE then lists the lowest-numbered such track
 // of each kind (rtpmux.Tracks). An unknown name, another app and a stream
-// that is not live yet all get the server's one 404 answer.
+// that is not live yet all get the server's one 404 answer. A session's
+// SDP is frozen and a frame of a kind it lacks ends the session, so a
+// stream whose video is live but whose audio is not yet (its first
+// keyframe came first) is described once audio comes, or video-only after
+// Options.DescribeWait.
 //
 // Each session reads the hub through its own subscription and keeps one
 // rtpmux.Muxer, fed in the session's goroutine together with a 1 s sender
@@ -47,6 +51,15 @@ const (
 	defaultApp     = "live"
 	defaultQueue   = 256
 	reportInterval = time.Second
+	// defaultDescribeWait is how long Describe waits for audio on a stream
+	// whose video is live but whose audio is not yet.
+	defaultDescribeWait = time.Second
+	// describePoll is how often Describe looks for audio while it waits.
+	describePoll = 10 * time.Millisecond
+	// noAudioMemo is how long a stream that showed no audio for a whole
+	// wait is answered at once: the first SETUP of the same player, and
+	// other players, do not wait again.
+	noAudioMemo = 10 * time.Second
 )
 
 // Options tunes a Server. Zero values select the defaults.
@@ -61,6 +74,13 @@ type Options struct {
 	// (hub.SubscribeCached), and the whole queue for UDP sessions. 0 means
 	// 256.
 	Queue int
+	// DescribeWait is how long Describe waits for an audio config when the
+	// hub is live with video but no audio track yet (the first keyframe
+	// often comes before the first audio frame, and a session whose SDP
+	// lacks audio ends when audio comes); a stream still without audio is
+	// then described video-only, and for the next 10 s without waiting. 0
+	// means 1 s; negative disables the wait.
+	DescribeWait time.Duration
 	// Server configures the RTSP server: timeouts, caps and UDPHost, which
 	// enables UDP sessions.
 	Server rtsp.ServerConfig
@@ -77,10 +97,14 @@ type Stats struct {
 	Frames, Packets, Reports uint64
 	// Resyncs counts deliveries that reported lost frames.
 	Resyncs uint64
-	// SkippedTracks counts the live hub tracks left out of the track lists
-	// built for DESCRIBE and for each session's first SETUP: a second track
-	// of a kind, or a codec RTP does not carry here.
+	// SkippedTracks counts, once per session played, the hub tracks live
+	// at PLAY that its SDP leaves out: a second track of a kind, a codec
+	// RTP does not carry here, or a track that came after the SETUP.
 	SkippedTracks uint64
+	// DescribeWaits counts the Describes that waited for audio, and
+	// DescribeWaitsTimedOut those that answered video-only after the whole
+	// wait.
+	DescribeWaits, DescribeWaitsTimedOut uint64
 	// Why sessions ended: a write that missed the write timeout, another
 	// failed write, a codec change, a frame the muxer could not send, the
 	// hub closing, the carried tracks going silent, TEARDOWN, a UDP session
@@ -98,6 +122,7 @@ type Stats struct {
 type counters struct {
 	players                                             atomic.Int64
 	started, frames, packets, reports, resyncs, skipped atomic.Uint64
+	waits, waitsTimedOut                                atomic.Uint64
 }
 
 // Server plays hub streams to RTSP players; it is the rtsp.Handler of its
@@ -107,11 +132,14 @@ type Server struct {
 	opt     Options
 	srv     *rtsp.Server
 	closing atomic.Bool
+	done    chan struct{} // closed by Close: Describe stops waiting
+	once    sync.Once
 
 	live counters
 
-	mu    sync.Mutex
-	ended Stats // the Ended fields and Mux
+	mu      sync.Mutex
+	ended   Stats                  // the Ended fields and Mux
+	noAudio map[*hub.Hub]time.Time // hubs that showed no audio for a whole wait, and when
 }
 
 // New returns a Server for the hubs that lookup finds by stream name.
@@ -126,7 +154,10 @@ func New(lookup func(name string) (*hub.Hub, bool), opt Options) *Server {
 	if opt.Queue <= 0 {
 		opt.Queue = defaultQueue
 	}
-	s := &Server{lookup: lookup, opt: opt}
+	if opt.DescribeWait == 0 {
+		opt.DescribeWait = defaultDescribeWait
+	}
+	s := &Server{lookup: lookup, opt: opt, done: make(chan struct{}), noAudio: map[*hub.Hub]time.Time{}}
 	s.srv = rtsp.NewServer(s, opt.Server)
 	return s
 }
@@ -139,6 +170,7 @@ func (s *Server) Serve(l net.Listener) error { return s.srv.Serve(l) }
 // and waits for them. It is idempotent.
 func (s *Server) Close() error {
 	s.closing.Store(true)
+	s.once.Do(func() { close(s.done) })
 	return s.srv.Close()
 }
 
@@ -158,6 +190,8 @@ func (s *Server) Stats() Stats {
 	st.Reports = s.live.reports.Load()
 	st.Resyncs = s.live.resyncs.Load()
 	st.SkippedTracks = s.live.skipped.Load()
+	st.DescribeWaits = s.live.waits.Load()
+	st.DescribeWaitsTimedOut = s.live.waitsTimedOut.Load()
 	st.Server = s.srv.Stats()
 	return st
 }
@@ -176,19 +210,87 @@ func (s *Server) stream(path string) (*hub.Hub, string, bool) {
 }
 
 // Describe implements rtsp.Handler: the carried tracks of the live stream
-// at path, each descriptor's ID its hub track.
+// at path, each descriptor's ID its hub track. A stream whose video is live
+// but whose audio is not yet is described once audio comes, or video-only
+// after Options.DescribeWait.
 func (s *Server) Describe(path string) ([]rtsp.TrackDesc, bool) {
 	h, _, ok := s.stream(path)
 	if !ok || !h.Live() {
 		return nil, false
 	}
 	cfgs := h.TrackConfigs()
+	if has(cfgs, media.KindVideo) && !has(cfgs, media.KindAudio) {
+		cfgs = s.waitAudio(h, cfgs)
+	}
 	descs, err := rtpmux.Tracks(cfgs)
 	if err != nil {
 		return nil, false
 	}
-	s.live.skipped.Add(uint64(len(cfgs) - len(descs)))
 	return descs, true
+}
+
+// waitAudio polls h's track configs until one is audio, the wait ends, the
+// hub closes or the server closes, and returns the last configs seen. It
+// does not wait for a hub that showed no audio for a whole wait in the
+// last 10 s.
+func (s *Server) waitAudio(h *hub.Hub, cfgs []hub.TrackConfig) []hub.TrackConfig {
+	if s.opt.DescribeWait < 0 || s.recentlyNoAudio(h) {
+		return cfgs
+	}
+	s.live.waits.Add(1)
+	deadline := time.NewTimer(s.opt.DescribeWait)
+	defer deadline.Stop()
+	poll := time.NewTicker(describePoll)
+	defer poll.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			s.live.waitsTimedOut.Add(1)
+			s.markNoAudio(h)
+			return h.TrackConfigs()
+		case <-h.Done():
+			return nil
+		case <-s.done:
+			return cfgs
+		case <-poll.C:
+			if cfgs = h.TrackConfigs(); has(cfgs, media.KindAudio) {
+				return cfgs
+			}
+		}
+	}
+}
+
+// recentlyNoAudio reports whether h showed no audio for a whole wait in the
+// last 10 s.
+func (s *Server) recentlyNoAudio(h *hub.Hub) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at, ok := s.noAudio[h]
+	return ok && time.Since(at) < noAudioMemo
+}
+
+// markNoAudio records that h showed no audio for a whole wait, forgetting
+// the records that have expired.
+func (s *Server) markNoAudio(h *hub.Hub) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for k, at := range s.noAudio {
+		if now.Sub(at) >= noAudioMemo {
+			delete(s.noAudio, k)
+		}
+	}
+	s.noAudio[h] = now
+}
+
+// has reports whether cfgs holds a track of kind k.
+func has(cfgs []hub.TrackConfig, k media.Kind) bool {
+	for _, c := range cfgs {
+		if c.Kind == k {
+			return true
+		}
+	}
+	return false
 }
 
 // end is why a session ended.
@@ -222,10 +324,12 @@ func (s *Server) Play(ctx context.Context, ss *rtsp.ServerSession) {
 		sub = h.SubscribeCached("rtsp "+name, s.opt.Queue)
 	}
 	defer sub.Close()
+	p := newPlayer(s, ss)
+	// Counted before the start, so a reader of Stats that sees the session
+	// sees its skipped tracks.
+	s.live.skipped.Add(p.skipped(h.TrackConfigs()))
 	s.live.started.Add(1)
 	s.live.players.Add(1)
-
-	p := newPlayer(s, ss)
 	why := p.run(ctx, sub)
 	// Unsubscribed, closed and uncounted before the end is counted, so a
 	// reader of Stats that sees the end sees the session gone.
@@ -276,8 +380,9 @@ type player struct {
 	s   *Server
 	ss  *rtsp.ServerSession
 	mux *rtpmux.Muxer
-	// carried holds the hub tracks of the set-up SDP tracks.
-	carried map[int]bool
+	// carried holds the hub tracks of the set-up SDP tracks, listed those
+	// of every SDP track.
+	carried, listed map[int]bool
 	// last is the DTS of the last frame of a carried track, or of the
 	// session's first frame until one comes; seen reports that it is set.
 	last int64
@@ -292,17 +397,30 @@ func newPlayer(s *Server, ss *rtsp.ServerSession) *player {
 	for _, i := range ss.Tracks() {
 		setup[i] = true
 	}
-	p := &player{s: s, ss: ss, carried: map[int]bool{}}
+	p := &player{s: s, ss: ss, carried: map[int]bool{}, listed: map[int]bool{}}
 	tracks := make([]rtpmux.Track, len(descs))
 	for i, d := range descs {
 		ssrc, _, base := ss.Origin(i) // zeros for a track not set up
 		tracks[i] = rtpmux.Track{SDPIndex: i, HubTrack: d.ID, Desc: d, Setup: setup[i], SSRC: ssrc, TSBase: base}
+		p.listed[d.ID] = true
 		if setup[i] {
 			p.carried[d.ID] = true
 		}
 	}
 	p.mux = rtpmux.NewMuxer(tracks, s.opt.MTU, time.Now)
 	return p
+}
+
+// skipped counts the live hub tracks of cfgs that the session's SDP leaves
+// out.
+func (p *player) skipped(cfgs []hub.TrackConfig) uint64 {
+	var n uint64
+	for _, c := range cfgs {
+		if !p.listed[c.Track] {
+			n++
+		}
+	}
+	return n
 }
 
 // run moves deliveries from sub to the session and sends the sender reports

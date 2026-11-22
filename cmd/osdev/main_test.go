@@ -608,18 +608,14 @@ func TestOsdevRTSPPlay(t *testing.T) {
 	url := fmt.Sprintf("rtsp://127.0.0.1:%d/live/demo", port)
 	for _, transport := range []string{"tcp", "udp"} {
 		var c *rtsp.Client
-		// Right at the start the stream may have only its video live: such
-		// a session ends when audio comes, so wait for both tracks.
 		require.Eventually(t, func() bool {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			c, err = rtsp.Dial(ctx, url, rtsp.Config{Transport: transport})
-			if err == nil && len(c.Description().Media) != 2 {
-				_ = c.Close()
-				return false
-			}
 			return err == nil
 		}, 15*time.Second, 100*time.Millisecond, transport)
+		// Even right at the start, DESCRIBE waits for the audio.
+		assert.Len(t, c.Description().Media, 2, transport)
 		for rtpPkts := 0; rtpPkts < 50; {
 			p, err := c.ReadPacket()
 			require.NoError(t, err, transport)

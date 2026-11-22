@@ -442,16 +442,18 @@ func check(t *testing.T, s session, pkts []rtsp.Packet, ordered bool) summary {
 	return sum
 }
 
-// A TCP player joining mid-GOP starts at a cached keyframe with parameter
-// sets, at the RTP-Info origins, and gets no audio presented before it.
+// A TCP player joining mid-GOP starts at once on the cached keyframe, with
+// parameter sets, at the RTP-Info origins, and gets no audio presented
+// before it.
 func TestPlayJoinsAtKeyframe(t *testing.T) {
 	e := start(t, Options{}, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	frames := looped(t, "h264_aac.ts", 4)
-	done := feed(ctx, e.h, frames, 2, nil)
-	require.Eventually(t, e.h.Live, waitFor, time.Millisecond)
-	time.Sleep(1300 * time.Millisecond) // into the stream, mid-GOP
+	frames := tagged(looped(t, "h264_aac.ts", 4))
+	var written atomic.Int64
+	written.Store(-1)
+	done := feed(ctx, e.h, frames, 2, &written)
+	latest := waitMidGOP(t, e, frames, &written)
 
 	c := play(t, e.url, "tcp", nil)
 	s := sessionOf(c)
@@ -465,6 +467,9 @@ func TestPlayJoinsAtKeyframe(t *testing.T) {
 	assert.Positive(t, sum.audio)
 	assert.Zero(t, sum.seqGaps)
 	assert.Zero(t, sum.resumes)
+	first, jumps := tagRuns(t, s, frames, r.pkts)
+	assert.Less(t, frames[first].DTS, latest, "the GOP cache was replayed: the first frame was written before PLAY")
+	assert.Zero(t, jumps)
 	// b is the keyframe's DTS: its timestamp is TSBase + its composition
 	// offset.
 	off := int32(sum.firstVideo.Timestamp - s.info[0].RTPTime)
@@ -661,6 +666,121 @@ func TestPlayUnknownStream(t *testing.T) {
 	assert.Equal(t, e.url+"/", r.Header.Get("Content-Base"))
 }
 
+// firstKey returns the index of the first video keyframe.
+func firstKey(t *testing.T, frames []media.Frame) int {
+	t.Helper()
+	for i, f := range frames {
+		if f.Kind() == media.KindVideo && f.Key {
+			return i
+		}
+	}
+	t.Fatal("no keyframe")
+	return -1
+}
+
+// A DESCRIBE right after the first keyframe, before the first audio frame,
+// waits for the audio: the SDP lists both tracks and the session goes on
+// when audio comes (a video-only SDP would end it).
+func TestPlayDescribeWaitsForAudio(t *testing.T) {
+	e := start(t, Options{}, false)
+	frames := looped(t, "h264_aac.ts", 2)
+	k := firstKey(t, frames)
+	e.h.Write(frames[k])
+	require.True(t, e.h.Live())
+	require.Len(t, e.h.TrackConfigs(), 1, "video only so far")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fed := make(chan time.Duration, 1)
+	go func() {
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+		}
+		fed <- <-feed(ctx, e.h, frames[k+1:], 2, nil)
+	}()
+	t0 := time.Now()
+	c := play(t, e.url, "tcp", nil)
+	waited := time.Since(t0)
+	s := sessionOf(c)
+	require.Len(t, s.desc.Media, 2, "the SDP waited for the audio")
+	assert.GreaterOrEqual(t, waited, 150*time.Millisecond)
+	assert.Less(t, waited, time.Second, "answered when the audio came, not at the end of the wait")
+	r := wait(t, collect(c, videoAUs(s, 40)))
+	require.NoError(t, r.err, "the session survives the audio")
+	sum := check(t, s, r.pkts, true)
+	assert.Positive(t, sum.audio)
+	st := e.srv.Stats()
+	assert.Equal(t, uint64(1), st.DescribeWaits, "only the DESCRIBE waited; the SETUP had audio")
+	assert.Zero(t, st.DescribeWaitsTimedOut)
+	assert.Zero(t, st.EndedCodecChange)
+	assert.Equal(t, 1, st.Players)
+	cancel()
+	<-fed
+}
+
+// A video-only stream is described video-only after DescribeWait, and then
+// without waiting again; a hub that closes during the wait is not found.
+func TestPlayDescribeVideoOnly(t *testing.T) {
+	const wait = 300 * time.Millisecond
+	e := start(t, Options{DescribeWait: wait}, false)
+	var video []media.Frame
+	for _, f := range looped(t, "h264_aac.ts", 1) {
+		if f.Kind() == media.KindVideo {
+			video = append(video, f)
+		}
+	}
+	gop, _ := firstGOP(video)
+	for _, f := range gop {
+		e.h.Write(f)
+	}
+	t0 := time.Now()
+	r := describe(t, e.addr, e.url)
+	took := time.Since(t0)
+	require.Equal(t, 200, r.StatusCode)
+	assert.GreaterOrEqual(t, took, wait)
+	assert.Less(t, took, wait+500*time.Millisecond)
+
+	t0 = time.Now()
+	c := play(t, e.url, "tcp", nil) // DESCRIBE, SETUP, PLAY
+	assert.Less(t, time.Since(t0), wait, "no second wait for the same stream")
+	require.Len(t, sessionOf(c).desc.Media, 1)
+	st := e.srv.Stats()
+	assert.Equal(t, uint64(1), st.DescribeWaits)
+	assert.Equal(t, uint64(1), st.DescribeWaitsTimedOut)
+
+	e2 := start(t, Options{DescribeWait: waitFor}, false)
+	for _, f := range gop {
+		e2.h.Write(f)
+	}
+	time.AfterFunc(100*time.Millisecond, e2.h.Close)
+	t0 = time.Now()
+	r = describe(t, e2.addr, e2.url)
+	assert.Equal(t, 404, r.StatusCode)
+	assert.Less(t, time.Since(t0), waitFor/2, "the wait ends with the hub")
+}
+
+// SkippedTracks counts, once per session, the live tracks its SDP leaves
+// out: here a second video track.
+func TestPlaySkippedTracksOncePerSession(t *testing.T) {
+	e := start(t, Options{}, false)
+	gop, _ := firstGOP(looped(t, "h264_aac.ts", 1))
+	for _, f := range gop {
+		e.h.Write(f)
+		if f.Kind() == media.KindVideo {
+			f.Track = 2
+			e.h.Write(f)
+		}
+	}
+	require.Len(t, e.h.TrackConfigs(), 3)
+	for range 2 {
+		c := play(t, e.url, "tcp", nil)
+		require.Len(t, sessionOf(c).desc.Media, 2)
+	}
+	waitStats(t, e, func(st Stats) bool { return st.PlayersStarted == 2 })
+	assert.Equal(t, uint64(2), e.srv.Stats().SkippedTracks, "one per session, not per DESCRIBE and SETUP")
+}
+
 // An audio-only hub plays: the SDP lists audio only, the first packet is at
 // the RTP-Info time, and every frame follows, the cached ones too.
 func TestPlayAudioOnly(t *testing.T) {
@@ -727,6 +847,79 @@ func tagOf(au rtsp.AU) (int, bool) {
 	return 0, false
 }
 
+// tagIndexes returns the frame indexes the video access units of pkts
+// carry, in arrival order, but for the last access unit.
+func tagIndexes(t *testing.T, s session, pkts []rtsp.Packet) []int {
+	t.Helper()
+	v, ok := s.video()
+	require.True(t, ok)
+	dp, err := rtsp.NewDepacketizer(v, 0)
+	require.NoError(t, err)
+	var idx []int
+	add := func(aus []rtsp.AU) {
+		for _, au := range aus {
+			require.False(t, au.Lost)
+			i, ok := tagOf(au)
+			require.True(t, ok, "every frame is tagged")
+			idx = append(idx, i)
+		}
+	}
+	for _, p := range pkts {
+		if p.RTP != nil && p.Track == v.Index {
+			add(dp.Push(p.RTP, p.Arrival))
+		}
+	}
+	// The last access unit may be cut short: a reader stopped in it.
+	return idx
+}
+
+// tagRuns checks the tagged video frames a player got: the first is a
+// keyframe, and so is the first after every jump (a video frame of frames
+// missing); it returns the first frame's index and the number of jumps.
+func tagRuns(t *testing.T, s session, frames []media.Frame, pkts []rtsp.Packet) (first, jumps int) {
+	t.Helper()
+	idx := tagIndexes(t, s, pkts)
+	require.NotEmpty(t, idx)
+	require.True(t, frames[idx[0]].Key, "the first frame is a keyframe")
+	for k := 1; k < len(idx); k++ {
+		next := idx[k-1] + 1
+		for next < len(frames) && frames[next].Kind() != media.KindVideo {
+			next++
+		}
+		if idx[k] != next {
+			require.True(t, frames[idx[k]].Key, "the first frame after a gap is a keyframe (frame %d after %d)", idx[k], idx[k-1])
+			jumps++
+		}
+	}
+	return idx[0], jumps
+}
+
+// waitMidGOP waits until the feed has written at least two keyframes and is
+// 5 to 15 video frames past the last one, and returns the latest DTS
+// written then. The hub's cache then holds a keyframe written before that
+// DTS, which a replay sends first.
+func waitMidGOP(t *testing.T, e *env, frames []media.Frame, written *atomic.Int64) int64 {
+	t.Helper()
+	var at int64
+	require.Eventually(t, func() bool {
+		at = written.Load()
+		if at < 0 || !e.h.Live() {
+			return false
+		}
+		keys, sinceKey := 0, 0
+		for j := int64(0); j <= at; j++ {
+			if f := frames[j]; f.Kind() == media.KindVideo {
+				sinceKey++
+				if f.Key {
+					keys, sinceKey = keys+1, 0
+				}
+			}
+		}
+		return keys >= 2 && sinceKey >= 5 && sinceKey <= 15
+	}, waitFor, time.Millisecond)
+	return lastDTS(frames[:at+1])
+}
+
 // A UDP player that joins mid-GOP gets no replay burst: its first frame is
 // a keyframe written after PLAY, and from it on every packet arrives, with
 // no sequence gap and every video frame in order.
@@ -738,33 +931,10 @@ func TestPlayUDPJoinNoLoss(t *testing.T) {
 	var written atomic.Int64
 	written.Store(-1)
 	done := feed(ctx, e.h, frames, 2, &written)
-	// Join mid-GOP: the hub's cache then holds a keyframe written before
-	// the DESCRIBE, which a replay would send first.
-	require.Eventually(t, func() bool {
-		i := written.Load()
-		if i < 0 || !e.h.Live() {
-			return false
-		}
-		keys, sinceKey := 0, 0
-		for j := int64(0); j <= i; j++ {
-			if f := frames[j]; f.Kind() == media.KindVideo {
-				sinceKey++
-				if f.Key {
-					keys, sinceKey = keys+1, 0
-				}
-			}
-		}
-		return keys >= 2 && sinceKey >= 5 && sinceKey <= 15
-	}, waitFor, time.Millisecond)
-	before := written.Load()
-	latest := lastDTS(frames[:before+1])
+	latest := waitMidGOP(t, e, frames, &written)
 
 	c := play(t, e.url, "udp", nil)
 	s := sessionOf(c)
-	v, ok := s.video()
-	require.True(t, ok)
-	dp, err := rtsp.NewDepacketizer(v, 0)
-	require.NoError(t, err)
 	r := wait(t, collect(c, videoAUs(s, 60)))
 	require.NoError(t, r.err)
 	sum := check(t, s, r.pkts, false)
@@ -772,18 +942,7 @@ func TestPlayUDPJoinNoLoss(t *testing.T) {
 	assert.Zero(t, sum.resumes)
 	assert.Zero(t, c.Stats().Dropped)
 
-	var idx []int
-	for _, p := range r.pkts {
-		if p.RTP == nil || p.Track != v.Index {
-			continue
-		}
-		for _, au := range dp.Push(p.RTP, p.Arrival) {
-			require.False(t, au.Lost)
-			i, ok := tagOf(au)
-			require.True(t, ok, "every frame is tagged")
-			idx = append(idx, i)
-		}
-	}
+	idx := tagIndexes(t, s, r.pkts)
 	require.NotEmpty(t, idx)
 	first := frames[idx[0]]
 	assert.True(t, first.Key, "starts at a keyframe")

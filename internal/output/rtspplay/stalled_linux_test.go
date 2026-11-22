@@ -55,7 +55,7 @@ func TestPlaySlowConsumer(t *testing.T) {
 	e := start(t, Options{Queue: 32, Server: rtsp.ServerConfig{ConnHook: shrinkSend}}, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	frames := looped(t, "h264_aac.ts", 6)
+	frames := tagged(looped(t, "h264_aac.ts", 6))
 	gop, rest := firstGOP(frames)
 	for _, f := range gop {
 		e.h.Write(f)
@@ -89,8 +89,10 @@ func TestPlaySlowConsumer(t *testing.T) {
 	st := e.srv.Stats()
 	require.Positive(t, st.Resyncs, "the player lost frames")
 	assert.Equal(t, st.Resyncs, st.Mux.Resyncs)
-	assert.Positive(t, sum.resumes, "the player saw the gap")
 	assert.LessOrEqual(t, uint64(sum.resumes), st.Resyncs)
+	_, jumps := tagRuns(t, s, frames, r.pkts) // a keyframe after every gap, however small
+	assert.Positive(t, jumps, "the player saw the gap")
+	assert.LessOrEqual(t, uint64(jumps), st.Resyncs, "a jump only where the hub reported a loss")
 	assert.Zero(t, sum.seqGaps, "dropped frames consume no sequence numbers")
 	assert.Equal(t, 2, sum.byes)
 }
@@ -101,7 +103,7 @@ func TestPlayStalledPlayerDropped(t *testing.T) {
 	e := start(t, Options{Server: rtsp.ServerConfig{WriteTimeout: 500 * time.Millisecond, ConnHook: shrinkSend}}, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	frames := looped(t, "h264_aac.ts", 4)
+	frames := tagged(looped(t, "h264_aac.ts", 4))
 	gop, rest := firstGOP(frames)
 	for _, f := range gop {
 		e.h.Write(f)
@@ -130,4 +132,6 @@ func TestPlayStalledPlayerDropped(t *testing.T) {
 	sum := check(t, s, r.pkts, true)
 	assert.Zero(t, sum.seqGaps)
 	assert.Zero(t, sum.resumes)
+	_, jumps := tagRuns(t, s, frames, r.pkts)
+	assert.Zero(t, jumps, "the other player lost nothing")
 }
