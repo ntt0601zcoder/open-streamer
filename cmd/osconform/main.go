@@ -1,5 +1,5 @@
 // Command osconform reads an HLS playlist, a DASH MPD or an MPEG-TS stream
-// over HTTP, or an RTMP stream (rtmp:// URL, played), and prints the conformance violations it finds, one per line.
+// over HTTP, an RTMP stream (rtmp:// URL, played), or an RTSP stream (rtsp:// URL, played; ?transport=udp selects UDP), and prints the conformance violations it finds, one per line.
 //
 // Exit status: 0 clean, 1 violations found, 2 read error or bad arguments.
 package main
@@ -28,10 +28,11 @@ func main() {
 func run(ctx context.Context, args []string, stdout io.Writer) int {
 	fs := flag.NewFlagSet("osconform", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	u := fs.String("url", "", "URL of a .m3u8, .mpd or .ts output, or an rtmp:// stream")
+	u := fs.String("url", "", "URL of a .m3u8, .mpd or .ts output, an rtmp:// stream, or an rtsp:// stream")
 	dur := fs.Duration("duration", 30*time.Second, "media time to capture")
 	once := fs.Bool("once", false, "read the playlist or MPD once instead of polling")
-	timeout := fs.Duration("timeout", 30*time.Second, "limit on each request, and on a stall of the .ts or RTMP stream")
+	timeout := fs.Duration("timeout", 30*time.Second, "limit on each request, and on a stall of the .ts, RTMP or RTSP stream")
+	mtu := fs.Int("mtu", 0, "largest RTP payload accepted from an RTSP stream (0: 1200)")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "osconform: %v\n", err)
 		return 2
@@ -45,11 +46,13 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 		fmt.Fprintln(os.Stderr, "osconform: -url is required and must be a valid URL")
 		return 2
 	}
-	opt := conform.ReadOptions{Duration: *dur, Once: *once, Timeout: *timeout}
+	opt := conform.ReadOptions{Duration: *dur, Once: *once, Timeout: *timeout, MTU: *mtu}
 	var read func(context.Context, string, conform.ReadOptions) (conform.Capture, error)
 	switch p := strings.ToLower(pu.Path); {
 	case strings.EqualFold(pu.Scheme, "rtmp"):
 		read = conform.ReadRTMP
+	case strings.EqualFold(pu.Scheme, "rtsp"):
+		read = conform.ReadRTSP
 	case strings.HasSuffix(p, ".m3u8"):
 		read = conform.ReadHLS
 	case strings.HasSuffix(p, ".mpd"):
@@ -57,7 +60,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	case strings.HasSuffix(p, ".ts"):
 		read = conform.ReadTS
 	default:
-		fmt.Fprintln(os.Stderr, "osconform: -url must end in .m3u8, .mpd or .ts, or be an rtmp:// URL")
+		fmt.Fprintln(os.Stderr, "osconform: -url must end in .m3u8, .mpd or .ts, or be an rtmp:// or rtsp:// URL")
 		return 2
 	}
 	c, err := read(ctx, *u, opt)

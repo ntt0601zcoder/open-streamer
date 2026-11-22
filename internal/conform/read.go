@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -60,6 +61,11 @@ type ReadOptions struct {
 	// For ReadRTMP it bounds the connection set-up and every wait for the
 	// next message. 0 means 30 s.
 	Timeout time.Duration
+	// MTU is the largest RTP payload ReadRTSP accepts; 0 means 1200.
+	MTU int
+	// Dial, when set, opens ReadRTSP's control connection; tests use it to
+	// interpose on the stream.
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 const defaultTimeout = 30 * time.Second

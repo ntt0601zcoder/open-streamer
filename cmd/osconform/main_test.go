@@ -21,6 +21,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/mux/flv"
+	rtpmux "github.com/ntt0601zcoder/open-streamer/internal/mux/rtp"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
@@ -28,6 +29,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/pkg/hls"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
 )
 
 var t0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -227,5 +229,107 @@ func TestOsconformRTMP(t *testing.T) {
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
 	code, _ = runConform(t, "-url", "rtmp://"+addr+"/live/s")
+	assert.Equal(t, 2, code)
+}
+
+// rtspClip plays the h264_aac fixture through our RTP muxer; noSR withholds
+// the sender reports.
+type rtspClip struct {
+	frames []media.Frame
+	descs  []rtsp.TrackDesc
+	noSR   bool
+}
+
+func newRTSPClip(t *testing.T, noSR bool) *rtspClip {
+	t.Helper()
+	b, err := os.ReadFile("../../testdata/fixtures/h264_aac.ts")
+	require.NoError(t, err)
+	d, err := ts.NewDemuxer(bytes.NewReader(b))
+	require.NoError(t, err)
+	c := clock.New(clock.Options{Kinds: d.TrackKinds()})
+	var all []media.Frame
+	for {
+		f, err := d.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		all = append(all, c.Push(f)...)
+	}
+	all = append(all, c.Flush()...)
+	clip := &rtspClip{noSR: noSR}
+	var cfgs []hub.TrackConfig
+	for _, f := range all {
+		if len(clip.frames) == 0 && (f.Kind() != media.KindVideo || !f.Key) {
+			continue
+		}
+		clip.frames = append(clip.frames, f)
+		seen := false
+		for _, c := range cfgs {
+			seen = seen || c.Track == f.Track
+		}
+		if !seen {
+			cfgs = append(cfgs, hub.TrackConfig{Track: f.Track, Kind: f.Kind(), Config: f.Config})
+		}
+	}
+	clip.descs, err = rtpmux.Tracks(cfgs)
+	require.NoError(t, err)
+	return clip
+}
+
+func (c *rtspClip) Describe(path string) ([]rtsp.TrackDesc, bool) { return c.descs, path == "live/s" }
+
+func (c *rtspClip) Play(ctx context.Context, s *rtsp.ServerSession) {
+	trs := make([]rtpmux.Track, 0, len(c.descs))
+	for i, d := range c.descs {
+		ssrc, _, base := s.Origin(i)
+		trs = append(trs, rtpmux.Track{SDPIndex: i, HubTrack: d.ID, Desc: d, Setup: true, SSRC: ssrc, TSBase: base})
+	}
+	var now time.Time
+	m := rtpmux.NewMuxer(trs, 0, func() time.Time { return now })
+	for _, f := range c.frames {
+		if ctx.Err() != nil {
+			return
+		}
+		now = t0.Add(time.Duration(f.DTS-c.frames[0].DTS) * time.Second / media.ClockRate)
+		p, reps, err := m.Frame(f)
+		if err != nil || (p != nil && s.WritePackets(p.SDPIndex, p.RTP) != nil) {
+			return
+		}
+		for _, r := range reps {
+			if !c.noSR && s.WriteRTCP(r.SDPIndex, r.RTCP) != nil {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	s.Close()
+}
+
+func serveRTSP(t *testing.T, h rtsp.Handler) string {
+	t.Helper()
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := rtsp.NewServer(h, rtsp.ServerConfig{})
+	done := make(chan struct{})
+	go func() { defer close(done); _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close(); <-done })
+	return "rtsp://" + ln.Addr().String() + "/live/s"
+}
+
+func TestOsconformRTSP(t *testing.T) {
+	code, out := runConform(t, "-url", serveRTSP(t, newRTSPClip(t, false)), "-timeout", "10s")
+	assert.Equal(t, 0, code, out)
+	assert.Empty(t, out)
+
+	code, out = runConform(t, "-url", serveRTSP(t, newRTSPClip(t, true)), "-timeout", "10s")
+	assert.Equal(t, 1, code)
+	assert.Contains(t, out, "rtsp-sr-timely")
+
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+	code, _ = runConform(t, "-url", "rtsp://"+addr+"/live/s", "-timeout", "2s")
 	assert.Equal(t, 2, code)
 }
