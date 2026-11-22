@@ -113,6 +113,7 @@ type track struct {
 	a0PTS      int64
 	a0Off      int64 // RTP ticks from b to a0PTS
 	a0Epoch    uint32
+	auOff      int64 // audio: RTP ticks from b to the last AU sent in the anchor's epoch
 	sent       bool
 	nextSR     time.Time // zero until the first SR: due right after the first packet
 	lastTS     uint32
@@ -127,11 +128,12 @@ type track struct {
 // when a video track is SETUP, else the first audio frame. Video RTP
 // timestamps are TSBase + (PTS − b); audio timestamps are TSBase +
 // round((PTS_a0 − b)·rate/90000) + round((PTS − PTS_a0)·rate/90000), with
-// PTS_a0 the track's first audio PTS sent in the current epoch. Anchored
-// rounding keeps the 90 kHz rounding of each PTS from adding ±1 sample of
-// jitter: frames step by exactly 1024 while their PTS stay within about a
-// tick of PTS_a0's sample grid (a source whose PTS stray further can still
-// step by 1023 or 1025). Every parameter set of the frame's Config goes
+// PTS_a0 the anchor: the track's first audio PTS sent in the current epoch.
+// When that value is within one sample of the previous AU's timestamp plus
+// 1024, the AU is stamped exactly 1024 after the previous one, so the 90 kHz
+// rounding of the source's PTS never shows as 1023 or 1025 steps; a larger
+// gap (lost AUs) re-anchors on the AU's own PTS, as a new epoch does.
+// Every parameter set of the frame's Config goes
 // before the slices of every keyframe. Frames with a DTS below b are
 // dropped, and so is audio presented before the start or resume keyframe;
 // video of a new epoch waits for that epoch's first keyframe.
@@ -213,7 +215,8 @@ func (m *Muxer) Resync() {
 // due; the caller writes the packets first. A frame whose kind the SDP does
 // not list, or a carried track's codec or AAC config change, is
 // ErrCodecChanged. A frame of a listed kind from another hub track, or of a
-// track not SETUP, is ignored and counted.
+// track not SETUP, is ignored and counted. Any error, ErrCodecChanged or
+// the one for a frame without a Config, ends the session.
 func (m *Muxer) Frame(f media.Frame) (*Packets, []Report, error) {
 	if f.Config == nil {
 		return nil, nil, errors.New("rtpmux: frame: no track config")
@@ -335,11 +338,7 @@ func (m *Muxer) send(t *track, f media.Frame) *Packets {
 		off = f.PTS - m.base
 		pkts = m.videoPackets(t, f, t.TSBase+uint32(off))
 	case media.KindAudio:
-		if !t.a0Set || f.Epoch != t.a0Epoch {
-			t.a0Set, t.a0PTS, t.a0Epoch = true, f.PTS, f.Epoch
-			t.a0Off = roundDiv((f.PTS-m.base)*t.rate, media.ClockRate)
-		}
-		off = t.a0Off + roundDiv((f.PTS-t.a0PTS)*t.rate, media.ClockRate)
+		off = t.audioOffset(f, m.base)
 		pkts = rtsp.PacketizeAAC(f.Data, t.TSBase+uint32(off), aacAUSamples, m.mtu+rtpHeaderLen, t.aac)
 	}
 	if len(pkts) == 0 {
@@ -355,6 +354,24 @@ func (m *Muxer) send(t *track, f media.Frame) *Packets {
 	}
 	t.lastTS, t.lastOff, t.sent = pkts[len(pkts)-1].Timestamp, off, true
 	return &Packets{SDPIndex: t.SDPIndex, RTP: pkts}
+}
+
+// audioOffset returns the RTP ticks from b to audio frame f's timestamp:
+// exactly one AU after the previous AU when the anchored value is within one
+// sample of that, else (the first AU, a new epoch, or a gap) the anchored
+// value of a new anchor at f.
+func (t *track) audioOffset(f media.Frame, b int64) int64 {
+	if t.a0Set && f.Epoch == t.a0Epoch {
+		off := t.a0Off + roundDiv((f.PTS-t.a0PTS)*t.rate, media.ClockRate)
+		if next := t.auOff + aacAUSamples; off >= next-1 && off <= next+1 {
+			t.auOff = next
+			return next
+		}
+	}
+	t.a0Set, t.a0PTS, t.a0Epoch = true, f.PTS, f.Epoch
+	t.a0Off = roundDiv((f.PTS-b)*t.rate, media.ClockRate)
+	t.auOff = t.a0Off
+	return t.a0Off
 }
 
 // videoPackets packetises one H.264 or H.265 access unit, the parameter sets of

@@ -218,21 +218,30 @@ func wantVideo(frames []media.Frame, tr Track, b int64) []want {
 }
 
 // wantAudio returns the AUs for the audio frames of tr.HubTrack with PTS at
-// or above keyPTS, with anchored rounding from the first one.
+// or above keyPTS (one epoch): anchored rounding from the first one, and a
+// frame whose anchored value is within one sample of the previous plus 1024
+// is stamped exactly 1024 after it; otherwise it re-anchors on its PTS.
 func wantAudio(frames []media.Frame, tr Track, b, keyPTS int64) []want {
 	var out []want
 	rate := int64(tr.Desc.ClockRate)
-	var a0, off0 int64
+	var a0, off0, last int64
 	first := true
 	for _, f := range frames {
 		if f.Track != tr.HubTrack || f.Kind() != media.KindAudio || f.PTS < keyPTS {
 			continue
 		}
-		if first {
-			a0, off0, first = f.PTS, roundTicks((f.PTS-b)*rate), false
+		off := int64(0)
+		if !first {
+			off = off0 + roundTicks((f.PTS-a0)*rate)
 		}
-		ts := tr.TSBase + uint32(off0+roundTicks((f.PTS-a0)*rate))
-		out = append(out, want{ts: ts, nalus: f.Data})
+		if next := last + 1024; !first && off >= next-1 && off <= next+1 {
+			off = next
+		} else {
+			a0, off0, first = f.PTS, roundTicks((f.PTS-b)*rate), false
+			off = off0
+		}
+		last = off
+		out = append(out, want{ts: tr.TSBase + uint32(off), nalus: f.Data})
 	}
 	return out
 }
@@ -510,17 +519,11 @@ func TestMuxAudioRoundingAnchored(t *testing.T) {
 	}
 	ep1 := withEpoch(shiftAudio(src, halfTickShift(firstAudio(src), b, 44100)), 1)
 	a1 := firstAudio(ep1)
-	// The second epoch repeats the frames the first one sent, so its first
-	// audio frame is the same source frame as the first epoch's anchor (the
-	// source's PTS are off the sample grid by up to about a tick; see the
-	// Muxer doc), at a half-tick phase against that anchor.
-	var sent []media.Frame
-	for _, f := range ep1 {
-		if f.Kind() != media.KindAudio || f.PTS >= ep1[0].PTS {
-			sent = append(sent, f)
-		}
-	}
-	next := shift(sent, maxDTS(ep1)+3600-sent[0].DTS)
+	// The second epoch is the whole clip again, early audio included, so it
+	// anchors on the clip's first audio frame: its PTS are off the sample
+	// grid by up to about a tick against that frame, which plain anchored
+	// rounding turns into a 1025 step at its 16th frame.
+	next := shift(src, maxDTS(ep1)+3600-src[0].DTS)
 	ep2 := withEpoch(shiftAudio(next, halfTickShift(firstAudio(next), a1, 44100)), 2)
 	all := append(append([]media.Frame(nil), ep1...), ep2...)
 
@@ -547,6 +550,65 @@ func TestMuxAudioRoundingAnchored(t *testing.T) {
 		}
 		require.Equal(t, uint32(1024), pf[i].RTP[0].Timestamp-pf[i-1].RTP[0].Timestamp, "frame %d", i)
 	}
+
+	t.Run("audio only, anchored on the first frame", func(t *testing.T) {
+		audio := ofKind(demux(t, "h265_aac51.ts"), media.KindAudio)
+		tracks := tracksFor(t, audio)
+		r := feed(t, NewMuxer(tracks, 0, (&fakeClock{t: t0}).now), audio)
+		pf := r.frames[0]
+		require.Len(t, pf, len(audio))
+		for i := 1; i < len(pf); i++ {
+			require.Equal(t, uint32(1024), pf[i].RTP[0].Timestamp-pf[i-1].RTP[0].Timestamp, "frame %d", i)
+		}
+	})
+
+	// A new epoch re-anchors even when it lands within one sample of the
+	// next AU's slot.
+	t.Run("epoch within a sample", func(t *testing.T) {
+		audio := ofKind(demux(t, "h265_aac51.ts"), media.KindAudio)
+		ep1 := withEpoch(audio[:100], 1)
+		tracks := tracksFor(t, ep1)
+		m := NewMuxer(tracks, 0, (&fakeClock{t: t0}).now)
+		r := feed(t, m, ep1)
+		b := ep1[0].DTS
+		last := int64(r.frames[0][99].RTP[0].Timestamp - tracks[0].TSBase)
+		lastPTS := ep1[99].PTS
+		// The PTS step that puts the epoch's anchored value one sample past
+		// the next AU's slot.
+		d := int64(-1)
+		for i := int64(1900); i < 2300 && d < 0; i++ {
+			if roundTicks((lastPTS+i-b)*44100) == last+1025 {
+				d = i
+			}
+		}
+		require.Positive(t, d)
+		ep2 := withEpoch(shift(audio[100:110], lastPTS+d-audio[100].PTS), 2)
+		r = feed(t, m, ep2)
+		assert.Equal(t, tracks[0].TSBase+uint32(last+1025), r.frames[0][0].RTP[0].Timestamp,
+			"re-anchored on the new epoch's PTS, not snapped to the next slot")
+	})
+
+	// A gap of several AUs is not snapped: the frame after it re-anchors on
+	// its PTS, and the steps are exact again from there.
+	t.Run("gap", func(t *testing.T) {
+		audio := ofKind(demux(t, "h265_aac51.ts"), media.KindAudio)
+		const at, lost = 50, 5
+		fed := append(append([]media.Frame(nil), audio[:at]...), audio[at+lost:]...)
+		tracks := tracksFor(t, fed)
+		r := feed(t, NewMuxer(tracks, 0, (&fakeClock{t: t0}).now), fed)
+		pf := r.frames[0]
+		require.Len(t, pf, len(fed))
+		b := fed[0].DTS
+		want := tracks[0].TSBase + uint32(roundTicks((fed[at].PTS-b)*44100))
+		assert.Equal(t, want, pf[at].RTP[0].Timestamp, "re-anchored on the PTS after the gap")
+		step := pf[at].RTP[0].Timestamp - pf[at-1].RTP[0].Timestamp
+		assert.InDelta(t, (lost+1)*1024, step, 2)
+		for i := 1; i < len(pf); i++ {
+			if i != at {
+				require.Equal(t, uint32(1024), pf[i].RTP[0].Timestamp-pf[i-1].RTP[0].Timestamp, "frame %d", i)
+			}
+		}
+	})
 }
 
 // A listed track that starts sending after the session started is carried
