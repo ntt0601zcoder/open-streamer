@@ -24,6 +24,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
 )
 
 const fixture = "../../testdata/fixtures/h264_aac.ts"
@@ -551,6 +552,90 @@ func TestOsdevRTMPPlay(t *testing.T) {
 	var st *rtmp.StatusError
 	require.ErrorAs(t, err, &st)
 	assert.Equal(t, "NetStream.Play.StreamNotFound", st.Code)
+	assert.Equal(t, 0, stop())
+}
+
+func TestOsdevRTSPPlayFlags(t *testing.T) {
+	cfg, code := parseArgs([]string{"-stream", "a=" + fixture}, io.Discard)
+	require.NotNil(t, cfg, code)
+	assert.Empty(t, cfg.rtspPlay, "off by default")
+	assert.Equal(t, "live", cfg.rtspPlayApp)
+	assert.False(t, cfg.rtspUDP)
+
+	cfg, code = parseArgs([]string{"-rtsp-play", ":19354", "-rtsp-play-app", "/tv/", "-rtsp-udp", "-stream", "a=" + fixture}, io.Discard)
+	require.NotNil(t, cfg, code)
+	assert.Equal(t, ":19354", cfg.rtspPlay)
+	assert.Equal(t, "tv", cfg.rtspPlayApp)
+	assert.True(t, cfg.rtspUDP)
+
+	for name, tc := range map[string]struct {
+		args []string
+		flag string
+	}{
+		"no port":          {[]string{"-rtsp-play", "127.0.0.1", "-stream", "a=" + fixture}, "-rtsp-play"},
+		"bad port":         {[]string{"-rtsp-play", ":0", "-stream", "a=" + fixture}, "-rtsp-play"},
+		"empty app":        {[]string{"-rtsp-play", ":19354", "-rtsp-play-app", "/", "-stream", "a=" + fixture}, "-rtsp-play-app"},
+		"udp without play": {[]string{"-rtsp-udp", "-stream", "a=" + fixture}, "-rtsp-udp"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var errw strings.Builder
+			cfg, code := parseArgs(tc.args, &errw)
+			assert.Nil(t, cfg)
+			assert.Equal(t, 2, code)
+			assert.Contains(t, errw.String(), tc.flag)
+		})
+	}
+
+	var sb strings.Builder
+	assert.Equal(t, 2, run(context.Background(), nil, io.Discard, &sb))
+	assert.Contains(t, sb.String(), "-rtsp-play")
+	assert.Contains(t, sb.String(), "-rtsp-udp")
+	assert.Contains(t, sb.String(), "rtsp://<host>:8554/live/<name>")
+}
+
+// Every stream is served to RTSP players on -rtsp-play, over TCP and, with
+// -rtsp-udp, over UDP; an unknown name is answered 404.
+func TestOsdevRTSPPlay(t *testing.T) {
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, ln.Close())
+
+	_, stop := startOsdev(t, []string{
+		"-rtsp-play", fmt.Sprintf("127.0.0.1:%d", port), "-rtsp-udp",
+		"-stream", "demo=" + fixture, "-loop",
+	}, io.Discard)
+	url := fmt.Sprintf("rtsp://127.0.0.1:%d/live/demo", port)
+	for _, transport := range []string{"tcp", "udp"} {
+		var c *rtsp.Client
+		// Right at the start the stream may have only its video live: such
+		// a session ends when audio comes, so wait for both tracks.
+		require.Eventually(t, func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			c, err = rtsp.Dial(ctx, url, rtsp.Config{Transport: transport})
+			if err == nil && len(c.Description().Media) != 2 {
+				_ = c.Close()
+				return false
+			}
+			return err == nil
+		}, 15*time.Second, 100*time.Millisecond, transport)
+		for rtpPkts := 0; rtpPkts < 50; {
+			p, err := c.ReadPacket()
+			require.NoError(t, err, transport)
+			if p.RTP != nil {
+				rtpPkts++
+			}
+		}
+		_ = c.Close()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = rtsp.Dial(ctx, fmt.Sprintf("rtsp://127.0.0.1:%d/live/nope", port), rtsp.Config{})
+	var st *rtsp.StatusError
+	require.ErrorAs(t, err, &st)
+	assert.Equal(t, 404, st.Code)
 	assert.Equal(t, 0, stop())
 }
 

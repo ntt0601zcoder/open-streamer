@@ -42,6 +42,15 @@
 // own play path (<app>/<name>) cannot be played over RTMP; osdev warns about
 // it at startup. Publish under a long random key instead.
 //
+// To serve every stream to RTSP players (ffplay, VLC, ffmpeg), give
+// -rtsp-play an address; a player plays rtsp://<host>:<port>/<app>/<name>,
+// where app is -rtsp-play-app (default live). Players use TCP interleaved
+// RTP; -rtsp-udp also serves UDP, from one RTP/RTCP port pair on the
+// -rtsp-play host:
+//
+//	osdev -stream cam=in.ts -loop -rtsp-play :8554 -rtsp-udp
+//	ffplay -rtsp_transport udp rtsp://<host>:8554/live/cam
+//
 // To push a stream to an RTMP server (a CDN ingest, a restreaming service),
 // give -rtmp-push name=URL, once per target; the URL's query goes to the
 // server as is. A target that fails is retried with a backoff of 1 s to
@@ -53,6 +62,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -63,6 +73,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,9 +86,11 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/rtmpplay"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/rtmppush"
+	"github.com/ntt0601zcoder/open-streamer/internal/output/rtspplay"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
 )
 
 const (
@@ -94,6 +107,7 @@ func main() {
 
 const usageText = `usage: osdev -stream name=URL [-stream ...] [-listen addr] [-layout video,audio] [-loop]
              [-rtmp-play addr [-rtmp-play-app live]] [-rtmp-push name=rtmp://host/app/key ...]
+             [-rtsp-play addr [-rtsp-play-app live] [-rtsp-udp]]
 
 Accept an RTMP publisher (OBS or ffmpeg):
   osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen
@@ -113,6 +127,13 @@ rtmp://<host>:<port>/<app>/<name>, app from -rtmp-play-app (default live):
   ffplay rtmp://<host>:1935/live/<name>
   A publish path is never playable: a stream published at <app>/<name>
   cannot be played (osdev warns), so publish under a long random key.
+
+Serve every stream to RTSP players (ffplay, VLC, ffmpeg) with -rtsp-play,
+over TCP interleaved RTP, and also over UDP with -rtsp-udp (one RTP/RTCP
+port pair on the -rtsp-play host). The play URL is
+rtsp://<host>:<port>/<app>/<name>, app from -rtsp-play-app (default live):
+  osdev -stream cam=in.ts -loop -rtsp-play :8554 -rtsp-udp
+  ffplay -rtsp_transport udp rtsp://<host>:8554/live/<name>
 
 Push a stream to an RTMP server (repeat -rtmp-push for more targets; the
 URL is shown only redacted, and a failing target is retried):
@@ -236,6 +257,11 @@ type config struct {
 	// rtmpPlay is the RTMP play address, empty when RTMP play is off;
 	// rtmpPlayApp the play app, normalised.
 	rtmpPlay, rtmpPlayApp string
+	// rtspPlay is the RTSP play address, empty when RTSP play is off;
+	// rtspPlayApp the play app, slashes trimmed; rtspUDP enables UDP
+	// sessions.
+	rtspPlay, rtspPlayApp string
+	rtspUDP               bool
 	pushes                []*push // in flag order
 }
 
@@ -286,6 +312,9 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	layoutFlag := fs.String("layout", "video,audio", "track layout of every stream: video and audio, comma-separated")
 	rtmpPlay := fs.String("rtmp-play", "", "serve every stream to RTMP players on this address (host:port)")
 	rtmpPlayApp := fs.String("rtmp-play-app", "live", "the app of RTMP play URLs: rtmp://host:port/<app>/<name>")
+	rtspPlay := fs.String("rtsp-play", "", "serve every stream to RTSP players on this address (host:port)")
+	rtspPlayApp := fs.String("rtsp-play-app", "live", "the app of RTSP play URLs: rtsp://host:port/<app>/<name>")
+	rtspUDP := fs.Bool("rtsp-udp", false, "also serve RTSP players over UDP, from one RTP/RTCP port pair on the -rtsp-play host")
 	var streams, pushes streamFlags
 	fs.Var(&streams, "stream", "name=URL (or name=path.ts) to serve; repeat a name to add a lower-priority input")
 	fs.Var(&pushes, "rtmp-push", "name=rtmp://host/app/key: push stream name to an RTMP server; repeatable")
@@ -318,7 +347,24 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 			return nil, 2
 		}
 	}
-	cfg := &config{listen: *listen, layout: layout, rtmpPlay: *rtmpPlay, rtmpPlayApp: app}
+	rtspApp := strings.Trim(*rtspPlayApp, "/")
+	if *rtspPlay != "" {
+		if err := checkHostPort(*rtspPlay); err != nil {
+			_, _ = fmt.Fprintf(stderr, "osdev: -rtsp-play: %v\n", err)
+			return nil, 2
+		}
+		if rtspApp == "" {
+			_, _ = fmt.Fprintln(stderr, "osdev: -rtsp-play-app: empty app")
+			return nil, 2
+		}
+	} else if *rtspUDP {
+		_, _ = fmt.Fprintln(stderr, "osdev: -rtsp-udp needs -rtsp-play")
+		return nil, 2
+	}
+	cfg := &config{
+		listen: *listen, layout: layout, rtmpPlay: *rtmpPlay, rtmpPlayApp: app,
+		rtspPlay: *rtspPlay, rtspPlayApp: rtspApp, rtspUDP: *rtspUDP,
+	}
 	byName := map[string]*source{}
 	for _, s := range streams {
 		name, input, ok := strings.Cut(s, "=")
@@ -370,6 +416,63 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 		cfg.pushes = append(cfg.pushes, &push{stream: name, pusher: p})
 	}
 	return cfg, 0
+}
+
+// checkHostPort accepts host:port with a port from 1 to 65535.
+func checkHostPort(addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("invalid port %q", port)
+	}
+	return nil
+}
+
+// startRTSP serves every stream to RTSP players on cfg.rtspPlay. It returns
+// once the listener (and, with -rtsp-udp, the UDP pair) is bound; stop
+// closes the server and waits for it. Serve errors after that go to stderr.
+func startRTSP(ctx context.Context, cfg *config, lookup func(string) (*hub.Hub, bool), stderr io.Writer) (stop func(), err error) {
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.rtspPlay)
+	if err != nil {
+		return nil, err
+	}
+	var opt rtspplay.Options
+	opt.App = cfg.rtspPlayApp
+	if cfg.rtspUDP {
+		host, _, _ := net.SplitHostPort(cfg.rtspPlay)
+		if host == "" {
+			host = "0.0.0.0"
+		}
+		opt.Server.UDPHost = host
+	}
+	srv := rtspplay.New(lookup, opt)
+	served := make(chan error, 1)
+	//nolint:contextcheck // the server lives until stop, not with ctx
+	go func() { served <- srv.Serve(ln) }()
+	if cfg.rtspUDP {
+		// Serve binds the pair before it accepts; wait for it so that a
+		// bind failure is a startup error.
+		for srv.UDPPorts()[0] == 0 {
+			select {
+			case err := <-served:
+				_ = ln.Close()
+				return nil, err
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if err := <-served; err != nil && !errors.Is(err, rtsp.ErrServerClosed) {
+			_, _ = fmt.Fprintf(stderr, "osdev: -rtsp-play: %v\n", err)
+		}
+	})
+	return func() {
+		_ = srv.Close()
+		wg.Wait()
+	}, nil
 }
 
 // validName reports whether name can name a stream.
@@ -520,6 +623,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	defer unregisterPlay() // idempotent; shutdown calls it first
+	stopRTSP := func() {}
+	if cfg.rtspPlay != "" {
+		stopRTSP, err = startRTSP(ctx, cfg, hubLookup, stderr)
+		if err != nil {
+			unregisterPlay()
+			_ = ln.Close()
+			_, _ = fmt.Fprintf(stderr, "osdev: -rtsp-play: %v\n", err)
+			return 2
+		}
+	}
+	defer func() { stopRTSP() }() // idempotent; shutdown calls it first
 	addr := ln.Addr().String()
 	_, _ = fmt.Fprintf(stdout, "listening on %s\n", addr)
 	base := "http://" + addr
@@ -538,6 +652,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		for _, s := range order {
 			_, _ = fmt.Fprintf(stdout, "rtmp://%s/%s/%s\n", net.JoinHostPort(host, port), cfg.rtmpPlayApp, s.name)
+		}
+	}
+	if cfg.rtspPlay != "" {
+		host, port, _ := net.SplitHostPort(cfg.rtspPlay)
+		if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
+			host = "127.0.0.1"
+		}
+		for _, s := range order {
+			_, _ = fmt.Fprintf(stdout, "rtsp://%s/%s/%s\n", net.JoinHostPort(host, port), cfg.rtspPlayApp, s.name)
 		}
 	}
 
@@ -657,6 +780,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		s.hub.Close()
 	}
 	unregisterPlay() // the players got end of stream; this waits for them
+	stopRTSP()       // the RTSP players got their BYEs; this waits for them
 	sd, done := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer done()
 	if err := srv.Shutdown(sd); err != nil {
