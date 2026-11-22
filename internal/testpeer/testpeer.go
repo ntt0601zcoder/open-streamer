@@ -30,7 +30,10 @@ const EnvMediaMTXRTSP = "OS_MEDIAMTX_RTSP"
 // EnvMediaMTXPull names the environment variable that, set to "1", says that
 // the MediaMTX RTSP listener of OS_MEDIAMTX_RTSP was started with the paths
 // m3b1pull and m3b1pullhevc pulling, on demand, from
-// rtmp://127.0.0.1:19361/live/m3b1pull and …/live/m3b1pullhevc. CI sets it.
+// rtmp://127.0.0.1:19361/live/m3b1pull and …/live/m3b1pullhevc, and the paths
+// m3b2pull and m3b2pullhevc pulling, on demand and over TCP
+// (…_RTSPTRANSPORT=tcp), from rtsp://127.0.0.1:19362/live/m3b2pull and
+// …/live/m3b2pullhevc. CI sets it.
 const EnvMediaMTXPull = "OS_MEDIAMTX_PULL"
 
 // Require returns the path of binary, which must support every listed
@@ -99,7 +102,7 @@ func MediaMTXRTSP(t testing.TB) (rtspAddr string) {
 }
 
 // MediaMTXPull returns the host:port of the MediaMTX RTSP listener whose
-// paths pull our RTMP play output (EnvMediaMTXPull). When OS_MEDIAMTX_PULL is
+// paths pull our RTMP and RTSP play outputs (EnvMediaMTXPull). When OS_MEDIAMTX_PULL is
 // not "1", or OS_MEDIAMTX_RTSP is unset, the test is skipped, or failed when
 // OS_REQUIRE_MEDIAMTX=1.
 func MediaMTXPull(t testing.TB) (rtspHostPort string) {

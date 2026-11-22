@@ -158,14 +158,27 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   keyframes, from stream time only. It decides timing once; HLS-TS, HLS-fMP4,
   DASH and DVR consume the same segments.
 - **TS muxer** (our `pkg/mpegts` writer), **fMP4 writer** (mp4ff `mp4`), **FLV tag
-  codec** with enhanced RTMP for H.265 (`pkg/rtmp`), **RTP** packetisers
-  (pion/rtp for H.264 and H.265, our own RFC 3640 for AAC in `pkg/rtsp`).
+  codec** with enhanced RTMP for H.265 (`pkg/rtmp`), **RTP** packetisers, all
+  our own in `pkg/rtsp` (M3b2): H.264 (RFC 6184, single NAL unit and FU-A),
+  H.265 (RFC 7798, single NAL unit and FU) and RFC 3640 AAC; `pion/rtp` only
+  marshals the packets. pion's payloaders take Annex B input and keep their
+  own parameter-set cache, while ours take the frame's NAL units and send the
+  parameter sets of `Config`, with one meaning of MTU (the RTP payload size)
+  across codecs.
 - **Epoch handling:** what an output does at an epoch change or `Lost > 0`
   (discontinuity tag, new period or init segment, sequence headers resent)
   lives in each muxer rather than in one shared helper, since the actions
   differ per container. The FLV muxer (`internal/mux/flv`, M3b1) sends one
   `onMetaData` and each carried track's sequence header per epoch and after
-  every resync, and resumes after a loss at the next video keyframe.
+  every resync, and resumes after a loss at the next video keyframe. The RTP
+  muxer (`internal/mux/rtp`, M3b2) needs nothing at an epoch change beyond the
+  new parameter sets, which go in band before every keyframe anyway: RTP
+  timestamps follow hub stream time, which is continuous across epochs, so
+  they stay continuous. After a loss it resumes at the next video keyframe,
+  with its parameter sets, and drops the audio presented before it. A codec
+  change on a carried track, a new AAC config, or a frame of a kind the
+  session's SDP lacks ends the session with a BYE per track (the SDP cannot
+  follow; players reconnect and DESCRIBE again).
 - **Parameter sets:** TS, RTP and FLV writers re-insert every parameter set
   from `Config` before each keyframe. No muxer or packetiser library does this
   for us.
@@ -218,7 +231,7 @@ never as dependencies.
 | Concern | Library |
 |---|---|
 | H.264, H.265, AAC parsing (SPS, PPS, VPS, ASC, ADTS); fMP4 boxes | `Eyevinn/mp4ff` |
-| RTP packets and H.264/H.265 packetisers; SDP | `pion/rtp`, `pion/sdp/v3`; used from M2c by `pkg/rtsp` (`pion/rtp` parses RTP everywhere; its payloaders only in tests and `rtsptest`) |
+| RTP packets; SDP | `pion/rtp`, `pion/sdp/v3`; used from M2c by `pkg/rtsp` (`pion/rtp` parses and marshals RTP everywhere; its payloaders only in tests and `rtsptest`: the H.264, H.265 and AAC packetisers of the RTSP output are our own in `pkg/rtsp`, M3b2) |
 | SRT | `datarhei/gosrt` (approved: a standalone library repository); used from M2a by the SRT caller and listener inputs |
 | Transcoding | `asticode/go-astiav` |
 | Transcoder protocol messages | `google.golang.org/protobuf` (M4) |
@@ -232,7 +245,7 @@ Our own libraries:
 | `pkg/unwrap` | Timestamp unwrapping for any bit width: 32-bit RTMP milliseconds, 32-bit RTP | M2 (delivered in M2b) |
 | `pkg/h26x` | Bounded bit reader and our own H.264/H.265 parameter-set and slice-header parsing (it does not use `mp4ff` for them); picture order counts; DTS from PTS and the reorder depth, for RTP sources, which carry PTS only (POC times the reordered access units packed in one PES in the TS demuxer) | M2 (delivered in M2c) |
 | `pkg/rtmp` | Handshake, chunk stream, client and server sessions, FLV tags, enhanced RTMP | M2 (ingest, delivered in M2b), M3 (play, push) |
-| `pkg/rtsp` | RTSP client and server, TCP interleaved and UDP, Basic and Digest authentication, RTCP, RFC 3640 AAC, and `rtsptest`, a scripted server for tests | M2 (client, delivered in M2c), M3 (server) |
+| `pkg/rtsp` | RTSP client and server, TCP interleaved and UDP, Basic and Digest authentication, RTCP (sender reports, BYE), SDP, our own H.264, H.265 and RFC 3640 AAC packetisers, and `rtsptest`, a scripted server for tests | M2 (client, delivered in M2c), M3 (server, delivered in M3b2) |
 | `pkg/hls` | Media and multivariant playlist parsing and writing | M3 (first), used by M2's HLS pull |
 | `pkg/dash` | MPD writing (live, multi-period, SegmentTimeline) and parsing for `osconform` | M3 |
 
@@ -260,9 +273,10 @@ internal/ingest/...    readers, one package per protocol
 internal/rtmpsrv/      the RTMP listener shared by publish inputs and play outputs
 internal/redact/       credential and stream-key redaction for URLs and errors
 internal/segment/      segmenter
-internal/mux/...       fMP4 writer on mp4ff; internal/mux/flv: hub frames to RTMP messages
+internal/mux/...       fMP4 writer on mp4ff; internal/mux/flv: hub frames to RTMP messages;
+                       internal/mux/rtp: hub frames to RTP packets and sender reports
 internal/output/...    one package per output protocol (rtmpplay: RTMP players;
-                       rtmppush: RTMP push-out)
+                       rtmppush: RTMP push-out; rtspplay: RTSP players)
 internal/transcode/    subprocess supervisor and protocol
 internal/stream/       supervisor and failover
 internal/store/        spec storage
@@ -299,7 +313,7 @@ output) follows M2b and M2c. M3b is split in three parts:
 | Part | Contents |
 |---|---|
 | M3b1 ([plan](superpowers/plans/2026-11-17-m3b1-rtmp-out.md), done) | `pkg/rtmp` server play and client publish, an RTMP listener shared by publish inputs and play outputs (players address a stream by its name, never by a publish key), the FLV muxer, RTMP play and RTMP push-out outputs, `osconform` for `rtmp://`, M2b's items carried to M3b |
-| M3b2 | `pkg/rtsp` server, RTP packetisers with parameter sets before keyframes, RTCP sender reports, the RTSP play output, `osconform` for `rtsp://` |
+| M3b2 ([plan](superpowers/plans/2026-11-22-m3b2-rtsp-out.md), done) | `pkg/rtsp` server (TCP interleaved and UDP), our own RTP packetisers with parameter sets before keyframes, RTCP sender reports, the RTP muxer, the RTSP play output, `osconform` for `rtsp://` |
 | M3b3 | The SRT output, EXT-X-GAP (or per-track placeholders) for the R4/R9 rendition alignment, the VLC-class client check and the M3 row's remaining scenarios for every output; M3 done |
 
 M3b1's exit criteria are the M3 row's, for RTMP (VLC-class clients are
@@ -329,6 +343,36 @@ Out of M3b1:
 | Legacy H.265 with FLV codec ID 12 | Non-standard; enhanced RTMP only |
 | More than one target per push-out | Configure several push-outs |
 | A mid-session video or audio codec change | Players and push targets cannot follow one: the play session ends with end of stream (players reconnect) and the push republishes |
+| VLC-class client checks | M3b3, for every output |
+
+M3b2's exit criteria are the M3 row's, for RTSP (VLC-class clients are
+checked in M3b3 for every output): ffmpeg/ffprobe (over TCP and UDP) and
+MediaMTX (as a puller) play our RTSP output for H.264+AAC and H.265+AAC; for
+the RTSP play output, `osconform`/`ReadRTSP` passes the steady-state,
+epoch-change, slow-consumer and B-frame scenarios and ffprobe reads it. The
+`TestM3b2` scenarios in `internal/e2e` prove them (our RTSP pull input reads
+the output with no A/V correction and no offset jump; MediaMTX pulls it on
+demand, over TCP, from port 19362 in CI's host-network RTSP MediaMTX), with
+`TestServerFFprobeTCP`/`TestServerFFprobeUDP` (`pkg/rtsp`) and
+`TestPlayFFmpegDecodes` (`internal/output/rtspplay`) for the exchanges with
+each peer. Over TCP a player that falls behind loses hub frames, not RTP
+packets (dropped frames consume no sequence numbers), so `TestM3b2SlowConsumer`
+maps the frames read back to the hub's to prove each resume is a keyframe.
+libavformat outputs the first access unit of an RTSP stream without a pts
+(its packets carry no byte position), on our output and on MediaMTX's alike,
+so `TestM3b2BFrames` aligns ffprobe's pts at the first packet that has one.
+
+Out of M3b2:
+
+| Item | Reason |
+|---|---|
+| RTSPS and SRTP | Need TLS and its configuration: M5 |
+| Play authentication and tokens | M6 sessions and tokens, as for RTMP play |
+| Multicast; RTSP over HTTP tunnelling | Rare for players; added on demand |
+| PAUSE, seek, `Scale` and `Speed` | Live only: PAUSE is answered 455 |
+| RECORD and ANNOUNCE | Publishing into us over RTSP is not a v2 input |
+| RTSP 2.0 | Players use RTSP 1.0 |
+| A mid-session codec change, a new AAC config or a kind appearing | The SDP cannot follow: the session ends with a BYE per track and players reconnect |
 | VLC-class client checks | M3b3, for every output |
 
 M2 is split in three parts:
@@ -435,7 +479,8 @@ Items accepted for later, not yet placed in a milestone:
   arrival-based sender reports move with their publisher's pacing (a client
   that joins MediaMTX while its publisher starts gets one discontinuity; the
   e2e scenarios that pull from MediaMTX join after it settles, see
-  `TestM2cRTSPMediaMTXH264` and M3b1's `TestM3b1MediaMTXPull`).
+  `TestM2cRTSPMediaMTXH264`, M3b1's `TestM3b1MediaMTXPull` and M3b2's
+  `TestM3b2MediaMTXPull`).
 
 ### Carried from M1
 

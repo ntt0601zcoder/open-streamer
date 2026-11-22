@@ -55,7 +55,9 @@ jobs:
       # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
       # TestM3b1MediaMTXPull (OS_MEDIAMTX_PULL) has it pull our RTMP play
       # output, on demand, from the fixed port 19361 into the paths m3b1pull
-      # (H.264+AAC) and m3b1pullhevc (H.265+AAC).
+      # (H.264+AAC) and m3b1pullhevc (H.265+AAC); TestM3b2MediaMTXPull has it
+      # pull our RTSP play output, on demand and over TCP, from the fixed
+      # port 19362 into the paths m3b2pull and m3b2pullhevc.
       - name: Start MediaMTX for RTSP
         run: |
           docker run -d --rm --name osv2-mtx-m2c --network host \
@@ -66,6 +68,12 @@ jobs:
             -e MTX_PATHS_M3B1PULL_SOURCEONDEMAND=yes \
             -e MTX_PATHS_M3B1PULLHEVC_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pullhevc \
             -e MTX_PATHS_M3B1PULLHEVC_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULL_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pull \
+            -e MTX_PATHS_M3B2PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULL_RTSPTRANSPORT=tcp \
+            -e MTX_PATHS_M3B2PULLHEVC_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pullhevc \
+            -e MTX_PATHS_M3B2PULLHEVC_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULLHEVC_RTSPTRANSPORT=tcp \
             bluenviron/mediamtx:1.21.3
           for _ in $(seq 50); do
             nc -z 127.0.0.1 18554 && exit 0
@@ -110,7 +118,9 @@ jobs:
       # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
       # TestM3b1MediaMTXPull (OS_MEDIAMTX_PULL) has it pull our RTMP play
       # output, on demand, from the fixed port 19361 into the paths m3b1pull
-      # (H.264+AAC) and m3b1pullhevc (H.265+AAC).
+      # (H.264+AAC) and m3b1pullhevc (H.265+AAC); TestM3b2MediaMTXPull has it
+      # pull our RTSP play output, on demand and over TCP, from the fixed
+      # port 19362 into the paths m3b2pull and m3b2pullhevc.
       - name: Start MediaMTX for RTSP
         run: |
           docker run -d --rm --name osv2-mtx-m2c --network host \
@@ -121,6 +131,12 @@ jobs:
             -e MTX_PATHS_M3B1PULL_SOURCEONDEMAND=yes \
             -e MTX_PATHS_M3B1PULLHEVC_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pullhevc \
             -e MTX_PATHS_M3B1PULLHEVC_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULL_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pull \
+            -e MTX_PATHS_M3B2PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULL_RTSPTRANSPORT=tcp \
+            -e MTX_PATHS_M3B2PULLHEVC_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pullhevc \
+            -e MTX_PATHS_M3B2PULLHEVC_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULLHEVC_RTSPTRANSPORT=tcp \
             bluenviron/mediamtx:1.21.3
           for _ in $(seq 50); do
             nc -z 127.0.0.1 18554 && exit 0
