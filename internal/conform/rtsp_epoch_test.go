@@ -253,8 +253,11 @@ func retime(m muxed, au int, ts func(old uint32) uint32) muxed {
 func TestReadRTSPDroppedByDTS(t *testing.T) {
 	first := uint32(muxBases[0])
 	// A picture presented before the epoch's start keyframe.
+	// An H.264 picture after an IDR is no leading picture: its DTS cannot be
+	// derived.
 	lead := retime(cleanMux(t), 3, func(uint32) uint32 { return first - 100 })
-	assert.Contains(t, ruleNames(lead.replay(false)), RuleRASL)
+	assert.Contains(t, ruleNames(lead.replay(false)), RuleDTS)
+	assert.NotContains(t, ruleNames(lead.replay(false)), RuleRASL)
 	// A picture whose PTS is at or below the last DTS.
 	m := cleanMux(t)
 	var keyTS uint32
@@ -266,6 +269,56 @@ func TestReadRTSPDroppedByDTS(t *testing.T) {
 	}
 	late := retime(m, 5, func(uint32) uint32 { return keyTS + 1 })
 	assert.Contains(t, ruleNames(late.replay(false)), RuleDTS)
+}
+
+// retype sets the NAL unit type of every VCL NAL unit of the nth H.265
+// video access unit (decode order).
+func retype(m muxed, au int, typ byte) muxed {
+	var olds []uint32
+	for _, p := range m.pkts {
+		if p.RTP != nil && p.Track == 0 && (len(olds) == 0 || olds[len(olds)-1] != p.RTP.Timestamp) {
+			olds = append(olds, p.RTP.Timestamp)
+		}
+	}
+	for _, p := range m.pkts {
+		if p.RTP == nil || p.Track != 0 || p.RTP.Timestamp != olds[au] {
+			continue
+		}
+		q := *p.RTP
+		pl := append([]byte(nil), q.Payload...)
+		switch nt := (pl[0] >> 1) & 0x3f; {
+		case nt == 49: // FU: the type is in the FU header
+			pl[2] = pl[2]&0xc0 | typ
+		case nt < 32:
+			pl[0] = pl[0]&0x81 | typ<<1
+		}
+		q.Payload = pl
+		*p.RTP = q
+	}
+	return m
+}
+
+// A leading H.265 picture, presented before the epoch's start keyframe, is
+// a RuleRASL violation only when it is RASL: a RADL picture is dropped
+// silently, and any other picture is a RuleDTS violation.
+func TestReadRTSPLeadingPictures(t *testing.T) {
+	hevc := func() muxed {
+		return muxFrames(t, newRTSPHandler(t, "h265_aac51.ts", rtspFaults{}).frames)
+	}
+	first := uint32(muxBases[0])
+	early := func(uint32) uint32 { return first - 100 }
+	require.Empty(t, hevc().replay(false).Violations)
+
+	rasl := retime(retype(hevc(), 3, 8), 3, early).replay(false)
+	assert.Contains(t, ruleNames(rasl), RuleRASL)
+	assert.NotContains(t, ruleNames(rasl), RuleDTS)
+
+	radl := retime(retype(hevc(), 3, 6), 3, early).replay(false)
+	assert.Empty(t, radl.Violations, "a RADL leading picture is dropped silently")
+
+	trail := retime(retype(hevc(), 3, 1), 3, early).replay(false)
+	assert.Contains(t, ruleNames(trail), RuleDTS)
+	assert.NotContains(t, ruleNames(trail), RuleRASL)
 }
 
 func TestStripTransport(t *testing.T) {

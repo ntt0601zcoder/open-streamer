@@ -704,6 +704,23 @@ func isFiller(codec media.Codec, n []byte) bool {
 	return typ == 9 || typ == 12
 }
 
+// isRADL reports an H.265 access unit with a RADL slice (NAL types 6 and
+// 7): a leading picture that decodes without the pictures before the
+// keyframe.
+func isRADL(codec media.Codec, data [][]byte) bool {
+	if codec != media.CodecH265 {
+		return false
+	}
+	for _, n := range data {
+		if len(n) > 0 {
+			if typ := (n[0] >> 1) & 0x3f; typ == 6 || typ == 7 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (r *rtspCapture) video(t *rtspTrack, au rtsp.AU) {
 	v := t.v
 	pts := t.pts90(au.Timestamp)
@@ -744,8 +761,12 @@ func (r *rtspCapture) video(t *rtspTrack, au rtsp.AU) {
 	if st == h26x.DTSDrop && wasKeyed {
 		after := v.dts.Stats()
 		switch {
+		case after.Leading > before.Leading && rasl:
+			r.b.violate(RuleRASL, t.track, "RASL picture at PTS %d is presented before the epoch's start keyframe", pts)
+		case after.Leading > before.Leading && isRADL(v.codec, data):
+			// A decodable leading picture: dropped without a DTS, no fault.
 		case after.Leading > before.Leading:
-			r.b.violate(RuleRASL, t.track, "picture at PTS %d is presented before the epoch's start keyframe", pts)
+			r.b.violate(RuleDTS, t.track, "picture at PTS %d is presented before the epoch's start keyframe but is no leading picture: its DTS cannot be derived", pts)
 		case after.Late > before.Late:
 			r.b.violate(RuleDTS, t.track, "picture at PTS %d is at or below the previous DTS: its DTS cannot be derived", pts)
 		}
