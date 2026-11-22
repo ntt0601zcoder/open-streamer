@@ -273,8 +273,9 @@ func (d *aacDepack) emit(ts uint32, frame []byte, arrival time.Time) AU {
 func (d *aacDepack) continueFrag(p *rtp.Packet, hs []aacHeader, data []byte, arrival time.Time) (out []AU, handled bool) {
 	if len(hs) != 1 || p.Timestamp != d.fragTS || hs[0].size != d.fragSize ||
 		len(d.frag)+len(data) > d.fragSize {
+		// The abandoned fragment is never emitted; complete AUs after it
+		// are self-delimiting, so nothing is marked Lost.
 		d.dropFrag()
-		d.lost = true
 		return nil, false
 	}
 	d.frag = append(d.frag, data...)

@@ -261,3 +261,25 @@ func TestAACAuxBounds(t *testing.T) {
 func TestSamplesPerAUHighClock(t *testing.T) {
 	assert.Equal(t, uint32(1024*8000000/44100), samplesPerAU(hbr([]byte{0x12, 0x10}), 8000000))
 }
+
+// TestAACAbandonedFragmentNextAUIntact checks that a fragment abandoned by a
+// packet of another AU does not mark the next complete AU Lost: that AU is
+// self-delimiting.
+func TestAACAbandonedFragmentNextAUIntact(t *testing.T) {
+	d, err := NewDepacketizer(aacMedia(hbr([]byte{0x11, 0x90}), 48000), 1<<20)
+	require.NoError(t, err)
+	frame := frameOf(100, 7)
+	hdr := func(size int) []byte { v := size << 3; return []byte{0, 16, byte(v >> 8), byte(v)} }
+
+	for name, abandon := range map[string]*rtp.Packet{
+		"new timestamp": pkt(2, 2000, false, append(hdr(100), frame[:40]...)),
+		"other size":    pkt(2, 1000, false, append(hdr(50), frameOf(20, 3)...)),
+	} {
+		assert.Empty(t, d.Push(pkt(1, 1000, false, append(hdr(100), frame[:40]...)), testT0), name)
+		assert.Empty(t, d.Push(abandon, testT0), name)
+		out := d.Push(pkt(3, 5000, true, rawAAC(frameOf(9, 1))), testT0)
+		require.Len(t, out, 1, name)
+		assert.False(t, out[0].Lost, name)
+		assert.Equal(t, frameOf(9, 1), out[0].Frames[0], name)
+	}
+}

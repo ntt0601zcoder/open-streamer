@@ -543,15 +543,16 @@ func TestRTPFramesSync(t *testing.T) {
 
 	t.Run("noisy SRs", func(t *testing.T) {
 		srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(39, 40)))
-		// Video with B frames (R 2, 40 ms frames). The video SRs map RTP to
-		// NTP with up to ±150 ms of jitter, as SRs built from arrival do;
-		// the audio SRs are exact. Six rounds.
+		// Video with B frames (measured reordering depth 1, 40 ms frames, so
+		// the lead is 40 ms). The video SRs map RTP to NTP with up to ±85 ms
+		// of jitter, within the 50 ms first threshold plus the lead, as SRs
+		// built from arrival are; the audio SRs are exact. Six rounds.
 		rng := rand.New(rand.NewPCG(41, 42))
 		steps := make([]step, 0, 6)
 		for k := range 6 {
-			j := time.Duration(rng.IntN(301)-150) * ms
+			j := time.Duration(rng.IntN(171)-85) * ms
 			if k < 2 {
-				j = []time.Duration{150 * ms, -150 * ms}[k] // the extremes, opposite sides
+				j = []time.Duration{85 * ms, -85 * ms}[k] // the extremes, opposite sides
 			}
 			steps = append(steps, step{at: 30 + 30*k, srcs: []int{0, 1}, skew: []time.Duration{j, 0}, want: false})
 		}
@@ -564,9 +565,7 @@ func TestRTPFramesSync(t *testing.T) {
 		st := r.stats()
 		assert.Zero(t, st["sync_corrected"])
 		assert.Zero(t, st["sync_jumps"])
-		// +150 ms is a candidate, −150 ms replaces it (beyond, other side),
-		// and the next pair, within the threshold, drops that one.
-		assert.Equal(t, uint64(2), st["sync_unconfirmed"])
+		assert.Zero(t, st["sync_unconfirmed"], "no pair is beyond the threshold")
 	})
 
 	t.Run("stale pairs are not evaluated", func(t *testing.T) {
@@ -1147,4 +1146,143 @@ func TestRTPFramesFarSRIgnored(t *testing.T) {
 	r.senderReport(1, a.sr(now, 0))
 	assert.True(t, r.tracks[1].sr.ok, "a near SR is taken")
 	assert.Equal(t, uint64(2), r.stats()["sr_ignored"])
+}
+
+// highSPSNoVUI is a High-profile H.264 SPS without VUI: h26x.ReorderOf
+// assumes a reorder depth of 2 for it.
+func highSPSNoVUI() []byte {
+	var bits []bool
+	put := func(v uint32, n int) {
+		for i := n - 1; i >= 0; i-- {
+			bits = append(bits, v>>uint(i)&1 == 1)
+		}
+	}
+	ue := func(v uint32) {
+		v++
+		n := 0
+		for x := v; x > 1; x >>= 1 {
+			n++
+		}
+		put(0, n)
+		put(v, n+1)
+	}
+	put(100, 8) // profile_idc High
+	put(0, 8)
+	put(30, 8)
+	ue(0) // sps id
+	ue(1) // chroma_format_idc
+	ue(0) // bit depths
+	ue(0)
+	put(0, 1) // qpprime
+	put(0, 1) // no scaling matrix
+	ue(0)     // log2_max_frame_num_minus4
+	ue(0)     // poc type 0
+	ue(0)     // log2_max_poc_lsb_minus4
+	ue(2)     // max_num_ref_frames
+	put(0, 1)
+	ue(19) // 320 px
+	ue(14) // 240 px
+	put(1, 1)
+	put(1, 1)
+	put(0, 1) // no cropping
+	put(0, 1) // no VUI
+	put(1, 1) // rbsp stop bit
+	for len(bits)%8 != 0 {
+		bits = append(bits, false)
+	}
+	out := []byte{0x67}
+	for i := 0; i < len(bits); i += 8 {
+		var b byte
+		for j := range 8 {
+			b <<= 1
+			if bits[i+j] {
+				b |= 1
+			}
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+func TestRTPFramesLeadMeasured(t *testing.T) {
+	t.Run("no reordering keeps the lead 0", func(t *testing.T) {
+		sps := highSPSNoVUI()
+		sets, ok := h26x.ParseSPS(h26x.H264, sps)
+		require.NoError(t, ok)
+		red, assumed := h26x.ReorderOf(h26x.H264, sets)
+		require.True(t, assumed)
+		require.Equal(t, 2, red)
+
+		srcs, desc := rtpFixture(t, "h264_aac.ts", false, true, rand.New(rand.NewPCG(51, 52)))
+		cfg, err := media.NewH264Config([][]byte{sps}, [][]byte{baselinePPS})
+		require.NoError(t, err)
+		v := &rtpSrc{
+			m:      rtsp.Media{Index: 0, Codec: rtsp.CodecH264, Payload: 96, ClockRate: 90000, ParamSets: [][]byte{sps, baselinePPS}},
+			base:   srcs[0].base,
+			origin: srcs[0].origin,
+			ssrc:   0x1000,
+		}
+		for k := range len(srcs[0].frames) {
+			pts := v.origin + int64(k)*3600
+			data := [][]byte{nalP}
+			if k%10 == 0 {
+				data = [][]byte{nalIDR}
+			}
+			v.frames = append(v.frames, media.Frame{Config: cfg, PTS: pts, DTS: pts, Key: k%10 == 0, Data: data})
+		}
+		srcs[0] = v
+		desc.Media[0] = v.m
+
+		aus := rtpAUs(t, srcs, srcArrival)
+		r := newRTPFrames(desc, nil, &media.ConfigCache{})
+		_, breaks := rtpRun(t, r, aus[:60])
+		require.Empty(t, breaks)
+		assert.Zero(t, r.lead(), "no frame has been reordered")
+		mid := v.frames[len(v.frames)/4].PTS
+		// Audio is 60 ms off: above the 50 ms threshold with no lead, below
+		// the 130 ms the assumed depth would give.
+		for k, want := range []bool{false, true} {
+			disc := r.senderReport(1, srcs[1].sr(mid+int64(k)*3600, 60*time.Millisecond))
+			disc = r.senderReport(0, srcs[0].sr(mid+int64(k)*3600, 0)) || disc
+			require.Equal(t, want, disc, "SR round %d", k)
+			_, brk := rtpRun(t, r, aus[60+k*10:70+k*10])
+			require.Empty(t, brk)
+		}
+		assert.Equal(t, uint64(1), r.stats()["sync_corrected"])
+	})
+
+	t.Run("pyramid", func(t *testing.T) {
+		srcs, desc := rtpFixture(t, "h264_pyramid.ts", false, false, rand.New(rand.NewPCG(53, 54)))
+		desc.Media = desc.Media[:1]
+		frames := srcs[0].frames
+		// The measured depth of the source in decode order.
+		want := 0
+		first := -1
+		for k, f := range frames {
+			d := 0
+			for _, e := range frames[:k] {
+				if e.PTS > f.PTS {
+					d++
+				}
+			}
+			want = max(want, d)
+			if d > 0 && first < 0 {
+				first = k
+			}
+		}
+		require.Positive(t, want, "the fixture reorders")
+		r := newRTPFrames(desc, nil, &media.ConfigCache{})
+		aus := rtpAUs(t, srcs, srcArrival)
+		for k, au := range aus {
+			_, _, err := r.push(au)
+			require.NoError(t, err)
+			if k < first {
+				require.Zero(t, r.lead(), "AU %d: nothing reordered yet", k)
+			}
+		}
+		assert.Equal(t, int64(want)*3600, r.lead())
+
+		require.True(t, r.restart(0))
+		assert.Zero(t, r.lead(), "the lead resets with the timeline")
+	})
 }

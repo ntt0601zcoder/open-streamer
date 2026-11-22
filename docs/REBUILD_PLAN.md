@@ -436,9 +436,6 @@ Items accepted for later, not yet placed in a milestone:
   that joins MediaMTX while its publisher starts gets one discontinuity; the
   e2e scenarios that pull from MediaMTX join after it settles, see
   `TestM2cRTSPMediaMTXH264` and M3b1's `TestM3b1MediaMTXPull`).
-- **M2c leftovers:** an abandoned AAC fragment marks the next complete AU
-  lost; the sync threshold's reorder lead uses the SPS reorder depth rather
-  than the measured one.
 
 ### Carried from M1
 

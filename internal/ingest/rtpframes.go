@@ -69,10 +69,11 @@ var ntpEpoch = time.Unix(-2208988800, 0)
 // track's SR offset is evaluated only on a fresh pair: both the reference's
 // SR and its own were updated since its last evaluation. Senders such as
 // MediaMTX build SRs from packet arrival, so each pair carries the video
-// reorder lead as jitter (up to R frames). The thresholds are 50 ms for the
+// reorder lead as jitter (up to the measured depth in frames). The thresholds are 50 ms for the
 // first evaluation after the track was placed provisionally and 100 ms
-// after that, each plus the lead: the reference's R times its frame
-// duration, 0 for an audio reference. A pair beyond the threshold is a
+// after that, each plus the lead: the reference's measured reordering depth
+// times its frame duration, 0 until a frame is reordered and for an audio
+// reference. A pair beyond the threshold is a
 // candidate; the offset changes only when the next fresh pair is beyond it
 // too, on the same side, and within the threshold of the candidate: then
 // the latest pair's offset applies (sync_corrected for the first change,
@@ -193,7 +194,41 @@ type rtpVideo struct {
 	recreate bool // frameDur changed: build a new extractor at its next reset
 	emitted  bool // the extractor returned a DTS since its creation or reset
 	seen     h26x.DTSStats
+
+	ro reorderMeter
 }
+
+// rtpReorderWindow is how many recent PTS values a reorderMeter keeps. The
+// depth of a stream is at most 16 in practice.
+const rtpReorderWindow = 32
+
+// reorderMeter measures the reordering of a timeline: the depth of a frame
+// is the number of earlier frames (in decode order) with a greater PTS, and
+// the reorder of the timeline is the greatest depth seen. It looks at the
+// last rtpReorderWindow frames only.
+type reorderMeter struct {
+	win   [rtpReorderWindow]int64
+	n     int // frames pushed, saturating at len(win)
+	next  int
+	depth int
+}
+
+// observe adds the PTS of the next frame in decode order.
+func (m *reorderMeter) observe(pts int64) {
+	d := 0
+	for i := range m.n {
+		if m.win[i] > pts {
+			d++
+		}
+	}
+	m.depth = max(m.depth, d)
+	m.win[m.next] = pts
+	m.next = (m.next + 1) % len(m.win)
+	m.n = min(m.n+1, len(m.win))
+}
+
+// reset starts a new timeline.
+func (m *reorderMeter) reset() { *m = reorderMeter{} }
 
 // newRTPFrames returns the converter of a session described by desc. info
 // is the PLAY response's RTP-Info, one entry per media (Client.RTPInfo);
@@ -448,8 +483,10 @@ func (r *rtpFrames) alignSR(t *rtpTrack) bool {
 	return r.report(t)
 }
 
-// lead is the reference's reorder lead in 90 kHz ticks: R frame durations,
-// the jitter that SRs built from video arrival carry. It is 0 for an audio
+// lead is the reference's reorder lead in 90 kHz ticks: the greatest
+// measured reordering depth of its current timeline times its frame
+// duration, the jitter that SRs built from video arrival carry. It is 0
+// until a frame arrives with a PTS below an earlier one's, and for an audio
 // reference.
 func (r *rtpFrames) lead() int64 {
 	v := r.ref.v
@@ -460,7 +497,7 @@ func (r *rtpFrames) lead() int64 {
 	if dur <= 0 {
 		dur = rtpDefaultFrameDur
 	}
-	return int64(v.reorder) * dur
+	return int64(v.ro.depth) * dur
 }
 
 // alignOthers applies the SR pair of every track but the reference.
@@ -687,8 +724,10 @@ func (r *rtpFrames) video(t *rtpTrack, au rtsp.AU, pts int64) (out []Frame, brk 
 			r.newExtractor(v)
 		}
 		v.emitted = false
+		v.ro.reset()
 		dts, st = v.dts.Extract(pts, key)
 	}
+	v.ro.observe(pts)
 	r.dtsStats(v)
 	if st != h26x.DTSOK {
 		return nil, brk, nil
@@ -822,6 +861,7 @@ func (r *rtpFrames) newExtractor(v *rtpVideo) {
 // resetDTS starts a new timeline on the extractor, recreating it when the
 // frame duration changed.
 func (r *rtpFrames) resetDTS(v *rtpVideo) {
+	v.ro.reset()
 	switch {
 	case v.dts == nil:
 	case v.recreate:
