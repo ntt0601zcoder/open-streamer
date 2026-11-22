@@ -11,7 +11,8 @@
 // live while stream time minus the DTS of that track's last frame is at most
 // LiveWindow (10 s). A track that has sent nothing for longer than that has
 // ended: it no longer holds audio back, and it no longer anchors the cache.
-// It becomes live again with its next frame.
+// It becomes live again with its next frame. TrackConfigs applies the same
+// window to every track, audio included.
 //
 // # Gates
 //
@@ -50,7 +51,8 @@
 // track, the cache holds the frames whose DTS is less than
 // Options.AudioCacheTicks behind stream time. Subscribe replays the cache
 // through the new subscriber's gates when it fits in the queue; otherwise
-// the subscriber waits, gated, for the next keyframes.
+// the subscriber waits, gated, for the next keyframes. SubscribeLive never
+// replays the cache.
 //
 // The hub starts no goroutines. Every state change and channel operation
 // happens under one mutex, so Close never races a send.
@@ -63,8 +65,8 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
 
-// LiveWindow is how long, in stream time, a video track stays live after its
-// last frame.
+// LiveWindow is how long, in stream time, a track stays live after its last
+// frame.
 const LiveWindow = 10 * media.ClockRate
 
 const (
@@ -120,6 +122,20 @@ type videoTrack struct {
 	lastDTS int64
 }
 
+// TrackConfig is the last config written on one live track.
+type TrackConfig struct {
+	Track  int
+	Kind   media.Kind
+	Config *media.TrackConfig
+}
+
+// trackInfo is the hub's record of one track with a config, for
+// TrackConfigs.
+type trackInfo struct {
+	cfg     *media.TrackConfig
+	lastDTS int64
+}
+
 // Hub fans frames out to subscribers. It is safe for concurrent use.
 type Hub struct {
 	gopCacheFrames  int
@@ -131,11 +147,12 @@ type Hub struct {
 	closed  bool
 	subs    []*Sub
 	video   map[int]*videoTrack
-	latest  int64 // stream time: the largest DTS written
-	started bool  // latest is set
-	keyed   bool  // a video keyframe was written
-	audio   bool  // an audio frame was written
-	anchor  int   // track the cache is anchored on, or -1 for the audio cache
+	tracks  map[int]*trackInfo // every track written with a config
+	latest  int64              // stream time: the largest DTS written
+	started bool               // latest is set
+	keyed   bool               // a video keyframe was written
+	audio   bool               // an audio frame was written
+	anchor  int                // track the cache is anchored on, or -1 for the audio cache
 	cache   []media.Frame
 	anchors []media.Anchor // oldest first, at most maxAnchors
 }
@@ -161,6 +178,7 @@ func New(opt Options) *Hub {
 		gopCacheFrames:  opt.GOPCacheFrames,
 		audioCacheTicks: opt.AudioCacheTicks,
 		video:           map[int]*videoTrack{},
+		tracks:          map[int]*trackInfo{},
 		anchor:          -1,
 		done:            make(chan struct{}),
 	}
@@ -184,6 +202,14 @@ func (h *Hub) Write(f media.Frame) {
 	if !h.started || f.DTS > h.latest {
 		h.latest = f.DTS
 		h.started = true
+	}
+	if f.Config != nil {
+		ti := h.tracks[f.Track]
+		if ti == nil {
+			ti = &trackInfo{}
+			h.tracks[f.Track] = ti
+		}
+		ti.cfg, ti.lastDTS = f.Config, f.DTS
 	}
 	switch f.Kind() {
 	case media.KindVideo:
@@ -213,7 +239,39 @@ func (h *Hub) Subscribe(name string, queue int) *Sub {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.subscribe(name, queue)
+	return h.subscribe(name, queue, true)
+}
+
+// SubscribeLive is Subscribe without the cache replay: every video track
+// starts gated at its next keyframe written after the call, and audio waits
+// for them; on a hub with no live video track the subscriber starts at the
+// next audio frame. Queue 0 means 1024.
+func (h *Hub) SubscribeLive(name string, queue int) *Sub {
+	if queue <= 0 {
+		queue = defaultQueue
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.subscribe(name, queue, false)
+}
+
+// TrackConfigs returns, in track order, the last config written on each
+// track whose last DTS is at most LiveWindow behind stream time. It does not
+// depend on the cache. A closed hub has none.
+func (h *Hub) TrackConfigs() []TrackConfig {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	var out []TrackConfig
+	for id, ti := range h.tracks {
+		if h.latest-ti.lastDTS <= LiveWindow {
+			out = append(out, TrackConfig{Track: id, Kind: ti.cfg.Codec.Kind(), Config: ti.cfg})
+		}
+	}
+	slices.SortFunc(out, func(a, b TrackConfig) int { return a.Track - b.Track })
+	return out
 }
 
 // SubscribeCached is Subscribe with a queue of max(minQueue, cached frames +
@@ -225,7 +283,7 @@ func (h *Hub) SubscribeCached(name string, minQueue int) *Sub {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.subscribe(name, max(minQueue, len(h.cache)+cachedHeadroom))
+	return h.subscribe(name, max(minQueue, len(h.cache)+cachedHeadroom), true)
 }
 
 // Live reports whether the hub can start a subscriber: a video keyframe has
@@ -237,16 +295,16 @@ func (h *Hub) Live() bool {
 	return !h.closed && (h.keyed || h.audio && len(h.video) == 0)
 }
 
-// subscribe adds a subscriber with a queue of length queue. Called with h.mu
-// held.
-func (h *Hub) subscribe(name string, queue int) *Sub {
+// subscribe adds a subscriber with a queue of length queue, replaying the
+// cache when replay is set and the cache fits. Called with h.mu held.
+func (h *Hub) subscribe(name string, queue int, replay bool) *Sub {
 	s := &Sub{h: h, name: name, ch: make(chan Delivery, queue), gates: map[int]trackGate{}}
 	if h.closed {
 		s.closed = true
 		close(s.ch)
 		return s
 	}
-	if len(h.cache) <= queue {
+	if replay && len(h.cache) <= queue {
 		for _, f := range h.cache {
 			if !h.admit(s, f) {
 				continue

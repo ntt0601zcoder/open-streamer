@@ -716,3 +716,94 @@ func TestHubDone(t *testing.T) {
 	}
 	assert.False(t, h.Live())
 }
+
+// TrackConfigs lists the last config written on each track, in track order,
+// while the track's last DTS is within LiveWindow of stream time. It does
+// not depend on the cache.
+func TestHubTrackConfigs(t *testing.T) {
+	h264b := &media.TrackConfig{Codec: media.CodecH264, Width: 640}
+	h := New(Options{GOPCacheFrames: 4})
+	assert.Empty(t, h.TrackConfigs(), "empty hub")
+
+	h.Write(vid(0, 0, true))
+	assert.Equal(t, []TrackConfig{{Track: 0, Kind: media.KindVideo, Config: h264}}, h.TrackConfigs(),
+		"just after the first keyframe: video only")
+	h.Write(aud(1, 0))
+	assert.Equal(t, []TrackConfig{
+		{Track: 0, Kind: media.KindVideo, Config: h264},
+		{Track: 1, Kind: media.KindAudio, Config: aac},
+	}, h.TrackConfigs(), "both kinds once audio is written")
+
+	// A GOP longer than the cache empties it; the configs stay.
+	for i := 1; i < 10; i++ {
+		h.Write(vid(0, int64(i)*vDur, false))
+	}
+	assert.Len(t, h.TrackConfigs(), 2, "over-long GOP")
+
+	// A new config replaces the track's entry.
+	h.Write(media.Frame{Track: 0, Config: h264b, PTS: 10 * vDur, DTS: 10 * vDur, Key: true})
+	got := h.TrackConfigs()
+	require.Len(t, got, 2)
+	assert.Same(t, h264b, got[0].Config)
+
+	// Audio silent for exactly LiveWindow is still listed; one tick more and
+	// it drops out. Stream time is the largest DTS, so the video drives it.
+	h.Write(vid(0, LiveWindow, false))
+	assert.Len(t, h.TrackConfigs(), 2, "boundary included")
+	h.Write(vid(0, LiveWindow+1, false))
+	assert.Equal(t, []TrackConfig{{Track: 0, Kind: media.KindVideo, Config: h264}}, h.TrackConfigs(),
+		"silent audio dropped; the last config written on track 0 is h264 again")
+	// It is listed again with its next frame.
+	h.Write(aud(1, LiveWindow+2))
+	assert.Len(t, h.TrackConfigs(), 2, "audio back")
+
+	// Frames without a config are not tracks.
+	h.Write(media.Frame{Track: 5, PTS: LiveWindow + 3, DTS: LiveWindow + 3})
+	assert.Len(t, h.TrackConfigs(), 2)
+
+	h.Close()
+	assert.Empty(t, h.TrackConfigs(), "closed")
+}
+
+// SubscribeLive never replays the cache: the first video frame delivered is
+// a keyframe written after the call, and audio waits for it. On an
+// audio-only hub it starts at the next audio frame.
+func TestHubSubscribeLive(t *testing.T) {
+	h := New(Options{})
+	defer h.Close()
+	dts := writeGOP(h, 0, 5)
+	h.Write(aud(1, dts))
+
+	s := h.SubscribeLive("live", 16)
+	defer s.Close()
+	assert.Equal(t, 16, cap(s.ch))
+	requireEmpty(t, s) // no replay
+	h.Write(vid(0, dts, false))
+	h.Write(aud(1, dts))
+	requireEmpty(t, s) // gated until the next keyframe
+	dts += vDur
+	h.Write(vid(0, dts, true))
+	h.Write(aud(1, dts))
+	got := drain(t, s, 2)
+	assert.True(t, got[0].Frame.Key)
+	assert.Equal(t, dts, got[0].Frame.DTS)
+	assert.Zero(t, got[0].Lost, "a new subscriber has lost nothing")
+	assert.Equal(t, media.KindAudio, got[1].Frame.Kind())
+
+	assert.Equal(t, 1024, cap(h.SubscribeLive("default", 0).ch), "0 means the Subscribe default")
+
+	a := New(Options{})
+	defer a.Close()
+	for i := range 10 {
+		a.Write(aud(0, int64(i)*aDur))
+	}
+	as := a.SubscribeLive("audio", 4)
+	requireEmpty(t, as)
+	a.Write(aud(0, 10*aDur))
+	d := recv(t, as)
+	assert.Equal(t, int64(10*aDur), d.Frame.DTS)
+
+	a.Close()
+	_, ok := <-a.SubscribeLive("late", 4).C()
+	assert.False(t, ok, "closed hub: closed channel")
+}
