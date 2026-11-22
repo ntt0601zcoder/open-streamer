@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 
@@ -43,7 +44,7 @@ func BuildSDP(origin string, tracks []TrackDesc) ([]byte, error) {
 			SessionID:      binary.BigEndian.Uint64(id[:]) >> 1,
 			SessionVersion: 0,
 			NetworkType:    "IN",
-			AddressType:    "IP4",
+			AddressType:    originAddrType(origin),
 			UnicastAddress: origin,
 		},
 		SessionName:           "Open Streamer",
@@ -73,21 +74,27 @@ func buildMedia(i int, t TrackDesc) (*sdp.MediaDescription, error) {
 	var rtpmap, fmtp string
 	switch t.Codec {
 	case CodecH264:
-		if len(t.ParamSets) < 2 || len(t.ParamSets[0]) < 4 {
+		sets := groupSets(t.ParamSets, func(n []byte) byte { return n[0] & 0x1f })
+		sps, pps := sets[h264NALSPS], sets[h264NALPPS]
+		if len(sps) == 0 || len(pps) == 0 || len(sps[0]) < 4 {
 			return nil, fmt.Errorf("rtsp: build sdp: track %d: H.264 needs SPS and PPS", i)
 		}
 		md.MediaName.Media = "video"
 		rtpmap = "H264/" + strconv.FormatUint(uint64(t.ClockRate), 10)
-		fmtp = fmt.Sprintf("packetization-mode=1;profile-level-id=%s;sprop-parameter-sets=%s,%s",
-			hex.EncodeToString(t.ParamSets[0][1:4]), b64(t.ParamSets[0]), b64(t.ParamSets[1]))
+		fmtp = fmt.Sprintf("packetization-mode=1;profile-level-id=%s;sprop-parameter-sets=%s",
+			hex.EncodeToString(sps[0][1:4]), b64All(t.ParamSets, func(n []byte) bool {
+				k := n[0] & 0x1f
+				return k == h264NALSPS || k == h264NALPPS
+			}))
 	case CodecH265:
-		if len(t.ParamSets) < 3 {
+		sets := groupSets(t.ParamSets, func(n []byte) byte { return (n[0] >> 1) & 0x3f })
+		vps, sps, pps := sets[h265NALVPS], sets[h265NALSPS], sets[h265NALPPS]
+		if len(vps) == 0 || len(sps) == 0 || len(pps) == 0 {
 			return nil, fmt.Errorf("rtsp: build sdp: track %d: H.265 needs VPS, SPS and PPS", i)
 		}
 		md.MediaName.Media = "video"
 		rtpmap = "H265/" + strconv.FormatUint(uint64(t.ClockRate), 10)
-		fmtp = fmt.Sprintf("sprop-vps=%s;sprop-sps=%s;sprop-pps=%s",
-			b64(t.ParamSets[0]), b64(t.ParamSets[1]), b64(t.ParamSets[2]))
+		fmtp = fmt.Sprintf("sprop-vps=%s;sprop-sps=%s;sprop-pps=%s", b64Join(vps), b64Join(sps), b64Join(pps))
 	case CodecAAC:
 		if t.AAC == nil || len(t.AAC.Config) == 0 || t.Channels <= 0 || t.ClockRate == 0 {
 			return nil, fmt.Errorf("rtsp: build sdp: track %d: AAC needs config, rate and channels", i)
@@ -109,4 +116,48 @@ func buildMedia(i int, t TrackDesc) (*sdp.MediaDescription, error) {
 	return md, nil
 }
 
-func b64(b []byte) string { return strings.TrimSpace(base64.StdEncoding.EncodeToString(b)) }
+const (
+	h264NALSPS = 7
+	h264NALPPS = 8
+	h265NALVPS = 32
+	h265NALSPS = 33
+	h265NALPPS = 34
+)
+
+// groupSets buckets the non-empty sets by NAL unit type, keeping order.
+func groupSets(sets [][]byte, typ func([]byte) byte) map[byte][][]byte {
+	out := map[byte][][]byte{}
+	for _, n := range sets {
+		if len(n) > 0 {
+			k := typ(n)
+			out[k] = append(out[k], n)
+		}
+	}
+	return out
+}
+
+func b64Join(sets [][]byte) string {
+	parts := make([]string, len(sets))
+	for i, n := range sets {
+		parts[i] = base64.StdEncoding.EncodeToString(n)
+	}
+	return strings.Join(parts, ",")
+}
+
+// b64All joins, in Config order, the non-empty sets accepted by keep.
+func b64All(sets [][]byte, keep func([]byte) bool) string {
+	var sel [][]byte
+	for _, n := range sets {
+		if len(n) > 0 && keep(n) {
+			sel = append(sel, n)
+		}
+	}
+	return b64Join(sel)
+}
+
+func originAddrType(origin string) string {
+	if ip := net.ParseIP(origin); ip != nil && ip.To4() == nil {
+		return "IP6"
+	}
+	return "IP4"
+}

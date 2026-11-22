@@ -15,10 +15,10 @@ var (
 
 func genTracks() []TrackDesc {
 	return []TrackDesc{
-		{Codec: CodecH264, Payload: 96, ClockRate: 90000, ParamSets: [][]byte{genSPS, genPPS}, ID: 7},
-		{Codec: CodecH265, Payload: 97, ClockRate: 90000, ParamSets: [][]byte{{0x40, 1, 2}, {0x42, 1, 3}, {0x44, 1, 4}}, ID: 8},
+		{Codec: CodecH264, Payload: 96, ClockRate: 90000, ParamSets: [][]byte{genSPS, genPPS}, ID: 4242},
+		{Codec: CodecH265, Payload: 97, ClockRate: 90000, ParamSets: [][]byte{{0x40, 1, 2}, {0x42, 1, 3}, {0x44, 1, 4}}, ID: 4243},
 		{
-			Codec: CodecAAC, Payload: 98, ClockRate: 48000, Channels: 2, ID: 9,
+			Codec: CodecAAC, Payload: 98, ClockRate: 48000, Channels: 2, ID: 4244,
 			AAC: &AACFormat{Config: []byte{0x11, 0x90}, SizeLength: 13, IndexLength: 3, IndexDeltaLength: 3},
 		},
 	}
@@ -33,8 +33,8 @@ func TestBuildSDPRoundTrip(t *testing.T) {
 	if err := sd.Unmarshal(body); err != nil {
 		t.Fatalf("pion rejects: %v\n%s", err, body)
 	}
-	for _, id := range []string{"=7", " 7", "=8", " 8", "=9", " 9"} {
-		if strings.Contains(string(body), id+"\r\n") {
+	for _, id := range []string{"4242", "4243", "4244"} {
+		if strings.Contains(string(body), id) {
 			t.Fatalf("ID leaked (%q):\n%s", id, body)
 		}
 	}
@@ -97,6 +97,62 @@ func TestBuildSDPErrors(t *testing.T) {
 	} {
 		if _, err := BuildSDP("127.0.0.1", tr); err == nil {
 			t.Errorf("%s: no error", name)
+		}
+	}
+}
+
+func TestBuildSDPMultipleSets(t *testing.T) {
+	pps2 := []byte{0x68, 0xee, 0x3c, 0x80}
+	h265 := [][]byte{{0x40, 1, 2}, {0x42, 1, 3}, {0x44, 1, 4}, {0x44, 1, 5}}
+	cases := map[string]TrackDesc{
+		"h264": {Codec: CodecH264, Payload: 96, ClockRate: 90000, ParamSets: [][]byte{genPPS, genSPS, pps2}},
+		"h265": {Codec: CodecH265, Payload: 96, ClockRate: 90000, ParamSets: [][]byte{h265[2], h265[0], h265[3], h265[1]}},
+	}
+	for name, tr := range cases {
+		body, err := BuildSDP("127.0.0.1", []TrackDesc{tr})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		d, err := ParseSDP(body, "rtsp://h/x/")
+		if err != nil || len(d.Media) != 1 {
+			t.Fatalf("%s: %v\n%s", name, err, body)
+		}
+		got := d.Media[0].ParamSets
+		wantN := 3
+		if name == "h265" {
+			wantN = 4
+		}
+		if len(got) != wantN {
+			t.Fatalf("%s: %d sets\n%s", name, len(got), body)
+		}
+		if name == "h264" && !bytes.Equal(got[2], pps2) {
+			t.Fatalf("h264 sets %x", got)
+		}
+		if name == "h265" && !bytes.Equal(got[3], h265[3]) {
+			t.Fatalf("h265 sets %x", got)
+		}
+	}
+	// Missing kinds are rejected by NAL type, not position.
+	for name, ps := range map[string][][]byte{"two pps": {genPPS, genPPS}, "two sps": {genSPS, genSPS}} {
+		if _, err := BuildSDP("h", []TrackDesc{{Codec: CodecH264, Payload: 96, ClockRate: 90000, ParamSets: ps}}); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+	if _, err := BuildSDP("h", []TrackDesc{{Codec: CodecH265, Payload: 96, ClockRate: 90000, ParamSets: h265[:2]}}); err == nil {
+		t.Error("h265 without pps: no error")
+	}
+}
+
+func TestBuildSDPOriginFamily(t *testing.T) {
+	for origin, want := range map[string]string{
+		"127.0.0.1": "IN IP4 127.0.0.1", "::1": "IN IP6 ::1", "example.com": "IN IP4 example.com",
+	} {
+		body, err := BuildSDP(origin, genTracks()[:1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), want+"\r\n") {
+			t.Errorf("%s: want %q in\n%s", origin, want, body)
 		}
 	}
 }
