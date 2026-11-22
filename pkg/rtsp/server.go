@@ -124,8 +124,12 @@ func (c ServerConfig) withDefaults() ServerConfig {
 type Handler interface {
 	// Describe returns the tracks of the stream at path (normalised: no
 	// leading or trailing slash, no query, no trackID suffix), or ok=false
-	// (answered 404). It is called for DESCRIBE and at a session's first
-	// SETUP, whose result is frozen for the session.
+	// (answered 404). It is called for DESCRIBE. A session's first SETUP
+	// freezes the tracks of the connection's last DESCRIBE answer when it
+	// was for the same path, so the session carries the SDP its client
+	// received; only a connection that did not DESCRIBE the path (or whose
+	// last DESCRIBE failed) has Describe called at its first SETUP. The
+	// returned descriptors are copied; the handler may reuse them.
 	Describe(path string) (tracks []TrackDesc, ok bool)
 	// Play is called in its own goroutine once PLAY is answered. It runs
 	// until ctx ends (the session ended) and sends with s.WritePackets and
@@ -142,7 +146,9 @@ type ServerStats struct {
 	// answered 404 (unknown stream or track, or a session cap).
 	Rejected uint64
 	// ProtocolErrors counts malformed or oversized requests, bad CSeq
-	// headers and garbage skipped on the interleaved stream.
+	// headers, garbage skipped on the interleaved stream and RTCP from a
+	// session's client that is no client report (an RTCP compound led by
+	// an SR or RR).
 	ProtocolErrors uint64
 	// Timeouts counts connections ended by the read timeout or the pending
 	// lifetime and sessions ended by the write or session timeout.
@@ -391,6 +397,17 @@ type serverConn struct {
 	sess     *ServerSession
 	playing  bool
 	playDone chan struct{} // closed when Play returns; nil before PLAY
+
+	// described is the connection's last successful DESCRIBE answer, kept
+	// for its first SETUP; used only by the connection's goroutine.
+	described *describedSDP
+}
+
+// describedSDP is a DESCRIBE answer: the normalised path and a deep copy
+// of the descriptors its SDP was built from.
+type describedSDP struct {
+	path  string
+	descs []TrackDesc
 }
 
 func (c *serverConn) serve() {
@@ -555,18 +572,31 @@ func (c *serverConn) resync() error {
 	}
 }
 
-// readFrame reads one interleaved frame from the client. Its RTCP only
-// proves the client alive.
+// readFrame reads one interleaved frame from the client. A client report
+// (an RTCP compound led by an SR or RR) on one of the session's RTCP
+// channels proves the client alive, which only informs: a TCP session lives
+// while its connection is open. Anything else on an RTCP channel is
+// counted as a protocol error; frames on other channels are dropped.
 func (c *serverConn) readFrame() error {
 	var h [4]byte
 	if _, err := io.ReadFull(c.br, h[:]); err != nil {
 		return fmt.Errorf("rtsp: read frame: %w", err)
 	}
-	if _, err := c.br.Discard(int(binary.BigEndian.Uint16(h[2:]))); err != nil {
+	n := int(binary.BigEndian.Uint16(h[2:]))
+	if c.sess == nil || !c.sess.rtcpChannel(int(h[1])) {
+		if _, err := c.br.Discard(n); err != nil {
+			return fmt.Errorf("rtsp: read frame: %w", err)
+		}
+		return nil
+	}
+	b := make([]byte, n)
+	if _, err := io.ReadFull(c.br, b); err != nil {
 		return fmt.Errorf("rtsp: read frame: %w", err)
 	}
-	if c.sess != nil {
+	if isClientReport(b) {
 		c.sess.touch()
+	} else {
+		c.srv.nProtocol.Add(1)
 	}
 	return nil
 }
@@ -674,6 +704,8 @@ func (c *serverConn) handle(req *Request) error {
 }
 
 func (c *serverConn) describe(req *Request, resp *Response) {
+	// A failed DESCRIBE leaves no answer for a later SETUP.
+	c.described = nil
 	tg, err := parseTarget(req.URL)
 	if err != nil {
 		setStatus(resp, 400)
@@ -689,6 +721,7 @@ func (c *serverConn) describe(req *Request, resp *Response) {
 		setStatus(resp, 500)
 		return
 	}
+	c.described = &describedSDP{path: tg.path, descs: copyDescs(tracks)}
 	setStatus(resp, 200)
 	resp.Header.Set("Content-Base", tg.contentBase)
 	resp.Header.Set("Content-Type", "application/sdp")
@@ -736,13 +769,18 @@ func (c *serverConn) setup(req *Request, resp *Response) {
 	}
 	sess := c.sess
 	var descs []TrackDesc
-	if sess == nil {
-		var ok bool
-		if descs, ok = c.srv.h.Describe(tg.path); !ok {
-			descs = nil
+	switch {
+	case sess != nil:
+		if tg.path == sess.path {
+			descs = sess.descs
 		}
-	} else if tg.path == sess.path {
-		descs = sess.descs
+	case c.described != nil && c.described.path == tg.path:
+		// Freeze the SDP the client received, not the stream's tracks now.
+		descs = c.described.descs
+	default:
+		if d, ok := c.srv.h.Describe(tg.path); ok {
+			descs = d
+		}
 	}
 	if tg.track < 0 || tg.track >= len(descs) || tg.track >= maxSessionTracks {
 		setStatus(resp, 404)
@@ -818,10 +856,12 @@ func (c *serverConn) play(req *Request, resp *Response) func() {
 	setStatus(resp, 200)
 	resp.Header.Set("Session", c.sess.header())
 	resp.Header.Set("Range", "npt=now-")
-	resp.Header.Set("RTP-Info", c.sess.rtpInfo())
 	if !first {
+		// The origins are those of the first packets, long sent: a
+		// repeated PLAY changes nothing and carries no RTP-Info.
 		return nil
 	}
+	resp.Header.Set("RTP-Info", c.sess.rtpInfo())
 	return c.startPlay
 }
 

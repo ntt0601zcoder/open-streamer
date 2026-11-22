@@ -19,13 +19,20 @@ type udpPair struct {
 	wg        sync.WaitGroup
 }
 
+// udpSendBuffer is the send buffer asked for the pair's RTP socket, best
+// effort, so that keyframe bursts to many clients are not dropped by the
+// server's own socket.
+const udpSendBuffer = 4 << 20
+
 // bindUDP binds the pair on UDPHost and starts its readers; the caller
 // holds Server.mu and has checked that no pair is bound.
 func (s *Server) bindUDP() error {
-	rtpC, rtcpC, err := ListenUDPPair(s.cfg.UDPHost)
+	rtpC, rtcpC, err := listenUDPPair(s.cfg.UDPHost)
 	if err != nil {
-		return fmt.Errorf("rtsp: serve: %w", err)
+		return fmt.Errorf("rtsp: serve: listen udp pair: %w", err)
 	}
+	// Best effort: the kernel caps it (net.core.wmem_max on Linux).
+	_ = rtpC.SetWriteBuffer(udpSendBuffer)
 	a := rtpC.LocalAddr().(*net.UDPAddr)
 	p := &udpPair{rtp: rtpC, rtcp: rtcpC, ports: [2]int{a.Port, rtcpC.LocalAddr().(*net.UDPAddr).Port}, local: a.IP}
 	p.wg.Add(2)
@@ -60,14 +67,15 @@ func (s *Server) closeUDP() {
 	p.wg.Wait()
 }
 
-// readRTCP reads the RTCP socket until it is closed. A datagram from a
-// session's client RTCP port proves that session alive; any other is
-// dropped and counted.
+// readRTCP reads the RTCP socket until it is closed. A client report (an
+// RTCP compound led by an SR or RR) from a session's client RTCP port
+// proves that session alive; anything else from that port is counted as a
+// protocol error, and a datagram from any other address as a stranger.
 func (s *Server) readRTCP(p *udpPair) {
 	defer p.wg.Done()
 	buf := make([]byte, maxDatagram)
 	for {
-		_, from, err := p.rtcp.ReadFromUDPAddrPort(buf)
+		n, from, err := p.rtcp.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -81,11 +89,14 @@ func (s *Server) readRTCP(p *udpPair) {
 		s.mu.Lock()
 		sess := s.udpPeers[key]
 		s.mu.Unlock()
-		if sess == nil {
+		switch {
+		case sess == nil:
 			s.nStrangers.Add(1)
-			continue
+		case isClientReport(buf[:n]):
+			sess.touch()
+		default:
+			s.nProtocol.Add(1)
 		}
-		sess.touch()
 	}
 }
 

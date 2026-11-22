@@ -464,8 +464,13 @@ func TestServerProtocolErrors(t *testing.T) {
 	assert.Equal(t, 454, r.do("PLAY", r.base, "Session", "bogus").StatusCode, "unknown Session")
 	assert.Equal(t, 454, r.do("GET_PARAMETER", r.base, "Session", "bogus").StatusCode)
 	assert.Equal(t, 404, r.do("PLAY", "rtsp://"+addr+"/live/other").StatusCode, "PLAY of another stream")
-	assert.Equal(t, 200, r.play().StatusCode)
-	assert.Equal(t, 200, r.play().StatusCode, "repeated PLAY")
+	resp = r.play()
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.NotEmpty(t, resp.Header.Get("RTP-Info"))
+	resp = r.play()
+	assert.Equal(t, 200, resp.StatusCode, "repeated PLAY")
+	assert.Equal(t, "npt=now-", resp.Header.Get("Range"))
+	assert.Empty(t, resp.Header.Get("RTP-Info"), "a repeated PLAY re-sends no RTP-Info")
 	assert.Equal(t, 455, r.setup(1, tcpOffer(2, 3)).StatusCode, "SETUP after PLAY")
 	assert.Equal(t, 455, r.do("PAUSE", r.base).StatusCode)
 	assert.Equal(t, 454, r.do("TEARDOWN", r.base, "Session", "bogus").StatusCode)
@@ -565,7 +570,7 @@ func TestServerPathNormalisation(t *testing.T) {
 	require.NoError(t, err)
 	r.session = sess.ID
 	require.Equal(t, 200, r.do("SETUP", u1, "Transport", tcpOffer(2, 3)).StatusCode)
-	assert.Equal(t, []string{"live/cam", "live/cam", "live/cam"}, h.describePaths(), "Describe once more, at the first SETUP")
+	assert.Equal(t, []string{"live/cam", "live/cam"}, h.describePaths(), "no Describe at SETUP: the DESCRIBE answer is frozen")
 	resp = r.do("PLAY", "rtsp://"+addr+"/live/cam/trackID=0")
 	require.Equal(t, 200, resp.StatusCode, "PLAY on a track URL is aggregate")
 	assert.Equal(t, "npt=now-", resp.Header.Get("Range"))
@@ -575,6 +580,67 @@ func TestServerPathNormalisation(t *testing.T) {
 	assert.Equal(t, fmt.Sprintf("url=%s;seq=%d;rtptime=%d,url=%s;seq=%d;rtptime=%d", u0, seq0, ts0, u1, seq1, ts1),
 		resp.Header.Get("RTP-Info"))
 	assert.Equal(t, "live/cam", ss.Path())
+}
+
+// The first SETUP freezes the tracks the connection's last DESCRIBE of the
+// path answered, even when the stream's tracks change in between; a
+// connection that never DESCRIBEd the path, or whose DESCRIBE failed, gets
+// them from Describe at its first SETUP.
+func TestServerSetupFreezesDescribe(t *testing.T) {
+	h := newHandler()
+	_, addr := startServer(t, h, rtsp.ServerConfig{})
+	setTracks := func(path string, tracks []rtsp.TrackDesc) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if tracks == nil {
+			delete(h.tracks, path)
+			return
+		}
+		h.tracks[path] = tracks
+	}
+	hevc := []rtsp.TrackDesc{{
+		Codec: rtsp.CodecH265, Payload: 97, ClockRate: 90000,
+		ParamSets: [][]byte{{0x40, 0x01}, {0x42, 0x01}, {0x44, 0x01}}, ID: 3,
+	}}
+
+	r := dialRaw(t, addr)
+	require.Equal(t, 200, r.do("DESCRIBE", r.base).StatusCode)
+	// After the DESCRIBE the stream changes codec and loses its audio, and
+	// the slice the handler returned is modified in place.
+	h.mu.Lock()
+	h.tracks["live/cam"][0].ParamSets[0][1] = 0x99
+	h.mu.Unlock()
+	setTracks("live/cam", hevc)
+	require.Equal(t, 200, r.setup(0, tcpOffer(0, 1)).StatusCode)
+	require.Equal(t, 200, r.setup(1, tcpOffer(2, 3)).StatusCode, "the described audio track")
+	require.Equal(t, 200, r.play().StatusCode)
+	assert.Equal(t, testTracks(), h.session(t).TrackDescs(), "the tracks the client was described")
+	assert.Equal(t, []string{"live/cam"}, h.describePaths(), "no Describe at SETUP")
+
+	// No DESCRIBE on this connection: Describe at the first SETUP.
+	r = dialRaw(t, addr)
+	require.Equal(t, 200, r.setup(0, tcpOffer(0, 1)).StatusCode)
+	assert.Equal(t, 404, r.setup(1, tcpOffer(2, 3)).StatusCode)
+	require.Equal(t, 200, r.play().StatusCode)
+	assert.Equal(t, hevc, h.session(t).TrackDescs())
+
+	// A DESCRIBE of another path is not this path's answer.
+	r = dialRaw(t, addr)
+	require.Equal(t, 200, r.do("DESCRIBE", "rtsp://"+addr+"/live/other").StatusCode)
+	require.Equal(t, 200, r.setup(0, tcpOffer(0, 1)).StatusCode)
+	require.Equal(t, 200, r.play().StatusCode)
+	assert.Equal(t, hevc, h.session(t).TrackDescs())
+
+	// A failed DESCRIBE forgets the earlier answer.
+	r = dialRaw(t, addr)
+	require.Equal(t, 200, r.do("DESCRIBE", r.base).StatusCode)
+	setTracks("live/cam", nil)
+	require.Equal(t, 404, r.do("DESCRIBE", r.base).StatusCode)
+	setTracks("live/cam", testTracks())
+	require.Equal(t, 200, r.setup(1, tcpOffer(2, 3)).StatusCode, "described afresh at SETUP")
+	require.Equal(t, 200, r.play().StatusCode)
+	assert.Equal(t, testTracks(), h.session(t).TrackDescs())
+	assert.Equal(t, []string{"live/cam", "live/cam", "live/other", "live/cam", "live/cam", "live/cam", "live/cam"}, h.describePaths())
 }
 
 func TestServerBounds(t *testing.T) {

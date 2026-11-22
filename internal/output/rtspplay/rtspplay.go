@@ -57,8 +57,8 @@ const (
 	// describePoll is how often Describe looks for audio while it waits.
 	describePoll = 10 * time.Millisecond
 	// noAudioMemo is how long a stream that showed no audio for a whole
-	// wait is answered at once: the first SETUP of the same player, and
-	// other players, do not wait again.
+	// wait is answered at once: other players, and a player that SETUPs
+	// without a DESCRIBE, do not wait again.
 	noAudioMemo = 10 * time.Second
 )
 
@@ -102,8 +102,8 @@ type Stats struct {
 	// RTP does not carry here, or a track that came after the SETUP.
 	SkippedTracks uint64
 	// DescribeWaits counts the Describes that waited for audio, and
-	// DescribeWaitsTimedOut those that answered video-only after the whole
-	// wait.
+	// DescribeWaitsTimedOut those that still had no audio at the end of the
+	// whole wait and answered video-only.
 	DescribeWaits, DescribeWaitsTimedOut uint64
 	// Why sessions ended: a write that missed the write timeout, another
 	// failed write, a codec change, a frame the muxer could not send, the
@@ -245,9 +245,13 @@ func (s *Server) waitAudio(h *hub.Hub, cfgs []hub.TrackConfig) []hub.TrackConfig
 	for {
 		select {
 		case <-deadline.C:
-			s.live.waitsTimedOut.Add(1)
-			s.markNoAudio(h)
-			return h.TrackConfigs()
+			// Audio may have come since the last poll: only a stream still
+			// without it timed out and is remembered as audio-less.
+			if cfgs = h.TrackConfigs(); !has(cfgs, media.KindAudio) {
+				s.live.waitsTimedOut.Add(1)
+				s.markNoAudio(h)
+			}
+			return cfgs
 		case <-h.Done():
 			return nil
 		case <-s.done:

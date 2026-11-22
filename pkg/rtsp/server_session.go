@@ -169,6 +169,20 @@ func (s *ServerSession) rtpInfo() string {
 	return strings.Join(parts, ",")
 }
 
+// rtcpChannel reports whether ch is the interleaved RTCP channel of a
+// set-up track of a TCP session.
+func (s *ServerSession) rtcpChannel(ch int) bool {
+	if s.kind != transportTCP {
+		return false
+	}
+	for _, t := range s.tracks {
+		if t != nil && t.ch[1] == ch {
+			return true
+		}
+	}
+	return false
+}
+
 // touch records a sign of life from the client.
 func (s *ServerSession) touch() { s.lastSeen.Store(s.c.srv.cfg.Now().UnixNano()) }
 
@@ -378,8 +392,13 @@ func (s *ServerSession) writeFailed(err error) error {
 // 500 ms (or the WriteTimeout when shorter), one compound RTCP packet of
 // the track's last sender report (or an empty receiver report) + SDES +
 // BYE on the track's RTCP channel or to the client's RTCP port, then
-// closes the connection. A writer blocked on a full send buffer is cut
-// short. It is idempotent.
+// closes the connection; it returns within that budget. Over TCP a writer
+// blocked on the connection's full send buffer is cut short. Over UDP the
+// pair's sockets are shared by every UDP session, so a writer blocked on
+// the pair's full send buffer is not cut (shortening the shared deadline
+// would fail other sessions' writes): Close then skips the BYE and ends
+// the session, and that write returns within the WriteTimeout (default
+// 10 s) without ending anything further. It is idempotent.
 func (s *ServerSession) Close() {
 	s.closeOnce.Do(func() {
 		if s.Err() != nil {

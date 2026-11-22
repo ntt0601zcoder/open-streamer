@@ -2,6 +2,7 @@ package rtsp
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"net"
 	"sync/atomic"
@@ -202,4 +203,46 @@ func TestCloseCutsResponseWrite(t *testing.T) {
 	srv.wg.Wait()
 	assert.ErrorIs(t, sess.Err(), ErrSessionClosed)
 	assert.Zero(t, srv.nTimeouts.Load(), "a write cut by Close is not a timeout")
+}
+
+func TestIsClientReport(t *testing.T) {
+	rr := ReceiverReport(7, nil)
+	sr := BuildSenderReport(7, time.Unix(1, 0), 1, 1, 1)
+	bye := BuildBye(7, "c", nil) // RR + SDES + BYE
+	assert.True(t, isClientReport(rr))
+	assert.True(t, isClientReport(sr))
+	assert.True(t, isClientReport(bye))
+	assert.True(t, isClientReport(append(append([]byte{}, rr...), 0xff)), "trailing bytes after a valid lead")
+	for _, b := range [][]byte{nil, {0x80}, rr[:6], bye[8:], {0x80, 96, 0, 1, 0, 0, 0, 0}, {0x40, rtcpRR, 0, 1, 0, 0, 0, 7}} {
+		assert.False(t, isClientReport(b), "% x", b)
+	}
+}
+
+// TestInterleavedRTCPLiveness checks that only a client report on one of
+// the session's RTCP channels counts as a sign of life on TCP.
+func TestInterleavedRTCPLiveness(t *testing.T) {
+	now := time.Unix(100, 0)
+	srv := NewServer(nil, ServerConfig{Now: func() time.Time { return now }})
+	frame := func(ch byte, b []byte) []byte {
+		return append([]byte{'$', ch, byte(len(b) >> 8), byte(len(b))}, b...)
+	}
+	rr := ReceiverReport(7, nil)
+	for _, tc := range []struct {
+		name  string
+		in    []byte
+		alive bool
+	}{
+		{"report on the RTCP channel", frame(1, rr), true},
+		{"garbage on the RTCP channel", frame(1, []byte{1, 2, 3, 4}), false},
+		{"report on the RTP channel", frame(0, rr), false},
+		{"report on another channel", frame(5, rr), false},
+	} {
+		c := &serverConn{srv: srv, br: bufio.NewReader(bytes.NewReader(tc.in))}
+		c.sess = &ServerSession{c: c, tracks: make([]*serverTrack, 1)}
+		c.sess.addTrack(0, "u", transportTCP, Transport{Interleaved: [2]int{0, 1}})
+		c.sess.lastSeen.Store(0)
+		require.NoError(t, c.readFrame(), tc.name)
+		assert.Equal(t, tc.alive, c.sess.lastSeen.Load() == now.UnixNano(), tc.name)
+	}
+	assert.Equal(t, uint64(1), srv.nProtocol.Load(), "only the garbage report is a protocol error")
 }

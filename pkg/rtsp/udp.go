@@ -50,15 +50,21 @@ func (l *udpLink) srvAddr(i int) *net.UDPAddr {
 // host (an IP address or a name; "" means every interface), retrying on
 // conflicts.
 func ListenUDPPair(host string) (rtp, rtcp *net.UDPConn, err error) {
-	a, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, "0"))
-	if err != nil {
-		return nil, nil, fmt.Errorf("rtsp: listen udp pair: %w", err)
-	}
-	rtp, rtcp, err = listenPair(context.Background(), a.IP, a.Zone)
+	rtp, rtcp, err = listenUDPPair(host)
 	if err != nil {
 		return nil, nil, fmt.Errorf("rtsp: listen udp pair: %w", err)
 	}
 	return rtp, rtcp, nil
+}
+
+// listenUDPPair is ListenUDPPair with its errors unwrapped, for callers
+// that add their own prefix.
+func listenUDPPair(host string) (*net.UDPConn, *net.UDPConn, error) {
+	a, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		return nil, nil, err
+	}
+	return listenPair(context.Background(), a.IP, a.Zone)
 }
 
 // listenPair binds an even RTP port and the odd RTCP port after it on ip,

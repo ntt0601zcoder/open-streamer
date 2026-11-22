@@ -1181,3 +1181,80 @@ func TestPlayEndReasons(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// At the end of the DESCRIBE wait the track configs are read once more:
+// audio that came after the last poll is described, and the stream is
+// neither counted as timed out nor remembered as audio-less.
+func TestWaitAudioFinalRead(t *testing.T) {
+	s := New(func(string) (*hub.Hub, bool) { return nil, false }, Options{DescribeWait: time.Millisecond})
+	defer func() { require.NoError(t, s.Close()) }()
+	h := hub.New(hub.Options{})
+	defer h.Close()
+	frames := looped(t, "h264_aac.ts", 1)
+	k := firstKey(t, frames)
+	h.Write(frames[k])
+	stale := h.TrackConfigs()
+	require.False(t, has(stale, media.KindAudio))
+	for _, f := range frames[k+1:] {
+		if f.Kind() == media.KindAudio && f.DTS >= frames[k].DTS {
+			h.Write(f)
+			break
+		}
+	}
+	require.True(t, has(h.TrackConfigs(), media.KindAudio))
+
+	got := s.waitAudio(h, stale) // the deadline (1 ms) comes before the first poll (10 ms)
+	assert.True(t, has(got, media.KindAudio), "the final read's audio is described")
+	st := s.Stats()
+	assert.Equal(t, uint64(1), st.DescribeWaits)
+	assert.Zero(t, st.DescribeWaitsTimedOut, "audio came: the wait did not time out")
+	assert.False(t, s.recentlyNoAudio(h), "a stream with audio is not remembered as audio-less")
+}
+
+// A session freezes the SDP its player was described, not the stream's
+// tracks at SETUP: a player described video-only (audio came after the
+// DESCRIBE wait) that SETUPs once audio is live ends with a BYE when audio
+// reaches it, instead of ignoring the audio, and DESCRIBEs again.
+func TestPlaySetupFreezesDescribe(t *testing.T) {
+	e := start(t, Options{DescribeWait: 100 * time.Millisecond}, false)
+	gop, rest := firstGOP(looped(t, "h264_aac.ts", 2))
+	for _, f := range gop {
+		if f.Kind() == media.KindVideo {
+			e.h.Write(f)
+		}
+	}
+	nc, err := new(net.Dialer).DialContext(context.Background(), "tcp", e.addr)
+	require.NoError(t, err)
+	defer nc.Close()
+	c := &rawConn{Conn: nc, br: bufio.NewReader(nc)}
+	resp := c.request(t, "DESCRIBE", e.url, rtsp.Header{})
+	assert.Equal(t, 1, bytes.Count(resp.Body, []byte("m=")), "described video-only: %s", resp.Body)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := feed(ctx, e.h, rest, 4, nil)
+	require.Eventually(t, func() bool { return has(e.h.TrackConfigs(), media.KindAudio) }, waitFor, time.Millisecond)
+	resp = c.request(t, "SETUP", e.url+"/trackID=0", rtsp.Header{"Transport": {"RTP/AVP/TCP;unicast;interleaved=0-1"}})
+	sess, err := rtsp.ParseSession(resp.Header.Get("Session"))
+	require.NoError(t, err)
+	c.request(t, "PLAY", e.url, rtsp.Header{"Session": {sess.ID}})
+
+	bye := false
+	_ = c.SetReadDeadline(time.Now().Add(waitFor))
+	for !bye {
+		var hdr [4]byte
+		if _, err := io.ReadFull(c.br, hdr[:]); err != nil {
+			break
+		}
+		require.Equal(t, byte('$'), hdr[0])
+		b := make([]byte, binary.BigEndian.Uint16(hdr[2:]))
+		_, err := io.ReadFull(c.br, b)
+		require.NoError(t, err)
+		bye = hdr[1] == 1 && bytes.IndexByte(rtcpTypes(b), rtcpBye) >= 0
+	}
+	require.True(t, bye, "the audio ends the session with a BYE")
+	waitStats(t, e, func(st Stats) bool { return st.EndedCodecChange == 1 })
+	assert.Zero(t, e.srv.Stats().Mux.IgnoredFrames, "no audio ignored")
+	cancel()
+	<-done
+}

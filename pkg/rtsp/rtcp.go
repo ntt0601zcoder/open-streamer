@@ -171,3 +171,10 @@ func ParseReceiverReports(rtcp []byte) []uint32 {
 	}
 	return out
 }
+
+// isClientReport reports whether b is an RTCP compound packet as a receiver
+// sends one (RFC 3550 section 6.1): version 2 and led by an SR or RR. Only
+// such a packet proves a client alive.
+func isClientReport(b []byte) bool {
+	return len(ParseReceiverReports(b)) > 0 && b[0]>>6 == rtcpVersionTop && (b[1] == rtcpSR || b[1] == rtcpRR)
+}

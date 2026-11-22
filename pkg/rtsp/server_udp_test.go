@@ -196,6 +196,44 @@ func TestServerUDPSessionTimeout(t *testing.T) {
 	assert.Less(t, time.Since(start), 200*time.Millisecond)
 }
 
+// Only an RTCP compound led by an SR or RR proves a UDP client alive:
+// garbage from its RTCP port does not, and is counted.
+func TestServerUDPGarbageRTCPNotAlive(t *testing.T) {
+	h := newHandler()
+	h.play = producer(10 * time.Millisecond)
+	srv, addr := startUDPServer(t, h, rtsp.ServerConfig{SessionTimeout: 300 * time.Millisecond})
+	ports := srv.UDPPorts()
+	r := dialRaw(t, addr)
+	p := newUDPPeer(t)
+	require.Equal(t, 200, r.setup(0, p.offer()).StatusCode)
+	require.Equal(t, 200, r.play().StatusCode)
+	s := h.session(t)
+	sdes := rtsp.BuildBye(1, "x", nil)[8:] // SDES + BYE without the leading RR
+	garbage := [][]byte{{1, 2, 3, 4}, {0x80, 96, 0, 1, 0, 0, 0, 0}, sdes, bytes.Repeat([]byte{0x81}, 40)}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		tk := time.NewTicker(20 * time.Millisecond)
+		defer tk.Stop()
+		for i := 0; ; i++ {
+			_, _ = p.rtcp.WriteToUDP(garbage[i%len(garbage)], loopback(ports[1]))
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+			}
+		}
+	})
+	defer func() { close(stop); wg.Wait() }()
+	start := time.Now()
+	require.True(t, ended(s, 2*time.Second), "garbage RTCP must not keep the session alive")
+	assert.Less(t, time.Since(start), time.Second)
+	st := srv.Stats()
+	assert.Positive(t, st.ProtocolErrors, "invalid RTCP from a client is counted")
+	assert.Zero(t, st.UDPStrangers, "it came from the client's port")
+	assert.Equal(t, uint64(1), st.Timeouts)
+}
+
 func TestServerUDPStrangersIgnored(t *testing.T) {
 	h := newHandler()
 	h.play = producer(10 * time.Millisecond)
@@ -422,6 +460,8 @@ func TestServerUDPPairClosed(t *testing.T) {
 	bad := rtsp.NewServer(newHandler(), rtsp.ServerConfig{UDPHost: "192.0.2.1"})
 	err = bad.Serve(l0)
 	require.Error(t, err)
+	assert.True(t, strings.HasPrefix(err.Error(), "rtsp: serve: listen udp pair: "), "one prefix: %v", err)
+	assert.NotContains(t, err.Error(), "rtsp: serve: rtsp:")
 	assert.NotErrorIs(t, err, rtsp.ErrServerClosed)
 	assert.Equal(t, [2]int{}, bad.UDPPorts())
 	_ = l0.Close()
