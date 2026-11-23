@@ -200,7 +200,9 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   hub's cached GOP (`SubscribeCached`), like the other streaming outputs.
 - **SRT output** (M3b3): one gosrt listener; the stream ID selects the stream
   (request mode only, every refusal identical). Writes are cut to 1316-byte
-  payloads and retried when gosrt's send queue is full, and paced by a token
+  payloads (fewer whole TS packets when a caller's MSS is lower, so each write
+  stays one SRT packet; below 4 packets the connection is refused) and
+  retried when gosrt's send queue is full, and paced by a token
   bucket per connection (2.5 times the stream's bitrate, between 2 Mbit/s and
   256 packets per 5 ms), so a GOP replay at join does not arrive as one burst
   that is too late at 120 ms latency. Vanished receivers are ended by the
@@ -319,7 +321,7 @@ before the code they check.
 |---|---|---|---|
 | M1 | Media core: Frame, TS demuxer, Clock, hub, frame checks, fixtures | – | Every fixture goes demux → Clock → hub with no check violation, including the PTS-wrap and looped-source fixtures |
 | M2 (done) | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change remaps the demuxer's tracks as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
-| M3 (done) | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg, VLC-class clients and MediaMTX play every output; for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it. Proved by `TestM3Matrix` (every output under the four scenarios), `TestM3VLCClass` and `TestM3GStreamerClass` (VLC-class clients), `TestM3b3MediaMTXPull`, `TestM3b3SRTFFmpeg`, `TestHLSFFmpegAcrossGap` and `TestM3b3HLSAlignment`, with the M3a, M3b1 and M3b2 scenarios for the cells they cover |
+| M3 (done) | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg and VLC-class clients play every output, and MediaMTX pulls every output it can take as a source (DASH and HTTP-TS are not MediaMTX sources; see Out of M3b3); for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it. Proved by `TestM3Matrix` (every output under the four scenarios), `TestM3VLCClass` and `TestM3GStreamerClass` (VLC-class clients), `TestM3b3MediaMTXPull`, `TestM3b3SRTFFmpeg`, `TestHLSFFmpegAcrossGap` and `TestM3b3HLSAlignment`, with the M3a, M3b1 and M3b2 scenarios for the cells they cover |
 | M4 | Transcoder, watermark, thumbnails | M1, M3 | In CI (no GPU, builder image restored): a 3-rung software ladder and passthrough pass M3's scenarios. On the GPU host: the same with 3 NVENC rungs, run by a make target and recorded in the PR; a killed subprocess comes back as one new epoch; the watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5 | Feature tests; DVR playback passes `osconform` |
@@ -431,10 +433,10 @@ Out of M3b3:
 | SRT encryption | Needs credentials: M5; encrypted requests are refused |
 | Publishing into the SRT output listener | The SRT inputs own publishing |
 | DASH placeholders | Periods carry their adaptation sets; there is nothing to align |
-| Silent AAC placeholder parts instead of gaps | Backlog item 1 |
+| Silent AAC placeholder parts instead of gaps | Backlog: silent AAC placeholder parts |
 | LL-HLS changes | Not part of the M3 row |
 | Play authentication and tokens | M6 sessions and tokens, as for the other outputs |
-| VLC-class playback across a video-only stretch | VLC 3 and GStreamer fail on it; see Backlog items 1 and 4 |
+| VLC-class playback across a video-only stretch | VLC 3 and GStreamer fail on it; see the Backlog's silent AAC placeholder and VLC 3 discontinuity items |
 | MediaMTX pulls of DASH and HTTP-TS | They are not MediaMTX sources; ffmpeg and the VLC-class clients cover them |
 
 M2 is split in three parts:
@@ -551,14 +553,16 @@ Items accepted for later, not yet placed in a milestone:
   GStreamer play across an audio-less stretch, and also help hls.js if stalls
   are reported there.
 - **Cut audio segments and parts at the video boundary's PTS, not by arrival
-  order (`internal/segment/segmenter.go`). High priority, before the M7
-  soak.** With interleaved TS input the audio EXTINFs come out as 1.707, 2.048
+  order (`internal/segment/segmenter.go`). High priority, before M4** (ruling
+  R-F3: M4's three-rung ladder multiplies the separate renditions). With
+  interleaved TS input the audio EXTINFs come out as 1.707, 2.048
   and 2.261 s against a video 2.000 s, so segment N of the separate CMAF audio
   and video renditions starts up to about 300 ms apart. This is the likely
   cause of VLC 3's live-start "PCR is called too late" clock reset and of the
   "no reference clock" decoder-error pair that `TestM3VLCClass` tolerates on
   HLS fMP4 and DASH (up to one pair per reset, at most four per VLC process).
-  Remove the tolerance when it lands.
+  Remove that tolerance (ruling R-T7c'') when it lands; the tolerated-pair
+  count `TestM3VLCClass` logs per VLC process is the before-and-after measure.
 - **DASH MPD stays `type="dynamic"` after the stream ends** (pre-existing;
   M3a). Players keep polling an MPD that will not change.
 - **VLC 3 stops at any fMP4 HLS discontinuity**, not only at gaps: every
@@ -566,6 +570,36 @@ Items accepted for later, not yet placed in a milestone:
   input). Reproduced with an ffmpeg-made playlist carrying one
   `EXT-X-DISCONTINUITY` (VLC 3.0.20), so it is a VLC defect, not ours. The
   docs should recommend HLS TS for VLC 3 users.
+- **PCR during audio-only stretches (`internal/ts/mux.go`). High priority for
+  SRT, before the M7 soak** (ruling R-F2). The PCR PID is the first video
+  track and the muxer sends PCR only on that PID's frames, so while video is
+  absent (an A/V to audio-only failover) the TS carries no PCR, where
+  ISO/IEC 13818-1 wants one at least every 100 ms. VLC and ffmpeg play
+  through it (M3b3 Task 7); broadcast IRDs may lose lock. Fix: move the PCR
+  PID to a live track, or send PCR-only adaptation-field packets on the PCR
+  PID while its track is silent; add a conform PCR-interval rule.
+
+#### M3b3 deferred minors
+
+- `tsstream.Stream`'s doc comment has a stray line break.
+- After hub loss while video has ended, up to 10 s of audio is dropped
+  waiting for a keyframe (`maxKeyWait` is `hub.LiveWindow`).
+- SRT pacing keeps the join-time rate when resets come more often than the
+  2 s bitrate window covers, so it may go stale.
+- HLS adds `EXT-X-PROGRAM-DATE-TIME` to the new first entry after eviction
+  (pre-existing, HLS TS too); fix by writing it on every entry.
+- conform drops a leftover pending rendition disagreement when polling stops.
+- `TestReadHLSRenditionLag` does not exercise the spacing (its
+  `TargetDuration` is 0).
+- conform flags a recovery-point SEI that follows another SEI message (seen
+  only on third-party streams).
+- Strict TS rules (continuity, start) for HTTP-TS as an opt-in
+  `ReadOptions` field.
+- testpeer's host peers survive Ctrl-C; set `Pdeathsig` on Linux.
+- procgroup's `Cancel` should map `ESRCH` to `os.ErrProcessDone`.
+- `TestM3VLCClass` should assert VLC's `lost` stats delta.
+- `store.learn` keeps a nil `Init` when a track's first part in an epoch had
+  none, so the gap's `EXT-X-MAP` gets 404 (only if `fmp4.Init` fails).
 
 ### Carried from M1
 
