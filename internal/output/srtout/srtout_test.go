@@ -331,6 +331,18 @@ func playWith(t *testing.T, e *env, addr, id string, mod func(*srt.Config), pre,
 	return got.data
 }
 
+// raceLatency gives the receiver latency d under the race detector, and
+// leaves gosrt's 120 ms otherwise. gosrt's sender tick sends what is due
+// every 10 ms, so even a paced burst can overflow a receiver's UDP buffer
+// on loopback; the losses are retransmitted, but a receiver slowed by the
+// race detector needs more than 120 ms for those repairs.
+func raceLatency(d time.Duration) func(*srt.Config) {
+	if !raceEnabled {
+		return nil
+	}
+	return func(c *srt.Config) { c.Latency = d }
+}
+
 // The stream reads back clean: every frame from the cached keyframe on,
 // conformant, with unbroken continuity counters; the hub closing ends the
 // connection.
@@ -673,7 +685,7 @@ func TestSRTWriterRetryExact(t *testing.T) {
 			f := &fakeConn{every: every}
 			var full atomic.Uint64
 			w := newWriter(ctx, cancel, f, time.Second, &full)
-			data := tsBytes(3000)
+			data := tsBytes(1500)
 			sizes := []int{1, 7, 8, 13, 40, 2, 100, 3}
 			for off, i := 0, 0; off < len(data); i++ {
 				n := min(sizes[i%len(sizes)]*mpegts.PacketSize, len(data)-off)
@@ -809,9 +821,7 @@ func TestSRTLossyLink(t *testing.T) {
 	gop, rest := splitAtKey(frames, 2)
 	p := newProxy(t, e.addr)
 	var rc srt.Conn
-	// 500 ms leaves room for a retransmission that is lost again, on a
-	// receiver slowed by the race detector.
-	data := playWith(t, e, p.Addr(), "#!::r=live/s", func(c *srt.Config) { c.Latency = 500 * time.Millisecond }, gop, rest, 3, func(c srt.Conn) {
+	data := playWith(t, e, p.Addr(), "#!::r=live/s", raceLatency(500*time.Millisecond), gop, rest, 3, func(c srt.Conn) {
 		rc = c
 		p.SetLoss(0.02)
 		time.AfterFunc(5*time.Second, func() { p.SetLoss(0) }) // the shutdown gets through
@@ -856,11 +866,7 @@ func TestSRTBurstJoin(t *testing.T) {
 	for i := 25; i < 100; i++ {
 		rest = append(rest, frame(i, 2000, i%25 == 0))
 	}
-	// The paced replay still comes in 10 ms bursts of up to 512 packets
-	// (gosrt's sender tick), more than the receiver's default UDP buffer:
-	// some are lost on loopback and retransmitted. A receiver slowed by
-	// the race detector needs more than 120 ms for those repairs.
-	data := playWith(t, e, e.addr, "live/s", func(c *srt.Config) { c.Latency = time.Second }, pre, rest, 2, nil)
+	data := playWith(t, e, e.addr, "live/s", raceLatency(time.Second), pre, rest, 2, nil)
 	assert.Zero(t, ccErrors(t, data), "no continuity break at the receiver")
 	got := readBack(t, data)
 	require.Len(t, got, 100)
@@ -983,4 +989,133 @@ func TestSRTServerLifecycle(t *testing.T) {
 	wg.Wait()
 	_, err := dial(e.addr, "live/s", func(c *srt.Config) { c.ConnectionTimeout = 300 * time.Millisecond })
 	require.Error(t, err)
+}
+
+func TestBucketRate(t *testing.T) {
+	const ceiling = float64(pacePackets*payloadSize) / 0.005 // bytes per second
+	assert.InDelta(t, 2e6/8, bucketRate(0), 1e-6, "2 Mbit/s floor")
+	assert.InDelta(t, 2e6/8, bucketRate(500e3), 1e-6, "2.5 x 0.5 Mbit/s is below the floor")
+	assert.InDelta(t, 2.5*6e6/8, bucketRate(6e6), 1e-6)
+	assert.InDelta(t, ceiling, bucketRate(1e9), 1e-6, "256 packets per 5 ms ceiling")
+	assert.InDelta(t, 0.05*2.5*6e6/8, bucketDepth(bucketRate(6e6)), 1e-6, "50 ms at the rate")
+	assert.InDelta(t, float64(32*payloadSize), bucketDepth(bucketRate(0)), 1e-6, "at least 32 packets")
+}
+
+// A 1.5 MB GOP replay on a 6 Mbit/s stream leaves at 15 Mbit/s: the bucket
+// lets its depth go at once and the rest at the rate.
+func TestBucketCatchUp(t *testing.T) {
+	t0 := time.Unix(0, 0)
+	b := newBucket(6e6, t0)
+	now := t0
+	for sent := 0; sent < 1_500_000; sent += payloadSize {
+		now = now.Add(b.take(now, payloadSize))
+	}
+	rate := 2.5 * 6e6 / 8
+	want := time.Duration((1_500_000 - 0.05*rate) / rate * float64(time.Second))
+	assert.InDelta(t, want.Seconds(), now.Sub(t0).Seconds(), 0.01, "about 0.75 s")
+
+	// Idle refills the bucket to its depth, no more.
+	now = now.Add(time.Hour)
+	assert.Zero(t, b.take(now, int(0.05*rate)))
+	assert.Positive(t, b.take(now, 2*minSleepBytes(rate)))
+
+	// A lower rate shrinks the depth.
+	b.setRate(0, now.Add(time.Hour))
+	assert.InDelta(t, float64(32*payloadSize), b.tokens, 1e-6)
+}
+
+// minSleepBytes is the debt the bucket allows before it asks for a sleep.
+func minSleepBytes(rate float64) int { return int(rate*minSleep.Seconds()) + 1 }
+
+func TestRateMeter(t *testing.T) {
+	var m rateMeter
+	assert.InDelta(t, 125000*8*188/184.0, m.prebuffered(125000, media.ClockRate), 1e-6, "TS overhead on the payload")
+	assert.Zero(t, m.prebuffered(1000, 0), "no span: unknown")
+
+	// 5000 TS bytes every 40 ms: 1 Mbit/s once 2 s of stream time are seen.
+	for i := range 50 {
+		_, ok := m.frame(int64(i)*3600, 5000)
+		require.False(t, ok, "frame %d: less than 2 s", i)
+	}
+	r, ok := m.frame(50*3600, 5000)
+	require.True(t, ok)
+	assert.InDelta(t, 1e6, r, 1)
+	for i := 51; i < 200; i++ {
+		r, ok = m.frame(int64(i)*3600, 10000)
+	}
+	require.True(t, ok)
+	assert.InDelta(t, 2e6, r, 1, "the window moves")
+	assert.LessOrEqual(t, len(m.samples), 52)
+
+	// An interleaved frame slightly behind does not move the clock back.
+	_, ok = m.frame(198*3600, 100)
+	assert.True(t, ok)
+	// A new timeline starts a new window.
+	_, ok = m.frame(0, 5000)
+	assert.False(t, ok)
+	_, ok = m.frame(200*3600+20*media.ClockRate, 5000)
+	assert.False(t, ok, "a jump forward is a new timeline too")
+}
+
+// The writer paces by the bitrate it is told: before it knows one, only
+// the ceiling applies.
+func TestWriterMeter(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	f := &fakeConn{}
+	var full atomic.Uint64
+	w := newWriter(ctx, cancel, f, time.Minute, &full)
+	assert.Nil(t, w.bucket)
+	w.Prebuffered(10_000, 0)
+	assert.NotNil(t, w.bucket, "an unknown bitrate paces at the floor")
+	w.Prebuffered(250_000, media.ClockRate) // about 2 Mbit/s: 5 Mbit/s pacing
+	assert.InDelta(t, bucketRate(250_000*8*188/184.0), w.bucket.rate, 1e-6)
+	for i := range 60 {
+		w.Frame(int64(i)*3600, 25_000) // 5 Mbit/s: 12.5 Mbit/s pacing
+	}
+	assert.InDelta(t, bucketRate(5e6), w.bucket.rate, 1)
+	data := bytes.Repeat(tsBytes(7), 300) // 395 kB: about 0.25 s at 12.5 Mbit/s less the depth
+	t0 := time.Now()
+	_, err := w.Write(data)
+	require.NoError(t, err)
+	assert.Greater(t, time.Since(t0), 150*time.Millisecond)
+	assert.True(t, bytes.Equal(data, f.got.Bytes()))
+}
+
+// A receiver behind a link of about three times the stream's bitrate, at
+// gosrt's default 120 ms latency, gets the GOP replay it joins on without a
+// continuity break: the replay leaves at 2.5 times the bitrate, not at
+// line rate into the link's queue.
+func TestSRTThrottledJoin(t *testing.T) {
+	e := start(t, Options{})
+	h264 := configOf(t, "h264_aac.ts", media.CodecH264)
+	frame := func(i, size int, key bool) media.Frame {
+		data := make([]byte, size)
+		data[0] = 0x41
+		if key {
+			data[0] = 0x65
+		}
+		for j := 1; j < size; j++ {
+			data[j] = byte(j*3 + i)
+		}
+		dts := int64(i) * 3600
+		return media.Frame{Track: 0, Config: h264, PTS: dts, DTS: dts, Key: key, Data: [][]byte{data}, Epoch: 1}
+	}
+	// 100 kB keyframes and 15 kB frames at 25 fps: about 3.7 Mbit/s.
+	frames := make([]media.Frame, 0, 150)
+	for i := range 150 {
+		size := 15_000
+		if i%25 == 0 {
+			size = 100_000
+		}
+		frames = append(frames, frame(i, size, i%25 == 0))
+	}
+	pre, rest := frames[:25], frames[25:]
+	p := newProxy(t, e.addr)
+	p.Throttle(1_400_000, 100*time.Millisecond) // about 3 x; a 100 ms router queue
+	data := play(t, e, p.Addr(), "live/s", pre, rest, 1, nil)
+	assert.Zero(t, ccErrors(t, data), "no continuity break at the receiver")
+	got := readBack(t, data)
+	assert.Len(t, got, len(frames), "the replay and every frame after it")
+	assert.Zero(t, e.srv.Stats().EndedStalled)
 }

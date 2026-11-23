@@ -74,6 +74,20 @@ type Options struct {
 	Prebuffer int64
 	// WriteTimeout is the deadline of every write (default 10 s).
 	WriteTimeout time.Duration
+	// Meter, when set, is told the stream's progress, for a sink that
+	// paces by bitrate. It never changes the bytes written.
+	Meter Meter
+}
+
+// Meter follows a stream's bitrate. Prebuffered is called once, before
+// the first write, with the frame payload bytes and the DTS span (90 kHz
+// ticks, last minus first) of the deliveries buffered before output starts:
+// the hub's cached GOP and what followed it. Frame is called before each
+// frame's bytes are written, with its DTS and the TS bytes about to be
+// written (tables included).
+type Meter interface {
+	Prebuffered(bytes int, span int64)
+	Frame(dts int64, bytes int)
 }
 
 // Stats summarises a finished stream.
@@ -108,7 +122,7 @@ func Stream(ctx context.Context, h *hub.Hub, name string, s Sink, opt Options) (
 	}
 	sub := h.SubscribeCached(name, opt.Queue)
 	defer sub.Close()
-	ss := &session{s: s, timeout: opt.WriteTimeout}
+	ss := &session{s: s, timeout: opt.WriteTimeout, meter: opt.Meter}
 	err := ss.run(ctx, sub.C(), opt.Prebuffer)
 	if err != nil {
 		ss.stats.Ended = EndedError
@@ -126,6 +140,7 @@ func (e endReason) Error() string { return string(e) }
 // the muxer writes into and the resync state.
 type session struct {
 	s       Sink
+	meter   Meter
 	timeout time.Duration
 	mux     *ts.Muxer
 	tracks  []*media.TrackConfig
@@ -184,6 +199,9 @@ func (s *session) start(ctx context.Context, ch <-chan hub.Delivery, prebuffer i
 		}
 		return endReason(EndedClosed)
 	}
+	if s.meter != nil {
+		s.meter.Prebuffered(payloadSpan(pending))
+	}
 	s.tracks = firstConfigs(pending)
 	mux, err := ts.NewMuxer(&s.buf, s.tracks)
 	if err != nil {
@@ -220,6 +238,20 @@ func buffer(ctx context.Context, ch <-chan hub.Delivery, prebuffer int64) []hub.
 			}
 		}
 	}
+}
+
+// payloadSpan returns the payload bytes of the deliveries and the span of
+// their DTS.
+func payloadSpan(ds []hub.Delivery) (bytes int, span int64) {
+	lo, hi := ds[0].Frame.DTS, ds[0].Frame.DTS
+	for i := range ds {
+		f := &ds[i].Frame
+		for _, b := range f.Data {
+			bytes += len(b)
+		}
+		lo, hi = min(lo, f.DTS), max(hi, f.DTS)
+	}
+	return bytes, hi - lo
 }
 
 // firstConfigs returns each track's first config among the deliveries.
@@ -304,6 +336,9 @@ func (s *session) frame(f media.Frame) error {
 		return fmt.Errorf("tsstream: write frame: %w", err)
 	}
 	s.stats.Frames++
+	if s.meter != nil {
+		s.meter.Frame(f.DTS, s.buf.Len())
+	}
 	return s.flush()
 }
 

@@ -52,8 +52,8 @@
 //	ffplay -rtsp_transport udp rtsp://<host>:8554/live/cam
 //
 // To serve every stream to SRT receivers (ffplay, VLC, ffmpeg), give
-// -srt-play a UDP address, which must not be the address of an SRT listen
-// input; the stream ID names the stream, as <app>/<name> or in the
+// -srt-play a UDP address, which must not overlap the address of an SRT
+// listen input (the same port, on the same host or either one a wildcard); the stream ID names the stream, as <app>/<name> or in the
 // access-control form #!::r=<app>/<name>, where app is -srt-play-app
 // (default live). -srt-latency sets the SRT latency (default 120ms):
 //
@@ -151,9 +151,10 @@ rtsp://<host>:<port>/<app>/<name>, app from -rtsp-play-app (default live):
   ffplay -rtsp_transport udp rtsp://<host>:8554/live/<name>
 
 Serve every stream to SRT receivers (ffplay, VLC, ffmpeg) with -srt-play, a
-UDP address that is not the address of an SRT listen input. The stream ID
-is <app>/<name> or #!::r=<app>/<name> (percent-encode it in a URL), app
-from -srt-play-app (default live); -srt-latency sets the latency:
+UDP address whose port is not that of an SRT listen input on the same host
+or a wildcard. The stream ID is <app>/<name> or #!::r=<app>/<name>
+(percent-encode it in a URL), app from -srt-play-app (default live);
+-srt-latency sets the latency:
   osdev -stream cam=in.ts -loop -srt-play :9000
   ffplay 'srt://<host>:9000?streamid=live/<name>'
 
@@ -479,35 +480,42 @@ func checkHostPort(addr string) error {
 	return nil
 }
 
-// srtAddrKey normalises an SRT host and port for comparison: an unspecified
-// host (empty, 0.0.0.0 or ::) is "", an IP is in canonical form (an
-// IPv4-mapped address unmapped), a name is lower-cased, and the port is
-// decimal.
-func srtAddrKey(host, port string) string {
+// srtHostKey normalises an SRT host for comparison: an unspecified host
+// (empty, 0.0.0.0 or ::) is "", an IP is in canonical form (an IPv4-mapped
+// address unmapped), and a name is lower-cased.
+func srtHostKey(host string) string {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		ip = ip.Unmap()
-		host = ip.String()
 		if ip.IsUnspecified() {
-			host = ""
+			return ""
 		}
-	} else {
-		host = strings.ToLower(host)
+		return ip.String()
 	}
-	if n, err := strconv.Atoi(port); err == nil {
-		port = strconv.Itoa(n)
-	}
-	return net.JoinHostPort(host, port)
+	return strings.ToLower(host)
 }
 
-// checkSRTPlayAddr refuses an -srt-play address that equals the address of
-// an SRT listen input: both would bind the same UDP socket. The input URL
-// is not echoed, since it may hold a passphrase.
+// srtAddrsCollide reports whether two SRT listen addresses overlap: the
+// same port, and the same host or either host unspecified. gosrt sets
+// SO_REUSEADDR, so a wildcard and a specific address on one port both bind
+// and the kernel splits the traffic between them.
+func srtAddrsCollide(hostA, portA, hostB, portB string) bool {
+	pa, errA := strconv.Atoi(portA)
+	pb, errB := strconv.Atoi(portB)
+	if errA != nil || errB != nil || pa != pb {
+		return false
+	}
+	a, b := srtHostKey(hostA), srtHostKey(hostB)
+	return a == b || a == "" || b == ""
+}
+
+// checkSRTPlayAddr refuses an -srt-play address that overlaps the address
+// of an SRT listen input (srtAddrsCollide). The input URL is not echoed,
+// since it may hold a passphrase.
 func checkSRTPlayAddr(cfg *config) error {
 	if cfg.srtPlay == "" {
 		return nil
 	}
 	host, port, _ := net.SplitHostPort(cfg.srtPlay) // checked by checkHostPort
-	play := srtAddrKey(host, port)
 	for _, s := range cfg.sources {
 		for _, in := range s.inputs {
 			u, err := url.Parse(in)
@@ -517,8 +525,8 @@ func checkSRTPlayAddr(cfg *config) error {
 			if spec, err := ingest.Parse(in); err != nil || !spec.Passive {
 				continue
 			}
-			if srtAddrKey(u.Hostname(), u.Port()) == play {
-				return fmt.Errorf("%s is the address of an SRT listen input of stream %s", cfg.srtPlay, s.name)
+			if srtAddrsCollide(host, port, u.Hostname(), u.Port()) {
+				return fmt.Errorf("%s overlaps the address of an SRT listen input of stream %s", cfg.srtPlay, s.name)
 			}
 		}
 	}

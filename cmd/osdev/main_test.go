@@ -713,10 +713,16 @@ func TestOsdevSRTPlayFlags(t *testing.T) {
 	assert.Equal(t, "tv", cfg.srtPlayApp)
 	assert.Equal(t, 300*time.Millisecond, cfg.srtLatency)
 
-	// Another port, or another host, does not collide with a listen input.
-	for _, play := range []string{":19356", "127.0.0.1:19355"} {
-		cfg, code = parseArgs([]string{"-srt-play", play, "-stream", "a=srt://:19355?mode=listener"}, io.Discard)
-		require.NotNil(t, cfg, "%s: %d", play, code)
+	// Another port, or another specific host, does not collide with a
+	// listen input; nor does an SRT caller input.
+	for _, tc := range [][2]string{
+		{":19356", "srt://:19355?mode=listener"},
+		{"127.0.0.1:19355", "srt://127.0.0.2:19355?mode=listener"},
+		{"[::1]:19355", "srt://127.0.0.1:19355?mode=listener"},
+		{":19355", "srt://example.com:19355"},
+	} {
+		cfg, code = parseArgs([]string{"-srt-play", tc[0], "-stream", "a=" + tc[1]}, io.Discard)
+		require.NotNil(t, cfg, "%s with %s: %d", tc[0], tc[1], code)
 	}
 
 	for name, tc := range map[string]struct {
@@ -732,6 +738,12 @@ func TestOsdevSRTPlayFlags(t *testing.T) {
 		"wildcard alias": {[]string{"-srt-play", "0.0.0.0:19355", "-stream", "b=" + fixture, "-stream", "a=srt://:19355?mode=listener"}, "-srt-play"},
 		"ipv6 wildcard":  {[]string{"-srt-play", "[::]:19355", "-stream", "a=srt://0.0.0.0:19355?mode=listener"}, "-srt-play"},
 		"same host":      {[]string{"-srt-play", "127.0.0.1:19355", "-stream", "a=srt://127.0.0.1:19355?mode=listener"}, "-srt-play"},
+		// SO_REUSEADDR lets a wildcard and a specific address on one port
+		// both bind, and the kernel then splits the traffic.
+		"specific in wildcard": {[]string{"-srt-play", "127.0.0.1:19355", "-stream", "a=srt://:19355?mode=listener"}, "-srt-play"},
+		"wildcard over host":   {[]string{"-srt-play", ":19355", "-stream", "a=srt://127.0.0.1:19355?mode=listener"}, "-srt-play"},
+		"ipv6 loopback":        {[]string{"-srt-play", "[::1]:19355", "-stream", "a=srt://[::]:19355?mode=listener"}, "-srt-play"},
+		"ipv6 under wildcard":  {[]string{"-srt-play", "0.0.0.0:19355", "-stream", "a=srt://[::1]:19355?mode=listener"}, "-srt-play"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var errw strings.Builder

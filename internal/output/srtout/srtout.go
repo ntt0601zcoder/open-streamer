@@ -22,11 +22,20 @@
 // or not at all. gosrt answers a full send queue with io.EOF and drops the
 // chunk; the same chunk is then retried every 5 ms (counted in
 // Stats.SendQueueFull), and a connection whose retries last longer than
-// Options.StallTimeout is ended as stalled. Writes are paced to at most 256
-// packets per 5 ms, so that a GOP replay or a large keyframe does not reach
-// the receiver as one burst that overflows its 1024-packet read queue; the
-// pause only slows this connection's loop, and the hub skips frames for it
-// if it falls behind.
+// Options.StallTimeout is ended as stalled.
+//
+// Writes are paced by a token bucket per connection, so that a GOP replay
+// or a large keyframe leaves at a few times the stream's bitrate rather than
+// at line rate, which on a WAN link would queue it past a 120 ms latency.
+// The bucket's rate is 2.5 times the stream's bitrate R, clamped to
+// [2 Mbit/s, 256 packets per 5 ms], and its depth 50 ms at that rate, at
+// least 32 packets. R is taken at the join from the payload of the frames
+// buffered before output starts (the hub's cached GOP and what followed
+// it) over their DTS span, then from the TS bytes written over the last 2 s
+// of stream time. On top of the bucket, writes never exceed 256 packets per
+// 5 ms, so that no burst overflows a gosrt receiver's 1024-packet read
+// queue. A pause only slows this connection's loop; the hub skips frames
+// for it if it falls behind.
 //
 // Every connection has a reader goroutine whose Read returning (the peer's
 // shutdown, gosrt's peer idle timeout, Close) ends the connection, so a
@@ -39,8 +48,8 @@
 // data: that is invisible here, and harmless to the server.
 //
 // A connection that ends on a codec change or the hub closing stays open for
-// twice the receiver's TSBPD delay plus 100 ms first, so that its last
-// packets are delivered, or retransmitted, before the shutdown.
+// twice the receiver's TSBPD delay plus 100 ms first, at most 5 s, so that
+// its last packets are delivered, or retransmitted, before the shutdown.
 package srtout
 
 import (
@@ -58,6 +67,7 @@ import (
 	"github.com/datarhei/gosrt"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
+	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/tsstream"
 )
 
@@ -75,9 +85,27 @@ const (
 	// retryInterval is how often a chunk that found the send queue full is
 	// retried.
 	retryInterval = 5 * time.Millisecond
-	// pacePackets is the most packets written per paceWindow.
+	// pacePackets is the most packets written per paceWindow: the
+	// ceiling over the token bucket.
 	pacePackets = 256
 	paceWindow  = 5 * time.Millisecond
+	// The token bucket: its rate is bucketFactor times the stream's
+	// bitrate within [bucketFloor bit/s, the ceiling], and its depth
+	// bucketDepthTime at that rate, at least bucketMinPackets packets.
+	bucketFactor     = 2.5
+	bucketFloor      = 2e6
+	bucketDepthTime  = 50 * time.Millisecond
+	bucketMinPackets = 32
+	// minSleep is the debt, in time at the bucket's rate, under which a
+	// write does not wait.
+	minSleep = time.Millisecond
+	// rateWindow is the stream time the bitrate is averaged over.
+	rateWindow = 2 * media.ClockRate
+	// newTimeline is how far a frame's DTS may run back, or ahead, before
+	// the bitrate average starts over.
+	newTimeline = 10 * media.ClockRate
+	// maxDrain bounds how long a connection that ended cleanly stays open.
+	maxDrain = 5 * time.Second
 	// statsInterval is how often the stall rule samples a connection.
 	statsInterval = 500 * time.Millisecond
 	// maxDropPercent is the share of the packets sent that the sender may
@@ -130,7 +158,8 @@ type Stats struct {
 	// the app; RejectedCaps those over a cap.
 	Rejected, RejectedUnknown, RejectedMode, RejectedCaps uint64
 	// Frames and Resyncs sum the frames written and the hub losses resynced
-	// by the connections that have ended.
+	// by each connection, added when the connection ends: a connection
+	// being served is not counted yet.
 	Frames, Resyncs uint64
 	// SendQueueFull counts chunks that found gosrt's send queue full and
 	// were retried.
@@ -444,7 +473,7 @@ func (s *Server) serve(conn srt.Conn, h *hub.Hub, name, key string) {
 	bg.Go(func() { s.watch(ctx, cancel, conn) })
 
 	w := newWriter(ctx, cancel, conn, s.opt.StallTimeout, &s.full)
-	st, err := tsstream.Stream(ctx, h, "srt "+conn.RemoteAddr().String(), w, tsstream.Options{Queue: s.opt.Queue})
+	st, err := tsstream.Stream(ctx, h, "srt "+conn.RemoteAddr().String(), w, tsstream.Options{Queue: s.opt.Queue, Meter: w})
 	why := classify(ctx, st, err)
 	if why == endCodecChange || why == endHubClosed {
 		t := time.NewTimer(drainTime(conn, s.opt.Latency))
@@ -464,12 +493,13 @@ func (s *Server) serve(conn srt.Conn, h *hub.Hub, name, key string) {
 // before it is closed: the receiver delivers a packet its TSBPD delay (the
 // larger of both sides' latencies) after it was sent and drops what it has
 // not delivered when the shutdown comes, so the last packets get twice that
-// delay plus 100 ms to be delivered, or retransmitted.
+// delay plus 100 ms to be delivered, or retransmitted; at most 5 s, since a
+// caller may ask for up to 65 s of latency.
 func drainTime(conn srt.Conn, latency time.Duration) time.Duration {
 	var st srt.Statistics
 	conn.Stats(&st)
 	d := max(time.Duration(st.Instantaneous.MsSendTsbPdDelay)*time.Millisecond, latency) //nolint:gosec // milliseconds of a 16-bit field
-	return 2*d + 100*time.Millisecond
+	return min(2*d+100*time.Millisecond, maxDrain)
 }
 
 // classify reports why a connection's stream ended.
@@ -593,9 +623,9 @@ func (m *stallMonitor) add(now time.Time, c sample) bool {
 	return (c.drop-b.drop)*100 > sent*maxDropPercent || c.acks == b.acks
 }
 
-// writer is the tsstream.Sink of a connection: it hands gosrt at most one
-// payload per Write, paces the packets and retries a chunk that found the
-// send queue full.
+// writer is the tsstream.Sink and tsstream.Meter of a connection: it hands
+// gosrt at most one payload per Write, paces the packets by the stream's
+// bitrate and retries a chunk that found the send queue full.
 type writer struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -603,8 +633,10 @@ type writer struct {
 	stall  time.Duration
 	full   *atomic.Uint64
 
-	winStart   time.Time // the current pacing window
+	winStart   time.Time // the current ceiling window
 	winPackets int       // packets written in it
+	bucket     *bucket   // nil until the bitrate is known: only the ceiling applies
+	meter      rateMeter
 }
 
 func newWriter(ctx context.Context, cancel context.CancelCauseFunc, w io.Writer, stall time.Duration, full *atomic.Uint64) *writer {
@@ -619,7 +651,7 @@ func (w *writer) Write(p []byte) (int, error) {
 	}
 	for off := 0; off < len(p); {
 		n := min(payloadSize, len(p)-off)
-		if err := w.pace(); err != nil {
+		if err := w.pace(n); err != nil {
 			return off, err
 		}
 		if err := w.chunk(p[off : off+n]); err != nil {
@@ -637,9 +669,49 @@ func (w *writer) SetWriteDeadline(time.Time) error { return nil }
 // Flush is a no-op: every chunk is queued by Write.
 func (w *writer) Flush() error { return nil }
 
-// pace waits, when the current window already holds pacePackets packets,
-// for the next window.
-func (w *writer) pace() error {
+// Prebuffered sets the bucket's rate from the payload buffered before the
+// stream's output starts; it implements tsstream.Meter.
+func (w *writer) Prebuffered(bytes int, span int64) {
+	w.setRate(w.meter.prebuffered(bytes, span))
+}
+
+// Frame follows the TS bytes written, and sets the bucket's rate once 2 s
+// of stream time have been seen; it implements tsstream.Meter.
+func (w *writer) Frame(dts int64, bytes int) {
+	if r, ok := w.meter.frame(dts, bytes); ok {
+		w.setRate(r)
+	}
+}
+
+// setRate paces by a stream bitrate (bit/s, 0 when unknown).
+func (w *writer) setRate(bitrate float64) {
+	now := time.Now()
+	if w.bucket == nil {
+		w.bucket = newBucket(bitrate, now)
+		return
+	}
+	w.bucket.setRate(bitrate, now)
+}
+
+// pace waits until a packet of n bytes may go: for the next ceiling window
+// when the current one already holds pacePackets packets, and for the
+// bucket's tokens.
+func (w *writer) pace(n int) error {
+	if err := w.ceiling(); err != nil {
+		return err
+	}
+	if w.bucket == nil {
+		return nil
+	}
+	if d := w.bucket.take(time.Now(), n); d > 0 {
+		return w.sleep(d)
+	}
+	return nil
+}
+
+// ceiling waits, when the current window already holds pacePackets
+// packets, for the next window.
+func (w *writer) ceiling() error {
 	now := time.Now()
 	if now.Sub(w.winStart) >= paceWindow {
 		w.winStart, w.winPackets = now, 0
@@ -673,6 +745,8 @@ func (w *writer) chunk(b []byte) error {
 		now := time.Now()
 		if since.IsZero() {
 			since = now
+			// gosrt closing on its own just before the reader cancels
+			// can count one spurious full queue here.
 			w.full.Add(1)
 		} else if now.Sub(since) >= w.stall {
 			w.cancel(errStalled)
@@ -694,4 +768,119 @@ func (w *writer) sleep(d time.Duration) error {
 	case <-t.C:
 		return nil
 	}
+}
+
+// bucketRate is the bucket's rate, in bytes per second, for a stream of
+// bitrate bit/s: 2.5 times it, within [2 Mbit/s, 256 packets per 5 ms].
+func bucketRate(bitrate float64) float64 {
+	ceil := float64(pacePackets*payloadSize) / paceWindow.Seconds()
+	return min(max(bucketFactor*bitrate/8, bucketFloor/8), ceil)
+}
+
+// bucketDepth is the bucket's depth, in bytes, at rate bytes per second:
+// 50 ms of it, at least 32 packets.
+func bucketDepth(rate float64) float64 {
+	return max(rate*bucketDepthTime.Seconds(), bucketMinPackets*payloadSize)
+}
+
+// bucket is a token bucket in bytes. Taking more than it holds runs a debt
+// that the caller pays by waiting.
+type bucket struct {
+	rate, depth, tokens float64 // bytes per second, bytes, bytes
+	last                time.Time
+}
+
+// newBucket returns a full bucket for a stream of bitrate bit/s.
+func newBucket(bitrate float64, now time.Time) *bucket {
+	b := &bucket{last: now}
+	b.setRate(bitrate, now)
+	b.tokens = b.depth
+	return b
+}
+
+// setRate changes the stream bitrate; the tokens are kept, up to the new
+// depth.
+func (b *bucket) setRate(bitrate float64, now time.Time) {
+	b.refill(now)
+	b.rate = bucketRate(bitrate)
+	b.depth = bucketDepth(b.rate)
+	b.tokens = min(b.tokens, b.depth)
+}
+
+func (b *bucket) refill(now time.Time) {
+	if el := now.Sub(b.last); el > 0 {
+		b.tokens = min(b.depth, b.tokens+el.Seconds()*b.rate)
+		b.last = now
+	}
+}
+
+// take spends n bytes at now and returns how long to wait before sending
+// them: zero while the debt is under 1 ms at the rate.
+func (b *bucket) take(now time.Time, n int) time.Duration {
+	b.refill(now)
+	b.tokens -= float64(n)
+	if b.tokens >= 0 {
+		return 0
+	}
+	d := time.Duration(-b.tokens / b.rate * float64(time.Second))
+	if d < minSleep {
+		return 0
+	}
+	return d
+}
+
+// rateMeter estimates a stream's bitrate.
+type rateMeter struct {
+	samples []rateSample // oldest first; the first is the newest at least a window old
+	newest  int64        // the largest DTS seen on this timeline
+	started bool
+}
+
+// rateSample is the TS bytes of a frame written when the stream's clock
+// (the largest DTS so far) read t.
+type rateSample struct {
+	t int64
+	n int
+}
+
+// prebuffered returns the bitrate of payload bytes over span 90 kHz ticks,
+// with the TS packet overhead (184 payload bytes per 188); 0 when the span
+// is not positive.
+func (m *rateMeter) prebuffered(bytes int, span int64) float64 {
+	if span <= 0 {
+		return 0
+	}
+	return float64(bytes) * mpegTSOverhead * 8 * media.ClockRate / float64(span)
+}
+
+// mpegTSOverhead is the TS packet size over its largest payload.
+const mpegTSOverhead = 188.0 / 184
+
+// frame records n TS bytes at dts and returns the bitrate over the last
+// 2 s of stream time; ok is false until the window is covered. A DTS more
+// than 1 s behind the stream's clock, or 10 s ahead, starts a new window.
+func (m *rateMeter) frame(dts int64, n int) (float64, bool) {
+	if m.started && (dts < m.newest-media.ClockRate || dts > m.newest+newTimeline) {
+		m.samples, m.started = m.samples[:0], false
+	}
+	if !m.started || dts > m.newest {
+		m.newest, m.started = dts, true
+	}
+	m.samples = append(m.samples, rateSample{t: m.newest, n: n})
+	base := -1
+	for i, smp := range m.samples {
+		if smp.t > m.newest-rateWindow {
+			break
+		}
+		base = i
+	}
+	if base < 0 {
+		return 0, false
+	}
+	m.samples = m.samples[base:]
+	bytes := 0
+	for _, smp := range m.samples[1:] {
+		bytes += smp.n
+	}
+	return float64(bytes) * 8 * media.ClockRate / float64(m.newest-m.samples[0].t), true
 }

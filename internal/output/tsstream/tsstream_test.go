@@ -538,3 +538,60 @@ func TestStreamLateTrack(t *testing.T) {
 	assert.Equal(t, uint64(1), st.LateTracks)
 	assert.Equal(t, uint64(len(frames)), st.Frames)
 }
+
+// recMeter records Meter calls.
+type recMeter struct {
+	pre    [][2]int64 // bytes, span
+	frames int
+	bytes  int
+	last   int64
+}
+
+func (m *recMeter) Prebuffered(bytes int, span int64) {
+	m.pre = append(m.pre, [2]int64{int64(bytes), span})
+}
+
+func (m *recMeter) Frame(dts int64, bytes int) {
+	m.frames++
+	m.bytes += bytes
+	m.last = dts
+}
+
+// The Meter sees the prebuffered payload once, before any write, and then
+// every frame's TS bytes, which sum to the bytes written.
+func TestStreamMeter(t *testing.T) {
+	frames := fixtureFrames(t, "h264_aac.ts")
+	h := hub.New(hub.Options{})
+	m := &recMeter{}
+	s := &recSink{}
+	done := make(chan Stats, 1)
+	go func() {
+		st, _ := Stream(context.Background(), h, "test", s, Options{Meter: m})
+		done <- st
+	}()
+	require.Eventually(t, func() bool { return len(h.Stats()) > 0 }, 5*time.Second, time.Millisecond)
+	var payload int
+	var first int64 = -1
+	cut := -1
+	for i, f := range frames {
+		h.Write(f)
+		if first < 0 {
+			first = f.DTS
+		}
+		if cut < 0 {
+			for _, b := range f.Data {
+				payload += len(b)
+			}
+			if f.DTS >= first+media.ClockRate {
+				cut = i
+			}
+		}
+	}
+	h.Close()
+	st := <-done
+	require.Len(t, m.pre, 1)
+	assert.Equal(t, int64(payload), m.pre[0][0], "payload of the prebuffered frames")
+	assert.Equal(t, frames[cut].DTS-first, m.pre[0][1])
+	assert.Equal(t, int(st.Frames), m.frames)
+	assert.Equal(t, s.bytes, m.bytes)
+}
