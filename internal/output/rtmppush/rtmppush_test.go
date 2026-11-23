@@ -451,6 +451,12 @@ func TestPushReconnects(t *testing.T) {
 		}
 		return ends >= 4
 	}, 3*waitFor, 10*time.Millisecond, "the server closed four connections")
+	// The server sees a connection end before the pusher counts its
+	// failure and asks for the next backoff.
+	require.Eventually(t, func() bool {
+		st := p.Stats()
+		return st.Connects >= 4 && st.Failures >= 4 && len(w.get()) >= 4
+	}, 3*waitFor, 10*time.Millisecond, "the pusher counted four failed connections")
 	cancelRun()
 	require.ErrorIs(t, waitRun(t, done), context.Canceled)
 	cancel()
