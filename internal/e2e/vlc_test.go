@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -52,15 +54,23 @@ import (
 // each sink logs a buffer (last-message = chain) within 10 s, and no ERROR
 // message. The exit code is never a pass.
 //
-// The gap rows play a failover through a stretch without one kind:
-// hls-fmp4-across-gap (A/V, then 6 s of video only, then A/V) samples VLC's
-// stats when the stream switches back to A/V, when no audio after the gap
-// exists yet, and 16 s later: the audio decoded count must grow by more
-// than 6 s of audio, more than any audio from before the gap still queued
-// in VLC could give. http-ts- and srt-audio-only-stretch (A/V, then 6 s of
-// audio only, then A/V) check that audio is decoded through the stretch,
-// while the TS carries no video and so no PCR on the video PID, and video
-// after it.
+// The VLC rows run one after the other (ruling R-T7b): VLC under CPU
+// starvation logs its own "no reference clock" decoder errors. The
+// GStreamer rows run in parallel once they are done.
+//
+// http-ts- and srt-audio-only-stretch (A/V, then 6 s of audio only, then
+// A/V) check that audio is decoded through the stretch, while the TS
+// carries no video and so no PCR on the video PID, and video after it.
+//
+// HLS fMP4 across a failover (ruling R-T7a): hls-fmp4-epoch-change (A/V,
+// then 6 s of h264_aac_640.ts, then A/V: two discontinuities with new
+// EXT-X-MAPs, no gap) is played by GStreamer through both. Across the
+// video-only stretch of gapSource, no VLC-class client plays (the stream
+// is proven by ffmpeg in TestHLSFFmpegAcrossGap): hls-fmp4-across-gap
+// skips both clients, citing the evidence, and so does
+// hls-fmp4-epoch-change for VLC. With OS_PEER_LIMITS=1 those rows instead
+// probe the limitation and fail if a client no longer has it, so that an
+// upgrade that fixes it shows.
 func TestM3VLCClass(t *testing.T) {
 	t.Parallel()
 	for _, out := range []struct{ name, path string }{
@@ -70,7 +80,6 @@ func TestM3VLCClass(t *testing.T) {
 		{"http-ts", "/stream.ts"},
 	} {
 		t.Run(out.name, func(t *testing.T) {
-			t.Parallel()
 			vlc := testpeer.VLC(t)
 			ffmpeg := testpeer.Require(t, "ffmpeg")
 			ffprobe := testpeer.Require(t, "ffprobe")
@@ -86,7 +95,6 @@ func TestM3VLCClass(t *testing.T) {
 		})
 	}
 	t.Run("srt", func(t *testing.T) {
-		t.Parallel()
 		vlc := testpeer.VLC(t)
 		ffmpeg := testpeer.Require(t, "ffmpeg")
 		ffprobe := testpeer.Require(t, "ffprobe")
@@ -96,7 +104,6 @@ func TestM3VLCClass(t *testing.T) {
 		vlcPlays(t, vlc, ffprobe, o.url())
 	})
 	t.Run("rtmp-play", func(t *testing.T) {
-		t.Parallel()
 		vlc := testpeer.VLC(t)
 		ffmpeg := testpeer.Require(t, "ffmpeg")
 		ffprobe := testpeer.Require(t, "ffprobe")
@@ -129,9 +136,213 @@ func TestM3VLCClass(t *testing.T) {
 		gstPlays(t, gst, rtspPipeline(u))
 		t.Logf("push %+v", push.Stats())
 	})
-	t.Run("hls-fmp4-across-gap", testVLCAcrossGap)
 	t.Run("http-ts-audio-only-stretch", func(t *testing.T) { testVLCAudioOnlyStretch(t, false) })
 	t.Run("srt-audio-only-stretch", func(t *testing.T) { testVLCAudioOnlyStretch(t, true) })
+	t.Run("hls-fmp4-across-gap/vlc", func(t *testing.T) {
+		peerLimit(t, vlcDiscontinuityLimit)
+		probeVLCLimit(t, "h264_640.ts", 3)
+	})
+	t.Run("hls-fmp4-epoch-change/vlc", func(t *testing.T) {
+		peerLimit(t, vlcDiscontinuityLimit)
+		probeVLCLimit(t, "h264_aac_640.ts", 1)
+	})
+	t.Run("hls-fmp4-across-gap/gstreamer", func(t *testing.T) {
+		t.Parallel()
+		peerLimit(t, gstGapLimit)
+		res := gstAcross(t, "h264_640.ts", 3)
+		if res.err == nil {
+			t.Errorf("GStreamer now plays HLS fMP4 across EXT-X-GAP entries: lift the skip (ruling R-T7a)")
+		}
+		t.Logf("the known limitation: %v", res.err)
+	})
+	t.Run("hls-fmp4-epoch-change/gstreamer", func(t *testing.T) {
+		t.Parallel()
+		res := gstAcross(t, "h264_aac_640.ts", 1)
+		require.NoError(t, res.err)
+	})
+}
+
+// envPeerLimits, set to "1", turns the skips of the VLC-class clients'
+// known limitations into probes that fail once a client no longer has
+// the limitation.
+const envPeerLimits = "OS_PEER_LIMITS"
+
+// The known limitations of the VLC-class clients (ruling R-T7a, evidence in
+// the M3b3 Task 7 report, section 5.1).
+const (
+	vlcDiscontinuityLimit = "VLC 3.0.20 cannot play fMP4 HLS past any EXT-X-DISCONTINUITY: it drains, " +
+		"recreates its MP4 demuxer without the init segment (adaptive demux error: Failed to create demuxer " +
+		"(nil) MP4) and reaches EOF; reproduced with an ffmpeg-made fMP4 playlist with one discontinuity, " +
+		"a VLC defect not specific to gaps (ruling R-T7a)"
+	gstGapLimit = "GStreamer's hlsdemux2 and hlsdemux (1.24, 1.28) load consecutive EXT-X-GAP URIs, get the " +
+		"404 the server answers for them and stop: 1.28 with Couldn't download fragments (http-status-code " +
+		"404), 1.24 with no buffer after the gap (ruling R-T7a)"
+)
+
+// peerLimit skips the test, naming the limitation, unless OS_PEER_LIMITS=1.
+func peerLimit(t *testing.T, limit string) {
+	t.Helper()
+	if os.Getenv(envPeerLimits) != "1" {
+		t.Skipf("%s; %s=1 probes it", limit, envPeerLimits)
+	}
+}
+
+// probeVLCLimit plays the HLS fMP4 master of failoverSource with mid (VLC's
+// display instance, stats as for the gap rows: when the stream switches back
+// to A/V and 16 s later) and expects vlcDiscontinuityLimit: no answer after
+// the switch back, and the demuxer failure in the log. A VLC that plays on
+// fails the test.
+func probeVLCLimit(t *testing.T, mid string, midPasses int) {
+	t.Helper()
+	vlc := testpeer.VLC(t)
+	ffmpeg := testpeer.Require(t, "ffmpeg")
+	r, p, origin := failoverSource(t, ffmpeg, mid, midPasses, 4)
+	r.waitActive(t, 0, rtspReady)
+	waitListed(t, p, 3)
+	v := startVLC(t, vlc, nil, origin+"/live/s/cmaf/master.m3u8")
+	r.waitActive(t, 1, 30*time.Second)
+	r.waitActive(t, 2, 30*time.Second)
+	s1, ok1 := v.stats(t)
+	time.Sleep(16 * time.Second)
+	s2, ok2 := v.stats(t)
+	v.quit(t)
+	log := v.log.String()
+	t.Logf("%s: stats back to A/V %+v (%v), 16 s later %+v (%v); log:\n%s", vlc, s1, ok1, s2, ok2, vlcErrors(log))
+	if ok2 && s2.video > s1.video && s2.audio > s1.audio {
+		t.Errorf("%s now plays HLS fMP4 across discontinuities: lift the skip (ruling R-T7a)", vlc)
+		return
+	}
+	assert.Contains(t, log, "Failed to create demuxer", "the known failure mode")
+}
+
+// hlsElements are the GStreamer elements of hlsPipeline.
+var hlsElements = []string{"uridecodebin3", "hlsdemux2", "qtdemux", "avdec_h264", "avdec_aac", "queue", "fakesink"}
+
+// hlsPipeline plays an HLS (or any) URL with uridecodebin3 into the sinks
+// v and a.
+func hlsPipeline(u string) []string {
+	return []string{
+		"uridecodebin3", "uri=" + u, "name=d",
+		"d.", "!", "video/x-raw", "!", "queue", "!", "fakesink", "name=v", "silent=false",
+		"d.", "!", "audio/x-raw", "!", "queue", "!", "fakesink", "name=a", "silent=false",
+	}
+}
+
+// acrossResult is how GStreamer played across a failover; err says how it
+// failed the pass rule, nil when it passed.
+type acrossResult struct{ err error }
+
+// gstAcross plays the HLS fMP4 master of failoverSource with mid with
+// GStreamer, for 40 s from its start, and applies the GStreamer pass rule
+// plus: each sink gets buffers later than 12 s after the stream switched
+// back to A/V, when GStreamer, joined at the live edge, plays what came
+// after the second failover.
+func gstAcross(t *testing.T, mid string, midPasses int) acrossResult {
+	t.Helper()
+	gst := testpeer.GStreamer(t, hlsElements...)
+	ffmpeg := testpeer.Require(t, "ffmpeg")
+	r, p, origin := failoverSource(t, ffmpeg, mid, midPasses, 4)
+	r.waitActive(t, 0, rtspReady)
+	waitListed(t, p, 3)
+	ch := runGst(t, gst, hlsPipeline(origin+"/live/s/cmaf/master.m3u8"), 40*time.Second)
+	r.waitActive(t, 1, 30*time.Second)
+	r.waitActive(t, 2, 30*time.Second)
+	back := time.Now()
+	var res gstResult
+	select {
+	case res = <-ch:
+	case <-time.After(runLimit):
+		t.Fatal("gst-launch-1.0 did not end")
+	}
+	after := map[string]int{}
+	for sink, ts := range res.times {
+		for _, at := range ts {
+			if at.After(back.Add(12 * time.Second)) {
+				after[sink]++
+			}
+		}
+	}
+	t.Logf("%s: buffers %v, %v later than 12 s after the switch back to A/V; errors %q", gst,
+		res.counts(), after, res.errLines)
+	var errs []error
+	if err := res.check(); err != nil {
+		errs = append(errs, err)
+	}
+	for _, sink := range []string{"v", "a"} {
+		if after[sink] == 0 {
+			errs = append(errs, fmt.Errorf("sink %s: no buffer after the second failover", sink))
+		}
+	}
+	return acrossResult{err: errors.Join(errs...)}
+}
+
+// gstResult is what one gst-launch-1.0 run logged.
+type gstResult struct {
+	start    time.Time
+	times    map[string][]time.Time // when each sink logged a buffer
+	errLines []string
+	exit     error
+}
+
+func (r gstResult) counts() map[string]int {
+	n := map[string]int{}
+	for sink, ts := range r.times {
+		n[sink] = len(ts)
+	}
+	return n
+}
+
+// check applies the GStreamer pass rule.
+func (r gstResult) check() error {
+	var errs []error
+	for _, sink := range []string{"v", "a"} {
+		ts := r.times[sink]
+		switch {
+		case len(ts) == 0:
+			errs = append(errs, fmt.Errorf("sink %s got no buffer", sink))
+		case ts[0].Sub(r.start) > gstWithin:
+			errs = append(errs, fmt.Errorf("sink %s: first buffer after %v, over %v", sink, ts[0].Sub(r.start), gstWithin))
+		}
+	}
+	if len(r.errLines) > 0 {
+		errs = append(errs, fmt.Errorf("ERROR messages: %q", r.errLines))
+	}
+	return errors.Join(errs...)
+}
+
+// runGst runs gst-launch-1.0 -v -e with pipeline, stopped by SIGINT after
+// run, in the background.
+func runGst(t *testing.T, gst testpeer.Peer, pipeline []string, run time.Duration) <-chan gstResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), runLimit)
+	cmd := gst.Command(ctx, t, testpeer.Run{Interrupt: run}, append([]string{"-v", "-e"}, pipeline...)...)
+	pr, pw, err := os.Pipe()
+	require.NoError(t, err)
+	cmd.Stdout, cmd.Stderr = pw, pw
+	res := gstResult{start: time.Now(), times: map[string][]time.Time{}}
+	require.NoError(t, cmd.Start())
+	_ = pw.Close()
+	ch := make(chan gstResult, 1)
+	go func() {
+		defer cancel()
+		sc := bufio.NewScanner(pr)
+		sc.Buffer(make([]byte, 64<<10), 4<<20)
+		for sc.Scan() {
+			line := sc.Text()
+			for _, sink := range []string{"v", "a"} {
+				if strings.Contains(line, "GstFakeSink:"+sink+": last-message = chain") {
+					res.times[sink] = append(res.times[sink], time.Now())
+				}
+			}
+			if strings.Contains(line, "ERROR") {
+				res.errLines = append(res.errLines, line)
+			}
+		}
+		_ = pr.Close()
+		res.exit = cmd.Wait()
+		ch <- res
+	}()
+	return ch
 }
 
 const (
@@ -458,68 +669,13 @@ func vlcPlays(t *testing.T, vlc testpeer.Peer, ffprobe, u string) {
 // gstPlays applies the GStreamer pass rule to a pipeline.
 func gstPlays(t *testing.T, gst testpeer.Peer, pipeline []string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), runLimit)
-	defer cancel()
-	cmd := gst.Command(ctx, t, testpeer.Run{Interrupt: gstRun}, append([]string{"-v", "-e"}, pipeline...)...)
-	pr, pw, err := os.Pipe()
-	require.NoError(t, err)
-	cmd.Stdout, cmd.Stderr = pw, pw
-	start := time.Now()
-	require.NoError(t, cmd.Start())
-	_ = pw.Close()
-	n := map[string]int{}
+	res := <-runGst(t, gst, pipeline, gstRun)
 	first := map[string]time.Duration{}
-	var errLines []string
-	sc := bufio.NewScanner(pr)
-	sc.Buffer(make([]byte, 64<<10), 4<<20)
-	for sc.Scan() {
-		line := sc.Text()
-		for _, sink := range []string{"v", "a"} {
-			if strings.Contains(line, "GstFakeSink:"+sink+": last-message = chain") {
-				if n[sink] == 0 {
-					first[sink] = time.Since(start)
-				}
-				n[sink]++
-			}
-		}
-		if strings.Contains(line, "ERROR") {
-			errLines = append(errLines, line)
-		}
+	for sink, ts := range res.times {
+		first[sink] = ts[0].Sub(res.start)
 	}
-	_ = pr.Close()
-	werr := cmd.Wait()
-	t.Logf("%s: buffers %v, first after %v, exit %v", gst, n, first, werr)
-	for _, sink := range []string{"v", "a"} {
-		require.Positive(t, n[sink], "sink %s got buffers", sink)
-		assert.LessOrEqual(t, first[sink], gstWithin, "sink %s within %v", sink, gstWithin)
-	}
-	assert.Empty(t, errLines, "ERROR messages")
-}
-
-// testVLCAcrossGap plays the HLS fMP4 master of A/V, then 6 s of video
-// only, then A/V, with the VLC pass rule, sampling stats as TestM3VLCClass
-// describes.
-func testVLCAcrossGap(t *testing.T) {
-	t.Parallel()
-	vlc := testpeer.VLC(t)
-	ffmpeg := testpeer.Require(t, "ffmpeg")
-	ffprobe := testpeer.Require(t, "ffprobe")
-	r, p, origin := gapSource(t, ffmpeg, 4)
-	r.waitActive(t, 0, rtspReady)
-	waitListed(t, p, 3)
-	pair := startVLCPair(t, vlc, origin+"/live/s/cmaf/master.m3u8")
-	r.waitActive(t, 1, 30*time.Second)
-	s0, ok0 := pair.disp.stats(t)
-	r.waitActive(t, 2, 30*time.Second)
-	s1, ok1 := pair.disp.stats(t)
-	time.Sleep(16 * time.Second)
-	s2, ok2 := pair.disp.stats(t)
-	t.Logf("stats at the switch to video only %+v (%v), back to A/V %+v (%v), 16 s later %+v (%v)",
-		s0, ok0, s1, ok1, s2, ok2)
-	pair.finish(t, ffprobe)
-	require.True(t, ok1 && ok2, "VLC answered stats after the gap; log:\n%s", vlcErrors(pair.disp.log.String()))
-	assert.Greater(t, float64(s2.audio-s1.audio), 6*aacPerSecond, "audio decoded after the gap")
-	assert.Greater(t, s2.video, s1.video, "video decoded after the gap")
+	t.Logf("%s: buffers %v, first after %v, exit %v", gst, res.counts(), first, res.exit)
+	require.NoError(t, res.check())
 }
 
 // testVLCAudioOnlyStretch plays HTTP-TS, or SRT when srt is set, of A/V,
@@ -529,7 +685,6 @@ func testVLCAcrossGap(t *testing.T) {
 // in the 8 s after the switch back). conform.ReadTS reads the same output
 // clean.
 func testVLCAudioOnlyStretch(t *testing.T, srt bool) {
-	t.Parallel()
 	vlc := testpeer.VLC(t)
 	ffmpeg := testpeer.Require(t, "ffmpeg")
 	ffprobe := testpeer.Require(t, "ffprobe")

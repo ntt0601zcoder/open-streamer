@@ -194,7 +194,8 @@ type Run struct {
 	// they are mounted at the same paths.
 	Dirs []string
 	// Interrupt, when positive, stops the program with SIGINT after that
-	// long (coreutils timeout, on the host and in the image).
+	// long, and kills it 10 s later if it is still running (coreutils
+	// timeout, on the host and in the image).
 	Interrupt time.Duration
 }
 
@@ -212,7 +213,7 @@ func (p Peer) Command(ctx context.Context, t testing.TB, run Run, args ...string
 	argv := append([]string{prog}, args...)
 	if run.Interrupt > 0 {
 		secs := strconv.FormatFloat(run.Interrupt.Seconds(), 'f', 3, 64)
-		argv = append([]string{"timeout", "-s", "INT", secs}, argv...)
+		argv = append([]string{"timeout", "-k", "10", "-s", "INT", secs}, argv...)
 	}
 	if p.image == "" {
 		return exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // test peers

@@ -94,7 +94,7 @@ func TestPeerCommandImage(t *testing.T) {
 	assert.Equal(t, []string{"run", "--rm", "-i", "--network", "host", "--name"}, run[:6])
 	name := run[6]
 	assert.True(t, strings.HasPrefix(name, "osv2-vlc-"), name)
-	assert.Contains(t, lines[0], "--user "+hostUser()+" -e HOME=/tmp -v "+dir+":"+dir+" img timeout -s INT 2.000 cvlc --version")
+	assert.Contains(t, lines[0], "--user "+hostUser()+" -e HOME=/tmp -v "+dir+":"+dir+" img timeout -k 10 -s INT 2.000 cvlc --version")
 	assert.Equal(t, "kill "+name, lines[1])
 }
 

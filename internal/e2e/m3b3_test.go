@@ -1054,9 +1054,16 @@ func testPushOutFFprobe(t *testing.T) {
 // stream s. It returns the origin.
 func gapSource(t *testing.T, ffmpeg string, av int) (*m2aRun, *live.Packager, string) {
 	t.Helper()
+	return failoverSource(t, ffmpeg, "h264_640.ts", 3, av)
+}
+
+// failoverSource is gapSource with mid, looped midPasses times, between
+// the two runs of h264_aac.ts.
+func failoverSource(t *testing.T, ffmpeg, mid string, midPasses, av int) (*m2aRun, *live.Packager, string) {
+	t.Helper()
 	inputs := []string{
 		fileURL(loopClip(t, ffmpeg, "h264_aac.ts", 2, 0), ""),
-		fileURL(loopClip(t, ffmpeg, "h264_640.ts", 3, 0), ""),
+		fileURL(loopClip(t, ffmpeg, mid, midPasses, 0), ""),
 		fileURL(loopClip(t, ffmpeg, "h264_aac.ts", av, 0), ""),
 	}
 	r, p := liveRun(t, inputs, chainAtEOF(inputs...))

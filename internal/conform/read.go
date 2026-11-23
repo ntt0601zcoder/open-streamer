@@ -47,7 +47,10 @@ var maxSegments = 100000
 
 // ReadOptions configures the readers.
 type ReadOptions struct {
-	// Duration of media to capture when polling; for ReadTS and ReadRTMP, 0
+	// Duration of media to capture. When ReadHLS or ReadDASH polls, it
+	// stops once one playlist or representation has that much (or at the
+	// end of the stream), so 0 means a single pass: to poll until the end,
+	// give a Duration longer than the stream. For ReadTS and ReadRTMP, 0
 	// means read until the end of the stream.
 	Duration time.Duration
 	// Once reads the current playlist or MPD once and fetches every listed
