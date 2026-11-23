@@ -630,3 +630,74 @@ func TestMuxParamSetsAfterExplicitTables(t *testing.T) {
 	assert.Equal(t, want, got[0])
 	assert.Equal(t, nonKey[1].Data, got[1])
 }
+
+// TestMuxDiscontinuityNextPacket: after MarkDiscontinuity, the next packet of
+// every track's PID carries discontinuity_indicator, once; tables and every
+// later packet do not, and continuity counters stay unbroken.
+func TestMuxDiscontinuityNextPacket(t *testing.T) {
+	c := loadClip(t, "h264_aac.ts", 0)
+	var buf bytes.Buffer
+	m, err := NewMuxer(&buf, c.tracks)
+	require.NoError(t, err)
+	half := len(c.frames) / 2
+	muxFrames(t, m, c.frames[:half])
+	mark := buf.Len()
+	m.MarkDiscontinuity()
+	require.NoError(t, m.WriteTables())
+	muxFrames(t, m, c.frames[half:])
+	m.MarkDiscontinuity() // nothing follows: no flag anywhere
+	data := buf.Bytes()
+
+	pkts := readPackets(t, data)
+	markAt := mark / mpegts.PacketSize
+	seen := map[uint16]bool{}
+	for i, p := range pkts {
+		want := false
+		if i >= markAt && isTrackPID(p.PID) && !seen[p.PID] {
+			seen[p.PID] = true
+			want = true
+		}
+		assert.Equal(t, want, p.Discontinuity, "packet %d PID %d", i, p.PID)
+	}
+	assert.Equal(t, map[uint16]bool{firstPID: true, firstPID + 1: true}, seen)
+
+	dmx := mpegts.NewDemux(bytes.NewReader(data))
+	for {
+		_, err := dmx.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+	st := dmx.Stats()
+	assert.Zero(t, st.CCErrors+st.PESErrors+st.LostPES)
+
+	// A track added after the mark is new: its first packet is not flagged
+	// by the earlier mark, the kept tracks' packets are.
+	buf.Reset()
+	m, err = NewMuxer(&buf, c.tracks[:1])
+	require.NoError(t, err)
+	var v, a []media.Frame
+	for _, f := range c.frames {
+		if f.Track == 0 {
+			v = append(v, f)
+		} else {
+			a = append(a, f)
+		}
+	}
+	muxFrames(t, m, v[:3])
+	m.MarkDiscontinuity()
+	require.NoError(t, m.SetTracks(c.tracks))
+	muxFrames(t, m, []media.Frame{a[0], v[3], a[1]})
+	flags := map[uint16][]bool{}
+	for _, p := range readPackets(t, buf.Bytes()) {
+		if p.PUSI && isTrackPID(p.PID) {
+			flags[p.PID] = append(flags[p.PID], p.Discontinuity)
+		}
+	}
+	assert.Equal(t, []bool{false, false, false, true}, flags[firstPID])
+	assert.Equal(t, []bool{false, false}, flags[firstPID+1])
+}
+
+// isTrackPID reports whether pid is one of the two fixture tracks' PIDs.
+func isTrackPID(pid uint16) bool { return pid == firstPID || pid == firstPID+1 }

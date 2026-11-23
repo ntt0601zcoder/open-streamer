@@ -33,6 +33,10 @@ type PESOptions struct {
 	RandomAccess bool  // random_access_indicator on the first packet
 	PCR          int64 // PCR base on the first packet, modulo 2^33; negative: none
 	Video        bool  // stream_id 0xE0 and PES_packet_length 0 when over 65535 bytes; otherwise 0xC0
+	// Discontinuity sets discontinuity_indicator on the first packet
+	// (ISO/IEC 13818-1 2.4.3.5): the PID's continuity_counter may jump there
+	// and, on the PCR PID, its PCR starts a new system time base.
+	Discontinuity bool
 }
 
 // Writer produces a transport stream with one program: PAT, PMT and PES
@@ -212,8 +216,11 @@ func (w *Writer) WritePES(pid uint16, data []byte, opt PESOptions) error {
 		hdr1 := byte(pid >> 8)
 		if first {
 			hdr1 |= 0x40
-			if opt.RandomAccess || opt.PCR >= 0 {
+			if opt.Discontinuity || opt.RandomAccess || opt.PCR >= 0 {
 				flags := byte(0)
+				if opt.Discontinuity {
+					flags |= 0x80
+				}
 				if opt.RandomAccess {
 					flags |= 0x40
 				}

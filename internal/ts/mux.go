@@ -48,6 +48,9 @@ type Muxer struct {
 	// setsDue marks, by track, video tracks whose next frame carries the
 	// parameter sets although it is not a keyframe: set by WriteTables.
 	setsDue map[int]bool
+	// discDue marks, by track, tracks whose next packet carries the
+	// discontinuity_indicator: set by MarkDiscontinuity.
+	discDue map[int]bool
 	buf     []byte
 }
 
@@ -82,7 +85,29 @@ func (m *Muxer) SetTracks(tracks []*media.TrackConfig) error {
 	m.pcrPID = pmt.PCRPID
 	m.haveTables, m.explicit = false, false
 	clear(m.setsDue)
+	for i := range m.discDue {
+		if i >= len(tracks) || tracks[i] == nil {
+			delete(m.discDue, i)
+		}
+	}
 	return nil
+}
+
+// MarkDiscontinuity sets the discontinuity_indicator on the next packet of
+// every track configured now, for output that resumes after a gap: each
+// track's next PES signals that its timestamps jump and, on the PCR PID, that
+// the PCR starts a new time base (ISO/IEC 13818-1 2.4.3.5). Tables are not
+// marked; their continuity counters never jump. A track kept by SetTracks
+// stays marked until its next frame.
+func (m *Muxer) MarkDiscontinuity() {
+	if m.discDue == nil {
+		m.discDue = map[int]bool{}
+	}
+	for i, tc := range m.tracks {
+		if tc != nil {
+			m.discDue[i] = true
+		}
+	}
 }
 
 func streamType(c media.Codec) (uint8, bool) {
@@ -167,12 +192,13 @@ func (m *Muxer) WriteFrame(f media.Frame) error {
 	pid := uint16(firstPID + f.Track)
 	video := tc.Codec.Kind() == media.KindVideo
 	opt := mpegts.PESOptions{
-		PTS:          (f.PTS + timeOffset) & ts33Mask,
-		DTS:          (f.DTS + timeOffset) & ts33Mask,
-		HasDTS:       video && f.DTS != f.PTS,
-		RandomAccess: f.Key && video,
-		PCR:          -1,
-		Video:        video,
+		PTS:           (f.PTS + timeOffset) & ts33Mask,
+		DTS:           (f.DTS + timeOffset) & ts33Mask,
+		HasDTS:        video && f.DTS != f.PTS,
+		RandomAccess:  f.Key && video,
+		PCR:           -1,
+		Video:         video,
+		Discontinuity: m.discDue[f.Track],
 	}
 	if pid == m.pcrPID {
 		opt.PCR = (f.DTS + pcrOffset) & ts33Mask
@@ -186,6 +212,7 @@ func (m *Muxer) WriteFrame(f media.Frame) error {
 	if err := m.w.WritePES(pid, m.buf, opt); err != nil {
 		return fmt.Errorf("ts: mux: %w", err)
 	}
+	delete(m.discDue, f.Track)
 	return nil
 }
 

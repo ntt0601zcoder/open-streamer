@@ -470,3 +470,66 @@ func TestHTTPTSGolden(t *testing.T) {
 		})
 	}
 }
+
+// TestHTTPTSJoinsCachedGOP: a client that connects mid-stream starts at the
+// hub's cached GOP even when the cache is longer than the configured queue,
+// which a plain Subscribe would not replay.
+func TestHTTPTSJoinsCachedGOP(t *testing.T) {
+	frames := timed(t, "h264_aac.ts")
+	// Write up to half way into the second GOP: the cache then holds the
+	// second keyframe and every frame after it.
+	keys := 0
+	cut, key := -1, -1
+	for i, f := range frames {
+		if f.Track == 0 && f.Key {
+			keys++
+			if keys == 2 {
+				key = i
+			}
+		}
+		if keys == 2 && f.Track == 0 && f.DTS >= frames[key].DTS+media.ClockRate/2 {
+			cut = i
+			break
+		}
+	}
+	require.Positive(t, cut)
+	const queue = 16
+	require.Greater(t, cut-key, queue, "the cache must be longer than the queue")
+
+	h := hub.New(hub.Options{})
+	for _, f := range frames[:cut] {
+		h.Write(f)
+	}
+	srv := httptest.NewServer(Handler(lookupOne(h), queue))
+	t.Cleanup(srv.Close)
+	ch := startGet(context.Background(), srv.Client(), srv.URL+"/live/s/stream.ts")
+	waitSubscribed(t, h)
+	// Fewer frames than the 64 frames of room SubscribeCached leaves past
+	// the cache, so none is lost while the response buffers.
+	end := cut + 40
+	for _, f := range frames[cut:end] {
+		h.Write(f)
+	}
+	h.Close()
+	r := wait(t, ch)
+	require.NoError(t, r.err)
+	require.Equal(t, http.StatusOK, r.status)
+
+	got := readBack(t, r.body)
+	require.NotEmpty(t, got)
+	var firstVideo media.Frame
+	for _, f := range got {
+		if f.Kind() == media.KindVideo {
+			firstVideo = f
+			break
+		}
+	}
+	assert.True(t, firstVideo.Key)
+	var wantVideo int
+	for _, f := range frames[key:end] {
+		if f.Track == 0 {
+			wantVideo++
+		}
+	}
+	assert.Equal(t, wantVideo, countKind(got, media.KindVideo), "every video frame from the cached keyframe on")
+}

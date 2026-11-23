@@ -1,11 +1,14 @@
 // Package httpts serves a stream as one continuous MPEG-TS response at
 // /live/{stream}/stream.ts.
 //
-// Each request subscribes to the stream's hub and keeps one TS muxer for its
-// life. The response starts after one second of stream time has been
-// buffered, so the muxer is built with every track that starts together; a
-// track that joins later is added to the program with fresh tables. A
-// configured track whose codec changes ends the response, and so do a closed
+// Each request subscribes to the stream's hub with hub.SubscribeCached, so it
+// starts at the cached GOP, and keeps one TS muxer for its life
+// (internal/output/tsstream). The response starts after one second of stream
+// time has been buffered, so the muxer is built with every track that starts
+// together; a track that joins later is added to the program with fresh
+// tables. After frames are lost to a slow client the response resumes at a
+// keyframe, with fresh tables and the discontinuity indicator. A configured
+// track whose codec changes ends the response, and so do a closed
 // subscription, a gone client and a write that misses its deadline. Media
 // timing comes only from frame timestamps; wallclock sets write deadlines.
 package httpts
@@ -31,8 +34,9 @@ const (
 )
 
 // Handler serves /live/{stream}/stream.ts for every stream that lookup
-// finds, and 404 otherwise. Each request subscribes with a queue of the given
-// length (0 means 1024).
+// finds, and 404 otherwise. Each request subscribes with
+// hub.SubscribeCached(name, queue) (0 means 1024): a queue of at least the
+// given length that always holds the cached GOP.
 func Handler(lookup func(stream string) (*hub.Hub, bool), queue int) http.Handler {
 	return newHandler(lookup, queue, defaultWriteTimeout)
 }

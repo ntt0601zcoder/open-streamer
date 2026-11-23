@@ -1,13 +1,25 @@
 // Package tsstream writes a stream's hub frames as one continuous MPEG-TS
 // byte stream to a Sink, for the outputs that stream TS (HTTP-TS, SRT).
 //
-// Stream subscribes to the hub and keeps one TS muxer for its life. Output
-// starts after one second of stream time has been buffered, so the muxer is
-// built with every track that starts together; a track that joins later is
-// added to the program with fresh tables. A configured track whose codec
-// changes ends the stream, and so do a closed subscription, a done context
-// and a write that fails. Media timing comes only from frame timestamps;
-// wallclock sets write deadlines.
+// Stream subscribes to the hub, starting at its cached GOP, and keeps one TS
+// muxer for its life. Output starts after one second of stream time has been
+// buffered, so the muxer is built with every track that starts together; a
+// track that joins later is added to the program with fresh tables. A
+// configured track whose codec changes ends the stream, and so do a closed
+// subscription, a done context and a write that fails. Media timing comes
+// only from frame timestamps; wallclock sets write deadlines.
+//
+// # Resync after loss
+//
+// A delivery that reports lost frames (a slow sink made the hub skip)
+// restarts the output: frames are dropped until the next video keyframe (on
+// an output without video, the next frame), which is preceded by the PAT and
+// PMT, and the first packet of every track's PID from there on carries the
+// discontinuity_indicator. Audio presented before that keyframe is dropped,
+// and so are a second video track's frames until its own keyframe. When no
+// video keyframe comes within hub.LiveWindow of stream time from the first
+// frame dropped, the video track has ended (e.g. a failover to an audio-only
+// source): the output resumes on audio, and video at its next keyframe.
 package tsstream
 
 import (
@@ -28,6 +40,10 @@ const (
 	// MaxTracks bounds track indexes: track i is on PID 256 + i, and PIDs
 	// stop below the null PID 0x1FFF. Frames on other indexes are skipped.
 	MaxTracks = 0x1FFF - 256
+	// maxKeyWait is how long, in stream time from the first frame dropped
+	// after a loss, the output waits for a video keyframe before it resumes
+	// on audio.
+	maxKeyWait = hub.LiveWindow
 )
 
 // Why a stream ended, as reported in Stats.Ended.
@@ -49,7 +65,9 @@ type Sink interface {
 
 // Options tunes a stream. Zero values select the defaults.
 type Options struct {
-	// Queue is the subscription queue length (default 1024).
+	// Queue is the minimum subscription queue length (default 1024); the
+	// queue always holds the hub's cached GOP plus 64 frames
+	// (hub.SubscribeCached).
 	Queue int
 	// Prebuffer is the stream time buffered before output starts, in 90 kHz
 	// ticks (default 90000).
@@ -62,10 +80,20 @@ type Options struct {
 type Stats struct {
 	Frames     uint64 // frames written
 	LateTracks uint64 // tracks added after the first tables
-	Ended      string // why the stream ended: one of the Ended constants
+	// Resyncs counts deliveries that reported lost frames.
+	Resyncs uint64
+	// DroppedBeforeKey counts frames dropped after a loss while waiting for
+	// the resume point, and a video track's frames dropped until its own
+	// keyframe after the resume.
+	DroppedBeforeKey uint64
+	// DroppedEarlyAudio counts audio frames presented before the keyframe
+	// the output resumed at.
+	DroppedEarlyAudio uint64
+	Ended             string // why the stream ended: one of the Ended constants
 }
 
-// Stream subscribes to h under name and writes MPEG-TS to s until ctx ends,
+// Stream subscribes to h under name (hub.SubscribeCached with opt.Queue) and
+// writes MPEG-TS to s until ctx ends,
 // the hub closes, a configured track's codec changes, or a write fails. A
 // failure is returned wrapped; every other end returns a nil error.
 func Stream(ctx context.Context, h *hub.Hub, name string, s Sink, opt Options) (Stats, error) {
@@ -78,10 +106,10 @@ func Stream(ctx context.Context, h *hub.Hub, name string, s Sink, opt Options) (
 	if opt.WriteTimeout <= 0 {
 		opt.WriteTimeout = defaultWriteTimeout
 	}
-	sub := h.Subscribe(name, opt.Queue)
+	sub := h.SubscribeCached(name, opt.Queue)
 	defer sub.Close()
 	ss := &session{s: s, timeout: opt.WriteTimeout}
-	err := ss.run(ctx, sub, opt.Prebuffer)
+	err := ss.run(ctx, sub.C(), opt.Prebuffer)
 	if err != nil {
 		ss.stats.Ended = EndedError
 		return ss.stats, err
@@ -94,8 +122,8 @@ type endReason string
 
 func (e endReason) Error() string { return string(e) }
 
-// session is one stream: its muxer, the tracks configured in it and the
-// buffer the muxer writes into.
+// session is one stream: its muxer, the tracks configured in it, the buffer
+// the muxer writes into and the resync state.
 type session struct {
 	s       Sink
 	timeout time.Duration
@@ -103,12 +131,23 @@ type session struct {
 	tracks  []*media.TrackConfig
 	buf     bytes.Buffer
 	stats   Stats
+
+	waitKey   bool  // after a loss: dropping frames until the resume point
+	waiting   bool  // a frame was dropped since waitKey was set
+	waitFrom  int64 // the DTS of that frame
+	resumeDue bool  // the next frame written resumes: tables and discontinuity first
+	resumePTS int64 // PTS of the frame the output resumed at
+	// needKey marks video tracks dropping frames until their keyframe, and
+	// early the tracks whose audio before resumePTS is dropped, after a
+	// resume.
+	needKey map[int]bool
+	early   map[int]bool
 }
 
-// run streams sub until it closes, ctx is done or a write fails. A clean end
-// sets stats.Ended and returns nil.
-func (s *session) run(ctx context.Context, sub *hub.Sub, prebuffer int64) error {
-	err := s.loop(ctx, sub, prebuffer)
+// run streams the deliveries of ch until it closes, ctx is done or a write
+// fails. A clean end sets stats.Ended and returns nil.
+func (s *session) run(ctx context.Context, ch <-chan hub.Delivery, prebuffer int64) error {
+	err := s.loop(ctx, ch, prebuffer)
 	if r, ok := err.(endReason); ok { //nolint:errorlint // endReason is a sentinel value, never wrapped.
 		s.stats.Ended = string(r)
 		return nil
@@ -116,19 +155,19 @@ func (s *session) run(ctx context.Context, sub *hub.Sub, prebuffer int64) error 
 	return err
 }
 
-func (s *session) loop(ctx context.Context, sub *hub.Sub, prebuffer int64) error {
-	if err := s.start(ctx, sub, prebuffer); err != nil {
+func (s *session) loop(ctx context.Context, ch <-chan hub.Delivery, prebuffer int64) error {
+	if err := s.start(ctx, ch, prebuffer); err != nil {
 		return err
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return endReason(EndedContext)
-		case d, ok := <-sub.C():
+		case d, ok := <-ch:
 			if !ok {
 				return endReason(EndedClosed)
 			}
-			if err := s.frame(d.Frame); err != nil {
+			if err := s.deliver(d); err != nil {
 				return err
 			}
 		}
@@ -137,8 +176,8 @@ func (s *session) loop(ctx context.Context, sub *hub.Sub, prebuffer int64) error
 
 // start buffers the first frames, builds the muxer with each track's first
 // config, writes tables and then the buffered frames.
-func (s *session) start(ctx context.Context, sub *hub.Sub, prebuffer int64) error {
-	pending := buffer(ctx, sub, prebuffer)
+func (s *session) start(ctx context.Context, ch <-chan hub.Delivery, prebuffer int64) error {
+	pending := buffer(ctx, ch, prebuffer)
 	if len(pending) == 0 {
 		if ctx.Err() != nil {
 			return endReason(EndedContext)
@@ -155,38 +194,39 @@ func (s *session) start(ctx context.Context, sub *hub.Sub, prebuffer int64) erro
 		return fmt.Errorf("tsstream: write tables: %w", err)
 	}
 	for i := range pending {
-		if err := s.frame(pending[i]); err != nil {
+		if err := s.deliver(pending[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// buffer collects frames from the first delivery up to and including the
-// first one whose DTS is at least prebuffer past it, or until sub closes. It
+// buffer collects deliveries from the first one up to and including the
+// first one whose DTS is at least prebuffer past it, or until ch closes. It
 // returns nil when ctx is done first.
-func buffer(ctx context.Context, sub *hub.Sub, prebuffer int64) []media.Frame {
-	var out []media.Frame
+func buffer(ctx context.Context, ch <-chan hub.Delivery, prebuffer int64) []hub.Delivery {
+	var out []hub.Delivery
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case d, ok := <-sub.C():
+		case d, ok := <-ch:
 			if !ok {
 				return out
 			}
-			out = append(out, d.Frame)
-			if d.Frame.DTS >= out[0].DTS+prebuffer {
+			out = append(out, d)
+			if d.Frame.DTS >= out[0].Frame.DTS+prebuffer {
 				return out
 			}
 		}
 	}
 }
 
-// firstConfigs returns each track's first config among frames.
-func firstConfigs(frames []media.Frame) []*media.TrackConfig {
+// firstConfigs returns each track's first config among the deliveries.
+func firstConfigs(ds []hub.Delivery) []*media.TrackConfig {
 	var tracks []*media.TrackConfig
-	for _, f := range frames {
+	for i := range ds {
+		f := &ds[i].Frame
 		if !validTrack(f.Track) || f.Config == nil {
 			continue
 		}
@@ -202,9 +242,23 @@ func firstConfigs(frames []media.Frame) []*media.TrackConfig {
 
 func validTrack(i int) bool { return i >= 0 && i < MaxTracks }
 
+// deliver writes one delivery, restarting the output first when it reports
+// lost frames.
+func (s *session) deliver(d hub.Delivery) error {
+	if d.Lost > 0 {
+		s.stats.Resyncs++
+		if !s.waitKey {
+			s.waitKey, s.waiting = true, false
+		}
+		// Already waiting: keep the wait that started at the first frame
+		// dropped.
+	}
+	return s.frame(d.Frame)
+}
+
 // frame writes f, adding its track to the program first when it is new.
-// Frames on an invalid track index and frames without a config on an
-// unconfigured track are skipped.
+// Frames on an invalid track index, frames without a config on an
+// unconfigured track and frames the resync rules drop are skipped.
 func (s *session) frame(f media.Frame) error {
 	if !validTrack(f.Track) {
 		return nil
@@ -213,10 +267,20 @@ func (s *session) frame(f media.Frame) error {
 	if f.Track < len(s.tracks) {
 		tc = s.tracks[f.Track]
 	}
+	cfg := tc
 	switch {
 	case tc == nil && f.Config == nil:
 		return nil
 	case tc == nil:
+		cfg = f.Config
+	case f.Config != nil && f.Config.Codec != tc.Codec:
+		return endReason(EndedCodecChange) // a codec change is out of M3a scope
+	}
+	if !s.admit(f, cfg.Codec.Kind() == media.KindVideo) {
+		return nil
+	}
+	tables := s.resumeDue
+	if tc == nil {
 		tracks := make([]*media.TrackConfig, max(len(s.tracks), f.Track+1))
 		copy(tracks, s.tracks)
 		tracks[f.Track] = f.Config
@@ -225,17 +289,92 @@ func (s *session) frame(f media.Frame) error {
 		}
 		s.tracks = tracks
 		s.stats.LateTracks++
+		tables = true
+	}
+	if tables {
 		if err := s.mux.WriteTables(); err != nil {
 			return fmt.Errorf("tsstream: write tables: %w", err)
 		}
-	case f.Config != nil && f.Config.Codec != tc.Codec:
-		return endReason(EndedCodecChange) // a codec change is out of M3a scope
+	}
+	if s.resumeDue {
+		s.mux.MarkDiscontinuity()
+		s.resumeDue = false
 	}
 	if err := s.mux.WriteFrame(f); err != nil {
 		return fmt.Errorf("tsstream: write frame: %w", err)
 	}
 	s.stats.Frames++
 	return s.flush()
+}
+
+// admit applies the resync rules to f, a frame of a video track when video
+// is set, and reports whether it is written.
+func (s *session) admit(f media.Frame, video bool) bool {
+	if s.waitKey {
+		switch {
+		case !video && !s.hasVideo():
+			// An output without video resumes at its next frame.
+		case video && f.Key:
+		case !video && s.waiting && f.DTS-s.waitFrom >= maxKeyWait:
+			// No video keyframe within the live window: the video track
+			// ended. Resume on audio; video waits for its keyframe.
+		default:
+			if !s.waiting {
+				s.waiting, s.waitFrom = true, f.DTS
+			}
+			s.stats.DroppedBeforeKey++
+			return false
+		}
+		s.resume(f)
+		return true
+	}
+	if video && s.needKey[f.Track] {
+		if !f.Key {
+			s.stats.DroppedBeforeKey++
+			return false
+		}
+		delete(s.needKey, f.Track)
+	}
+	if !video && s.early[f.Track] {
+		if f.PTS < s.resumePTS {
+			s.stats.DroppedEarlyAudio++
+			return false
+		}
+		delete(s.early, f.Track)
+	}
+	return true
+}
+
+// resume ends the wait at f: it is written after fresh tables with the
+// discontinuity indicator on every PID. Every other configured video track
+// waits for its keyframe, and audio presented before f is dropped.
+func (s *session) resume(f media.Frame) {
+	s.waitKey, s.waiting = false, false
+	s.resumeDue, s.resumePTS = true, f.PTS
+	if s.needKey == nil {
+		s.needKey, s.early = map[int]bool{}, map[int]bool{}
+	}
+	clear(s.needKey)
+	clear(s.early)
+	for i, tc := range s.tracks {
+		switch {
+		case tc == nil, i == f.Track:
+		case tc.Codec.Kind() == media.KindVideo:
+			s.needKey[i] = true
+		default:
+			s.early[i] = true
+		}
+	}
+}
+
+// hasVideo reports whether a video track is configured.
+func (s *session) hasVideo() bool {
+	for _, tc := range s.tracks {
+		if tc != nil && tc.Codec.Kind() == media.KindVideo {
+			return true
+		}
+	}
+	return false
 }
 
 // flush writes the buffered bytes under the write deadline and flushes them

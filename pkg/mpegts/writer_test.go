@@ -470,3 +470,70 @@ func TestWriterPMTTooLarge(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "mpegts:")
 }
+
+// wPackets parses every packet of a stream, cloning the payloads.
+func wPackets(t *testing.T, b []byte) []Packet {
+	t.Helper()
+	r := NewReader(bytes.NewReader(b))
+	var out []Packet
+	for {
+		p, err := r.Next()
+		if errors.Is(err, io.EOF) {
+			return out
+		}
+		require.NoError(t, err)
+		p.Payload = bytes.Clone(p.Payload)
+		out = append(out, p)
+	}
+}
+
+// TestWriterDiscontinuityIndicator: PESOptions.Discontinuity sets
+// discontinuity_indicator in the adaptation field of the PES's first packet
+// only, adding the field when nothing else needs one, for every payload size
+// around the packet boundaries; the PES reads back intact.
+func TestWriterDiscontinuityIndicator(t *testing.T) {
+	for _, mode := range []string{"alone", "with-rai-pcr"} {
+		for n := 0; n <= 600; n++ {
+			var buf bytes.Buffer
+			w := newTestWriter(t, &buf)
+			data := bytes.Repeat([]byte{0x5A}, n)
+			opt := PESOptions{PTS: 90, PCR: -1, Discontinuity: true}
+			if mode == "with-rai-pcr" {
+				opt.RandomAccess, opt.PCR = true, 12345
+			}
+			require.NoError(t, w.WritePES(tVideo, data, opt))
+			require.NoError(t, w.WritePES(tVideo, data, PESOptions{PTS: 180, PCR: -1}))
+			raw := buf.Bytes()
+			require.Zero(t, len(raw)%PacketSize)
+
+			pkts := wPackets(t, raw)
+			first := true
+			for i, p := range pkts {
+				if p.PUSI && i > 0 {
+					first = false
+				}
+				assert.Equal(t, first && i == 0, p.Discontinuity, "n=%d %s packet %d", n, mode, i)
+			}
+			b := raw[:PacketSize]
+			require.NotZero(t, b[3]&0x20, "n=%d %s: adaptation field present", n, mode)
+			require.Positive(t, int(b[4]), "n=%d %s: adaptation field has its flags byte", n, mode)
+			assert.Equal(t, byte(0x80), b[5]&0x80, "n=%d %s", n, mode)
+			if mode == "with-rai-pcr" {
+				assert.Equal(t, byte(0xD0), b[5], "n=%d", n)
+				assert.Equal(t, int64(12345), pkts[0].PCR, "n=%d", n)
+			} else {
+				assert.Equal(t, byte(0x80), b[5], "n=%d", n)
+			}
+
+			var all bytes.Buffer
+			tw := newTestWriter(t, &all)
+			require.NoError(t, tw.WriteTables())
+			all.Write(raw)
+			pes, _, st := wDemux(t, all.Bytes())
+			require.Len(t, pes, 2, "n=%d %s", n, mode)
+			require.Equal(t, data, append([]byte{}, pes[0].Data...), "n=%d %s", n, mode)
+			require.Equal(t, data, append([]byte{}, pes[1].Data...), "n=%d %s", n, mode)
+			require.Zero(t, st.CCErrors+st.PESErrors+st.Reader.Resyncs+st.Reader.Errored, "n=%d %s", n, mode)
+		}
+	}
+}
