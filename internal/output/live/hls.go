@@ -261,12 +261,17 @@ func (p *Packager) cmafTargetDuration(s Snapshot) int {
 // entry (EXT-X-GAP, RFC 8216bis section 4.4.4.7): EXTINF is the segment's
 // duration and the URI gap-{track}-{Seq}.m4s, which is never served.
 //
-// A gap entry keeps the previous entry's EXT-X-MAP; leading gaps take the
-// first real entry's, and a playlist with no real entry writes none, so
-// every map names an init in the window. Gap entries are never loaded, so
-// their map is never fetched for them. EXT-X-PROGRAM-DATE-TIME is on the
-// first entry and on every discontinuity: a real entry's from its part's
-// earliest presentation time, a gap's from its segment's start.
+// A gap entry's EXT-X-MAP comes from the stream's history, not from the
+// window: it is the init of the epoch of the track's latest part before the
+// segment (SegmentInfo.GapMap), fixed when the segment was packaged, so a
+// listed entry's map never changes between refreshes (RFC 8216 section
+// 6.2.1). The packager keeps that init servable while the gap is listed,
+// even after its epoch left the window. Gaps before the track's first part
+// ever carry no map. Gap entries are never loaded, so their map is never
+// fetched for them; it only keeps the map in effect valid.
+// EXT-X-PROGRAM-DATE-TIME is on the first entry and on every discontinuity:
+// a real entry's from its part's earliest presentation time, a gap's from
+// its segment's start.
 func buildTrackPlaylist(p *Packager, s Snapshot, kind media.Kind, track int) []byte {
 	if !servesTrack(s, kind, track) {
 		return nil
@@ -278,14 +283,10 @@ func buildTrackPlaylist(p *Packager, s Snapshot, kind media.Kind, track int) []b
 		real bool
 	}
 	slots := make([]slot, len(listed))
-	curMap := "" // the first real entry's map, for leading gaps
 	for i, seg := range listed {
 		slots[i].seg = seg
 		if e, ok := trackPart(s, seg, track); ok && e.et.Config.Codec.Kind() == kind {
 			slots[i].e, slots[i].real = e, true
-			if curMap == "" {
-				curMap = initName(track, seg.Epoch)
-			}
 		}
 	}
 	pl := hls.MediaPlaylist{
@@ -298,7 +299,7 @@ func buildTrackPlaylist(p *Packager, s Snapshot, kind media.Kind, track int) []b
 		seg := hls.Segment{Discontinuity: sl.seg.Discontinuity}
 		start := sl.seg.Start
 		if sl.real {
-			curMap = initName(track, sl.seg.Epoch)
+			seg.Map = initName(track, sl.seg.Epoch)
 			seg.URI = strconv.Itoa(track) + "-" + strconv.FormatUint(sl.e.part.N, 10) + ".m4s"
 			seg.Duration = partDuration(sl.e)
 			start = 0
@@ -309,8 +310,10 @@ func buildTrackPlaylist(p *Packager, s Snapshot, kind media.Kind, track int) []b
 			seg.URI = "gap-" + strconv.Itoa(track) + "-" + strconv.FormatUint(sl.seg.Seq, 10) + ".m4s"
 			seg.Duration = media.ToDuration(sl.seg.Duration)
 			seg.Gap = true
+			if epoch, ok := sl.seg.GapMap[track]; ok {
+				seg.Map = initName(track, epoch)
+			}
 		}
-		seg.Map = curMap
 		if i == 0 || seg.Discontinuity {
 			seg.ProgramDateTime = pdt(s, sl.seg.Epoch, start)
 		}

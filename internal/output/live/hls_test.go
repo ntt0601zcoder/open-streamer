@@ -378,10 +378,11 @@ type entry struct {
 	duration time.Duration
 	disc     bool
 	gap      bool
+	init     string // the EXT-X-MAP in effect
 }
 
 func entryOf(s hls.Segment) entry {
-	return entry{s.URI, s.Duration, s.Discontinuity, s.Gap}
+	return entry{s.URI, s.Duration, s.Discontinuity, s.Gap, s.Map}
 }
 
 // discSeqs returns each entry's discontinuity sequence number by media
@@ -514,29 +515,82 @@ func discontinuities(pl hls.MediaPlaylist) int {
 func TestHLSGapEviction(t *testing.T) {
 	h := hub.New(hub.Options{})
 	ds := gapFeed(t, h)
+	// Epoch 3 goes on for two more segments, so the gaps leave the window.
+	ds = append(ds, synthAV(t, 3, 1080000)...)
 	p := NewPackager(h, Options{Window: 3, Now: farFuture})
 	srv := serve(p)
 	w := newWatch(t, srv, "/live/s/cmaf/v0.m3u8", "/live/s/cmaf/a1.m3u8")
 	lastSeq := int64(-1)
+	sawEvictedRef := false
 	for _, d := range ds {
 		p.Handle(d)
 		s := p.Snapshot()
 		if len(s.Segments) == 0 {
 			continue
 		}
-		if seq := int64(s.Segments[len(s.Segments)-1].Seq); seq != lastSeq {
-			lastSeq = seq
-			w.check("after " + itoa(uint64(seq)))
+		seq := int64(s.Segments[len(s.Segments)-1].Seq)
+		if seq == lastSeq {
+			continue
+		}
+		lastSeq = seq
+		a := w.check("after " + itoa(uint64(seq)))["/live/s/cmaf/a1.m3u8"]
+		referenced := false
+		for _, e := range a.Segments {
+			if e.Gap {
+				assert.Equal(t, "init-1-1.mp4", e.Map, "after %d: a gap keeps the map of the track's last part", seq)
+				referenced = true
+			}
+		}
+		_, inWindow := s.Epoch(1)
+		code, _ := get(t, srv, "/live/s/cmaf/init-1-1.mp4")
+		switch {
+		case referenced:
+			assert.Equal(t, http.StatusOK, code, "after %d: referenced by a gap", seq)
+			sawEvictedRef = sawEvictedRef || !inWindow
+		case !inWindow:
+			assert.Equal(t, http.StatusNotFound, code, "after %d: referenced by nothing", seq)
 		}
 	}
+	assert.True(t, sawEvictedRef, "a gap referenced init-1-1 after epoch 1 left the window")
 	p.Flush()
 	pls := w.check("flushed")
 	a := pls["/live/s/cmaf/a1.m3u8"]
-	assert.EqualValues(t, 3, a.MediaSequence)
-	assert.EqualValues(t, 1, a.DiscontinuitySequence, "the gap at Seq 2 carried epoch 2's discontinuity")
-	require.Len(t, a.Segments, 3)
-	assert.True(t, a.Segments[0].Gap)
-	assert.Equal(t, "init-1-3.mp4", a.Segments[0].Map, "a leading gap takes the first real entry's map")
+	assert.EqualValues(t, 5, a.MediaSequence)
+	assert.EqualValues(t, 2, a.DiscontinuitySequence, "the gap at Seq 2 and Seq 4 carried the discontinuities")
+	for _, e := range a.Segments {
+		assert.False(t, e.Gap)
+	}
+	code, _ := get(t, srv, "/live/s/cmaf/init-1-1.mp4")
+	assert.Equal(t, http.StatusNotFound, code)
+}
+
+// A playlist that holds only gaps, then gets real entries, never changes
+// the map of a listed gap.
+func TestHLSGapOnlyThenReal(t *testing.T) {
+	h := hub.New(hub.Options{})
+	ds := gapFeed(t, h)
+	p := NewPackager(h, Options{Window: 2, Now: farFuture})
+	srv := serve(p)
+	w := newWatch(t, srv, "/live/s/cmaf/v0.m3u8", "/live/s/cmaf/a1.m3u8")
+	lastSeq := int64(-1)
+	gapOnly := false
+	for _, d := range ds {
+		p.Handle(d)
+		s := p.Snapshot()
+		if len(s.Segments) == 0 || int64(s.Segments[len(s.Segments)-1].Seq) == lastSeq {
+			continue
+		}
+		lastSeq = int64(s.Segments[len(s.Segments)-1].Seq)
+		a := w.check("after " + itoa(uint64(lastSeq)))["/live/s/cmaf/a1.m3u8"]
+		only := true
+		for _, e := range a.Segments {
+			only = only && e.Gap
+		}
+		gapOnly = gapOnly || only
+	}
+	p.Flush()
+	w.check("flushed")
+	assert.True(t, gapOnly, "the window held only gaps at some refresh")
 }
 
 // R7: two discontinuities merged by loss in the audio track's part flags
@@ -593,16 +647,17 @@ func TestHLSGapOnlyPlaylistServed(t *testing.T) {
 	require.Len(t, m.Renditions, 1)
 	assert.Equal(t, "a1.m3u8", m.Renditions[0].URI)
 
-	code, body := get(t, srv, "/live/s/cmaf/a1.m3u8")
+	code, _ := get(t, srv, "/live/s/cmaf/a1.m3u8")
 	require.Equal(t, http.StatusOK, code)
-	assert.NotContains(t, string(body), "EXT-X-MAP", "gap entries are never loaded")
 	w := newWatch(t, srv, "/live/s/cmaf/v0.m3u8", "/live/s/cmaf/a1.m3u8")
 	a := w.check("gap only")["/live/s/cmaf/a1.m3u8"]
 	require.Len(t, a.Segments, 2)
 	for _, s := range a.Segments {
 		assert.True(t, s.Gap)
-		assert.Empty(t, s.Map)
+		assert.Equal(t, "init-1-1.mp4", s.Map, "the retained init of the track's last part")
 	}
+	code, _ = get(t, srv, "/live/s/cmaf/init-1-1.mp4")
+	assert.Equal(t, http.StatusOK, code, "retained while a gap references it")
 
 	// The video's resolution still comes from its parts in the window.
 	assert.Equal(t, 320, m.Variants[0].Width)
@@ -633,8 +688,10 @@ func TestHLSGapOnlyVideoKeepsResolution(t *testing.T) {
 	v := media3(t, srv, "/live/s/cmaf/v0.m3u8")
 	for _, s := range v.Segments {
 		assert.True(t, s.Gap)
-		assert.Empty(t, s.Map)
+		assert.Equal(t, "init-0-1.mp4", s.Map)
 	}
+	code, _ := get(t, srv, "/live/s/cmaf/init-0-1.mp4")
+	assert.Equal(t, http.StatusOK, code)
 }
 
 func TestHLSGapKeepsMap(t *testing.T) {
@@ -649,13 +706,24 @@ func TestHLSGapKeepsMap(t *testing.T) {
 		assert.Equal(t, want, got)
 	})
 	t.Run("leading", func(t *testing.T) {
+		// The gaps lead the window but keep the map of the track's last
+		// part before them, retained after epoch 1 left the window.
 		p := gapScenario(t, Options{Window: 4, Now: farFuture})
-		a := media3(t, serve(p), "/live/s/cmaf/a1.m3u8")
+		srv := serve(p)
+		a := media3(t, srv, "/live/s/cmaf/a1.m3u8")
 		require.Len(t, a.Segments, 4)
 		for i, s := range a.Segments {
 			assert.Equal(t, i < 2, s.Gap, "entry %d", i)
-			assert.Equal(t, "init-1-3.mp4", s.Map, "entry %d", i)
+			want := "init-1-3.mp4"
+			if s.Gap {
+				want = "init-1-1.mp4"
+			}
+			assert.Equal(t, want, s.Map, "entry %d", i)
 		}
+		_, ok := p.Snapshot().Epoch(1)
+		require.False(t, ok)
+		code, _ := get(t, srv, "/live/s/cmaf/init-1-1.mp4")
+		assert.Equal(t, http.StatusOK, code)
 	})
 	t.Run("late track", func(t *testing.T) {
 		// Audio first appears in epoch 2.
@@ -672,9 +740,39 @@ func TestHLSGapKeepsMap(t *testing.T) {
 		assert.EqualValues(t, 0, a.MediaSequence)
 		for i, s := range a.Segments {
 			assert.Equal(t, i < 2, s.Gap, "entry %d", i)
-			assert.Equal(t, "init-1-2.mp4", s.Map, "entry %d", i)
+			if s.Gap {
+				assert.Empty(t, s.Map, "entry %d: before the track's first part, no map", i)
+			} else {
+				assert.Equal(t, "init-1-2.mp4", s.Map, "entry %d", i)
+			}
 		}
 		newWatch(t, srv, "/live/s/cmaf/v0.m3u8", "/live/s/cmaf/a1.m3u8").check("late track")
+	})
+	t.Run("late track refreshed", func(t *testing.T) {
+		// Listed one segment per refresh, the leading gaps never gain a map.
+		h := hub.New(hub.Options{})
+		h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+		h.SetAnchor(media.Anchor{Epoch: 2, Start: 360000, Wall: t0.Add(4 * time.Second)})
+		p := NewPackager(h, Options{Window: 10, Now: farFuture})
+		srv := serve(p)
+		w := newWatch(t, srv, "/live/s/cmaf/v0.m3u8")
+		aw := newWatch(t, srv, "/live/s/cmaf/a1.m3u8")
+		segs := 0
+		for _, d := range append(synth(h264Config(t), 1, 0, 100), synthAV(t, 2, 360000)...) {
+			p.Handle(d)
+			if n := len(p.Snapshot().Segments); n != segs {
+				segs = n
+				w.check("v " + itoa(uint64(n)))
+				if code, _ := get(t, srv, "/live/s/cmaf/a1.m3u8"); code == http.StatusOK {
+					aw.check("a " + itoa(uint64(n)))
+				}
+			}
+		}
+		p.Flush()
+		a := aw.check("flushed")["/live/s/cmaf/a1.m3u8"]
+		require.Len(t, a.Segments, 4)
+		assert.Empty(t, a.Segments[0].Map)
+		assert.Empty(t, a.Segments[1].Map)
 	})
 }
 

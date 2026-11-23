@@ -240,6 +240,9 @@ type hlsCapture struct {
 	// misaligned: the renditions' media sequence numbers disagreed, so
 	// entries cannot be matched by number.
 	misaligned bool
+	// pending is the rule the previous pass's playlists disagreed on
+	// without AlignedSequences, not reported yet.
+	pending string
 }
 
 // ReadHLS reads an HLS master or media playlist, with TS or fMP4 segments,
@@ -261,10 +264,17 @@ type hlsCapture struct {
 //
 // A master's playlists are read back to back on every pass and must agree
 // (RFC 8216 section 6.2.4), or they are read again, up to alignTries times
-// in all: the discontinuity sequence number of their last entries must be
-// equal (RuleRenditionDiscontinuity); with AlignedSequences, MEDIA-SEQUENCE
-// must be equal (RuleRenditionSequence) and so must the discontinuity
-// sequence number of every media sequence number they share.
+// in all. With AlignedSequences, MEDIA-SEQUENCE must be equal
+// (RuleRenditionSequence) and so must the discontinuity sequence number of
+// every media sequence number they share (RuleRenditionDiscontinuity); the
+// re-reads follow at once, and a disagreement on the last is reported.
+// Without it, the discontinuity sequence number of their last entries must
+// be equal (RuleRenditionDiscontinuity); since renditions may differ by up
+// to a target duration at the live edge, the re-reads are half the largest
+// target duration apart, and a disagreement on the last is reported only
+// when the next pass's reads disagree too, or at once with Once (which has
+// no next pass; its reads span a target duration) or when every playlist
+// has ended.
 //
 // Gap entries (EXT-X-GAP) are counted in HLSGaps and never fetched; their
 // discontinuities count like any entry's. With AlignedSequences, a gap
@@ -368,16 +378,50 @@ func (c *hlsCapture) readPlaylists(ctx context.Context, body []byte, pass int) (
 		}
 		rule, detail := c.disagreement(reads)
 		if rule == "" {
+			c.pending = ""
 			return reads, nil
 		}
-		if try == alignTries {
+		if try < alignTries {
+			if !c.opt.AlignedSequences {
+				// Renditions may differ by up to a target duration at the
+				// live edge (RFC 8216 section 6.2.4): read again later.
+				if err := wait(ctx, maxTarget(reads)/2); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		switch {
+		case c.opt.AlignedSequences, c.opt.Once, c.pending == rule, allEnded(reads):
 			if rule == RuleRenditionSequence {
 				c.misaligned = true
 			}
 			c.b.once("align:"+rule, rule, -1, "%s", detail)
-			return reads, nil
+		default:
+			c.pending = rule // flagged if the next pass still disagrees
+		}
+		return reads, nil
+	}
+}
+
+// allEnded reports whether every read playlist has EXT-X-ENDLIST: final, so
+// no later pass can bring them into agreement.
+func allEnded(reads []hlsRead) bool {
+	for _, rd := range reads {
+		if !rd.p.Ended {
+			return false
 		}
 	}
+	return true
+}
+
+// maxTarget returns the largest EXT-X-TARGETDURATION of the reads.
+func maxTarget(reads []hlsRead) time.Duration {
+	var d time.Duration
+	for _, rd := range reads {
+		d = max(d, time.Duration(rd.p.TargetDuration)*time.Second)
+	}
+	return d
 }
 
 func parseMedia(pl *hlsPlaylist, body []byte) (hls.MediaPlaylist, error) {

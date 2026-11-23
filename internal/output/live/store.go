@@ -41,8 +41,9 @@ import (
 //     with TS bytes carry TSSeq, which counts them from 0 with no holes, so
 //     the TS playlist's MEDIA-SEQUENCE is the TSSeq of its first entry.
 //
-// Byte slices (SegmentInfo.TS, CMAFPart.Data, EpochTrack.Init) and configs
-// are shared with the packager and must never be modified. Segments and
+// Byte slices (SegmentInfo.TS, CMAFPart.Data, EpochTrack.Init), configs and
+// SegmentInfo.GapMap are shared with the packager and must never be
+// modified. Segments and
 // Epochs are the snapshot's own; Tracks, SegmentInfo.Parts and
 // EpochInfo.Tracks share immutable backing arrays clipped to their length,
 // so appending to them never touches the packager's data.
@@ -85,6 +86,13 @@ type SegmentInfo struct {
 	// Discontinuity or follows dropped TS segments.
 	TSDiscontinuity bool
 	Parts           []CMAFPart // one per track that has frames and muxed cleanly, ascending Track
+	// GapMap maps each known track without a part in this segment to the
+	// epoch of its latest part before it: its gap entry's EXT-X-MAP is that
+	// epoch's init, served while the entry is in the window. A track that
+	// never had a part before the segment has no entry. Fixed when the
+	// segment is added and never modified; nil when every known track has a
+	// part.
+	GapMap map[int]uint32
 }
 
 // CMAFPart is one track's CMAF media segment, served as cmaf/{Track}-{N}.m4s.
@@ -165,23 +173,47 @@ func (s Snapshot) IsListed(seg SegmentInfo) bool {
 // under Packager.mu; readers copy it under the same lock. Values it hands
 // out are never modified afterwards: a changed epoch is replaced whole.
 type store struct {
-	ast       time.Time
-	segs      []SegmentInfo
-	epochs    []EpochInfo  // ascending Epoch, only epochs with a segment in segs
-	known     []EpochTrack // ascending Track: Snapshot.Tracks
-	evicted   uint64
-	evictedTS uint64
-	ended     bool
+	ast        time.Time
+	segs       []SegmentInfo
+	epochs     []EpochInfo    // ascending Epoch, only epochs with a segment in segs
+	known      []EpochTrack   // ascending Track: Snapshot.Tracks
+	knownEpoch map[int]uint32 // per known track: the epoch of known's entry
+	retained   []retainedInit // inits a GapMap in segs references
+	evicted    uint64
+	evictedTS  uint64
+	ended      bool
 }
 
-// add appends a segment and the current state of its epoch, records the
-// epoch tracks of its parts as known, then evicts segments beyond window and
-// epochs left without a segment.
+// retainedInit is a track's init in an epoch, kept while a segment's GapMap
+// references it, even after the epoch left the window. It is not an epoch
+// of the window, so the DASH MPD has no period for it.
+type retainedInit struct {
+	track int
+	epoch uint32
+	init  []byte
+}
+
+// add sets the segment's GapMap from the known tracks, appends it and the
+// current state of its epoch, records the epoch tracks of its parts as
+// known, then evicts segments beyond window, and epochs and retained inits
+// nothing in the window needs.
 func (s *store) add(seg SegmentInfo, ep EpochInfo, window int) {
+	seg.GapMap = nil
+	for _, kt := range s.known {
+		if slices.ContainsFunc(seg.Parts, func(p CMAFPart) bool { return p.Track == kt.Track }) {
+			continue
+		}
+		if seg.GapMap == nil {
+			seg.GapMap = map[int]uint32{}
+		}
+		epoch := s.knownEpoch[kt.Track]
+		seg.GapMap[kt.Track] = epoch
+		s.retain(kt.Track, epoch, kt.Init)
+	}
 	s.segs = append(s.segs, seg)
 	for _, part := range seg.Parts {
 		if et, ok := ep.Track(part.Track); ok {
-			s.learn(et)
+			s.learn(et, ep.Epoch)
 		}
 	}
 	i, found := slices.BinarySearchFunc(s.epochs, ep.Epoch, func(e EpochInfo, id uint32) int {
@@ -218,11 +250,34 @@ func (s *store) add(seg SegmentInfo, ep EpochInfo, window int) {
 	s.epochs = slices.DeleteFunc(s.epochs, func(e EpochInfo) bool {
 		return !slices.ContainsFunc(s.segs, func(seg SegmentInfo) bool { return seg.Epoch == e.Epoch })
 	})
+	s.retained = slices.DeleteFunc(s.retained, func(r retainedInit) bool {
+		return !slices.ContainsFunc(s.segs, func(seg SegmentInfo) bool {
+			e, ok := seg.GapMap[r.track]
+			return ok && e == r.epoch
+		})
+	})
 }
 
-// learn records et as its track's latest known epoch track. The slice is
-// replaced, never changed in place, since snapshots share it.
-func (s *store) learn(et EpochTrack) {
+// retain keeps a track's init in an epoch until no GapMap references it.
+func (s *store) retain(track int, epoch uint32, init []byte) {
+	if init == nil || slices.ContainsFunc(s.retained, func(r retainedInit) bool { return r.track == track && r.epoch == epoch }) {
+		return
+	}
+	s.retained = append(s.retained, retainedInit{track, epoch, init})
+}
+
+// learn records et, the track's epoch track in epoch, as its latest known
+// epoch track. The slice is replaced, never changed in place, since
+// snapshots share it; an epoch track already recorded for that epoch is
+// left as it is (it does not change within an epoch once it has a part).
+func (s *store) learn(et EpochTrack, epoch uint32) {
+	if e, ok := s.knownEpoch[et.Track]; ok && e == epoch {
+		return
+	}
+	if s.knownEpoch == nil {
+		s.knownEpoch = map[int]uint32{}
+	}
+	s.knownEpoch[et.Track] = epoch
 	i, found := slices.BinarySearchFunc(s.known, et.Track, func(k EpochTrack, track int) int { return k.Track - track })
 	known := make([]EpochTrack, len(s.known), len(s.known)+1)
 	copy(known, s.known)
@@ -269,12 +324,20 @@ func (s *store) part(track int, n uint64) []byte {
 	return nil
 }
 
-// init returns the init segment of a track in an epoch in the window.
+// init returns the init segment of a track in an epoch in the window, or
+// one retained for a gap entry.
 func (s *store) init(track int, epoch uint32) []byte {
 	for _, e := range s.epochs {
 		if e.Epoch == epoch {
-			t, _ := e.Track(track)
-			return t.Init
+			if t, _ := e.Track(track); t.Init != nil {
+				return t.Init
+			}
+			break
+		}
+	}
+	for _, r := range s.retained {
+		if r.track == track && r.epoch == epoch {
+			return r.init
 		}
 	}
 	return nil

@@ -1342,3 +1342,44 @@ func TestReadHLSGap(t *testing.T) {
 		}
 	})
 }
+
+// TestReadHLSRenditionLag: without aligned sequences, renditions that
+// disagree on the discontinuity count during one pass are reported only when
+// the next pass still disagrees.
+func TestReadHLSRenditionLag(t *testing.T) {
+	p := packClip(t, "h264_aac_then_640.ts", 100, farFuture)
+	// edit hides ENDLIST from the first live reads of a playlist (three per
+	// pass) and polls at the minimum interval; lagged reads also lose the
+	// discontinuity of the audio's first gap.
+	edit := func(live int, lagged func(k int) bool) func(b []byte, k int) []byte {
+		return func(b []byte, k int) []byte {
+			pl, err := hls.ParseMedia(b)
+			require.NoError(t, err)
+			pl.TargetDuration = 0
+			pl.Ended = pl.Ended && k > live
+			if lagged != nil && lagged(k) {
+				for i := range pl.Segments {
+					if pl.Segments[i].Gap && pl.Segments[i].Discontinuity {
+						pl.Segments[i].Discontinuity = false
+						break
+					}
+				}
+			}
+			return pl.Encode()
+		}
+	}
+	read := func(live int, lagged func(k int) bool) Capture {
+		v := rewrite("cmaf/v0.m3u8", edit(live, nil))
+		a := rewrite("cmaf/a1.m3u8", edit(live, lagged))
+		base := serveLive(t, p, func(h http.Handler) http.Handler { return v(a(h)) })
+		c, err := ReadHLS(context.Background(), base+"cmaf/master.m3u8", ReadOptions{Duration: time.Hour})
+		require.NoError(t, err)
+		return c
+	}
+	c := read(3, func(k int) bool { return k <= 3 })
+	assert.Empty(t, c.Violations, "a lag during one pass only")
+	// Two live passes that both disagree: reported by the second.
+	c = read(6, func(k int) bool { return k <= 6 })
+	assert.Equal(t, []string{RuleRenditionDiscontinuity}, rules(c.Violations), "a lag that persists")
+	require.Len(t, c.Violations, 1)
+}
