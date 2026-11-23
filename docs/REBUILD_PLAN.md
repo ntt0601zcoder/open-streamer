@@ -201,7 +201,8 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 - **SRT output** (M3b3): one gosrt listener; the stream ID selects the stream
   (request mode only, every refusal identical). Writes are cut to 1316-byte
   payloads (fewer whole TS packets when a caller's MSS is lower, so each write
-  stays one SRT packet; below 4 packets the connection is refused) and
+  stays one SRT packet; below 4 packets the connection is closed at once and
+  counted as refused) and
   retried when gosrt's send queue is full, and paced by a token
   bucket per connection (2.5 times the stream's bitrate, between 2 Mbit/s and
   256 packets per 5 ms), so a GOP replay at join does not arrive as one burst
@@ -574,8 +575,8 @@ Items accepted for later, not yet placed in a milestone:
   SRT, before the M7 soak** (ruling R-F2). The PCR PID is the first video
   track and the muxer sends PCR only on that PID's frames, so while video is
   absent (an A/V to audio-only failover) the TS carries no PCR, where
-  ISO/IEC 13818-1 wants one at least every 100 ms. VLC and ffmpeg play
-  through it (M3b3 Task 7); broadcast IRDs may lose lock. Fix: move the PCR
+  ISO/IEC 13818-1 wants one at least every 100 ms. VLC plays through it
+  (M3b3 Task 7 audio-only-stretch rows); broadcast IRDs may lose lock. Fix: move the PCR
   PID to a live track, or send PCR-only adaptation-field packets on the PCR
   PID while its track is silent; add a conform PCR-interval rule.
 
