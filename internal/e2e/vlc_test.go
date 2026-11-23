@@ -54,38 +54,39 @@ import (
 // each sink logs a buffer (last-message = chain) within 10 s, and no ERROR
 // message. The exit code is never a pass.
 //
-// The VLC rows run one after the other (ruling R-T7b), and the GStreamer
-// rows in parallel once they are done. On the HLS fMP4 and DASH rows,
-// VLC 3.0.20 intermittently resets its clock at the live start and then
-// logs two decoder errors ("Timestamp conversion failed for N: no
+// The VLC rows run one after the other (ruling R-T7b); the GStreamer rows
+// are TestM3GStreamerClass, which overlaps them. On the HLS fMP4 and DASH
+// rows, VLC 3.0.20 intermittently resets its clock at the live start and
+// then logs two decoder errors ("Timestamp conversion failed for N: no
 // reference clock", "Could not convert timestamp 0 for FFmpeg"), whether
-// or not the machine is loaded; ruling R-T7c tolerates that pair once per
-// run on those rows, only right after the reset (vlcBadLines). Any other
-// decoder error fails.
+// or not the machine is loaded; ruling R-T7c' tolerates that pair once per
+// VLC process on those rows, only right after the process's first clock
+// reset (vlcBadLines). Any other decoder error fails.
 //
 // http-ts- and srt-audio-only-stretch (A/V, then 6 s of audio only, then
 // A/V) check that audio is decoded through the stretch, while the TS
-// carries no video and so no PCR on the video PID, and video after it.
+// carries no video and so no PCR on the video PID, and video after it
+// (testVLCAudioOnlyStretch).
 //
-// HLS fMP4 across a failover (ruling R-T7a): hls-fmp4-epoch-change (A/V,
-// then 6 s of h264_aac_640.ts, then A/V: two discontinuities with new
-// EXT-X-MAPs, no gap) is played by GStreamer through both. Across the
-// video-only stretch of gapSource, no VLC-class client plays (the stream
-// is proven by ffmpeg in TestHLSFFmpegAcrossGap): hls-fmp4-across-gap
-// skips both clients, citing the evidence, and so does
-// hls-fmp4-epoch-change for VLC. With OS_PEER_LIMITS=1 those rows instead
-// probe the limitation and fail if a client no longer has it, so that an
-// upgrade that fixes it shows.
+// HLS fMP4 across a failover (ruling R-T7a): VLC 3 cannot play past any
+// fMP4 discontinuity, so hls-fmp4-across-gap/vlc and
+// hls-fmp4-epoch-change/vlc skip, citing the evidence; the GStreamer rows
+// are in TestM3GStreamerClass. With OS_PEER_LIMITS=1 the skipped rows
+// instead probe the limitation and fail if the client no longer has it, so
+// that an upgrade that fixes it shows.
 func TestM3VLCClass(t *testing.T) {
 	t.Parallel()
-	for _, out := range []struct{ name, path string }{
-		{"hls-fmp4", "/cmaf/master.m3u8"},
-		{"hls-ts", "/hls/index.m3u8"},
-		{"dash", "/cmaf/index.mpd"},
-		{"http-ts", "/stream.ts"},
+	for _, out := range []struct {
+		name, path string
+		modules    []string
+	}{
+		{"hls-fmp4", "/cmaf/master.m3u8", []string{"adaptive", "mp4", "avcodec"}},
+		{"hls-ts", "/hls/index.m3u8", []string{"adaptive", "ts", "avcodec"}},
+		{"dash", "/cmaf/index.mpd", []string{"adaptive", "mp4", "avcodec"}},
+		{"http-ts", "/stream.ts", []string{"http", "ts", "avcodec"}},
 	} {
 		t.Run(out.name, func(t *testing.T) {
-			vlc := testpeer.VLC(t)
+			vlc := testpeer.VLC(t, out.modules...)
 			ffmpeg := testpeer.Require(t, "ffmpeg")
 			ffprobe := testpeer.Require(t, "ffprobe")
 			r, p := liveRun(t, []string{fileURL(loopClip(t, ffmpeg, "h264_aac.ts", 4, 0), "")}, nil)
@@ -100,7 +101,7 @@ func TestM3VLCClass(t *testing.T) {
 		})
 	}
 	t.Run("srt", func(t *testing.T) {
-		vlc := testpeer.VLC(t)
+		vlc := testpeer.VLC(t, "access_srt", "ts", "avcodec")
 		ffmpeg := testpeer.Require(t, "ffmpeg")
 		ffprobe := testpeer.Require(t, "ffprobe")
 		r := startRun(t, runOptions{inputs: []string{fileURL(loopClip(t, ffmpeg, "h264_aac.ts", 3, 0), "")}})
@@ -109,7 +110,7 @@ func TestM3VLCClass(t *testing.T) {
 		vlcPlays(t, vlc, ffprobe, o.url(), false)
 	})
 	t.Run("rtmp-play", func(t *testing.T) {
-		vlc := testpeer.VLC(t)
+		vlc := testpeer.VLC(t, "avio", "avcodec")
 		ffmpeg := testpeer.Require(t, "ffmpeg")
 		ffprobe := testpeer.Require(t, "ffprobe")
 		r := startRun(t, runOptions{inputs: []string{fileURL(loopClip(t, ffmpeg, "h264_aac.ts", 3, 0), "")}})
@@ -117,6 +118,29 @@ func TestM3VLCClass(t *testing.T) {
 		waitLive(t, p.srv, "s")
 		vlcPlays(t, vlc, ffprobe, p.url(), false)
 	})
+	t.Run("http-ts-audio-only-stretch", func(t *testing.T) { testVLCAudioOnlyStretch(t, false) })
+	t.Run("srt-audio-only-stretch", func(t *testing.T) { testVLCAudioOnlyStretch(t, true) })
+	t.Run("hls-fmp4-across-gap/vlc", func(t *testing.T) {
+		peerLimit(t, vlcDiscontinuityLimit)
+		probeVLCLimit(t, "h264_640.ts", 3)
+	})
+	t.Run("hls-fmp4-epoch-change/vlc", func(t *testing.T) {
+		peerLimit(t, vlcDiscontinuityLimit)
+		probeVLCLimit(t, "h264_aac_640.ts", 1)
+	})
+}
+
+// TestM3GStreamerClass plays the outputs whose VLC-class client is
+// GStreamer, with the GStreamer pass rule (see TestM3VLCClass): RTSP play
+// over TCP, the RTMP push-out played back from MediaMTX's RTSP, and HLS
+// fMP4 across an epoch change with no gap (A/V, then 6 s of
+// h264_aac_640.ts, then A/V: two discontinuities with new EXT-X-MAPs),
+// where each sink must also get buffers after the second failover. Across
+// the video-only stretch of gapSource GStreamer loads the EXT-X-GAP URIs and
+// stops (ruling R-T7a): that row skips, or with OS_PEER_LIMITS=1 probes the
+// limitation. It runs alongside TestM3VLCClass's serial VLC rows.
+func TestM3GStreamerClass(t *testing.T) {
+	t.Parallel()
 	t.Run("rtsp-play", func(t *testing.T) {
 		t.Parallel()
 		gst := testpeer.GStreamer(t, rtspElements...)
@@ -141,23 +165,18 @@ func TestM3VLCClass(t *testing.T) {
 		gstPlays(t, gst, rtspPipeline(u))
 		t.Logf("push %+v", push.Stats())
 	})
-	t.Run("http-ts-audio-only-stretch", func(t *testing.T) { testVLCAudioOnlyStretch(t, false) })
-	t.Run("srt-audio-only-stretch", func(t *testing.T) { testVLCAudioOnlyStretch(t, true) })
-	t.Run("hls-fmp4-across-gap/vlc", func(t *testing.T) {
-		peerLimit(t, vlcDiscontinuityLimit)
-		probeVLCLimit(t, "h264_640.ts", 3)
-	})
-	t.Run("hls-fmp4-epoch-change/vlc", func(t *testing.T) {
-		peerLimit(t, vlcDiscontinuityLimit)
-		probeVLCLimit(t, "h264_aac_640.ts", 1)
-	})
 	t.Run("hls-fmp4-across-gap/gstreamer", func(t *testing.T) {
 		t.Parallel()
 		peerLimit(t, gstGapLimit)
 		res := gstAcross(t, "h264_640.ts", 3)
 		if res.err == nil {
 			t.Errorf("GStreamer now plays HLS fMP4 across EXT-X-GAP entries: lift the skip (ruling R-T7a)")
+			return
 		}
+		// 1.28 reports the failed gap download; 1.24 stops delivering.
+		download := slices.ContainsFunc(res.errLines, func(l string) bool { return strings.Contains(l, "Couldn't download") })
+		stalled := res.after["v"] == 0 && res.after["a"] == 0
+		assert.True(t, download || stalled, "the known failure mode: %v", res.err)
 		t.Logf("the known limitation: %v", res.err)
 	})
 	t.Run("hls-fmp4-epoch-change/gstreamer", func(t *testing.T) {
@@ -199,7 +218,7 @@ func peerLimit(t *testing.T, limit string) {
 // fails the test.
 func probeVLCLimit(t *testing.T, mid string, midPasses int) {
 	t.Helper()
-	vlc := testpeer.VLC(t)
+	vlc := testpeer.VLC(t, "adaptive", "mp4", "avcodec")
 	ffmpeg := testpeer.Require(t, "ffmpeg")
 	r, p, origin := failoverSource(t, ffmpeg, mid, midPasses, 4)
 	r.waitActive(t, 0, rtspReady)
@@ -233,9 +252,14 @@ func hlsPipeline(u string) []string {
 	}
 }
 
-// acrossResult is how GStreamer played across a failover; err says how it
-// failed the pass rule, nil when it passed.
-type acrossResult struct{ err error }
+// acrossResult is how GStreamer played across a failover: err says how it
+// failed the pass rule, nil when it passed; after counts each sink's
+// buffers after the second failover; errLines are its ERROR lines.
+type acrossResult struct {
+	err      error
+	after    map[string]int
+	errLines []string
+}
 
 // gstAcross plays the HLS fMP4 master of failoverSource with mid with
 // GStreamer, for 40 s from its start, and applies the GStreamer pass rule
@@ -278,7 +302,7 @@ func gstAcross(t *testing.T, mid string, midPasses int) acrossResult {
 			errs = append(errs, fmt.Errorf("sink %s: no buffer after the second failover", sink))
 		}
 	}
-	return acrossResult{err: errors.Join(errs...)}
+	return acrossResult{err: errors.Join(errs...), after: after, errLines: res.errLines}
 }
 
 // gstResult is what one gst-launch-1.0 run logged.
@@ -366,8 +390,6 @@ const (
 	// the push-out's target on the RTMP MediaMTX (OS_MEDIAMTX_RTMP):
 	// live/m3b3push (MTX_PATHS_M3B3PUSH_SOURCE).
 	m3b3PushPath = "m3b3push"
-	// aacPerSecond is the AAC frames of one second at 48 kHz.
-	aacPerSecond = 48000.0 / 1024
 )
 
 // rtspElements are the GStreamer elements of rtspPipeline.
@@ -402,8 +424,9 @@ func (l *lockedBuffer) String() string {
 	return l.b.String()
 }
 
-// vlcStats is one answer to rc's stats command.
-type vlcStats struct{ video, audio int }
+// vlcStats is one answer to rc's stats command: decoded video and audio
+// blocks, and audio buffers played and lost.
+type vlcStats struct{ video, audio, played, lost int }
 
 // vlcProc is a running cvlc with the rc interface on its stdin and stdout.
 type vlcProc struct {
@@ -469,6 +492,10 @@ func (v *vlcProc) parse(r io.Reader) {
 			cur.video = statValue(line)
 		case cur != nil && strings.Contains(line, "audio decoded"):
 			cur.audio = statValue(line)
+		case cur != nil && strings.Contains(line, "buffers played"):
+			cur.played = statValue(line)
+		case cur != nil && strings.Contains(line, "buffers lost"):
+			cur.lost = statValue(line)
 		}
 	}
 }
@@ -487,9 +514,18 @@ func statValue(line string) int {
 }
 
 // stats sends rc's stats command and returns the answer; ok is false when
-// none comes within 5 s (VLC answers nothing once its input has ended).
+// none comes within 5 s (VLC answers nothing once its input has ended). An
+// answer that came after an earlier call gave up is dropped first, so that
+// it is not taken for this one.
 func (v *vlcProc) stats(t *testing.T) (vlcStats, bool) {
 	t.Helper()
+	for drained := false; !drained; {
+		select {
+		case <-v.blocks:
+		default:
+			drained = true
+		}
+	}
 	if _, err := io.WriteString(v.stdin, "stats\n"); err != nil {
 		return vlcStats{}, false
 	}
@@ -584,14 +620,16 @@ func isPCRLate(msg string) bool {
 	return err == nil
 }
 
-// vlcBadLines returns the lines of a VLC log that fail the log rule (that
-// contain "decoder error" or "cannot", case-insensitively), and the
-// tolerated pairs. While budget is positive, ruling R-T7c tolerates the
-// pair vlcNoClock…vlcNoClockEnd, vlcNoConvert as consecutive messages
-// when the messages right before it are vlcPCRLate, vlcPCRReset and at most
-// one vlcFirstPicture; each tolerated pair takes one from budget, and a
-// pair over budget, or anywhere else, is bad like any other error.
-func vlcBadLines(log string, budget int) (bad []string, tolerated int) {
+// vlcBadLines returns the lines of one VLC process's log that fail the
+// log rule (that contain "decoder error" or "cannot", case-insensitively),
+// and whether it tolerated the start-up pair. When tolerate is set, ruling
+// R-T7c' tolerates the pair vlcNoClock…vlcNoClockEnd, vlcNoConvert once
+// per process, as consecutive messages right after the process's live-start
+// clock reset: the messages before it are vlcPCRLate, vlcPCRReset and at
+// most one vlcFirstPicture, and that vlcPCRReset is the first in the log. A
+// second pair, a pair after a later reset, or a pair anywhere else is bad
+// like any other error.
+func vlcBadLines(log string, tolerate bool) (bad []string, tolerated bool) {
 	es := vlcEntries(log)
 	var msgs []int // indexes of the messages in es
 	for i, e := range es {
@@ -606,16 +644,20 @@ func vlcBadLines(log string, budget int) (bad []string, tolerated int) {
 		return es[msgs[k]].msg
 	}
 	skip := map[int]bool{}
+	resets := 0 // vlcPCRReset messages before k
 	for k := range msgs {
-		if tolerated >= budget || !isNoClock(at(k)) || at(k+1) != vlcNoConvert {
+		if at(k) == vlcPCRReset {
+			resets++
+		}
+		if !tolerate || tolerated || !isNoClock(at(k)) || at(k+1) != vlcNoConvert {
 			continue
 		}
 		j := k - 1
 		if at(j) == vlcFirstPicture {
 			j--
 		}
-		if at(j) == vlcPCRReset && isPCRLate(at(j-1)) {
-			tolerated++
+		if resets == 1 && at(j) == vlcPCRReset && isPCRLate(at(j-1)) {
+			tolerated = true
 			skip[msgs[k]], skip[msgs[k+1]] = true, true
 		}
 	}
@@ -628,17 +670,18 @@ func vlcBadLines(log string, budget int) (bad []string, tolerated int) {
 	return bad, tolerated
 }
 
-// checkVLCLog checks the log part of the VLC pass rule, with budget
-// tolerated pairs (vlcBadLines), and returns the pairs it tolerated; a
+// checkVLCLog checks the log part of the VLC pass rule on one process's
+// log, tolerating its start-up pair when tolerate is set (vlcBadLines); a
 // failure shows the 8 messages before the first offending line.
-func checkVLCLog(t *testing.T, name, log string, budget int) (tolerated int) {
+func checkVLCLog(t *testing.T, name, log string, tolerate bool) {
 	t.Helper()
 	assert.Contains(t, log, "successfully opened", "%s: the input opened", name)
-	bad, tolerated := vlcBadLines(log, budget)
-	if tolerated > 0 {
-		t.Logf("%s: tolerated VLC's start-up pair after its clock reset (ruling R-T7c)", name)
+	bad, tolerated := vlcBadLines(log, tolerate)
+	if tolerated {
+		t.Logf("%s: tolerated VLC's start-up pair after its first clock reset (ruling R-T7c')", name)
 	}
 	if !assert.Empty(t, bad, "%s: decoder errors", name) {
+		t.Logf("%s: clock lines of the log:\n%s", name, strings.Join(vlcLogLines(log, "es_out_reset_pcr", "called too late"), "\n"))
 		var lines []string
 		for line := range strings.SplitSeq(log, "\n") {
 			if strings.HasPrefix(line, "[") {
@@ -652,7 +695,6 @@ func checkVLCLog(t *testing.T, name, log string, budget int) (tolerated int) {
 			}
 		}
 	}
-	return tolerated
 }
 
 // vlcErrors returns at most 20 error lines of a VLC log, for failure
@@ -729,8 +771,8 @@ type vlcPair struct {
 	disp, dump *vlcProc
 	file       string
 	started    time.Time
-	// tolerate allows the run one start-up pair after VLC's clock reset
-	// (ruling R-T7c): set on the HLS fMP4 and DASH rows only.
+	// tolerate allows each instance one start-up pair after its first
+	// clock reset (ruling R-T7c'): set on the HLS fMP4 and DASH rows only.
 	tolerate bool
 }
 
@@ -752,12 +794,8 @@ func (p *vlcPair) finish(t *testing.T, ffprobe string) {
 	t.Helper()
 	p.disp.quit(t)
 	p.dump.quit(t)
-	budget := 0
-	if p.tolerate {
-		budget = 1
-	}
-	budget -= checkVLCLog(t, "display", p.disp.log.String(), budget)
-	checkVLCLog(t, "dump", p.dump.log.String(), budget)
+	checkVLCLog(t, "display", p.disp.log.String(), p.tolerate)
+	checkVLCLog(t, "dump", p.dump.log.String(), p.tolerate)
 	_, err := os.Stat(p.file)
 	require.NoError(t, err, "the dump exists; dump log:\n%s", vlcErrors(p.dump.log.String()))
 	spans := dumpSpans(t, ffprobe, p.file)
@@ -795,13 +833,22 @@ func gstPlays(t *testing.T, gst testpeer.Peer, pipeline []string) {
 }
 
 // testVLCAudioOnlyStretch plays HTTP-TS, or SRT when srt is set, of A/V,
-// then 6 s of audio only, then A/V, with the VLC pass rule: audio is
-// decoded through the stretch (at least 3 s of it between the switch to
-// audio only and the switch back), and video after it (at least 3 s of it
-// in the 8 s after the switch back). conform.ReadTS reads the same output
-// clean.
+// then 6 s of audio only, then A/V, with the VLC pass rule, and samples
+// VLC's stats 3 s after VLC started and when the stream switches to audio
+// only (the A/V phase: its audio block rate), 2 s after that switch and when
+// the stream switches back (the window: VLC, about 1 s behind the server,
+// is past the A/V before the stretch and cannot have decoded the video
+// after it), and 8 s after the switch back. In the window fewer video
+// blocks than one GOP's frames are decoded, which proves it inside the
+// stretch, while at least half the A/V phase's audio block rate is decoded
+// and audio buffers are played; after the switch back, video is decoded
+// again (at least 3 s of it). conform.ReadTS reads the same output clean.
 func testVLCAudioOnlyStretch(t *testing.T, srt bool) {
-	vlc := testpeer.VLC(t)
+	modules := []string{"http", "ts", "avcodec"}
+	if srt {
+		modules = []string{"access_srt", "ts", "avcodec"}
+	}
+	vlc := testpeer.VLC(t, modules...)
 	ffmpeg := testpeer.Require(t, "ffmpeg")
 	ffprobe := testpeer.Require(t, "ffprobe")
 	inputs := []string{
@@ -820,27 +867,50 @@ func testVLCAudioOnlyStretch(t *testing.T, srt bool) {
 	waitAV(t, r.h)
 	capCh := readTS(u)
 	pair := startVLCPair(t, vlc, u)
+	type sample struct {
+		at time.Time
+		s  vlcStats
+		ok bool
+	}
+	take := func() sample {
+		st, ok := pair.disp.stats(t)
+		return sample{time.Now(), st, ok}
+	}
+	time.Sleep(time.Until(pair.started.Add(3 * time.Second)))
+	avStart := take()
 	r.waitActive(t, 1, 30*time.Second)
-	s0, ok0 := pair.disp.stats(t)
+	avEnd := take()
+	time.Sleep(time.Until(avEnd.at.Add(2 * time.Second)))
+	win0 := take()
 	r.waitActive(t, 2, 30*time.Second)
-	s1, ok1 := pair.disp.stats(t)
+	win1 := take()
 	time.Sleep(8 * time.Second)
-	s2, ok2 := pair.disp.stats(t)
-	t.Logf("stats at the switch to audio only %+v (%v), back to A/V %+v (%v), 8 s later %+v (%v)",
-		s0, ok0, s1, ok1, s2, ok2)
+	after := take()
+	t.Logf("stats: A/V phase %+v -> %+v; window %+v -> %+v (%v); 8 s after the switch back %+v",
+		avStart.s, avEnd.s, win0.s, win1.s, win1.at.Sub(win0.at).Round(time.Millisecond), after.s)
 	pair.finish(t, ffprobe)
-	require.True(t, ok0 && ok1 && ok2, "VLC answered stats; log:\n%s", vlcErrors(pair.disp.log.String()))
-	assert.Greater(t, float64(s1.audio-s0.audio), 3*aacPerSecond, "audio decoded through the audio-only stretch")
-	assert.Greater(t, s2.video-s1.video, 3*gopVideo, "video decoded after the stretch")
+	for _, smp := range []sample{avStart, avEnd, win0, win1, after} {
+		require.True(t, smp.ok, "VLC answered stats; log:\n%s", vlcErrors(pair.disp.log.String()))
+	}
+	rate := float64(avEnd.s.audio-avStart.s.audio) / avEnd.at.Sub(avStart.at).Seconds()
+	window := win1.at.Sub(win0.at).Seconds()
+	require.Positive(t, rate, "audio decoded in the A/V phase")
+	require.Greater(t, window, 2.0, "a window of more than 2 s inside the stretch")
+	assert.Less(t, win1.s.video-win0.s.video, gopVideo, "no video decoded in the window: it is inside the stretch")
+	assert.GreaterOrEqual(t, float64(win1.s.audio-win0.s.audio), 0.5*rate*window,
+		"audio decoded through the stretch at half the A/V phase's rate (%.1f blocks/s) or more", rate)
+	assert.Positive(t, win1.s.played-win0.s.played, "audio buffers played through the stretch")
+	assert.Greater(t, after.s.video-win1.s.video, 3*gopVideo, "video decoded after the stretch")
 	r.check(t, []uint32{1, 2, 3})
 	c := waitCapture(t, capCh)
 	assert.Empty(t, c.Violations)
 	t.Logf("hub %s; conform %s; violations %v", kindCounts(r.col.frames), kindCounts(c.Frames), c.Violations)
 }
 
-// TestVLCLogTolerance checks ruling R-T7c's matcher on log excerpts shaped
-// like VLC 3.0.20's: the start-up pair is tolerated once, right after the
-// clock reset, on a row that allows it; twice, without the reset, on
+// TestVLCLogTolerance checks the matcher of ruling R-T7c' on log excerpts
+// shaped like VLC 3.0.20's, one log per VLC process: the start-up pair is
+// tolerated once per process, right after its first clock reset, on a row
+// that allows it; twice, after a later reset, without the reset, on
 // another row, or with another error, the log fails.
 func TestVLCLogTolerance(t *testing.T) {
 	t.Parallel()
@@ -865,30 +935,42 @@ func TestVLCLogTolerance(t *testing.T) {
 		return strings.Join(all, "\n")
 	}
 	for _, tc := range []struct {
-		name          string
-		log           string
-		budget        int
-		bad, tolerate int
+		name      string
+		log       string
+		tolerate  bool
+		bad       int
+		tolerated bool
 	}{
-		{"clean", join([]string{opened, segment, header}), 1, 0, 0},
-		{"after the reset", join([]string{opened, segment}, startup, []string{segment}), 1, 0, 1},
-		{"reset without first picture", join([]string{opened, late, reset, noClock, convert}), 1, 0, 1},
-		{"pcr-late line with another delay", join([]string{opened, strings.Replace(late, "1000 ms", "2033 ms", 1), reset, picture, noClock, convert}), 1, 0, 1},
-		{"twice", join([]string{opened}, startup, []string{segment}, startup), 1, 2, 1},
-		{"without the reset", join([]string{opened, segment, picture, noClock, convert}), 1, 2, 0},
-		{"reset without the pcr-late line", join([]string{opened, segment, reset, picture, noClock, convert}), 1, 2, 0},
-		{"a message between the reset and the pair", join([]string{opened, late, reset, segment, noClock, convert}), 1, 2, 0},
-		{"a message inside the pair", join([]string{opened, late, reset, picture, noClock, segment, convert}), 1, 2, 0},
-		{"half the pair", join([]string{opened, late, reset, picture, noClock}), 1, 1, 0},
-		{"another row", join([]string{opened}, startup), 0, 2, 0},
-		{"with another error", join([]string{opened}, startup, []string{other}), 1, 1, 1},
-		{"with a cannot line", join([]string{opened}, startup, []string{cannot}), 1, 1, 1},
+		{"clean", join([]string{opened, segment, header}), true, 0, false},
+		{"after the reset", join([]string{opened, segment}, startup, []string{segment}), true, 0, true},
+		{"reset without first picture", join([]string{opened, late, reset, noClock, convert}), true, 0, true},
+		{"pcr-late line with another delay", join([]string{opened, strings.Replace(late, "1000 ms", "2033 ms", 1), reset, picture, noClock, convert}), true, 0, true},
+		{"two pairs on one process", join([]string{opened}, startup, []string{segment}, startup), true, 2, true},
+		{"pair after a second reset", join([]string{opened, late, reset, segment}, startup), true, 2, false},
+		{"without the reset", join([]string{opened, segment, picture, noClock, convert}), true, 2, false},
+		{"reset without the pcr-late line", join([]string{opened, segment, reset, picture, noClock, convert}), true, 2, false},
+		{"a message between the reset and the pair", join([]string{opened, late, reset, segment, noClock, convert}), true, 2, false},
+		{"a message inside the pair", join([]string{opened, late, reset, picture, noClock, segment, convert}), true, 2, false},
+		{"half the pair", join([]string{opened, late, reset, picture, noClock}), true, 1, false},
+		{"another row", join([]string{opened}, startup), false, 2, false},
+		{"with another error", join([]string{opened}, startup, []string{other}), true, 1, true},
+		{"with a cannot line", join([]string{opened}, startup, []string{cannot}), true, 1, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			bad, tolerated := vlcBadLines(tc.log, tc.budget)
+			bad, tolerated := vlcBadLines(tc.log, tc.tolerate)
 			assert.Len(t, bad, tc.bad, "bad lines %q", bad)
-			assert.Equal(t, tc.tolerate, tolerated)
+			assert.Equal(t, tc.tolerated, tolerated)
 		})
 	}
+	// A pair on each instance of a row (display and dump): each process
+	// has its own allowance.
+	t.Run("a pair on each instance", func(t *testing.T) {
+		t.Parallel()
+		for _, name := range []string{"display", "dump"} {
+			bad, tolerated := vlcBadLines(join([]string{opened, segment}, startup), true)
+			assert.Empty(t, bad, name)
+			assert.True(t, tolerated, name)
+		}
+	})
 }

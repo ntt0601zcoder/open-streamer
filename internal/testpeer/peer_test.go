@@ -14,8 +14,9 @@ import (
 )
 
 // fakeDocker is a docker client that appends its arguments to $FAKE_LOG,
-// has every image but missing-image, and fails a run whose last argument is
-// "lacking" (a gst-inspect-1.0 --exists of an element the image lacks).
+// has every image but missing-image, fails a run whose last argument is
+// "lacking" (a gst-inspect-1.0 --exists of an element the image lacks), and
+// answers a run of --list with two VLC modules.
 const fakeDocker = `#!/bin/sh
 echo "$@" >> "$FAKE_LOG"
 case "$1" in
@@ -24,6 +25,11 @@ kill) exit 0 ;;
 run)
 	for a; do last=$a; done
 	[ "$last" = lacking ] && exit 1
+	if [ "$last" = --list ]; then
+		echo "  access_srt             SRT input"
+		echo "  adaptive               Unified adaptive streaming for DASH/HLS"
+		exit 0
+	fi
 	echo "fake 1.0"
 	echo more
 	exit 0 ;;
@@ -130,24 +136,32 @@ func TestVLC(t *testing.T) {
 	useFakeDocker(t)
 	empty := t.TempDir()
 	withVLC := t.TempDir()
-	script(t, withVLC, "cvlc", "#!/bin/sh\n")
+	script(t, withVLC, "cvlc", "#!/bin/sh\n[ \"$1\" = --list ] && echo '  adaptive               Unified adaptive streaming'\nexit 0\n")
 	for _, tt := range []struct {
-		name, path, image, require string
-		wantImage, wantHost        bool
-		wantSkip, wantFail         bool
+		name, path, image, force, require string
+		modules                           []string
+		wantImage, wantHost               bool
+		wantSkip, wantFail                bool
 	}{
-		{"host", withVLC, "", "", false, true, false, false},
-		{"image", empty, "vlc-image", "", true, false, false, false},
-		{"missing image", empty, "missing-image", "", false, false, true, false},
-		{"none", empty, "", "", false, false, true, false},
-		{"none required", empty, "", "1", false, false, false, true},
+		{"host", withVLC, "", "", "", nil, false, true, false, false},
+		{"host has the module", withVLC, "", "", "", []string{"adaptive"}, false, true, false, false},
+		{"host lacks the module, image has it", withVLC, "vlc-image", "", "", []string{"access_srt"}, true, false, false, false},
+		{"host lacks the module, no image", withVLC, "", "", "", []string{"access_srt"}, false, false, true, false},
+		{"image lacks the module", empty, "vlc-image", "", "", []string{"live555"}, false, false, true, false},
+		{"forced image", withVLC, "vlc-image", "1", "", nil, true, false, false, false},
+		{"forced without an image", withVLC, "", "1", "1", nil, false, false, false, true},
+		{"image", empty, "vlc-image", "", "", nil, true, false, false, false},
+		{"missing image", empty, "missing-image", "", "", nil, false, false, true, false},
+		{"none", empty, "", "", "", nil, false, false, true, false},
+		{"none required", empty, "", "", "1", nil, false, false, false, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("PATH", tt.path)
 			t.Setenv(EnvPeerImage, tt.image)
+			t.Setenv(EnvPeerForceImage, tt.force)
 			t.Setenv(EnvRequire, tt.require)
 			rec := &recorder{TB: t}
-			p := VLC(rec)
+			p := VLC(rec, tt.modules...)
 			assert.Equal(t, tt.wantSkip, rec.skipped)
 			assert.Equal(t, tt.wantFail, rec.failed)
 			assert.Equal(t, tt.wantImage, p.InImage())
@@ -179,6 +193,7 @@ func TestGStreamer(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("PATH", tt.path)
 			t.Setenv(EnvPeerImage, tt.image)
+			t.Setenv(EnvPeerForceImage, "")
 			t.Setenv(EnvRequire, tt.require)
 			rec := &recorder{TB: t}
 			p := GStreamer(rec, tt.elements...)
@@ -188,6 +203,35 @@ func TestGStreamer(t *testing.T) {
 			assert.Equal(t, tt.wantHost, p.path != "")
 		})
 	}
+}
+
+func TestGStreamerForcedImage(t *testing.T) {
+	useFakeDocker(t)
+	withGst := t.TempDir()
+	script(t, withGst, "gst-launch-1.0", "#!/bin/sh\n")
+	script(t, withGst, "gst-inspect-1.0", "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", withGst)
+	t.Setenv(EnvPeerImage, "gst-forced")
+	t.Setenv(EnvPeerForceImage, "1")
+	rec := &recorder{TB: t}
+	p := GStreamer(rec, "good")
+	assert.False(t, rec.skipped || rec.failed)
+	assert.True(t, p.InImage(), "the host has every element, but the image is forced")
+}
+
+func TestPeerCommandHostCancelKillsGroup(t *testing.T) {
+	sh, err := filepath.Abs("/bin/sh")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	// timeout's child outlives a kill of timeout alone; the group kill ends
+	// both, so Wait returns at once instead of after WaitDelay.
+	cmd := Peer{name: "sh", path: sh}.Command(ctx, t, Run{Interrupt: time.Minute}, "-c", "sleep 60")
+	require.NoError(t, cmd.Start())
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	_ = cmd.Wait()
+	assert.Less(t, time.Since(start), 5*time.Second)
 }
 
 func TestFFmpegSRT(t *testing.T) {

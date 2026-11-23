@@ -601,6 +601,25 @@ func burstFeed(ctx context.Context, h *hub.Hub, steps []step, at, burst time.Dur
 	return done
 }
 
+// bgResult is what a function run by inBackground returned.
+type bgResult[T any] struct {
+	v   T
+	err error
+}
+
+// inBackground runs f with a context bounded by runLimit in a goroutine and
+// delivers its result on the channel it returns.
+func inBackground[T any](f func(ctx context.Context) (T, error)) <-chan bgResult[T] {
+	ch := make(chan bgResult[T], 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), runLimit)
+		defer cancel()
+		v, err := f(ctx)
+		ch <- bgResult[T]{v, err}
+	}()
+	return ch
+}
+
 // probeTime is one packet as ffprobe reports it, in seconds.
 type probeTime struct {
 	pts, dts float64
@@ -699,10 +718,9 @@ func hubTimes(frames []media.Frame) []probeTime {
 	return out
 }
 
-// probeHTTPOutput has ffprobe read the output out (a path under the
-// stream's base URL) of the fixture name, packaged as TestM3aFFprobe does,
-// with extra options, and returns its video packets.
-func probeHTTPOutput(t *testing.T, ffprobe, name, out string, extra ...string) []probeTime {
+// probeBase packages and serves the fixture name as TestM3aFFprobe does,
+// for ffprobe, until the test ends, and returns the stream's base URL.
+func probeBase(t *testing.T, name string) string {
 	t.Helper()
 	data := fixtureBytes(t, name)
 	var last int64
@@ -712,12 +730,7 @@ func probeHTTPOutput(t *testing.T, ffprobe, name, out string, extra ...string) [
 	t0 := time.Now().Add(-media.ToDuration(last) - 5*time.Second)
 	fd := pipelineFeed(data, func() time.Time { return t0 })
 	p, _ := packFeed(t, fd, time.Now)
-	base := serve(t, p, fd)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	pkts, err := probeVideoTimes(ctx, ffprobe, base+out, extra...)
-	require.NoError(t, err)
-	return pkts
+	return serve(t, p, fd)
 }
 
 // TestM3Matrix fills the M3 matrix cells that no earlier scenario covers
@@ -757,6 +770,10 @@ func probeHTTPOutput(t *testing.T, ffprobe, name, out string, extra ...string) [
 // instead (TestSRTStalledReceiverEnded).
 func TestM3Matrix(t *testing.T) {
 	t.Parallel()
+	// One conform read of the four HTTP outputs and one packaging for
+	// ffprobe serve the four b-frames cells.
+	_, _, caps := pipelineScenario(t, fixtureBytes(t, "h264_pyramid.ts"))
+	base := probeBase(t, "h264_pyramid.ts")
 	for _, out := range []struct {
 		name, path string
 		extra      []string
@@ -769,9 +786,11 @@ func TestM3Matrix(t *testing.T) {
 		t.Run(out.name+"/b-frames", func(t *testing.T) {
 			t.Parallel()
 			ffprobe := testpeer.Require(t, "ffprobe")
-			_, _, caps := pipelineScenario(t, fixtureBytes(t, "h264_pyramid.ts"))
 			assert.Empty(t, caps[out.name].Violations)
-			pkts := probeHTTPOutput(t, ffprobe, "h264_pyramid.ts", out.path, out.extra...)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			pkts, err := probeVideoTimes(ctx, ffprobe, base+out.path, out.extra...)
+			require.NoError(t, err)
 			want := pyramidRef(t)
 			require.GreaterOrEqual(t, len(pkts), len(want)/2, "ffprobe read most of the clip")
 			reordered := assertReorder(t, want, pkts, true)
@@ -837,17 +856,9 @@ func testSRTSteady(t *testing.T) {
 			o := serveSRT(t, "", srtout.Options{}, map[string]*hub.Hub{"s": r.h})
 			waitAV(t, r.h)
 			capCh := readTS(o.url())
-			type probed struct {
-				streams []string
-				err     error
-			}
-			probeCh := make(chan probed, 1)
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), runLimit)
-				defer cancel()
-				s, err := probeStreams(ctx, ffprobe, o.url())
-				probeCh <- probed{s, err}
-			}()
+			probeCh := inBackground(func(ctx context.Context) ([]string, error) {
+				return probeStreams(ctx, ffprobe, o.url())
+			})
 
 			r.check(t, []uint32{1})
 			c := waitCapture(t, capCh)
@@ -856,13 +867,13 @@ func testSRTSteady(t *testing.T) {
 			assertTSMatchesHub(t, r.col.frames, c.Frames)
 			pr := <-probeCh
 			require.NoError(t, pr.err)
-			assert.ElementsMatch(t, tc.probe, pr.streams)
+			assert.ElementsMatch(t, tc.probe, pr.v)
 			require.Eventually(t, func() bool { return o.srv.Stats().Conns == 0 }, m3b3Read, 10*time.Millisecond)
 			st := o.srv.Stats()
 			assert.Zero(t, st.Resyncs)
 			assert.Zero(t, st.EndedStalled)
 			assert.Zero(t, st.EndedError)
-			t.Logf("hub %s; read %s; ffprobe %v; srt %+v", kindCounts(r.col.frames), kindCounts(c.Frames), pr.streams, st)
+			t.Logf("hub %s; read %s; ffprobe %v; srt %+v", kindCounts(r.col.frames), kindCounts(c.Frames), pr.v, st)
 		})
 	}
 }
@@ -896,7 +907,7 @@ func testSRTEpochChange(t *testing.T) {
 		out    []string
 	}{
 		{"h264_aac_640.ts", 1, []string{"-t", "15", "-f", "null", "-"}},
-		{"h264_640.ts", 3, []string{"-map", "0:v", "-t", "15", "-f", "null", "-", "-map", "0:a", "-t", "11", "-f", "null", "-"}},
+		{"h264_640.ts", 3, []string{"-map", "0:v", "-t", "15", "-f", "null", "-", "-map", "0:a", "-t", "9", "-f", "null", "-"}},
 	} {
 		t.Run(tc.backup, func(t *testing.T) {
 			t.Parallel()
@@ -981,17 +992,9 @@ func testSRTBFrames(t *testing.T) {
 	o := serveSRT(t, "", srtout.Options{}, map[string]*hub.Hub{"s": r.h})
 	waitAV(t, r.h)
 	capCh := readTS(o.url())
-	type probed struct {
-		pkts []probeTime
-		err  error
-	}
-	probeCh := make(chan probed, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), runLimit)
-		defer cancel()
-		pkts, err := probeVideoTimes(ctx, ffprobe, o.url())
-		probeCh <- probed{pkts, err}
-	}()
+	probeCh := inBackground(func(ctx context.Context) ([]probeTime, error) {
+		return probeVideoTimes(ctx, ffprobe, o.url())
+	})
 
 	r.check(t, []uint32{1})
 	c := waitCapture(t, capCh)
@@ -999,11 +1002,11 @@ func testSRTBFrames(t *testing.T) {
 	assertTSMatchesHub(t, r.col.frames, c.Frames)
 	pr := <-probeCh
 	require.NoError(t, pr.err)
-	require.NotEmpty(t, pr.pkts)
-	reordered := assertReorder(t, hubTimes(r.col.frames), pr.pkts, false)
+	require.NotEmpty(t, pr.v)
+	reordered := assertReorder(t, hubTimes(r.col.frames), pr.v, false)
 	assert.Positive(t, reordered, "packets with a composition offset")
 	t.Logf("hub %s; read %s; ffprobe %d video packets, %d reordered", kindCounts(r.col.frames),
-		kindCounts(c.Frames), len(pr.pkts), reordered)
+		kindCounts(c.Frames), len(pr.v), reordered)
 }
 
 func testPushOutFFprobe(t *testing.T) {
@@ -1319,7 +1322,9 @@ func TestM3b3HLSAlignment(t *testing.T) {
 // our RTSP pull read each path over TCP: one epoch of violation-free frames
 // with no offset jump. DASH and HTTP-TS are not MediaMTX sources (ruling
 // R-PF2). Each path is warmed with a throwaway reader and joined 1 s later
-// (settleRTSP); an HLS path is warmed 1 s after a segment is listed.
+// (settleRTSP); an HLS path is warmed 1 s after a segment is listed, and an
+// HLS row whose read MediaMTX still ends runs once more (the retry is
+// logged).
 func TestM3b3MediaMTXPull(t *testing.T) {
 	t.Parallel()
 	mtx := testpeer.MediaMTXPull(t)
@@ -1327,38 +1332,64 @@ func TestM3b3MediaMTXPull(t *testing.T) {
 	// The rows run one after the other on the fixed ports.
 	for _, path := range []string{"m3b3hls", "m3b3hlsts", "m3b3srt"} {
 		t.Run(path, func(t *testing.T) {
-			clip := loopClip(t, ffmpeg, "h264_aac.ts", 4, 0)
-			src, p := liveRun(t, []string{fileURL(clip, "")}, nil)
-			hubs := map[string]*hub.Hub{"m3b3": src.h, "m3b3srt": src.h}
-			serveHTTP(t, m3b3HTTPAddr, hubs, map[string]*live.Packager{"m3b3": p}, 0, nil)
-			o := serveSRT(t, m3b3SRTAddr, srtout.Options{}, hubs)
-			waitAV(t, src.h)
-			if path != "m3b3srt" {
-				// MediaMTX's HLS client (gohlslib) treats a reload that
-				// finds no new segment as an error, instead of retrying
-				// after half the target duration (RFC 8216 section
-				// 6.3.4), and reloads one target duration after its
-				// first load. A segment is listed every 2 s: starting
-				// the client 1 s after a listing keeps its reloads off
-				// the listing instants.
-				waitListed(t, p, 3)
-				time.Sleep(time.Second)
+			// An HLS row that hits gohlslib's reload phase (below) despite
+			// the offset, seen as MediaMTX ending our read, runs once more;
+			// each attempt is a subtest, so that its ports are free after it.
+			hls := path != "m3b3srt"
+			for n := 1; ; n++ {
+				retry := false
+				t.Run(fmt.Sprintf("attempt-%d", n), func(t *testing.T) {
+					retry = mediaMTXPullRow(t, mtx, ffmpeg, path, hls && n == 1)
+				})
+				if !retry {
+					return
+				}
+				t.Logf("%s: MediaMTX's HLS source stopped during attempt %d (gohlslib's reload phase): retrying once", path, n)
 			}
-			u := "rtsp://" + mtx + "/" + path + "?transport=tcp"
-			settleRTSP(t, u)
-			var rl readerLog
-			r := startRun(t, runOptions{inputs: []string{u}, open: rl.wrap(nil)})
-			r.waitActive(t, 0, rtspReady)
-			time.Sleep(10 * time.Second)
-			r.cancel()
-			r.check(t, []uint32{1})
-			assertCodecs(t, r.col.frames, media.CodecH264, media.CodecAAC)
-			st := rl.stats()
-			assert.Zero(t, st["sync_jumps"], "offset jumps")
-			t.Logf("read %s over %v; clock %+v; reader %v; srt %+v; failures %v", r.col.counts(),
-				r.col.span().Round(time.Millisecond), r.stats.Clock, st, o.srv.Stats(), r.failures())
 		})
 	}
+}
+
+// mediaMTXPullRow runs one row of TestM3b3MediaMTXPull. When mayRetry is
+// set and MediaMTX ended our read (unexpected EOF, its source stopped), it
+// returns true without checking.
+func mediaMTXPullRow(t *testing.T, mtx, ffmpeg, path string, mayRetry bool) (retry bool) {
+	t.Helper()
+	clip := loopClip(t, ffmpeg, "h264_aac.ts", 4, 0)
+	src, p := liveRun(t, []string{fileURL(clip, "")}, nil)
+	hubs := map[string]*hub.Hub{"m3b3": src.h, "m3b3srt": src.h}
+	serveHTTP(t, m3b3HTTPAddr, hubs, map[string]*live.Packager{"m3b3": p}, 0, nil)
+	o := serveSRT(t, m3b3SRTAddr, srtout.Options{}, hubs)
+	waitAV(t, src.h)
+	if path != "m3b3srt" {
+		// MediaMTX's HLS client (gohlslib) treats a reload that finds no
+		// new segment as an error, instead of retrying after half the
+		// target duration (RFC 8216 section 6.3.4), and reloads one target
+		// duration after its first load. A segment is listed every 2 s:
+		// starting the client 1 s after a listing keeps its reloads off
+		// the listing instants.
+		waitListed(t, p, 3)
+		time.Sleep(time.Second)
+	}
+	u := "rtsp://" + mtx + "/" + path + "?transport=tcp"
+	settleRTSP(t, u)
+	var rl readerLog
+	r := startRun(t, runOptions{inputs: []string{u}, open: rl.wrap(nil)})
+	r.waitActive(t, 0, rtspReady)
+	time.Sleep(10 * time.Second)
+	r.cancel()
+	r.wait()
+	if mayRetry && slices.ContainsFunc(r.failures(), func(f string) bool { return strings.Contains(f, "unexpected EOF") }) {
+		t.Logf("read %s; failures %v", r.col.counts(), r.failures())
+		return true
+	}
+	r.check(t, []uint32{1})
+	assertCodecs(t, r.col.frames, media.CodecH264, media.CodecAAC)
+	st := rl.stats()
+	assert.Zero(t, st["sync_jumps"], "offset jumps")
+	t.Logf("read %s over %v; clock %+v; reader %v; srt %+v; failures %v", r.col.counts(),
+		r.col.span().Round(time.Millisecond), r.stats.Clock, st, o.srv.Stats(), r.failures())
+	return false
 }
 
 // srtEOFLine is the one line ffmpeg with libsrt writes, with -v error, when

@@ -30,7 +30,7 @@ jobs:
       - run: go vet ./...
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
       # 1.21.3, which reads and writes H.265 over enhanced RTMP (FourCC hvc1,
@@ -115,7 +115,7 @@ jobs:
         run: docker stop osv2-mtx-m2c || true
 
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
       # 1.21.3, which reads and writes H.265 over enhanced RTMP (FourCC hvc1,
