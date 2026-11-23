@@ -561,7 +561,7 @@ Items accepted for later, not yet placed in a milestone:
   cause of VLC 3's live-start "PCR is called too late" clock reset and of the
   "no reference clock" decoder-error pair that `TestM3VLCClass` tolerates on
   HLS fMP4 and DASH (up to one pair per reset, at most four per VLC process).
-  Remove that tolerance (ruling R-T7c'') when it lands; the tolerated-pair
+  Remove that tolerance (ruling R-T7e) when it lands; the tolerated-pair
   count `TestM3VLCClass` logs per VLC process is the before-and-after measure.
 - **DASH MPD stays `type="dynamic"` after the stream ends** (pre-existing;
   M3a). Players keep polling an MPD that will not change.

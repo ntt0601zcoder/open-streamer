@@ -60,7 +60,7 @@ import (
 // then logs two decoder errors ("Timestamp conversion failed for N: no
 // reference clock", "Could not convert timestamp 0 for FFmpeg"), whether
 // or not the machine is loaded, sometimes after several resets; ruling
-// R-T7c″ tolerates on those rows one such pair right after each reset, at
+// R-T7e tolerates on those rows one such pair right after each reset, at
 // most 4 per VLC process (vlcBadLines). Any other decoder error fails.
 //
 // http-ts- and srt-audio-only-stretch (A/V, then 6 s of audio only, then
@@ -568,7 +568,7 @@ func vlcLogLines(log string, words ...string) []string {
 }
 
 // VLC's live-start clock reset and the decoder error pair that may follow
-// it on an adaptive output (ruling R-T7c), as VLC 3.0.20 logs them after
+// it on an adaptive output (ruling R-T7e), as VLC 3.0.20 logs them after
 // the "[<object>] " prefix. The reset is the PCR line, then the reset
 // line; the decoder may log its first picture before the pair.
 const (
@@ -627,7 +627,7 @@ const vlcMaxTolerated = 4
 // vlcBadLines returns the lines of one VLC process's log that fail the
 // log rule (that contain "decoder error" or "cannot", case-insensitively),
 // and how many start-up pairs it tolerated. When tolerate is set, ruling
-// R-T7c″ tolerates the pair vlcNoClock…vlcNoClockEnd, vlcNoConvert, as
+// R-T7e tolerates the pair vlcNoClock…vlcNoClockEnd, vlcNoConvert, as
 // consecutive messages, right after each of the process's live-start clock
 // resets: the messages before the pair are vlcPCRLate, vlcPCRReset and at
 // most one vlcFirstPicture, so one pair per reset, and at most
@@ -680,7 +680,7 @@ func checkVLCLog(t *testing.T, name, log string, tolerate bool) {
 	assert.Contains(t, log, "successfully opened", "%s: the input opened", name)
 	bad, tolerated := vlcBadLines(log, tolerate)
 	if tolerated > 0 {
-		t.Logf("%s: tolerated %d of VLC's start-up pairs, each after its own clock reset (ruling R-T7c'')", name, tolerated)
+		t.Logf("R-T7e: %s: tolerated %d of VLC's start-up pairs, each after its own clock reset", name, tolerated)
 	}
 	if !assert.Empty(t, bad, "%s: decoder errors", name) {
 		t.Logf("%s: clock lines of the log:\n%s", name, strings.Join(vlcLogLines(log, "es_out_reset_pcr", "called too late"), "\n"))
@@ -774,7 +774,7 @@ type vlcPair struct {
 	file       string
 	started    time.Time
 	// tolerate allows each instance a start-up pair after each of its
-	// clock resets, at most vlcMaxTolerated (ruling R-T7c''): set on the
+	// clock resets, at most vlcMaxTolerated (ruling R-T7e): set on the
 	// HLS fMP4 and DASH rows only.
 	tolerate bool
 }
@@ -808,7 +808,7 @@ func (p *vlcPair) finish(t *testing.T, ffprobe string) {
 }
 
 // vlcPlays applies the VLC pass rule to u; tolerate is set on the HLS fMP4
-// and DASH rows (ruling R-T7c).
+// and DASH rows (ruling R-T7e).
 func vlcPlays(t *testing.T, vlc testpeer.Peer, ffprobe, u string, tolerate bool) {
 	t.Helper()
 	p := startVLCPair(t, vlc, u)
@@ -910,7 +910,7 @@ func testVLCAudioOnlyStretch(t *testing.T, srt bool) {
 	t.Logf("hub %s; conform %s; violations %v", kindCounts(r.col.frames), kindCounts(c.Frames), c.Violations)
 }
 
-// TestVLCLogTolerance checks the matcher of ruling R-T7c″ on log excerpts
+// TestVLCLogTolerance checks the matcher of ruling R-T7e on log excerpts
 // shaped like VLC 3.0.20's, one log per VLC process: a start-up pair is
 // tolerated right after each clock reset, at most 4 per process, on a row
 // that allows it; a pair without its own reset, two pairs after one reset,
