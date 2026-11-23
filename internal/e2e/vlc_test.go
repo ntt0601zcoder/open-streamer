@@ -54,9 +54,14 @@ import (
 // each sink logs a buffer (last-message = chain) within 10 s, and no ERROR
 // message. The exit code is never a pass.
 //
-// The VLC rows run one after the other (ruling R-T7b): VLC under CPU
-// starvation logs its own "no reference clock" decoder errors. The
-// GStreamer rows run in parallel once they are done.
+// The VLC rows run one after the other (ruling R-T7b), and the GStreamer
+// rows in parallel once they are done. On the HLS fMP4 and DASH rows,
+// VLC 3.0.20 intermittently resets its clock at the live start and then
+// logs two decoder errors ("Timestamp conversion failed for N: no
+// reference clock", "Could not convert timestamp 0 for FFmpeg"), whether
+// or not the machine is loaded; ruling R-T7c tolerates that pair once per
+// run on those rows, only right after the reset (vlcBadLines). Any other
+// decoder error fails.
 //
 // http-ts- and srt-audio-only-stretch (A/V, then 6 s of audio only, then
 // A/V) check that audio is decoded through the stretch, while the TS
@@ -91,7 +96,7 @@ func TestM3VLCClass(t *testing.T) {
 				// suggestedPresentationDelay (6 s) behind the live edge.
 				waitListed(t, p, 5)
 			}
-			vlcPlays(t, vlc, ffprobe, origin+"/live/s"+out.path)
+			vlcPlays(t, vlc, ffprobe, origin+"/live/s"+out.path, out.name == "hls-fmp4" || out.name == "dash")
 		})
 	}
 	t.Run("srt", func(t *testing.T) {
@@ -101,7 +106,7 @@ func TestM3VLCClass(t *testing.T) {
 		r := startRun(t, runOptions{inputs: []string{fileURL(loopClip(t, ffmpeg, "h264_aac.ts", 3, 0), "")}})
 		o := serveSRT(t, "", srtout.Options{}, map[string]*hub.Hub{"s": r.h})
 		waitAV(t, r.h)
-		vlcPlays(t, vlc, ffprobe, o.url())
+		vlcPlays(t, vlc, ffprobe, o.url(), false)
 	})
 	t.Run("rtmp-play", func(t *testing.T) {
 		vlc := testpeer.VLC(t)
@@ -110,7 +115,7 @@ func TestM3VLCClass(t *testing.T) {
 		r := startRun(t, runOptions{inputs: []string{fileURL(loopClip(t, ffmpeg, "h264_aac.ts", 3, 0), "")}})
 		p := servePlay(t, "", rtmpplay.Options{}, nil, map[string]*hub.Hub{"s": r.h})
 		waitLive(t, p.srv, "s")
-		vlcPlays(t, vlc, ffprobe, p.url())
+		vlcPlays(t, vlc, ffprobe, p.url(), false)
 	})
 	t.Run("rtsp-play", func(t *testing.T) {
 		t.Parallel()
@@ -526,12 +531,113 @@ func vlcLogLines(log string, words ...string) []string {
 	return out
 }
 
-// checkVLCLog checks the log part of the VLC pass rule; a failure shows the
-// 8 lines before each offending line, with HTTP header lines left out.
-func checkVLCLog(t *testing.T, name, log string) {
+// VLC's live-start clock reset and the decoder error pair that may follow
+// it on an adaptive output (ruling R-T7c), as VLC 3.0.20 logs them after
+// the "[<object>] " prefix. The reset is the PCR line, then the reset
+// line; the decoder may log its first picture before the pair.
+const (
+	vlcPCRLate      = "main input error: ES_OUT_SET_(GROUP_)PCR  is called too late (pts_delay increased to "
+	vlcPCRReset     = "main input debug: ES_OUT_RESET_PCR called"
+	vlcFirstPicture = "main decoder debug: Received first picture"
+	vlcNoClock      = "main decoder error: Timestamp conversion failed for "
+	vlcNoClockEnd   = ": no reference clock"
+	vlcNoConvert    = "main decoder error: Could not convert timestamp 0 for FFmpeg"
+)
+
+// vlcEntry is one line of a VLC log: msg is the line after its "[<object>] "
+// prefix; a line without one (a continuation, such as an HTTP header) is
+// not a message.
+type vlcEntry struct {
+	raw, msg string
+	message  bool
+}
+
+func vlcEntries(log string) []vlcEntry {
+	var out []vlcEntry
+	for line := range strings.SplitSeq(log, "\n") {
+		e := vlcEntry{raw: line, msg: line}
+		if strings.HasPrefix(line, "[") {
+			if _, msg, ok := strings.Cut(line, "] "); ok {
+				e.msg, e.message = msg, true
+			}
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// isNoClock reports whether msg is the first line of the tolerated pair.
+func isNoClock(msg string) bool {
+	if !strings.HasPrefix(msg, vlcNoClock) || !strings.HasSuffix(msg, vlcNoClockEnd) {
+		return false
+	}
+	_, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(msg, vlcNoClock), vlcNoClockEnd), 10, 64)
+	return err == nil
+}
+
+// isPCRLate reports whether msg is VLC's PCR-late line, with any delay.
+func isPCRLate(msg string) bool {
+	if !strings.HasPrefix(msg, vlcPCRLate) || !strings.HasSuffix(msg, " ms)") {
+		return false
+	}
+	_, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(msg, vlcPCRLate), " ms)"), 10, 64)
+	return err == nil
+}
+
+// vlcBadLines returns the lines of a VLC log that fail the log rule (that
+// contain "decoder error" or "cannot", case-insensitively), and the
+// tolerated pairs. While budget is positive, ruling R-T7c tolerates the
+// pair vlcNoClock…vlcNoClockEnd, vlcNoConvert as consecutive messages
+// when the messages right before it are vlcPCRLate, vlcPCRReset and at most
+// one vlcFirstPicture; each tolerated pair takes one from budget, and a
+// pair over budget, or anywhere else, is bad like any other error.
+func vlcBadLines(log string, budget int) (bad []string, tolerated int) {
+	es := vlcEntries(log)
+	var msgs []int // indexes of the messages in es
+	for i, e := range es {
+		if e.message {
+			msgs = append(msgs, i)
+		}
+	}
+	at := func(k int) string {
+		if k < 0 || k >= len(msgs) {
+			return ""
+		}
+		return es[msgs[k]].msg
+	}
+	skip := map[int]bool{}
+	for k := range msgs {
+		if tolerated >= budget || !isNoClock(at(k)) || at(k+1) != vlcNoConvert {
+			continue
+		}
+		j := k - 1
+		if at(j) == vlcFirstPicture {
+			j--
+		}
+		if at(j) == vlcPCRReset && isPCRLate(at(j-1)) {
+			tolerated++
+			skip[msgs[k]], skip[msgs[k+1]] = true, true
+		}
+	}
+	for i, e := range es {
+		l := strings.ToLower(e.raw)
+		if !skip[i] && (strings.Contains(l, "decoder error") || strings.Contains(l, "cannot")) {
+			bad = append(bad, e.raw)
+		}
+	}
+	return bad, tolerated
+}
+
+// checkVLCLog checks the log part of the VLC pass rule, with budget
+// tolerated pairs (vlcBadLines), and returns the pairs it tolerated; a
+// failure shows the 8 messages before the first offending line.
+func checkVLCLog(t *testing.T, name, log string, budget int) (tolerated int) {
 	t.Helper()
 	assert.Contains(t, log, "successfully opened", "%s: the input opened", name)
-	bad := vlcLogLines(log, "decoder error", "cannot")
+	bad, tolerated := vlcBadLines(log, budget)
+	if tolerated > 0 {
+		t.Logf("%s: tolerated VLC's start-up pair after its clock reset (ruling R-T7c)", name)
+	}
 	if !assert.Empty(t, bad, "%s: decoder errors", name) {
 		var lines []string
 		for line := range strings.SplitSeq(log, "\n") {
@@ -546,6 +652,7 @@ func checkVLCLog(t *testing.T, name, log string) {
 			}
 		}
 	}
+	return tolerated
 }
 
 // vlcErrors returns at most 20 error lines of a VLC log, for failure
@@ -622,6 +729,9 @@ type vlcPair struct {
 	disp, dump *vlcProc
 	file       string
 	started    time.Time
+	// tolerate allows the run one start-up pair after VLC's clock reset
+	// (ruling R-T7c): set on the HLS fMP4 and DASH rows only.
+	tolerate bool
 }
 
 func startVLCPair(t *testing.T, vlc testpeer.Peer, u string) *vlcPair {
@@ -642,8 +752,12 @@ func (p *vlcPair) finish(t *testing.T, ffprobe string) {
 	t.Helper()
 	p.disp.quit(t)
 	p.dump.quit(t)
-	checkVLCLog(t, "display", p.disp.log.String())
-	checkVLCLog(t, "dump", p.dump.log.String())
+	budget := 0
+	if p.tolerate {
+		budget = 1
+	}
+	budget -= checkVLCLog(t, "display", p.disp.log.String(), budget)
+	checkVLCLog(t, "dump", p.dump.log.String(), budget)
 	_, err := os.Stat(p.file)
 	require.NoError(t, err, "the dump exists; dump log:\n%s", vlcErrors(p.dump.log.String()))
 	spans := dumpSpans(t, ffprobe, p.file)
@@ -652,10 +766,12 @@ func (p *vlcPair) finish(t *testing.T, ffprobe string) {
 	t.Logf("dump: video %v, audio %v", spans["video"].Round(time.Millisecond), spans["audio"].Round(time.Millisecond))
 }
 
-// vlcPlays applies the VLC pass rule to u.
-func vlcPlays(t *testing.T, vlc testpeer.Peer, ffprobe, u string) {
+// vlcPlays applies the VLC pass rule to u; tolerate is set on the HLS fMP4
+// and DASH rows (ruling R-T7c).
+func vlcPlays(t *testing.T, vlc testpeer.Peer, ffprobe, u string, tolerate bool) {
 	t.Helper()
 	p := startVLCPair(t, vlc, u)
+	p.tolerate = tolerate
 	time.Sleep(time.Until(p.started.Add(vlcStatsAfter)))
 	st, ok := p.disp.stats(t)
 	time.Sleep(time.Until(p.started.Add(vlcQuitAfter)))
@@ -720,4 +836,59 @@ func testVLCAudioOnlyStretch(t *testing.T, srt bool) {
 	c := waitCapture(t, capCh)
 	assert.Empty(t, c.Violations)
 	t.Logf("hub %s; conform %s; violations %v", kindCounts(r.col.frames), kindCounts(c.Frames), c.Violations)
+}
+
+// TestVLCLogTolerance checks ruling R-T7c's matcher on log excerpts shaped
+// like VLC 3.0.20's: the start-up pair is tolerated once, right after the
+// clock reset, on a row that allows it; twice, without the reset, on
+// another row, or with another error, the log fails.
+func TestVLCLogTolerance(t *testing.T) {
+	t.Parallel()
+	const (
+		opened  = "[00007a75bc000c90] main input debug: `http://127.0.0.1:1/live/s/cmaf/index.mpd' successfully opened"
+		segment = "[00007a75b8001150] adaptive demux debug: Retrieving http://127.0.0.1:1/live/s/cmaf/0-6.m4s"
+		header  = "Accept-Encoding: deflate, gzip"
+		late    = "[00007aa760000c90] main input error: ES_OUT_SET_(GROUP_)PCR  is called too late (pts_delay increased to 1000 ms)"
+		reset   = "[00007aa760000c90] main input debug: ES_OUT_RESET_PCR called"
+		picture = "[00007aa75c0f0380] main decoder debug: Received first picture"
+		noClock = "[00007aa75c0f0380] main decoder error: Timestamp conversion failed for 5520001: no reference clock"
+		convert = "[00007aa75c0f0380] main decoder error: Could not convert timestamp 0 for FFmpeg"
+		other   = "[00007aa75c0f0380] main decoder error: buffer deadlock prevented"
+		cannot  = "[00007aa75c0f0380] main stream error: cannot pre fill buffer"
+	)
+	startup := []string{late, reset, picture, noClock, convert}
+	join := func(parts ...[]string) string {
+		var all []string
+		for _, p := range parts {
+			all = append(all, p...)
+		}
+		return strings.Join(all, "\n")
+	}
+	for _, tc := range []struct {
+		name          string
+		log           string
+		budget        int
+		bad, tolerate int
+	}{
+		{"clean", join([]string{opened, segment, header}), 1, 0, 0},
+		{"after the reset", join([]string{opened, segment}, startup, []string{segment}), 1, 0, 1},
+		{"reset without first picture", join([]string{opened, late, reset, noClock, convert}), 1, 0, 1},
+		{"pcr-late line with another delay", join([]string{opened, strings.Replace(late, "1000 ms", "2033 ms", 1), reset, picture, noClock, convert}), 1, 0, 1},
+		{"twice", join([]string{opened}, startup, []string{segment}, startup), 1, 2, 1},
+		{"without the reset", join([]string{opened, segment, picture, noClock, convert}), 1, 2, 0},
+		{"reset without the pcr-late line", join([]string{opened, segment, reset, picture, noClock, convert}), 1, 2, 0},
+		{"a message between the reset and the pair", join([]string{opened, late, reset, segment, noClock, convert}), 1, 2, 0},
+		{"a message inside the pair", join([]string{opened, late, reset, picture, noClock, segment, convert}), 1, 2, 0},
+		{"half the pair", join([]string{opened, late, reset, picture, noClock}), 1, 1, 0},
+		{"another row", join([]string{opened}, startup), 0, 2, 0},
+		{"with another error", join([]string{opened}, startup, []string{other}), 1, 1, 1},
+		{"with a cannot line", join([]string{opened}, startup, []string{cannot}), 1, 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			bad, tolerated := vlcBadLines(tc.log, tc.budget)
+			assert.Len(t, bad, tc.bad, "bad lines %q", bad)
+			assert.Equal(t, tc.tolerate, tolerated)
+		})
+	}
 }
