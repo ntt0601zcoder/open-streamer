@@ -2,10 +2,16 @@
 package testpeer
 
 import (
+	"context"
+	"crypto/rand"
+	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // EnvRequire names the environment variable that turns a missing peer from a
@@ -149,4 +155,213 @@ func missing(t testing.TB, format string, args ...any) {
 		return
 	}
 	t.Skipf(format, args...)
+}
+
+// EnvPeerImage names the environment variable that holds the image of the
+// VLC-class peers (testdata/peers/Dockerfile.vlc): when it is set and the
+// host lacks VLC, or GStreamer or one of the elements a test needs, the
+// peer runs in a throwaway container of that image on the host network.
+const EnvPeerImage = "OS_PEER_IMAGE"
+
+// dockerBin is the docker client; tests replace it.
+var dockerBin = "docker"
+
+// containerUser is the user the image runs as: VLC refuses to run as root.
+const containerUser = "peer"
+
+// Peer is a program that a test runs: a host binary, or the same program in
+// the peer image.
+type Peer struct {
+	name  string // the program, as named on the host and in the image
+	path  string // the host binary; "" in the image
+	image string // the image; "" on the host
+}
+
+// String names the program and where it runs.
+func (p Peer) String() string {
+	if p.image != "" {
+		return p.name + " in " + p.image
+	}
+	return p.path
+}
+
+// InImage reports whether the peer runs in the image.
+func (p Peer) InImage() bool { return p.image != "" }
+
+// Run tunes Peer.Command.
+type Run struct {
+	// Dirs are host directories the program reads or writes; in the image
+	// they are mounted at the same paths.
+	Dirs []string
+	// Interrupt, when positive, stops the program with SIGINT after that
+	// long (coreutils timeout, on the host and in the image).
+	Interrupt time.Duration
+}
+
+// Command returns a command that runs the peer with args until it exits or
+// ctx ends. In the image the container is named osv2-vlc-<random>, uses the
+// host network, runs as a non-root user (the host's own user and group when
+// those are not root, so that it can write to Dirs), is removed when it
+// exits, and is killed when ctx ends and at the test's cleanup.
+func (p Peer) Command(ctx context.Context, t testing.TB, run Run, args ...string) *exec.Cmd {
+	t.Helper()
+	prog := p.name
+	if p.image == "" {
+		prog = p.path
+	}
+	argv := append([]string{prog}, args...)
+	if run.Interrupt > 0 {
+		secs := strconv.FormatFloat(run.Interrupt.Seconds(), 'f', 3, 64)
+		argv = append([]string{"timeout", "-s", "INT", secs}, argv...)
+	}
+	if p.image == "" {
+		return exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // test peers
+	}
+	name := "osv2-vlc-" + strings.ToLower(rand.Text()[:12])
+	cmd := exec.CommandContext(ctx, dockerBin, dockerArgs(name, p.image, run.Dirs, argv)...) //nolint:gosec // test peers
+	kill := func() {
+		// ctx may be done by now: the kill runs on regardless.
+		kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = exec.CommandContext(kctx, dockerBin, "kill", name).Run() //nolint:gosec // test peers
+	}
+	cmd.Cancel = func() error {
+		kill()
+		return cmd.Process.Kill()
+	}
+	cmd.WaitDelay = 10 * time.Second
+	t.Cleanup(kill)
+	return cmd
+}
+
+// dockerArgs is the docker command line that runs argv in image.
+func dockerArgs(name, image string, dirs, argv []string) []string {
+	args := []string{"run", "--rm", "-i", "--network", "host", "--name", name, "--user", hostUser(), "-e", "HOME=/tmp"}
+	for _, d := range dirs {
+		args = append(args, "-v", d+":"+d)
+	}
+	return append(append(args, image), argv...)
+}
+
+// hostUser is the host's user and group when they are not root, else the
+// image's non-root user.
+func hostUser() string {
+	if uid, gid := os.Getuid(), os.Getgid(); uid > 0 && gid >= 0 {
+		return strconv.Itoa(uid) + ":" + strconv.Itoa(gid)
+	}
+	return containerUser
+}
+
+// Version returns the first line the peer prints for --version.
+func (p Peer) Version(t testing.TB) string {
+	t.Helper()
+	out, err := p.Command(t.Context(), t, Run{}, "--version").CombinedOutput()
+	line, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+	if err != nil {
+		return fmt.Sprintf("%s (--version: %v)", line, err)
+	}
+	return line
+}
+
+// VLC returns cvlc from the host, or from the peer image (OS_PEER_IMAGE) when
+// the host has none. When neither has it the test is skipped, or failed
+// when OS_REQUIRE_PEERS=1.
+func VLC(t testing.TB) Peer {
+	t.Helper()
+	if path, err := exec.LookPath("cvlc"); err == nil {
+		return Peer{name: "cvlc", path: path}
+	}
+	if img := peerImage(t); img != "" {
+		return Peer{name: "cvlc", image: img}
+	}
+	missing(t, "peer cvlc not found, and %s names no usable image", EnvPeerImage)
+	return Peer{}
+}
+
+// GStreamer returns gst-launch-1.0 from the host when the host has every
+// listed element (gst-inspect-1.0 --exists), else from the peer image
+// (OS_PEER_IMAGE) when the image has them. When neither does the test is
+// skipped, or failed when OS_REQUIRE_PEERS=1.
+func GStreamer(t testing.TB, elements ...string) Peer {
+	t.Helper()
+	const launch, inspect = "gst-launch-1.0", "gst-inspect-1.0"
+	path, err := exec.LookPath(launch)
+	if err == nil {
+		if ins, ierr := exec.LookPath(inspect); ierr == nil && hostHas(t, ins, elements) {
+			return Peer{name: launch, path: path}
+		}
+	}
+	if img := peerImage(t); img != "" {
+		lacks := imageLacks(t, img, elements)
+		if lacks == "" {
+			return Peer{name: launch, image: img}
+		}
+		missing(t, "peer %s in %s lacks element %s", launch, img, lacks)
+		return Peer{}
+	}
+	missing(t, "peer %s with elements %v not found, and %s names no usable image", launch, elements, EnvPeerImage)
+	return Peer{}
+}
+
+// FFmpegSRT returns the host's ffmpeg when it reads srt:// (libsrt), which
+// makes it an SRT receiver independent of gosrt. The peer image carries no
+// ffmpeg: when the host's has no SRT the test is skipped, or failed when
+// OS_REQUIRE_PEERS=1.
+func FFmpegSRT(t testing.TB) string {
+	t.Helper()
+	return Require(t, "ffmpeg", "srt")
+}
+
+func hostHas(t testing.TB, inspect string, elements []string) bool {
+	for _, e := range elements {
+		if exec.CommandContext(t.Context(), inspect, "--exists", e).Run() != nil { //nolint:gosec // test peers
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	imageMu    sync.Mutex
+	imageOK    = map[string]bool{}
+	imageElems = map[string]bool{}
+)
+
+// peerImage returns OS_PEER_IMAGE when docker has that image, else "".
+func peerImage(t testing.TB) string {
+	img := os.Getenv(EnvPeerImage)
+	if img == "" {
+		return ""
+	}
+	imageMu.Lock()
+	defer imageMu.Unlock()
+	ok, known := imageOK[img]
+	if !known {
+		ok = exec.CommandContext(t.Context(), dockerBin, "image", "inspect", img).Run() == nil //nolint:gosec // test peers
+		imageOK[img] = ok
+	}
+	if !ok {
+		return ""
+	}
+	return img
+}
+
+// imageLacks returns the first of elements that the image lacks, or "".
+func imageLacks(t testing.TB, img string, elements []string) string {
+	imageMu.Lock()
+	defer imageMu.Unlock()
+	for _, e := range elements {
+		key := img + "\x00" + e
+		has, known := imageElems[key]
+		if !known {
+			name := "osv2-vlc-" + strings.ToLower(rand.Text()[:12])
+			has = exec.CommandContext(t.Context(), dockerBin, //nolint:gosec // test peers
+				dockerArgs(name, img, nil, []string{"gst-inspect-1.0", "--exists", e})...).Run() == nil
+			imageElems[key] = has
+		}
+		if !has {
+			return e
+		}
+	}
+	return ""
 }

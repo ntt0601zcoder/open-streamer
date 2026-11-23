@@ -46,8 +46,17 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # ffmpeg (with libsrt), and the VLC-class peers of TestM3VLCClass:
+      # VLC 3 (its SRT access is in vlc-plugin-access-extra) and GStreamer
+      # 1.24 with the libav decoders. The runner's user is not root, which
+      # VLC requires.
+      - name: Install ffmpeg, VLC and GStreamer
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg \
+            vlc-bin vlc-plugin-base vlc-plugin-access-extra \
+            gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+          cvlc --version | head -1
+          gst-launch-1.0 --version | head -1
       - name: Check ffmpeg has SRT
         run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
       # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
@@ -57,7 +66,12 @@ jobs:
       # output, on demand, from the fixed port 19361 into the paths m3b1pull
       # (H.264+AAC) and m3b1pullhevc (H.265+AAC); TestM3b2MediaMTXPull has it
       # pull our RTSP play output, on demand and over TCP, from the fixed
-      # port 19362 into the paths m3b2pull and m3b2pullhevc.
+      # port 19362 into the paths m3b2pull and m3b2pullhevc;
+      # TestM3b3MediaMTXPull has it pull our HLS fMP4 and HLS TS outputs
+      # from the fixed HTTP port 19364 (paths m3b3hls and m3b3hlsts) and
+      # our SRT output from the fixed port 19363 (m3b3srt), on demand; and
+      # TestM3VLCClass/push-out has it pull, on demand, the push-out's
+      # target live/m3b3push from the RTMP MediaMTX above (path m3b3push).
       - name: Start MediaMTX for RTSP
         run: |
           docker run -d --rm --name osv2-mtx-m2c --network host \
@@ -74,6 +88,14 @@ jobs:
             -e MTX_PATHS_M3B2PULLHEVC_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pullhevc \
             -e MTX_PATHS_M3B2PULLHEVC_SOURCEONDEMAND=yes \
             -e MTX_PATHS_M3B2PULLHEVC_RTSPTRANSPORT=tcp \
+            -e MTX_PATHS_M3B3HLS_SOURCE=http://127.0.0.1:19364/live/m3b3/cmaf/master.m3u8 \
+            -e MTX_PATHS_M3B3HLS_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B3HLSTS_SOURCE=http://127.0.0.1:19364/live/m3b3/hls/index.m3u8 \
+            -e MTX_PATHS_M3B3HLSTS_SOURCEONDEMAND=yes \
+            -e 'MTX_PATHS_M3B3SRT_SOURCE=srt://127.0.0.1:19363?streamid=live/m3b3srt' \
+            -e MTX_PATHS_M3B3SRT_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B3PUSH_SOURCE=rtmp://127.0.0.1:19350/live/m3b3push \
+            -e MTX_PATHS_M3B3PUSH_SOURCEONDEMAND=yes \
             bluenviron/mediamtx:1.21.3
           for _ in $(seq 50); do
             nc -z 127.0.0.1 18554 && exit 0
@@ -109,8 +131,17 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # ffmpeg (with libsrt), and the VLC-class peers of TestM3VLCClass:
+      # VLC 3 (its SRT access is in vlc-plugin-access-extra) and GStreamer
+      # 1.24 with the libav decoders. The runner's user is not root, which
+      # VLC requires.
+      - name: Install ffmpeg, VLC and GStreamer
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg \
+            vlc-bin vlc-plugin-base vlc-plugin-access-extra \
+            gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+          cvlc --version | head -1
+          gst-launch-1.0 --version | head -1
       - name: Check ffmpeg has SRT
         run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
       # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
@@ -120,7 +151,12 @@ jobs:
       # output, on demand, from the fixed port 19361 into the paths m3b1pull
       # (H.264+AAC) and m3b1pullhevc (H.265+AAC); TestM3b2MediaMTXPull has it
       # pull our RTSP play output, on demand and over TCP, from the fixed
-      # port 19362 into the paths m3b2pull and m3b2pullhevc.
+      # port 19362 into the paths m3b2pull and m3b2pullhevc;
+      # TestM3b3MediaMTXPull has it pull our HLS fMP4 and HLS TS outputs
+      # from the fixed HTTP port 19364 (paths m3b3hls and m3b3hlsts) and
+      # our SRT output from the fixed port 19363 (m3b3srt), on demand; and
+      # TestM3VLCClass/push-out has it pull, on demand, the push-out's
+      # target live/m3b3push from the RTMP MediaMTX above (path m3b3push).
       - name: Start MediaMTX for RTSP
         run: |
           docker run -d --rm --name osv2-mtx-m2c --network host \
@@ -137,6 +173,14 @@ jobs:
             -e MTX_PATHS_M3B2PULLHEVC_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pullhevc \
             -e MTX_PATHS_M3B2PULLHEVC_SOURCEONDEMAND=yes \
             -e MTX_PATHS_M3B2PULLHEVC_RTSPTRANSPORT=tcp \
+            -e MTX_PATHS_M3B3HLS_SOURCE=http://127.0.0.1:19364/live/m3b3/cmaf/master.m3u8 \
+            -e MTX_PATHS_M3B3HLS_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B3HLSTS_SOURCE=http://127.0.0.1:19364/live/m3b3/hls/index.m3u8 \
+            -e MTX_PATHS_M3B3HLSTS_SOURCEONDEMAND=yes \
+            -e 'MTX_PATHS_M3B3SRT_SOURCE=srt://127.0.0.1:19363?streamid=live/m3b3srt' \
+            -e MTX_PATHS_M3B3SRT_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B3PUSH_SOURCE=rtmp://127.0.0.1:19350/live/m3b3push \
+            -e MTX_PATHS_M3B3PUSH_SOURCEONDEMAND=yes \
             bluenviron/mediamtx:1.21.3
           for _ in $(seq 50); do
             nc -z 127.0.0.1 18554 && exit 0
