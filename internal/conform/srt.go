@@ -239,7 +239,9 @@ func (p *pump) Read(b []byte) (int, error) {
 	}
 }
 
-// sniffMax is how much of the start of a stream a sniffReader keeps.
+// sniffMax is how much of the start of a stream a sniffReader keeps: the
+// first video PES packet is looked for in this window only, and a stream
+// whose first video packet comes later is not checked for RuleTSStart.
 const sniffMax = 1 << 20
 
 // sniffReader keeps the first sniffMax bytes read through it.
@@ -256,10 +258,23 @@ func (s *sniffReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// strictTS runs the checks of a stream read over SRT that the demuxer, which
-// recovers from them, does not report: continuity counter gaps, and a first
-// video access unit that starts with a non-IDR slice (RuleTSStart).
-func strictTS(d *ts.Demuxer, sniff *sniffReader, frames []media.Frame) []Violation {
+// firstVideoPID returns the PID of the first video track the demuxer found
+// in the PMT.
+func firstVideoPID(d *ts.Demuxer) (uint16, bool) {
+	pids := d.TrackPIDs()
+	for i, k := range d.TrackKinds() {
+		if k == media.KindVideo && i < len(pids) {
+			return pids[i], true
+		}
+	}
+	return 0, false
+}
+
+// strictTS runs the checks of a stream that the demuxer, which recovers from
+// them, does not report: continuity counter gaps, and a first video access
+// unit that starts with a non-IDR slice (RuleTSStart). pid is the video PID
+// of the first PMT.
+func strictTS(d *ts.Demuxer, sniff *sniffReader, pid uint16, haveVideo bool, frames []media.Frame) []Violation {
 	var out []Violation
 	if cc := d.CCErrors(); cc > 0 {
 		out = append(out, Violation{
@@ -274,47 +289,24 @@ func strictTS(d *ts.Demuxer, sniff *sniffReader, frames []media.Frame) []Violati
 			break
 		}
 	}
-	pid, ok := uint16(0), false
-	for i, k := range d.TrackKinds() {
-		if k == media.KindVideo && i < len(d.TrackPIDs()) {
-			pid, ok = d.TrackPIDs()[i], true
-			break
-		}
-	}
-	if !ok || codec == 0 {
+	if !haveVideo || codec == 0 {
 		return out
 	}
-	if typ, found := firstVideoNAL(sniff.buf, pid, codec); found && !isSyncNAL(typ, codec) && !isSideNAL(typ, codec) {
+	if ok, known := videoStart(sniff.buf, pid, codec); known && !ok {
 		out = append(out, Violation{
 			Rule: RuleTSStart, Index: -1,
-			Detail: fmt.Sprintf("the first video access unit starts with NAL type %d, not parameter sets or an IDR slice", typ),
+			Detail: "the first video access unit starts with a non-IDR slice, with no parameter sets or recovery point before it",
 		})
 	}
 	return out
 }
 
-// isSyncNAL reports whether a NAL unit type is a parameter set or a random
-// access slice.
-func isSyncNAL(typ uint8, codec media.Codec) bool {
-	if codec == media.CodecH265 {
-		return typ >= 16 && typ <= 21 || typ >= 32 && typ <= 34
-	}
-	return typ == 5 || typ == 7 || typ == 8
-}
-
-// isSideNAL reports whether a NAL unit type is SEI, which says nothing about
-// the slices after it.
-func isSideNAL(typ uint8, codec media.Codec) bool {
-	if codec == media.CodecH265 {
-		return typ == 39 || typ == 40
-	}
-	return typ == 6
-}
-
-// firstVideoNAL returns the type of the first NAL unit after the access unit
-// delimiter in the first PES packet on pid found in data (TS packets from its
-// start), if its first TS packet holds that much.
-func firstVideoNAL(data []byte, pid uint16, codec media.Codec) (uint8, bool) {
+// videoStart reports whether the first video PES packet on pid found in data
+// (TS packets from its start) begins at a random access point: its first
+// NAL unit that is not a delimiter or SEI is a parameter set or an IDR slice,
+// or a recovery point SEI comes first. known is false when the first TS
+// packet of the PES does not reach such a NAL unit.
+func videoStart(data []byte, pid uint16, codec media.Codec) (ok, known bool) {
 	start := 0
 	for start+mpegts.PacketSize < len(data) && data[start] != 0x47 {
 		start++
@@ -327,48 +319,47 @@ func firstVideoNAL(data []byte, pid uint16, codec media.Codec) (uint8, bool) {
 		pl := p[4:]
 		if p[3]&0x20 != 0 {
 			if len(pl) == 0 || int(pl[0])+1 > len(pl) {
-				return 0, false
+				return false, false
 			}
 			pl = pl[int(pl[0])+1:]
 		}
 		if len(pl) < 9 || pl[0] != 0 || pl[1] != 0 || pl[2] != 1 || len(pl) < 9+int(pl[8]) {
-			return 0, false
+			return false, false
 		}
-		pl = pl[9+int(pl[8]):]
-		// Annex B start codes: the first NAL unit that is not a delimiter.
-		for len(pl) >= 4 {
-			if pl[0] != 0 || pl[1] != 0 || (pl[2] != 1 && (pl[2] != 0 || pl[3] != 1)) {
-				return 0, false
-			}
-			h := pl[3]
-			skip := 3
-			if pl[2] == 0 {
-				if len(pl) < 5 {
-					return 0, false
-				}
-				h, skip = pl[4], 4
-			}
-			typ := h & 0x1f
-			if codec == media.CodecH265 {
-				typ = h >> 1 & 0x3f
-			}
-			if typ != 9 && (codec != media.CodecH265 || typ != 35) {
-				return typ, true
-			}
-			// Skip the delimiter: find the next start code.
-			next := -1
-			for i := skip + 1; i+3 <= len(pl); i++ {
-				if pl[i] == 0 && pl[i+1] == 0 && (pl[i+2] == 1 || i+3 < len(pl) && pl[i+2] == 0 && pl[i+3] == 1) {
-					next = i
-					break
-				}
-			}
-			if next < 0 {
-				return 0, false
-			}
-			pl = pl[next:]
-		}
-		return 0, false
+		return nalsStartAtSync(pl[9+int(pl[8]):], codec)
 	}
-	return 0, false
+	return false, false
+}
+
+// nalsStartAtSync walks the Annex B NAL units of pl up to the first one that
+// decides whether the access unit is a random access point.
+func nalsStartAtSync(pl []byte, codec media.Codec) (ok, known bool) {
+	h265 := codec == media.CodecH265
+	for i := 0; i+3 < len(pl); i++ {
+		if pl[i] != 0 || pl[i+1] != 0 || pl[i+2] != 1 {
+			continue
+		}
+		hdr := pl[i+3:]
+		typ, body := hdr[0]&0x1f, 1
+		if h265 {
+			typ, body = hdr[0]>>1&0x3f, 2
+		}
+		switch {
+		case !h265 && typ == 9, h265 && typ == 35:
+			// An access unit delimiter.
+		case !h265 && typ == 6, h265 && (typ == 39 || typ == 40):
+			// SEI: a recovery point makes the unit a random access point;
+			// any other SEI says nothing about the slices after it.
+			if len(hdr) > body && hdr[body] == 6 {
+				return true, true
+			}
+		case !h265 && (typ == 5 || typ == 7 || typ == 8),
+			h265 && (typ >= 16 && typ <= 21 || typ >= 32 && typ <= 34):
+			return true, true
+		default:
+			return false, true
+		}
+		i += 2
+	}
+	return false, false
 }

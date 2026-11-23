@@ -703,8 +703,10 @@ func TestReadErrors(t *testing.T) {
 		_, err := ReadDASH(ctx, srv+u, once())
 		assert.Error(t, err, u)
 	}
-	_, err = ReadTS(ctx, srv+"/ts.ts", ReadOptions{})
-	assert.Error(t, err)
+	// A TS body without PSI is a violation, not a read error.
+	c, err := ReadTS(ctx, srv+"/ts.ts", ReadOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, []string{RuleTSPSI}, rules(c.Violations))
 	_, err = ReadHLS(ctx, "http://[::1]:namedport/x", once())
 	assert.Error(t, err)
 	_, err = ReadTS(ctx, "http://[::1]:namedport/x", ReadOptions{})

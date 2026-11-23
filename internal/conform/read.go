@@ -1245,6 +1245,37 @@ func ReadTS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	return checkTS(ctx, body, opt, false, fail)
 }
 
+// RuleTSPSI names the rule that a TS stream carries a PAT and a PMT before
+// its first frame: within psiMaxBytes and the read timeout.
+const RuleTSPSI = "ts-psi-present"
+
+// psiMaxBytes bounds the bytes read before the first PMT.
+const psiMaxBytes = 4 << 20
+
+// psiGuard bounds the read up to the first PMT, while armed.
+type psiGuard struct {
+	r        io.Reader
+	wait     time.Duration
+	deadline time.Time
+	armed    bool
+	n        int
+	exceeded bool // the byte or time budget ran out
+	eof      bool // the stream ended
+}
+
+func (g *psiGuard) Read(b []byte) (int, error) {
+	if g.armed && (g.n >= psiMaxBytes || time.Now().After(g.deadline)) {
+		g.exceeded = true
+		return 0, errors.New("no PAT and PMT within the budget")
+	}
+	n, err := g.r.Read(b)
+	g.n += n
+	if errors.Is(err, io.EOF) {
+		g.eof = true
+	}
+	return n, err
+}
+
 // checkTS demuxes a TS byte stream and runs the frame checks. fail wraps a
 // read or demux error with the source and any stall. With strict, the
 // stream's own continuity and start are checked too (RuleTSContinuity,
@@ -1255,13 +1286,28 @@ func checkTS(ctx context.Context, body io.Reader, opt ReadOptions, strict bool, 
 		sniff = &sniffReader{r: body}
 		body = sniff
 	}
-	d, err := ts.NewDemuxerWithOptions(body, ts.DemuxOptions{FollowPMT: true})
+	// The wait for the first PMT is bounded in time and bytes: a stream that
+	// keeps sending but never carries PSI would not stall.
+	wait := opt.Timeout
+	if wait <= 0 {
+		wait = defaultTimeout
+	}
+	guard := &psiGuard{r: body, wait: wait, deadline: time.Now().Add(wait), armed: true}
+	d, err := ts.NewDemuxerWithOptions(guard, ts.DemuxOptions{FollowPMT: true})
+	guard.armed = false
 	if err != nil {
 		if ctx.Err() != nil {
 			return Capture{}, fmt.Errorf("conform: read: %w", ctx.Err())
 		}
+		if guard.exceeded || guard.eof {
+			return Capture{Violations: []Violation{{
+				Rule: RuleTSPSI, Index: -1,
+				Detail: fmt.Sprintf("no PAT and PMT in the first %d bytes, or within %v", guard.n, wait),
+			}}}, nil
+		}
 		return Capture{}, fail(err)
 	}
+	vpid, haveVideo := firstVideoPID(d)
 	b := newBuilder()
 	b.httpTS = true
 	limit := media.FromDuration(opt.Duration)
@@ -1290,7 +1336,7 @@ func checkTS(ctx context.Context, body io.Reader, opt ReadOptions, strict bool, 
 	}
 	c := b.finish()
 	if strict {
-		c.Violations = append(c.Violations, strictTS(d, sniff, c.Frames)...)
+		c.Violations = append(c.Violations, strictTS(d, sniff, vpid, haveVideo, c.Frames)...)
 	}
 	return c, nil
 }

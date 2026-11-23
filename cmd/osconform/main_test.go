@@ -444,3 +444,20 @@ func TestOsconformSRT(t *testing.T) {
 	code, _ = runConform(t, "-url", "srt://"+dead+"?streamid=x", "-timeout", "1s")
 	assert.Equal(t, 2, code)
 }
+
+// A .ts stream without a PAT is a violation, not a read error.
+func TestOsconformNoPSI(t *testing.T) {
+	b, err := os.ReadFile("../../testdata/fixtures/h264_aac.ts")
+	require.NoError(t, err)
+	var data []byte
+	for i := 0; i+188 <= len(b); i += 188 {
+		if pid := uint16(b[i+1]&0x1f)<<8 | uint16(b[i+2]); pid != 0 {
+			data = append(data, b[i:i+188]...)
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(data) }))
+	defer srv.Close()
+	code, out := runConform(t, "-url", srv.URL+"/x.ts", "-timeout", "5s")
+	assert.Equal(t, 1, code)
+	assert.Contains(t, out, "ts-psi-present")
+}

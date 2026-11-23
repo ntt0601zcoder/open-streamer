@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -108,7 +110,6 @@ func connectSRT(t *testing.T, e *srtServer, pre []media.Frame, query string, opt
 	for _, f := range pre {
 		e.h.Write(f)
 	}
-	opt.Timeout = max(opt.Timeout, 0)
 	if opt.Timeout == 0 {
 		opt.Timeout = srtWait
 	}
@@ -211,6 +212,14 @@ func TestReadSRTBadURL(t *testing.T) {
 // scriptedSRT serves data to the first caller, then closes.
 func scriptedSRT(t *testing.T, data []byte) string {
 	t.Helper()
+	return scriptedSRTLoop(t, data, false)
+}
+
+// scriptedSRTLoop is scriptedSRT; with loop, data repeats until the caller
+// goes away, and the connection never closes by itself.
+func scriptedSRTLoop(t *testing.T, data []byte, loop bool) string {
+	t.Helper()
+	all := data
 	cfg := srt.DefaultConfig()
 	ln, err := srt.Listen("srt", "127.0.0.1:0", cfg)
 	require.NoError(t, err)
@@ -226,13 +235,19 @@ func scriptedSRT(t *testing.T, data []byte) string {
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		for len(data) > 0 {
-			n := min(len(data), 1316)
-			if _, err := conn.Write(data[:n]); err != nil {
-				return
+		for {
+			for len(data) > 0 {
+				n := min(len(data), 1316)
+				if _, err := conn.Write(data[:n]); err != nil {
+					return
+				}
+				data = data[n:]
+				time.Sleep(time.Millisecond)
 			}
-			data = data[n:]
-			time.Sleep(time.Millisecond)
+			if !loop {
+				break
+			}
+			data = all
 		}
 		time.Sleep(500 * time.Millisecond)
 	}()
@@ -312,7 +327,7 @@ func TestReadSRTViolations(t *testing.T) {
 		data []byte
 		want string // a violation rule, or "error:" and text of the error
 	}{
-		"missing PAT":    {dropPID(t, muxTS(t, clip), 0), "error:no PMT"},
+		"missing PAT":    {dropPID(t, muxTS(t, clip), 0), RuleTSPSI},
 		"continuity gap": {dropVideoPackets(t, muxTS(t, clip)), RuleTSContinuity},
 		// The timeline restarts at the beginning: DTS repeats.
 		"backward PTS": {muxTS(t, append(slices.Clone(clip), clip...)), RuleDTS},
@@ -424,3 +439,75 @@ func (e *endlessReader) Read(p []byte) (int, error) {
 }
 
 func (e *endlessReader) Close() error { e.closed.Store(true); return nil }
+
+// A stream that keeps sending but carries no PAT is reported at the read
+// timeout, whatever the transport.
+func TestReadTSNoPSIEndless(t *testing.T) {
+	data := dropPID(t, muxTS(t, streamClip(t, "h264_aac.ts")), 0)
+	check := func(t *testing.T, u string) {
+		t.Helper()
+		start := time.Now()
+		r := awaitSRT(t, readSRTAsync(u, ReadOptions{Timeout: time.Second}))
+		require.NoError(t, r.err)
+		assert.Equal(t, []string{RuleTSPSI}, rules(r.c.Violations))
+		assert.Less(t, time.Since(start), 10*time.Second)
+	}
+	t.Run("srt", func(t *testing.T) {
+		check(t, "srt://"+scriptedSRTLoop(t, data, true)+"?streamid=x")
+	})
+	t.Run("http", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for r.Context().Err() == nil {
+				if _, err := w.Write(data); err != nil {
+					return
+				}
+				w.(http.Flusher).Flush()
+				time.Sleep(time.Millisecond)
+			}
+		}))
+		defer srv.Close()
+		check(t, srv.URL+"/x.ts")
+	})
+}
+
+// pesPacket returns one TS packet that starts a video PES with payload.
+func pesPacket(pid uint16, payload []byte) []byte {
+	p := make([]byte, mpegts.PacketSize)
+	p[0], p[1], p[2], p[3] = 0x47, 0x40|byte(pid>>8), byte(pid), 0x10
+	pes := append([]byte{0, 0, 1, 0xe0, 0, 0, 0x80, 0, 0}, payload...)
+	n := copy(p[4:], pes)
+	for i := 4 + n; i < len(p); i++ {
+		p[i] = 0xff
+	}
+	return p
+}
+
+func TestVideoStartSEI(t *testing.T) {
+	sc := []byte{0, 0, 0, 1}
+	nal := func(parts ...[]byte) []byte {
+		var out []byte
+		for _, p := range parts {
+			out = append(append(out, sc...), p...)
+		}
+		return out
+	}
+	aud, slice, idr := []byte{0x09, 0xf0}, []byte{0x41, 0x9a, 0x00}, []byte{0x65, 0x88, 0x00}
+	plain := []byte{0x06, 0x01, 0x01, 0x00, 0x80} // payload type 1
+	recovery := []byte{0x06, 0x06, 0x01, 0x00, 0x80}
+	for name, tc := range map[string]struct {
+		data      []byte
+		ok, known bool
+	}{
+		"sei then delta":      {nal(aud, plain, slice), false, true},
+		"recovery then delta": {nal(aud, recovery, slice), true, true},
+		"sei then idr":        {nal(aud, plain, idr), true, true},
+		"delta":               {nal(aud, slice), false, true},
+		"only aud":            {nal(aud), false, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ok, known := videoStart(pesPacket(256, tc.data), 256, media.CodecH264)
+			assert.Equal(t, tc.known, known)
+			assert.Equal(t, tc.ok, ok)
+		})
+	}
+}
