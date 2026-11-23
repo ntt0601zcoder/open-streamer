@@ -420,8 +420,10 @@ func (s *ServerSession) Close() {
 	})
 }
 
-// sendByeLocked sends the BYE compound of every set-up track by deadline;
-// the caller holds the write mutex.
+// sendByeLocked sends the BYE compound of every set-up track; over TCP the
+// write ends by deadline, over UDP it is bounded like every other UDP write
+// (the pair's sockets are shared, so no shorter deadline is set on them).
+// The caller holds the write mutex.
 func (s *ServerSession) sendByeLocked(deadline time.Time) {
 	var buf []byte
 	for _, t := range s.tracks {
@@ -430,7 +432,7 @@ func (s *ServerSession) sendByeLocked(deadline time.Time) {
 		}
 		bye := BuildBye(t.ssrc, sessionCNAME, t.lastSR)
 		if s.kind == transportUDP {
-			_ = s.pair.rtcp.SetWriteDeadline(deadline)
+			_ = s.pair.rtcp.SetWriteDeadline(time.Now().Add(s.c.srv.cfg.WriteTimeout))
 			_, _ = s.pair.rtcp.WriteToUDPAddrPort(bye, t.rtcpTo)
 			continue
 		}

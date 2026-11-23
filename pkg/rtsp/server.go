@@ -357,6 +357,33 @@ func (s *Server) startPlaying(c *serverConn) bool {
 	return true
 }
 
+// playingReaderBytes is the request buffer of a connection that plays, and
+// the limit of its request header bytes.
+const playingReaderBytes = 4 << 10
+
+// requestLimits returns the limits of the next request: once the connection
+// plays, request headers are held to the playing buffer.
+func (c *serverConn) requestLimits() Limits {
+	lim := c.srv.cfg.Limits
+	if c.playing && (lim.HeaderBytes <= 0 || lim.HeaderBytes > playingReaderBytes) {
+		lim.HeaderBytes = playingReaderBytes
+	}
+	return lim
+}
+
+// shrinkReader replaces the connection's request reader by a small one that
+// first yields what the old one had buffered; it runs on the connection's
+// goroutine. Interleaved frames are read through it with io.ReadFull or
+// Discard, so their length is not bound by the buffer.
+func (c *serverConn) shrinkReader() {
+	if c.br.Size() <= playingReaderBytes {
+		return
+	}
+	n := c.br.Buffered()
+	pending, _ := c.br.Peek(n)
+	c.br = bufio.NewReaderSize(io.MultiReader(bytes.NewReader(bytes.Clone(pending)), c.nc), playingReaderBytes)
+}
+
 // release forgets a finished connection.
 func (s *Server) release(c *serverConn) {
 	s.mu.Lock()
@@ -504,7 +531,7 @@ func (c *serverConn) readOne() error {
 		c.srv.nProtocol.Add(1)
 		return c.resync()
 	}
-	req, err := ReadRequest(c.br, c.srv.cfg.Limits)
+	req, err := ReadRequest(c.br, c.requestLimits())
 	if err != nil {
 		if !isTimeout(err) && !errors.Is(err, io.EOF) {
 			c.srv.nProtocol.Add(1)
@@ -852,6 +879,9 @@ func (c *serverConn) play(req *Request, resp *Response) func() {
 	if first && !c.srv.startPlaying(c) {
 		setStatus(resp, 404)
 		return nil
+	}
+	if first {
+		c.shrinkReader()
 	}
 	setStatus(resp, 200)
 	resp.Header.Set("Session", c.sess.header())

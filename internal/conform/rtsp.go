@@ -624,6 +624,11 @@ func (r *rtspCapture) result(ended bool) Capture {
 	}
 	c := r.b.finish()
 	c.RTPLost = r.lost
+	for _, t := range r.tracks {
+		if t != nil && t.bye {
+			c.ByeTracks++
+		}
+	}
 	return c
 }
 

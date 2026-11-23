@@ -411,16 +411,24 @@ func ParseTransport(v string) (Transport, error) {
 
 // ParseTransports parses every comma-separated entry of a Transport header
 // value, in order (RFC 2326 section 12.39: the client lists its offers by
-// preference). Any malformed entry fails the whole value.
+// preference). A malformed entry is skipped while another one parses; the
+// error of the first malformed entry is returned only when none does.
 func ParseTransports(v string) ([]Transport, error) {
 	entries := strings.Split(v, ",")
 	out := make([]Transport, 0, len(entries))
+	var first error
 	for _, e := range entries {
 		t, err := parseTransportEntry(e)
 		if err != nil {
-			return nil, err
+			if first == nil {
+				first = err
+			}
+			continue
 		}
 		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil, first
 	}
 	return out, nil
 }

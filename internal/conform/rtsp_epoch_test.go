@@ -352,3 +352,19 @@ func TestReadRTSPBadTransport(t *testing.T) {
 	_, err := ReadRTSP(context.Background(), "rtsp://127.0.0.1:1/live/s?transport=sctp", ReadOptions{})
 	require.Error(t, err)
 }
+
+// TestReadRTSPCountsBye checks that Capture.ByeTracks counts the tracks that
+// sent an RTCP BYE, once each however many they send.
+func TestReadRTSPCountsBye(t *testing.T) {
+	m := cleanMux(t)
+	require.Len(t, m.desc.Media, 2)
+	assert.Zero(t, m.replay(false).ByeTracks)
+	last := m.pkts[len(m.pkts)-1].Arrival
+	bye := func(track int) rtsp.Packet {
+		return rtsp.Packet{Track: track, RTCP: rtsp.BuildBye(0x2000+uint32(track), "t", nil), Arrival: last}
+	}
+	m.pkts = append(m.pkts, bye(0), bye(0))
+	assert.Equal(t, 1, m.replay(false).ByeTracks)
+	m.pkts = append(m.pkts, bye(1))
+	assert.Equal(t, 2, m.replay(true).ByeTracks)
+}

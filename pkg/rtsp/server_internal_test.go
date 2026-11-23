@@ -246,3 +246,80 @@ func TestInterleavedRTCPLiveness(t *testing.T) {
 	}
 	assert.Equal(t, uint64(1), srv.nProtocol.Load(), "only the garbage report is a protocol error")
 }
+
+// TestServerUDPByeDeadline checks that the UDP BYE is written under the
+// WriteTimeout deadline of every other UDP write, not under the short BYE
+// deadline given for TCP: a deadline already past must not fail it.
+func TestServerUDPByeDeadline(t *testing.T) {
+	rtpC, rtcpC, err := listenUDPPair("127.0.0.1")
+	require.NoError(t, err)
+	defer rtpC.Close()
+	defer rtcpC.Close()
+	peerRTP, peerRTCP, err := listenUDPPair("127.0.0.1")
+	require.NoError(t, err)
+	defer peerRTP.Close()
+	defer peerRTCP.Close()
+
+	srv := NewServer(nil, ServerConfig{WriteTimeout: 5 * time.Second})
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	c := &serverConn{srv: srv, nc: a, peer: net.IPv4(127, 0, 0, 1).To4(), ipKey: "127.0.0.1", since: time.Now()}
+	sess := newServerSession(c, "live/cam", []TrackDesc{{Codec: CodecH264, Payload: 96, ClockRate: 90000}})
+	sess.pair = &udpPair{rtp: rtpC, rtcp: rtcpC}
+	ports := [2]int{peerRTP.LocalAddr().(*net.UDPAddr).Port, peerRTCP.LocalAddr().(*net.UDPAddr).Port}
+	sess.addTrack(0, "rtsp://x/live/cam/trackID=0", transportUDP, Transport{ClientPort: ports})
+
+	c.wmu.Lock()
+	sess.sendByeLocked(time.Now().Add(-time.Second))
+	c.wmu.Unlock()
+
+	buf := make([]byte, 1500)
+	require.NoError(t, peerRTCP.SetReadDeadline(time.Now().Add(2*time.Second)))
+	n, _, err := peerRTCP.ReadFromUDP(buf)
+	require.NoError(t, err, "the BYE is sent under the WriteTimeout deadline")
+	assert.Equal(t, []byte{201, 202, 203}, rtcpTypeBytes(buf[:n]))
+}
+
+// rtcpTypeBytes returns the packet type of each packet of a compound.
+func rtcpTypeBytes(b []byte) []byte {
+	var out []byte
+	for len(b) >= 4 {
+		out = append(out, b[1])
+		b = b[(int(b[2])<<8|int(b[3])+1)*4:]
+	}
+	return out
+}
+
+// TestServerPlayingReaderSmall checks that a connection that plays reads
+// requests through a 4 KiB buffer, keeping what was already buffered, and
+// still reads a large interleaved frame whole.
+func TestServerPlayingReaderSmall(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	srv := NewServer(nil, ServerConfig{})
+	c := &serverConn{srv: srv, nc: a, br: bufio.NewReaderSize(a, 64<<10)}
+	go func() {
+		_, _ = b.Write([]byte("OPTIONS * RTSP/1.0\r\nCSeq: 9\r\n\r\n"))
+	}()
+	_, err := c.br.Peek(1)
+	require.NoError(t, err)
+	c.playing = true
+	c.shrinkReader()
+	assert.Equal(t, playingReaderBytes, c.br.Size())
+	req, err := ReadRequest(c.br, c.requestLimits())
+	require.NoError(t, err)
+	assert.Equal(t, "9", req.Header.Get("CSeq"))
+	assert.Equal(t, playingReaderBytes, c.requestLimits().HeaderBytes, "request headers are limited to the buffer size")
+
+	// A 60000-byte frame on a session channel, read through the small buffer.
+	rr := ReceiverReport(7, nil)
+	payload := append(append([]byte{}, rr...), make([]byte, 60000-len(rr))...)
+	frame := append([]byte{'$', 1, byte(len(payload) >> 8), byte(len(payload))}, payload...)
+	c.sess = &ServerSession{c: c, tracks: make([]*serverTrack, 1)}
+	c.sess.addTrack(0, "u", transportTCP, Transport{Interleaved: [2]int{0, 1}})
+	go func() { _, _ = b.Write(frame) }()
+	require.NoError(t, c.readFrame())
+	assert.Zero(t, srv.nProtocol.Load())
+}

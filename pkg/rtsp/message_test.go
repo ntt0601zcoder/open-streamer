@@ -307,10 +307,25 @@ func TestParseTransports(t *testing.T) {
 	if s := got[2].String(); s != "RTP/AVP;destination=10.0.0.9" {
 		t.Errorf("String %q", s)
 	}
-	for _, bad := range []string{"", "RTP/AVP/TCP;unicast,", "RTP/AVP;unicast, RTP/AVP;client_port=x"} {
+	for _, bad := range []string{"", ",", "RTP/AVP;client_port=x", "RTP/AVP;client_port=x, ;unicast"} {
 		if _, err := ParseTransports(bad); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
+	}
+}
+
+// TestParseTransportsSkipsMalformed checks that a malformed offer is skipped
+// while another parses, and the error comes only when none does.
+func TestParseTransportsSkipsMalformed(t *testing.T) {
+	got, err := ParseTransports("RTP/AVP;client_port=x, RTP/AVP/TCP;unicast;interleaved=0-1, ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Protocol != "RTP/AVP/TCP" || got[0].Interleaved != [2]int{0, 1} {
+		t.Fatalf("got %+v", got)
+	}
+	if _, err := ParseTransports("RTP/AVP;client_port=x, RTP/AVP;interleaved=999"); err == nil {
+		t.Error("accepted a header with no valid offer")
 	}
 }
 

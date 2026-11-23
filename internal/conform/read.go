@@ -78,6 +78,8 @@ type Capture struct {
 	// RTPLost counts the RTP packets ReadRTSP found missing from a track's
 	// sequence numbers, over UDP (not a violation) and TCP alike.
 	RTPLost uint64
+	// ByeTracks counts the tracks that sent an RTCP BYE (ReadRTSP only).
+	ByeTracks int
 }
 
 // reader is the HTTP side shared by the readers.

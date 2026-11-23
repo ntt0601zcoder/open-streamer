@@ -1150,3 +1150,24 @@ func TestServerWritePacketsNoGapOnError(t *testing.T) {
 	assert.Equal(t, seq, p.SequenceNumber, "the refused batch must not leave a gap")
 	assert.Equal(t, []byte{0x65, 3}, p.Payload)
 }
+
+// TestServerPlayingHeaderLimit checks that request headers of 64 KiB are
+// accepted before PLAY and refused after it (4 KiB), and that a large
+// interleaved frame still passes once playing.
+func TestServerPlayingHeaderLimit(t *testing.T) {
+	h := newHandler()
+	h.play = func(ctx context.Context, _ *rtsp.ServerSession) { <-ctx.Done() }
+	srv, addr := startServer(t, h, rtsp.ServerConfig{})
+	r := dialRaw(t, addr)
+	pad := strings.Repeat("a", 8<<10)
+	assert.Equal(t, 200, r.do("OPTIONS", "*", "X-Pad", pad).StatusCode, "before PLAY")
+	require.Equal(t, 200, r.setup(0, tcpOffer(0, 1)).StatusCode)
+	require.Equal(t, 200, r.play().StatusCode)
+	rr := rtsp.ReceiverReport(7, nil)
+	payload := append(append([]byte{}, rr...), make([]byte, 60000-len(rr))...)
+	r.writeRaw(string(append([]byte{'$', 1, byte(len(payload) >> 8), byte(len(payload))}, payload...)))
+	assert.Equal(t, 200, r.do("OPTIONS", "*").StatusCode, "after a large frame")
+	assert.Zero(t, srv.Stats().ProtocolErrors)
+	r.send("OPTIONS", "*", "X-Pad", pad)
+	assert.True(t, r.eof(2*time.Second), "an 8 KiB header after PLAY ends the connection")
+}
