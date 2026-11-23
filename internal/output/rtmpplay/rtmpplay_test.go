@@ -490,8 +490,13 @@ func TestPlayUnregisterEndsPlayers(t *testing.T) {
 
 // Fifty players joining one after the other all get the same messages.
 func TestPlayManyPlayers(t *testing.T) {
-	e := start(t, Options{}, nil)
+	// A queue that holds the whole clip: fifty players under the race
+	// detector on a loaded machine can fall behind a feed at 4x, and frames
+	// the hub drops at the end of the clip are never reported as lost.
+	const queue = 1024
+	e := start(t, Options{Queue: queue}, nil)
 	frames := looped(t, "h264_aac.ts", 1)
+	require.Less(t, len(frames), queue, "the clip fits a player's queue")
 	gop, rest := firstGOP(frames)
 	for _, f := range gop {
 		e.h.Write(f)
@@ -501,6 +506,9 @@ func TestPlayManyPlayers(t *testing.T) {
 	for i := range chans {
 		chans[i] = collect(play(t, e.url, rtmp.Config{}), nil)
 	}
+	// A player subscribes in the server's goroutine after its play is
+	// answered: feeding before would lose a late one the cached GOP.
+	require.Eventually(t, func() bool { return len(e.h.Stats()) == n }, waitFor, time.Millisecond, "every player subscribed")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	<-feed(ctx, e.h, rest, 4)
