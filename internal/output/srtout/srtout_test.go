@@ -155,6 +155,12 @@ type env struct {
 
 func start(t *testing.T, opt Options) *env {
 	t.Helper()
+	return startWrapped(t, opt, nil)
+}
+
+// startWrapped is start with the Server's wrap hook set, before it serves.
+func startWrapped(t *testing.T, opt Options, wrap func(io.Writer) io.Writer) *env {
+	t.Helper()
 	h, q := hub.New(hub.Options{}), hub.New(hub.Options{})
 	srv := New(func(name string) (*hub.Hub, bool) {
 		switch name {
@@ -167,6 +173,7 @@ func start(t *testing.T, opt Options) *env {
 		}
 		return nil, false
 	}, opt)
+	srv.wrap = wrap
 	require.NoError(t, srv.Listen("127.0.0.1:0"))
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve() }()
@@ -204,9 +211,11 @@ func mustDial(t *testing.T, addr string) srt.Conn {
 	return c
 }
 
-// capture is what a receiver read before its Read failed or it stopped.
+// capture is what a receiver read before its Read failed or it stopped,
+// and the largest single Read: gosrt returns one SRT packet per Read.
 type capture struct {
 	data []byte
+	most int
 	err  error
 }
 
@@ -220,18 +229,20 @@ func receive(c srt.Conn, n *atomic.Int64, stop func([]byte) bool) <-chan capture
 		// would overflow its own gosrt read queue.
 		data := make([]byte, 0, 8<<20)
 		buf := make([]byte, 2048)
+		most := 0
 		for {
 			k, err := c.Read(buf)
 			data = append(data, buf[:k]...)
+			most = max(most, k)
 			if n != nil {
 				n.Store(int64(len(data)))
 			}
 			if err != nil {
-				out <- capture{data: data, err: err}
+				out <- capture{data: data, most: most, err: err}
 				return
 			}
 			if stop != nil && stop(data) {
-				out <- capture{data: data}
+				out <- capture{data: data, most: most}
 				return
 			}
 		}
@@ -310,6 +321,12 @@ func play(t *testing.T, e *env, addr, id string, pre, rest []media.Frame, speed 
 // playWith is play with the receiver's config edited by mod.
 func playWith(t *testing.T, e *env, addr, id string, mod func(*srt.Config), pre, rest []media.Frame, speed float64, connected func(srt.Conn)) []byte {
 	t.Helper()
+	return playCapture(t, e, addr, id, mod, pre, rest, speed, connected).data
+}
+
+// playCapture is playWith returning the receiver's whole capture.
+func playCapture(t *testing.T, e *env, addr, id string, mod func(*srt.Config), pre, rest []media.Frame, speed float64, connected func(srt.Conn)) capture {
+	t.Helper()
 	for _, f := range pre {
 		e.h.Write(f)
 	}
@@ -328,7 +345,7 @@ func playWith(t *testing.T, e *env, addr, id string, mod func(*srt.Config), pre,
 	e.h.Close()
 	got := waitCapture(t, ch)
 	require.Error(t, got.err, "the server closed the connection")
-	return got.data
+	return got
 }
 
 // raceLatency gives the receiver latency d under the race detector, and
@@ -475,8 +492,9 @@ func TestSRTRejects(t *testing.T) {
 	// twice.
 	assert.GreaterOrEqual(t, st.RejectedMode, uint64(4))
 	assert.GreaterOrEqual(t, st.RejectedUnknown, uint64(len(cases)-4))
-	assert.Equal(t, st.Rejected, st.RejectedMode+st.RejectedUnknown+st.RejectedCaps)
+	assert.Equal(t, st.Rejected, st.RejectedMode+st.RejectedUnknown+st.RejectedCaps+st.RejectedMSS)
 	assert.Zero(t, st.RejectedCaps)
+	assert.Zero(t, st.RejectedMSS)
 	assert.Zero(t, st.Conns)
 }
 
@@ -627,11 +645,12 @@ func TestSRTStalledReceiverEnded(t *testing.T) {
 }
 
 // fakeConn copies gosrt's Write: bytes are appended to a buffer that is cut
-// into payload-sized chunks, and a chunk that finds the send queue full is
-// consumed and discarded (0, io.EOF), leaving any rest of the call's bytes
-// in the buffer. Every every-th chunk finds the queue full.
+// into payload-sized chunks (payload bytes, 0 meaning payloadSize), and a
+// chunk that finds the send queue full is consumed and discarded (0,
+// io.EOF), leaving any rest of the call's bytes in the buffer. Every
+// every-th chunk finds the queue full.
 type fakeConn struct {
-	every              int
+	every, payload     int
 	buf, got           bytes.Buffer
 	chunks, fails      int
 	calls, empty, most int
@@ -645,7 +664,11 @@ func (f *fakeConn) Write(b []byte) (int, error) {
 	f.most = max(f.most, len(b))
 	f.buf.Write(b)
 	for {
-		chunk := f.buf.Next(payloadSize)
+		size := f.payload
+		if size == 0 {
+			size = payloadSize
+		}
+		chunk := f.buf.Next(size)
 		if len(chunk) == 0 {
 			return 0, io.EOF // gosrt: reading an empty buffer
 		}
@@ -684,7 +707,7 @@ func TestSRTWriterRetryExact(t *testing.T) {
 			ctx, cancel := context.WithCancelCause(context.Background())
 			f := &fakeConn{every: every}
 			var full atomic.Uint64
-			w := newWriter(ctx, cancel, f, time.Second, &full)
+			w := newWriter(ctx, cancel, f, payloadSize, time.Second, &full)
 			data := tsBytes(1500)
 			sizes := []int{1, 7, 8, 13, 40, 2, 100, 3}
 			for off, i := 0, 0; off < len(data); i++ {
@@ -713,7 +736,7 @@ func TestSRTWriterRetryExact(t *testing.T) {
 		defer cancel(nil)
 		f := &fakeConn{every: 1}
 		var full atomic.Uint64
-		w := newWriter(ctx, cancel, f, 50*time.Millisecond, &full)
+		w := newWriter(ctx, cancel, f, payloadSize, 50*time.Millisecond, &full)
 		t0 := time.Now()
 		_, err := w.Write(tsBytes(7))
 		require.ErrorIs(t, err, errStalled)
@@ -726,7 +749,7 @@ func TestSRTWriterRetryExact(t *testing.T) {
 		ctx, cancel := context.WithCancelCause(context.Background())
 		f := &fakeConn{every: 1}
 		var full atomic.Uint64
-		w := newWriter(ctx, cancel, f, time.Minute, &full)
+		w := newWriter(ctx, cancel, f, payloadSize, time.Minute, &full)
 		go func() {
 			time.Sleep(20 * time.Millisecond)
 			cancel(errGone)
@@ -741,7 +764,7 @@ func TestSRTWriterRetryExact(t *testing.T) {
 		defer cancel(nil)
 		boom := errors.New("boom")
 		var full atomic.Uint64
-		w := newWriter(ctx, cancel, writerFunc(func([]byte) (int, error) { return 0, boom }), time.Minute, &full)
+		w := newWriter(ctx, cancel, writerFunc(func([]byte) (int, error) { return 0, boom }), payloadSize, time.Minute, &full)
 		_, err := w.Write(tsBytes(1))
 		require.ErrorIs(t, err, boom)
 	})
@@ -750,7 +773,7 @@ func TestSRTWriterRetryExact(t *testing.T) {
 		defer cancel(nil)
 		f := &fakeConn{}
 		var full atomic.Uint64
-		w := newWriter(ctx, cancel, f, time.Minute, &full)
+		w := newWriter(ctx, cancel, f, payloadSize, time.Minute, &full)
 		data := bytes.Repeat(tsBytes(7), 4*pacePackets+1) // 4 windows full, one more packet
 		t0 := time.Now()
 		_, err := w.Write(data)
@@ -762,7 +785,7 @@ func TestSRTWriterRetryExact(t *testing.T) {
 		ctx, cancel := context.WithCancelCause(context.Background())
 		f := &fakeConn{}
 		var full atomic.Uint64
-		w := newWriter(ctx, cancel, f, time.Minute, &full)
+		w := newWriter(ctx, cancel, f, payloadSize, time.Minute, &full)
 		cancel(errShutdown)
 		_, err := w.Write(tsBytes(7))
 		require.ErrorIs(t, err, errShutdown)
@@ -840,6 +863,181 @@ func TestSRTLossyLink(t *testing.T) {
 // ended.
 func TestSRTBurstJoin(t *testing.T) {
 	e := start(t, Options{})
+	pre, rest := burstFrames(t)
+	data := playWith(t, e, e.addr, "live/s", raceLatency(time.Second), pre, rest, 2, nil)
+	assert.Zero(t, ccErrors(t, data), "no continuity break at the receiver")
+	got := readBack(t, data)
+	require.Len(t, got, 100)
+	size := 0
+	for _, d := range got[0].Data {
+		size += len(d)
+	}
+	assert.GreaterOrEqual(t, size, burstKeyframe)
+	st := e.srv.Stats()
+	assert.Zero(t, st.EndedStalled)
+	assert.Equal(t, uint64(1), st.EndedHubClosed)
+}
+
+// chunkSize keeps an SRT packet's 7 TS packets while the connection's
+// payload (gosrt's MSS less 44) holds them, else the whole TS packets that
+// fit; fewer than 4 refuse the connection (0).
+func TestChunkSize(t *testing.T) {
+	for _, tc := range []struct {
+		mss  uint64
+		want int
+	}{
+		{1500, payloadSize},
+		{1360, payloadSize},
+		{1359, 6 * mpegts.PacketSize},
+		{1200, 6 * mpegts.PacketSize},
+		{796, 4 * mpegts.PacketSize},
+		{795, 0},
+		{76, 0},
+		{0, 0},
+	} {
+		assert.Equal(t, tc.want, chunkSize(tc.mss), "MSS %d", tc.mss)
+	}
+}
+
+// With a payload of 1156 bytes (a caller's MSS of 1200), gosrt splits a
+// 1316-byte Write over two packets, and a full queue on the second makes
+// the retry repeat the first; chunks of the whole TS packets that fit one
+// payload keep every Write one packet, queued whole or not at all.
+func TestSRTWriterLowMSS(t *testing.T) {
+	size := chunkSize(1200)
+	for _, every := range []int{2, 3, 7} {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		f := &fakeConn{every: every, payload: 1200 - 44}
+		var full atomic.Uint64
+		w := newWriter(ctx, cancel, f, size, time.Second, &full)
+		data := tsBytes(1500)
+		sizes := []int{1, 7, 8, 13, 40, 2, 100, 3}
+		for off, i := 0, 0; off < len(data); i++ {
+			n := min(sizes[i%len(sizes)]*mpegts.PacketSize, len(data)-off)
+			k, err := w.Write(data[off : off+n])
+			require.NoError(t, err)
+			require.Equal(t, n, k)
+			off += n
+		}
+		require.True(t, bytes.Equal(data, f.got.Bytes()), "every %d: no duplicate or missing packet", every)
+		assert.Equal(t, size, f.most)
+		assert.Equal(t, f.calls, f.chunks, "every %d: one gosrt packet per Write", every)
+		assert.Positive(t, f.fails)
+		cancel(nil)
+	}
+}
+
+// recorder stands between a connection's writer and gosrt: it records the
+// bytes gosrt took and the largest Write, and answers every every-th Write
+// as gosrt answers a full send queue (0, io.EOF, the bytes dropped) without
+// passing it on, so that retries happen on demand.
+type recorder struct {
+	w     io.Writer
+	every int
+
+	mu                 sync.Mutex
+	calls, most, fails int
+	got                bytes.Buffer
+}
+
+func (r *recorder) Write(b []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	r.most = max(r.most, len(b))
+	if r.calls%r.every == 0 {
+		r.fails++
+		return 0, io.EOF
+	}
+	n, err := r.w.Write(b)
+	if err == nil {
+		r.got.Write(b[:n])
+	}
+	return n, err
+}
+
+// A burst join with full-queue retries reaches a receiver byte-exact, at the
+// default MSS and at an MSS of 1200, where the connection's chunks shrink
+// to 6 TS packets so that each Write stays one SRT packet.
+func TestSRTLowMSS(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		mss   uint32
+		chunk int
+	}{
+		{"default MSS", 0, payloadSize},
+		{"MSS 1200", 1200, 6 * mpegts.PacketSize},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recs := make(chan *recorder, 1)
+			e := startWrapped(t, Options{}, func(w io.Writer) io.Writer {
+				r := &recorder{w: w, every: 5}
+				recs <- r
+				return r
+			})
+			mod := func(c *srt.Config) {
+				if tc.mss > 0 {
+					c.MSS, c.PayloadSize = tc.mss, tc.mss-44
+				}
+				if raceEnabled {
+					c.Latency = time.Second
+				}
+			}
+			pre, rest := burstFrames(t)
+			got := playCapture(t, e, e.addr, "live/s", mod, pre, rest, 2, nil)
+			r := <-recs
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			assert.Positive(t, r.fails)
+			st := e.srv.Stats()
+			assert.GreaterOrEqual(t, st.SendQueueFull, uint64(r.fails), "every full queue retried")
+			assert.Equal(t, tc.chunk, r.most, "the connection's chunk size")
+			assert.Equal(t, tc.chunk, got.most, "one chunk per SRT packet")
+			require.True(t, bytes.Equal(r.got.Bytes(), got.data), "byte-exact: no duplicated or missing bytes")
+			assert.Zero(t, ccErrors(t, got.data), "no continuity break at the receiver")
+			require.Len(t, readBack(t, got.data), 100)
+			assert.Zero(t, st.EndedStalled)
+			assert.Equal(t, uint64(1), st.EndedHubClosed)
+		})
+	}
+}
+
+// A caller whose MSS leaves room for fewer than 4 TS packets per SRT packet
+// completes gosrt's handshake, which decides the MSS, and is then closed at
+// once and counted as refused; a caller at 4 packets is served.
+func TestSRTRefusesSmallMSS(t *testing.T) {
+	e := start(t, Options{})
+	gop, rest := splitAtKey(looped(t, "h264_aac.ts", 1), 2)
+	for _, f := range gop {
+		e.h.Write(f)
+	}
+	mss := func(n uint32) func(*srt.Config) {
+		return func(c *srt.Config) { c.MSS, c.PayloadSize = n, n-44 }
+	}
+	c, err := dial(e.addr, "live/s", mss(795))
+	require.NoError(t, err, "gosrt completes the handshake")
+	t.Cleanup(func() { _ = c.Close() })
+	got := waitCapture(t, receive(c, nil, nil))
+	require.Error(t, got.err, "closed by the server")
+	assert.Empty(t, got.data)
+	waitStats(t, e.srv, func(s Stats) bool { return s.RejectedMSS == 1 && s.Conns == 0 }, "refused")
+	st := e.srv.Stats()
+	assert.Equal(t, uint64(1), st.Rejected)
+	assert.Zero(t, st.EndedGone+st.EndedShutdown+st.EndedStalled+st.EndedError, "never served")
+
+	more := playCapture(t, e, e.addr, "live/s", mss(796), nil, rest, 4, nil)
+	assert.Equal(t, 4*mpegts.PacketSize, more.most, "4 TS packets per SRT packet")
+	assert.Zero(t, ccErrors(t, more.data))
+	assert.Equal(t, uint64(1), e.srv.Stats().RejectedMSS)
+}
+
+// burstKeyframe is the size of the keyframe burstFrames starts with.
+const burstKeyframe = 2_300_000
+
+// burstFrames returns a synthetic H.264 GOP whose keyframe is over 2 MB, to
+// be cached before a join (pre), and 75 small frames after it (rest).
+func burstFrames(t *testing.T) (pre, rest []media.Frame) {
+	t.Helper()
 	h264 := configOf(t, "h264_aac.ts", media.CodecH264)
 	frame := func(i, size int, key bool) media.Frame {
 		data := make([]byte, size)
@@ -853,31 +1051,19 @@ func TestSRTBurstJoin(t *testing.T) {
 		dts := int64(i) * 3600
 		return media.Frame{Track: 0, Config: h264, PTS: dts, DTS: dts, Key: key, Data: [][]byte{data}, Epoch: 1}
 	}
-	const big = 2_300_000
-	pre := make([]media.Frame, 0, 25)
-	rest := make([]media.Frame, 0, 75)
+	pre = make([]media.Frame, 0, 25)
+	rest = make([]media.Frame, 0, 75)
 	for i := range 25 {
 		size := 2000
 		if i == 0 {
-			size = big
+			size = burstKeyframe
 		}
 		pre = append(pre, frame(i, size, i == 0))
 	}
 	for i := 25; i < 100; i++ {
 		rest = append(rest, frame(i, 2000, i%25 == 0))
 	}
-	data := playWith(t, e, e.addr, "live/s", raceLatency(time.Second), pre, rest, 2, nil)
-	assert.Zero(t, ccErrors(t, data), "no continuity break at the receiver")
-	got := readBack(t, data)
-	require.Len(t, got, 100)
-	size := 0
-	for _, d := range got[0].Data {
-		size += len(d)
-	}
-	assert.GreaterOrEqual(t, size, big)
-	st := e.srv.Stats()
-	assert.Zero(t, st.EndedStalled)
-	assert.Equal(t, uint64(1), st.EndedHubClosed)
+	return pre, rest
 }
 
 // A codec change on a configured track ends the connection.
@@ -1078,7 +1264,7 @@ func TestWriterMeter(t *testing.T) {
 	defer cancel(nil)
 	f := &fakeConn{}
 	var full atomic.Uint64
-	w := newWriter(ctx, cancel, f, time.Minute, &full)
+	w := newWriter(ctx, cancel, f, payloadSize, time.Minute, &full)
 	assert.Nil(t, w.bucket)
 	w.Prebuffered(10_000, 0)
 	assert.NotNil(t, w.bucket, "an unknown bitrate paces at the floor")
@@ -1148,7 +1334,7 @@ func feedMeter(w *writer, from, to float64, size int) {
 func TestWriterRateAfterGap(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	w := newWriter(ctx, cancel, &fakeConn{}, time.Minute, new(atomic.Uint64))
+	w := newWriter(ctx, cancel, &fakeConn{}, payloadSize, time.Minute, new(atomic.Uint64))
 	w.Prebuffered(750_000, media.ClockRate)
 	feedMeter(w, 0, 3, 30_000) // 30 kB every 40 ms: 6 Mbit/s
 	want := bucketRate(6e6)
@@ -1164,7 +1350,7 @@ func TestWriterRateAfterGap(t *testing.T) {
 func TestWriterRateAfterResync(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	w := newWriter(ctx, cancel, &fakeConn{}, time.Minute, new(atomic.Uint64))
+	w := newWriter(ctx, cancel, &fakeConn{}, payloadSize, time.Minute, new(atomic.Uint64))
 	w.Prebuffered(750_000, media.ClockRate)
 	feedMeter(w, 0, 3, 30_000)
 	want := bucketRate(6e6)

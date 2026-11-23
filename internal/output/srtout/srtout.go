@@ -19,10 +19,17 @@
 // second of stream time, and resumes at a keyframe after hub loss. The
 // listener sends 1316-byte payloads (7 TS packets), and every gosrt Write
 // gets at most one payload, never an empty slice, so a chunk is queued whole
-// or not at all. gosrt answers a full send queue with io.EOF and drops the
-// chunk; the same chunk is then retried every 5 ms (counted in
-// Stats.SendQueueFull), and a connection whose retries last longer than
-// Options.StallTimeout is ended as stalled.
+// or not at all. A caller whose MSS is smaller than 1360 bytes makes gosrt
+// lower the connection's payload to its MSS less 44 bytes, and gosrt would
+// split a larger Write over packets; such a connection's chunks are the
+// whole TS packets that fit (6 at an MSS of 1200). A connection where fewer
+// than 4 fit (an MSS under 796) is closed as soon as it is accepted and
+// counted in Stats.RejectedMSS: gosrt decides the MSS in the handshake, so
+// the caller sees its connection close rather than a rejection. gosrt
+// answers a full send queue with io.EOF and drops the chunk; the same chunk
+// is then retried every 5 ms (counted in Stats.SendQueueFull), and a
+// connection whose retries last longer than Options.StallTimeout is ended
+// as stalled.
 //
 // Writes are paced by a token bucket per connection, so that a GOP replay
 // or a large keyframe leaves at a few times the stream's bitrate rather than
@@ -85,7 +92,14 @@ const (
 	defaultMaxPerIP       = 64
 
 	// payloadSize is the listener's payload size: 7 TS packets.
-	payloadSize = 7 * 188
+	payloadSize = 7 * tsPacket
+	// minChunk is the smallest chunk a connection is served with: 4 TS
+	// packets.
+	minChunk = 4 * tsPacket
+	tsPacket = 188
+	// gosrtHeaders is what gosrt takes off a connection's MSS for its
+	// payload: the SRT header and the IPv4 and UDP headers.
+	gosrtHeaders = srt.SRT_HEADER_SIZE + srt.UDP_HEADER_SIZE
 	// retryInterval is how often a chunk that found the send queue full is
 	// retried.
 	retryInterval = 5 * time.Millisecond
@@ -160,8 +174,10 @@ type Stats struct {
 	// Rejected counts refused connection requests: RejectedMode those with
 	// an empty stream ID, a mode other than request, a type other than
 	// stream or encryption; RejectedUnknown those naming no live stream of
-	// the app; RejectedCaps those over a cap.
-	Rejected, RejectedUnknown, RejectedMode, RejectedCaps uint64
+	// the app; RejectedCaps those over a cap; RejectedMSS those whose MSS
+	// leaves room for fewer than 4 TS packets per SRT packet (accepted,
+	// then closed at once).
+	Rejected, RejectedUnknown, RejectedMode, RejectedCaps, RejectedMSS uint64
 	// Frames and Resyncs sum the frames written and the hub losses resynced
 	// by each connection, added when the connection ends: a connection
 	// being served is not counted yet.
@@ -193,6 +209,10 @@ type Server struct {
 	perIP     map[string]int
 	total     int
 	stats     Stats // all but SendQueueFull
+
+	// wrap, when set (by tests, before Serve), stands between each
+	// connection's writer and gosrt.
+	wrap func(io.Writer) io.Writer
 }
 
 // New returns a Server for the hubs that lookup finds by stream name.
@@ -322,6 +342,7 @@ const (
 	refuseMode refusal = iota
 	refuseUnknown
 	refuseCaps
+	refuseMSS
 )
 
 // answer accepts or refuses one connection request.
@@ -354,7 +375,33 @@ func (s *Server) answer(req srt.ConnRequest) {
 		s.finish(name, key, nil, tsstream.Stats{})
 		return
 	}
-	go s.serve(conn, h, name, key)
+	var st srt.Statistics
+	conn.Stats(&st)
+	size := chunkSize(st.Instantaneous.ByteMSS)
+	if size == 0 {
+		_ = conn.Close()
+		s.mu.Lock()
+		s.countRefusal(refuseMSS)
+		s.mu.Unlock()
+		s.finish(name, key, nil, tsstream.Stats{})
+		return
+	}
+	go s.serve(conn, h, name, key, size)
+}
+
+// chunkSize returns the bytes a connection's gosrt Write may carry so that
+// it is one SRT packet: gosrt's payload is the connection's MSS less 44
+// bytes, capped by the listener's 1316, and a chunk is the whole TS packets
+// that fit. It is 0, refusing the connection, when fewer than 4 fit.
+func chunkSize(mss uint64) int {
+	if mss <= gosrtHeaders {
+		return 0
+	}
+	n := min(payloadSize, int(mss-gosrtHeaders)/tsPacket*tsPacket) //nolint:gosec // an MSS is at most 1500
+	if n < minChunk {
+		return 0
+	}
+	return n
 }
 
 // stream resolves the stream a request names, or refuses it.
@@ -391,6 +438,8 @@ func (s *Server) countRefusal(why refusal) {
 		s.stats.RejectedUnknown++
 	case refuseCaps:
 		s.stats.RejectedCaps++
+	case refuseMSS:
+		s.stats.RejectedMSS++
 	}
 }
 
@@ -458,9 +507,9 @@ const (
 	endError
 )
 
-// serve streams h to one accepted connection until it must end, then closes
-// it and counts the end.
-func (s *Server) serve(conn srt.Conn, h *hub.Hub, name, key string) {
+// serve streams h to one accepted connection, in chunks of size bytes,
+// until it must end, then closes it and counts the end.
+func (s *Server) serve(conn srt.Conn, h *hub.Hub, name, key string, size int) {
 	ctx, cancel := context.WithCancelCause(s.ctx)
 	defer cancel(errDone)
 	var bg sync.WaitGroup
@@ -477,7 +526,11 @@ func (s *Server) serve(conn srt.Conn, h *hub.Hub, name, key string) {
 	})
 	bg.Go(func() { s.watch(ctx, cancel, conn) })
 
-	w := newWriter(ctx, cancel, conn, s.opt.StallTimeout, &s.full)
+	var out io.Writer = conn
+	if s.wrap != nil {
+		out = s.wrap(conn)
+	}
+	w := newWriter(ctx, cancel, out, size, s.opt.StallTimeout, &s.full)
 	st, err := tsstream.Stream(ctx, h, "srt "+conn.RemoteAddr().String(), w, tsstream.Options{Queue: s.opt.Queue, Meter: w})
 	why := classify(ctx, st, err)
 	if why == endCodecChange || why == endHubClosed {
@@ -629,12 +682,13 @@ func (m *stallMonitor) add(now time.Time, c sample) bool {
 }
 
 // writer is the tsstream.Sink and tsstream.Meter of a connection: it hands
-// gosrt at most one payload per Write, paces the packets by the stream's
-// bitrate and retries a chunk that found the send queue full.
+// gosrt at most one chunk (one SRT packet) per Write, paces the packets by
+// the stream's bitrate and retries a chunk that found the send queue full.
 type writer struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 	w      io.Writer
+	size   int // the chunk size: whole TS packets in one SRT packet
 	stall  time.Duration
 	full   *atomic.Uint64
 
@@ -644,18 +698,18 @@ type writer struct {
 	meter      rateMeter
 }
 
-func newWriter(ctx context.Context, cancel context.CancelCauseFunc, w io.Writer, stall time.Duration, full *atomic.Uint64) *writer {
-	return &writer{ctx: ctx, cancel: cancel, w: w, stall: stall, full: full}
+func newWriter(ctx context.Context, cancel context.CancelCauseFunc, w io.Writer, size int, stall time.Duration, full *atomic.Uint64) *writer {
+	return &writer{ctx: ctx, cancel: cancel, w: w, size: size, stall: stall, full: full}
 }
 
-// Write writes p in chunks of at most one payload. It fails when the
+// Write writes p in chunks of at most w.size bytes. It fails when the
 // connection ends or stalls; n is then the bytes queued before.
 func (w *writer) Write(p []byte) (int, error) {
 	if w.ctx.Err() != nil {
 		return 0, fmt.Errorf("srtout: write: %w", context.Cause(w.ctx))
 	}
 	for off := 0; off < len(p); {
-		n := min(payloadSize, len(p)-off)
+		n := min(w.size, len(p)-off)
 		if err := w.pace(n); err != nil {
 			return off, err
 		}
@@ -737,7 +791,7 @@ func (w *writer) ceiling() error {
 	return nil
 }
 
-// chunk queues b, at most one payload, retrying it while the send queue is
+// chunk queues b, at most one SRT packet, retrying it while the send queue is
 // full. gosrt reports a full queue, and a closed connection, with io.EOF:
 // while the connection's context is not done it is the queue.
 func (w *writer) chunk(b []byte) error {
