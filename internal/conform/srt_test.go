@@ -511,3 +511,36 @@ func TestVideoStartSEI(t *testing.T) {
 		})
 	}
 }
+
+// A stream that ends before its first byte is a read error, whatever the
+// transport, not a missing-PSI violation.
+func TestReadTSEmpty(t *testing.T) {
+	t.Run("http", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+		c, err := ReadTS(context.Background(), srv.URL+"/x.ts", ReadOptions{Timeout: 5 * time.Second})
+		require.ErrorContains(t, err, "ended before any byte")
+		assert.Empty(t, c.Violations)
+	})
+	t.Run("srt", func(t *testing.T) {
+		r := awaitSRT(t, readSRTAsync("srt://"+scriptedSRT(t, nil)+"?streamid=x", ReadOptions{Timeout: 5 * time.Second}))
+		require.ErrorContains(t, r.err, "ended before any byte")
+		assert.Empty(t, r.c.Violations)
+	})
+}
+
+// PSI that first comes after more than 4 MiB of other packets (a third-party
+// stream at a high bitrate that repeats its tables rarely) is found.
+func TestReadTSLatePSI(t *testing.T) {
+	null := make([]byte, mpegts.PacketSize)
+	null[0], null[1], null[2], null[3] = 0x47, 0x1F, 0xFF, 0x10
+	body := append(bytes.Repeat(null, (5<<20)/mpegts.PacketSize), muxTS(t, streamClip(t, "h264_aac.ts"))...)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
+	defer srv.Close()
+	c, err := ReadTS(context.Background(), srv.URL+"/x.ts", ReadOptions{Timeout: 10 * time.Second})
+	require.NoError(t, err)
+	assert.Empty(t, c.Violations)
+	assert.NotEmpty(t, c.Frames)
+}

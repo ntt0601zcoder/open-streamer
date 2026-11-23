@@ -1249,11 +1249,14 @@ func ReadTS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 }
 
 // RuleTSPSI names the rule that a TS stream carries a PAT and a PMT before
-// its first frame: within psiMaxBytes and the read timeout.
+// its first frame: within psiMaxBytes and the read timeout. A stream that
+// ends before its first byte is a read error instead.
 const RuleTSPSI = "ts-psi-present"
 
-// psiMaxBytes bounds the bytes read before the first PMT.
-const psiMaxBytes = 4 << 20
+// psiMaxBytes bounds the bytes read before the first PMT: room for a
+// third-party stream that repeats its tables rarely at a high bitrate; the
+// read timeout bounds the wait in time.
+const psiMaxBytes = 32 << 20
 
 // psiGuard bounds the read up to the first PMT, while armed.
 type psiGuard struct {
@@ -1301,6 +1304,9 @@ func checkTS(ctx context.Context, body io.Reader, opt ReadOptions, strict bool, 
 	if err != nil {
 		if ctx.Err() != nil {
 			return Capture{}, fmt.Errorf("conform: read: %w", ctx.Err())
+		}
+		if guard.eof && guard.n == 0 {
+			return Capture{}, fail(errors.New("the stream ended before any byte"))
 		}
 		if guard.exceeded || guard.eof {
 			return Capture{Violations: []Violation{{

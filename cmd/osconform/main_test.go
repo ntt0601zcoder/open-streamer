@@ -445,6 +445,15 @@ func TestOsconformSRT(t *testing.T) {
 	assert.Equal(t, 2, code)
 }
 
+// A .ts stream that ends before its first byte is a read error.
+func TestOsconformEmptyTS(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer srv.Close()
+	code, out := runConform(t, "-url", srv.URL+"/x.ts", "-timeout", "5s")
+	assert.Equal(t, 2, code)
+	assert.NotContains(t, out, "ts-psi-present")
+}
+
 // A .ts stream without a PAT is a violation, not a read error.
 func TestOsconformNoPSI(t *testing.T) {
 	b, err := os.ReadFile("../../testdata/fixtures/h264_aac.ts")

@@ -1,7 +1,8 @@
 // Command osconform reads an HLS playlist, a DASH MPD or an MPEG-TS stream
 // over HTTP, an RTMP stream (rtmp:// URL, played), or an RTSP stream (rtsp:// URL, played; ?transport=udp selects UDP), or an SRT stream (srt://host:port?streamid=...&latency=ms, called), and prints the conformance violations it finds, one per line.
 //
-// Exit status: 0 clean, 1 violations found, 2 read error or bad arguments.
+// Exit status: 0 clean, 1 violations found, 2 read error (an MPEG-TS stream
+// that ends before its first byte is one) or bad arguments.
 package main
 
 import (
