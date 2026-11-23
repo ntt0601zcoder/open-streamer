@@ -182,6 +182,29 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 - **Parameter sets:** TS, RTP and FLV writers re-insert every parameter set
   from `Config` before each keyframe. No muxer or packetiser library does this
   for us.
+- **HLS renditions stay aligned** (M3b3, closing the M3a rulings R4, R9 and R7,
+  which are not §1's rules of the same number): every CMAF per-track playlist
+  lists one entry per segment in the window, the track's part or an
+  `EXT-X-GAP` placeholder (`gap-{track}-{seq}.m4s`, answered 404 and never
+  loaded). Media sequence numbers and discontinuity counts are therefore equal
+  across renditions by construction, also across a stretch where a track is
+  absent, across window eviction, and when loss merges discontinuities in one
+  rendition. A gap entry's `EXT-X-MAP` is that of the track's latest real part
+  so far, so no listed entry changes between refreshes (RFC 8216 §6.2.1).
+  DASH needs no placeholders: periods carry their adaptation sets.
+- **TS streaming** (M3b3): HTTP-TS and SRT share one loop, `internal/output/tsstream`.
+  After hub loss (`Lost > 0`) it drops frames until the next video keyframe
+  (audio-only: the next frame), writes PAT and PMT, sets the
+  `discontinuity_indicator` on the first packet of every track PID from there
+  on, and drops audio presented before the keyframe. HTTP-TS starts from the
+  hub's cached GOP (`SubscribeCached`), like the other streaming outputs.
+- **SRT output** (M3b3): one gosrt listener; the stream ID selects the stream
+  (request mode only, every refusal identical). Writes are cut to 1316-byte
+  payloads and retried when gosrt's send queue is full, and paced by a token
+  bucket per connection (2.5 times the stream's bitrate, between 2 Mbit/s and
+  256 packets per 5 ms), so a GOP replay at join does not arrive as one burst
+  that is too late at 120 ms latency. Vanished receivers are ended by the
+  reader goroutine, stalled ones from `conn.Stats`.
 - DASH maps stream time to wallclock through the epoch anchors, with one fixed
   `availabilityStartTime` for the life of the stream. A period starts at
   `max(anchor, previous period end)`.
@@ -276,7 +299,9 @@ internal/segment/      segmenter
 internal/mux/...       fMP4 writer on mp4ff; internal/mux/flv: hub frames to RTMP messages;
                        internal/mux/rtp: hub frames to RTP packets and sender reports
 internal/output/...    one package per output protocol (rtmpplay: RTMP players;
-                       rtmppush: RTMP push-out; rtspplay: RTSP players)
+                       rtmppush: RTMP push-out; rtspplay: RTSP players;
+                       srtout: SRT receivers; tsstream: the MPEG-TS streaming
+                       loop shared by httpts and srtout)
 internal/transcode/    subprocess supervisor and protocol
 internal/stream/       supervisor and failover
 internal/store/        spec storage
@@ -294,7 +319,7 @@ before the code they check.
 |---|---|---|---|
 | M1 | Media core: Frame, TS demuxer, Clock, hub, frame checks, fixtures | – | Every fixture goes demux → Clock → hub with no check violation, including the PTS-wrap and looped-source fixtures |
 | M2 (done) | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change remaps the demuxer's tracks as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
-| M3 | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg, VLC-class clients and MediaMTX play every output; for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it |
+| M3 (done) | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg, VLC-class clients and MediaMTX play every output; for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it. Proved by `TestM3Matrix` (every output under the four scenarios), `TestM3VLCClass` and `TestM3GStreamerClass` (VLC-class clients), `TestM3b3MediaMTXPull`, `TestM3b3SRTFFmpeg`, `TestHLSFFmpegAcrossGap` and `TestM3b3HLSAlignment`, with the M3a, M3b1 and M3b2 scenarios for the cells they cover |
 | M4 | Transcoder, watermark, thumbnails | M1, M3 | In CI (no GPU, builder image restored): a 3-rung software ladder and passthrough pass M3's scenarios. On the GPU host: the same with 3 NVENC rungs, run by a make target and recorded in the PR; a killed subprocess comes back as one new epoch; the watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5 | Feature tests; DVR playback passes `osconform` |
@@ -314,7 +339,7 @@ output) follows M2b and M2c. M3b is split in three parts:
 |---|---|
 | M3b1 ([plan](superpowers/plans/2026-11-17-m3b1-rtmp-out.md), done) | `pkg/rtmp` server play and client publish, an RTMP listener shared by publish inputs and play outputs (players address a stream by its name, never by a publish key), the FLV muxer, RTMP play and RTMP push-out outputs, `osconform` for `rtmp://`, M2b's items carried to M3b |
 | M3b2 ([plan](superpowers/plans/2026-11-22-m3b2-rtsp-out.md), done) | `pkg/rtsp` server (TCP interleaved and UDP), our own RTP packetisers with parameter sets before keyframes, RTCP sender reports, the RTP muxer, the RTSP play output, `osconform` for `rtsp://` |
-| M3b3 | The SRT output, EXT-X-GAP (or per-track placeholders) for the R4/R9 rendition alignment, the VLC-class client check and the M3 row's remaining scenarios for every output; M3 done |
+| M3b3 ([plan](superpowers/plans/2026-11-23-m3b3-srt-out-m3-done.md), done) | The shared TS streaming loop with resync after loss, the SRT output, per-segment HLS entries with `EXT-X-GAP` placeholders for the R4/R9 rendition alignment, `osconform` for `srt://`, the VLC-class client check and the M3 row's remaining scenarios for every output; M3 done |
 
 M3b1's exit criteria are the M3 row's, for RTMP (VLC-class clients are
 checked in M3b3 for every output): ffmpeg/ffprobe and MediaMTX (as a puller)
@@ -374,6 +399,43 @@ Out of M3b2:
 | RTSP 2.0 | Players use RTSP 1.0 |
 | A mid-session codec change, a new AAC config or a kind appearing | The SDP cannot follow: the session ends with a BYE per track and players reconnect |
 | VLC-class client checks | M3b3, for every output |
+
+M3b3's exit criteria are the M3 row's. ffmpeg and a VLC-class client play
+every output: HLS fMP4, HLS TS, DASH, HTTP-TS, SRT and RTMP play with VLC 3
+(two instances per row, since its `rc` stats count nothing while a `--sout` is
+attached: one supplies the decoded counts, one the dump), RTSP play and the
+RTMP push-out (read back over MediaMTX's RTSP) with GStreamer, as Ubuntu's VLC
+has no RTSP module. MediaMTX pulls every output it can take as a source (HLS
+fMP4, HLS TS and SRT; RTMP and RTSP by M3b1 and M3b2), and our RTSP input reads
+back violation-free frames in one epoch; ffmpeg with libsrt, independent of
+gosrt, decodes the SRT output with `-xerror`. Every output passes `osconform`
+and ffprobe under the steady-state, epoch-change, slow-consumer (defined per
+output: a slow packager subscriber for segment outputs, hub loss from a slow
+writer for streaming ones) and B-frame scenarios. CMAF HLS renditions keep
+equal media sequence numbers and discontinuity counts at every refresh, across
+a video-only stretch and across window eviction. The `TestM3b3` scenarios and
+`TestM3Matrix` in `internal/e2e` prove them (`TestM3b3MediaMTXPull` pulls from
+ports 19363 for SRT and 19364 for HTTP in CI's host-network MediaMTX), with
+`TestStreamResyncAfterLoss` (`internal/output/tsstream`),
+`TestHLSPerSegmentEntries` and `TestHLSGapEviction` (`internal/output/live`),
+and the `internal/output/srtout` tests (`TestSRTStalledReceiverEnded`,
+`TestSRTLossyLink`, `TestSRTBurstJoin`) for the parts that need no peer.
+Across a video-only stretch only ffmpeg plays on (`TestHLSFFmpegAcrossGap`);
+the VLC and GStreamer limitations are in Backlog.
+
+Out of M3b3:
+
+| Item | Reason |
+|---|---|
+| SRT caller push-out | Add on demand; the RTMP push-out covers pushing today |
+| SRT encryption | Needs credentials: M5; encrypted requests are refused |
+| Publishing into the SRT output listener | The SRT inputs own publishing |
+| DASH placeholders | Periods carry their adaptation sets; there is nothing to align |
+| Silent AAC placeholder parts instead of gaps | Backlog item 1 |
+| LL-HLS changes | Not part of the M3 row |
+| Play authentication and tokens | M6 sessions and tokens, as for the other outputs |
+| VLC-class playback across a video-only stretch | VLC 3 and GStreamer fail on it; see Backlog items 1 and 4 |
+| MediaMTX pulls of DASH and HTTP-TS | They are not MediaMTX sources; ffmpeg and the VLC-class clients cover them |
 
 M2 is split in three parts:
 
@@ -481,6 +543,29 @@ Items accepted for later, not yet placed in a milestone:
   e2e scenarios that pull from MediaMTX join after it settles, see
   `TestM2cRTSPMediaMTXH264`, M3b1's `TestM3b1MediaMTXPull` and M3b2's
   `TestM3b2MediaMTXPull`).
+
+- **Silent AAC placeholder parts instead of `EXT-X-GAP` entries.** GStreamer's
+  hlsdemux2 (1.24 and 1.28) loads consecutive gap URIs, gets 404 and stops
+  (`TestM3GStreamerClass/hls-fmp4-across-gap` is skipped with this evidence;
+  `OS_PEER_LIMITS=1` probes the limitation). It would very likely make
+  GStreamer play across an audio-less stretch, and also help hls.js if stalls
+  are reported there.
+- **Cut audio segments and parts at the video boundary's PTS, not by arrival
+  order (`internal/segment/segmenter.go`). High priority, before the M7
+  soak.** With interleaved TS input the audio EXTINFs come out as 1.707, 2.048
+  and 2.261 s against a video 2.000 s, so segment N of the separate CMAF audio
+  and video renditions starts up to about 300 ms apart. This is the likely
+  cause of VLC 3's live-start "PCR is called too late" clock reset and of the
+  "no reference clock" decoder-error pair that `TestM3VLCClass` tolerates on
+  HLS fMP4 and DASH (up to one pair per reset, at most four per VLC process).
+  Remove the tolerance when it lands.
+- **DASH MPD stays `type="dynamic"` after the stream ends** (pre-existing;
+  M3a). Players keep polling an MPD that will not change.
+- **VLC 3 stops at any fMP4 HLS discontinuity**, not only at gaps: every
+  failover ends playback (`Failed to create demuxer (nil) MP4`, then end of
+  input). Reproduced with an ffmpeg-made playlist carrying one
+  `EXT-X-DISCONTINUITY` (VLC 3.0.20), so it is a VLC defect, not ours. The
+  docs should recommend HLS TS for VLC 3 users.
 
 ### Carried from M1
 
