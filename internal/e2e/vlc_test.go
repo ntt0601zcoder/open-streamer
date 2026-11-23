@@ -59,9 +59,9 @@ import (
 // rows, VLC 3.0.20 intermittently resets its clock at the live start and
 // then logs two decoder errors ("Timestamp conversion failed for N: no
 // reference clock", "Could not convert timestamp 0 for FFmpeg"), whether
-// or not the machine is loaded; ruling R-T7c' tolerates that pair once per
-// VLC process on those rows, only right after the process's first clock
-// reset (vlcBadLines). Any other decoder error fails.
+// or not the machine is loaded, sometimes after several resets; ruling
+// R-T7c” tolerates on those rows one such pair right after each reset, at
+// most 4 per VLC process (vlcBadLines). Any other decoder error fails.
 //
 // http-ts- and srt-audio-only-stretch (A/V, then 6 s of audio only, then
 // A/V) check that audio is decoded through the stretch, while the TS
@@ -620,16 +620,22 @@ func isPCRLate(msg string) bool {
 	return err == nil
 }
 
+// vlcMaxTolerated bounds the start-up pairs tolerated per VLC process: VLC
+// 3.0.20 was seen to reset its clock up to 4 times in its first seconds.
+const vlcMaxTolerated = 4
+
 // vlcBadLines returns the lines of one VLC process's log that fail the
 // log rule (that contain "decoder error" or "cannot", case-insensitively),
-// and whether it tolerated the start-up pair. When tolerate is set, ruling
-// R-T7c' tolerates the pair vlcNoClock…vlcNoClockEnd, vlcNoConvert once
-// per process, as consecutive messages right after the process's live-start
-// clock reset: the messages before it are vlcPCRLate, vlcPCRReset and at
-// most one vlcFirstPicture, and that vlcPCRReset is the first in the log. A
-// second pair, a pair after a later reset, or a pair anywhere else is bad
-// like any other error.
-func vlcBadLines(log string, tolerate bool) (bad []string, tolerated bool) {
+// and how many start-up pairs it tolerated. When tolerate is set, ruling
+// R-T7c” tolerates the pair vlcNoClock…vlcNoClockEnd, vlcNoConvert, as
+// consecutive messages, right after each of the process's live-start clock
+// resets: the messages before the pair are vlcPCRLate, vlcPCRReset and at
+// most one vlcFirstPicture, so one pair per reset, and at most
+// vlcMaxTolerated pairs. VLC logs nothing when it answers rc's stats, and
+// its log and the rc output are separate streams, so no start-up window
+// bounds the pairs beyond that count. A pair without its own reset, a
+// second pair after one reset, a fifth pair, or any other error is bad.
+func vlcBadLines(log string, tolerate bool) (bad []string, tolerated int) {
 	es := vlcEntries(log)
 	var msgs []int // indexes of the messages in es
 	for i, e := range es {
@@ -644,20 +650,16 @@ func vlcBadLines(log string, tolerate bool) (bad []string, tolerated bool) {
 		return es[msgs[k]].msg
 	}
 	skip := map[int]bool{}
-	resets := 0 // vlcPCRReset messages before k
 	for k := range msgs {
-		if at(k) == vlcPCRReset {
-			resets++
-		}
-		if !tolerate || tolerated || !isNoClock(at(k)) || at(k+1) != vlcNoConvert {
+		if !tolerate || tolerated >= vlcMaxTolerated || !isNoClock(at(k)) || at(k+1) != vlcNoConvert {
 			continue
 		}
 		j := k - 1
 		if at(j) == vlcFirstPicture {
 			j--
 		}
-		if resets == 1 && at(j) == vlcPCRReset && isPCRLate(at(j-1)) {
-			tolerated = true
+		if at(j) == vlcPCRReset && isPCRLate(at(j-1)) {
+			tolerated++
 			skip[msgs[k]], skip[msgs[k+1]] = true, true
 		}
 	}
@@ -677,8 +679,8 @@ func checkVLCLog(t *testing.T, name, log string, tolerate bool) {
 	t.Helper()
 	assert.Contains(t, log, "successfully opened", "%s: the input opened", name)
 	bad, tolerated := vlcBadLines(log, tolerate)
-	if tolerated {
-		t.Logf("%s: tolerated VLC's start-up pair after its first clock reset (ruling R-T7c')", name)
+	if tolerated > 0 {
+		t.Logf("%s: tolerated %d of VLC's start-up pairs, each after its own clock reset (ruling R-T7c'')", name, tolerated)
 	}
 	if !assert.Empty(t, bad, "%s: decoder errors", name) {
 		t.Logf("%s: clock lines of the log:\n%s", name, strings.Join(vlcLogLines(log, "es_out_reset_pcr", "called too late"), "\n"))
@@ -771,8 +773,9 @@ type vlcPair struct {
 	disp, dump *vlcProc
 	file       string
 	started    time.Time
-	// tolerate allows each instance one start-up pair after its first
-	// clock reset (ruling R-T7c'): set on the HLS fMP4 and DASH rows only.
+	// tolerate allows each instance a start-up pair after each of its
+	// clock resets, at most vlcMaxTolerated (ruling R-T7c''): set on the
+	// HLS fMP4 and DASH rows only.
 	tolerate bool
 }
 
@@ -907,11 +910,13 @@ func testVLCAudioOnlyStretch(t *testing.T, srt bool) {
 	t.Logf("hub %s; conform %s; violations %v", kindCounts(r.col.frames), kindCounts(c.Frames), c.Violations)
 }
 
-// TestVLCLogTolerance checks the matcher of ruling R-T7c' on log excerpts
-// shaped like VLC 3.0.20's, one log per VLC process: the start-up pair is
-// tolerated once per process, right after its first clock reset, on a row
-// that allows it; twice, after a later reset, without the reset, on
-// another row, or with another error, the log fails.
+// TestVLCLogTolerance checks the matcher of ruling R-T7c” on log excerpts
+// shaped like VLC 3.0.20's, one log per VLC process: a start-up pair is
+// tolerated right after each clock reset, at most 4 per process, on a row
+// that allows it; a pair without its own reset, two pairs after one reset,
+// a fifth pair, a pair on another row, or another error fails the log.
+// VLC logs no marker for rc's stats answer, so no start-up window is
+// checked.
 func TestVLCLogTolerance(t *testing.T) {
 	t.Parallel()
 	const (
@@ -926,7 +931,9 @@ func TestVLCLogTolerance(t *testing.T) {
 		other   = "[00007aa75c0f0380] main decoder error: buffer deadlock prevented"
 		cannot  = "[00007aa75c0f0380] main stream error: cannot pre fill buffer"
 	)
+	lateAt := func(ms string) string { return strings.Replace(late, "1000 ms", ms+" ms", 1) }
 	startup := []string{late, reset, picture, noClock, convert}
+	pair := []string{noClock, convert}
 	join := func(parts ...[]string) string {
 		var all []string
 		for _, p := range parts {
@@ -934,27 +941,43 @@ func TestVLCLogTolerance(t *testing.T) {
 		}
 		return strings.Join(all, "\n")
 	}
+	// The four resets of the failing hls-fmp4 run (task 7 report, section
+	// 12), with pairs after resets 1 and 3.
+	fourResets := join(
+		[]string{opened, late, reset, picture}, pair, []string{segment},
+		[]string{lateAt("1029"), reset, segment},
+		[]string{lateAt("1064"), reset}, pair, []string{segment},
+		[]string{lateAt("1071"), reset, segment},
+	)
+	fivePairs := make([][]string, 0, 15)
+	for range 5 {
+		fivePairs = append(fivePairs, []string{late, reset}, pair, []string{segment})
+	}
 	for _, tc := range []struct {
 		name      string
 		log       string
 		tolerate  bool
 		bad       int
-		tolerated bool
+		tolerated int
 	}{
-		{"clean", join([]string{opened, segment, header}), true, 0, false},
-		{"after the reset", join([]string{opened, segment}, startup, []string{segment}), true, 0, true},
-		{"reset without first picture", join([]string{opened, late, reset, noClock, convert}), true, 0, true},
-		{"pcr-late line with another delay", join([]string{opened, strings.Replace(late, "1000 ms", "2033 ms", 1), reset, picture, noClock, convert}), true, 0, true},
-		{"two pairs on one process", join([]string{opened}, startup, []string{segment}, startup), true, 2, true},
-		{"pair after a second reset", join([]string{opened, late, reset, segment}, startup), true, 2, false},
-		{"without the reset", join([]string{opened, segment, picture, noClock, convert}), true, 2, false},
-		{"reset without the pcr-late line", join([]string{opened, segment, reset, picture, noClock, convert}), true, 2, false},
-		{"a message between the reset and the pair", join([]string{opened, late, reset, segment, noClock, convert}), true, 2, false},
-		{"a message inside the pair", join([]string{opened, late, reset, picture, noClock, segment, convert}), true, 2, false},
-		{"half the pair", join([]string{opened, late, reset, picture, noClock}), true, 1, false},
-		{"another row", join([]string{opened}, startup), false, 2, false},
-		{"with another error", join([]string{opened}, startup, []string{other}), true, 1, true},
-		{"with a cannot line", join([]string{opened}, startup, []string{cannot}), true, 1, true},
+		{"clean", join([]string{opened, segment, header}), true, 0, 0},
+		{"after the reset", join([]string{opened, segment}, startup, []string{segment}), true, 0, 1},
+		{"reset without first picture", join([]string{opened, late, reset}, pair), true, 0, 1},
+		{"pcr-late line with another delay", join([]string{opened, lateAt("2033"), reset, picture}, pair), true, 0, 1},
+		{"four resets, pairs after 1 and 3", fourResets, true, 0, 2},
+		{"a pair after each of two resets", join([]string{opened}, startup, []string{segment}, startup), true, 0, 2},
+		{"four pairs", join(append([][]string{{opened}}, fivePairs[:12]...)...), true, 0, 4},
+		{"five pairs", join(append([][]string{{opened}}, fivePairs...)...), true, 2, 4},
+		{"two pairs after one reset", join([]string{opened}, startup, []string{segment}, pair), true, 2, 1},
+		{"a pair without its own reset", join([]string{opened}, startup, []string{segment, picture}, pair), true, 2, 1},
+		{"without any reset", join([]string{opened, segment, picture}, pair), true, 2, 0},
+		{"reset without the pcr-late line", join([]string{opened, segment, reset, picture}, pair), true, 2, 0},
+		{"a message between the reset and the pair", join([]string{opened, late, reset, segment}, pair), true, 2, 0},
+		{"a message inside the pair", join([]string{opened, late, reset, picture, noClock, segment, convert}), true, 2, 0},
+		{"half the pair", join([]string{opened, late, reset, picture, noClock}), true, 1, 0},
+		{"another row", join([]string{opened}, startup), false, 2, 0},
+		{"with another error", join([]string{opened}, startup, []string{other}), true, 1, 1},
+		{"with a cannot line", join([]string{opened}, startup, []string{cannot}), true, 1, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -970,7 +993,7 @@ func TestVLCLogTolerance(t *testing.T) {
 		for _, name := range []string{"display", "dump"} {
 			bad, tolerated := vlcBadLines(join([]string{opened, segment}, startup), true)
 			assert.Empty(t, bad, name)
-			assert.True(t, tolerated, name)
+			assert.Equal(t, 1, tolerated, name)
 		}
 	})
 }
