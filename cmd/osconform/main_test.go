@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/datarhei/gosrt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/mux/flv"
 	rtpmux "github.com/ntt0601zcoder/open-streamer/internal/mux/rtp"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
+	"github.com/ntt0601zcoder/open-streamer/internal/output/srtout"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/dash"
@@ -331,5 +333,114 @@ func TestOsconformRTSP(t *testing.T) {
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
 	code, _ = runConform(t, "-url", "rtsp://"+addr+"/live/s", "-timeout", "2s")
+	assert.Equal(t, 2, code)
+}
+
+// srtPlay serves the h264_aac fixture's first GOP on an SRT output as
+// stream "s", and the rest paced once a viewer is subscribed. It returns the
+// listener address.
+func srtPlay(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("../../testdata/fixtures/h264_aac.ts")
+	require.NoError(t, err)
+	d, err := ts.NewDemuxer(bytes.NewReader(b))
+	require.NoError(t, err)
+	c := clock.New(clock.Options{Kinds: d.TrackKinds()})
+	var frames []media.Frame
+	for {
+		f, err := d.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		frames = append(frames, c.Push(f)...)
+	}
+	frames = append(frames, c.Flush()...)
+	split, keys := len(frames), 0
+	for i, f := range frames {
+		if f.Kind() == media.KindVideo && f.Key {
+			if keys++; keys == 2 {
+				split = i
+				break
+			}
+		}
+	}
+	h := hub.New(hub.Options{})
+	srv := srtout.New(func(name string) (*hub.Hub, bool) { return h, name == "s" }, srtout.Options{})
+	require.NoError(t, srv.Listen("127.0.0.1:0"))
+	go func() { _ = srv.Serve() }()
+	for _, f := range frames[:split] {
+		h.Write(f)
+	}
+	go func() {
+		// Feed once the viewer is subscribed, paced by DTS at 4x.
+		for len(h.Stats()) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		start, base := time.Now(), frames[split].DTS
+		for _, f := range frames[split:] {
+			time.Sleep(time.Until(start.Add(time.Duration(float64(f.DTS-base) / media.ClockRate / 4 * float64(time.Second)))))
+			h.Write(f)
+		}
+		h.Close()
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		h.Close()
+	})
+	return srv.Addr().String()
+}
+
+func TestOsconformSRT(t *testing.T) {
+	addr := srtPlay(t)
+	code, out := runConform(t, "-url", "srt://"+addr+"?streamid=live/s&latency=500", "-timeout", "10s")
+	assert.Equal(t, 0, code)
+	assert.Empty(t, out)
+
+	// A refused stream ID.
+	code, _ = runConform(t, "-url", "srt://"+addr+"?streamid=live/nope", "-timeout", "10s")
+	assert.Equal(t, 2, code)
+
+	// A stream with packets missing: continuity gaps.
+	b, err := os.ReadFile("../../testdata/fixtures/h264_aac.ts")
+	require.NoError(t, err)
+	const pkt = 188
+	require.Greater(t, len(b), 110*pkt)
+	b = append(b[:100*pkt:100*pkt], b[103*pkt:]...)
+	cfg := srt.DefaultConfig()
+	ln, err := srt.Listen("srt", "127.0.0.1:0", cfg)
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req, err := ln.Accept2()
+		if err != nil {
+			return
+		}
+		conn, err := req.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for data := b; len(data) > 0; data = data[min(len(data), 1316):] {
+			if _, err := conn.Write(data[:min(len(data), 1316)]); err != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}()
+	code, out = runConform(t, "-url", "srt://"+ln.Addr().String()+"?streamid=x", "-timeout", "10s")
+	ln.Close()
+	<-done
+	assert.Equal(t, 1, code)
+	assert.Contains(t, out, "ts-cc-continuous")
+
+	// Nothing listens.
+	l2, err := srt.Listen("srt", "127.0.0.1:0", srt.DefaultConfig())
+	require.NoError(t, err)
+	dead := l2.Addr().String()
+	l2.Close()
+	code, _ = runConform(t, "-url", "srt://"+dead+"?streamid=x", "-timeout", "1s")
 	assert.Equal(t, 2, code)
 }

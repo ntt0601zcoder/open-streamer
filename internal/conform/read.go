@@ -1202,12 +1202,15 @@ func templateWidth(format string) (int, error) {
 
 // ---- HTTP-TS ----
 
-// ReadTS reads a continuous MPEG-TS stream (HTTP-TS) with one demuxer that
-// follows PMT changes. It stops at EOF, which is a clean end, or once
-// Duration of media (the DTS span) is read; Duration 0 means EOF. Every
-// frame is in epoch 1, and the config and start rules that need signalled
-// epochs are skipped.
+// ReadTS reads a continuous MPEG-TS stream (HTTP-TS, or SRT for an srt://
+// URL, see readSRT) with one demuxer that follows PMT changes. It reads until
+// the stream ends, or until ReadOptions.Duration of media (by DTS) has been
+// captured. The whole stream is one epoch with no signalled start, so
+// the stream is joined mid-epoch: neither config rule applies.
 func ReadTS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
+	if pu, err := url.Parse(u); err == nil && strings.EqualFold(pu.Scheme, "srt") {
+		return readSRT(ctx, pu, opt)
+	}
 	r := newReader(opt)
 	// The request is cancelled when the server stalls for the timeout: the
 	// timer runs until the headers arrive and restarts on every body read.
@@ -1239,8 +1242,24 @@ func ReadTS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	}
 	timer.Reset(r.timeout)
 	body := &stallReader{r: resp.Body, timer: timer, d: r.timeout}
+	return checkTS(ctx, body, opt, false, fail)
+}
+
+// checkTS demuxes a TS byte stream and runs the frame checks. fail wraps a
+// read or demux error with the source and any stall. With strict, the
+// stream's own continuity and start are checked too (RuleTSContinuity,
+// RuleTSStart).
+func checkTS(ctx context.Context, body io.Reader, opt ReadOptions, strict bool, fail func(error) error) (Capture, error) {
+	var sniff *sniffReader
+	if strict {
+		sniff = &sniffReader{r: body}
+		body = sniff
+	}
 	d, err := ts.NewDemuxerWithOptions(body, ts.DemuxOptions{FollowPMT: true})
 	if err != nil {
+		if ctx.Err() != nil {
+			return Capture{}, fmt.Errorf("conform: read: %w", ctx.Err())
+		}
 		return Capture{}, fail(err)
 	}
 	b := newBuilder()
@@ -1269,7 +1288,11 @@ func ReadTS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 			break
 		}
 	}
-	return b.finish(), nil
+	c := b.finish()
+	if strict {
+		c.Violations = append(c.Violations, strictTS(d, sniff, c.Frames)...)
+	}
+	return c, nil
 }
 
 // stallReader restarts timer for d after every read.
