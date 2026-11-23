@@ -1,7 +1,6 @@
 package live
 
 import (
-	"maps"
 	"slices"
 	"time"
 
@@ -22,38 +21,43 @@ import (
 //   - Epochs holds every epoch that has a segment in the window, ascending.
 //     Each epoch's Start and Wall were computed once, when its first segment
 //     was packaged, and never change.
-//   - Three discontinuity views, each with an eviction counter for the
+//   - Two discontinuity views, each with an eviction counter for the
 //     playlist's DISCONTINUITY-SEQUENCE. SegmentInfo.Discontinuity is the
 //     segmenter's flag (epoch change or lost frames); EvictedDiscontinuities
-//     counts it on segments that left the window. SegmentInfo.TSDiscontinuity
-//     is the HLS-TS flag: set on a segment with TS bytes, other than the
-//     first one ever, when it is Discontinuity or a TS segment was dropped
-//     (TS == nil) since the previous segment with TS bytes; it is always
-//     false when TS is nil, and EvictedTSDiscontinuities counts it on
-//     segments that left the window. CMAFPart.Discontinuity is the
-//     per-track flag (see CMAFPart); EvictedTrackDiscontinuities counts it
-//     per track (nil when none).
+//     counts it on segments that left the window. The CMAF track playlists
+//     list one entry per segment and follow this flag, so they all share
+//     EvictedDiscontinuities. SegmentInfo.TSDiscontinuity is the HLS-TS
+//     flag: set on a segment with TS bytes, other than the first one ever,
+//     when it is Discontinuity or a TS segment was dropped (TS == nil) since
+//     the previous segment with TS bytes; it is always false when TS is nil,
+//     and EvictedTSDiscontinuities counts it on segments that left the
+//     window. CMAFPart.Discontinuity is the per-track flag (see CMAFPart),
+//     kept for inspection; no playlist uses it.
+//   - Tracks is the known-tracks set: every track that has had a part since
+//     the stream started, ascending Track, each with its EpochTrack from the
+//     latest epoch it had a part in. It outlives the window, so a rendition
+//     whose window holds no part keeps its codec string and resolution.
 //   - HLS-TS numbering: a segment with TS == nil has no TS entry. Segments
 //     with TS bytes carry TSSeq, which counts them from 0 with no holes, so
 //     the TS playlist's MEDIA-SEQUENCE is the TSSeq of its first entry.
 //
 // Byte slices (SegmentInfo.TS, CMAFPart.Data, EpochTrack.Init) and configs
-// are shared with the packager and must never be modified. Segments, Epochs
-// and the map are the snapshot's own; SegmentInfo.Parts and
+// are shared with the packager and must never be modified. Segments and
+// Epochs are the snapshot's own; Tracks, SegmentInfo.Parts and
 // EpochInfo.Tracks share immutable backing arrays clipped to their length,
 // so appending to them never touches the packager's data.
 type Snapshot struct {
-	Target                      int64     // segment target, 90 kHz ticks
-	Window                      int       // window length in segments
-	Now                         time.Time // the packager's clock when the snapshot was taken
-	AST                         time.Time // wall of the first anchor ever packaged; zero before the first segment
-	Segments                    []SegmentInfo
-	Listed                      int
-	Ended                       bool // the stream ended (Packager.End); Segments is final
-	Epochs                      []EpochInfo
-	EvictedDiscontinuities      uint64
-	EvictedTSDiscontinuities    uint64
-	EvictedTrackDiscontinuities map[int]uint64
+	Target                   int64     // segment target, 90 kHz ticks
+	Window                   int       // window length in segments
+	Now                      time.Time // the packager's clock when the snapshot was taken
+	AST                      time.Time // wall of the first anchor ever packaged; zero before the first segment
+	Segments                 []SegmentInfo
+	Listed                   int
+	Ended                    bool // the stream ended (Packager.End); Segments is final
+	Epochs                   []EpochInfo
+	Tracks                   []EpochTrack
+	EvictedDiscontinuities   uint64
+	EvictedTSDiscontinuities uint64
 }
 
 // SegmentInfo is one packaged segment. The timing fields are the segmenter's
@@ -129,6 +133,16 @@ func (e EpochInfo) Track(track int) (EpochTrack, bool) {
 	return EpochTrack{}, false
 }
 
+// Track returns a known track's latest epoch track.
+func (s Snapshot) Track(track int) (EpochTrack, bool) {
+	for _, t := range s.Tracks {
+		if t.Track == track {
+			return t, true
+		}
+	}
+	return EpochTrack{}, false
+}
+
 // Epoch returns the snapshot's entry for an epoch.
 func (s Snapshot) Epoch(id uint32) (EpochInfo, bool) {
 	for _, e := range s.Epochs {
@@ -151,19 +165,25 @@ func (s Snapshot) IsListed(seg SegmentInfo) bool {
 // under Packager.mu; readers copy it under the same lock. Values it hands
 // out are never modified afterwards: a changed epoch is replaced whole.
 type store struct {
-	ast         time.Time
-	segs        []SegmentInfo
-	epochs      []EpochInfo // ascending Epoch, only epochs with a segment in segs
-	evicted     uint64
-	evictedTS   uint64
-	evictedPart map[int]uint64
-	ended       bool
+	ast       time.Time
+	segs      []SegmentInfo
+	epochs    []EpochInfo  // ascending Epoch, only epochs with a segment in segs
+	known     []EpochTrack // ascending Track: Snapshot.Tracks
+	evicted   uint64
+	evictedTS uint64
+	ended     bool
 }
 
-// add appends a segment and the current state of its epoch, then evicts
-// segments beyond window and epochs left without a segment.
+// add appends a segment and the current state of its epoch, records the
+// epoch tracks of its parts as known, then evicts segments beyond window and
+// epochs left without a segment.
 func (s *store) add(seg SegmentInfo, ep EpochInfo, window int) {
 	s.segs = append(s.segs, seg)
+	for _, part := range seg.Parts {
+		if et, ok := ep.Track(part.Track); ok {
+			s.learn(et)
+		}
+	}
 	i, found := slices.BinarySearchFunc(s.epochs, ep.Epoch, func(e EpochInfo, id uint32) int {
 		switch {
 		case e.Epoch < id:
@@ -191,14 +211,6 @@ func (s *store) add(seg SegmentInfo, ep EpochInfo, window int) {
 		if old.TSDiscontinuity {
 			s.evictedTS++
 		}
-		for _, part := range old.Parts {
-			if part.Discontinuity {
-				if s.evictedPart == nil {
-					s.evictedPart = map[int]uint64{}
-				}
-				s.evictedPart[part.Track]++
-			}
-		}
 	}
 	m := copy(s.segs, s.segs[n:])
 	clear(s.segs[m:])
@@ -208,16 +220,30 @@ func (s *store) add(seg SegmentInfo, ep EpochInfo, window int) {
 	})
 }
 
+// learn records et as its track's latest known epoch track. The slice is
+// replaced, never changed in place, since snapshots share it.
+func (s *store) learn(et EpochTrack) {
+	i, found := slices.BinarySearchFunc(s.known, et.Track, func(k EpochTrack, track int) int { return k.Track - track })
+	known := make([]EpochTrack, len(s.known), len(s.known)+1)
+	copy(known, s.known)
+	if found {
+		known[i] = et
+	} else {
+		known = slices.Insert(known, i, et)
+	}
+	s.known = slices.Clip(known)
+}
+
 // snapshot copies the store. Listed is left for the caller.
 func (s *store) snapshot() Snapshot {
 	return Snapshot{
-		AST:                         s.ast,
-		Ended:                       s.ended,
-		Segments:                    slices.Clone(s.segs),
-		Epochs:                      slices.Clone(s.epochs),
-		EvictedDiscontinuities:      s.evicted,
-		EvictedTSDiscontinuities:    s.evictedTS,
-		EvictedTrackDiscontinuities: maps.Clone(s.evictedPart),
+		AST:                      s.ast,
+		Ended:                    s.ended,
+		Segments:                 slices.Clone(s.segs),
+		Epochs:                   slices.Clone(s.epochs),
+		Tracks:                   s.known,
+		EvictedDiscontinuities:   s.evicted,
+		EvictedTSDiscontinuities: s.evictedTS,
 	}
 }
 

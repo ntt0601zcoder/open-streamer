@@ -82,3 +82,31 @@ func TestParseErrorsQuoteNoLine(t *testing.T) {
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), secret)
 }
+
+// EXT-X-GAP (RFC 8216bis section 4.4.4.7) marks only the segment that
+// follows it.
+func TestParseGap(t *testing.T) {
+	src := "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:4\n" +
+		"#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.000,\n1-0.m4s\n" +
+		"#EXT-X-DISCONTINUITY\n#EXT-X-GAP\n#EXTINF:2.000,\ngap-1-5.m4s\n" +
+		"#EXT-X-GAP\n#EXTINF:1.960,\ngap-1-6.m4s\n" +
+		"#EXTINF:2.000,\n1-1.m4s\n"
+	p, err := ParseMedia([]byte(src))
+	require.NoError(t, err)
+	require.Len(t, p.Segments, 4)
+	assert.False(t, p.Segments[0].Gap)
+	assert.True(t, p.Segments[1].Gap)
+	assert.True(t, p.Segments[1].Discontinuity)
+	assert.True(t, p.Segments[2].Gap)
+	assert.Equal(t, 1960*time.Millisecond, p.Segments[2].Duration)
+	assert.False(t, p.Segments[3].Gap, "the tag applies to one segment")
+	for _, s := range p.Segments {
+		assert.Equal(t, "init.mp4", s.Map)
+	}
+
+	out := p.Encode()
+	assert.Contains(t, string(out), "#EXT-X-DISCONTINUITY\n#EXT-X-GAP\n#EXTINF:2.000,\ngap-1-5.m4s\n")
+	back, err := ParseMedia(out)
+	require.NoError(t, err)
+	assert.Equal(t, p, back)
+}

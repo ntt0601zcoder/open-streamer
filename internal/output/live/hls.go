@@ -44,7 +44,7 @@ func init() {
 			},
 			build: func(p *Packager, s Snapshot, name string) ([]byte, string, bool) {
 				kind, track, _ := parseTrackPlaylist(name)
-				return finish(buildTrackPlaylist(p, s, kind, track, name))
+				return finish(buildTrackPlaylist(p, s, kind, track))
 			},
 		},
 	)
@@ -171,23 +171,34 @@ type trackEntry struct {
 	et   EpochTrack
 }
 
-// trackEntries returns the listed parts of a track, oldest first.
-func trackEntries(s Snapshot, track int) []trackEntry {
+// trackPart returns a track's part in a segment and the track's epoch
+// track; ok is false when the segment has no part of the track or its epoch
+// track has no config.
+func trackPart(s Snapshot, seg SegmentInfo, track int) (trackEntry, bool) {
+	for _, part := range seg.Parts {
+		if part.Track != track {
+			continue
+		}
+		e, ok := s.Epoch(seg.Epoch)
+		if !ok {
+			return trackEntry{}, false
+		}
+		et, ok := e.Track(track)
+		if !ok || et.Config == nil {
+			return trackEntry{}, false
+		}
+		return trackEntry{seg, part, et}, true
+	}
+	return trackEntry{}, false
+}
+
+// trackEntries returns the listed parts of a track of the given kind,
+// oldest first.
+func trackEntries(s Snapshot, track int, kind media.Kind) []trackEntry {
 	var out []trackEntry
 	for _, seg := range s.Segments[:s.Listed] {
-		for _, part := range seg.Parts {
-			if part.Track != track {
-				continue
-			}
-			e, ok := s.Epoch(seg.Epoch)
-			if !ok {
-				continue
-			}
-			et, ok := e.Track(track)
-			if !ok || et.Config == nil {
-				continue
-			}
-			out = append(out, trackEntry{seg, part, et})
+		if e, ok := trackPart(s, seg, track); ok && e.et.Config.Codec.Kind() == kind {
+			out = append(out, e)
 		}
 	}
 	return out
@@ -202,81 +213,139 @@ func partDuration(e trackEntry) time.Duration {
 	return time.Duration((e.part.Timing.Duration*uint64(time.Second) + ts/2) / ts)
 }
 
-// buildTrackPlaylist renders cmaf/v{track}.m3u8 or cmaf/a{track}.m3u8 for a
-// track of the given kind. It returns nil when the track has no listed part.
-//
-// The playlist follows the track's own numbering (MEDIA-SEQUENCE is the N of
-// its first entry) and its own discontinuity flags. Known limitation (M3a):
-// when a track is absent for a whole epoch, no entry carries that epoch's
-// discontinuity, so this playlist's discontinuity count diverges from the
-// other renditions' (RFC 8216 section 6.2.4). No EXT-X-GAP placeholders are
-// written.
-func buildTrackPlaylist(p *Packager, s Snapshot, kind media.Kind, track int, name string) []byte {
-	pl := hls.MediaPlaylist{Version: hlsVersionFMP4, DiscontinuitySequence: s.EvictedTrackDiscontinuities[track]}
-	epochs := map[uint32]bool{}
-	var extinfs []time.Duration
-	for _, e := range trackEntries(s, track) {
-		if e.et.Config.Codec.Kind() != kind {
-			continue
-		}
-		if len(pl.Segments) == 0 {
-			pl.MediaSequence = e.part.N
-		}
-		seg := hls.Segment{
-			URI:           strconv.Itoa(track) + "-" + strconv.FormatUint(e.part.N, 10) + ".m4s",
-			Duration:      partDuration(e),
-			Discontinuity: e.part.Discontinuity,
-			Map:           "init-" + strconv.Itoa(track) + "-" + strconv.FormatUint(uint64(e.seg.Epoch), 10) + ".mp4",
-		}
-		if len(pl.Segments) == 0 || e.part.Discontinuity {
-			first := int64(0)
-			if ts := int64(fmp4.Timescale(e.et.Config)); ts > 0 {
-				first = int64(e.part.Timing.Earliest) * media.ClockRate / ts
-			}
-			seg.ProgramDateTime = pdt(s, e.seg.Epoch, first)
-		}
-		pl.Segments = append(pl.Segments, seg)
-		extinfs = append(extinfs, seg.Duration)
-		epochs[e.seg.Epoch] = true
+// initName returns the URI of a track's init segment in an epoch.
+func initName(track int, epoch uint32) string {
+	return "init-" + strconv.Itoa(track) + "-" + strconv.FormatUint(uint64(epoch), 10) + ".mp4"
+}
+
+// servesTrack reports whether cmaf/{v|a}{track}.m3u8 exists for a track of
+// the given kind: the track is known with that kind, or has a listed part of
+// that kind (a track whose kind changed keeps both playlists while the
+// window shows the old one).
+func servesTrack(s Snapshot, kind media.Kind, track int) bool {
+	if kt, ok := s.Track(track); ok && kt.Config != nil && kt.Config.Codec.Kind() == kind {
+		return true
 	}
-	if len(pl.Segments) == 0 {
+	return len(trackEntries(s, track, kind)) > 0
+}
+
+// cmafTargetDuration returns the EXT-X-TARGETDURATION shared by every CMAF
+// track playlist, computed like the HLS-TS playlist's (see targetDuration)
+// over every listed segment's duration, which is each gap entry's EXTINF,
+// and every listed part's, which is each real entry's. One value for all
+// renditions satisfies RFC 8216 section 6.2.4, and it bounds every EXTINF
+// of every one of them.
+func (p *Packager) cmafTargetDuration(s Snapshot) int {
+	var extinfs []time.Duration
+	for _, seg := range s.Segments[:s.Listed] {
+		extinfs = append(extinfs, media.ToDuration(seg.Duration))
+		for _, part := range seg.Parts {
+			if e, ok := trackPart(s, seg, part.Track); ok {
+				extinfs = append(extinfs, partDuration(e))
+			}
+		}
+	}
+	return p.targetDuration("cmaf", s, extinfs)
+}
+
+// buildTrackPlaylist renders cmaf/v{track}.m3u8 or cmaf/a{track}.m3u8 for a
+// track of the given kind. It returns nil when servesTrack is false.
+//
+// The playlist lists one entry per listed segment, so every rendition has
+// the same media sequence numbers (MEDIA-SEQUENCE is the first segment's
+// Seq) and the same discontinuity sequence numbers (each entry carries its
+// segment's Discontinuity flag; DISCONTINUITY-SEQUENCE is the shared
+// EvictedDiscontinuities), as RFC 8216 section 6.2.4 requires. A segment
+// with the track's part lists it as {track}-{N}.m4s. A segment without one
+// (the track absent from the epoch, lost or failed to mux) lists a gap
+// entry (EXT-X-GAP, RFC 8216bis section 4.4.4.7): EXTINF is the segment's
+// duration and the URI gap-{track}-{Seq}.m4s, which is never served.
+//
+// A gap entry keeps the previous entry's EXT-X-MAP; leading gaps take the
+// first real entry's, and a playlist with no real entry writes none, so
+// every map names an init in the window. Gap entries are never loaded, so
+// their map is never fetched for them. EXT-X-PROGRAM-DATE-TIME is on the
+// first entry and on every discontinuity: a real entry's from its part's
+// earliest presentation time, a gap's from its segment's start.
+func buildTrackPlaylist(p *Packager, s Snapshot, kind media.Kind, track int) []byte {
+	if !servesTrack(s, kind, track) {
 		return nil
 	}
-	pl.TargetDuration = p.targetDuration("cmaf/"+name, s, extinfs)
+	listed := s.Segments[:s.Listed]
+	type slot struct {
+		seg  SegmentInfo
+		e    trackEntry
+		real bool
+	}
+	slots := make([]slot, len(listed))
+	curMap := "" // the first real entry's map, for leading gaps
+	for i, seg := range listed {
+		slots[i].seg = seg
+		if e, ok := trackPart(s, seg, track); ok && e.et.Config.Codec.Kind() == kind {
+			slots[i].e, slots[i].real = e, true
+			if curMap == "" {
+				curMap = initName(track, seg.Epoch)
+			}
+		}
+	}
+	pl := hls.MediaPlaylist{
+		Version:               hlsVersionFMP4,
+		MediaSequence:         listed[0].Seq,
+		DiscontinuitySequence: s.EvictedDiscontinuities,
+	}
+	epochs := map[uint32]bool{}
+	for i, sl := range slots {
+		seg := hls.Segment{Discontinuity: sl.seg.Discontinuity}
+		start := sl.seg.Start
+		if sl.real {
+			curMap = initName(track, sl.seg.Epoch)
+			seg.URI = strconv.Itoa(track) + "-" + strconv.FormatUint(sl.e.part.N, 10) + ".m4s"
+			seg.Duration = partDuration(sl.e)
+			start = 0
+			if ts := int64(fmp4.Timescale(sl.e.et.Config)); ts > 0 {
+				start = int64(sl.e.part.Timing.Earliest) * media.ClockRate / ts
+			}
+		} else {
+			seg.URI = "gap-" + strconv.Itoa(track) + "-" + strconv.FormatUint(sl.seg.Seq, 10) + ".m4s"
+			seg.Duration = media.ToDuration(sl.seg.Duration)
+			seg.Gap = true
+		}
+		seg.Map = curMap
+		if i == 0 || seg.Discontinuity {
+			seg.ProgramDateTime = pdt(s, sl.seg.Epoch, start)
+		}
+		pl.Segments = append(pl.Segments, seg)
+		epochs[sl.seg.Epoch] = true
+	}
+	pl.TargetDuration = p.cmafTargetDuration(s)
 	pl.Independent = independent(s, epochs)
 	pl.Ended = ended(s)
 	return pl.Encode()
 }
 
-// lowestTracks returns the lowest track of each kind with a listed part.
+// lowestTracks returns the lowest known track of each kind (by its latest
+// epoch track), so a rendition whose window holds only gaps stays listed.
 func lowestTracks(s Snapshot) (video, audio int, haveV, haveA bool) {
-	for _, seg := range s.Segments[:s.Listed] {
-		for _, part := range seg.Parts {
-			e, ok := s.Epoch(seg.Epoch)
-			if !ok {
-				continue
+	for _, kt := range s.Tracks { // ascending Track
+		if kt.Config == nil {
+			continue
+		}
+		switch kt.Config.Codec.Kind() {
+		case media.KindVideo:
+			if !haveV {
+				video, haveV = kt.Track, true
 			}
-			et, ok := e.Track(part.Track)
-			if !ok || et.Config == nil {
-				continue
-			}
-			switch et.Config.Codec.Kind() {
-			case media.KindVideo:
-				if !haveV || part.Track < video {
-					video, haveV = part.Track, true
-				}
-			case media.KindAudio:
-				if !haveA || part.Track < audio {
-					audio, haveA = part.Track, true
-				}
+		case media.KindAudio:
+			if !haveA {
+				audio, haveA = kt.Track, true
 			}
 		}
 	}
 	return
 }
 
-// buildMaster renders cmaf/master.m3u8. It returns nil when no track has a
-// listed part.
+// buildMaster renders cmaf/master.m3u8 from the lowest known video and audio
+// tracks. It returns nil when no track is known.
 func buildMaster(s Snapshot) []byte {
 	vTrack, aTrack, haveV, haveA := lowestTracks(s)
 	if !haveV && !haveA {
@@ -287,18 +356,26 @@ func buildMaster(s Snapshot) []byte {
 	epochs := map[uint32]bool{}
 	var codecs []string
 	bandwidth := map[uint64]float64{} // segment Seq -> bits per second summed over the chosen tracks
+	codec := func(et EpochTrack, kind media.Kind) {
+		if c := et.Codec; c != "" && !slices.Contains(codecs, c) {
+			codecs = append(codecs, c)
+		}
+		if kind == media.KindVideo && et.Config.Width*et.Config.Height > v.Width*v.Height {
+			v.Width, v.Height = et.Config.Width, et.Config.Height
+		}
+	}
 	add := func(track int, kind media.Kind) {
-		for _, e := range trackEntries(s, track) {
-			if e.et.Config.Codec.Kind() != kind {
-				continue
+		entries := trackEntries(s, track, kind)
+		if len(entries) == 0 {
+			// Only gaps in the window: the retained codec and resolution.
+			if kt, ok := s.Track(track); ok {
+				codec(kt, kind)
 			}
+			return
+		}
+		for _, e := range entries {
 			epochs[e.seg.Epoch] = true
-			if c := e.et.Codec; c != "" && !slices.Contains(codecs, c) {
-				codecs = append(codecs, c)
-			}
-			if kind == media.KindVideo && e.et.Config.Width*e.et.Config.Height > v.Width*v.Height {
-				v.Width, v.Height = e.et.Config.Width, e.et.Config.Height
-			}
+			codec(e.et, kind)
 			if d := partDuration(e).Seconds(); d > 0 {
 				bandwidth[e.seg.Seq] += float64(len(e.part.Data)) * 8 / d
 			}

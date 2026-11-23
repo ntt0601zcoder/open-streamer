@@ -229,7 +229,7 @@ func TestReadPackagerOutputsClean(t *testing.T) {
 				read func() (Capture, error)
 			}{
 				{"hls-ts", func() (Capture, error) { return ReadHLS(ctx, base+"hls/index.m3u8", once()) }},
-				{"hls-fmp4", func() (Capture, error) { return ReadHLS(ctx, base+"cmaf/master.m3u8", once()) }},
+				{"hls-fmp4", func() (Capture, error) { return ReadHLS(ctx, base+"cmaf/master.m3u8", aligned()) }},
 				{"dash", func() (Capture, error) { return ReadDASH(ctx, base+"cmaf/index.mpd", once()) }},
 			} {
 				c, err := tc.read()
@@ -279,7 +279,7 @@ func TestReadMidEpoch(t *testing.T) {
 		read func() (Capture, error)
 	}{
 		{"hls-ts", func() (Capture, error) { return ReadHLS(ctx, base+"hls/index.m3u8", once()) }},
-		{"hls-fmp4", func() (Capture, error) { return ReadHLS(ctx, base+"cmaf/master.m3u8", once()) }},
+		{"hls-fmp4", func() (Capture, error) { return ReadHLS(ctx, base+"cmaf/master.m3u8", aligned()) }},
 		{"dash", func() (Capture, error) { return ReadDASH(ctx, base+"cmaf/index.mpd", once()) }},
 	} {
 		c, err := tc.read()
@@ -1245,4 +1245,100 @@ func TestReadTimeout(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "stalled")
 	assert.Less(t, time.Since(start), 5*time.Second)
+}
+
+func aligned() ReadOptions { return ReadOptions{Once: true, AlignedSequences: true} }
+
+// TestReadHLSGap reads a master whose audio rendition has gap entries for
+// the video-only epoch 2 of h264_aac_then_640.ts.
+func TestReadHLSGap(t *testing.T) {
+	p := packClip(t, "h264_aac_then_640.ts", 100, farFuture)
+	snap := p.Snapshot()
+	gaps := 0
+	for _, seg := range snap.Segments {
+		if seg.Epoch == 2 {
+			gaps++
+		}
+	}
+	require.Positive(t, gaps)
+	ctx := context.Background()
+
+	// editAudio rewrites the audio playlist; fetched counts gap requests.
+	var mu sync.Mutex
+	fetchedGaps := 0
+	countGaps := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/gap-") {
+				mu.Lock()
+				fetchedGaps++
+				mu.Unlock()
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	editAudio := func(edit func(pl *hls.MediaPlaylist)) string {
+		return serveLive(t, p, func(h http.Handler) http.Handler {
+			return countGaps(rewrite("cmaf/a1.m3u8", func(b []byte, _ int) []byte {
+				pl, err := hls.ParseMedia(b)
+				require.NoError(t, err)
+				edit(&pl)
+				return pl.Encode()
+			})(h))
+		})
+	}
+	firstGap := func(pl *hls.MediaPlaylist) *hls.Segment {
+		for i := range pl.Segments {
+			if pl.Segments[i].Gap {
+				return &pl.Segments[i]
+			}
+		}
+		t.Fatal("no gap entry")
+		return nil
+	}
+
+	t.Run("clean", func(t *testing.T) {
+		base := serveLive(t, p, countGaps)
+		for _, opt := range []ReadOptions{once(), aligned()} {
+			c, err := ReadHLS(ctx, base+"cmaf/master.m3u8", opt)
+			require.NoError(t, err)
+			assert.Empty(t, c.Violations)
+			assert.Equal(t, gaps, c.HLSGaps)
+			assert.NotZero(t, countKind(c.Frames, media.KindAudio))
+		}
+		assert.Zero(t, fetchedGaps, "gap entries are never fetched")
+	})
+	t.Run("gap duration", func(t *testing.T) {
+		base := editAudio(func(pl *hls.MediaPlaylist) { firstGap(pl).Duration += 500 * time.Millisecond })
+		c, err := ReadHLS(ctx, base+"cmaf/master.m3u8", aligned())
+		require.NoError(t, err)
+		assert.Equal(t, []string{RuleGapDuration}, rules(c.Violations))
+		require.Len(t, c.Violations, 1)
+		// Without aligned sequences the same segment cannot be found.
+		c, err = ReadHLS(ctx, base+"cmaf/master.m3u8", once())
+		require.NoError(t, err)
+		assert.Empty(t, c.Violations)
+	})
+	t.Run("media sequence", func(t *testing.T) {
+		base := editAudio(func(pl *hls.MediaPlaylist) { pl.MediaSequence += 3 })
+		c, err := ReadHLS(ctx, base+"cmaf/master.m3u8", aligned())
+		require.NoError(t, err)
+		assert.Equal(t, []string{RuleRenditionSequence}, rules(c.Violations))
+		require.Len(t, c.Violations, 1)
+		c, err = ReadHLS(ctx, base+"cmaf/master.m3u8", once())
+		require.NoError(t, err)
+		assert.Empty(t, c.Violations, "other servers may number renditions independently")
+	})
+	t.Run("discontinuity count", func(t *testing.T) {
+		base := editAudio(func(pl *hls.MediaPlaylist) {
+			g := firstGap(pl)
+			require.True(t, g.Discontinuity)
+			g.Discontinuity = false
+		})
+		for _, opt := range []ReadOptions{once(), aligned()} {
+			c, err := ReadHLS(ctx, base+"cmaf/master.m3u8", opt)
+			require.NoError(t, err)
+			assert.Equal(t, []string{RuleRenditionDiscontinuity}, rules(c.Violations), "aligned %v", opt.AlignedSequences)
+			require.Len(t, c.Violations, 1)
+		}
+	})
 }

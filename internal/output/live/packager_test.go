@@ -291,7 +291,6 @@ func TestWindowSlides(t *testing.T) {
 	assert.Equal(t, 2, snap.Listed)
 	// Seq 3 opened epoch 2 and has left the window.
 	assert.EqualValues(t, 1, snap.EvictedDiscontinuities)
-	assert.Equal(t, map[int]uint64{0: 1, 1: 1}, snap.EvictedTrackDiscontinuities)
 	require.Len(t, snap.Epochs, 1)
 	assert.EqualValues(t, 2, snap.Epochs[0].Epoch)
 	for _, s := range snap.Segments {
@@ -1041,4 +1040,27 @@ func TestHandlerCORS(t *testing.T) {
 	assert.Contains(t, rec.Header().Get("Access-Control-Allow-Methods"), "GET")
 	assert.Contains(t, strings.ToLower(rec.Header().Get("Access-Control-Allow-Headers")), "range")
 	assert.Empty(t, rec.Body.Bytes())
+}
+
+// The known tracks keep every track that had a part, with its last epoch
+// track, after its epochs left the window.
+func TestKnownTracks(t *testing.T) {
+	p, _ := packClip(t, "h264_aac_then_640.ts", Options{Window: 1, Now: farFuture})
+	snap := p.Snapshot()
+	require.Len(t, snap.Epochs, 1)
+	require.EqualValues(t, 2, snap.Epochs[0].Epoch)
+	require.Len(t, snap.Tracks, 2)
+	v, a := snap.Tracks[0], snap.Tracks[1]
+	assert.Equal(t, 0, v.Track)
+	assert.Equal(t, 640, v.Config.Width, "the last epoch's config")
+	assert.Equal(t, "avc1.4D401E", v.Codec)
+	assert.NotEmpty(t, v.Init)
+	assert.Equal(t, 1, a.Track)
+	assert.Equal(t, "mp4a.40.2", a.Codec)
+	assert.NotEmpty(t, a.Init)
+	kt, ok := snap.Track(1)
+	require.True(t, ok)
+	assert.Equal(t, a, kt)
+	_, ok = snap.Track(2)
+	assert.False(t, ok)
 }

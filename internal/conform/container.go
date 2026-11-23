@@ -38,6 +38,16 @@ const (
 	// RuleSegmentAvailable: every listed segment (and the init it needs)
 	// answers 200.
 	RuleSegmentAvailable = "segment-available"
+	// RuleRenditionDiscontinuity: the media playlists of an HLS master
+	// agree on discontinuity sequence numbers (RFC 8216 section 6.2.4).
+	RuleRenditionDiscontinuity = "rendition-discontinuity"
+	// RuleRenditionSequence: the media playlists of an HLS master have the
+	// same MEDIA-SEQUENCE (ReadOptions.AlignedSequences only).
+	RuleRenditionSequence = "rendition-sequence"
+	// RuleGapDuration: an HLS gap entry's EXTINF matches the same media
+	// sequence number's EXTINF in the other renditions
+	// (ReadOptions.AlignedSequences only).
+	RuleGapDuration = "gap-duration"
 )
 
 // frameRules are the rules CheckFrames knows.

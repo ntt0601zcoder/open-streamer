@@ -66,6 +66,12 @@ type ReadOptions struct {
 	// Dial, when set, opens ReadRTSP's control connection; tests use it to
 	// interpose on the stream.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// AlignedSequences makes ReadHLS require that the media playlists of a
+	// master number their segments alike: equal MEDIA-SEQUENCE, so one
+	// media sequence number is one segment in every rendition. RFC 8216bis
+	// lets servers number renditions independently, so it is off by
+	// default; set it for servers that promise alignment (ours do).
+	AlignedSequences bool
 }
 
 const defaultTimeout = 30 * time.Second
@@ -80,6 +86,9 @@ type Capture struct {
 	RTPLost uint64
 	// ByeTracks counts the tracks that sent an RTCP BYE (ReadRTSP only).
 	ByeTracks int
+	// HLSGaps counts the EXT-X-GAP entries ReadHLS saw, once per playlist
+	// and media sequence number. Gap entries are never fetched.
+	HLSGaps int
 }
 
 // reader is the HTTP side shared by the readers.
@@ -188,9 +197,35 @@ type hlsPlaylist struct {
 	records  []tsRecord
 }
 
+// hlsEntry is what the gap-duration rule needs from one media playlist
+// entry, by media sequence number.
+type hlsEntry struct {
+	src    string // playlist
+	url    string
+	gap    bool
+	extinf int64 // ticks
+	tol    int64 // ticks: one frame of a real entry's track; 0 for a gap
+}
+
+// hlsRead is one media playlist read in a pass.
+type hlsRead struct {
+	pl *hlsPlaylist
+	p  hls.MediaPlaylist
+}
+
+// alignTries bounds the back-to-back reads of a master's playlists that
+// disagree before the disagreement is a violation: a playlist update
+// between two reads is a race, not a fault.
+const alignTries = 3
+
+// gapTolerance is the gap-duration tolerance between two gap entries:
+// EXTINF prints milliseconds.
+const gapTolerance = media.ClockRate / 1000
+
 // hlsCapture is the state of one ReadHLS.
 type hlsCapture struct {
 	r        reader
+	opt      ReadOptions
 	b        *builder
 	lists    []*hlsPlaylist
 	byURL    map[string]*hlsPlaylist
@@ -200,6 +235,11 @@ type hlsCapture struct {
 	dec      mpegts.TimeDecoder
 	codecs   []string // union of the CODECS of every master read
 	master   bool
+	gaps     int
+	entries  map[uint64][]hlsEntry // by media sequence number; AlignedSequences only
+	// misaligned: the renditions' media sequence numbers disagreed, so
+	// entries cannot be matched by number.
+	misaligned bool
 }
 
 // ReadHLS reads an HLS master or media playlist, with TS or fMP4 segments,
@@ -219,14 +259,25 @@ type hlsCapture struct {
 // window they showed; if that read fails the union collected so far is
 // kept.
 //
-// Accepted limitations, not flagged: a track absent for a whole epoch has
-// no entry carrying that epoch's discontinuity, so its playlist's epoch
-// count can diverge from the other renditions' (R4). TS tracks are keyed by
-// PID, so they keep their capture track across segments.
+// A master's playlists are read back to back on every pass and must agree
+// (RFC 8216 section 6.2.4), or they are read again, up to alignTries times
+// in all: the discontinuity sequence number of their last entries must be
+// equal (RuleRenditionDiscontinuity); with AlignedSequences, MEDIA-SEQUENCE
+// must be equal (RuleRenditionSequence) and so must the discontinuity
+// sequence number of every media sequence number they share.
+//
+// Gap entries (EXT-X-GAP) are counted in HLSGaps and never fetched; their
+// discontinuities count like any entry's. With AlignedSequences, a gap
+// entry's EXTINF must match the EXTINF of the same media sequence number
+// in every other playlist, within one frame of a real entry's track (1 ms
+// against another gap): RuleGapDuration.
+//
+// TS tracks are keyed by PID, so they keep their capture track across
+// segments.
 func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	c := &hlsCapture{
-		r: newReader(opt), b: newBuilder(), byURL: map[string]*hlsPlaylist{},
-		inits: map[string]fmp4Init{}, badInits: map[string]bool{},
+		r: newReader(opt), opt: opt, b: newBuilder(), byURL: map[string]*hlsPlaylist{},
+		inits: map[string]fmp4Init{}, badInits: map[string]bool{}, entries: map[uint64][]hlsEntry{},
 	}
 	body, err := c.r.getOK(ctx, u)
 	if err != nil {
@@ -247,17 +298,12 @@ func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 				return Capture{}, err
 			}
 		}
-		for _, pl := range c.lists {
-			if pl.ended || (c.master && !c.active[pl.url]) {
-				continue
-			}
-			b := body
-			if c.master || pass > 0 {
-				if b, err = c.r.getOK(ctx, pl.url); err != nil {
-					return Capture{}, err
-				}
-			}
-			if err := c.poll(ctx, pl, b); err != nil {
+		reads, err := c.readPlaylists(ctx, body, pass)
+		if err != nil {
+			return Capture{}, err
+		}
+		for _, rd := range reads {
+			if err := c.poll(ctx, rd.pl, rd.p); err != nil {
 				return Capture{}, err
 			}
 		}
@@ -269,13 +315,172 @@ func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 		}
 	}
 	c.checkTSExtinf()
+	c.checkGaps()
 	if c.master {
 		if !opt.Once {
 			c.finalMaster(ctx, u)
 		}
 		c.b.checkMasterCodecs(c.codecs)
 	}
-	return c.b.finish(), nil
+	out := c.b.finish()
+	out.HLSGaps = c.gaps
+	return out, nil
+}
+
+// readPlaylists reads the media playlists of one pass. Without a master it
+// is the one playlist (body on the first pass). With one, it reads every
+// active playlist that has not ended, back to back, and checks that they
+// agree, reading them again on a disagreement; one that persists is a
+// violation, reported once per rule.
+func (c *hlsCapture) readPlaylists(ctx context.Context, body []byte, pass int) ([]hlsRead, error) {
+	if !c.master {
+		pl := c.lists[0]
+		if pl.ended {
+			return nil, nil
+		}
+		if pass > 0 {
+			var err error
+			if body, err = c.r.getOK(ctx, pl.url); err != nil {
+				return nil, err
+			}
+		}
+		p, err := parseMedia(pl, body)
+		if err != nil {
+			return nil, err
+		}
+		return []hlsRead{{pl, p}}, nil
+	}
+	for try := 1; ; try++ {
+		var reads []hlsRead
+		for _, pl := range c.lists {
+			if pl.ended || !c.active[pl.url] {
+				continue
+			}
+			b, err := c.r.getOK(ctx, pl.url)
+			if err != nil {
+				return nil, err
+			}
+			p, err := parseMedia(pl, b)
+			if err != nil {
+				return nil, err
+			}
+			reads = append(reads, hlsRead{pl, p})
+		}
+		rule, detail := c.disagreement(reads)
+		if rule == "" {
+			return reads, nil
+		}
+		if try == alignTries {
+			if rule == RuleRenditionSequence {
+				c.misaligned = true
+			}
+			c.b.once("align:"+rule, rule, -1, "%s", detail)
+			return reads, nil
+		}
+	}
+}
+
+func parseMedia(pl *hlsPlaylist, body []byte) (hls.MediaPlaylist, error) {
+	p, err := hls.ParseMedia(body)
+	if err != nil {
+		return p, fmt.Errorf("conform: read: %s: %w", pl.url, err)
+	}
+	return p, nil
+}
+
+// discSeq returns the discontinuity sequence number of each entry of p.
+func discSeq(p hls.MediaPlaylist) []uint64 {
+	out := make([]uint64, len(p.Segments))
+	d := p.DiscontinuitySequence
+	for i, s := range p.Segments {
+		if s.Discontinuity {
+			d++
+		}
+		out[i] = d
+	}
+	return out
+}
+
+// disagreement returns the rule the playlists of one pass break by
+// disagreeing, and a detail; rule is "" when they agree.
+func (c *hlsCapture) disagreement(reads []hlsRead) (rule, detail string) {
+	if len(reads) < 2 {
+		return "", ""
+	}
+	ref := reads[0]
+	refD := discSeq(ref.p)
+	if !c.opt.AlignedSequences {
+		end := func(p hls.MediaPlaylist, d []uint64) uint64 {
+			if len(d) == 0 {
+				return p.DiscontinuitySequence
+			}
+			return d[len(d)-1]
+		}
+		for _, rd := range reads[1:] {
+			if a, b := end(ref.p, refD), end(rd.p, discSeq(rd.p)); a != b {
+				return RuleRenditionDiscontinuity, fmt.Sprintf("last entry: discontinuity sequence %d in %s, %d in %s",
+					a, ref.pl.url, b, rd.pl.url)
+			}
+		}
+		return "", ""
+	}
+	for _, rd := range reads[1:] {
+		if rd.p.MediaSequence != ref.p.MediaSequence {
+			return RuleRenditionSequence, fmt.Sprintf("MEDIA-SEQUENCE %d in %s, %d in %s",
+				ref.p.MediaSequence, ref.pl.url, rd.p.MediaSequence, rd.pl.url)
+		}
+	}
+	for _, rd := range reads[1:] {
+		for i, d := range discSeq(rd.p) {
+			if i < len(refD) && refD[i] != d {
+				return RuleRenditionDiscontinuity, fmt.Sprintf("media sequence %d: discontinuity sequence %d in %s, %d in %s",
+					rd.p.MediaSequence+uint64(i), refD[i], ref.pl.url, d, rd.pl.url)
+			}
+		}
+	}
+	return "", ""
+}
+
+// entry records one entry for the gap-duration rule.
+func (c *hlsCapture) entry(msn uint64, e hlsEntry) {
+	if c.opt.AlignedSequences {
+		c.entries[msn] = append(c.entries[msn], e)
+	}
+}
+
+// checkGaps applies RuleGapDuration: with aligned sequences, each gap
+// entry's EXTINF matches the other playlists' entries of its media sequence
+// number.
+func (c *hlsCapture) checkGaps() {
+	if !c.opt.AlignedSequences || c.misaligned {
+		return
+	}
+	msns := make([]uint64, 0, len(c.entries))
+	for msn := range c.entries {
+		msns = append(msns, msn)
+	}
+	slices.Sort(msns)
+	for _, msn := range msns {
+		es := c.entries[msn]
+		for _, g := range es {
+			if !g.gap {
+				continue
+			}
+			for _, o := range es {
+				if o.src == g.src {
+					continue
+				}
+				tol := o.tol
+				if o.gap {
+					tol = gapTolerance
+				}
+				if d := g.extinf - o.extinf; d > tol || -d > tol {
+					c.b.once("gap:"+g.url, RuleGapDuration, -1, "%s: EXTINF %d ticks, %s EXTINF %d ticks (tolerance %d)",
+						g.url, g.extinf, o.url, o.extinf, tol)
+				}
+			}
+		}
+	}
 }
 
 // finalMaster reads the master once more after the last playlist poll: the
@@ -347,12 +552,8 @@ func (c *hlsCapture) done(d time.Duration) bool {
 }
 
 // poll handles one refresh of a media playlist: it fetches every segment not
-// fetched yet.
-func (c *hlsCapture) poll(ctx context.Context, pl *hlsPlaylist, body []byte) error {
-	p, err := hls.ParseMedia(body)
-	if err != nil {
-		return fmt.Errorf("conform: read: %s: %w", pl.url, err)
-	}
+// fetched yet, and counts the gap entries instead of fetching them.
+func (c *hlsCapture) poll(ctx context.Context, pl *hlsPlaylist, p hls.MediaPlaylist) error {
 	pl.target = time.Duration(p.TargetDuration) * time.Second
 	pl.ended = p.Ended
 	// DISCONTINUITY-SEQUENCE counts the discontinuities before the first
@@ -379,6 +580,15 @@ func (c *hlsCapture) poll(ctx context.Context, pl *hlsPlaylist, body []byte) err
 			pl.polled = true
 		}
 		pl.next = msn + 1
+		if s.Gap {
+			u, err := resolve(pl.url, s.URI)
+			if err != nil {
+				return err
+			}
+			c.gaps++
+			c.entry(msn, hlsEntry{src: pl.src, url: u, gap: true, extinf: media.FromDuration(s.Duration)})
+			continue
+		}
 		if err := c.segment(ctx, pl, s, msn, epoch); err != nil {
 			return err
 		}
@@ -415,7 +625,11 @@ func (c *hlsCapture) segment(ctx context.Context, pl *hlsPlaylist, s hls.Segment
 	pl.captured += s.Duration
 	extinf := media.FromDuration(s.Duration)
 	if s.Map == "" {
-		return c.tsSegment(pl, u, body, msn, epoch, s.Discontinuity, extinf)
+		if err := c.tsSegment(pl, u, body, msn, epoch, s.Discontinuity, extinf); err != nil {
+			return err
+		}
+		c.entry(msn, hlsEntry{src: pl.src, url: u, extinf: extinf, tol: pl.records[len(pl.records)-1].frame})
+		return nil
 	}
 	seg, err := parseSegment(body, in)
 	if err != nil {
@@ -427,8 +641,9 @@ func (c *hlsCapture) segment(ctx context.Context, pl *hlsPlaylist, s hls.Segment
 	}
 	c.b.checkSegmentKey(u, seg.frames, 0)
 	ts := int(in.timescale)
-	c.b.checkExtinf(u, track, extinf, media.SampleTime(int64(seg.duration), ts),
-		media.SampleTime(int64(seg.duration)/int64(seg.samples), ts))
+	frame := media.SampleTime(int64(seg.duration)/int64(seg.samples), ts)
+	c.b.checkExtinf(u, track, extinf, media.SampleTime(int64(seg.duration), ts), frame)
+	c.entry(msn, hlsEntry{src: pl.src, url: u, extinf: extinf, tol: frame})
 	for _, f := range seg.frames {
 		c.b.add(f)
 	}

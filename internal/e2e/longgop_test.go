@@ -101,7 +101,7 @@ func TestM3aKeyframesStop(t *testing.T) {
 		case "hls-ts":
 			c, err = conform.ReadHLS(ctx, base+"hls/index.m3u8", once)
 		case "hls-fmp4":
-			c, err = conform.ReadHLS(ctx, base+"cmaf/master.m3u8", once)
+			c, err = conform.ReadHLS(ctx, base+"cmaf/master.m3u8", conform.ReadOptions{Once: true, AlignedSequences: true})
 		case "dash":
 			c, err = conform.ReadDASH(ctx, base+"cmaf/index.mpd", once)
 		}

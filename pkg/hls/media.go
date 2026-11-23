@@ -23,6 +23,9 @@ type Segment struct {
 	// ByteRange is the segment's sub-range of URI (EXT-X-BYTERANGE); nil
 	// means the whole resource.
 	ByteRange *ByteRange
+	// Gap marks the segment as missing (EXT-X-GAP, RFC 8216bis section
+	// 4.4.4.7): clients must not load it.
+	Gap bool
 }
 
 // Key is an EXT-X-KEY: how the segments that follow it are encrypted.
@@ -48,7 +51,8 @@ type MediaPlaylist struct {
 
 // Encode renders the playlist. EXT-X-MAP and EXT-X-KEY are written on the
 // first segment that has one and whenever they differ from the previous
-// segment's; EXT-X-BYTERANGE always carries its offset.
+// segment's; EXT-X-BYTERANGE always carries its offset; EXT-X-GAP is
+// written right before the EXTINF of each gap segment.
 func (p MediaPlaylist) Encode() []byte {
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
@@ -85,6 +89,9 @@ func (p MediaPlaylist) Encode() []byte {
 		if !s.ProgramDateTime.IsZero() {
 			fmt.Fprintf(&b, "#EXT-X-PROGRAM-DATE-TIME:%s\n", s.ProgramDateTime.Format("2006-01-02T15:04:05.000Z07:00"))
 		}
+		if s.Gap {
+			b.WriteString("#EXT-X-GAP\n")
+		}
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\n%s\n", s.Duration.Seconds(), s.URI)
 	}
 	if p.Ended {
@@ -94,7 +101,8 @@ func (p MediaPlaylist) Encode() []byte {
 }
 
 // ParseMedia parses a media playlist. Unknown tags are ignored; EXT-X-MAP and
-// EXT-X-KEY are carried to every following segment. An EXT-X-BYTERANGE
+// EXT-X-KEY are carried to every following segment, EXT-X-GAP applies to the
+// next segment only. An EXT-X-BYTERANGE
 // without an offset starts where the previous range of the same URI ended.
 // Errors never quote playlist text, which may hold signed URIs.
 func ParseMedia(b []byte) (MediaPlaylist, error) {
@@ -147,6 +155,8 @@ func ParseMedia(b []byte) (MediaPlaylist, error) {
 			p.Ended = true
 		case "#EXT-X-DISCONTINUITY":
 			cur.Discontinuity = true
+		case "#EXT-X-GAP":
+			cur.Gap = true
 		case "#EXT-X-PROGRAM-DATE-TIME":
 			cur.ProgramDateTime, err = parseDateTime(val)
 		case "#EXT-X-MAP":
