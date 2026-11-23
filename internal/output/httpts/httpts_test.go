@@ -450,3 +450,23 @@ func TestHTTPTSUnsupportedFirstTrack(t *testing.T) {
 	require.NoError(t, r.err)
 	assert.Empty(t, r.body)
 }
+
+// updateGolden rewrites the golden files: UPDATE_GOLDEN=1 go test -run Golden.
+var updateGolden = os.Getenv("UPDATE_GOLDEN") != ""
+
+// TestHTTPTSGolden pins the exact bytes the handler writes for fixtures.
+func TestHTTPTSGolden(t *testing.T) {
+	for _, name := range []string{"h264_aac", "h265_aac51", "h264_aac_then_640"} {
+		t.Run(name, func(t *testing.T) {
+			r := stream(t, timed(t, name+".ts"))
+			path := "testdata/golden_" + name + ".ts"
+			if updateGolden {
+				require.NoError(t, os.MkdirAll("testdata", 0o755))
+				require.NoError(t, os.WriteFile(path, r.body, 0o644))
+			}
+			want, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.True(t, bytes.Equal(want, r.body), "%s: %d bytes, want %d", name, len(r.body), len(want))
+		})
+	}
+}
