@@ -1,6 +1,6 @@
 # The VLC-class test peers of internal/e2e (TestM3VLCClass), for hosts
 # without them: VLC 3 and GStreamer 1.24 from Ubuntu 24.04, the packages
-# CI's ubuntu-latest installs. testpeer runs it, when OS_PEER_IMAGE names
+# CI's ubuntu-24.04 installs. testpeer runs it, when OS_PEER_IMAGE names
 # it, as a throwaway container on the host network with a non-root user
 # (VLC refuses to run as root):
 #

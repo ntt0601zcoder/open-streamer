@@ -60,7 +60,7 @@ import (
 // then logs two decoder errors ("Timestamp conversion failed for N: no
 // reference clock", "Could not convert timestamp 0 for FFmpeg"), whether
 // or not the machine is loaded, sometimes after several resets; ruling
-// R-T7c” tolerates on those rows one such pair right after each reset, at
+// R-T7c″ tolerates on those rows one such pair right after each reset, at
 // most 4 per VLC process (vlcBadLines). Any other decoder error fails.
 //
 // http-ts- and srt-audio-only-stretch (A/V, then 6 s of audio only, then
@@ -627,7 +627,7 @@ const vlcMaxTolerated = 4
 // vlcBadLines returns the lines of one VLC process's log that fail the
 // log rule (that contain "decoder error" or "cannot", case-insensitively),
 // and how many start-up pairs it tolerated. When tolerate is set, ruling
-// R-T7c” tolerates the pair vlcNoClock…vlcNoClockEnd, vlcNoConvert, as
+// R-T7c″ tolerates the pair vlcNoClock…vlcNoClockEnd, vlcNoConvert, as
 // consecutive messages, right after each of the process's live-start clock
 // resets: the messages before the pair are vlcPCRLate, vlcPCRReset and at
 // most one vlcFirstPicture, so one pair per reset, and at most
@@ -910,7 +910,7 @@ func testVLCAudioOnlyStretch(t *testing.T, srt bool) {
 	t.Logf("hub %s; conform %s; violations %v", kindCounts(r.col.frames), kindCounts(c.Frames), c.Violations)
 }
 
-// TestVLCLogTolerance checks the matcher of ruling R-T7c” on log excerpts
+// TestVLCLogTolerance checks the matcher of ruling R-T7c″ on log excerpts
 // shaped like VLC 3.0.20's, one log per VLC process: a start-up pair is
 // tolerated right after each clock reset, at most 4 per process, on a row
 // that allows it; a pair without its own reset, two pairs after one reset,
