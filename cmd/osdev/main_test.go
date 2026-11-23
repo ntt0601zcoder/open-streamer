@@ -699,3 +699,84 @@ func TestOsdevRTMPPush(t *testing.T) {
 	assert.Contains(t, out, "push rtmp://"+srv.Addr+"/live/sexxxxx?mode=x: stopped, connects 1")
 	assert.NotContains(t, out, key)
 }
+
+func TestOsdevSRTPlayFlags(t *testing.T) {
+	cfg, code := parseArgs([]string{"-stream", "a=" + fixture}, io.Discard)
+	require.NotNil(t, cfg, code)
+	assert.Empty(t, cfg.srtPlay, "off by default")
+	assert.Equal(t, "live", cfg.srtPlayApp)
+	assert.Equal(t, 120*time.Millisecond, cfg.srtLatency)
+
+	cfg, code = parseArgs([]string{"-srt-play", ":19355", "-srt-play-app", "/tv/", "-srt-latency", "300ms", "-stream", "a=" + fixture}, io.Discard)
+	require.NotNil(t, cfg, code)
+	assert.Equal(t, ":19355", cfg.srtPlay)
+	assert.Equal(t, "tv", cfg.srtPlayApp)
+	assert.Equal(t, 300*time.Millisecond, cfg.srtLatency)
+
+	// Another port, or another host, does not collide with a listen input.
+	for _, play := range []string{":19356", "127.0.0.1:19355"} {
+		cfg, code = parseArgs([]string{"-srt-play", play, "-stream", "a=srt://:19355?mode=listener"}, io.Discard)
+		require.NotNil(t, cfg, "%s: %d", play, code)
+	}
+
+	for name, tc := range map[string]struct {
+		args []string
+		flag string
+	}{
+		"no port":        {[]string{"-srt-play", "127.0.0.1", "-stream", "a=" + fixture}, "-srt-play"},
+		"bad port":       {[]string{"-srt-play", ":0", "-stream", "a=" + fixture}, "-srt-play"},
+		"empty app":      {[]string{"-srt-play", ":19355", "-srt-play-app", "/", "-stream", "a=" + fixture}, "-srt-play-app"},
+		"zero latency":   {[]string{"-srt-play", ":19355", "-srt-latency", "0s", "-stream", "a=" + fixture}, "-srt-latency"},
+		"huge latency":   {[]string{"-srt-play", ":19355", "-srt-latency", "70s", "-stream", "a=" + fixture}, "-srt-latency"},
+		"same address":   {[]string{"-srt-play", ":19355", "-stream", "a=srt://:19355?mode=listener"}, "-srt-play"},
+		"wildcard alias": {[]string{"-srt-play", "0.0.0.0:19355", "-stream", "b=" + fixture, "-stream", "a=srt://:19355?mode=listener"}, "-srt-play"},
+		"ipv6 wildcard":  {[]string{"-srt-play", "[::]:19355", "-stream", "a=srt://0.0.0.0:19355?mode=listener"}, "-srt-play"},
+		"same host":      {[]string{"-srt-play", "127.0.0.1:19355", "-stream", "a=srt://127.0.0.1:19355?mode=listener"}, "-srt-play"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var errw strings.Builder
+			cfg, code := parseArgs(tc.args, &errw)
+			assert.Nil(t, cfg)
+			assert.Equal(t, 2, code)
+			assert.Contains(t, errw.String(), tc.flag)
+		})
+	}
+
+	var sb strings.Builder
+	assert.Equal(t, 2, run(context.Background(), nil, io.Discard, &sb))
+	assert.Contains(t, sb.String(), "-srt-play")
+	assert.Contains(t, sb.String(), "-srt-latency")
+	assert.Contains(t, sb.String(), "srt://<host>:9000?streamid=live/<name>")
+}
+
+// Every stream is served to SRT receivers on -srt-play; an unknown name is
+// refused.
+func TestOsdevSRTPlay(t *testing.T) {
+	pc, err := new(net.ListenConfig).ListenPacket(context.Background(), "udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	require.NoError(t, pc.Close())
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	_, stop := startOsdev(t, []string{"-srt-play", addr, "-stream", "demo=" + fixture, "-loop"}, io.Discard)
+	var c srt.Conn
+	require.Eventually(t, func() bool {
+		cfg := srt.DefaultConfig()
+		cfg.StreamId = "#!::r=live/demo,m=request"
+		c, err = srt.Dial("srt", addr, cfg)
+		return err == nil
+	}, 15*time.Second, 100*time.Millisecond)
+	buf := make([]byte, 1500)
+	n, err := c.Read(buf)
+	require.NoError(t, err)
+	require.Positive(t, n)
+	assert.Equal(t, byte(0x47), buf[0])
+	_ = c.Close()
+
+	cfg := srt.DefaultConfig()
+	cfg.StreamId = "live/nope"
+	_, err = srt.Dial("srt", addr, cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "connection rejected")
+	assert.Equal(t, 0, stop())
+}

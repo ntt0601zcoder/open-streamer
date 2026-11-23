@@ -51,6 +51,15 @@
 //	osdev -stream cam=in.ts -loop -rtsp-play :8554 -rtsp-udp
 //	ffplay -rtsp_transport udp rtsp://<host>:8554/live/cam
 //
+// To serve every stream to SRT receivers (ffplay, VLC, ffmpeg), give
+// -srt-play a UDP address, which must not be the address of an SRT listen
+// input; the stream ID names the stream, as <app>/<name> or in the
+// access-control form #!::r=<app>/<name>, where app is -srt-play-app
+// (default live). -srt-latency sets the SRT latency (default 120ms):
+//
+//	osdev -stream cam=in.ts -loop -srt-play :9000
+//	ffplay 'srt://<host>:9000?streamid=live/cam'
+//
 // To push a stream to an RTMP server (a CDN ingest, a restreaming service),
 // give -rtmp-push name=URL, once per target; the URL's query goes to the
 // server as is. A target that fails is retried with a backoff of 1 s to
@@ -68,6 +77,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -87,6 +97,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/output/rtmpplay"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/rtmppush"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/rtspplay"
+	"github.com/ntt0601zcoder/open-streamer/internal/output/srtout"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
@@ -96,6 +107,9 @@ import (
 const (
 	subQueue       = 1024
 	reportInterval = 30 * time.Second
+	// maxSRTLatency is the largest SRT latency: the handshake carries it
+	// in 16-bit milliseconds.
+	maxSRTLatency = 65535 * time.Millisecond
 )
 
 func main() {
@@ -108,6 +122,7 @@ func main() {
 const usageText = `usage: osdev -stream name=URL [-stream ...] [-listen addr] [-layout video,audio] [-loop]
              [-rtmp-play addr [-rtmp-play-app live]] [-rtmp-push name=rtmp://host/app/key ...]
              [-rtsp-play addr [-rtsp-play-app live] [-rtsp-udp]]
+             [-srt-play addr [-srt-play-app live] [-srt-latency 120ms]]
 
 Accept an RTMP publisher (OBS or ffmpeg):
   osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen
@@ -134,6 +149,13 @@ port pair on the -rtsp-play host). The play URL is
 rtsp://<host>:<port>/<app>/<name>, app from -rtsp-play-app (default live):
   osdev -stream cam=in.ts -loop -rtsp-play :8554 -rtsp-udp
   ffplay -rtsp_transport udp rtsp://<host>:8554/live/<name>
+
+Serve every stream to SRT receivers (ffplay, VLC, ffmpeg) with -srt-play, a
+UDP address that is not the address of an SRT listen input. The stream ID
+is <app>/<name> or #!::r=<app>/<name> (percent-encode it in a URL), app
+from -srt-play-app (default live); -srt-latency sets the latency:
+  osdev -stream cam=in.ts -loop -srt-play :9000
+  ffplay 'srt://<host>:9000?streamid=live/<name>'
 
 Push a stream to an RTMP server (repeat -rtmp-push for more targets; the
 URL is shown only redacted, and a failing target is retried):
@@ -262,7 +284,11 @@ type config struct {
 	// sessions.
 	rtspPlay, rtspPlayApp string
 	rtspUDP               bool
-	pushes                []*push // in flag order
+	// srtPlay is the SRT play address, empty when SRT play is off;
+	// srtPlayApp the play app, slashes trimmed; srtLatency the SRT latency.
+	srtPlay, srtPlayApp string
+	srtLatency          time.Duration
+	pushes              []*push // in flag order
 }
 
 // parseLayout parses a comma-separated list of video and audio.
@@ -315,6 +341,9 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	rtspPlay := fs.String("rtsp-play", "", "serve every stream to RTSP players on this address (host:port)")
 	rtspPlayApp := fs.String("rtsp-play-app", "live", "the app of RTSP play URLs: rtsp://host:port/<app>/<name>")
 	rtspUDP := fs.Bool("rtsp-udp", false, "also serve RTSP players over UDP, from one RTP/RTCP port pair on the -rtsp-play host")
+	srtPlay := fs.String("srt-play", "", "serve every stream to SRT receivers on this UDP address (host:port)")
+	srtPlayApp := fs.String("srt-play-app", "live", "the app of SRT stream IDs: <app>/<name> or #!::r=<app>/<name>")
+	srtLatency := fs.Duration("srt-latency", 120*time.Millisecond, "the SRT latency of -srt-play")
 	var streams, pushes streamFlags
 	fs.Var(&streams, "stream", "name=URL (or name=path.ts) to serve; repeat a name to add a lower-priority input")
 	fs.Var(&pushes, "rtmp-push", "name=rtmp://host/app/key: push stream name to an RTMP server; repeatable")
@@ -361,9 +390,25 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 		_, _ = fmt.Fprintln(stderr, "osdev: -rtsp-udp needs -rtsp-play")
 		return nil, 2
 	}
+	srtApp := strings.Trim(*srtPlayApp, "/")
+	if *srtPlay != "" {
+		if err := checkHostPort(*srtPlay); err != nil {
+			_, _ = fmt.Fprintf(stderr, "osdev: -srt-play: %v\n", err)
+			return nil, 2
+		}
+		if srtApp == "" {
+			_, _ = fmt.Fprintln(stderr, "osdev: -srt-play-app: empty app")
+			return nil, 2
+		}
+		if *srtLatency <= 0 || *srtLatency > maxSRTLatency {
+			_, _ = fmt.Fprintf(stderr, "osdev: -srt-latency: %v out of range (0, %v]\n", *srtLatency, maxSRTLatency)
+			return nil, 2
+		}
+	}
 	cfg := &config{
 		listen: *listen, layout: layout, rtmpPlay: *rtmpPlay, rtmpPlayApp: app,
 		rtspPlay: *rtspPlay, rtspPlayApp: rtspApp, rtspUDP: *rtspUDP,
+		srtPlay: *srtPlay, srtPlayApp: srtApp, srtLatency: *srtLatency,
 	}
 	byName := map[string]*source{}
 	for _, s := range streams {
@@ -394,6 +439,10 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	}
 	if err := checkCopyCycles(cfg.sources); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
+		return nil, 2
+	}
+	if err := checkSRTPlayAddr(cfg); err != nil {
+		_, _ = fmt.Fprintf(stderr, "osdev: -srt-play: %v\n", err)
 		return nil, 2
 	}
 	for _, v := range pushes {
@@ -428,6 +477,72 @@ func checkHostPort(addr string) error {
 		return fmt.Errorf("invalid port %q", port)
 	}
 	return nil
+}
+
+// srtAddrKey normalises an SRT host and port for comparison: an unspecified
+// host (empty, 0.0.0.0 or ::) is "", an IP is in canonical form (an
+// IPv4-mapped address unmapped), a name is lower-cased, and the port is
+// decimal.
+func srtAddrKey(host, port string) string {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		ip = ip.Unmap()
+		host = ip.String()
+		if ip.IsUnspecified() {
+			host = ""
+		}
+	} else {
+		host = strings.ToLower(host)
+	}
+	if n, err := strconv.Atoi(port); err == nil {
+		port = strconv.Itoa(n)
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// checkSRTPlayAddr refuses an -srt-play address that equals the address of
+// an SRT listen input: both would bind the same UDP socket. The input URL
+// is not echoed, since it may hold a passphrase.
+func checkSRTPlayAddr(cfg *config) error {
+	if cfg.srtPlay == "" {
+		return nil
+	}
+	host, port, _ := net.SplitHostPort(cfg.srtPlay) // checked by checkHostPort
+	play := srtAddrKey(host, port)
+	for _, s := range cfg.sources {
+		for _, in := range s.inputs {
+			u, err := url.Parse(in)
+			if err != nil || !strings.EqualFold(u.Scheme, "srt") {
+				continue
+			}
+			if spec, err := ingest.Parse(in); err != nil || !spec.Passive {
+				continue
+			}
+			if srtAddrKey(u.Hostname(), u.Port()) == play {
+				return fmt.Errorf("%s is the address of an SRT listen input of stream %s", cfg.srtPlay, s.name)
+			}
+		}
+	}
+	return nil
+}
+
+// startSRT serves every stream to SRT receivers on cfg.srtPlay. It returns
+// once the listener is bound; stop closes the server and waits for it.
+// Serve errors after that go to stderr.
+func startSRT(cfg *config, lookup func(string) (*hub.Hub, bool), stderr io.Writer) (stop func(), err error) {
+	srv := srtout.New(lookup, srtout.Options{App: cfg.srtPlayApp, Latency: cfg.srtLatency})
+	if err := srv.Listen(cfg.srtPlay); err != nil {
+		return nil, err
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if err := srv.Serve(); err != nil && !errors.Is(err, srtout.ErrServerClosed) {
+			_, _ = fmt.Fprintf(stderr, "osdev: -srt-play: %v\n", err)
+		}
+	})
+	return func() {
+		_ = srv.Close()
+		wg.Wait()
+	}, nil
 }
 
 // startRTSP serves every stream to RTSP players on cfg.rtspPlay. It returns
@@ -639,6 +754,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	defer func() { stopRTSP() }() // idempotent; shutdown calls it first
+	stopSRT := func() {}
+	if cfg.srtPlay != "" {
+		//nolint:contextcheck // the server lives until stopSRT, not with ctx
+		stopSRT, err = startSRT(cfg, hubLookup, stderr)
+		if err != nil {
+			stopRTSP()
+			unregisterPlay()
+			_ = ln.Close()
+			_, _ = fmt.Fprintf(stderr, "osdev: -srt-play: %v\n", err)
+			return 2
+		}
+	}
+	defer func() { stopSRT() }() // idempotent; shutdown calls it first
 	addr := ln.Addr().String()
 	_, _ = fmt.Fprintf(stdout, "listening on %s\n", addr)
 	base := "http://" + addr
@@ -666,6 +794,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		for _, s := range order {
 			_, _ = fmt.Fprintf(stdout, "rtsp://%s/%s/%s\n", net.JoinHostPort(host, port), cfg.rtspPlayApp, s.name)
+		}
+	}
+	if cfg.srtPlay != "" {
+		host, port, _ := net.SplitHostPort(cfg.srtPlay)
+		if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
+			host = "127.0.0.1"
+		}
+		for _, s := range order {
+			_, _ = fmt.Fprintf(stdout, "srt://%s?streamid=%s/%s\n", net.JoinHostPort(host, port), cfg.srtPlayApp, s.name)
 		}
 	}
 
@@ -786,6 +923,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	unregisterPlay() // the players got end of stream; this waits for them
 	stopRTSP()       // the RTSP players got their BYEs; this waits for them
+	stopSRT()        // ends the SRT receivers and waits for them
 	sd, done := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer done()
 	if err := srv.Shutdown(sd); err != nil {
