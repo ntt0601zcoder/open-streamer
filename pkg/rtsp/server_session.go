@@ -388,17 +388,22 @@ func (s *ServerSession) writeFailed(err error) error {
 	return err
 }
 
-// Close ends the session: per set-up track it sends, best effort within
-// 500 ms (or the WriteTimeout when shorter), one compound RTCP packet of
-// the track's last sender report (or an empty receiver report) + SDES +
-// BYE on the track's RTCP channel or to the client's RTCP port, then
-// closes the connection; it returns within that budget. Over TCP a writer
-// blocked on the connection's full send buffer is cut short. Over UDP the
-// pair's sockets are shared by every UDP session, so a writer blocked on
-// the pair's full send buffer is not cut (shortening the shared deadline
-// would fail other sessions' writes): Close then skips the BYE and ends
-// the session, and that write returns within the WriteTimeout (default
-// 10 s) without ending anything further. It is idempotent.
+// Close ends the session: per set-up track it sends, best effort, one
+// compound RTCP packet of the track's last sender report (or an empty
+// receiver report) + SDES + BYE on the track's RTCP channel or to the
+// client's RTCP port, then closes the connection.
+//
+// A TCP BYE is bounded by the close budget, 500 ms (or the WriteTimeout when
+// shorter): a writer blocked on the connection's full send buffer is cut
+// short and Close returns within that budget. A UDP BYE uses the normal
+// WriteTimeout, like every other UDP write: the pair's sockets are shared by
+// every UDP session, so a shorter deadline on them would fail other
+// sessions' writes, and UDP sends rarely block (an asynchronous BYE would
+// also race the pair's close). Close can therefore take up to WriteTimeout
+// (default 10 s) while the shared UDP socket is blocked. A UDP writer
+// blocked on the pair's full send buffer is not cut: Close then skips the
+// BYE and ends the session, and that write returns within the WriteTimeout
+// without ending anything further. It is idempotent.
 func (s *ServerSession) Close() {
 	s.closeOnce.Do(func() {
 		if s.Err() != nil {

@@ -358,7 +358,9 @@ func (s *Server) startPlaying(c *serverConn) bool {
 }
 
 // playingReaderBytes is the request buffer of a connection that plays, and
-// the limit of its request header bytes.
+// the limit of its request header bytes. A request header over it after
+// PLAY ending the connection is deliberate: a playing client sends only
+// short keep-alive and teardown requests.
 const playingReaderBytes = 4 << 10
 
 // requestLimits returns the limits of the next request: once the connection
