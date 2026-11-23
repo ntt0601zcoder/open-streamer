@@ -1055,6 +1055,20 @@ func TestRateMeter(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = m.frame(200*3600+20*media.ClockRate, 5000)
 	assert.False(t, ok, "a jump forward is a new timeline too")
+
+	// 6 Mbit/s, then a 3 s gap: the window starts over.
+	m = rateMeter{}
+	for i := range 76 {
+		r, ok = m.frame(int64(i)*3600, 30_000)
+	}
+	require.True(t, ok)
+	assert.InDelta(t, 6e6, r, 1)
+	_, ok = m.frame(75*3600+3*media.ClockRate, 30_000)
+	assert.False(t, ok, "a gap over 1 s starts a new window")
+	_, ok = m.frame(75*3600+4*media.ClockRate, 30_000)
+	assert.False(t, ok, "not covered yet")
+	m.reset()
+	assert.Empty(t, m.samples)
 }
 
 // The writer paces by the bitrate it is told: before it knows one, only
@@ -1118,4 +1132,47 @@ func TestSRTThrottledJoin(t *testing.T) {
 	got := readBack(t, data)
 	assert.Len(t, got, len(frames), "the replay and every frame after it")
 	assert.Zero(t, e.srv.Stats().EndedStalled)
+}
+
+// feedMeter tells w about frames of size bytes every 40 ms over [from, to)
+// seconds of stream time.
+func feedMeter(w *writer, from, to float64, size int) {
+	for t := from; t < to; t += 0.04 {
+		w.Frame(int64(t*media.ClockRate), size)
+	}
+}
+
+// A gap in the stream (an outage, a failover) does not drag the pacing
+// rate below the stream's: the window starts over and the previous rate
+// holds until it is covered again.
+func TestWriterRateAfterGap(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	w := newWriter(ctx, cancel, &fakeConn{}, time.Minute, new(atomic.Uint64))
+	w.Prebuffered(750_000, media.ClockRate)
+	feedMeter(w, 0, 3, 30_000) // 30 kB every 40 ms: 6 Mbit/s
+	want := bucketRate(6e6)
+	require.InDelta(t, want, w.bucket.rate, want*0.01)
+	for i, t0 := 0, 6.0; t0 < 10; i, t0 = i+1, t0+0.04 { // after a 3 s gap
+		w.Frame(int64(t0*media.ClockRate), 30_000)
+		require.InDelta(t, want, w.bucket.rate, want*0.01, "frame %d after the gap", i)
+	}
+}
+
+// Frames the hub skipped for a slow connection (a resync) do not drag the
+// pacing rate down either.
+func TestWriterRateAfterResync(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	w := newWriter(ctx, cancel, &fakeConn{}, time.Minute, new(atomic.Uint64))
+	w.Prebuffered(750_000, media.ClockRate)
+	feedMeter(w, 0, 3, 30_000)
+	want := bucketRate(6e6)
+	require.InDelta(t, want, w.bucket.rate, want*0.01)
+	w.Resync()
+	// 0.8 s skipped, under the 1 s that counts as a gap on its own.
+	for i, t0 := 0, 3.8; t0 < 8; i, t0 = i+1, t0+0.04 {
+		w.Frame(int64(t0*media.ClockRate), 30_000)
+		require.InDelta(t, want, w.bucket.rate, want*0.01, "frame %d after the resync", i)
+	}
 }

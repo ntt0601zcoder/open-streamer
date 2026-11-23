@@ -541,15 +541,18 @@ func TestStreamLateTrack(t *testing.T) {
 
 // recMeter records Meter calls.
 type recMeter struct {
-	pre    [][2]int64 // bytes, span
-	frames int
-	bytes  int
-	last   int64
+	resyncs int
+	pre     [][2]int64 // bytes, span
+	frames  int
+	bytes   int
+	last    int64
 }
 
 func (m *recMeter) Prebuffered(bytes int, span int64) {
 	m.pre = append(m.pre, [2]int64{int64(bytes), span})
 }
+
+func (m *recMeter) Resync() { m.resyncs++ }
 
 func (m *recMeter) Frame(dts int64, bytes int) {
 	m.frames++
@@ -594,4 +597,14 @@ func TestStreamMeter(t *testing.T) {
 	assert.Equal(t, frames[cut].DTS-first, m.pre[0][1])
 	assert.Equal(t, int(st.Frames), m.frames)
 	assert.Equal(t, s.bytes, m.bytes)
+}
+
+// A delivery that reports lost frames tells the Meter.
+func TestStreamMeterResync(t *testing.T) {
+	m := &recMeter{}
+	s := &session{meter: m}
+	require.NoError(t, s.deliver(hub.Delivery{Frame: media.Frame{Track: -1}, Lost: 3}))
+	require.NoError(t, s.deliver(hub.Delivery{Frame: media.Frame{Track: -1}}))
+	assert.Equal(t, 1, m.resyncs)
+	assert.Equal(t, uint64(1), s.stats.Resyncs)
 }

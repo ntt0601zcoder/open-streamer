@@ -32,8 +32,12 @@
 // least 32 packets. R is taken at the join from the payload of the frames
 // buffered before output starts (the hub's cached GOP and what followed
 // it) over their DTS span, then from the TS bytes written over the last 2 s
-// of stream time. On top of the bucket, writes never exceed 256 packets per
-// 5 ms, so that no burst overflows a gosrt receiver's 1024-packet read
+// of stream time; the window starts over after a gap of more than 1 s and
+// after hub loss, and the rate in force holds until it is covered again.
+// Because of the 2 Mbit/s floor, a viewer on a link slower than 2 Mbit/s
+// may still get a join faster than its link carries, and see it corrupt at
+// 120 ms latency. On top of the bucket, writes never exceed 256 packets
+// per 5 ms, so that no burst overflows a gosrt receiver's 1024-packet read
 // queue. A pause only slows this connection's loop; the hub skips frames
 // for it if it falls behind.
 //
@@ -102,8 +106,9 @@ const (
 	// rateWindow is the stream time the bitrate is averaged over.
 	rateWindow = 2 * media.ClockRate
 	// newTimeline is how far a frame's DTS may run back, or ahead, before
-	// the bitrate average starts over.
-	newTimeline = 10 * media.ClockRate
+	// the bitrate average starts over: a gap (an outage, a failover) would
+	// otherwise count as stream time without bytes.
+	newTimeline = media.ClockRate
 	// maxDrain bounds how long a connection that ended cleanly stays open.
 	maxDrain = 5 * time.Second
 	// statsInterval is how often the stall rule samples a connection.
@@ -683,6 +688,12 @@ func (w *writer) Frame(dts int64, bytes int) {
 	}
 }
 
+// Resync starts a new bitrate window after the hub skipped frames for this
+// connection, which would otherwise count as stream time without bytes; the
+// rate in force holds until the window is covered. It implements
+// tsstream.Meter.
+func (w *writer) Resync() { w.meter.reset() }
+
 // setRate paces by a stream bitrate (bit/s, 0 when unknown).
 func (w *writer) setRate(bitrate float64) {
 	now := time.Now()
@@ -856,12 +867,18 @@ func (m *rateMeter) prebuffered(bytes int, span int64) float64 {
 // mpegTSOverhead is the TS packet size over its largest payload.
 const mpegTSOverhead = 188.0 / 184
 
+// reset starts a new window; the caller keeps the last rate until it is
+// covered.
+func (m *rateMeter) reset() {
+	m.samples, m.started = m.samples[:0], false
+}
+
 // frame records n TS bytes at dts and returns the bitrate over the last
 // 2 s of stream time; ok is false until the window is covered. A DTS more
-// than 1 s behind the stream's clock, or 10 s ahead, starts a new window.
+// than 1 s behind or ahead of the stream's clock starts a new window.
 func (m *rateMeter) frame(dts int64, n int) (float64, bool) {
-	if m.started && (dts < m.newest-media.ClockRate || dts > m.newest+newTimeline) {
-		m.samples, m.started = m.samples[:0], false
+	if m.started && (dts < m.newest-newTimeline || dts > m.newest+newTimeline) {
+		m.reset()
 	}
 	if !m.started || dts > m.newest {
 		m.newest, m.started = dts, true

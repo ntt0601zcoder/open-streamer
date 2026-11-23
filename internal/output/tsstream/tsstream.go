@@ -84,10 +84,13 @@ type Options struct {
 // ticks, last minus first) of the deliveries buffered before output starts:
 // the hub's cached GOP and what followed it. Frame is called before each
 // frame's bytes are written, with its DTS and the TS bytes about to be
-// written (tables included).
+// written (tables included). Resync is called for each delivery that
+// reports lost frames: the frames the hub skipped are missing from the
+// bytes that follow.
 type Meter interface {
 	Prebuffered(bytes int, span int64)
 	Frame(dts int64, bytes int)
+	Resync()
 }
 
 // Stats summarises a finished stream.
@@ -279,6 +282,9 @@ func validTrack(i int) bool { return i >= 0 && i < MaxTracks }
 func (s *session) deliver(d hub.Delivery) error {
 	if d.Lost > 0 {
 		s.stats.Resyncs++
+		if s.meter != nil {
+			s.meter.Resync()
+		}
 		if !s.waitKey {
 			s.waitKey, s.waiting = true, false
 		}

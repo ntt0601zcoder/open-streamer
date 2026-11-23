@@ -53,7 +53,8 @@
 //
 // To serve every stream to SRT receivers (ffplay, VLC, ffmpeg), give
 // -srt-play a UDP address, which must not overlap the address of an SRT
-// listen input (the same port, on the same host or either one a wildcard); the stream ID names the stream, as <app>/<name> or in the
+// listen input (the same port, on the same host or either one a
+// wildcard); the stream ID names the stream, as <app>/<name> or in the
 // access-control form #!::r=<app>/<name>, where app is -srt-play-app
 // (default live). -srt-latency sets the SRT latency (default 120ms):
 //
