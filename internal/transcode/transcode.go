@@ -89,7 +89,7 @@ const (
 )
 
 // Video describes a rendition's video: copied from the source, or encoded
-// at Height (width keeps the aspect ratio). BFrames -1 means none, 0 means
+// at Height, which must be even (width keeps the aspect ratio). BFrames -1 means none, 0 means
 // the encoder default (2); at most 3.
 type Video struct {
 	Copy                                         bool
@@ -186,8 +186,21 @@ type ChildStats struct {
 	DroppedTracks, Reanchors, AudioDropped, AudioCorrupt, VideoCorrupt uint64
 }
 
+// max returns the per-counter maximum of s and o.
+func (s ChildStats) max(o ChildStats) ChildStats {
+	return ChildStats{
+		DroppedTracks: max(s.DroppedTracks, o.DroppedTracks),
+		Reanchors:     max(s.Reanchors, o.Reanchors),
+		AudioDropped:  max(s.AudioDropped, o.AudioDropped),
+		AudioCorrupt:  max(s.AudioCorrupt, o.AudioCorrupt),
+		VideoCorrupt:  max(s.VideoCorrupt, o.VideoCorrupt),
+	}
+}
+
 // add adds the rise from prev to cur, per counter, to s. Counters never
-// fall within one child; one that does is ignored.
+// fall within one child; one that does adds nothing, and the reader keeps
+// the per-counter maximum as prev, so the counter adds again only once it
+// is above its old high.
 func (s *ChildStats) add(prev, cur ChildStats) {
 	rise := func(p, c uint64) uint64 {
 		if c < p {
@@ -246,8 +259,10 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 		}
 		v := r.Video
 		switch {
-		case v.Height <= 0:
-			return nil, fmt.Errorf("transcode: new: rendition %q: height %d", r.Name, v.Height)
+		case v.Height <= 0 || v.Height%2 != 0:
+			// YUV 4:2:0 needs an even height: the child would fail at
+			// Configure and respawn forever.
+			return nil, fmt.Errorf("transcode: new: rendition %q: height %d is not positive and even", r.Name, v.Height)
 		case v.BitrateKbps <= 0 || v.MaxBitrateKbps < 0:
 			return nil, fmt.Errorf("transcode: new: rendition %q: bitrate %d, max %d", r.Name, v.BitrateKbps, v.MaxBitrateKbps)
 		case v.BFrames < -1 || v.BFrames > maxBFrames:
@@ -823,7 +838,7 @@ func (t *Transcoder) readChild(c *child) error {
 			}
 			if cur != counted {
 				t.update(func(st *Stats) { st.Child.add(counted, cur) })
-				counted = cur
+				counted = counted.max(cur)
 			}
 		case wire.Error:
 			t.log.Warn("transcode: child error", "pid", c.p.pid, "rung", v.Rung, "fatal", v.Fatal, "msg", v.Message)

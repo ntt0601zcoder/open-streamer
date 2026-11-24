@@ -71,12 +71,13 @@
 //
 // To transcode a stream into a ladder, give -rung name=label:height:kbps
 // once per encoded rendition, or name=label:copy for one that copies the
-// source video; -audio name=copy|aac[:kbps] sets the audio of every
-// rendition of the stream (default aac at 128 kbps). Each rendition is
-// served as its own stream, <name>_<label>, on every output. Encoding runs
-// in the transcoder child, cmd/ostranscoder, whose path -ostranscoder
-// gives (build it with make ostranscoder); a ladder of copies only needs
-// none. Renditions are presented 0.5 s behind the source:
+// source video; -audio name=copy|aac[:kbps], once per stream, sets the
+// audio of every rendition of the stream (default aac at 128 kbps). Each
+// rendition is served as its own stream, <name>_<label>, on every output.
+// Encoding runs in the transcoder child, cmd/ostranscoder, whose path
+// -ostranscoder gives (build it with make ostranscoder). A ladder that only
+// copies, with -audio name=copy (the default audio is AAC), needs none.
+// Renditions are presented 0.5 s behind the source:
 //
 //	osdev -stream cam=in.ts -loop -ostranscoder dist/ostranscoder-amd64/ostranscoder \
 //		-rung cam=720:720:3000 -rung cam=360:360:800 -rung cam=src:copy -audio cam=aac:96
@@ -184,7 +185,8 @@ URL is shown only redacted, and a failing target is retried):
 Transcode a stream into renditions, each served as the stream <name>_<label>
 (-rung per rendition: label:height:kbps encodes, label:copy copies the
 video; -audio sets the audio of every rendition, default aac at 128 kbps;
-encoding needs the transcoder, built with make ostranscoder):
+encoding needs the transcoder, built with make ostranscoder, so a ladder
+without it must copy both video and audio, -audio name=copy):
   osdev -stream cam=in.ts -loop -ostranscoder dist/ostranscoder-amd64/ostranscoder \
     -rung cam=360:360:800 -rung cam=src:copy -audio cam=aac:96
 `
@@ -198,6 +200,7 @@ func (s *streamFlags) Set(v string) error { *s = append(*s, v); return nil }
 type source struct {
 	name     string
 	inputs   []string // input URLs by priority, first highest
+	from     string   // a rendition's stream, which it is transcoded from
 	hub      *hub.Hub
 	pack     *live.Packager
 	pipe     *pipeline.Pipeline
@@ -359,6 +362,8 @@ func parseRung(v string) (stream, label string, video transcode.Video, err error
 	switch {
 	case len(f) == 2 && f[1] == "copy":
 		return stream, label, transcode.Video{Copy: true}, nil
+	case len(f) > 1 && f[1] == "copy":
+		return "", "", video, fmt.Errorf("-rung %q: label:copy takes nothing more", v)
 	case len(f) == 3:
 		height, herr := strconv.Atoi(f[1])
 		kbps, kerr := strconv.Atoi(f[2])
@@ -414,7 +419,7 @@ func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, 
 			order = append(order, stream)
 		}
 		ladders[stream] = append(ladders[stream], transcode.Rendition{Name: name, Video: video})
-		byName[name] = &source{name: name} // reserved; completed below
+		byName[name] = &source{name: name, from: stream} // reserved; completed below
 	}
 	audio := map[string]transcode.Audio{}
 	for _, v := range audios {
@@ -424,6 +429,9 @@ func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, 
 		}
 		if _, ok := ladders[stream]; !ok {
 			return fmt.Errorf("-audio: stream %s has no -rung", stream)
+		}
+		if _, ok := audio[stream]; ok {
+			return fmt.Errorf("-audio: stream %s given twice", stream)
 		}
 		audio[stream] = a
 	}
@@ -601,16 +609,20 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 		}
 		src.inputs = append(src.inputs, input)
 	}
-	if err := checkCopyCycles(cfg.sources); err != nil {
-		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
-		return nil, 2
-	}
 	if err := checkSRTPlayAddr(cfg); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: -srt-play: %v\n", err)
 		return nil, 2
 	}
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	if err := parseLadders(cfg, byName, *ostx, rungs, audios, log); err != nil {
+		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
+		return nil, 2
+	}
+	renditionOf := map[string]string{}
+	for _, r := range cfg.renditions {
+		renditionOf[r.name] = r.from
+	}
+	if err := checkCopyCycles(cfg.sources, renditionOf); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return nil, 2
 	}
@@ -786,44 +798,60 @@ func copyTarget(input string) (string, bool) {
 }
 
 // checkCopyCycles rejects a copy:// input that reads its own stream, directly
-// or through other streams: such a stream would re-ingest its own output.
-func checkCopyCycles(srcs []*source) error {
-	byName := map[string]*source{}
+// or through other streams or renditions: such a stream would re-ingest its
+// own output. renditionOf maps each rendition stream to the stream it is
+// transcoded from, which it reads.
+func checkCopyCycles(srcs []*source, renditionOf map[string]string) error {
+	reads := map[string][]string{} // stream → the streams it reads
+	names := make([]string, 0, len(srcs)+len(renditionOf))
 	for _, s := range srcs {
-		byName[s.name] = s
+		names = append(names, s.name)
+		for _, in := range s.inputs {
+			if t, ok := copyTarget(in); ok {
+				reads[s.name] = append(reads[s.name], t)
+			}
+		}
+	}
+	for r, from := range renditionOf {
+		names = append(names, r)
+		reads[r] = []string{from}
+	}
+	slices.Sort(names[len(srcs):]) // renditions in a stable order
+	known := map[string]bool{}
+	for _, n := range names {
+		known[n] = true
 	}
 	const (
 		visiting = 1
 		done     = 2
 	)
 	state := map[string]int{}
-	var visit func(s *source, path []string) error
-	visit = func(s *source, path []string) error {
-		state[s.name] = visiting
-		path = append(path, s.name)
-		for _, in := range s.inputs {
-			t, ok := copyTarget(in)
-			if !ok || byName[t] == nil {
+	var visit func(name string, path []string) error
+	visit = func(name string, path []string) error {
+		state[name] = visiting
+		path = append(path, name)
+		for _, t := range reads[name] {
+			if !known[t] {
 				continue
 			}
 			switch state[t] {
 			case visiting:
-				if t == s.name {
-					return fmt.Errorf("stream %s: copy://%s reads its own stream", s.name, t)
+				if t == name {
+					return fmt.Errorf("stream %s: copy://%s reads its own stream", name, t)
 				}
 				return fmt.Errorf("copy:// cycle between streams: %s -> %s", strings.Join(path, " -> "), t)
 			case 0:
-				if err := visit(byName[t], path); err != nil {
+				if err := visit(t, path); err != nil {
 					return err
 				}
 			}
 		}
-		state[s.name] = done
+		state[name] = done
 		return nil
 	}
-	for _, s := range srcs {
-		if state[s.name] == 0 {
-			if err := visit(s, nil); err != nil {
+	for _, n := range names {
+		if state[n] == 0 {
+			if err := visit(n, nil); err != nil {
 				return err
 			}
 		}

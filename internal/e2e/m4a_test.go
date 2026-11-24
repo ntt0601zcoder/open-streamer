@@ -661,11 +661,11 @@ func (a *arrivals) get() map[uint32]time.Time {
 // TestM4aRespawn kills the child with SIGKILL mid-stream. The transcoder is
 // fed h264_aac_then_640.ts looped twice at its pace (upstream epochs 1 to
 // 4, the second of each pass video-only at 640x360), and the child is
-// killed 3 s in, inside upstream epoch 1. Every rendition hub gets exactly
-// one new epoch within 5 s of the kill, starting on a keyframe; the later
-// upstream epochs map above it; and each rendition's HLS fMP4, read back,
-// has exactly one discontinuity more than the source's epoch changes, and
-// no violation.
+// killed 1.5 s after the first rendition frame, inside upstream epoch 1.
+// Every rendition hub gets exactly one new epoch within 5 s of the kill,
+// starting on a keyframe; the later upstream epochs map above it; and each
+// rendition's HLS fMP4, read back, has exactly one discontinuity more than
+// the source's epoch changes, and no violation.
 func TestM4aRespawn(t *testing.T) {
 	t.Parallel()
 	bin := testpeer.OSTranscoder(t)
@@ -700,8 +700,18 @@ func TestM4aRespawn(t *testing.T) {
 		src.Close()
 	}()
 
-	// Kill the child 3 s in: mid-GOP, inside upstream epoch 1.
-	time.Sleep(3 * time.Second)
+	// Kill the child 1.5 s after the first rendition frame: mid-GOP, with
+	// K well inside upstream epoch 1 (its last key is at about 5.08 s) even
+	// on a slow runner.
+	require.Eventually(t, func() bool {
+		for _, a := range arr {
+			if len(a.get()) > 0 {
+				return true
+			}
+		}
+		return false
+	}, 30*time.Second, 5*time.Millisecond, "a rendition frame")
+	time.Sleep(1500 * time.Millisecond)
 	pid := tr.Stats().PID
 	require.Positive(t, pid)
 	killed := time.Now()

@@ -20,6 +20,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
+	"github.com/ntt0601zcoder/open-streamer/pkg/h26x"
 )
 
 func TestMain(m *testing.M) {
@@ -160,6 +161,27 @@ func hasIDR(f media.Frame) bool {
 		}
 	}
 	return false
+}
+
+// x264Params carries b-pyramid=none (ruling R-T7b'): with B-frames 2 the
+// output SPS announces a reorder depth of 1, not the B-pyramid's 2, which
+// VLC 3 failed to decode without a "buffer deadlock".
+func TestPipelineNoBPyramid(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	p := newPipeline(t, []Rung{{Height: 120, BitrateKbps: 150, BFrames: 2}}, nil)
+	v := rungFrames(run(t, p, src), 0)
+	require.NotEmpty(t, v)
+	require.NotEmpty(t, v[0].Config.SPS)
+	sps, err := h26x.ParseSPS(h26x.H264, v[0].Config.SPS[0])
+	require.NoError(t, err)
+	assert.Equal(t, 1, sps.ReorderFrames, "max_num_reorder_frames")
+	reordered := 0
+	for _, f := range v {
+		if f.PTS > f.DTS {
+			reordered++
+		}
+	}
+	assert.Positive(t, reordered, "B-frames are still used")
 }
 
 func TestPipelineLadder(t *testing.T) {

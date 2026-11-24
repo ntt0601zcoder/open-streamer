@@ -290,6 +290,12 @@ func TestChildStatsAdd(t *testing.T) {
 	s.add(ChildStats{}, ChildStats{Reanchors: 2, AudioDropped: 10})
 	s.add(ChildStats{Reanchors: 2, AudioDropped: 10}, ChildStats{Reanchors: 3, AudioDropped: 4, VideoCorrupt: 1})
 	assert.Equal(t, ChildStats{Reanchors: 3, AudioDropped: 10, VideoCorrupt: 1}, s, "a falling counter adds nothing")
+	// The reader keeps the per-counter maximum: a counter that fell (10 to
+	// 4) adds again only above 10.
+	prev := ChildStats{Reanchors: 2, AudioDropped: 10}.max(ChildStats{Reanchors: 3, AudioDropped: 4, VideoCorrupt: 1})
+	assert.Equal(t, ChildStats{Reanchors: 3, AudioDropped: 10, VideoCorrupt: 1}, prev)
+	s.add(prev, ChildStats{Reanchors: 3, AudioDropped: 12, VideoCorrupt: 1})
+	assert.Equal(t, ChildStats{Reanchors: 3, AudioDropped: 12, VideoCorrupt: 1}, s)
 }
 
 func TestSupervisorMixedRespawn(t *testing.T) {
@@ -533,6 +539,7 @@ func TestNewRejects(t *testing.T) {
 		"no renditions": {Binary: "x"},
 		"bframes 4":     {Binary: "x", Renditions: []Rendition{{Name: "a", Video: Video{Height: 240, BitrateKbps: 1, BFrames: 4}}}},
 		"no height":     {Binary: "x", Renditions: []Rendition{{Name: "a", Video: Video{BitrateKbps: 1}}}},
+		"odd height":    {Binary: "x", Renditions: []Rendition{{Name: "a", Video: Video{Height: 181, BitrateKbps: 1}}}},
 		"no bitrate":    {Binary: "x", Renditions: []Rendition{{Name: "a", Video: Video{Height: 240}}}},
 		"duplicate":     {Binary: "x", Renditions: []Rendition{copySrc, copySrc}},
 		"no binary":     {Renditions: []Rendition{encode240}},

@@ -380,6 +380,25 @@ func TestOsdevCopyCycles(t *testing.T) {
 	cfg, code := parseArgs([]string{"-stream", "a=" + fixture, "-stream", "b=copy://a", "-stream", "c=copy://b", "-stream", "d=copy://nope"}, io.Discard)
 	require.NotNil(t, cfg, code)
 	assert.Len(t, cfg.sources, 4)
+
+	// A rendition reads its stream: a stream that copies its own rendition,
+	// directly or through another stream, is a cycle.
+	for name, args := range map[string][]string{
+		"own rendition":     {"-stream", "cam=copy://cam_t", "-rung", "cam=t:copy", "-audio", "cam=copy"},
+		"through a stream":  {"-stream", "cam=copy://b", "-stream", "b=copy://cam_t", "-rung", "cam=t:copy", "-audio", "cam=copy"},
+		"failover to rung":  {"-stream", "cam=" + fixture, "-stream", "cam=copy://cam_t", "-rung", "cam=t:copy", "-audio", "cam=copy"},
+		"rendition of rung": {"-stream", "a=" + fixture, "-stream", "b=copy://a_t", "-rung", "a=t:copy", "-rung", "b=u:copy", "-audio", "a=copy", "-audio", "b=copy", "-stream", "a=copy://b_u"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var errw strings.Builder
+			cfg, code := parseArgs(args, &errw)
+			assert.Nil(t, cfg)
+			assert.Equal(t, 2, code)
+			assert.Contains(t, errw.String(), "copy://")
+		})
+	}
+	cfg, code = parseArgs([]string{"-stream", "a=" + fixture, "-stream", "b=copy://a_t", "-rung", "a=t:copy", "-audio", "a=copy"}, io.Discard)
+	require.NotNil(t, cfg, code, "a stream may copy another stream's rendition")
 }
 
 func TestOsdevUnexpectedArgRedacted(t *testing.T) {
@@ -852,6 +871,9 @@ func TestOsdevLadderFlags(t *testing.T) {
 		"bad audio kbps":   {"-stream", "a=" + fixture, "-rung", "a=x:copy", "-audio", "a=aac:0"},
 		"audio no equals":  {"-stream", "a=" + fixture, "-rung", "a=x:copy", "-audio", "copy"},
 		"audio bad stream": {"-stream", "a=" + fixture, "-rung", "a=x:copy", "-audio", "b=copy"},
+		"odd height":       {"-stream", "a=" + fixture, "-ostranscoder", "/bin/true", "-rung", "a=x:241:600"},
+		"copy with kbps":   {"-stream", "a=" + fixture, "-rung", "a=x:copy:300", "-audio", "a=copy"},
+		"audio twice":      {"-stream", "a=" + fixture, "-rung", "a=x:copy", "-audio", "a=copy", "-audio", "a=copy"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var errw strings.Builder
@@ -859,6 +881,7 @@ func TestOsdevLadderFlags(t *testing.T) {
 			assert.Nil(t, cfg)
 			assert.Equal(t, 2, code)
 			assert.NotEmpty(t, errw.String())
+			t.Log(strings.TrimSpace(errw.String()))
 		})
 	}
 }

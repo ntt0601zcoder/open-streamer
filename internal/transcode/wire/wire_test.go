@@ -199,6 +199,21 @@ func TestStatsCounterFieldNumbers(t *testing.T) {
 	}))
 }
 
+// A Stats from a newer child, with fields this reader does not know, still
+// decodes: the unknown fields are skipped.
+func TestStatsUnknownFieldSkipped(t *testing.T) {
+	body := appendUint(nil, 1, 7)
+	body = appendUint(body, 9, 42)
+	body = appendBytes(body, 10, []byte("future"))
+	body = appendUint(body, 5, 3) // a known field after the unknown ones
+	env := appendEnvelope(nil, fStats, body)
+	msg := binary.BigEndian.AppendUint32(nil, uint32(len(env)))
+	msg = append(msg, env...)
+	m, err := NewReader(bytes.NewReader(msg)).Read()
+	require.NoError(t, err)
+	assert.Equal(t, Stats{In: 7, Reanchors: 3}, m)
+}
+
 func TestConfigSentOnce(t *testing.T) {
 	cfg := h264Config(t)
 	f := Frame{Rung: -1, F: media.Frame{Config: cfg, PTS: 1, DTS: 1, Key: true, Data: [][]byte{{0x65, 1}}}}
