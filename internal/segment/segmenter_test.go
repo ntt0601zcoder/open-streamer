@@ -2,10 +2,13 @@ package segment
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -156,6 +159,8 @@ func TestSegmentAnchorChangeAfterAudioSegment(t *testing.T) {
 	}
 	require.Len(t, segs, 1)
 	segs = append(segs, s.Push(vid(1, 100*aDur, true))...)
+	require.Len(t, segs, 1, "the closed audio segment waits for audio to reach the cut")
+	segs = append(segs, s.Push(aud(100*aDur))...)
 	require.Len(t, segs, 2) // the open audio segment closed, not carried
 	assert.Equal(t, uint64(1), segs[1].Seq)
 	assert.False(t, segs[1].Discontinuity)
@@ -240,29 +245,28 @@ func TestSegmentSeqMonotonic(t *testing.T) {
 	}
 }
 
-func TestSegmentFixture(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "fixtures", "h264_aac.ts"))
+// fixtureFrames returns the frames of a fixture as the Clock delivers them.
+func fixtureFrames(t *testing.T, name string) []media.Frame {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "fixtures", name))
 	require.NoError(t, err)
 	d, err := ts.NewDemuxer(bytes.NewReader(data))
 	require.NoError(t, err)
 	c := clock.New(clock.Options{Kinds: d.TrackKinds()})
-	s := New(Options{})
-	var segs []Segment
-	feed := func(fs []media.Frame) {
-		for _, f := range fs {
-			segs = append(segs, s.Push(hub.Delivery{Frame: f})...)
-		}
-	}
+	var out []media.Frame
 	for {
 		f, err := d.Read()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(t, err)
-		feed(c.Push(f))
+		out = append(out, c.Push(f)...)
 	}
-	feed(c.Flush())
-	segs = append(segs, s.Flush()...)
+	return append(out, c.Flush()...)
+}
+
+func TestSegmentFixture(t *testing.T) {
+	segs := pushAll(New(Options{}), fixtureFrames(t, "h264_aac.ts"))
 	require.Len(t, segs, 3)
 	for i, g := range segs {
 		assert.EqualValues(t, i, g.Seq)
@@ -333,4 +337,261 @@ func TestSegmentCarryBounded(t *testing.T) {
 	}
 	assert.LessOrEqual(t, len(s.carry), 900000/aDur+1)
 	assert.Positive(t, s.Dropped())
+}
+
+// assertAudioInside checks the R-F3 guarantee on segs: every audio frame
+// lies in [Start, Start+Duration), and the first one starts within one AAC
+// frame of Start.
+func assertAudioInside(t *testing.T, segs []Segment) {
+	t.Helper()
+	for _, g := range segs {
+		first := true
+		for _, f := range g.Frames {
+			if f.Kind() != media.KindAudio {
+				continue
+			}
+			assert.GreaterOrEqual(t, f.PTS, g.Start, "segment %d: audio %d before Start", g.Seq, f.PTS)
+			assert.Less(t, f.PTS, g.Start+g.Duration, "segment %d: audio %d past the end", g.Seq, f.PTS)
+			if first {
+				assert.Less(t, f.PTS, g.Start+aDur, "segment %d: first audio %d", g.Seq, f.PTS)
+				first = false
+			}
+		}
+	}
+}
+
+// reorder returns frames in an arrival order where audio leads video by
+// lead ticks (lags it when lead is negative): video arrives at its DTS,
+// audio at its PTS − lead.
+func reorder(frames []media.Frame, lead int64) []media.Frame {
+	out := slices.Clone(frames)
+	key := func(f media.Frame) int64 {
+		if f.Kind() == media.KindAudio {
+			return f.PTS - lead
+		}
+		return f.DTS
+	}
+	slices.SortStableFunc(out, func(a, b media.Frame) int { return cmp.Compare(key(a), key(b)) })
+	return out
+}
+
+// pushAll pushes frames and returns every segment, Flush included.
+func pushAll(s *Segmenter, frames []media.Frame) []Segment {
+	var segs []Segment
+	for _, f := range frames {
+		segs = append(segs, s.Push(hub.Delivery{Frame: f})...)
+	}
+	return append(segs, s.Flush()...)
+}
+
+func assertSeqs(t *testing.T, segs []Segment) {
+	t.Helper()
+	for i, g := range segs {
+		assert.EqualValues(t, i, g.Seq, "segment %d out of order", i)
+	}
+}
+
+// Interleaved TS input with audio up to 300 ms ahead of video: audio is cut
+// at the video keyframe's PTS, not by arrival order.
+func TestAudioCutAtVideoPTS(t *testing.T) {
+	frames := fixtureFrames(t, "h264_aac.ts")
+	for _, lead := range []int64{0, 9000, 18000, 27000} {
+		t.Run(strconv.FormatInt(lead/90, 10)+"ms", func(t *testing.T) {
+			s := New(Options{})
+			segs := pushAll(s, reorder(frames, lead))
+			require.Len(t, segs, 3)
+			assertSeqs(t, segs)
+			assertAudioInside(t, segs[:len(segs)-1])
+			assert.Zero(t, s.Late())
+		})
+	}
+	// Audio 300 ms behind video: segments are held until audio passes the
+	// cut, and audio below the first keyframe of the epoch is late.
+	t.Run("lagging", func(t *testing.T) {
+		s := New(Options{})
+		segs := pushAll(s, reorder(frames, -27000))
+		require.Len(t, segs, 3)
+		assertSeqs(t, segs)
+		var late uint64
+		for _, f := range segs[0].Frames {
+			if f.Kind() == media.KindAudio && f.PTS < segs[0].Start {
+				late++
+			}
+		}
+		assert.Equal(t, late, s.Late())
+		assertAudioInside(t, segs[1:len(segs)-1])
+	})
+}
+
+// Audio stops inside segment 2: segment 2's cut waits for it until the
+// anchor is 1 s past the cut, and later cuts no longer wait.
+func TestAudioCutHoldReleasedByAnchor(t *testing.T) {
+	s := New(Options{})
+	emitted := map[uint64]int64{} // Seq → last video PTS pushed when it came out
+	var segs []Segment
+	var nextA, lastV int64
+	collect := func(out []Segment) {
+		for _, g := range out {
+			emitted[g.Seq] = lastV
+			segs = append(segs, g)
+		}
+	}
+	for i := 0; i <= 250; i++ {
+		lastV = int64(i) * 3600
+		collect(s.Push(vid(1, lastV, lastV%180000 == 0)))
+		for ; nextA <= lastV+3600 && nextA < 405000; nextA += aDur {
+			collect(s.Push(aud(nextA)))
+		}
+	}
+	require.Len(t, segs, 5)
+	assertSeqs(t, segs)
+	assert.Equal(t, map[uint64]int64{0: 180000, 1: 360000, 2: 630000, 3: 720000, 4: 900000}, emitted)
+	assertAudioInside(t, segs[:2])
+	for _, g := range segs {
+		assert.EqualValues(t, 180000, g.Duration, "segment %d", g.Seq)
+	}
+	assert.Zero(t, s.Late())
+}
+
+// A segment held for lagging audio takes the audio below its cut; once it
+// is released, audio below the cut goes to the next segment and is late.
+func TestAudioLateCounted(t *testing.T) {
+	s := New(Options{})
+	var segs []Segment
+	var nextA int64
+	for v := int64(0); v <= 180000; v += 3600 {
+		segs = append(segs, s.Push(vid(1, v, v%180000 == 0))...)
+		for ; nextA <= v-9000; nextA += aDur {
+			segs = append(segs, s.Push(aud(nextA))...)
+		}
+	}
+	require.Empty(t, segs, "held: audio has not reached the cut")
+	for ; nextA < 180000; nextA += aDur {
+		require.Empty(t, s.Push(aud(nextA)))
+	}
+	segs = s.Push(aud(nextA)) // 180480: past the cut
+	require.Len(t, segs, 1)
+	assertAudioInside(t, segs)
+	assert.Zero(t, s.Late())
+	require.Empty(t, s.Push(aud(179000)))
+	assert.EqualValues(t, 1, s.Late())
+	segs = s.Flush()
+	require.Len(t, segs, 1)
+	assert.True(t, slices.ContainsFunc(segs[0].Frames, func(f media.Frame) bool { return f.PTS == 179000 }))
+}
+
+// heldVideo pushes epoch 1 video with a keyframe every 2 s from 0 to end,
+// with audio arriving 100 ms late, and returns what came out.
+func heldVideo(s *Segmenter, end int64) []Segment {
+	var segs []Segment
+	var nextA int64
+	for v := int64(0); v <= end; v += 3600 {
+		segs = append(segs, s.Push(vid(1, v, v%180000 == 0))...)
+		for ; nextA <= v-9000; nextA += aDur {
+			segs = append(segs, s.Push(aud(nextA))...)
+		}
+	}
+	return segs
+}
+
+func TestAudioCutReleaseOnEpoch(t *testing.T) {
+	s := New(Options{})
+	segs := heldVideo(s, 360000)
+	require.Len(t, segs, 1)
+	require.Len(t, s.held, 1, "the cut at 4 s waits for audio")
+	segs = append(segs, s.Push(vid(2, 10_000_000, true))...)
+	require.Len(t, segs, 3)
+	segs = append(segs, s.Flush()...)
+	require.Len(t, segs, 4)
+	assertSeqs(t, segs)
+	assert.EqualValues(t, []uint32{1, 1, 1, 2}, []uint32{segs[0].Epoch, segs[1].Epoch, segs[2].Epoch, segs[3].Epoch})
+	assert.EqualValues(t, 180000, segs[1].Start)
+	assert.EqualValues(t, 180000, segs[1].Duration)
+	assert.EqualValues(t, 360000, segs[2].Start)
+	assert.True(t, segs[3].Discontinuity)
+	assert.Empty(t, s.held)
+}
+
+func TestAudioCutReleaseOnLost(t *testing.T) {
+	s := New(Options{})
+	segs := heldVideo(s, 360000)
+	require.Len(t, segs, 1)
+	require.Len(t, s.held, 1)
+	d := vid(1, 500000, true)
+	d.Lost = 4
+	segs = append(segs, s.Push(d)...)
+	require.Len(t, segs, 3)
+	segs = append(segs, s.Flush()...)
+	require.Len(t, segs, 4)
+	assertSeqs(t, segs)
+	assert.EqualValues(t, 360000, segs[2].Start)
+	assert.EqualValues(t, 500000, segs[3].Start)
+	assert.True(t, segs[3].Discontinuity)
+	assert.Empty(t, s.held)
+}
+
+// No keyframe for 6.4 s with MaxDuration 4 s: the forced cut, at the PTS of
+// the first frame presented 4 s past the start, cuts audio there too. With
+// audio ahead that frame is audio; with audio behind it is video, and the
+// segment waits for the audio below the cut.
+func TestAudioCutForcedCut(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		lead, at   int64
+		durations  []int64
+		forcedFrom int
+	}{
+		{"audio-ahead", 18000, 188 * aDur, []int64{188 * aDur, 576000 - 188*aDur, 180000}, 1},
+		{"audio-behind", -18000, 360000, []int64{360000, 216000, 180000}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Options{MaxDuration: 360000})
+			var segs []Segment
+			var nextA int64
+			for v := int64(0); v <= 900000; v += 3600 {
+				key := v == 0 || (v >= 576000 && (v-576000)%180000 == 0)
+				segs = append(segs, s.Push(vid(1, v, key))...)
+				for ; nextA <= v+tc.lead; nextA += aDur {
+					segs = append(segs, s.Push(aud(nextA))...)
+				}
+			}
+			segs = append(segs, s.Flush()...)
+			require.Len(t, segs, 4)
+			assertSeqs(t, segs)
+			assert.True(t, segs[1].Forced)
+			assert.False(t, segs[2].Forced)
+			assert.Equal(t, tc.at, segs[1].Start)
+			for i, d := range tc.durations {
+				assert.Equal(t, d, segs[i].Duration, "segment %d", i)
+			}
+			assertAudioInside(t, segs[:len(segs)-1])
+			assert.Zero(t, s.Late())
+		})
+	}
+}
+
+// Target 0.4 s, and audio falls 0.9 s behind after 2 s: several segments
+// wait at once and come out in order.
+func TestAudioCutShortTarget(t *testing.T) {
+	s := New(Options{Target: 36000})
+	var segs []Segment
+	var nextA int64
+	maxHeld := 0
+	for v := int64(0); v <= 900000; v += 3600 {
+		segs = append(segs, s.Push(vid(1, v, v%36000 == 0))...)
+		lag := int64(0)
+		if v >= 180000 {
+			lag = 81000
+		}
+		for ; nextA <= v-lag; nextA += aDur {
+			segs = append(segs, s.Push(aud(nextA))...)
+		}
+		maxHeld = max(maxHeld, len(s.held))
+	}
+	assert.GreaterOrEqual(t, maxHeld, 2)
+	segs = append(segs, s.Flush()...)
+	require.Len(t, segs, 26)
+	assertSeqs(t, segs)
+	assertAudioInside(t, segs[:len(segs)-1])
+	assert.Zero(t, s.Late())
 }

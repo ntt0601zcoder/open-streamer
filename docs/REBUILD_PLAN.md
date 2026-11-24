@@ -156,7 +156,14 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 
 - **Segmenter:** cuts the frame sequence into segments and parts on video
   keyframes, from stream time only. It decides timing once; HLS-TS, HLS-fMP4,
-  DASH and DVR consume the same segments.
+  DASH and DVR consume the same segments. Every track is cut at the cut's
+  PTS K, not by arrival order (ruling R-F3, M4a): at a keyframe, MaxDuration
+  or anchor-change cut, frames of other tracks presented at or after K move
+  to the next segment, and the closed segment is held until every other
+  track of the epoch reaches K or the anchor is 1 s past it (later frames
+  below K are counted by `Late()`); closes at an epoch change, `Lost` or
+  `Flush` move nothing, so a segment closed by an epoch change or `Lost` may
+  hold audio past its end.
 - **TS muxer** (our `pkg/mpegts` writer), **fMP4 writer** (mp4ff `mp4`), **FLV tag
   codec** with enhanced RTMP for H.265 (`pkg/rtmp`), **RTP** packetisers, all
   our own in `pkg/rtsp` (M3b2): H.264 (RFC 6184, single NAL unit and FU-A),
@@ -557,17 +564,13 @@ Items accepted for later, not yet placed in a milestone:
   `OS_PEER_LIMITS=1` probes the limitation). It would very likely make
   GStreamer play across an audio-less stretch, and also help hls.js if stalls
   are reported there.
-- **Cut audio segments and parts at the video boundary's PTS, not by arrival
-  order (`internal/segment/segmenter.go`). High priority, before M4** (ruling
-  R-F3: M4's three-rung ladder multiplies the separate renditions). With
-  interleaved TS input the audio EXTINFs come out as 1.707, 2.048
-  and 2.261 s against a video 2.000 s, so segment N of the separate CMAF audio
-  and video renditions starts up to about 300 ms apart. This is the likely
-  cause of VLC 3's live-start "PCR is called too late" clock reset and of the
-  "no reference clock" decoder-error pair that `TestM3VLCClass` tolerates on
-  HLS fMP4 and DASH (up to one pair per reset, at most four per VLC process).
-  Remove that tolerance (ruling R-T7e) when it lands; the tolerated-pair
-  count `TestM3VLCClass` logs per VLC process is the before-and-after measure.
+- **VLC 3 DASH start-up clock reset persists after R-F3**: audio parts are
+  now aligned (2.005 s, start within 11 ms of video) and HLS fMP4 is strict,
+  but VLC's DASH module still resets its clock at live start and logs the
+  'no reference clock' pair (2 of 3 runs); `TestM3VLCClass` tolerates it on
+  the dash row only (ruling R-T1a). Investigate the
+  `suggestedPresentationDelay` start and the period/AST mapping as VLC's
+  DASH module sees them. Normal priority.
 - **DASH MPD stays `type="dynamic"` after the stream ends** (pre-existing;
   M3a). Players keep polling an MPD that will not change.
 - **VLC 3 stops at any fMP4 HLS discontinuity**, not only at gaps: every

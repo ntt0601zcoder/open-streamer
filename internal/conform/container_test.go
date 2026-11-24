@@ -651,9 +651,11 @@ func TestReadDroppedNoConfig(t *testing.T) {
 	}))
 	c, err := ReadHLS(context.Background(), base+"hls/index.m3u8", once())
 	require.NoError(t, err)
-	// Without video, segment 1's anchor is its audio, which does not span
-	// the video EXTINF: extinf-matches follows from the dropped frames.
-	assert.Equal(t, []string{RuleExtinf, RuleSegmentKey}, rules(c.Violations))
+	// Without video, segment 1's anchor is its audio. The segmenter cuts
+	// audio at the video keyframe's PTS (ruling R-F3), so the audio spans
+	// the video EXTINF and only segment-starts-on-key follows from the
+	// dropped frames.
+	assert.Equal(t, []string{RuleSegmentKey}, rules(c.Violations))
 }
 
 func TestReadErrors(t *testing.T) {

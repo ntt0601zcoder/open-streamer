@@ -17,10 +17,26 @@
 // must not promise it for a Forced segment. Leading audio held for the
 // video anchor's first keyframe is likewise kept to MaxDuration.
 //
+// Every track is cut at the anchor's cut PTS K, not by arrival order (ruling
+// R-F3), for the cuts made within an epoch: on a keyframe, at MaxDuration
+// (K is the PTS of the frame that triggers it) and when the anchor changes.
+// Non-anchor frames of the closing segment presented at or after K move to
+// the next segment (to the carry when an anchor change opens none), and the
+// closed segment is held until every other track of the epoch has delivered
+// a frame at or after K, or the anchor is 1 s past K. A track that makes a
+// hold time out is not waited for again until it delivers. Non-anchor frames
+// below K that arrive while the segment is held go into it; after its
+// release they go into the open segment and count as Late. Held segments
+// come out in Seq order, all of them before the open segment closes at an
+// epoch change, Lost > 0 or Flush; those closes neither move frames nor
+// hold, so a segment they close may hold audio past its end.
+//
 // The Segmenter starts no goroutines and is not safe for concurrent use.
 package segment
 
 import (
+	"slices"
+
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
@@ -30,6 +46,10 @@ const (
 	videoDelta    = 3600 // fallback frame duration for a one-frame video track
 	audioSamples  = 1024 // AAC frame size
 	defaultRate   = 48000
+
+	// holdTimeout is how far past a cut the anchor may advance before the
+	// held segment is released without the tracks it waits for.
+	holdTimeout = media.ClockRate
 )
 
 // Options tunes a Segmenter.
@@ -90,13 +110,23 @@ type open struct {
 	tracks  map[int]*trackAcc
 }
 
+// held is a segment closed by a cut at K, waiting for the other tracks to
+// reach K.
+type held struct {
+	c        *open
+	k        int64
+	duration int64 // as for closeOpen
+}
+
 // Segmenter cuts deliveries into segments. Create one with New.
 type Segmenter struct {
 	target  int64
 	maxDur  int64
 	cur     *open
+	held    []held // in Seq order
 	seq     uint64
 	dropped uint64
+	late    uint64
 
 	haveEpoch   bool
 	epoch       uint32
@@ -106,6 +136,8 @@ type Segmenter struct {
 	lost        bool          // next segment opens after Lost > 0
 	closed      bool          // a segment of this epoch has closed
 	carry       []media.Frame // leading audio waiting for the video anchor's keyframe
+	reached     map[int]int64 // per track of the epoch: its largest PTS so far
+	timedOut    map[int]bool  // tracks a hold stopped waiting for
 }
 
 // New returns a Segmenter.
@@ -118,51 +150,59 @@ func New(opt Options) *Segmenter {
 	if m <= 0 {
 		m = 5 * t
 	}
-	return &Segmenter{target: t, maxDur: max(m, t), anchor: -1}
+	return &Segmenter{target: t, maxDur: max(m, t), anchor: -1, reached: map[int]int64{}, timedOut: map[int]bool{}}
 }
 
 // Dropped returns the number of frames discarded: those that arrived before
 // a segment could open, and early non-anchor frames after a loss.
 func (s *Segmenter) Dropped() uint64 { return s.dropped }
 
+// Late returns the number of non-anchor frames put in a segment that starts
+// after their PTS: those that arrived after the segment cut at their PTS was
+// released, and those below the first segment of an epoch.
+func (s *Segmenter) Late() uint64 { return s.late }
+
 // Push feeds one delivery and returns the segments it completed.
 func (s *Segmenter) Push(d hub.Delivery) []Segment {
 	f := d.Frame
 	var out []Segment
 	if !s.haveEpoch || f.Epoch != s.epoch {
-		if s.cur != nil {
-			out = append(out, s.closeOpen(-1))
-		}
+		out = s.closeAll(out)
 		if s.haveEpoch {
 			s.disc = true
 		}
 		s.haveEpoch, s.epoch = true, f.Epoch
 		s.anchor, s.anchorVideo, s.closed = -1, false, false
 		s.dropCarry()
+		clear(s.reached)
+		clear(s.timedOut)
 	}
 	if d.Lost > 0 {
-		if s.cur != nil {
-			out = append(out, s.closeOpen(-1))
-		}
+		out = s.closeAll(out)
 		s.dropCarry()
 		s.disc, s.lost = true, true
 	}
+	if r, ok := s.reached[f.Track]; !ok || f.PTS > r {
+		s.reached[f.Track] = f.PTS
+	}
+	delete(s.timedOut, f.Track)
 	if s.promote(f) && s.cur != nil {
 		if s.cur.leading {
 			s.uncut()
 		} else {
-			out = append(out, s.closeOpen(-1))
+			s.cut(f.PTS, -1)
 		}
 	}
 
 	isAnchor := f.Track == s.anchor
 	opens := isAnchor && (f.Key || !s.anchorVideo)
 	switch {
+	case !isAnchor && s.toHeld(f):
 	case s.cur == nil && !opens && s.carry != nil && !isAnchor:
 		s.carry = append(s.carry, f)
 		s.trimCarry()
 	case s.cur != nil && !opens && f.PTS >= s.cur.seg.Start+s.maxDur:
-		out = append(out, s.closeOpen(f.PTS-s.cur.seg.Start))
+		s.cut(f.PTS, f.PTS-s.cur.seg.Start)
 		s.openAt(f)
 		s.cur.seg.Forced = true
 	case s.cur == nil && !opens:
@@ -170,12 +210,118 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 	case s.cur == nil:
 		s.openAt(f)
 	case isAnchor && opens && f.PTS >= s.cur.seg.Start+s.target:
-		out = append(out, s.closeOpen(f.PTS-s.cur.seg.Start))
+		s.cut(f.PTS, f.PTS-s.cur.seg.Start)
 		s.openAt(f)
-	case !isAnchor && s.cur.lost && f.PTS < s.cur.seg.Start:
-		s.dropped++
 	default:
-		s.add(f)
+		s.place(s.cur, f)
+	}
+	return s.release(out)
+}
+
+// cut closes the open segment at K within the epoch: its frames of tracks
+// other than the epoch's anchor presented at or after K go to the carry,
+// from where the next segment takes them, and it is held. A K at or before
+// the segment's start (an anchor change to a track presented earlier) moves
+// nothing. duration is as for closeOpen.
+func (s *Segmenter) cut(k, duration int64) {
+	c := s.cur
+	s.cur = nil
+	s.closed = true
+	moved := []media.Frame{}
+	kept := c.seg.Frames[:0]
+	for _, f := range c.seg.Frames {
+		if f.Track != s.anchor && f.PTS >= k && k > c.seg.Start {
+			moved = append(moved, f)
+		} else {
+			kept = append(kept, f)
+		}
+	}
+	if len(moved) > 0 {
+		// Rebuild the accumulators from the frames that stay.
+		c.seg.Frames = nil
+		c.tracks = map[int]*trackAcc{}
+		for _, f := range slices.Clip(kept) {
+			addTo(c, f)
+		}
+	}
+	s.carry = moved
+	s.held = append(s.held, held{c: c, k: k, duration: duration})
+}
+
+// toHeld puts a non-anchor frame presented before a held segment's cut into
+// the first such segment, and reports whether it did.
+func (s *Segmenter) toHeld(f media.Frame) bool {
+	for i := range s.held {
+		if f.PTS < s.held[i].k {
+			s.place(s.held[i].c, f)
+			return true
+		}
+	}
+	return false
+}
+
+// place adds a frame to c. A non-anchor frame presented before c's start is
+// dropped after a loss, else kept and counted late.
+func (s *Segmenter) place(c *open, f media.Frame) {
+	if f.Track != s.anchor && f.PTS < c.seg.Start {
+		if c.lost {
+			s.dropped++
+			return
+		}
+		s.late++
+	}
+	addTo(c, f)
+}
+
+// release emits the held segments, in order, while the first one no longer
+// waits.
+func (s *Segmenter) release(out []Segment) []Segment {
+	for len(s.held) > 0 && s.releasable(s.held[0].k) {
+		out = append(out, s.finish(s.held[0].c, s.held[0].duration))
+		s.held[0] = held{}
+		s.held = s.held[1:]
+	}
+	if len(s.held) == 0 {
+		s.held = nil
+	}
+	return out
+}
+
+// releasable reports whether a segment cut at k may come out: every track
+// of the epoch other than the anchor has reached k or was given up, or the
+// anchor is holdTimeout past k, in which case the tracks still short of k
+// are given up until they deliver again.
+func (s *Segmenter) releasable(k int64) bool {
+	waiting := false
+	for tr, r := range s.reached {
+		if tr != s.anchor && !s.timedOut[tr] && r < k {
+			waiting = true
+			break
+		}
+	}
+	if !waiting {
+		return true
+	}
+	if r, ok := s.reached[s.anchor]; !ok || r < k+holdTimeout {
+		return false
+	}
+	for tr, r := range s.reached {
+		if tr != s.anchor && r < k {
+			s.timedOut[tr] = true
+		}
+	}
+	return true
+}
+
+// closeAll emits every held segment, in order, then closes the open one,
+// without moving frames.
+func (s *Segmenter) closeAll(out []Segment) []Segment {
+	for _, h := range s.held {
+		out = append(out, s.finish(h.c, h.duration))
+	}
+	s.held = nil
+	if s.cur != nil {
+		out = append(out, s.closeOpen(-1))
 	}
 	return out
 }
@@ -196,13 +342,10 @@ func (s *Segmenter) promote(f media.Frame) bool {
 	return changed
 }
 
-// Flush closes the open segment, if any.
+// Flush emits the held segments and closes the open one, if any.
 func (s *Segmenter) Flush() []Segment {
 	s.dropCarry()
-	if s.cur == nil {
-		return nil
-	}
-	return []Segment{s.closeOpen(-1)}
+	return s.closeAll(nil)
 }
 
 func (s *Segmenter) openAt(f media.Frame) {
@@ -262,14 +405,16 @@ func (s *Segmenter) dropCarry() {
 	s.carry = nil
 }
 
-func (s *Segmenter) add(f media.Frame) {
-	a := s.cur.tracks[f.Track]
+func (s *Segmenter) add(f media.Frame) { addTo(s.cur, f) }
+
+func addTo(c *open, f media.Frame) {
+	a := c.tracks[f.Track]
 	if a == nil {
 		a = &trackAcc{dflt: defaultDelta(f)}
-		s.cur.tracks[f.Track] = a
+		c.tracks[f.Track] = a
 	}
 	a.add(f)
-	s.cur.seg.Frames = append(s.cur.seg.Frames, f)
+	c.seg.Frames = append(c.seg.Frames, f)
 }
 
 func defaultDelta(f media.Frame) int64 {
@@ -289,6 +434,11 @@ func (s *Segmenter) closeOpen(duration int64) Segment {
 	c := s.cur
 	s.cur = nil
 	s.closed = true
+	return s.finish(c, duration)
+}
+
+// finish builds the closed segment c; duration is as for closeOpen.
+func (s *Segmenter) finish(c *open, duration int64) Segment {
 	seg := c.seg
 	if duration < 0 {
 		duration = c.tracks[c.anchor].end() - seg.Start
