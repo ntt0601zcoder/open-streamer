@@ -526,3 +526,69 @@ func TestPipelineDiscontinuity(t *testing.T) {
 	t.Logf("before: %d video; after: first video PTS %d key %v (source key %d), %d video, first audio PTS %d",
 		len(rungFrames(before, 0)), v[0].PTS, v[0].Key, nextKey.PTS, len(v), rungFrames(after, -1)[0].PTS)
 }
+
+// TestPacketPadding checks that decoder input packets carry
+// AV_INPUT_BUFFER_PADDING_SIZE (64 in FFmpeg 8) zeroed bytes after the
+// payload, which bitstream readers rely on.
+func TestPacketPadding(t *testing.T) {
+	require.GreaterOrEqual(t, inputPadding, 64)
+	p := newInPacket()
+	defer p.free()
+	for _, n := range []int{0, 1, 7, 100, 4096, 3, 65536, 33} {
+		data := bytes.Repeat([]byte{0xff}, n)
+		require.NoError(t, p.fill(data, 1, 1))
+		pad := p.padding()
+		require.Len(t, pad, inputPadding, "size %d", n)
+		require.Equal(t, make([]byte, inputPadding), pad, "size %d", n)
+	}
+}
+
+// TestPipelineFrameRateAtCRA starts at a CRA followed by RASL pictures: the
+// skipped pictures still count in the framerate estimate.
+func TestPipelineFrameRateAtCRA(t *testing.T) {
+	video := ofKind(source(t, "h265_aac51.ts"), media.KindVideo)
+	k := slices.IndexFunc(video[1:], func(f media.Frame) bool { return f.Key }) + 1
+	require.Positive(t, k)
+	require.True(t, video[k+1].RASL)
+	p := newPipeline(t, []Rung{{Height: 120, BitrateKbps: 150}}, nil)
+	run(t, p, video[k:])
+	assert.Equal(t, [2]int{25, 1}, [2]int{p.video.fps.Num(), p.video.fps.Den()})
+
+	// The estimate is the median delta, so a missing frame does not move it.
+	fps := estimateFPS([]int64{0, 3600, 7200, 18000, 21600, 25200, 28800, 32400, 36000})
+	assert.Equal(t, [2]int{25, 1}, [2]int{fps.Num(), fps.Den()})
+	fps = estimateFPS([]int64{0, 3003, 6006, 9009})
+	assert.Equal(t, [2]int{30000, 1001}, [2]int{fps.Num(), fps.Den()})
+	fps = estimateFPS([]int64{0})
+	assert.Equal(t, [2]int{25, 1}, [2]int{fps.Num(), fps.Den()})
+}
+
+// TestPipelineRungOpenFailure: a rung that fails to open fails the whole
+// pipeline, permanently, with no rung left open.
+func TestPipelineRungOpenFailure(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	p := newPipeline(t, []Rung{{Height: 120, BitrateKbps: 150}, {Height: 120, BitrateKbps: 150, Preset: "no-such-preset"}}, &Audio{})
+	var (
+		first error
+		n     int
+	)
+	for i, f := range src {
+		o, err := p.Push(f)
+		assert.Empty(t, rungFrames(o, 0))
+		if err != nil {
+			first, n = err, i
+			break
+		}
+	}
+	require.Error(t, first)
+	assert.Nil(t, p.video.encs)
+	assert.Nil(t, p.video.dec)
+	_, err := p.Push(src[n+1])
+	require.Error(t, err)
+	assert.Equal(t, first, err)
+	_, err = p.Discontinuity()
+	assert.Equal(t, first, err)
+	_, err = p.Flush()
+	assert.Equal(t, first, err)
+	t.Logf("frame %d: %v", n, first)
+}

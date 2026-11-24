@@ -50,7 +50,7 @@ type audioTrack struct {
 	// The current build; dec is nil between builds.
 	cfg       *media.TrackConfig // input
 	dec       *astiav.CodecContext
-	decPkt    *astiav.Packet
+	decPkt    *inPacket
 	decFrm    *astiav.Frame
 	swr       *astiav.SoftwareResampleContext
 	res       *astiav.Frame
@@ -91,14 +91,10 @@ func (a *audioTrack) push(f media.Frame, epoch uint32, st *Stats) ([]Output, err
 			return out, err
 		}
 	}
-	if err := a.decPkt.FromData(bytes.Join(f.Data, nil)); err != nil {
-		return out, fmt.Errorf("audio decoder: packet: %w", err)
+	if err := a.decPkt.fill(bytes.Join(f.Data, nil), f.PTS, f.DTS); err != nil {
+		return out, fmt.Errorf("audio decoder: %w", err)
 	}
-	a.decPkt.SetPts(f.PTS)
-	a.decPkt.SetDts(f.DTS)
-	err := a.dec.SendPacket(a.decPkt)
-	a.decPkt.Unref()
-	if err != nil && !errors.Is(err, astiav.ErrInvaliddata) {
+	if err := a.decPkt.send(a.dec); err != nil && !errors.Is(err, astiav.ErrInvaliddata) {
 		return out, fmt.Errorf("audio decoder: track %d: send: %w", a.track, err)
 	}
 	// A corrupt frame is skipped: the timeline closes the hole.
@@ -120,6 +116,7 @@ func (a *audioTrack) build(cfg *media.TrackConfig) error {
 		return errors.New("audio decoder: alloc aac context")
 	}
 	a.dec.SetTimeBase(timeBase)
+	setPktTimebase(a.dec)
 	if err := a.dec.SetExtraData(cfg.ASC); err != nil {
 		return fmt.Errorf("audio decoder: track %d: extradata: %w", a.track, err)
 	}
@@ -160,7 +157,7 @@ func (a *audioTrack) build(cfg *media.TrackConfig) error {
 	if a.swr == nil || a.fifo == nil || a.stage == nil {
 		return errors.New("audio: alloc resampler or fifo")
 	}
-	a.decPkt, a.decFrm = astiav.AllocPacket(), astiav.AllocFrame()
+	a.decPkt, a.decFrm = newInPacket(), astiav.AllocFrame()
 	a.res, a.encPkt = astiav.AllocFrame(), astiav.AllocPacket()
 	a.anchored, a.primed, a.catchUp, a.resampled = false, false, false, false
 	return nil
@@ -422,10 +419,11 @@ func (a *audioTrack) release() {
 			cc.Free()
 		}
 	}
-	for _, p := range []*astiav.Packet{a.decPkt, a.encPkt} {
-		if p != nil {
-			p.Free()
-		}
+	if a.decPkt != nil {
+		a.decPkt.free()
+	}
+	if a.encPkt != nil {
+		a.encPkt.Free()
 	}
 	for _, f := range []*astiav.Frame{a.decFrm, a.res} {
 		if f != nil {

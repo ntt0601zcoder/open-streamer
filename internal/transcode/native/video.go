@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/asticode/go-astiav"
 
@@ -54,12 +55,13 @@ type videoPath struct {
 	// The current build; dec is nil between builds.
 	cfg      *media.TrackConfig
 	dec      *astiav.CodecContext
-	pkt      *astiav.Packet
+	pkt      *inPacket
 	frm      *astiav.Frame
 	startPTS int64          // PTS of the build's first key; earlier pictures are not encoded
 	skipRASL bool           // until the first trailing picture after the start key
 	keys     []int64        // source key PTS not yet matched to a decoded picture, ascending
 	pending  []media.Frame  // input held until the framerate is known
+	seenDTS  []int64        // DTS of every frame received while the framerate is unknown, skipped ones too
 	encs     []*rungEncoder // opened at the build's first decoded picture
 
 	// The framerate, estimated once per source config.
@@ -81,26 +83,28 @@ func (v *videoPath) push(f media.Frame, epoch uint32) ([]Output, error) {
 			return out, err
 		}
 	}
-	switch {
-	case v.dec == nil:
+	if v.dec == nil {
 		if !f.Key {
 			return out, nil
 		}
 		if err := v.build(f); err != nil {
 			return out, err
 		}
-	case v.skipRASL:
+	}
+	estimating := v.fpsCfg != v.cfg
+	if estimating {
+		v.seenDTS = append(v.seenDTS, f.DTS)
+	}
+	if v.skipRASL && !f.Key {
 		if f.RASL {
 			return out, nil
 		}
-		if !f.Key {
-			v.skipRASL = false
-		}
+		v.skipRASL = false
 	}
 	v.track = f.Track
-	if v.fpsCfg != v.cfg {
+	if estimating {
 		v.pending = append(v.pending, f)
-		if len(v.pending) <= fpsDeltas {
+		if len(v.seenDTS) <= fpsDeltas {
 			return out, nil
 		}
 		o, err := v.feedPending(epoch)
@@ -132,22 +136,24 @@ func (v *videoPath) build(f media.Frame) error {
 		return fmt.Errorf("video decoder: alloc %s context", name)
 	}
 	cc.SetTimeBase(timeBase)
+	setPktTimebase(cc)
 	cc.SetThreadCount(0)
 	if err := cc.Open(codec, nil); err != nil {
 		cc.Free()
 		return fmt.Errorf("video decoder: open %s: %w", name, err)
 	}
 	v.cfg, v.dec = f.Config, cc
-	v.pkt, v.frm = astiav.AllocPacket(), astiav.AllocFrame()
+	v.pkt, v.frm = newInPacket(), astiav.AllocFrame()
 	v.startPTS, v.skipRASL = f.PTS, true
 	return nil
 }
 
-// feedPending estimates the framerate from the held frames and feeds them.
+// feedPending estimates the framerate from the DTS received so far and
+// feeds the held frames.
 func (v *videoPath) feedPending(epoch uint32) ([]Output, error) {
-	v.fps, v.fpsCfg = estimateFPS(v.pending), v.cfg
+	v.fps, v.fpsCfg = estimateFPS(v.seenDTS), v.cfg
 	held := v.pending
-	v.pending = nil
+	v.pending, v.seenDTS = nil, nil
 	var out []Output
 	for _, f := range held {
 		o, err := v.feed(f, epoch)
@@ -159,13 +165,26 @@ func (v *videoPath) feedPending(epoch uint32) ([]Output, error) {
 	return out, nil
 }
 
-// estimateFPS returns the framerate of up to fpsDeltas+1 frames in decode
-// order: their mean DTS delta, snapped to a common rate within 1 %.
-func estimateFPS(fs []media.Frame) astiav.Rational {
-	if len(fs) < 2 || fs[len(fs)-1].DTS <= fs[0].DTS {
+// estimateFPS returns the framerate of up to fpsDeltas+1 DTS in decode
+// order: the median of their deltas, snapped to a common rate within 1 %.
+// The median ignores a delta that spans frames not received.
+func estimateFPS(dts []int64) astiav.Rational {
+	deltas := make([]int64, 0, len(dts))
+	for i := 1; i < len(dts); i++ {
+		if d := dts[i] - dts[i-1]; d > 0 {
+			deltas = append(deltas, d)
+		}
+	}
+	if len(deltas) == 0 {
 		return astiav.NewRational(defaultFPS, 1)
 	}
-	r := float64(len(fs)-1) * media.ClockRate / float64(fs[len(fs)-1].DTS-fs[0].DTS)
+	slices.Sort(deltas)
+	n := len(deltas)
+	med := float64(deltas[n/2])
+	if n%2 == 0 {
+		med = float64(deltas[n/2-1]+deltas[n/2]) / 2
+	}
+	r := media.ClockRate / med
 	best, bestDist := astiav.Rational{}, math.Inf(1)
 	for _, c := range commonFPS {
 		if d := math.Abs(r-c.Float64()) / c.Float64(); d < bestDist {
@@ -190,17 +209,13 @@ func gcd(a, b int) int {
 
 // feed sends one frame to the decoder and encodes every picture it returns.
 func (v *videoPath) feed(f media.Frame, epoch uint32) ([]Output, error) {
-	if err := v.pkt.FromData(annexB(f)); err != nil {
-		return nil, fmt.Errorf("video decoder: packet: %w", err)
+	if err := v.pkt.fill(annexB(f), f.PTS, f.DTS); err != nil {
+		return nil, fmt.Errorf("video decoder: %w", err)
 	}
-	v.pkt.SetPts(f.PTS)
-	v.pkt.SetDts(f.DTS)
 	if f.Key {
 		v.keys = append(v.keys, f.PTS)
 	}
-	err := v.dec.SendPacket(v.pkt)
-	v.pkt.Unref()
-	if err != nil && !errors.Is(err, astiav.ErrInvaliddata) {
+	if err := v.pkt.send(v.dec); err != nil && !errors.Is(err, astiav.ErrInvaliddata) {
 		return nil, fmt.Errorf("video decoder: send: %w", err)
 	}
 	// A corrupt access unit is skipped; the decoder conceals it.
@@ -259,14 +274,21 @@ func (v *videoPath) encode(fr *astiav.Frame, epoch uint32) ([]Output, error) {
 	return out, nil
 }
 
+// openEncoders opens every rung or none: on a failure it closes the rungs
+// it opened.
 func (v *videoPath) openEncoders(fr *astiav.Frame) error {
+	encs := make([]*rungEncoder, 0, len(v.rungs))
 	for i, r := range v.rungs {
 		e, err := openRung(i, r, fr, v.fps, &v.caches[i])
 		if err != nil {
+			for _, o := range encs {
+				o.release()
+			}
 			return err
 		}
-		v.encs = append(v.encs, e)
+		encs = append(encs, e)
 	}
+	v.encs = encs
 	return nil
 }
 
@@ -312,13 +334,13 @@ func (v *videoPath) release() {
 		v.dec.Free()
 	}
 	if v.pkt != nil {
-		v.pkt.Free()
+		v.pkt.free()
 	}
 	if v.frm != nil {
 		v.frm.Free()
 	}
 	v.cfg, v.dec, v.pkt, v.frm = nil, nil, nil, nil
-	v.keys, v.pending, v.encs = nil, nil, nil
+	v.keys, v.pending, v.seenDTS, v.encs = nil, nil, nil, nil
 }
 
 // rungEncoder scales decoded pictures to one rung and encodes them with
@@ -380,7 +402,7 @@ func openRung(idx int, r Rung, fr *astiav.Frame, fps astiav.Rational, cache *med
 	}
 	if err := cc.Open(codec, opts); err != nil {
 		cc.Free()
-		return nil, fmt.Errorf("video encoder: open libx264 %dx%d: %w", e.w, e.h, err)
+		return nil, fmt.Errorf("video encoder: rung %d: open libx264 %dx%d: %w", idx, e.w, e.h, err)
 	}
 	e.pkt = astiav.AllocPacket()
 	return e, nil

@@ -75,6 +75,9 @@ type Pipeline struct {
 	started bool
 	epoch   uint32
 	closed  bool
+	// err is the first error the pipeline returned; every later call
+	// returns it.
+	err error
 
 	// vtrack is the encoded video track, or −1 before the first video frame.
 	vtrack  int
@@ -171,10 +174,39 @@ func resolveAudio(a Audio) (Audio, error) {
 // Push feeds one frame and returns the outputs it completed. The frame is
 // already in rendition time, epoch and shift. A new epoch first drains the
 // decoder and every encoder, whose outputs keep the old epoch.
+//
+// An error from Push, Discontinuity or Flush is permanent: the pipeline
+// releases its codecs and every later call returns the same error.
 func (p *Pipeline) Push(f media.Frame) ([]Output, error) {
-	if p.closed {
-		return nil, errors.New("transcode: push: pipeline closed")
+	if err := p.usable("push"); err != nil {
+		return nil, err
 	}
+	out, err := p.push(f)
+	if err != nil {
+		return out, p.fail(fmt.Errorf("transcode: push: %w", err))
+	}
+	return out, nil
+}
+
+// usable returns the error that stops a call to op, if any.
+func (p *Pipeline) usable(op string) error {
+	switch {
+	case p.closed:
+		return fmt.Errorf("transcode: %s: pipeline closed", op)
+	case p.err != nil:
+		return p.err
+	}
+	return nil
+}
+
+// fail makes err permanent and releases every codec.
+func (p *Pipeline) fail(err error) error {
+	p.err = err
+	p.release()
+	return err
+}
+
+func (p *Pipeline) push(f media.Frame) ([]Output, error) {
 	var out []Output
 	switch {
 	case !p.started:
@@ -198,11 +230,7 @@ func (p *Pipeline) Push(f media.Frame) ([]Output, error) {
 	case media.KindAudio:
 		o, err = p.pushAudio(f)
 	}
-	out = append(out, o...)
-	if err != nil {
-		return out, fmt.Errorf("transcode: push: %w", err)
-	}
-	return out, nil
+	return append(out, o...), err
 }
 
 func (p *Pipeline) pushVideo(f media.Frame) ([]Output, error) {
@@ -295,12 +323,12 @@ func (p *Pipeline) sortedAudio() []*audioTrack {
 // track, dropping audio until then and audio presented before it; when the
 // epoch has no video, it resumes at the next frame.
 func (p *Pipeline) Discontinuity() ([]Output, error) {
-	if p.closed {
-		return nil, errors.New("transcode: discontinuity: pipeline closed")
+	if err := p.usable("discontinuity"); err != nil {
+		return nil, err
 	}
 	out, err := p.drain()
 	if err != nil {
-		return out, fmt.Errorf("transcode: discontinuity: %w", err)
+		return out, p.fail(fmt.Errorf("transcode: discontinuity: %w", err))
 	}
 	p.awaitKey = p.sawVideo && p.video != nil
 	p.gated = false
@@ -310,12 +338,12 @@ func (p *Pipeline) Discontinuity() ([]Output, error) {
 // Flush drains the decoders and every encoder at the end of the input. The
 // pipeline can take frames again afterwards, starting at a key.
 func (p *Pipeline) Flush() ([]Output, error) {
-	if p.closed {
-		return nil, errors.New("transcode: flush: pipeline closed")
+	if err := p.usable("flush"); err != nil {
+		return nil, err
 	}
 	out, err := p.drain()
 	if err != nil {
-		return out, fmt.Errorf("transcode: flush: %w", err)
+		return out, p.fail(fmt.Errorf("transcode: flush: %w", err))
 	}
 	p.awaitKey, p.gated = false, false
 	return out, nil
@@ -331,6 +359,11 @@ func (p *Pipeline) Close() {
 		return
 	}
 	p.closed = true
+	p.release()
+}
+
+// release frees every codec without draining.
+func (p *Pipeline) release() {
 	if p.video != nil {
 		p.video.release()
 	}
