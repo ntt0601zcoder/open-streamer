@@ -62,12 +62,26 @@ var (
 type events struct {
 	mu  sync.Mutex
 	evs []Event
+	at  []time.Time
 }
 
 func (e *events) add(ev Event) {
 	e.mu.Lock()
 	e.evs = append(e.evs, ev)
+	e.at = append(e.at, time.Now())
 	e.mu.Unlock()
+}
+
+// firstAt returns when the first event of kind k was recorded.
+func (e *events) firstAt(k EventKind) time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i, ev := range e.evs {
+		if ev.Kind == k {
+			return e.at[i]
+		}
+	}
+	return time.Time{}
 }
 
 func (e *events) of(k EventKind) []Event {
@@ -84,11 +98,12 @@ func (e *events) of(k EventKind) []Event {
 
 // session is one transcoder run over a fed source hub.
 type session struct {
-	tr   *Transcoder
-	src  *hub.Hub
-	cols []*collector
-	ev   *events
-	errc chan error
+	noHello bool // the first child never says Hello: feed without waiting
+	tr      *Transcoder
+	src     *hub.Hub
+	cols    []*collector
+	ev      *events
+	errc    chan error
 }
 
 // start builds a transcoder over a new source hub and runs it.
@@ -116,9 +131,14 @@ func start(t *testing.T, opt Options) *session {
 	return s
 }
 
-// feed plays steps into the source, closes it and waits for Run.
+// feed plays steps into the source, closes it and waits for Run. With a
+// child that says Hello, it starts once the first Hello has arrived: before
+// it the host never waits on the child and would drop what does not fit.
 func (s *session) feed(t *testing.T, steps []step, speed float64) [][]media.Frame {
 	t.Helper()
+	if s.tr.needChild && !s.noHello {
+		require.Eventually(t, func() bool { return s.tr.hellos.Load() > 0 }, 10*time.Second, time.Millisecond)
+	}
 	<-play(t.Context(), s.src, steps, speed, true)
 	select {
 	case err := <-s.errc:
@@ -596,10 +616,15 @@ func TestSupervisorWedgedChild(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opt := fakeOptions(t, tc.env,
 				transcodetest.EnvCrashOnce+"="+filepath.Join(t.TempDir(), "once"))
-			opt.HelloTimeout = 300 * time.Millisecond
+			// The first child gets 1 s (4 s of media, over 256 frames) to
+			// say Hello while the source queue holds only 64: feeding it
+			// must not stall the copy rendition.
+			opt.HelloTimeout = time.Second
+			opt.Queue = 64
 			opt.Renditions = []Rendition{encode240, copySrc}
 			opt.Audio.Copy = true
 			s := start(t, opt)
+			s.noHello = true
 			out := s.feed(t, steps, 4)
 			st := s.tr.Stats()
 			assert.EqualValues(t, 2, st.Spawns)
@@ -631,6 +656,45 @@ func TestSupervisorWedgedChild(t *testing.T) {
 				}
 			}
 			assert.Equal(t, srcVideo, copyVideo, "copy rendition video")
+			assert.Zero(t, st.Losses, "the source subscription lost nothing")
 		})
 	}
+}
+
+// A child that sends junk after a valid Hello is killed at once, and the
+// event names the decode error.
+func TestSupervisorDecodeErrorAfterHello(t *testing.T) {
+	opt := fakeOptions(t, transcodetest.EnvJunkAfterHello+"=1",
+		transcodetest.EnvCrashOnce+"="+filepath.Join(t.TempDir(), "once"))
+	opt.Renditions = []Rendition{encode240}
+	s := start(t, opt)
+	require.Eventually(t, func() bool { return len(s.ev.of(EventSpawned)) == 2 }, 10*time.Second, time.Millisecond)
+	exits := s.ev.of(EventExited)
+	require.Len(t, exits, 1)
+	assert.ErrorIs(t, exits[0].Err, wire.ErrMalformed)
+	assert.ErrorContains(t, exits[0].Err, "killed")
+	// Killed at once, not after the grace given to a child that closes its
+	// socket.
+	took := s.ev.firstAt(EventExited).Sub(s.ev.firstAt(EventSpawned))
+	assert.Less(t, took, stopGrace, "exit %v after the spawn", took)
+}
+
+// A child that closes its socket, then logs and exits on its own, is not
+// killed: the event carries its exit status and its last stderr line is
+// logged, and it is respawned.
+func TestSupervisorClosingChildExits(t *testing.T) {
+	var buf syncBuffer
+	opt := fakeOptions(t, transcodetest.EnvCloseThenExit+"=1",
+		transcodetest.EnvCrashOnce+"="+filepath.Join(t.TempDir(), "once"))
+	opt.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+	opt.Renditions = []Rendition{encode240}
+	s := start(t, opt)
+	require.Eventually(t, func() bool { return len(s.ev.of(EventSpawned)) == 2 }, 10*time.Second, time.Millisecond)
+	exits := s.ev.of(EventExited)
+	require.Len(t, exits, 1)
+	assert.ErrorContains(t, exits[0].Err, "exit status 2")
+	assert.NotContains(t, exits[0].Err.Error(), "killed")
+	assert.Contains(t, buf.String(), "line=\"closing child exits\"")
+	took := s.ev.firstAt(EventExited).Sub(s.ev.firstAt(EventSpawned))
+	t.Logf("exit %v after the spawn", took)
 }

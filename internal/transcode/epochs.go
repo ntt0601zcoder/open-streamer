@@ -234,6 +234,19 @@ func (r *router) childExited() {
 	r.em.bump()
 }
 
+// overflowBeforeHello records a message the current child could not take
+// before its Hello: it is no longer fed, and a bump feeds it again from K
+// once it says Hello.
+func (r *router) overflowBeforeHello() {
+	r.dropped(1)
+	if !r.childFed {
+		return
+	}
+	r.childFed = false
+	r.needHello = true
+	r.em.bump()
+}
+
 // childHello records the current child's Hello.
 func (r *router) childHello() { r.needHello = false }
 

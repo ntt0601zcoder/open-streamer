@@ -35,6 +35,15 @@ const (
 	// EnvNoHello makes the child hang without sending Hello. With
 	// EnvCrashOnce, only while the file is absent.
 	EnvNoHello = "OS_TRANSCODE_FAKE_NO_HELLO"
+	// EnvJunkAfterHello makes the child send a valid Hello, then bytes that
+	// do not decode, then hang. With EnvCrashOnce, only while the file is
+	// absent.
+	EnvJunkAfterHello = "OS_TRANSCODE_FAKE_JUNK_AFTER_HELLO"
+	// EnvCloseThenExit makes the child, after Hello and Configure, close
+	// fd 3, sleep 50 ms, write "closing child exits" to stderr and exit 2,
+	// as the real child does on a pipeline error. With EnvCrashOnce, only
+	// while the file is absent.
+	EnvCloseThenExit = "OS_TRANSCODE_FAKE_CLOSE_THEN_EXIT"
 )
 
 // Main runs the fake child on fd 3 and exits. It sends Hello, reads
@@ -92,6 +101,13 @@ func Main() {
 	if err := w.Write(wire.Hello{Version: version, PID: os.Getpid()}); err != nil {
 		os.Exit(1)
 	}
+	if misbehave && os.Getenv(EnvJunkAfterHello) != "" {
+		markOnce()
+		_, _ = conn.Write([]byte{0, 0, 0, 0, 0xff, 0xff})
+		for { // hang until killed
+			time.Sleep(time.Hour)
+		}
+	}
 	var cfg wire.Configure
 	n := 0
 	for {
@@ -105,6 +121,13 @@ func Main() {
 		switch v := m.(type) {
 		case wire.Configure:
 			cfg = v
+			if misbehave && os.Getenv(EnvCloseThenExit) != "" {
+				markOnce()
+				_ = conn.Close()
+				time.Sleep(50 * time.Millisecond)
+				_, _ = os.Stderr.WriteString("closing child exits\n")
+				os.Exit(2)
+			}
 			if crashAfter == 0 {
 				crash()
 			}

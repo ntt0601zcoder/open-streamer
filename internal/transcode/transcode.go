@@ -178,6 +178,7 @@ type Transcoder struct {
 	running  atomic.Bool
 	childOut atomic.Uint64 // frames received from children
 	bumps    atomic.Uint64 // bumps that took effect
+	hellos   atomic.Uint64 // valid Hellos received
 
 	mu    sync.Mutex
 	stats Stats
@@ -441,9 +442,22 @@ func (s *run) scheduleRespawn(uptime time.Duration) {
 }
 
 // toChild queues m for the current child, waiting while its queue is full.
+//
+// Before the child's Hello it never waits: a child that is slow to start, or
+// never says Hello, must not stall the copy renditions. A message that does
+// not fit is dropped, and the child is then fed again only from the K of a
+// bump after its Hello, so its input never has a gap.
 func (s *run) toChild(m wire.Message) {
 	c := s.c
 	if c == nil {
+		return
+	}
+	select {
+	case <-c.helloOK:
+	default:
+		if !s.tryChild(m) {
+			s.r.overflowBeforeHello()
+		}
 		return
 	}
 	select {
@@ -589,7 +603,16 @@ func (t *Transcoder) startChild(wg *sync.WaitGroup) (*child, error) {
 		defer wg.Done()
 		defer close(readDone)
 		c.cause = t.readChild(c)
-		// The socket has ended: a child still running is wedged.
+		if c.cause == nil {
+			// The child closed its socket: let it exit on its own, with
+			// its exit status and last stderr lines, before killing it.
+			timer := time.NewTimer(stopGrace)
+			select {
+			case <-c.exited:
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
 		c.kill()
 	}()
 	go func() {
@@ -640,6 +663,7 @@ func (t *Transcoder) readChild(c *child) error {
 		_ = c.p.conn.SetReadDeadline(time.Time{})
 	}
 	c.reapMu.Unlock()
+	t.hellos.Add(1)
 	close(c.helloOK)
 	c.hello <- struct{}{}
 	for {
@@ -692,6 +716,9 @@ func (t *Transcoder) writeChild(c *child) {
 	select {
 	case <-c.helloOK:
 	case <-c.quit:
+		// The child reads its socket once it has sent Hello: Stop then
+		// ends it without waiting out the kill.
+		_ = c.w.Write(wire.Stop{})
 		return
 	case <-c.exited:
 		return
