@@ -17,16 +17,19 @@
 // must not promise it for a Forced segment. Leading audio held for the
 // video anchor's first keyframe is likewise kept to MaxDuration.
 //
-// Every track is cut at the anchor's cut PTS K, not by arrival order (ruling
-// R-F3), for the cuts made within an epoch: on a keyframe, at MaxDuration
-// (K is the PTS of the frame that triggers it) and when the anchor changes.
-// Non-anchor frames of the closing segment presented at or after K move to
-// the next segment (to the carry when an anchor change opens none), and the
-// closed segment is held until every other track of the epoch has delivered
-// a frame at or after K, or the anchor is 1 s past K. A track that makes a
-// hold time out is not waited for again until it delivers. Non-anchor frames
-// below K that arrive while the segment is held go into it; after its
-// release they go into the open segment and count as Late. Held segments
+// Audio is cut at the anchor's cut PTS K, not by arrival order (rulings
+// R-F3 and R-T1d), for the cuts made within an epoch: on a keyframe, at
+// MaxDuration (K is the PTS of the frame that triggers it) and when the
+// anchor changes. Audio frames of the closing segment, other than the
+// anchor's, presented at or after K move to the next segment (to the carry
+// when an anchor change opens none), and the closed segment is held until
+// every other audio track of the epoch has delivered a frame at or after K,
+// or some track of the epoch has reached 1 s past K. An audio track that
+// makes a hold time out is not waited for again until it delivers. Audio
+// frames below K that arrive while the segment is held go into it; after
+// its release they go into the open segment and count as Late. Video tracks
+// other than the anchor are never moved or waited for: they stay in arrival
+// order, since their decode order differs from PTS order. Held segments
 // come out in Seq order, all of them before the open segment closes at an
 // epoch change, Lost > 0 or Flush; those closes neither move frames nor
 // hold, so a segment they close may hold audio past its end.
@@ -47,8 +50,8 @@ const (
 	audioSamples  = 1024 // AAC frame size
 	defaultRate   = 48000
 
-	// holdTimeout is how far past a cut the anchor may advance before the
-	// held segment is released without the tracks it waits for.
+	// holdTimeout is how far past a cut any track of the epoch may reach
+	// before the held segment is released without the tracks it waits for.
 	holdTimeout = media.ClockRate
 )
 
@@ -137,7 +140,8 @@ type Segmenter struct {
 	closed      bool          // a segment of this epoch has closed
 	carry       []media.Frame // leading audio waiting for the video anchor's keyframe
 	reached     map[int]int64 // per track of the epoch: its largest PTS so far
-	timedOut    map[int]bool  // tracks a hold stopped waiting for
+	audio       map[int]bool  // tracks of the epoch that carry audio
+	timedOut    map[int]bool  // audio tracks a hold stopped waiting for
 }
 
 // New returns a Segmenter.
@@ -150,16 +154,19 @@ func New(opt Options) *Segmenter {
 	if m <= 0 {
 		m = 5 * t
 	}
-	return &Segmenter{target: t, maxDur: max(m, t), anchor: -1, reached: map[int]int64{}, timedOut: map[int]bool{}}
+	return &Segmenter{
+		target: t, maxDur: max(m, t), anchor: -1,
+		reached: map[int]int64{}, audio: map[int]bool{}, timedOut: map[int]bool{},
+	}
 }
 
 // Dropped returns the number of frames discarded: those that arrived before
 // a segment could open, and early non-anchor frames after a loss.
 func (s *Segmenter) Dropped() uint64 { return s.dropped }
 
-// Late returns the number of non-anchor frames put in a segment that starts
-// after their PTS: those that arrived after the segment cut at their PTS was
-// released, and those below the first segment of an epoch.
+// Late returns the number of non-anchor audio frames put in a segment that
+// starts after their PTS: those that arrived after the segment cut at their
+// PTS was released, and those below the first segment of an epoch.
 func (s *Segmenter) Late() uint64 { return s.late }
 
 // Push feeds one delivery and returns the segments it completed.
@@ -175,6 +182,7 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 		s.anchor, s.anchorVideo, s.closed = -1, false, false
 		s.dropCarry()
 		clear(s.reached)
+		clear(s.audio)
 		clear(s.timedOut)
 	}
 	if d.Lost > 0 {
@@ -184,6 +192,9 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 	}
 	if r, ok := s.reached[f.Track]; !ok || f.PTS > r {
 		s.reached[f.Track] = f.PTS
+	}
+	if f.Kind() == media.KindAudio {
+		s.audio[f.Track] = true
 	}
 	delete(s.timedOut, f.Track)
 	if s.promote(f) && s.cur != nil {
@@ -197,7 +208,7 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 	isAnchor := f.Track == s.anchor
 	opens := isAnchor && (f.Key || !s.anchorVideo)
 	switch {
-	case !isAnchor && s.toHeld(f):
+	case !isAnchor && f.Kind() == media.KindAudio && s.toHeld(f):
 	case s.cur == nil && !opens && s.carry != nil && !isAnchor:
 		s.carry = append(s.carry, f)
 		s.trimCarry()
@@ -218,11 +229,11 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 	return s.release(out)
 }
 
-// cut closes the open segment at K within the epoch: its frames of tracks
-// other than the epoch's anchor presented at or after K go to the carry,
-// from where the next segment takes them, and it is held. A K at or before
-// the segment's start (an anchor change to a track presented earlier) moves
-// nothing. duration is as for closeOpen.
+// cut closes the open segment at K within the epoch: its audio frames of
+// tracks other than the epoch's anchor presented at or after K go to the
+// carry, from where the next segment takes them, and it is held. Video
+// frames never move. A K at or before the segment's start (an anchor change
+// to a track presented earlier) moves nothing. duration is as for closeOpen.
 func (s *Segmenter) cut(k, duration int64) {
 	c := s.cur
 	s.cur = nil
@@ -230,7 +241,7 @@ func (s *Segmenter) cut(k, duration int64) {
 	moved := []media.Frame{}
 	kept := c.seg.Frames[:0]
 	for _, f := range c.seg.Frames {
-		if f.Track != s.anchor && f.PTS >= k && k > c.seg.Start {
+		if f.Track != s.anchor && f.Kind() == media.KindAudio && f.PTS >= k && k > c.seg.Start {
 			moved = append(moved, f)
 		} else {
 			kept = append(kept, f)
@@ -248,8 +259,8 @@ func (s *Segmenter) cut(k, duration int64) {
 	s.held = append(s.held, held{c: c, k: k, duration: duration})
 }
 
-// toHeld puts a non-anchor frame presented before a held segment's cut into
-// the first such segment, and reports whether it did.
+// toHeld puts a non-anchor audio frame presented before a held segment's
+// cut into the first such segment, and reports whether it did.
 func (s *Segmenter) toHeld(f media.Frame) bool {
 	for i := range s.held {
 		if f.PTS < s.held[i].k {
@@ -261,14 +272,16 @@ func (s *Segmenter) toHeld(f media.Frame) bool {
 }
 
 // place adds a frame to c. A non-anchor frame presented before c's start is
-// dropped after a loss, else kept and counted late.
+// dropped after a loss, else kept, and counted late if it is audio.
 func (s *Segmenter) place(c *open, f media.Frame) {
 	if f.Track != s.anchor && f.PTS < c.seg.Start {
 		if c.lost {
 			s.dropped++
 			return
 		}
-		s.late++
+		if f.Kind() == media.KindAudio {
+			s.late++
+		}
 	}
 	addTo(c, f)
 }
@@ -287,30 +300,39 @@ func (s *Segmenter) release(out []Segment) []Segment {
 	return out
 }
 
-// releasable reports whether a segment cut at k may come out: every track
-// of the epoch other than the anchor has reached k or was given up, or the
-// anchor is holdTimeout past k, in which case the tracks still short of k
-// are given up until they deliver again.
+// releasable reports whether a segment cut at k may come out: every audio
+// track of the epoch other than the anchor has reached k or was given up,
+// or some track of the epoch has reached holdTimeout past k, in which case
+// the audio tracks still short of k are given up until they deliver again.
+// Timing out on any track, not only the anchor, bounds the held segments
+// when the anchor stalls and forced cuts follow another track.
 func (s *Segmenter) releasable(k int64) bool {
 	waiting := false
+	furthest := k
 	for tr, r := range s.reached {
-		if tr != s.anchor && !s.timedOut[tr] && r < k {
+		furthest = max(furthest, r)
+		if s.waitsFor(tr) && r < k {
 			waiting = true
-			break
 		}
 	}
 	if !waiting {
 		return true
 	}
-	if r, ok := s.reached[s.anchor]; !ok || r < k+holdTimeout {
+	if furthest < k+holdTimeout {
 		return false
 	}
 	for tr, r := range s.reached {
-		if tr != s.anchor && r < k {
+		if s.waitsFor(tr) && r < k {
 			s.timedOut[tr] = true
 		}
 	}
 	return true
+}
+
+// waitsFor reports whether a hold waits for track tr: an audio track of the
+// epoch other than the anchor that has not timed out.
+func (s *Segmenter) waitsFor(tr int) bool {
+	return tr != s.anchor && s.audio[tr] && !s.timedOut[tr]
 }
 
 // closeAll emits every held segment, in order, then closes the open one,

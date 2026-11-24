@@ -58,12 +58,13 @@ import (
 // are TestM3GStreamerClass, which overlaps them. On the HLS TS, HLS fMP4
 // and DASH rows, VLC 3.0.20 may reset its clock at the live start and then
 // log two decoder errors ("Timestamp conversion failed for N: no reference
-// clock", "Could not convert timestamp 0 for FFmpeg"): on HLS fMP4 and DASH
-// in about 20 % of runs whether or not segments are aligned (R-F3 A/B: 7/30
-// before, 6/30 after), on HLS TS in about 1 of 30 runs since R-F3 added one
-// reset there. Ruling R-T1c tolerates on those rows one such pair right
-// after each reset, at most 4 per VLC process (vlcBadLines). Any other
-// decoder error fails.
+// clock", "Could not convert timestamp 0 for FFmpeg"). Measured in the
+// 30-run A/B of R-F3: on HLS fMP4 in 7/30 runs before it and 6/30 after,
+// on HLS TS in 0/30 before and 1/30 after (R-F3 added one reset there).
+// DASH was not in that A/B; with R-F3 it showed the pair in 2 of 3 runs.
+// Ruling R-T1c tolerates on those rows one such pair right after each
+// reset, at most 4 per VLC process (vlcBadLines). Any other decoder error
+// fails.
 //
 // http-ts- and srt-audio-only-stretch (A/V, then 6 s of audio only, then
 // A/V) check that audio is decoded through the stretch, while the TS
@@ -81,11 +82,12 @@ func TestM3VLCClass(t *testing.T) {
 	for _, out := range []struct {
 		name, path string
 		modules    []string
+		tolerate   bool // VLC's start-up pair (ruling R-T1c)
 	}{
-		{"hls-fmp4", "/cmaf/master.m3u8", []string{"adaptive", "mp4", "avcodec"}},
-		{"hls-ts", "/hls/index.m3u8", []string{"adaptive", "ts", "avcodec"}},
-		{"dash", "/cmaf/index.mpd", []string{"adaptive", "mp4", "avcodec"}},
-		{"http-ts", "/stream.ts", []string{"http", "ts", "avcodec"}},
+		{"hls-fmp4", "/cmaf/master.m3u8", []string{"adaptive", "mp4", "avcodec"}, true},
+		{"hls-ts", "/hls/index.m3u8", []string{"adaptive", "ts", "avcodec"}, true},
+		{"dash", "/cmaf/index.mpd", []string{"adaptive", "mp4", "avcodec"}, true},
+		{"http-ts", "/stream.ts", []string{"http", "ts", "avcodec"}, false},
 	} {
 		t.Run(out.name, func(t *testing.T) {
 			vlc := testpeer.VLC(t, out.modules...)
@@ -99,7 +101,7 @@ func TestM3VLCClass(t *testing.T) {
 				// suggestedPresentationDelay (6 s) behind the live edge.
 				waitListed(t, p, 5)
 			}
-			vlcPlays(t, vlc, ffprobe, origin+"/live/s"+out.path, out.name != "http-ts")
+			vlcPlays(t, vlc, ffprobe, origin+"/live/s"+out.path, out.tolerate)
 		})
 	}
 	t.Run("srt", func(t *testing.T) {

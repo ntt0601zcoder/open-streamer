@@ -156,14 +156,15 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 
 - **Segmenter:** cuts the frame sequence into segments and parts on video
   keyframes, from stream time only. It decides timing once; HLS-TS, HLS-fMP4,
-  DASH and DVR consume the same segments. Every track is cut at the cut's
-  PTS K, not by arrival order (ruling R-F3, M4a): at a keyframe, MaxDuration
-  or anchor-change cut, frames of other tracks presented at or after K move
-  to the next segment, and the closed segment is held until every other
-  track of the epoch reaches K or the anchor is 1 s past it (later frames
-  below K are counted by `Late()`); closes at an epoch change, `Lost` or
-  `Flush` move nothing, so a segment closed by an epoch change or `Lost` may
-  hold audio past its end.
+  DASH and DVR consume the same segments. Audio is cut at the cut's PTS K,
+  not by arrival order (rulings R-F3 and R-T1d, M4a): at a keyframe,
+  MaxDuration or anchor-change cut, audio presented at or after K moves to
+  the next segment, and the closed segment is held until every other audio
+  track of the epoch reaches K or any track is 1 s past it (later audio
+  below K is counted by `Late()`). Video tracks other than the anchor stay
+  in arrival order, since their decode order differs from PTS order. Closes
+  at an epoch change, `Lost` or `Flush` move nothing, so a segment closed by
+  an epoch change or `Lost` may hold audio past its end.
 - **TS muxer** (our `pkg/mpegts` writer), **fMP4 writer** (mp4ff `mp4`), **FLV tag
   codec** with enhanced RTMP for H.265 (`pkg/rtmp`), **RTP** packetisers, all
   our own in `pkg/rtsp` (M3b2): H.264 (RFC 6184, single NAL unit and FU-A),
@@ -564,11 +565,12 @@ Items accepted for later, not yet placed in a milestone:
   `OS_PEER_LIMITS=1` probes the limitation). It would very likely make
   GStreamer play across an audio-less stretch, and also help hls.js if stalls
   are reported there.
-- **VLC 3's start-up "no reference clock" pair on HLS fMP4 and DASH**
-  appears in about 20 % of runs whether or not segments are aligned (R-F3
-  A/B: 7/30 before, 6/30 after). `TestM3VLCClass` tolerates it on those two
-  rows (ruling R-T1c). Next: investigate VLC's fMP4/DASH clock start. Normal
-  priority.
+- **VLC 3's start-up "no reference clock" pair on HLS fMP4 and DASH.** On
+  HLS fMP4 it appears in about 20 % of runs whether or not segments are
+  aligned (30-run R-F3 A/B: 7/30 before, 6/30 after). DASH was not part of
+  that A/B; with R-F3 it appeared in 2 of 3 runs. `TestM3VLCClass` tolerates
+  it on both rows (ruling R-T1c). Next: investigate VLC's fMP4/DASH clock
+  start, and measure DASH as HLS fMP4 was. Normal priority.
 - **VLC 3 HLS-TS: R-F3 adds one deterministic clock reset at live start** (in
   `TestM3VLCClass` it lands on the loop seam of the 4× concatenated source,
   `hls/6.ts`; the 'no reference clock' pair follows in 1 of 30 runs).

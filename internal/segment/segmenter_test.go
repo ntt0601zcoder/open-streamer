@@ -570,15 +570,16 @@ func TestAudioCutForcedCut(t *testing.T) {
 	}
 }
 
-// Target 0.4 s, and audio falls 0.9 s behind after 2 s: several segments
-// wait at once and come out in order.
+// Target 0.5 s (50 fps video, a keyframe every 0.5 s), and audio falls
+// 0.9 s behind after 2 s: several segments wait at once and come out in
+// order.
 func TestAudioCutShortTarget(t *testing.T) {
-	s := New(Options{Target: 36000})
+	s := New(Options{Target: 45000})
 	var segs []Segment
 	var nextA int64
 	maxHeld := 0
-	for v := int64(0); v <= 900000; v += 3600 {
-		segs = append(segs, s.Push(vid(1, v, v%36000 == 0))...)
+	for v := int64(0); v <= 900000; v += 1800 {
+		segs = append(segs, s.Push(vid(1, v, v%45000 == 0))...)
 		lag := int64(0)
 		if v >= 180000 {
 			lag = 81000
@@ -590,8 +591,199 @@ func TestAudioCutShortTarget(t *testing.T) {
 	}
 	assert.GreaterOrEqual(t, maxHeld, 2)
 	segs = append(segs, s.Flush()...)
-	require.Len(t, segs, 26)
+	require.Len(t, segs, 21)
 	assertSeqs(t, segs)
 	assertAudioInside(t, segs[:len(segs)-1])
 	assert.Zero(t, s.Late())
+}
+
+// frame returns a frame of any track and config.
+func frame(track int, cfg *media.TrackConfig, pts, dts int64, key bool) hub.Delivery {
+	return hub.Delivery{Frame: media.Frame{Track: track, Config: cfg, PTS: pts, DTS: dts, Key: key, Epoch: 1}}
+}
+
+// bframes returns the n-th frame, in decode order, of 25 fps video in
+// closed GOPs of 49 frames (I, then P B B groups): DTS n×3600, PTS its
+// display slot + 2 frames, keyframe on each GOP's I.
+func bframes(n int64) (pts, dts int64, key bool) {
+	j := n % 49
+	disp := j
+	switch {
+	case j == 0:
+	case (j-1)%3 == 0:
+		disp = j + 2 // P
+	default:
+		disp = j - 1 // B
+	}
+	return (n - j + disp + 2) * 3600, n * 3600, j == 0
+}
+
+// shifted returns bframes for a GOP phase 20 frames off, on the same
+// timeline, so the anchor's cuts fall in the middle of its GOPs.
+func shifted(n int64) (pts, dts int64, key bool) {
+	pts, dts, key = bframes(n + 20)
+	return pts - 20*3600, dts - 20*3600, key
+}
+
+// assertDTSOrder checks that every track's DTS strictly increases across
+// the segments, in segment order.
+func assertDTSOrder(t *testing.T, segs []Segment) {
+	t.Helper()
+	last := map[int]int64{}
+	for _, g := range segs {
+		for _, f := range g.Frames {
+			if prev, ok := last[f.Track]; ok {
+				assert.Greater(t, f.DTS, prev, "segment %d: track %d DTS goes backwards", g.Seq, f.Track)
+			}
+			last[f.Track] = f.DTS
+		}
+	}
+}
+
+// Ruling R-T1d: only audio is cut at K. A second video track with B-frames
+// (decode order P B B) stays in arrival order, so its DTS never goes
+// backwards across segments, with audio 200 ms behind; likewise the old
+// anchor at a video-to-video anchor change.
+func TestVideoTracksKeepDecodeOrder(t *testing.T) {
+	t.Run("second-video-track", func(t *testing.T) {
+		s := New(Options{})
+		var segs []Segment
+		var nextA int64
+		for n := int64(0); n < 300; n++ {
+			pts, dts, key := bframes(n)
+			segs = append(segs, s.Push(frame(0, h264, pts, dts, key))...)
+			pts2, dts2, key2 := shifted(n)
+			segs = append(segs, s.Push(frame(2, h264, pts2, dts2, key2))...)
+			for ; nextA <= dts-18000; nextA += aDur {
+				segs = append(segs, s.Push(aud(nextA))...)
+			}
+		}
+		segs = append(segs, s.Flush()...)
+		require.Greater(t, len(segs), 3)
+		assertSeqs(t, segs)
+		assertDTSOrder(t, segs)
+		assertAudioInside(t, segs[1:len(segs)-1])
+	})
+	t.Run("video-anchor-change", func(t *testing.T) {
+		s := New(Options{})
+		var segs []Segment
+		for n := int64(0); n < 300; n++ {
+			pts2, dts2, key2 := shifted(n)
+			segs = append(segs, s.Push(frame(2, h264, pts2, dts2, key2))...)
+			pts, dts, key := bframes(n)
+			if n >= 98 { // track 0 joins on a keyframe and becomes the anchor
+				segs = append(segs, s.Push(frame(0, h264, pts, dts, key))...)
+			}
+		}
+		segs = append(segs, s.Flush()...)
+		require.Greater(t, len(segs), 2)
+		assertSeqs(t, segs)
+		assertDTSOrder(t, segs)
+	})
+}
+
+// Ruling R-T1d: a hold times out when any track is 1 s past its cut. Video
+// stalls after 2 s, audio track 1 keeps flowing and audio track 3 stalls
+// with the video: the forced cuts on track 1 still come out, and at most
+// two segments are held at any time.
+func TestHoldBoundedWhenAnchorStalls(t *testing.T) {
+	aac3 := &media.TrackConfig{Codec: media.CodecAAC, SampleRate: 48000, Channels: 2}
+	s := New(Options{})
+	var segs []Segment
+	maxHeld := 0
+	for a := int64(0); a < 120*90000; a += aDur {
+		if a < 180000 && a%3600 < aDur {
+			segs = append(segs, s.Push(vid(1, a-a%3600, a%90000 < aDur))...)
+		}
+		segs = append(segs, s.Push(aud(a))...)
+		if a < 180000 {
+			segs = append(segs, s.Push(frame(3, aac3, a, a, true))...)
+		}
+		maxHeld = max(maxHeld, len(s.held))
+	}
+	assert.LessOrEqual(t, maxHeld, 2)
+	assert.Greater(t, len(segs), 10, "forced cuts keep coming out")
+	assertSeqs(t, segs)
+}
+
+// M1: after a cut moves audio, the closed segment's End comes from the
+// frames that stay (the accumulators are rebuilt).
+func TestAudioCutEndAfterMove(t *testing.T) {
+	s := New(Options{})
+	var segs []Segment
+	var nextA int64
+	for v := int64(0); v <= 180000; v += 3600 {
+		for ; nextA <= v+18000; nextA += aDur {
+			segs = append(segs, s.Push(aud(nextA))...)
+		}
+		segs = append(segs, s.Push(vid(1, v, v%180000 == 0))...)
+	}
+	require.Len(t, segs, 1)
+	g := segs[0]
+	var want int64
+	for _, f := range g.Frames {
+		d := int64(3600)
+		if f.Kind() == media.KindAudio {
+			d = aDur
+		}
+		want = max(want, f.PTS+d)
+	}
+	assert.Equal(t, want, g.End)
+	assert.Less(t, g.End, g.Start+g.Duration+aDur)
+}
+
+// M1: an audio track that made a hold time out is waited for again once it
+// delivers: audio stops at 4.5 s and resumes 100 ms behind video at 7.5 s,
+// so the cut at 8 s is held until the audio reaches it.
+func TestAudioTimedOutTrackRejoins(t *testing.T) {
+	s := New(Options{})
+	emitted := map[uint64]int64{}
+	var nextA, lastV int64
+	for i := 0; i <= 250; i++ {
+		lastV = int64(i) * 3600
+		for _, g := range s.Push(vid(1, lastV, lastV%180000 == 0)) {
+			emitted[g.Seq] = lastV
+		}
+		for ; nextA <= lastV-9000; nextA += aDur {
+			if nextA >= 405000 && nextA < 675000 {
+				continue
+			}
+			for _, g := range s.Push(aud(nextA)) {
+				emitted[g.Seq] = lastV
+			}
+		}
+	}
+	assert.EqualValues(t, 630000, emitted[2], "the cut at 6 s times out 1 s later")
+	assert.Greater(t, emitted[3], int64(720000), "the cut at 8 s waits for the returned audio")
+}
+
+// M1: at an anchor change whose new anchor frame is not a keyframe, the
+// audio presented at or after the cut goes to the carry and reaches the
+// next segment.
+func TestPromoteCutCarriesMovedAudio(t *testing.T) {
+	s := New(Options{})
+	var segs []Segment
+	for a := int64(0); a <= 300*aDur; a += aDur { // an audio-only stretch
+		segs = append(segs, s.Push(aud(a))...)
+	}
+	require.NotEmpty(t, segs)
+	k := int64(300*aDur) - 18000
+	segs = append(segs, s.Push(vid(1, k, false))...)     // the anchor changes on a non-key frame
+	segs = append(segs, s.Push(vid(1, k+3600, true))...) // then the keyframe
+	segs = append(segs, s.Flush()...)
+	last := segs[len(segs)-1]
+	assert.EqualValues(t, k+3600, last.Start)
+	var carried int
+	for _, f := range last.Frames {
+		if f.Kind() == media.KindAudio {
+			carried++
+			assert.GreaterOrEqual(t, f.PTS, k+3600)
+		}
+	}
+	assert.Equal(t, int((int64(300*aDur)-(k+3600))/aDur)+1, carried, "audio at or after the keyframe is carried")
+	for _, g := range segs[:len(segs)-1] {
+		for _, f := range g.Frames {
+			assert.Less(t, f.PTS, k, "segment %d keeps no audio at or after the cut", g.Seq)
+		}
+	}
 }
