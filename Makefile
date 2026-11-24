@@ -1,4 +1,4 @@
-.PHONY: test lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers
+.PHONY: test lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers ostranscoder test-transcode
 
 test:
 	go test -race -shuffle=on -count=1 -timeout=10m ./...
@@ -40,3 +40,27 @@ fixtures:
 test-ci-peers: export TEST_CI_PEERS_ARGS := $(value ARGS)
 test-ci-peers:
 	@set -f; sh scripts/test-ci-peers.sh $$TEST_CI_PEERS_ARGS
+
+# The transcoder (M4a). Both targets fetch the pinned FFmpeg 8.1 on the host
+# first (scripts/ffmpeg-dev.sh, cached in ~/.cache/osv2-ffmpeg), then run in
+# osv2-ci-peers:m4a through scripts/test-ci-peers.sh --exec, with its mounts:
+# Ubuntu 24.04's glibc, and PKG_CONFIG_PATH and LD_LIBRARY_PATH on the
+# prefix. The arch is the host's: there is no cross build.
+OSTX_ARCH := $(shell uname -m | sed 's/^x86_64$$/amd64/; s/^aarch64$$/arm64/')
+
+# Builds and bundles cmd/ostranscoder into dist/ostranscoder-<arch>/: the
+# binary, with DT_RPATH $$ORIGIN/lib, and lib/ with the FFmpeg libraries it
+# links. See scripts/bundle-ostranscoder.sh.
+ostranscoder:
+	@sh scripts/ffmpeg-dev.sh $(OSTX_ARCH) >/dev/null
+	@sh scripts/test-ci-peers.sh --name osv2-ostx-build-$$$$ --exec \
+		sh scripts/bundle-ostranscoder.sh $(OSTX_ARCH) dist/ostranscoder-$(OSTX_ARCH)
+
+# go test -race -tags libav $(ARGS) in the same container. ARGS is quoted as
+# for test-ci-peers, and defaults to the cgo packages that exist.
+TRANSCODE_PKGS := $(patsubst %,./%/...,$(wildcard internal/transcode/native cmd/ostranscoder))
+test-transcode: export TEST_TRANSCODE_ARGS := $(value ARGS)
+test-transcode:
+	@sh scripts/ffmpeg-dev.sh $(OSTX_ARCH) >/dev/null
+	@set -f; sh scripts/test-ci-peers.sh --name osv2-ostx-test-$$$$ --exec \
+		go test -race -tags libav $${TEST_TRANSCODE_ARGS:-$(TRANSCODE_PKGS)}

@@ -14,6 +14,9 @@ dts() { ffprobe -v error -select_streams v -show_entries packet=pts,dts,flags -o
 
 $F $(v 320x240) $(a 48000) -t 6 $X264 -c:a aac -ac 2 -b:a 64k  $BX h264_aac.ts
 dts h264_aac.ts h264_aac_dts.txt
+# h264_aac.ts without B-frames: decode order is presentation order (DTS = PTS).
+$F $(v 320x240) $(a 48000) -t 6 $X264 -bf 0 -c:a aac -ac 2 -b:a 64k $BX h264_aac_nob.ts
+dts h264_aac_nob.ts h264_aac_nob_dts.txt
 $F $(v 320x240) $(a 44100) -t 6 $X265 -c:a aac -ac 6 -b:a 128k $BX h265_aac51.ts
 dts h265_aac51.ts h265_aac51_dts.txt
 $F $(v 320x240) $(a 44100) -t 6 $X264 -c:a aac -ac 1 -b:a 64k -output_ts_offset 95440 $BX h264_aacmono_wrap.ts
