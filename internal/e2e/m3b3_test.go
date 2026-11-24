@@ -482,19 +482,19 @@ func assertTSMatchesHub(t *testing.T, hubFrames, got []media.Frame) {
 
 // tsResumes checks the frames of a TS reader that read to the hub's end but
 // lost frames on the way: every frame is a hub frame (by PTS, one offset
-// over the stream, the hub's last video frame aligned with the reader's),
-// with the hub frame's DTS and key flag; the first video frame and the
-// first after every gap are keyframes. It returns the number of gaps.
+// over the stream, tsOffset), with the hub frame's DTS and key flag; the
+// first video frame and the first after every gap are keyframes. It returns
+// the number of gaps.
 func tsResumes(t *testing.T, hubFrames, got []media.Frame) (gaps int) {
 	t.Helper()
 	hv, _ := byKind(hubFrames, media.KindVideo)
 	gv, _ := byKind(got, media.KindVideo)
 	require.NotEmpty(t, gv, "video received")
-	off := hv[len(hv)-1].PTS - gv[len(gv)-1].PTS
 	at := map[int64]int{}
 	for i, f := range hv {
 		at[f.PTS] = i
 	}
+	off := tsOffset(t, hv, gv, at)
 	prev := -1
 	for i, f := range gv {
 		j, ok := at[f.PTS+off]
@@ -521,6 +521,36 @@ func tsResumes(t *testing.T, hubFrames, got []media.Frame) (gaps int) {
 		require.True(t, pts[f.PTS+off], "audio %d (PTS %d) is a hub frame", i, f.PTS+off)
 	}
 	return gaps
+}
+
+// tsOffset returns the offset from a lossy TS reader's video timestamps to
+// the hub's: the one under which every frame the reader got, from its first
+// (a keyframe), is a hub frame with the same DTS and key flag. The reader's
+// last frame is not aligned with the hub's, because a loss in the hub's
+// last GOP leaves no keyframe to resume at and the reader's tail is
+// missing. at maps each hub video PTS to its index in hv.
+func tsOffset(t *testing.T, hv, gv []media.Frame, at map[int64]int) int64 {
+	t.Helper()
+	var offs []int64
+	for _, k := range hv {
+		if !k.Key {
+			continue
+		}
+		off := k.PTS - gv[0].PTS
+		ok := true
+		for _, f := range gv {
+			j, found := at[f.PTS+off]
+			if !found || hv[j].DTS-off != f.DTS || hv[j].Key != f.Key {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			offs = append(offs, off)
+		}
+	}
+	require.Len(t, offs, 1, "one hub keyframe aligns every video frame the reader got")
+	return offs[0]
 }
 
 // clockStepsData is clockSteps over the TS bytes data.
