@@ -72,6 +72,16 @@ jobs:
           done
       - name: go vet -tags libav
         run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go vet -tags libav $OSTX_PKGS
+      # The lint and govulncheck jobs build without the tag, so they never
+      # see the libav packages: lint them here with the lint job's version,
+      # and scan the tagged build with the govulncheck job's version.
+      - name: golangci-lint --build-tags libav
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0
+          args: --build-tags libav ${{ env.OSTX_PKGS }}
+      - name: govulncheck -tags libav
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -tags libav ./...
       - name: go test -race -tags libav
         run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go test -race -count=1 -tags libav $OSTX_PKGS
       - name: Bundle ostranscoder
