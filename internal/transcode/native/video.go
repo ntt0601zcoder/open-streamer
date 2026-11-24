@@ -25,8 +25,6 @@ const (
 	// fpsSnap is the relative distance within which an estimate is taken as
 	// the nearest common framerate.
 	fpsSnap = 0.01
-	// maxBadPictures bounds the decode errors skipped in one receive loop.
-	maxBadPictures = 64
 )
 
 // timeBase is the time base of every codec context: 90 kHz, like Frame.
@@ -48,6 +46,7 @@ var commonFPS = []astiav.Rational{
 // Config, and the rung encoders at the first decoded frame. drain flushes
 // and releases a build.
 type videoPath struct {
+	stats  *Stats
 	rungs  []Rung
 	caches []media.ConfigCache // one per rung, kept across builds
 	track  int
@@ -63,14 +62,15 @@ type videoPath struct {
 	pending  []media.Frame  // input held until the framerate is known
 	seenDTS  []int64        // DTS of every frame received while the framerate is unknown, skipped ones too
 	encs     []*rungEncoder // opened at the build's first decoded picture
+	corrupt  corruptRun     // the decoder's consecutive corrupt frames
 
 	// The framerate, estimated once per source config.
 	fpsCfg *media.TrackConfig
 	fps    astiav.Rational
 }
 
-func newVideoPath(rungs []Rung) *videoPath {
-	return &videoPath{rungs: rungs, caches: make([]media.ConfigCache, len(rungs))}
+func newVideoPath(rungs []Rung, st *Stats) *videoPath {
+	return &videoPath{stats: st, rungs: rungs, caches: make([]media.ConfigCache, len(rungs))}
 }
 
 // push feeds one frame of the encoded video track.
@@ -145,6 +145,7 @@ func (v *videoPath) build(f media.Frame) error {
 	v.cfg, v.dec = f.Config, cc
 	v.pkt, v.frm = newInPacket(), astiav.AllocFrame()
 	v.startPTS, v.skipRASL = f.PTS, true
+	v.corrupt = corruptRun{}
 	return nil
 }
 
@@ -215,28 +216,37 @@ func (v *videoPath) feed(f media.Frame, epoch uint32) ([]Output, error) {
 	if f.Key {
 		v.keys = append(v.keys, f.PTS)
 	}
-	if err := v.pkt.send(v.dec); err != nil && !errors.Is(err, astiav.ErrInvaliddata) {
+	// A corrupt access unit is skipped and counted. Damage the decoder can
+	// conceal is not an error.
+	switch err := v.pkt.send(v.dec); {
+	case isCorruptData(err):
+		if err := v.corrupt.add(&v.stats.VideoCorrupt, err); err != nil {
+			return nil, fmt.Errorf("video decoder: %w", err)
+		}
+	case err != nil:
 		return nil, fmt.Errorf("video decoder: send: %w", err)
 	}
-	// A corrupt access unit is skipped; the decoder conceals it.
 	return v.receive(epoch)
 }
 
 // receive encodes every picture the decoder has ready.
 func (v *videoPath) receive(epoch uint32) ([]Output, error) {
 	var out []Output
-	for bad := 0; ; {
+	for {
 		err := v.dec.ReceiveFrame(v.frm)
 		switch {
 		case errors.Is(err, astiav.ErrEagain), errors.Is(err, astiav.ErrEof):
 			return out, nil
-		case errors.Is(err, astiav.ErrInvaliddata) && bad < maxBadPictures:
+		case isCorruptData(err):
 			// A picture that failed to decode is skipped.
-			bad++
+			if err := v.corrupt.add(&v.stats.VideoCorrupt, err); err != nil {
+				return out, fmt.Errorf("video decoder: %w", err)
+			}
 			continue
 		case err != nil:
 			return out, fmt.Errorf("video decoder: receive: %w", err)
 		}
+		v.corrupt.ok()
 		o, err := v.encode(v.frm, epoch)
 		v.frm.Unref()
 		out = append(out, o...)

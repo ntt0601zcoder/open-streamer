@@ -598,8 +598,7 @@ func TestPipelineRungOpenFailure(t *testing.T) {
 // window, max_sfb 0) with the SSR gain_control_data_present bit set and
 // zeros after it. FFmpeg 8.1 parses gain control (it only warns that it is
 // not implemented), so the frame fails later, on the zeros, as
-// AVERROR_INVALIDDATA; no practical frame yields AVERROR_PATCHWELCOME, whose
-// classification TestIsCorruptData checks directly.
+// AVERROR_INVALIDDATA.
 var gainControlAAC = []byte{
 	// 001 0000 0 | 01100100 | 0 00 0 0000|00 0 0 0 1 00 | zero padding
 	0x20, 0x64, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
@@ -609,27 +608,129 @@ var gainControlAAC = []byte{
 // stream does not have: AVERROR_INVALIDDATA.
 var invalidAAC = []byte{0x0a, 0x64, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00}
 
+// minusOneAAC is a fuzz-found raw AAC frame (a fill element with a broken
+// extension payload) that the decoder rejects with a bare -1, EPERM.
+var minusOneAAC = []byte{0xa7, 0x10, 0x68, 0x92, 0xae, 0x7d}
+
+// adtsAAC starts with the ADTS sync word, so the decoder parses an ADTS
+// header and rejects it with a private AAC_PARSE_ERROR code.
+var adtsAAC = []byte{0xff, 0xff, 0xff, 0xff}
+
 func TestIsCorruptData(t *testing.T) {
 	assert.True(t, isCorruptData(astiav.ErrInvaliddata))
 	assert.True(t, isCorruptData(astiav.ErrPatchwelcome))
+	assert.True(t, isCorruptData(astiav.Error(-1)))
+	assert.True(t, isCorruptData(astiav.Error(-0x3030c0a)))
 	assert.True(t, isCorruptData(fmt.Errorf("wrapped: %w", astiav.ErrPatchwelcome)))
 	assert.False(t, isCorruptData(nil))
+	assert.False(t, isCorruptData(errNoMem))
+	assert.False(t, isCorruptData(fmt.Errorf("wrapped: %w", errNoMem)))
 	assert.False(t, isCorruptData(astiav.ErrEagain))
 	assert.False(t, isCorruptData(astiav.ErrEof))
-	assert.False(t, isCorruptData(errors.New("other")))
 }
 
-// TestPipelineAudioCorrupt: frames the AAC decoder rejects as corrupt are
-// skipped and counted, and the pipeline keeps going.
+// TestPipelineAudioCorrupt: frames the AAC decoder rejects, whatever the
+// error, are skipped and counted, and the pipeline keeps going.
 func TestPipelineAudioCorrupt(t *testing.T) {
 	audio := ofKind(source(t, "h264_aac.ts"), media.KindAudio)
 	src := slices.Clone(audio)
-	src[50].Data = [][]byte{gainControlAAC}
-	src[120].Data = [][]byte{invalidAAC}
+	bad := map[int][]byte{50: gainControlAAC, 120: invalidAAC, 180: minusOneAAC, 240: adtsAAC}
+	for i, d := range bad {
+		src[i].Data = [][]byte{d}
+	}
 	p := newPipeline(t, nil, &Audio{})
 	a := rungFrames(run(t, p, src), -1)
-	assert.Equal(t, uint64(2), p.Stats().AudioCorrupt)
-	assert.Len(t, a, len(src)-2)
+	assert.Equal(t, uint64(len(bad)), p.Stats().AudioCorrupt)
+	assert.Len(t, a, len(src)-len(bad))
 	requireConforms(t, a)
 	t.Logf("%d in, %d out, stats %+v", len(src), len(a), p.Stats())
+}
+
+// TestPipelineCorruptRunFails: 50 consecutive corrupt frames on one decoder
+// fail the pipeline for good; 49 followed by a good frame do not.
+func TestPipelineCorruptRunFails(t *testing.T) {
+	audio := ofKind(source(t, "h264_aac.ts"), media.KindAudio)
+	const at = 100
+	corrupt := func(n int) []media.Frame {
+		src := slices.Clone(audio)
+		for i := at; i < at+n; i++ {
+			src[i].Data = [][]byte{invalidAAC}
+		}
+		return src
+	}
+
+	t.Run("49 twice", func(t *testing.T) {
+		// Two runs of 49, with one good frame between them that ends the
+		// first run.
+		src := corrupt(2*maxCorruptRun - 1)
+		src[at+maxCorruptRun-1] = audio[at+maxCorruptRun-1]
+		p := newPipeline(t, nil, &Audio{})
+		a := rungFrames(run(t, p, src), -1)
+		assert.Equal(t, uint64(2*(maxCorruptRun-1)), p.Stats().AudioCorrupt)
+		assert.Len(t, a, len(audio)-2*(maxCorruptRun-1))
+		requireConforms(t, a)
+	})
+
+	t.Run("50", func(t *testing.T) {
+		p := newPipeline(t, nil, &Audio{})
+		src := corrupt(maxCorruptRun)
+		var (
+			first error
+			n     int
+		)
+		for i, f := range src {
+			if _, err := p.Push(f); err != nil {
+				first, n = err, i
+				break
+			}
+		}
+		require.Error(t, first)
+		assert.Equal(t, at+maxCorruptRun-1, n)
+		assert.Equal(t, uint64(maxCorruptRun), p.Stats().AudioCorrupt)
+		_, err := p.Push(src[n+1])
+		assert.Equal(t, first, err)
+		_, err = p.Flush()
+		assert.Equal(t, first, err)
+		t.Logf("frame %d: %v", n, first)
+	})
+}
+
+// TestPipelineVideoCorrupt: non-key frames with a broken slice header are
+// rejected by the decoder, skipped and counted; the output goes on with
+// every source key.
+func TestPipelineVideoCorrupt(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	nv, broken := 0, 0
+	for i, f := range src {
+		if f.Kind() != media.KindVideo {
+			continue
+		}
+		if nv >= 30 && nv < 34 && !f.Key {
+			data := make([][]byte, len(f.Data))
+			for j, n := range f.Data {
+				n = bytes.Clone(n)
+				if n[0]&0x1f == 1 { // a non-IDR slice: garble its header
+					for k := 1; k < min(len(n), 6); k++ {
+						n[k] = 0xff
+					}
+				}
+				data[j] = n
+			}
+			src[i].Data = data
+			broken++
+		}
+		nv++
+	}
+	require.Equal(t, 4, broken)
+	p := newPipeline(t, []Rung{{Height: 120, BitrateKbps: 150}}, &Audio{})
+	outs := run(t, p, src)
+
+	assert.Positive(t, p.Stats().VideoCorrupt)
+	v := rungFrames(outs, 0)
+	srcVideo := ofKind(src, media.KindVideo)
+	assert.Equal(t, keys(srcVideo), keys(v))
+	assert.GreaterOrEqual(t, len(v), len(srcVideo)-broken)
+	assert.Equal(t, srcVideo[len(srcVideo)-1].PTS, slices.MaxFunc(v, func(a, b media.Frame) int { return int(a.PTS - b.PTS) }).PTS)
+	requireConforms(t, rendition(outs, 0))
+	t.Logf("%d broken, stats %+v, %d of %d frames out", broken, p.Stats(), len(v), len(srcVideo))
 }

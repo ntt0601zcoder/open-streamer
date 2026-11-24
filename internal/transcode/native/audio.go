@@ -68,15 +68,7 @@ type audioTrack struct {
 	catchUp   bool  // the input is early: drop until it meets the prediction
 	primed    bool  // the build's first packet has been seen
 	resampled bool  // the resampler has had input
-}
-
-// isCorruptData reports whether a decoder error means a corrupt frame,
-// which is skipped. Besides AVERROR_INVALIDDATA, the AAC decoder reports
-// some corrupt bitstreams, such as a set SSR gain-control bit, as
-// AVERROR_PATCHWELCOME (a feature it does not implement); on lossy UDP or
-// SRT input that is one damaged frame, not a broken stream.
-func isCorruptData(err error) bool {
-	return errors.Is(err, astiav.ErrInvaliddata) || errors.Is(err, astiav.ErrPatchwelcome)
+	corrupt   corruptRun
 }
 
 func newAudioTrack(track int, out Audio) *audioTrack {
@@ -106,7 +98,9 @@ func (a *audioTrack) push(f media.Frame, epoch uint32, st *Stats) ([]Output, err
 	// A corrupt frame is skipped and counted: the timeline closes the hole.
 	switch err := a.decPkt.send(a.dec); {
 	case isCorruptData(err):
-		st.AudioCorrupt++
+		if err := a.corrupt.add(&st.AudioCorrupt, err); err != nil {
+			return out, fmt.Errorf("audio decoder: track %d: %w", a.track, err)
+		}
 	case err != nil:
 		return out, fmt.Errorf("audio decoder: track %d: send: %w", a.track, err)
 	}
@@ -172,24 +166,27 @@ func (a *audioTrack) build(cfg *media.TrackConfig) error {
 	a.decPkt, a.decFrm = newInPacket(), astiav.AllocFrame()
 	a.res, a.encPkt = astiav.AllocFrame(), astiav.AllocPacket()
 	a.anchored, a.primed, a.catchUp, a.resampled = false, false, false, false
+	a.corrupt = corruptRun{}
 	return nil
 }
 
 // receive places every decoded frame on the timeline and encodes it.
 func (a *audioTrack) receive(epoch uint32, st *Stats) ([]Output, error) {
 	var out []Output
-	for bad := 0; ; {
+	for {
 		err := a.dec.ReceiveFrame(a.decFrm)
 		switch {
 		case errors.Is(err, astiav.ErrEagain), errors.Is(err, astiav.ErrEof):
 			return out, nil
-		case isCorruptData(err) && bad < maxBadPictures:
-			bad++
-			st.AudioCorrupt++
+		case isCorruptData(err):
+			if err := a.corrupt.add(&st.AudioCorrupt, err); err != nil {
+				return out, fmt.Errorf("audio decoder: track %d: %w", a.track, err)
+			}
 			continue
 		case err != nil:
 			return out, fmt.Errorf("audio decoder: track %d: receive: %w", a.track, err)
 		}
+		a.corrupt.ok()
 		o, err := a.place(a.decFrm, epoch, st)
 		a.decFrm.Unref()
 		out = append(out, o...)

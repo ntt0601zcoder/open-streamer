@@ -60,10 +60,14 @@ type Output struct {
 // DroppedTracks is the number of video tracks that are not encoded (only the
 // lowest-numbered video track is). Reanchors counts audio re-anchors after a
 // forward gap, and AudioDropped the audio samples (at the output rate)
-// dropped because the input ran early. AudioCorrupt counts audio frames the
-// decoder rejected as corrupt (invalid data, or a feature it does not
-// implement) and that were skipped.
-type Stats struct{ DroppedTracks, Reanchors, AudioDropped, AudioCorrupt uint64 }
+// dropped because the input ran early. AudioCorrupt and VideoCorrupt count
+// the input frames a decoder rejected and that were skipped: any decoder
+// error but ENOMEM. Damage a video decoder conceals is not counted. A
+// decoder that rejects 50 frames in a row fails the pipeline.
+type Stats struct {
+	DroppedTracks, Reanchors, AudioDropped uint64
+	AudioCorrupt, VideoCorrupt             uint64
+}
 
 // Pipeline decodes the source video once, encodes it per rung with libx264,
 // and re-encodes every audio track to AAC. Its input is already in rendition
@@ -113,7 +117,7 @@ func New(rungs []Rung, audio *Audio) (*Pipeline, error) {
 	}
 	p := &Pipeline{audios: map[int]*audioTrack{}, vtrack: -1, dropped: map[int]bool{}}
 	if len(specs) > 0 {
-		p.video = newVideoPath(specs)
+		p.video = newVideoPath(specs, &p.stats)
 	}
 	if audio != nil {
 		a, err := resolveAudio(*audio)
