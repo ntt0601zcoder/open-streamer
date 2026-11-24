@@ -825,3 +825,42 @@ func TestBacklogOverflow(t *testing.T) {
 	assert.True(t, s.toChild(wire.Discontinuity{}), "after the Hello, the queue")
 	assert.Equal(t, 1, len(s.c.in))
 }
+
+// A child that stops reading its input after its Hello is killed once Run
+// has waited InputStallTimeout without the writer making progress: the
+// exit names the stall, the child is respawned with a bump, and Run never
+// stalls long enough for the source subscription to lose frames.
+func TestSupervisorStalledChild(t *testing.T) {
+	steps := longGOP(fixtureSteps(t, "h264_aac.ts"), 4, 1)
+	opt := fakeOptions(t, transcodetest.EnvStopReadingAfter+"=50",
+		transcodetest.EnvCrashOnce+"="+filepath.Join(t.TempDir(), "once"))
+	opt.InputStallTimeout = 300 * time.Millisecond
+	opt.Renditions = []Rendition{encode240, copySrc}
+	opt.Audio.Copy = true
+	s := start(t, opt)
+	out := s.feed(t, steps, 8)
+	st := s.tr.Stats()
+	exits := s.ev.of(EventExited)
+	require.Len(t, exits, 1)
+	assert.ErrorContains(t, exits[0].Err, "input stalled")
+	assert.ErrorContains(t, exits[0].Err, "killed")
+	assert.EqualValues(t, 2, st.Spawns)
+	assert.EqualValues(t, 1, s.tr.bumps.Load())
+	assert.Zero(t, st.Losses, "Run never stalled long enough to lose source frames")
+	assertOneExtraEpoch(t, s, out, steps)
+	for i, fs := range out {
+		check(t, fs, opt.Renditions[i].Name)
+	}
+	var srcVideo, copyVideo int
+	for _, f := range frames(steps) {
+		if f.Kind() == media.KindVideo {
+			srcVideo++
+		}
+	}
+	for _, f := range out[1] {
+		if f.Kind() == media.KindVideo {
+			copyVideo++
+		}
+	}
+	assert.Equal(t, srcVideo, copyVideo, "copy rendition video")
+}

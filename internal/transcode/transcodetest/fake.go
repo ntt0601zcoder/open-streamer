@@ -44,6 +44,10 @@ const (
 	// as the real child does on a pipeline error. With EnvCrashOnce, only
 	// while the file is absent.
 	EnvCloseThenExit = "OS_TRANSCODE_FAKE_CLOSE_THEN_EXIT"
+	// EnvStopReadingAfter makes the child stop reading its input, while it
+	// keeps running, after that many input frames. With EnvCrashOnce, only
+	// while the file is absent.
+	EnvStopReadingAfter = "OS_TRANSCODE_FAKE_STOP_READING_AFTER"
 )
 
 // Main runs the fake child on fd 3 and exits. It sends Hello, reads
@@ -74,6 +78,10 @@ func Main() {
 		}
 	}
 	delay, _ := time.ParseDuration(os.Getenv(EnvDelay))
+	stopReading := -1
+	if n, err := strconv.Atoi(os.Getenv(EnvStopReadingAfter)); err == nil && misbehave {
+		stopReading = n
+	}
 	markOnce := func() {
 		if once != "" {
 			_ = os.WriteFile(once, nil, 0o600)
@@ -147,6 +155,12 @@ func Main() {
 			n++
 			if crashAfter > 0 && n >= crashAfter {
 				crash()
+			}
+			if n == stopReading {
+				markOnce()
+				for { // alive, never reading again
+					time.Sleep(time.Hour)
+				}
 			}
 		case wire.Stop:
 			os.Exit(0)

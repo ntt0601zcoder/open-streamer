@@ -75,6 +75,7 @@ const (
 	defaultHealthyAfter = 30 * time.Second
 	defaultMergeHold    = 2 * time.Second
 	defaultHelloTimeout = 10 * time.Second
+	defaultInputStall   = 5 * time.Second
 
 	// childQueue is the length of the child's input channel.
 	childQueue = 256
@@ -125,6 +126,10 @@ type Options struct {
 	HealthyAfter time.Duration // 0 means 30 s
 	MergeHold    time.Duration // 0 means 2 s
 	HelloTimeout time.Duration // a child without Hello by then is killed; 0 means 10 s
+	// InputStallTimeout bounds how long Run waits to queue a frame for a
+	// child that takes none of its input: a child whose writer makes no
+	// progress for that long is killed ("input stalled"); 0 means 5 s.
+	InputStallTimeout time.Duration
 
 	Now   func() time.Time                     // nil means time.Now
 	After func(time.Duration) <-chan time.Time // nil means time.After
@@ -154,7 +159,10 @@ type Event struct {
 
 // Stats counts the transcoder's work. FramesOut has one entry per
 // rendition: the frames written to its hub. MaxQueued is the high-water
-// mark of the child's input channel. PID is the running child's, or 0.
+// mark of the child's input channel (at most 256); it excludes the
+// pre-Hello backlog, which can hold up to 1500 frames. PID is the running
+// child's, or 0. DroppedBeforeKey also counts the frames given up on
+// because the child exited, stalled, or Run ended while they waited.
 type Stats struct {
 	Spawns, Exits, Losses, DroppedBeforeKey, MergeDropped uint64
 	FramesIn                                              uint64
@@ -245,6 +253,7 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 	opt.HealthyAfter = orDefault(opt.HealthyAfter, defaultHealthyAfter)
 	opt.MergeHold = orDefault(opt.MergeHold, defaultMergeHold)
 	opt.HelloTimeout = orDefault(opt.HelloTimeout, defaultHelloTimeout)
+	opt.InputStallTimeout = orDefault(opt.InputStallTimeout, defaultInputStall)
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
@@ -423,8 +432,12 @@ func (s *run) exited() error {
 	if err == nil {
 		err = errors.New("exited")
 	}
-	if c.cause != nil {
-		err = fmt.Errorf("%w: %w", c.cause, err)
+	cause := c.cause
+	if c.stalled != nil {
+		cause = c.stalled
+	}
+	if cause != nil {
+		err = fmt.Errorf("%w: %w", cause, err)
 	}
 	err = fmt.Errorf("transcode: child %d: %w", c.p.pid, err)
 	t.update(func(st *Stats) { st.Exits++ })
@@ -460,6 +473,7 @@ func (s *run) scheduleRespawn(uptime time.Duration) {
 func (s *run) toChild(m wire.Message) bool {
 	c := s.c
 	if c == nil {
+		s.droppedFrame(m)
 		return false
 	}
 	if !c.handed {
@@ -472,13 +486,49 @@ func (s *run) toChild(m wire.Message) bool {
 	}
 	select {
 	case c.in <- m:
-		n := len(c.in)
-		s.t.update(func(st *Stats) { st.MaxQueued = max(st.MaxQueued, n) })
+		s.queued(c)
 		return true
-	case <-c.done:
-	case <-s.ctx.Done():
+	default:
 	}
-	return false
+	// The queue is full: wait, but kill a child whose writer makes no
+	// progress for InputStallTimeout, so Run never stalls on it for longer.
+	stall := s.t.opt.InputStallTimeout
+	timer := time.NewTimer(stall)
+	defer timer.Stop()
+	seen := c.progress.Load()
+	for {
+		select {
+		case c.in <- m:
+			s.queued(c)
+			return true
+		case <-c.done:
+		case <-s.ctx.Done():
+		case <-timer.C:
+			if p := c.progress.Load(); p != seen {
+				seen = p
+				timer.Reset(stall)
+				continue
+			}
+			c.stalled = fmt.Errorf("transcode: input stalled for %v", stall)
+			s.t.log.Warn("transcode: child stopped reading its input", "pid", c.p.pid, "after", stall)
+			c.kill()
+		}
+		s.droppedFrame(m)
+		return false
+	}
+}
+
+// queued records the queue's high-water mark after a send to c.in.
+func (s *run) queued(c *child) {
+	n := len(c.in)
+	s.t.update(func(st *Stats) { st.MaxQueued = max(st.MaxQueued, n) })
+}
+
+// droppedFrame counts a frame that toChild gave up on.
+func (s *run) droppedFrame(m wire.Message) {
+	if _, ok := m.(wire.Frame); ok {
+		s.t.update(func(st *Stats) { st.DroppedBeforeKey++ })
+	}
 }
 
 // tryChild is toChild without waiting: it queues m only if there is room,
@@ -497,8 +547,7 @@ func (s *run) tryChild(m wire.Message) bool {
 	}
 	select {
 	case c.in <- m:
-		n := len(c.in)
-		s.t.update(func(st *Stats) { st.MaxQueued = max(st.MaxQueued, n) })
+		s.queued(c)
 		return true
 	default:
 		return false
@@ -608,7 +657,15 @@ type child struct {
 	// Written before done is closed.
 	waitErr error
 	fatal   error
-	cause   error // why the host killed the child, if it did
+	cause   error // why the reader gave up on the child, if it did
+
+	// Owned by the Run goroutine: set when Run killed the child for not
+	// taking its input.
+	stalled error
+
+	// progress counts the writer's successful writes; Run reads it to tell
+	// a slow child from one that stopped reading.
+	progress atomic.Uint64
 }
 
 // startChild spawns the child and starts its reader, writer and waiter.
@@ -773,6 +830,7 @@ func (t *Transcoder) writeChild(c *child) {
 				c.kill()
 				return
 			}
+			c.progress.Add(1)
 		}
 	case <-c.quit:
 		_ = c.w.Write(wire.Stop{})
@@ -791,6 +849,7 @@ func (t *Transcoder) writeChild(c *child) {
 				c.kill()
 				return
 			}
+			c.progress.Add(1)
 		case <-c.quit:
 			_ = c.w.Write(wire.Stop{})
 			return
