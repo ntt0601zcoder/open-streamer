@@ -55,7 +55,7 @@ jobs:
       # Dropping it leaves archive.ubuntu.com and security.ubuntu.com.
       - name: Install ffmpeg, VLC and GStreamer
         run: |
-          if [ -f /etc/apt/apt-mirrors.txt ]; then
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
             sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
           fi
           sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg \
@@ -168,7 +168,7 @@ jobs:
       # Dropping it leaves archive.ubuntu.com and security.ubuntu.com.
       - name: Install ffmpeg, VLC and GStreamer
         run: |
-          if [ -f /etc/apt/apt-mirrors.txt ]; then
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
             sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
           fi
           sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg \

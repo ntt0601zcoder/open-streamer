@@ -595,6 +595,12 @@ Items accepted for later, not yet placed in a milestone:
   `TestSRTLossyLink` (299 of 300 video frames) and `TestM3b2SteadyState`'s UDP
   player (273 of 275 video frames, 0 RTP lost) each failed once locally, only
   under soak load, and passed alone and in CI.
+- **`TestFailoverSearchSkipsRunningProbe` flake** (internal/pipeline, from
+  M2a): about 1–2 % under parallel race load (7 of 320), before and after the
+  arm fix; `stepTo` (failback_test.go) syncs with `Run` only by waiting for
+  the readers and a 50 µs sleep, so `Run` can fall behind the fake clock. Fix:
+  a handshake that `Run` is idle after each step (13 call sites); raise if CI
+  hits it.
 
 #### M3b3 deferred minors
 
