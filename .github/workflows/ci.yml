@@ -338,6 +338,9 @@ jobs:
           exit 1
       - run: make test
         env:
+          # Only CI may bind 127.0.0.1:1935 (internal/ingest's default-port
+          # check); the tests skip it elsewhere.
+          OS_TEST_BIND_1935: "1"
           OS_REQUIRE_PEERS: "1"
           OS_MEDIAMTX_RTMP: 127.0.0.1:19350
           OS_MEDIAMTX_RTSP: 127.0.0.1:18554
@@ -465,6 +468,9 @@ jobs:
           exit 1
       - run: make cover covercheck
         env:
+          # Only CI may bind 127.0.0.1:1935 (internal/ingest's default-port
+          # check); the tests skip it elsewhere.
+          OS_TEST_BIND_1935: "1"
           OS_REQUIRE_PEERS: "1"
           OS_MEDIAMTX_RTMP: 127.0.0.1:19350
           OS_MEDIAMTX_RTSP: 127.0.0.1:18554

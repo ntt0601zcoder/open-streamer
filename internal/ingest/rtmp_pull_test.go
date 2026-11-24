@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"testing"
@@ -204,26 +205,39 @@ func TestOpenRTMPPull(t *testing.T) {
 	assert.Contains(t, err.Error(), "live/skxxxxx")
 	assert.NotContains(t, err.Error(), vStreamKey)
 
-	// The port defaults to 1935, when that port is free to check.
-	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:1935")
-	if err != nil {
-		t.Logf("port 1935 is taken; default port not checked: %v", err)
-		return
-	}
-	defer ln.Close()
-	accepted := make(chan struct{})
-	go func() {
-		if c, err := ln.Accept(); err == nil {
-			close(accepted)
-			_ = c.Close()
+	// The port defaults to 1935.
+	t.Run("default port 1935", func(t *testing.T) {
+		requireBind1935(t)
+		ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:1935")
+		require.NoError(t, err, "%s is set but port 1935 is not free", envBind1935)
+		defer ln.Close()
+		accepted := make(chan struct{})
+		go func() {
+			if c, err := ln.Accept(); err == nil {
+				close(accepted)
+				_ = c.Close()
+			}
+		}()
+		_, err = Open(context.Background(), "rtmp://127.0.0.1/live/s", Env{})
+		require.Error(t, err)
+		select {
+		case <-accepted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Open did not dial port 1935")
 		}
-	}()
-	_, err = Open(context.Background(), "rtmp://127.0.0.1/live/s", Env{})
-	require.Error(t, err)
-	select {
-	case <-accepted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Open did not dial port 1935")
+	})
+}
+
+// envBind1935 allows tests to bind 127.0.0.1:1935. Only CI sets it: on a
+// development machine that port may belong to a running server (or be
+// forbidden), and a test must never take it.
+const envBind1935 = "OS_TEST_BIND_1935"
+
+// requireBind1935 skips the test unless envBind1935 is "1".
+func requireBind1935(t *testing.T) {
+	t.Helper()
+	if os.Getenv(envBind1935) != "1" {
+		t.Skipf("binds 127.0.0.1:1935, the RTMP default port; set %s=1 to run it (CI does)", envBind1935)
 	}
 }
 
