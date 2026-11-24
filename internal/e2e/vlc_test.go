@@ -55,14 +55,14 @@ import (
 // message. The exit code is never a pass.
 //
 // The VLC rows run one after the other (ruling R-T7b); the GStreamer rows
-// are TestM3GStreamerClass, which overlaps them. On the DASH row, VLC
-// 3.0.20 intermittently resets its clock at the live start and then logs
-// two decoder errors ("Timestamp conversion failed for N: no reference
-// clock", "Could not convert timestamp 0 for FFmpeg"), whether or not the
-// machine is loaded, sometimes after several resets; ruling R-T1a
-// tolerates on that row one such pair right after each reset, at most 4
-// per VLC process (vlcBadLines). Since the segmenter cuts audio at the
-// video keyframe's PTS (ruling R-F3) the HLS fMP4 row is strict. Any other
+// are TestM3GStreamerClass, which overlaps them. On the HLS TS, HLS fMP4
+// and DASH rows, VLC 3.0.20 may reset its clock at the live start and then
+// log two decoder errors ("Timestamp conversion failed for N: no reference
+// clock", "Could not convert timestamp 0 for FFmpeg"): on HLS fMP4 and DASH
+// in about 20 % of runs whether or not segments are aligned (R-F3 A/B: 7/30
+// before, 6/30 after), on HLS TS in about 1 of 30 runs since R-F3 added one
+// reset there. Ruling R-T1c tolerates on those rows one such pair right
+// after each reset, at most 4 per VLC process (vlcBadLines). Any other
 // decoder error fails.
 //
 // http-ts- and srt-audio-only-stretch (A/V, then 6 s of audio only, then
@@ -99,7 +99,7 @@ func TestM3VLCClass(t *testing.T) {
 				// suggestedPresentationDelay (6 s) behind the live edge.
 				waitListed(t, p, 5)
 			}
-			vlcPlays(t, vlc, ffprobe, origin+"/live/s"+out.path, out.name == "dash")
+			vlcPlays(t, vlc, ffprobe, origin+"/live/s"+out.path, out.name != "http-ts")
 		})
 	}
 	t.Run("srt", func(t *testing.T) {
@@ -570,8 +570,8 @@ func vlcLogLines(log string, words ...string) []string {
 }
 
 // VLC's live-start clock reset and the decoder error pair that may follow
-// it on the DASH output (ruling R-T1a), as VLC 3.0.20 logs them after
-// the "[<object>] " prefix. The reset is the PCR line, then the reset
+// it on an adaptive output, HLS or DASH (ruling R-T1c), as VLC 3.0.20 logs
+// them after the "[<object>] " prefix. The reset is the PCR line, then the reset
 // line; the decoder may log its first picture before the pair.
 const (
 	vlcPCRLate      = "main input error: ES_OUT_SET_(GROUP_)PCR  is called too late (pts_delay increased to "
@@ -629,7 +629,7 @@ const vlcMaxTolerated = 4
 // vlcBadLines returns the lines of one VLC process's log that fail the
 // log rule (that contain "decoder error" or "cannot", case-insensitively),
 // and how many start-up pairs it tolerated. When tolerate is set, ruling
-// R-T1a tolerates the pair vlcNoClock…vlcNoClockEnd, vlcNoConvert, as
+// R-T1c tolerates the pair vlcNoClock…vlcNoClockEnd, vlcNoConvert, as
 // consecutive messages, right after each of the process's live-start clock
 // resets: the messages before the pair are vlcPCRLate, vlcPCRReset and at
 // most one vlcFirstPicture, so one pair per reset, and at most
@@ -682,7 +682,7 @@ func checkVLCLog(t *testing.T, name, log string, tolerate bool) {
 	assert.Contains(t, log, "successfully opened", "%s: the input opened", name)
 	bad, tolerated := vlcBadLines(log, tolerate)
 	if tolerated > 0 {
-		t.Logf("R-T1a: %s: tolerated %d of VLC's start-up pairs, each after its own clock reset", name, tolerated)
+		t.Logf("R-T1c: %s: tolerated %d of VLC's start-up pairs, each after its own clock reset", name, tolerated)
 	}
 	if !assert.Empty(t, bad, "%s: decoder errors", name) {
 		t.Logf("%s: clock lines of the log:\n%s", name, strings.Join(vlcLogLines(log, "es_out_reset_pcr", "called too late"), "\n"))
@@ -776,8 +776,8 @@ type vlcPair struct {
 	file       string
 	started    time.Time
 	// tolerate allows each instance a start-up pair after each of its
-	// clock resets, at most vlcMaxTolerated (ruling R-T1a): set on the
-	// DASH row only.
+	// clock resets, at most vlcMaxTolerated (ruling R-T1c): set on the
+	// HLS TS, HLS fMP4 and DASH rows only.
 	tolerate bool
 }
 
@@ -809,8 +809,8 @@ func (p *vlcPair) finish(t *testing.T, ffprobe string) {
 	t.Logf("dump: video %v, audio %v", spans["video"].Round(time.Millisecond), spans["audio"].Round(time.Millisecond))
 }
 
-// vlcPlays applies the VLC pass rule to u; tolerate is set on the DASH row
-// only (ruling R-T1a).
+// vlcPlays applies the VLC pass rule to u; tolerate is set on the HLS TS,
+// HLS fMP4 and DASH rows (ruling R-T1c).
 func vlcPlays(t *testing.T, vlc testpeer.Peer, ffprobe, u string, tolerate bool) {
 	t.Helper()
 	p := startVLCPair(t, vlc, u)
@@ -912,12 +912,12 @@ func testVLCAudioOnlyStretch(t *testing.T, srt bool) {
 	t.Logf("hub %s; conform %s; violations %v", kindCounts(r.col.frames), kindCounts(c.Frames), c.Violations)
 }
 
-// TestVLCLogTolerance checks the matcher of ruling R-T1a on log excerpts
+// TestVLCLogTolerance checks the matcher of ruling R-T1c on log excerpts
 // shaped like VLC 3.0.20's, one log per VLC process: a start-up pair is
 // tolerated right after each clock reset, at most 4 per process, on the
-// DASH row; a pair without its own reset, two pairs after one reset, a
-// fifth pair, a pair on a strict row (HLS fMP4 and every other), or another
-// error fails the log.
+// HLS TS, HLS fMP4 and DASH rows; a pair without its own reset, two pairs
+// after one reset, a fifth pair, a pair on a strict row (HTTP-TS and every
+// other non-adaptive row), or another error fails the log.
 // VLC logs no marker for rc's stats answer, so no start-up window is
 // checked.
 func TestVLCLogTolerance(t *testing.T) {
@@ -978,7 +978,7 @@ func TestVLCLogTolerance(t *testing.T) {
 		{"a message between the reset and the pair", join([]string{opened, late, reset, segment}, pair), true, 2, 0},
 		{"a message inside the pair", join([]string{opened, late, reset, picture, noClock, segment, convert}), true, 2, 0},
 		{"half the pair", join([]string{opened, late, reset, picture, noClock}), true, 1, 0},
-		{"a strict row (hls-fmp4)", join([]string{opened}, startup), false, 2, 0},
+		{"a strict row (http-ts)", join([]string{opened}, startup), false, 2, 0},
 		{"with another error", join([]string{opened}, startup, []string{other}), true, 1, 1},
 		{"with a cannot line", join([]string{opened}, startup, []string{cannot}), true, 1, 1},
 	} {

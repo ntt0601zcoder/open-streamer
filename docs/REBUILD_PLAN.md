@@ -564,13 +564,17 @@ Items accepted for later, not yet placed in a milestone:
   `OS_PEER_LIMITS=1` probes the limitation). It would very likely make
   GStreamer play across an audio-less stretch, and also help hls.js if stalls
   are reported there.
-- **VLC 3 DASH start-up clock reset persists after R-F3**: audio parts are
-  now aligned (2.005 s, start within 11 ms of video) and HLS fMP4 is strict,
-  but VLC's DASH module still resets its clock at live start and logs the
-  'no reference clock' pair (2 of 3 runs); `TestM3VLCClass` tolerates it on
-  the dash row only (ruling R-T1a). Investigate the
-  `suggestedPresentationDelay` start and the period/AST mapping as VLC's
-  DASH module sees them. Normal priority.
+- **VLC 3's start-up "no reference clock" pair on HLS fMP4 and DASH**
+  appears in about 20 % of runs whether or not segments are aligned (R-F3
+  A/B: 7/30 before, 6/30 after). `TestM3VLCClass` tolerates it on those two
+  rows (ruling R-T1c). Next: investigate VLC's fMP4/DASH clock start. Normal
+  priority.
+- **VLC 3 HLS-TS: R-F3 adds one deterministic clock reset at live start** (in
+  `TestM3VLCClass` it lands on the loop seam of the 4× concatenated source,
+  `hls/6.ts`; the 'no reference clock' pair follows in 1 of 30 runs).
+  Measure with a seamless source. If the reset is real, start each TS
+  segment's audio at or before the keyframe PTS (a TS-only layout; CMAF keeps
+  R-F3's cut). Normal priority.
 - **DASH MPD stays `type="dynamic"` after the stream ends** (pre-existing;
   M3a). Players keep polling an MPD that will not change.
 - **VLC 3 stops at any fMP4 HLS discontinuity**, not only at gaps: every
