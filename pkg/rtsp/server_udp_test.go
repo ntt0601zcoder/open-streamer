@@ -198,6 +198,11 @@ func TestServerUDPSessionTimeout(t *testing.T) {
 
 // Only an RTCP compound led by an SR or RR proves a UDP client alive:
 // garbage from its RTCP port does not, and is counted.
+//
+// The garbage goes in lockstep: each datagram leaves once the server has
+// counted the previous one, so every count is attributed. The server
+// releases the client's port only after the session has ended, so garbage
+// that arrives after that is a stranger's; the loop stops there.
 func TestServerUDPGarbageRTCPNotAlive(t *testing.T) {
 	h := newHandler()
 	h.play = producer(10 * time.Millisecond)
@@ -210,28 +215,37 @@ func TestServerUDPGarbageRTCPNotAlive(t *testing.T) {
 	s := h.session(t)
 	sdes := rtsp.BuildBye(1, "x", nil)[8:] // SDES + BYE without the leading RR
 	garbage := [][]byte{{1, 2, 3, 4}, {0x80, 96, 0, 1, 0, 0, 0, 0}, sdes, bytes.Repeat([]byte{0x81}, 40)}
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		tk := time.NewTicker(20 * time.Millisecond)
-		defer tk.Stop()
-		for i := 0; ; i++ {
-			_, _ = p.rtcp.WriteToUDP(garbage[i%len(garbage)], loopback(ports[1]))
-			select {
-			case <-stop:
-				return
-			case <-tk.C:
-			}
+	done := func() bool {
+		select {
+		case <-s.Done():
+			return true
+		default:
+			return false
 		}
-	})
-	defer func() { close(stop); wg.Wait() }()
+	}
 	start := time.Now()
-	require.True(t, ended(s, 2*time.Second), "garbage RTCP must not keep the session alive")
+	sent := 0
+	for i := 0; !done(); i++ {
+		require.Less(t, time.Since(start), 2*time.Second, "garbage RTCP must not keep the session alive")
+		before := srv.Stats()
+		_, err := p.rtcp.WriteToUDP(garbage[i%len(garbage)], loopback(ports[1]))
+		require.NoError(t, err)
+		var after rtsp.ServerStats
+		require.Eventually(t, func() bool {
+			after = srv.Stats()
+			return after.ProtocolErrors+after.UDPStrangers > before.ProtocolErrors+before.UDPStrangers
+		}, 2*time.Second, time.Millisecond, "the server reads every datagram")
+		if after.UDPStrangers > before.UDPStrangers {
+			require.True(t, done(), "garbage from the client's port counted as a stranger's while its session lived")
+			break
+		}
+		assert.Equal(t, before.ProtocolErrors+1, after.ProtocolErrors, "invalid RTCP from a client is counted")
+		sent++
+		time.Sleep(20 * time.Millisecond)
+	}
 	assert.Less(t, time.Since(start), time.Second)
-	st := srv.Stats()
-	assert.Positive(t, st.ProtocolErrors, "invalid RTCP from a client is counted")
-	assert.Zero(t, st.UDPStrangers, "it came from the client's port")
-	assert.Equal(t, uint64(1), st.Timeouts)
+	assert.Greater(t, sent, 3, "garbage was sent while the session lived")
+	assert.Equal(t, uint64(1), srv.Stats().Timeouts)
 }
 
 func TestServerUDPStrangersIgnored(t *testing.T) {
