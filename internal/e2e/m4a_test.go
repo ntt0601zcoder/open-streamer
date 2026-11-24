@@ -631,10 +631,12 @@ func TestM4aKeyframesAligned(t *testing.T) {
 	}
 }
 
-// arrivals records when each epoch's first frame reached a hub.
+// arrivals records when each epoch's first frame reached a hub, and
+// whether a video frame has.
 type arrivals struct {
 	mu    sync.Mutex
 	first map[uint32]time.Time
+	video bool
 }
 
 func watchEpochs(h *hub.Hub) *arrivals {
@@ -646,10 +648,18 @@ func watchEpochs(h *hub.Hub) *arrivals {
 			if _, ok := a.first[dl.Frame.Epoch]; !ok {
 				a.first[dl.Frame.Epoch] = time.Now()
 			}
+			a.video = a.video || dl.Frame.Kind() == media.KindVideo
 			a.mu.Unlock()
 		}
 	}()
 	return a
+}
+
+// hasVideo reports whether a video frame has reached the hub.
+func (a *arrivals) hasVideo() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.video
 }
 
 func (a *arrivals) get() map[uint32]time.Time {
@@ -661,7 +671,8 @@ func (a *arrivals) get() map[uint32]time.Time {
 // TestM4aRespawn kills the child with SIGKILL mid-stream. The transcoder is
 // fed h264_aac_then_640.ts looped twice at its pace (upstream epochs 1 to
 // 4, the second of each pass video-only at 640x360), and the child is
-// killed 1.5 s after the first rendition frame, inside upstream epoch 1.
+// killed at most 0.5 s after the first encoded video frame (t240), inside
+// upstream epoch 1.
 // Every rendition hub gets exactly one new epoch within 5 s of the kill,
 // starting on a keyframe; the later upstream epochs map above it; and each
 // rendition's HLS fMP4, read back, has exactly one discontinuity more than
@@ -700,18 +711,12 @@ func TestM4aRespawn(t *testing.T) {
 		src.Close()
 	}()
 
-	// Kill the child 1.5 s after the first rendition frame: mid-GOP, with
-	// K well inside upstream epoch 1 (its last key is at about 5.08 s) even
-	// on a slow runner.
-	require.Eventually(t, func() bool {
-		for _, a := range arr {
-			if len(a.get()) > 0 {
-				return true
-			}
-		}
-		return false
-	}, 30*time.Second, 5*time.Millisecond, "a rendition frame")
-	time.Sleep(1500 * time.Millisecond)
+	// Kill the child 0.5 s after the first encoded video frame (t240; the
+	// copy rendition's video comes at once): mid-GOP, after the child has
+	// output video in epoch 1, with K well inside upstream epoch 1 (its last
+	// key is at about 5.08 s) even on a slow runner.
+	require.Eventually(t, arr[0].hasVideo, 60*time.Second, 5*time.Millisecond, "an encoded video frame on t240")
+	time.Sleep(500 * time.Millisecond)
 	pid := tr.Stats().PID
 	require.Positive(t, pid)
 	killed := time.Now()
@@ -737,6 +742,10 @@ func TestM4aRespawn(t *testing.T) {
 		assert.Zero(t, cols[i].lost, r.Name)
 		assert.Empty(t, conform.CheckFrames(frames, conform.FrameOptions{}), r.Name)
 		assert.Equal(t, want, epochs(frames), r.Name)
+		if !r.Video.Copy {
+			assert.Positive(t, kindCounts(frames)[epochKind{1, media.KindVideo}],
+				"%s: the child output video in epoch 1 before the kill (else the kill came too early)", r.Name)
+		}
 		// The respawn epoch starts with K's keyframe, at K + D on every
 		// rendition, where its anchor starts, and nothing in it is
 		// presented before. (On an encoded rung the new child's audio
