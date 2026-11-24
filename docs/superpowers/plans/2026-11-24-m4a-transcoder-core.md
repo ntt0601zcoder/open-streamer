@@ -571,7 +571,7 @@ func pacedFeed(steps []step, n int) feed
     - Each rendition hub gets exactly one new epoch within 5 s.
     - `ReadHLS` of HLS fMP4 shows exactly one extra discontinuity per rendition, and no violation.
     - The feed's later upstream epoch change maps above the respawn epoch.
-  - `TestM4aVLC`: `t180` HLS-TS plays in VLC, with the M3 pass rule and no tolerance.
+  - `TestM4aVLC`: `t180` HLS-TS plays in VLC, with the M3 pass rule and the R-T1c start-up tolerance (ruling R-T7a').
 - [ ] **Step 2:** Run `make ostranscoder && OS_TRANSCODER=$PWD/dist/ostranscoder-amd64/ostranscoder go test -race -run 'TestM4a|TestSupervisorRealChild' ./internal/e2e/ ./internal/transcode/`. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4: Run** each of these. Expected: PASS everywhere.
