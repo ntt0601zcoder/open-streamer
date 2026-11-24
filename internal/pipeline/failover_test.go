@@ -373,6 +373,31 @@ func TestAllInputsDown(t *testing.T) {
 	assert.Equal(t, 20, len(opens["fake://0"])+len(opens["fake://1"]), "at most 10 opens per input in 60 s")
 }
 
+// TestArmKeepsRetryDueSinceSchedule is the race behind TestAllInputsDown's
+// flakes: the time passes a retry between schedule, which found it not due,
+// and arm. arm must keep the timer for it, or Run, with no attempt running,
+// waits forever.
+func TestArmKeepsRetryDueSinceSchedule(t *testing.T) {
+	ft := newFakeTime()
+	p := New(hub.New(hub.Options{}), multiOptions(ft, nil, newEvents(), "fake://0", "fake://1"))
+	retryAt := fakeT0.Add(firstRetry)
+	p.inputs = []*input{{backoff: firstRetry, retryAt: retryAt}, {backoff: firstRetry, retryAt: retryAt}}
+	p.schedule(context.Background()) // not due yet: nothing starts
+	require.Nil(t, p.inputs[0].a)
+	p.arm()
+	armed := p.timer
+	require.NotNil(t, armed)
+	ft.Advance(firstRetry) // the time passes the retry before Run's next arm
+	p.arm()
+	require.NotNil(t, p.timer, "the retry keeps its timer")
+	assert.Equal(t, armed, p.timer, "the same timer, not a new one")
+	select {
+	case <-p.timer:
+	default:
+		t.Fatal("the retry's timer is due")
+	}
+}
+
 func TestSinglePassiveStartsLate(t *testing.T) {
 	ft, ev := newFakeTime(), newEvents()
 	const late = 30 * time.Second

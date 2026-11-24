@@ -319,7 +319,9 @@ func (p *Pipeline) schedule(ctx context.Context) {
 // limit, a retry that schedule would start, or the end of the layout wait
 // while attempts wait for it. Every deadline is absolute: a timer armed late
 // fires late by the lag, and the deadline it was armed for counts as due
-// when it fires (reached), whatever the clock reads.
+// when it fires (reached), whatever the clock reads. A retry stays a
+// deadline until its input runs, even once past: the clock may pass it
+// after schedule found it not due, and the timer then fires at once.
 func (p *Pipeline) arm() {
 	now := p.now()
 	var next time.Time
@@ -332,7 +334,7 @@ func (p *Pipeline) arm() {
 		switch {
 		case in.a != nil:
 			consider(in.a.deadline)
-		case (in.passive || p.reopens(i)) && in.retryAt.After(now):
+		case (in.passive || p.reopens(i)) && !in.retryAt.IsZero():
 			consider(in.retryAt)
 		}
 	}
