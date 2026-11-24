@@ -6,7 +6,3 @@
 // the source. It uses cgo through go-astiav and builds only with the build
 // tag libav, against FFmpeg 8.1 (scripts/ffmpeg-dev.sh).
 package native
-
-// go-astiav is the package's libav binding; the blank import keeps it in
-// the module graph until the pipeline imports it by name.
-import _ "github.com/asticode/go-astiav"
