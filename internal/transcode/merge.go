@@ -22,10 +22,14 @@ type pendingFrame struct {
 // Frames are released in (epoch, DTS) order. The expected tracks are those
 // seen in the hub's current epoch (before the first write, in the epoch of
 // the next frame). The next frame waits only while another expected track
-// has nothing pending, and only for at most hold, measured as stream time
-// (the largest pending DTS minus the frame's DTS) or as wall time since it
-// arrived, whichever ends first. A track that makes a hold run out leaves
-// the expected set until it delivers again.
+// has nothing pending, and only for at most hold, measured as wall time
+// since it arrived or, when the frame is in the current epoch, as stream
+// time (the largest DTS pending in that epoch minus the frame's DTS),
+// whichever ends first. A later epoch's frames are no measure of the
+// current epoch's progress: a burst of new-epoch copy frames must not
+// release the current epoch while the child's output for it is still on
+// its way. A track that makes a hold run out leaves the expected set until
+// it delivers again.
 //
 // A frame whose epoch is below the hub's current epoch, or whose DTS is not
 // above the last one written on its track, is dropped and counted. Before
@@ -196,13 +200,14 @@ func (m *merger) missing(c int) []int {
 	return out
 }
 
-// maxPendingDTS returns the largest DTS pending. Called with m.mu held.
-func (m *merger) maxPendingDTS() int64 {
+// maxPendingDTS returns the largest DTS pending in epoch e. Called with
+// m.mu held.
+func (m *merger) maxPendingDTS(e uint32) int64 {
 	var hi int64
 	found := false
 	for _, q := range m.q {
 		for _, p := range q {
-			if !found || p.f.DTS > hi {
+			if p.f.Epoch == e && (!found || p.f.DTS > hi) {
 				hi, found = p.f.DTS, true
 			}
 		}
@@ -230,12 +235,14 @@ func (m *merger) release(now time.Time, all bool) {
 		}
 		p := m.q[c][0]
 		if miss := m.missing(c); len(miss) > 0 && !all {
-			if m.maxPendingDTS()-p.f.DTS < m.holdTicks && now.Sub(p.at) < m.hold {
-				return
-			}
 			e := m.epoch
 			if !m.written {
 				e = p.f.Epoch
+			}
+			// The stream-time bound only holds within the current epoch.
+			streamUp := p.f.Epoch == e && m.maxPendingDTS(e)-p.f.DTS >= m.holdTicks
+			if !streamUp && now.Sub(p.at) < m.hold {
+				return
 			}
 			for _, t := range miss {
 				delete(m.seen[e], t)

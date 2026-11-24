@@ -675,14 +675,19 @@ Items accepted for later, not yet placed in a milestone:
   Measure with a seamless source. If the reset is real, start each TS
   segment's audio at or before the keyframe PTS (a TS-only layout; CMAF keeps
   R-F3's cut). Normal priority.
-- **Transcoder merger drops child audio on a long copy-video burst**
-  (`internal/transcode/merge.go`, found in M4a Task 7). When more than 2 s of
-  copied video arrives in one burst before an epoch boundary, as when an
-  unpaced failover flushes, the stream-time hold runs out at once, the hub
-  moves to the next epoch, and the old epoch's late child audio is dropped
-  (`MergeDropped`): 220 audio frames on `src` for unpaced
-  `h264_aac_then_640.ts`. Live paced sources are not affected. Fix: hold on
-  arrival time as well, or flush the copy side in step with the child.
+- **Transcoder merger drops a child track it has not seen yet in an epoch**
+  (`internal/transcode/merge.go`). The merger waits only for tracks already
+  seen in the hub's current epoch. Since the M4a final fix wave, a burst of
+  new-epoch copy frames no longer counts as stream time for the old epoch's
+  hold, so late child output of an epoch the child has already delivered to
+  is kept within `MergeHold` wall time (`TestMergerHoldAcrossEpochs`). What
+  remains: when the copy path runs through a whole epoch, and into the next,
+  before the child's first output of that epoch arrives, nothing makes the
+  merger wait, and that output is dropped (`MergeDropped`). Seen only with
+  unpaced input: unpaced `h264_aac_then_640.ts` with copy video and a child
+  1 ms per frame drops all 282 epoch-1 audio frames. Live paced sources are
+  not affected. Fix: seed each epoch's expected set with the child's tracks
+  (with the item below).
 - **Transcoder merger: seed a new epoch's expected tracks with the rung's
   video.** After a respawn, the new child's audio reaches an encoded
   rendition's hub about 1.2 s (the x264 delay) before its first IDR. The

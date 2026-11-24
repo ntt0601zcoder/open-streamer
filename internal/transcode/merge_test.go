@@ -208,3 +208,89 @@ func TestMergerEpochs(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, int64(90000), a.Start)
 }
+
+// A burst of new-epoch copy frames does not count as stream time elapsed
+// for the old epoch's hold: the child's late old-epoch audio, arriving
+// after 3 s of new-epoch copy video but within the wall-time hold, is still
+// written (regression: the merger released the old epoch at once and
+// dropped that audio). The wall-time bound still applies across epochs.
+func TestMergerHoldAcrossEpochs(t *testing.T) {
+	const v, a = 3600, 1920 // 25 fps video, 48 kHz AAC
+	// feed pushes epoch 1 (1 s of video and audio, then 1 s more of video
+	// with the audio lagging) and a 3 s burst of epoch 2 copy video. It
+	// returns the late epoch 1 audio, not yet pushed.
+	feed := func(m *merger) []media.Frame {
+		var late []media.Frame
+		m.push(aframe(1, 0)) // audio is expected from the start
+		for i := int64(0); i < 2*90000/v; i++ {
+			m.push(vframe(1, i*v, i%25 == 0))
+		}
+		for i := int64(1); i*a < 2*90000; i++ {
+			if i*a < 90000 {
+				m.push(aframe(1, i*a))
+			} else {
+				late = append(late, aframe(1, i*a))
+			}
+		}
+		for i := int64(0); i < 3*90000/v; i++ {
+			m.push(vframe(2, 2*90000+i*v, i%25 == 0))
+		}
+		return late
+	}
+	countAudio := func(fs []media.Frame, e uint32) (n int) {
+		for _, f := range fs {
+			if f.Kind() == media.KindAudio && f.Epoch == e {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("within the wall-time hold", func(t *testing.T) {
+		ft := newFakeTime()
+		m, sub := newTestMerger(ft)
+		late := feed(m)
+		before := drain(sub)
+		for _, f := range before {
+			assert.EqualValues(t, 1, f.Epoch, "nothing of epoch 2 before epoch 1's audio")
+		}
+		ft.advance(1900 * time.Millisecond)
+		for _, f := range late {
+			m.push(f)
+		}
+		for i := int64(0); i*a < 3*90000; i++ {
+			m.push(aframe(2, 2*90000+i*a))
+		}
+		m.flush()
+		out := append(before, drain(sub)...)
+		_, dropped := m.counts()
+		assert.Zero(t, dropped)
+		assert.Equal(t, int(2*90000+a-1)/a, countAudio(out, 1), "every epoch 1 audio frame")
+		// Epochs never go back, and each track is in DTS order. (Within
+		// epoch 2 the 3 s of video still runs out the stream-time hold
+		// before epoch 2's audio comes: that is the same-epoch rule.)
+		last := map[int]int64{}
+		for i := 1; i < len(out); i++ {
+			p, c := out[i-1], out[i]
+			assert.GreaterOrEqual(t, c.Epoch, p.Epoch, "frame %d", i)
+			if d, ok := last[c.Track]; ok {
+				assert.Greater(t, c.DTS, d, "frame %d", i)
+			}
+			last[c.Track] = c.DTS
+		}
+	})
+	t.Run("past the wall-time hold", func(t *testing.T) {
+		ft := newFakeTime()
+		m, sub := newTestMerger(ft)
+		late := feed(m)
+		ft.advance(2 * time.Second)
+		m.push(vframe(2, 5*90000, false)) // releases what waited out its hold
+		out := drain(sub)
+		assert.NotZero(t, len(out))
+		for _, f := range late {
+			m.push(f)
+		}
+		_, dropped := m.counts()
+		assert.EqualValues(t, len(late), dropped, "audio later than the wall-time hold is dropped")
+	})
+}
