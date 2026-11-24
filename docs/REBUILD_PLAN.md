@@ -689,6 +689,12 @@ Items accepted for later, not yet placed in a milestone:
   1 ms per frame drops all 282 epoch-1 audio frames. Live paced sources are
   not affected. Fix: seed each epoch's expected set with the child's audio
   tracks too, as the router already does with an encoded rung's video.
+  Related (found reviewing the CI fix, not reproduced): with copy audio and
+  a child respawn, the new epoch's first copied audio frame can still reach
+  the hub before the child's IDR, because `merger.missing` checks only the
+  hub's current epoch's expected set until the new epoch's first frame is
+  written. Fix: when a candidate's epoch is above the hub's, check the union
+  of both epochs' expected sets; add a copy-audio respawn subtest.
 - **Root cause of VLC 3's "buffer deadlock prevented" on B-pyramid rungs,
   before M4c** (ruling R-T7b'). `b-pyramid=none` cured it on our encoded
   rungs (3 of 8 runs to 0 of 8), but treats a symptom: the trigger is
