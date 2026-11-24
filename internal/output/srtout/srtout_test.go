@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"net/url"
 	"os"
 	"os/exec"
 	"sync"
@@ -1087,7 +1086,10 @@ func TestSRTCodecChangeEnds(t *testing.T) {
 }
 
 // ffprobe reads both codec pairs over SRT, with the access-control stream
-// ID percent-encoded in its URL.
+// ID. The ID goes in libsrt's streamid option rather than the URL: ffmpeg
+// 6.1 passes a URL's streamid query value on undecoded (a percent-encoded
+// #!::r=live/s,m=request arrives as %23%21%3A%3A...), where ffmpeg 8
+// decodes it, and the option is passed on verbatim by both.
 func TestSRTFFprobe(t *testing.T) {
 	ffprobe := testpeer.Require(t, "ffprobe", "srt")
 	for _, tc := range []struct {
@@ -1107,12 +1109,15 @@ func TestSRTFFprobe(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := feed(ctx, e.h, rest, 2)
-			u := fmt.Sprintf("srt://%s?streamid=%s", e.addr, url.QueryEscape("#!::r=live/s,m=request"))
+			u := fmt.Sprintf("srt://%s", e.addr)
 			pctx, pcancel := context.WithTimeout(ctx, 20*time.Second)
 			defer pcancel()
-			out, err := exec.CommandContext(pctx, ffprobe, "-v", "error", "-show_entries",
-				"stream=codec_name,codec_type,width,height,sample_rate", "-of", "json", u).Output()
-			require.NoError(t, err, "%s", out)
+			cmd := exec.CommandContext(pctx, ffprobe, "-v", "error", "-streamid", "#!::r=live/s,m=request", "-show_entries",
+				"stream=codec_name,codec_type,width,height,sample_rate", "-of", "json", u)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
+			require.NoError(t, err, "ffprobe stdout %q stderr %q; server %+v", out, stderr.String(), e.srv.Stats())
 			var probe struct {
 				Streams []struct {
 					CodecName  string `json:"codec_name"`
