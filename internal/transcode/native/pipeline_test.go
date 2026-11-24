@@ -5,6 +5,7 @@ package native
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"slices"
@@ -591,4 +592,44 @@ func TestPipelineRungOpenFailure(t *testing.T) {
 	_, err = p.Flush()
 	assert.Equal(t, first, err)
 	t.Logf("frame %d: %v", n, first)
+}
+
+// gainControlAAC is one raw AAC-LC stereo frame (a CPE without a common
+// window, max_sfb 0) with the SSR gain_control_data_present bit set and
+// zeros after it. FFmpeg 8.1 parses gain control (it only warns that it is
+// not implemented), so the frame fails later, on the zeros, as
+// AVERROR_INVALIDDATA; no practical frame yields AVERROR_PATCHWELCOME, whose
+// classification TestIsCorruptData checks directly.
+var gainControlAAC = []byte{
+	// 001 0000 0 | 01100100 | 0 00 0 0000|00 0 0 0 1 00 | zero padding
+	0x20, 0x64, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
+}
+
+// invalidAAC is one raw AAC frame with an SCE of tag 5, which a stereo
+// stream does not have: AVERROR_INVALIDDATA.
+var invalidAAC = []byte{0x0a, 0x64, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00}
+
+func TestIsCorruptData(t *testing.T) {
+	assert.True(t, isCorruptData(astiav.ErrInvaliddata))
+	assert.True(t, isCorruptData(astiav.ErrPatchwelcome))
+	assert.True(t, isCorruptData(fmt.Errorf("wrapped: %w", astiav.ErrPatchwelcome)))
+	assert.False(t, isCorruptData(nil))
+	assert.False(t, isCorruptData(astiav.ErrEagain))
+	assert.False(t, isCorruptData(astiav.ErrEof))
+	assert.False(t, isCorruptData(errors.New("other")))
+}
+
+// TestPipelineAudioCorrupt: frames the AAC decoder rejects as corrupt are
+// skipped and counted, and the pipeline keeps going.
+func TestPipelineAudioCorrupt(t *testing.T) {
+	audio := ofKind(source(t, "h264_aac.ts"), media.KindAudio)
+	src := slices.Clone(audio)
+	src[50].Data = [][]byte{gainControlAAC}
+	src[120].Data = [][]byte{invalidAAC}
+	p := newPipeline(t, nil, &Audio{})
+	a := rungFrames(run(t, p, src), -1)
+	assert.Equal(t, uint64(2), p.Stats().AudioCorrupt)
+	assert.Len(t, a, len(src)-2)
+	requireConforms(t, a)
+	t.Logf("%d in, %d out, stats %+v", len(src), len(a), p.Stats())
 }

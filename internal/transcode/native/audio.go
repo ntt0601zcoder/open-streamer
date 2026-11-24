@@ -70,6 +70,15 @@ type audioTrack struct {
 	resampled bool  // the resampler has had input
 }
 
+// isCorruptData reports whether a decoder error means a corrupt frame,
+// which is skipped. Besides AVERROR_INVALIDDATA, the AAC decoder reports
+// some corrupt bitstreams, such as a set SSR gain-control bit, as
+// AVERROR_PATCHWELCOME (a feature it does not implement); on lossy UDP or
+// SRT input that is one damaged frame, not a broken stream.
+func isCorruptData(err error) bool {
+	return errors.Is(err, astiav.ErrInvaliddata) || errors.Is(err, astiav.ErrPatchwelcome)
+}
+
 func newAudioTrack(track int, out Audio) *audioTrack {
 	layout, _ := channelLayout(out.Channels) // checked by New
 	return &audioTrack{track: track, out: out, layout: layout}
@@ -94,10 +103,13 @@ func (a *audioTrack) push(f media.Frame, epoch uint32, st *Stats) ([]Output, err
 	if err := a.decPkt.fill(bytes.Join(f.Data, nil), f.PTS, f.DTS); err != nil {
 		return out, fmt.Errorf("audio decoder: %w", err)
 	}
-	if err := a.decPkt.send(a.dec); err != nil && !errors.Is(err, astiav.ErrInvaliddata) {
+	// A corrupt frame is skipped and counted: the timeline closes the hole.
+	switch err := a.decPkt.send(a.dec); {
+	case isCorruptData(err):
+		st.AudioCorrupt++
+	case err != nil:
 		return out, fmt.Errorf("audio decoder: track %d: send: %w", a.track, err)
 	}
-	// A corrupt frame is skipped: the timeline closes the hole.
 	o, err := a.receive(epoch, st)
 	return append(out, o...), err
 }
@@ -171,8 +183,9 @@ func (a *audioTrack) receive(epoch uint32, st *Stats) ([]Output, error) {
 		switch {
 		case errors.Is(err, astiav.ErrEagain), errors.Is(err, astiav.ErrEof):
 			return out, nil
-		case errors.Is(err, astiav.ErrInvaliddata) && bad < maxBadPictures:
+		case isCorruptData(err) && bad < maxBadPictures:
 			bad++
+			st.AudioCorrupt++
 			continue
 		case err != nil:
 			return out, fmt.Errorf("audio decoder: track %d: receive: %w", a.track, err)

@@ -60,8 +60,10 @@ type Output struct {
 // DroppedTracks is the number of video tracks that are not encoded (only the
 // lowest-numbered video track is). Reanchors counts audio re-anchors after a
 // forward gap, and AudioDropped the audio samples (at the output rate)
-// dropped because the input ran early.
-type Stats struct{ DroppedTracks, Reanchors, AudioDropped uint64 }
+// dropped because the input ran early. AudioCorrupt counts audio frames the
+// decoder rejected as corrupt (invalid data, or a feature it does not
+// implement) and that were skipped.
+type Stats struct{ DroppedTracks, Reanchors, AudioDropped, AudioCorrupt uint64 }
 
 // Pipeline decodes the source video once, encodes it per rung with libx264,
 // and re-encodes every audio track to AAC. Its input is already in rendition
