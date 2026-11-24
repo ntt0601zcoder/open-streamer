@@ -797,17 +797,10 @@ func TestM4aRespawn(t *testing.T) {
 	}
 }
 
-// m4aVLCTolerate makes TestM4aVLC tolerate VLC's start-up pair (a live-start
-// clock reset, then "no reference clock") as ruling R-T1c does on the M3
-// hls-ts row. The plan asked for no tolerance, written when R-F3 was
-// expected to remove the pair; R-T1c came after, and the rendition shows
-// the same pair, in 1 of 4 strict runs in the CI-peer image.
-const m4aVLCTolerate = true
-
 // TestM4aVLC plays the t180 rendition's HLS TS in VLC with the pass rule of
-// TestM3VLCClass's hls-ts row (m4aVLCTolerate): the rendition of
-// h264_aac.ts replayed four times at its pace, packaged live as the M3 row
-// does.
+// TestM3VLCClass's hls-ts row, the start-up pair's tolerance of ruling
+// R-T1c included (ruling R-T7a'): the rendition of h264_aac.ts replayed four
+// times at its pace, packaged live as the M3 row does.
 func TestM4aVLC(t *testing.T) {
 	bin := testpeer.OSTranscoder(t)
 	vlc := testpeer.VLC(t, "adaptive", "ts", "avcodec")
@@ -833,5 +826,5 @@ func TestM4aVLC(t *testing.T) {
 	origin := serveHTTP(t, "", map[string]*hub.Hub{"s": r.h}, map[string]*live.Packager{"s": p}, 0, nil)
 	waitAV(t, r.h)
 	waitListed(t, p, 5) // as the M3 row: a window of five segments
-	vlcPlays(t, vlc, ffprobe, origin+"/live/s/hls/index.m3u8", m4aVLCTolerate)
+	vlcPlays(t, vlc, ffprobe, origin+"/live/s/hls/index.m3u8", true)
 }

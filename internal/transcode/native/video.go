@@ -16,8 +16,13 @@ import (
 const (
 	// x264Params keeps keyframes where the pipeline puts them: no scene
 	// cuts, a keyframe interval long enough that the source's keys force
-	// every IDR, and IDRs allowed at any distance.
-	x264Params = "scenecut=0:keyint=600:min-keyint=1:rc-lookahead=10"
+	// every IDR, and IDRs allowed at any distance. b-pyramid=none (ruling
+	// R-T7b'): with x264's default B-pyramid, VLC 3.0.20 logged "buffer
+	// deadlock prevented" at the start of 5 of 16 HLS-TS plays of an
+	// encoded rung (0 of 8 for the copied source); without it, 0 of 8.
+	// It also halves the reorder depth and DPB the SPS announces (2 → 1,
+	// 4 → 2).
+	x264Params = "scenecut=0:keyint=600:min-keyint=1:rc-lookahead=10:b-pyramid=none"
 	// fpsDeltas is how many DTS deltas of the source estimate its framerate.
 	fpsDeltas = 8
 	// defaultFPS is the framerate when the source gives no delta.

@@ -86,7 +86,7 @@
   - Every audio track gets its own decoder, resampler and encoder (AAC mode), or is copied (copy mode).
 - **Keyframes:**
   - Every rung encodes an IDR at exactly the PTS of every source frame with `Key`. The decoded frame is matched by PTS, because the decoder's own key flag misses H.264 recovery points. The IDR is forced with `pict_type` I, the key flag and `forced-idr=1`; every other frame's `pict_type` is reset to none.
-  - libx264 uses `x264-params` = `scenecut=0:keyint=600:min-keyint=1:rc-lookahead=10`.
+  - libx264 uses `x264-params` = `scenecut=0:keyint=600:min-keyint=1:rc-lookahead=10:b-pyramid=none` (`b-pyramid=none`: ruling R-T7b', VLC 3 otherwise logs "buffer deadlock prevented" on encoded rungs).
   - Defaults are B-frames 2, preset `veryfast`, threads 0 (auto), and MaxBitrate = Bitrate when 0, with bufsize = 2 × maxrate.
 - **Rendition epochs (§3.5):**
   - The host's `epochMap` assigns the epoch of every frame before it goes to the child or a merger. Upstream epoch e maps to e + offset.
