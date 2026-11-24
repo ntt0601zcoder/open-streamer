@@ -4,6 +4,8 @@
 #
 #   <outdir>/ostranscoder
 #   <outdir>/lib/<soname>   one per library ldd resolves inside the prefix
+#   <outdir>/LICENSE-ffmpeg/ FFmpeg's LICENSE* and COPYING* files from the
+#                            prefix (the libraries are the GPL build)
 #
 # The binary carries DT_RPATH $ORIGIN/lib (-r with --disable-new-dtags), so
 # the bundle runs from any directory with no LD_LIBRARY_PATH; only glibc
@@ -57,6 +59,15 @@ echo "$deps" | awk -v lib="$prefix/lib/" '$2 == "=>" && index($3, lib) == 1 { pr
 		cp -L "$path" "$out/lib/$soname"
 	done
 [ -n "$(ls "$out/lib")" ] || die "no library resolved inside $prefix"
+
+# The libraries are FFmpeg-Builds' GPL build: their licence goes with them.
+mkdir -p "$out/LICENSE-ffmpeg"
+for f in "$prefix"/LICENSE* "$prefix"/COPYING*; do
+	if [ -f "$f" ]; then
+		cp -L "$f" "$out/LICENSE-ffmpeg/"
+	fi
+done
+[ -n "$(ls "$out/LICENSE-ffmpeg")" ] || die "no LICENSE* or COPYING* file in $prefix"
 
 # The bundle alone, with no LD_LIBRARY_PATH: every library resolves, and
 # every bundled one from lib/.

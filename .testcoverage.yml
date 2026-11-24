@@ -17,3 +17,8 @@ exclude:
     # internal/ingest tests, which go test does not count towards it
     # without -coverpkg
     - ^pkg/rtsp/rtsptest
+    # cgo behind -tags libav, covered by the transcoder jobs; transcodetest
+    # runs only in re-executed children
+    - ^cmd/ostranscoder
+    - ^internal/transcode/native
+    - ^internal/transcode/transcodetest

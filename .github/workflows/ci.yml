@@ -29,7 +29,134 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
 
+  # The transcoder child (cmd/ostranscoder, -tags libav) on amd64: built
+  # with cgo against the pinned FFmpeg 8.1 shared build (scripts/
+  # ffmpeg-dev.sh) on Ubuntu 24.04, so that the bundle needs only glibc
+  # 2.39 or later from the system. The tagged packages are vetted and tested
+  # with LD_LIBRARY_PATH on the prefix's lib/ (a test binary has no rpath);
+  # the bundle (scripts/bundle-ostranscoder.sh: the binary with DT_RPATH
+  # $ORIGIN/lib, lib/ and LICENSE-ffmpeg/) must then run -version from
+  # another directory without it. It is uploaded as a tar, which keeps the
+  # exec bit.
+  transcoder-amd64:
+    runs-on: ubuntu-24.04
+    env:
+      OSTX_ARCH: amd64
+      OSTX_PKGS: ./internal/transcode/native/... ./cmd/ostranscoder/...
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The EC2 regional mirror is dropped as in the test job.
+      - name: Install pkg-config
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config
+      - name: Fetch the pinned FFmpeg 8.1
+        run: |
+          prefix=$(sh scripts/ffmpeg-dev.sh "$OSTX_ARCH")
+          echo "OSTX_PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      # go vet and go test only warn, and pass, when a pattern matches no
+      # packages: a moved or mistagged package would go unchecked.
+      - name: Check the libav packages exist
+        run: |
+          for p in $OSTX_PKGS; do
+            if [ -z "$(go list -tags libav "$p")" ]; then
+              echo "$p matches no packages with -tags libav" >&2
+              exit 1
+            fi
+          done
+      - name: go vet -tags libav
+        run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go vet -tags libav $OSTX_PKGS
+      - name: go test -race -tags libav
+        run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go test -race -count=1 -tags libav $OSTX_PKGS
+      - name: Bundle ostranscoder
+        run: sh scripts/bundle-ostranscoder.sh "$OSTX_ARCH" "dist/ostranscoder-$OSTX_ARCH"
+      - name: Run the bundle
+        run: |
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-$OSTX_ARCH/ostranscoder"
+          out=$(cd / && env -u LD_LIBRARY_PATH "$ostx" -version)
+          echo "$out"
+          echo "$out" | grep -Eqx 'ostranscoder wire [0-9]+ libavcodec 62\.[0-9]+\.[0-9]+'
+          ls -l "$(dirname "$ostx")/lib" "$(dirname "$ostx")/LICENSE-ffmpeg"
+      - name: Tar the bundle
+        run: tar -C dist -cf "ostranscoder-$OSTX_ARCH.tar" "ostranscoder-$OSTX_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ostranscoder-${{ env.OSTX_ARCH }}
+          path: ostranscoder-${{ env.OSTX_ARCH }}.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  # The transcoder child (cmd/ostranscoder, -tags libav) on arm64: built
+  # with cgo against the pinned FFmpeg 8.1 shared build (scripts/
+  # ffmpeg-dev.sh) on Ubuntu 24.04, so that the bundle needs only glibc
+  # 2.39 or later from the system. The tagged packages are vetted and tested
+  # with LD_LIBRARY_PATH on the prefix's lib/ (a test binary has no rpath);
+  # the bundle (scripts/bundle-ostranscoder.sh: the binary with DT_RPATH
+  # $ORIGIN/lib, lib/ and LICENSE-ffmpeg/) must then run -version from
+  # another directory without it. It is uploaded as a tar, which keeps the
+  # exec bit.
+  transcoder-arm64:
+    runs-on: ubuntu-24.04-arm
+    env:
+      OSTX_ARCH: arm64
+      OSTX_PKGS: ./internal/transcode/native/... ./cmd/ostranscoder/...
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The EC2 regional mirror is dropped as in the test job.
+      - name: Install pkg-config
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config
+      - name: Fetch the pinned FFmpeg 8.1
+        run: |
+          prefix=$(sh scripts/ffmpeg-dev.sh "$OSTX_ARCH")
+          echo "OSTX_PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      # go vet and go test only warn, and pass, when a pattern matches no
+      # packages: a moved or mistagged package would go unchecked.
+      - name: Check the libav packages exist
+        run: |
+          for p in $OSTX_PKGS; do
+            if [ -z "$(go list -tags libav "$p")" ]; then
+              echo "$p matches no packages with -tags libav" >&2
+              exit 1
+            fi
+          done
+      - name: go vet -tags libav
+        run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go vet -tags libav $OSTX_PKGS
+      - name: go test -race -tags libav
+        run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go test -race -count=1 -tags libav $OSTX_PKGS
+      - name: Bundle ostranscoder
+        run: sh scripts/bundle-ostranscoder.sh "$OSTX_ARCH" "dist/ostranscoder-$OSTX_ARCH"
+      - name: Run the bundle
+        run: |
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-$OSTX_ARCH/ostranscoder"
+          out=$(cd / && env -u LD_LIBRARY_PATH "$ostx" -version)
+          echo "$out"
+          echo "$out" | grep -Eqx 'ostranscoder wire [0-9]+ libavcodec 62\.[0-9]+\.[0-9]+'
+          ls -l "$(dirname "$ostx")/lib" "$(dirname "$ostx")/LICENSE-ffmpeg"
+      - name: Tar the bundle
+        run: tar -C dist -cf "ostranscoder-$OSTX_ARCH.tar" "ostranscoder-$OSTX_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ostranscoder-${{ env.OSTX_ARCH }}
+          path: ostranscoder-${{ env.OSTX_ARCH }}.tar
+          if-no-files-found: error
+          retention-days: 7
+
   test:
+    needs: transcoder-amd64
     runs-on: ubuntu-24.04
     services:
       # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
@@ -46,6 +173,19 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # The transcoder bundle of transcoder-amd64, for the tests that spawn
+      # the real child (testpeer.OSTranscoder).
+      - uses: actions/download-artifact@v4
+        with:
+          name: ostranscoder-amd64
+          path: ${{ runner.temp }}/ostranscoder
+      - name: Unpack the transcoder bundle (OS_TRANSCODER)
+        run: |
+          mkdir -p dist
+          tar -C dist -xf "$RUNNER_TEMP/ostranscoder/ostranscoder-amd64.tar"
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-amd64/ostranscoder"
+          "$ostx" -version
+          echo "OS_TRANSCODER=$ostx" >> "$GITHUB_ENV"
       # ffmpeg (with libsrt), and the VLC-class peers of TestM3VLCClass:
       # VLC 3 (its SRT access is in vlc-plugin-access-extra) and GStreamer
       # 1.24 with the libav decoders. The runner's user is not root, which
@@ -143,6 +283,7 @@ jobs:
         run: docker stop osv2-mtx-m2c || true
 
   coverage:
+    needs: transcoder-amd64
     runs-on: ubuntu-24.04
     services:
       # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
@@ -159,6 +300,19 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # The transcoder bundle of transcoder-amd64, for the tests that spawn
+      # the real child (testpeer.OSTranscoder).
+      - uses: actions/download-artifact@v4
+        with:
+          name: ostranscoder-amd64
+          path: ${{ runner.temp }}/ostranscoder
+      - name: Unpack the transcoder bundle (OS_TRANSCODER)
+        run: |
+          mkdir -p dist
+          tar -C dist -xf "$RUNNER_TEMP/ostranscoder/ostranscoder-amd64.tar"
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-amd64/ostranscoder"
+          "$ostx" -version
+          echo "OS_TRANSCODER=$ostx" >> "$GITHUB_ENV"
       # ffmpeg (with libsrt), and the VLC-class peers of TestM3VLCClass:
       # VLC 3 (its SRT access is in vlc-plugin-access-extra) and GStreamer
       # 1.24 with the libav decoders. The runner's user is not root, which

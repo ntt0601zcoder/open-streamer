@@ -228,3 +228,48 @@ func TestFFmpeg8(t *testing.T) {
 		})
 	}
 }
+
+// fakeTranscoder writes an executable named ostranscoder in a new directory
+// that runs script, and returns its path.
+func fakeTranscoder(t *testing.T, script string) string {
+	t.Helper()
+	bin := t.TempDir() + "/ostranscoder"
+	assert.NoError(t, os.WriteFile(bin, []byte("#!/bin/sh\n"+script+"\n"), 0o755))
+	return bin
+}
+
+func TestOSTranscoderPeer(t *testing.T) {
+	good := fakeTranscoder(t, "echo 'ostranscoder wire 1 libavcodec 62.28.103'")
+	stub := fakeTranscoder(t, "echo 'ostranscoder: built without -tags libav' >&2; exit 2")
+	other := fakeTranscoder(t, "echo 'something else'")
+	dir := func(p string) string { return p[:len(p)-len("/ostranscoder")] }
+	for _, tt := range []struct {
+		name               string
+		env, path, require string
+		want               string
+		wantSkip, wantFail bool
+	}{
+		{name: "env", env: good, path: dir(stub), want: good},
+		{name: "env nonexistent", env: "/nonexistent", path: dir(good), wantFail: true},
+		{name: "env stub", env: stub, path: dir(good), wantFail: true},
+		{name: "env not ostranscoder", env: other, wantFail: true},
+		{name: "PATH", path: dir(good), want: good},
+		{name: "PATH stub", path: dir(stub), wantSkip: true},
+		{name: "PATH stub required", path: dir(stub), require: "1", wantFail: true},
+		{name: "none", path: t.TempDir(), wantSkip: true},
+		{name: "none required", path: t.TempDir(), require: "1", wantFail: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(EnvTranscoder, tt.env)
+			t.Setenv(EnvRequire, tt.require)
+			t.Setenv("PATH", tt.path)
+			rec := &recorder{TB: t}
+			got := OSTranscoder(rec)
+			assert.Equal(t, tt.wantSkip, rec.skipped, "skipped")
+			assert.Equal(t, tt.wantFail, rec.failed, "failed")
+			if !tt.wantSkip && !tt.wantFail {
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}

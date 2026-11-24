@@ -507,3 +507,48 @@ func parseFFmpegMajor(line string) (int, bool) {
 	major, err := strconv.Atoi(v)
 	return major, err == nil
 }
+
+// EnvTranscoder names the environment variable that holds the path of a
+// bundled ostranscoder (dist/ostranscoder-<arch>/ostranscoder, built by make
+// ostranscoder or by CI's transcoder jobs). CI sets it in the test and
+// coverage jobs; scripts/test-ci-peers.sh mounts it at the same path.
+const EnvTranscoder = "OS_TRANSCODER"
+
+// OSTranscoder returns the path of an ostranscoder built with -tags libav:
+// OS_TRANSCODER when it is set (it must run -version and print
+// "ostranscoder wire ..."), else the ostranscoder on PATH when it does. When
+// there is none the test is skipped, or failed when OS_REQUIRE_PEERS=1.
+func OSTranscoder(t testing.TB) string {
+	t.Helper()
+	if path := os.Getenv(EnvTranscoder); path != "" {
+		if err := transcoderVersion(t, path); err != nil {
+			t.Fatalf("%s=%s: -version: %v", EnvTranscoder, path, err)
+			return ""
+		}
+		return path
+	}
+	path, err := exec.LookPath("ostranscoder")
+	if err != nil {
+		missing(t, "peer ostranscoder: %s unset and none on PATH: %v", EnvTranscoder, err)
+		return ""
+	}
+	if err := transcoderVersion(t, path); err != nil {
+		missing(t, "peer ostranscoder: %s unset and %s -version: %v", EnvTranscoder, path, err)
+		return ""
+	}
+	return path
+}
+
+// transcoderVersion runs binary -version, which must succeed and print a
+// first line that starts with "ostranscoder wire ".
+func transcoderVersion(t testing.TB, binary string) error {
+	out, err := exec.CommandContext(t.Context(), binary, "-version").CombinedOutput() //nolint:gosec // test peers
+	line, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+	if err != nil {
+		return fmt.Errorf("%w (%q)", err, line)
+	}
+	if !strings.HasPrefix(line, "ostranscoder wire ") {
+		return fmt.Errorf("not an ostranscoder: printed %q", line)
+	}
+	return nil
+}
