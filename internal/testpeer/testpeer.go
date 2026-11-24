@@ -433,6 +433,49 @@ func imageLacks(t testing.TB, img string, elements []string) string {
 	return ""
 }
 
+// EnvFFmpeg8 names the environment variable that holds the path of an
+// ffmpeg 8 or later, for rows that the distribution's ffmpeg cannot prove
+// (Ubuntu 24.04's 6.1 stops an HLS rendition at the first segment it fails
+// to load). CI sets it to a pinned static build; the apt ffmpeg stays the
+// one on PATH.
+const EnvFFmpeg8 = "OS_FFMPEG8"
+
+// EnvFFmpeg8OnHost names the environment variable that, set to "1", says
+// that the ffmpeg 8 rows run outside this process's environment:
+// scripts/test-ci-peers.sh sets it in its container when OS_FFMPEG8 is unset
+// and runs those rows on the host instead. FFmpeg8 then skips, whatever
+// OS_REQUIRE_PEERS says.
+const EnvFFmpeg8OnHost = "OS_FFMPEG8_ON_HOST"
+
+// FFmpeg8 returns an ffmpeg of major version 8 or later: OS_FFMPEG8 when it
+// is set (it must run and be 8 or later), else the ffmpeg on PATH when it is.
+// When there is none the test is skipped, or failed when
+// OS_REQUIRE_PEERS=1; with OS_FFMPEG8_ON_HOST=1 it is skipped.
+func FFmpeg8(t testing.TB) string {
+	t.Helper()
+	if path := os.Getenv(EnvFFmpeg8); path != "" {
+		if major, ok := FFmpegMajor(t, path); !ok || major < 8 {
+			t.Fatalf("%s=%s: not an ffmpeg 8 or later (major %d, parsed %v)", EnvFFmpeg8, path, major, ok)
+			return ""
+		}
+		return path
+	}
+	if os.Getenv(EnvFFmpeg8OnHost) == "1" {
+		t.Skipf("the ffmpeg 8 rows run on the host (%s=1)", EnvFFmpeg8OnHost)
+		return ""
+	}
+	path, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		missing(t, "peer ffmpeg 8: %s unset and no ffmpeg on PATH: %v", EnvFFmpeg8, err)
+		return ""
+	}
+	if major, ok := FFmpegMajor(t, path); !ok || major < 8 {
+		missing(t, "peer ffmpeg 8: %s unset and %s is not 8 or later (major %d, parsed %v)", EnvFFmpeg8, path, major, ok)
+		return ""
+	}
+	return path
+}
+
 // FFmpegMajor returns the major version that binary (ffmpeg or ffprobe)
 // prints first for -version, as in "ffmpeg version 6.1.1-3ubuntu5" or
 // "ffmpeg version n7.1"; ok is false when it cannot be run or names no

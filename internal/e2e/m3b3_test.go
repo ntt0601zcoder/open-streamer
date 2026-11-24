@@ -1132,11 +1132,6 @@ func largestGap(lines []framecrcLine, s int) (gap, from, to float64, n int) {
 	return gap, from, to, len(at)
 }
 
-// acrossGapFFmpeg is the oldest ffmpeg major that TestHLSFFmpegAcrossGap
-// was proven with: 8 resumes a rendition after segments it fails to load,
-// 6.1 does not, and 7 is untried.
-const acrossGapFFmpeg = 8
-
 // TestHLSFFmpegAcrossGap has ffmpeg read the HLS fMP4 master of a live
 // stream across a video-only stretch (gapSource: 12 s of A/V, 6 s of video
 // only, 12 s of A/V), from its first listed segment until EXT-X-ENDLIST,
@@ -1145,25 +1140,23 @@ const acrossGapFFmpeg = 8
 // video throughout. Its warnings (the gap entries it may try to load) are
 // recorded.
 //
-// It needs ffmpeg 8 (acrossGapFFmpeg) and is skipped on an older one:
-// ffmpeg 6.1 (Ubuntu 24.04's) loads gap entries' URIs, which fail, and its
-// HLS demuxer then reads no more of that rendition, so the audio ends at
-// the stretch. It does the same with a VOD playlist and segments written
-// by its own hls muxer, three audio segments missing and no EXT-X-GAP or
-// EXT-X-DISCONTINUITY (259 of 863 audio frames, none after the first
-// missing one), where ffmpeg 8 resumes after the hole.
+// The reader is ffmpeg 8 or later (testpeer.FFmpeg8; CI's is a pinned
+// static build), not the distribution's ffmpeg: ffmpeg 6.1 (Ubuntu 24.04's)
+// loads gap entries' URIs, which fail, and its HLS demuxer then reads no
+// more of that rendition, so the audio ends at the stretch. It does the same
+// with a VOD playlist and segments written by its own hls muxer, three audio
+// segments missing and no EXT-X-GAP or EXT-X-DISCONTINUITY (259 of 863
+// audio frames, none after the first missing one), where ffmpeg 8 resumes
+// after the hole. 7 is untried.
 func TestHLSFFmpegAcrossGap(t *testing.T) {
 	t.Parallel()
 	ffmpeg := testpeer.Require(t, "ffmpeg")
-	if major, ok := testpeer.FFmpegMajor(t, ffmpeg); ok && major < acrossGapFFmpeg {
-		t.Skipf("ffmpeg %d: its HLS demuxer stops a rendition at the first segment it fails to load "+
-			"(a gap entry), also on its own hls muxer's output; the row needs ffmpeg %d", major, acrossGapFFmpeg)
-	}
+	ffmpeg8 := testpeer.FFmpeg8(t)
 	r, p, origin := gapSource(t, ffmpeg, 2)
 	waitListed(t, p, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), runLimit)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, ffmpeg, "-hide_banner", "-nostdin", "-v", "warning",
+	cmd := exec.CommandContext(ctx, ffmpeg8, "-hide_banner", "-nostdin", "-v", "warning",
 		"-live_start_index", "0", "-i", origin+"/live/s/cmaf/master.m3u8",
 		"-map", "0:v", "-map", "0:a", "-f", "framecrc", "-")
 	var stdout, stderr bytes.Buffer

@@ -181,3 +181,50 @@ func TestFFmpegMajor(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, 6, got)
 }
+
+// fakeFFmpeg writes an executable named ffmpeg in a new directory that
+// prints version line, and returns its path.
+func fakeFFmpeg(t *testing.T, version string) string {
+	t.Helper()
+	bin := t.TempDir() + "/ffmpeg"
+	assert.NoError(t, os.WriteFile(bin, []byte("#!/bin/sh\necho 'ffmpeg version "+version+" Copyright'\n"), 0o755))
+	return bin
+}
+
+func TestFFmpeg8(t *testing.T) {
+	ff8 := fakeFFmpeg(t, "8.0.1-static")
+	ff6 := fakeFFmpeg(t, "6.1.1-3ubuntu5")
+	dir := func(p string) string { return p[:len(p)-len("/ffmpeg")] }
+	for _, tt := range []struct {
+		name               string
+		env, path, onHost  string
+		require            string
+		want               string
+		wantSkip, wantFail bool
+	}{
+		{name: "env 8", env: ff8, path: dir(ff6), want: ff8},
+		{name: "env 6", env: ff6, path: dir(ff8), wantFail: true},
+		{name: "env not runnable", env: "/no/such/ffmpeg", wantFail: true},
+		{name: "env 8 wins over on-host", env: ff8, onHost: "1", want: ff8},
+		{name: "on host", onHost: "1", path: dir(ff8), require: "1", wantSkip: true},
+		{name: "PATH 8", path: dir(ff8), want: ff8},
+		{name: "PATH 6", path: dir(ff6), wantSkip: true},
+		{name: "PATH 6 required", path: dir(ff6), require: "1", wantFail: true},
+		{name: "none", path: t.TempDir(), wantSkip: true},
+		{name: "none required", path: t.TempDir(), require: "1", wantFail: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(EnvFFmpeg8, tt.env)
+			t.Setenv(EnvFFmpeg8OnHost, tt.onHost)
+			t.Setenv(EnvRequire, tt.require)
+			t.Setenv("PATH", tt.path)
+			rec := &recorder{TB: t}
+			got := FFmpeg8(rec)
+			assert.Equal(t, tt.wantSkip, rec.skipped, "skipped")
+			assert.Equal(t, tt.wantFail, rec.failed, "failed")
+			if !tt.wantSkip && !tt.wantFail {
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
