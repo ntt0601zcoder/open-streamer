@@ -1392,17 +1392,23 @@ func mediaMTXPullRow(t *testing.T, mtx, ffmpeg, path string, mayRetry bool) (ret
 	return false
 }
 
-// srtEOFLine is the one line ffmpeg with libsrt writes, with -v error, when
-// the SRT sender ends the stream: libsrt reports the sender's shutdown as an
-// I/O error, for any sender (ffmpeg's own libsrt listener included).
-const srtEOFLine = "Error during demuxing: Input/output error"
+// srtEOFLine is the line ffmpeg with libsrt writes, with -v error, when the
+// SRT sender ends the stream: libsrt reports the sender's shutdown as an I/O
+// error, for any sender (ffmpeg's own libsrt listener included). ffmpeg 6.1
+// follows it with srtEOFLine61, again for any sender; ffmpeg 8 writes
+// srtEOFLine alone.
+const (
+	srtEOFLine   = "Error during demuxing: Input/output error"
+	srtEOFLine61 = "Error retrieving a packet from demuxer: Input/output error"
+)
 
 // TestM3b3SRTFFmpeg has ffmpeg with libsrt, an SRT receiver independent of
 // gosrt, read our SRT output of h264_aac.ts looped twice (12 s) with the
 // plain stream ID, twice at once: with -xerror -v error for 10 s of stream,
 // it exits 0 and writes nothing to stderr; with -v error until the stream
 // ends, it exits 0 and its stderr is the end-of-stream line alone
-// (srtEOFLine), which -xerror would make fatal.
+// (srtEOFLine, followed by srtEOFLine61 on ffmpeg 6.1), which -xerror would
+// make fatal.
 func TestM3b3SRTFFmpeg(t *testing.T) {
 	t.Parallel()
 	ffmpeg := testpeer.FFmpegSRT(t)
@@ -1420,8 +1426,11 @@ func TestM3b3SRTFFmpeg(t *testing.T) {
 	for l := range strings.SplitSeq(strings.TrimSpace(toEnd.stderr.String()), "\n") {
 		lines = append(lines, l)
 	}
-	require.Len(t, lines, 1, "ffmpeg stderr %q", toEnd.stderr.String())
+	require.True(t, len(lines) == 1 || len(lines) == 2, "ffmpeg stderr %q", toEnd.stderr.String())
 	assert.Contains(t, lines[0], srtEOFLine)
+	if len(lines) == 2 {
+		assert.Contains(t, lines[1], srtEOFLine61)
+	}
 	require.Eventually(t, func() bool { return o.srv.Stats().Conns == 0 }, m3b3Read, 10*time.Millisecond)
 	st := o.srv.Stats()
 	assert.Equal(t, uint64(1), st.EndedHubClosed, "the second receiver read to the end")
