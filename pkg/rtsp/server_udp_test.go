@@ -9,6 +9,7 @@ import (
 	"net"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -510,4 +511,143 @@ func TestServerUDPPairClosed(t *testing.T) {
 	if n := runtime.NumGoroutine(); n > before {
 		t.Fatalf("goroutines: before %d, now %d\n%s", before, n, stacks())
 	}
+}
+
+// A UDP client reads every packet a server sent before it ended the
+// session, and the BYE on every track, although the control connection's
+// EOF overtakes the datagrams still queued on its sockets. The race is
+// timing-bound, so the test plays several sessions (about one in ten lost
+// its tail before the fix, unloaded).
+func TestClientUDPTailAtServerEnd(t *testing.T) {
+	const n = 400 // under the client's packet queue
+	h := newHandler()
+	h.play = func(ctx context.Context, s *rtsp.ServerSession) {
+		_, _, vbase := s.Origin(0)
+		for i := range n {
+			p := &rtp.Packet{Header: rtp.Header{Timestamp: vbase + uint32(i*3000), Marker: true}, Payload: []byte{0x65, byte(i)}}
+			if s.WritePackets(0, []*rtp.Packet{p}) != nil {
+				return
+			}
+		}
+		s.Close() // a BYE per track, then the connection closes
+	}
+	_, addr := startUDPServer(t, h, rtsp.ServerConfig{})
+	start := time.Now()
+	for run := 0; run < 30 && time.Since(start) < 2*time.Second; run++ {
+		c := dial(t, "rtsp://"+addr+"/live/cam", udpConfig())
+		got, byes := 0, map[int]bool{}
+		var err error
+		for {
+			var p rtsp.Packet
+			if p, err = c.ReadPacket(); err != nil {
+				break
+			}
+			switch {
+			case p.RTP != nil && p.Track == 0:
+				got++
+			case p.RTCP != nil && rtcpHasBye(p.RTCP):
+				byes[p.Track] = true
+			}
+		}
+		require.ErrorIs(t, err, io.EOF, "run %d: the server ended the session", run)
+		require.Equal(t, n, got, "run %d: RTP packets sent before the session ended (dropped %d)", run, c.Stats().Dropped)
+		require.Equal(t, map[int]bool{0: true, 1: true}, byes, "run %d: a BYE per track", run)
+		require.NoError(t, c.Close())
+	}
+}
+
+// rtcpHasBye reports whether an RTCP compound holds a BYE.
+func rtcpHasBye(b []byte) bool {
+	return slices.Contains(rtcpTypes(b), 203)
+}
+
+// cutProxy forwards TCP connections to target; cut closes the client's side
+// of every connection while the server's side stays open, so the server
+// keeps sending UDP to a client whose control connection has ended.
+func cutProxy(t *testing.T, target string) (addr string, cut func()) {
+	t.Helper()
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var mu sync.Mutex
+	var downs, ups []net.Conn
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			down, err := l.Accept()
+			if err != nil {
+				return
+			}
+			up, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", target)
+			if err != nil {
+				_ = down.Close()
+				continue
+			}
+			mu.Lock()
+			downs, ups = append(downs, down), append(ups, up)
+			mu.Unlock()
+			wg.Go(func() { _, _ = io.Copy(up, down) })
+			wg.Go(func() { _, _ = io.Copy(down, up) })
+		}
+	})
+	closeAll := func(withUp bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range downs {
+			_ = c.Close()
+		}
+		if withUp {
+			for _, c := range ups {
+				_ = c.Close()
+			}
+		}
+	}
+	t.Cleanup(func() {
+		_ = l.Close()
+		closeAll(true)
+		wg.Wait()
+	})
+	return l.Addr().String(), func() { closeAll(false) }
+}
+
+// The drain after a control connection EOF is bounded although datagrams
+// keep coming, and Close during it returns at once.
+func TestClientUDPDrainBounded(t *testing.T) {
+	h := newHandler()
+	h.play = producer(5 * time.Millisecond)
+	_, addr := startUDPServer(t, h, rtsp.ServerConfig{SessionTimeout: 10 * time.Second})
+	proxy, cut := cutProxy(t, addr)
+
+	// A stream that goes on: the drain reads it until its 100 ms budget.
+	c := dial(t, "rtsp://"+proxy+"/live/cam", udpConfig())
+	readUntil(t, c, 2*time.Second, func(p rtsp.Packet) bool { return p.RTP != nil })
+	cut()
+	require.Eventually(t, c.Draining, 2*time.Second, time.Millisecond)
+	start := time.Now()
+	n := 0
+	var err error
+	for {
+		var p rtsp.Packet
+		if p, err = c.ReadPacket(); err != nil {
+			break
+		}
+		if p.RTP != nil {
+			n++
+		}
+	}
+	d := time.Since(start)
+	require.ErrorIs(t, err, io.EOF)
+	assert.GreaterOrEqual(t, d, 80*time.Millisecond, "a stream that goes on is read for the whole budget")
+	assert.Less(t, d, time.Second, "the drain is bounded")
+	assert.Positive(t, n, "packets read during the drain")
+
+	// Close during the drain neither waits for it nor sends TEARDOWN.
+	c = dial(t, "rtsp://"+proxy+"/live/cam", udpConfig())
+	readUntil(t, c, 2*time.Second, func(p rtsp.Packet) bool { return p.RTP != nil })
+	cut()
+	require.Eventually(t, c.Draining, 2*time.Second, time.Millisecond)
+	start = time.Now()
+	require.NoError(t, c.Close())
+	assert.Less(t, time.Since(start), 50*time.Millisecond, "Close cuts the drain short")
+	_, err = c.ReadPacket()
+	require.ErrorIs(t, err, rtsp.ErrClosed)
 }

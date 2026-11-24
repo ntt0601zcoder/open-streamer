@@ -24,6 +24,20 @@ const maxDatagram = 64 << 10
 // UDP sockets, so that a burst does not overflow it.
 const udpReadBuffer = 4 << 20
 
+// udpDrainWait bounds how long each UDP socket reader keeps reading after
+// the control connection ended, and udpDrainIdle is how long a socket must
+// stay quiet to count as dry. A server sends its last RTP and its BYEs
+// before it closes the connection, so on loopback and on a LAN they are
+// already queued on the sockets when the EOF arrives, and are read at once;
+// over a WAN they can trail the EOF by the jitter between the two paths,
+// usually a few milliseconds. 100 ms covers that with room while keeping
+// the end of a session, and a failover it starts, prompt; 20 ms of quiet
+// ends the drain early in the common case.
+const (
+	udpDrainWait = 100 * time.Millisecond
+	udpDrainIdle = 20 * time.Millisecond
+)
+
 // udpLink is the UDP transport of a track, fixed once SETUP returns.
 type udpLink struct {
 	rtp, rtcp *net.UDPConn
@@ -171,7 +185,16 @@ func (c *Client) setupUDP(ctx context.Context, m Media) error {
 		_ = c.writeUDP(link.rtp, link.srvAddr(0), nil)
 		_ = c.writeUDP(link.rtcp, link.srvAddr(1), nil)
 	}
+	// Under sockMu, so that a drain begun meanwhile (the server closed the
+	// connection right after this SETUP) never waits while readers start.
+	c.sockMu.Lock()
+	if c.draining.Load() {
+		c.sockMu.Unlock()
+		return fmt.Errorf("rtsp: setup: %w", net.ErrClosed)
+	}
 	c.wg.Add(2)
+	c.sockWG.Add(2)
+	c.sockMu.Unlock()
 	go c.readSocket(t, rtpC, false)
 	go c.readSocket(t, rtcpC, true)
 	return nil
@@ -189,13 +212,42 @@ func (c *Client) writeUDP(conn *net.UDPConn, to *net.UDPAddr, b []byte) error {
 }
 
 // readSocket reads one UDP socket of a track until the session ends.
-// Datagrams from anyone but the server are ignored.
+// Datagrams from anyone but the server are ignored. Once drainUDP wakes it,
+// it reads what is queued and returns when the socket has been quiet for
+// udpDrainIdle, after udpDrainWait, or when the socket is closed. Each read
+// of the drain sets its own deadline just before it, so a reader that runs
+// late still reads what is queued.
 func (c *Client) readSocket(t *clientTrack, conn *net.UDPConn, rtcp bool) {
 	defer c.wg.Done()
+	defer c.sockWG.Done()
 	buf := make([]byte, maxDatagram)
+	var draining bool
+	var until, idle time.Time
 	for {
+		if draining {
+			if !time.Now().Before(until) {
+				return
+			}
+			idle = time.Now().Add(udpDrainIdle)
+			_ = conn.SetReadDeadline(idle)
+		}
 		n, from, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			switch {
+			case draining:
+				// A deadline drainUDP set late can end a read early: only
+				// a quiet udpDrainIdle ends the drain.
+				if isTimeout(err) && time.Now().Before(idle) {
+					continue
+				}
+				return
+			case c.draining.Load():
+				if errors.Is(err, net.ErrClosed) {
+					return // Close cut the drain short
+				}
+				draining, until = true, time.Now().Add(udpDrainWait)
+				continue
+			}
 			select {
 			case <-c.done:
 			default:
@@ -223,6 +275,24 @@ func (c *Client) readSocket(t *clientTrack, conn *net.UDPConn, rtcp bool) {
 		c.firstOnce.Do(func() { close(c.firstRTP) })
 		c.queueUDP(Packet{Track: t.index, RTP: p, Arrival: arrival})
 	}
+}
+
+// drainUDP reads the UDP sockets dry after the control connection ended
+// on its own: the server sent its last packets and BYEs before it closed
+// the connection, but the EOF can overtake them while they wait on the
+// sockets, and closing the sockets would discard them. It wakes every
+// socket reader into its drain (see readSocket) and waits for them, so
+// that the packets are queued before the session ends; Close and any
+// failure still close the sockets at once and cut the drain short.
+func (c *Client) drainUDP() {
+	c.sockMu.Lock()
+	c.draining.Store(true)
+	now := time.Now()
+	for _, s := range c.socks {
+		_ = s.SetReadDeadline(now)
+	}
+	c.sockMu.Unlock()
+	c.sockWG.Wait()
 }
 
 // queueUDP hands a packet to ReadPacket, dropping it (counted) when the

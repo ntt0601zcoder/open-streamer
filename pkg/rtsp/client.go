@@ -214,10 +214,14 @@ type Client struct {
 	nResyncs, nUnknown, nServerReqs, nDropped, nReauth atomic.Uint64
 	nDup, nReordered, nFallback                        atomic.Uint64
 
-	// UDP sockets, closed when the session ends.
+	// UDP sockets, closed when the session ends. sockWG counts their
+	// readers; draining is set once the control connection has ended and
+	// the readers are reading the sockets dry (drainUDP).
 	sockMu      sync.Mutex
 	socks       []*net.UDPConn
 	socksClosed bool
+	sockWG      sync.WaitGroup
+	draining    atomic.Bool
 	firstRTP    chan struct{} // closed on the first RTP packet over UDP
 	firstOnce   sync.Once
 
@@ -729,7 +733,10 @@ func (c *Client) Stats() ClientStats {
 // ReadPacket returns the next packet. After the session ends it returns the
 // packets still queued, then the error that ended it (ErrClosed after
 // Close). Over UDP the RTP packets of each track come in sequence order,
-// held back at most 200 ms (or 64 packets) behind a missing one.
+// held back at most 200 ms (or 64 packets) behind a missing one; when the
+// server ends the session by closing the control connection, the packets
+// and BYEs it sent before are still returned, read from the UDP sockets for
+// at most 100 ms more.
 func (c *Client) ReadPacket() (Packet, error) {
 	if c.closed.Load() {
 		return Packet{}, ErrClosed
@@ -767,7 +774,11 @@ func (c *Client) shutdown(ctx context.Context) {
 		select {
 		case <-c.done:
 		default:
-			c.teardown(ctx)
+			// While the sockets drain the server has already closed the
+			// connection: there is no one to send TEARDOWN to.
+			if !c.draining.Load() {
+				c.teardown(ctx)
+			}
 		}
 		c.fail(ErrClosed)
 		c.wg.Wait()

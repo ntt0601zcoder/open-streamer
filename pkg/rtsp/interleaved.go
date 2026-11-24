@@ -23,11 +23,22 @@ var methods = []string{
 // maxStartPeek covers "RTSP/1.0" and the longest method plus its space.
 const maxStartPeek = len("GET_PARAMETER ")
 
-// readLoop owns the reading side of the connection until it fails.
+// readLoop owns the reading side of the connection until it fails. When
+// the connection of a UDP session ends on its own (the server closed it,
+// not Close or another failure), the UDP sockets are read dry before the
+// session ends: the server may have sent its last packets and closed
+// before Dial even returned.
 func (c *Client) readLoop() {
 	defer c.wg.Done()
 	for {
 		if err := c.readOne(); err != nil {
+			select {
+			case <-c.done:
+			default:
+				if c.udp && !c.closed.Load() {
+					c.drainUDP()
+				}
+			}
 			c.fail(err)
 			return
 		}
@@ -292,6 +303,11 @@ func (c *Client) timerLoop() {
 		case <-c.done:
 			return
 		case <-ticker.C:
+		}
+		if c.draining.Load() {
+			// The connection has ended: the session ends once the UDP
+			// sockets are dry, with the connection's error.
+			continue
 		}
 		now := time.Now()
 		if c.blocked.Load() {

@@ -462,21 +462,27 @@ func TestRTSPPullCloseUnblocks(t *testing.T) {
 	}
 }
 
+// The server ending the session ends the pull cleanly, over TCP and over
+// UDP (where the client first reads its sockets dry).
 func TestRTSPPullServerEnds(t *testing.T) {
-	s := newRTSPServer(t, rtsptest.ServerOptions{Seed: 10})
-	r := rtspOpenT(t, s.URL("/stream"))
-	got := readRTSP(t, r, 10)
-	require.NoError(t, got.err)
-	s.Close()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_, err := r.Read()
-		if err == nil || errors.Is(err, ErrDiscontinuity) {
-			require.True(t, time.Now().Before(deadline), "the stream did not end")
-			continue
-		}
-		assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
-		return
+	for _, path := range []string{"/stream", "/stream?transport=udp"} {
+		t.Run(path, func(t *testing.T) {
+			s := newRTSPServer(t, rtsptest.ServerOptions{Seed: 10})
+			r := rtspOpenT(t, s.URL(path))
+			got := readRTSP(t, r, 10)
+			require.NoError(t, got.err)
+			s.Close()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				_, err := r.Read()
+				if err == nil || errors.Is(err, ErrDiscontinuity) {
+					require.True(t, time.Now().Before(deadline), "the stream did not end")
+					continue
+				}
+				assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+				return
+			}
+		})
 	}
 }
 
