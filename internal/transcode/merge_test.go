@@ -294,3 +294,49 @@ func TestMergerHoldAcrossEpochs(t *testing.T) {
 		assert.EqualValues(t, len(late), dropped, "audio later than the wall-time hold is dropped")
 	})
 }
+
+// A track announced with expect for an epoch is waited for before any frame
+// of that epoch is written, as if it had been seen: the child's audio that
+// reaches the merger before the rung's first IDR (the encoder's delay) is
+// not written ahead of it. Without expect, that audio went out first, and a
+// subscriber that joined on the IDR (the GOP cache) never got it.
+func TestMergerExpect(t *testing.T) {
+	t.Run("audio waits for the expected video", func(t *testing.T) {
+		ft := newFakeTime()
+		m, sub := newTestMerger(ft)
+		m.expect(1, 0)
+		for i := int64(0); i < 25; i++ { // 0.5 s of audio, video not yet out
+			m.push(aframe(1, i*1920))
+		}
+		assert.Empty(t, drain(sub), "audio held for the expected video")
+		for i := int64(0); i < 25; i++ {
+			m.push(vframe(1, i*3600, i == 0))
+		}
+		m.flush()
+		out := drain(sub)
+		require.Len(t, out, 50)
+		assert.Equal(t, media.KindVideo, out[0].Kind(), "the IDR comes first")
+		assert.True(t, out[0].Key)
+		for i := 1; i < len(out); i++ {
+			assert.GreaterOrEqual(t, out[i].DTS, out[i-1].DTS, "frame %d", i)
+		}
+	})
+	t.Run("the hold still bounds it", func(t *testing.T) {
+		ft := newFakeTime()
+		m, sub := newTestMerger(ft)
+		m.expect(1, 0)
+		m.push(aframe(1, 0))
+		assert.Empty(t, drain(sub))
+		ft.advance(2 * time.Second)
+		m.push(aframe(1, 1920))
+		assert.Len(t, drain(sub), 2, "the expected track ran out its hold")
+	})
+	t.Run("an older epoch is ignored", func(t *testing.T) {
+		ft := newFakeTime()
+		m, sub := newTestMerger(ft)
+		m.push(vframe(2, 0, true))
+		m.expect(1, 1)
+		m.push(vframe(2, 3600, false))
+		assert.Len(t, drain(sub), 2)
+	})
+}

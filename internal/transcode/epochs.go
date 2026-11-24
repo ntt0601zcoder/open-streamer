@@ -143,6 +143,8 @@ type router struct {
 	childFed  bool // the current child takes encode-path frames
 	buf       []media.Frame
 
+	expEpoch uint32 // rendition epoch last announced with expectVideo
+	expOK    bool
 	sentMax  int64 // largest PTS sent in the current rendition epoch
 	sentAny  bool
 	kPTS     int64 // PTS of the last K, shifted
@@ -154,16 +156,19 @@ type router struct {
 	upOK     bool
 
 	// Hooks.
-	toChild   func(wire.Message) bool // false: not queued
-	tryChild  func(wire.Message) bool // toChild without waiting; false: not queued
-	toCopy    func(f media.Frame)
-	setAnchor func(a media.Anchor)
-	srcAnchor func(up uint32) (media.Anchor, bool)
-	now       func() time.Time
-	onEpoch   func(epoch uint32, bump bool)
-	onLoss    func()
-	dropped   func(n uint64) // DroppedBeforeKey
-	warn      func(msg string, args ...any)
+	toChild  func(wire.Message) bool // false: not queued
+	tryChild func(wire.Message) bool // toChild without waiting; false: not queued
+	toCopy   func(f media.Frame)
+	// expectVideo announces the main video track of a rendition epoch to
+	// the encoded renditions' mergers; see send.
+	expectVideo func(epoch uint32, track int)
+	setAnchor   func(a media.Anchor)
+	srcAnchor   func(up uint32) (media.Anchor, bool)
+	now         func() time.Time
+	onEpoch     func(epoch uint32, bump bool)
+	onLoss      func()
+	dropped     func(n uint64) // DroppedBeforeKey
+	warn        func(msg string, args ...any)
 }
 
 // deliver handles one source delivery.
@@ -399,7 +404,9 @@ func (r *router) sendEvicted(a media.Frame) {
 }
 
 // send hands f, already in its rendition epoch, to its paths. Only a frame
-// that some path took counts as sent.
+// that some path took counts as sent. Before the first video frame of a
+// rendition epoch goes to the child, the encoded renditions' mergers are
+// told to expect that video track in the epoch (expectVideo).
 func (r *router) send(f media.Frame) {
 	sent := false
 	switch f.Kind() {
@@ -408,6 +415,7 @@ func (r *router) send(f media.Frame) {
 			sent = r.sendCopyVideo(f)
 		}
 		if r.childVideo {
+			r.expectChildVideo(f)
 			sent = r.sendChild(f) || sent
 		}
 	case media.KindAudio:
@@ -421,6 +429,18 @@ func (r *router) send(f media.Frame) {
 	if sent {
 		r.noteSent(f.PTS)
 	}
+}
+
+// expectChildVideo announces f's track in f's epoch once per epoch, while
+// the child is fed: the child's output for the epoch can only follow this
+// call, so its audio never reaches a merger that does not yet expect the
+// video.
+func (r *router) expectChildVideo(f media.Frame) {
+	if !r.childFed || r.expectVideo == nil || r.expOK && r.expEpoch == f.Epoch {
+		return
+	}
+	r.expEpoch, r.expOK = f.Epoch, true
+	r.expectVideo(f.Epoch, f.Track)
 }
 
 // sendChild hands f to the child when it is fed, and reports whether it was

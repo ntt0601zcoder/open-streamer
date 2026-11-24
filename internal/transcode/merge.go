@@ -21,11 +21,15 @@ type pendingFrame struct {
 //
 // Frames are released in (epoch, DTS) order. The expected tracks are those
 // seen in the hub's current epoch (before the first write, in the epoch of
-// the next frame). The next frame waits only while another expected track
-// has nothing pending, and only for at most hold, measured as wall time
-// since it arrived or, when the frame is in the current epoch, as stream
-// time (the largest DTS pending in that epoch minus the frame's DTS),
-// whichever ends first. A later epoch's frames are no measure of the
+// the next frame), and those announced for it with expect: the router
+// announces an encoded rung's video when it sends the epoch's first video
+// frame to the child, so the child's audio, which comes out up to the
+// encoder's delay (about 1 s with x264) ahead of the rung's IDR, waits for
+// it instead of being written before it. The next frame waits only while
+// another expected track has nothing pending, and only for at most hold,
+// measured as wall time since it arrived or, when the frame is in the
+// current epoch, as stream time (the largest DTS pending in that epoch
+// minus the frame's DTS), whichever ends first. A later epoch's frames are no measure of the
 // current epoch's progress: a burst of new-epoch copy frames must not
 // release the current epoch while the child's output for it is still on
 // its way. A track that makes a hold run out leaves the expected set until
@@ -92,6 +96,22 @@ func (m *merger) push(f media.Frame) {
 		default:
 		}
 	}
+}
+
+// expect makes track an expected track of epoch e before any frame of it
+// arrives. An epoch below the hub's current one is ignored.
+func (m *merger) expect(e uint32, track int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.written && e < m.epoch {
+		return
+	}
+	s := m.seen[e]
+	if s == nil {
+		s = map[int]bool{}
+		m.seen[e] = s
+	}
+	s[track] = true
 }
 
 // flush writes every pending frame, in order, without holding.

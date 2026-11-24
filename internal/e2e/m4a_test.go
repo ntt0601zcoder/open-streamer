@@ -128,6 +128,7 @@ func transcodeSteps(t *testing.T, src feed, opt transcode.Options) ([][]step, tr
 		require.Zero(t, r.lost, "%s: lost frames", opt.Renditions[i].Name)
 		require.Empty(t, r.missing, "%s: epochs without an anchor", opt.Renditions[i].Name)
 		require.NotEmpty(t, r.steps, opt.Renditions[i].Name)
+		requireVideoFirst(t, stepFrames(r.steps), opt.Renditions[i].Name)
 		out[i] = r.steps
 	}
 	st := tr.Stats()
@@ -137,6 +138,29 @@ func transcodeSteps(t *testing.T, src feed, opt transcode.Options) ([][]step, tr
 	require.Zero(t, st.DroppedBeforeKey, "%+v", st)
 	require.Zero(t, st.MergeDropped, "%+v", st)
 	return out, st
+}
+
+// requireVideoFirst checks that each epoch of a rendition hub that has
+// video starts, in hub order, with its video keyframe: no audio is written
+// ahead of the rung's IDR (the child's audio leads its video by the
+// encoder's delay), so a subscriber that joins on the IDR, through the GOP
+// cache, gets the epoch's audio from the start.
+func requireVideoFirst(t *testing.T, frames []media.Frame, name string) {
+	t.Helper()
+	first := map[uint32]media.Frame{}
+	video := map[uint32]bool{}
+	for _, f := range frames {
+		if _, ok := first[f.Epoch]; !ok {
+			first[f.Epoch] = f
+		}
+		video[f.Epoch] = video[f.Epoch] || f.Kind() == media.KindVideo
+	}
+	for e, f := range first {
+		if video[e] {
+			require.True(t, f.Kind() == media.KindVideo && f.Key,
+				"%s: epoch %d starts with a frame of kind %d, PTS %d, not the video keyframe", name, e, f.Kind(), f.PTS)
+		}
+	}
 }
 
 // transcodeFeed runs one transcoder over src, records every rendition hub's

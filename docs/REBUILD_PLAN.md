@@ -547,7 +547,7 @@ Out of M4a:
 | Video encoders other than libx264 | Rungs are H.264 software; NVENC is M4c |
 | More than one encoded video track | Only the lowest-numbered video track is encoded or copied; the others are dropped and counted |
 | More than 3 B-frames, and B-frames below about 8 fps | Beyond what D covers (R-M4c); use none |
-| Merger audio on a long copy-video burst, and a new epoch's expected tracks | Backlog |
+| Merger audio on a long copy-video burst | Backlog |
 
 M2 is split in three parts:
 
@@ -687,8 +687,8 @@ Items accepted for later, not yet placed in a milestone:
   merger wait, and that output is dropped (`MergeDropped`). Seen only with
   unpaced input: unpaced `h264_aac_then_640.ts` with copy video and a child
   1 ms per frame drops all 282 epoch-1 audio frames. Live paced sources are
-  not affected. Fix: seed each epoch's expected set with the child's tracks
-  (with the item below).
+  not affected. Fix: seed each epoch's expected set with the child's audio
+  tracks too, as the router already does with an encoded rung's video.
 - **Root cause of VLC 3's "buffer deadlock prevented" on B-pyramid rungs,
   before M4c** (ruling R-T7b'). `b-pyramid=none` cured it on our encoded
   rungs (3 of 8 runs to 0 of 8), but treats a symptom: the trigger is
@@ -703,12 +703,11 @@ Items accepted for later, not yet placed in a milestone:
   crash-loops the whole ladder, video included. Drop that track after
   repeated failures, count it, and keep the video rungs running (M4a final
   review, M3).
-- **Transcoder merger: seed a new epoch's expected tracks with the rung's
-  video.** After a respawn, the new child's audio reaches an encoded
-  rendition's hub about 1.2 s (the x264 delay) before its first IDR. The
-  packager copes, but direct outputs (HTTP-TS, SRT, RTSP, RTMP) get that
-  audio before any video. With the fix, add an HTTP-TS read to
-  `TestM4aRespawn`.
+- **`TestM4aRespawn`: add an HTTP-TS read** of the respawned rendition.
+  The merger now waits for an encoded rung's video in every new epoch (the
+  router announces it when it sends the epoch's first video frame to the
+  child), so a direct output no longer gets the new child's first second
+  of audio ahead of the IDR; an HTTP-TS read would pin that end to end.
 - **DASH MPD stays `type="dynamic"` after the stream ends** (pre-existing;
   M3a). Players keep polling an MPD that will not change.
 - **VLC 3 stops at any fMP4 HLS discontinuity**, not only at gaps: every

@@ -639,9 +639,14 @@ func (t *Transcoder) newRouter(s *run) *router {
 		toChild:    s.toChild,
 		tryChild:   s.tryChild,
 		toCopy:     t.toCopy,
-		setAnchor:  t.anchors.set,
-		srcAnchor:  t.src.Anchor,
-		now:        t.opt.Now,
+		expectVideo: func(epoch uint32, track int) {
+			for _, i := range t.encodeIdx {
+				t.mergers[i].expect(epoch, track)
+			}
+		},
+		setAnchor: t.anchors.set,
+		srcAnchor: t.src.Anchor,
+		now:       t.opt.Now,
 		onEpoch: func(e uint32, bump bool) {
 			if bump {
 				t.bumps.Add(1)

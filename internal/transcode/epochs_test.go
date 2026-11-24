@@ -85,10 +85,11 @@ func TestEpochMapSkippedUpstream(t *testing.T) {
 
 // routed records what a router hands out.
 type routed struct {
-	child   []wire.Message
-	copied  []media.Frame
-	anchors []media.Anchor
-	dropped uint64
+	child    []wire.Message
+	copied   []media.Frame
+	anchors  []media.Anchor
+	expected []media.Frame // epoch and track of each expectVideo call
+	dropped  uint64
 }
 
 func newTestRouter(rt *routed, childVideo, copyVideo, childAudio bool) *router {
@@ -99,6 +100,9 @@ func newTestRouter(rt *routed, childVideo, copyVideo, childAudio bool) *router {
 		mainVideo: -1,
 		childFed:  true,
 		toChild:   func(m wire.Message) bool { rt.child = append(rt.child, m); return true },
+		expectVideo: func(epoch uint32, track int) {
+			rt.expected = append(rt.expected, media.Frame{Epoch: epoch, Track: track})
+		},
 		tryChild:  func(m wire.Message) bool { rt.child = append(rt.child, m); return true },
 		toCopy:    func(f media.Frame) { rt.copied = append(rt.copied, f) },
 		setAnchor: func(a media.Anchor) { rt.anchors = append(rt.anchors, a) },
@@ -276,4 +280,39 @@ func TestRouterStaleNeverK(t *testing.T) {
 	assert.False(t, r.em.isPending())
 	assert.Equal(t, uint32(2), r.em.up)
 	assert.Equal(t, uint32(3), r.em.cur)
+}
+
+// The router announces the main video track to the encoded renditions'
+// mergers once per rendition epoch, before the first video frame of that
+// epoch goes to the child, so that the child's audio for the epoch waits
+// for the rung's video in the merger. Copied video needs no announcement:
+// it reaches the mergers at once.
+func TestRouterExpectsChildVideo(t *testing.T) {
+	t.Run("encoded video", func(t *testing.T) {
+		var rt routed
+		r := newTestRouter(&rt, true, false, true)
+		r.deliver(hub.Delivery{Frame: vframe(1, 0, true)})
+		require.Equal(t, []media.Frame{{Epoch: 1, Track: 0}}, rt.expected)
+		require.Len(t, rt.child, 1, "announced before the frame went to the child")
+		r.deliver(hub.Delivery{Frame: aframe(1, 0)})
+		r.deliver(hub.Delivery{Frame: vframe(1, 3600, false)})
+		r.childExited()
+		r.childHello()
+		r.deliver(hub.Delivery{Frame: vframe(1, 90000, true)}) // K of epoch 2
+		r.deliver(hub.Delivery{Frame: vframe(1, 93600, false)})
+		assert.Equal(t, []media.Frame{{Epoch: 1, Track: 0}, {Epoch: 2, Track: 0}}, rt.expected)
+	})
+	t.Run("not while the child is not fed", func(t *testing.T) {
+		var rt routed
+		r := newTestRouter(&rt, true, false, true)
+		r.childFed = false
+		r.deliver(hub.Delivery{Frame: vframe(1, 0, true)})
+		assert.Empty(t, rt.expected)
+	})
+	t.Run("copied video", func(t *testing.T) {
+		var rt routed
+		r := newTestRouter(&rt, false, true, true)
+		r.deliver(hub.Delivery{Frame: vframe(1, 0, true)})
+		assert.Empty(t, rt.expected)
+	})
 }

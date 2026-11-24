@@ -278,6 +278,62 @@ func TestSupervisorRespawnOneEpoch(t *testing.T) {
 	assert.NotZero(t, s.ev.of(EventExited)[0].PID)
 }
 
+// A child whose video comes out 1 s (25 frames) after its audio, as x264's
+// delay makes it, still gives every rendition hub an epoch that starts on
+// its video keyframe, with no audio written ahead of it: the merger waits
+// for the rung's video in each new epoch, at the start and after a respawn.
+// Before, the child's first second of audio went out ahead of the IDR, and
+// a subscriber that joined on the IDR (the GOP cache) never got it.
+func TestSupervisorVideoLag(t *testing.T) {
+	lag := transcodetest.EnvVideoLag + "=25"
+	// assertVideoFirst checks each epoch of each hub that has video; it
+	// returns how many epochs had none.
+	assertVideoFirst := func(t *testing.T, out [][]media.Frame, names []string) (noVideo int) {
+		t.Helper()
+		for i, fs := range out {
+			for _, e := range epochs(fs) {
+				if !slices.ContainsFunc(fs, func(f media.Frame) bool { return f.Epoch == e && f.Kind() == media.KindVideo }) {
+					noVideo++
+					continue
+				}
+				f := firstOfEpoch(fs, e)
+				assert.Equal(t, media.KindVideo, f.Kind(), "%s: epoch %d starts with video", names[i], e)
+				assert.True(t, f.Key, "%s: epoch %d starts on a keyframe", names[i], e)
+			}
+		}
+		return noVideo
+	}
+	names := []string{encode240.Name, encode180.Name, copySrc.Name}
+	t.Run("start", func(t *testing.T) {
+		steps := fixtureSteps(t, "h264_aac.ts")
+		opt := fakeOptions(t, lag)
+		opt.Renditions = []Rendition{encode240, encode180, copySrc}
+		s := start(t, opt)
+		out := s.feed(t, steps, 0)
+		assert.Zero(t, assertVideoFirst(t, out, names))
+		want := shifted(frames(steps))
+		for i, fs := range out {
+			assertSameFrames(t, want, sortTD(fs), names[i])
+			check(t, fs, names[i])
+		}
+		assert.Zero(t, s.tr.Stats().MergeDropped)
+	})
+	t.Run("respawn", func(t *testing.T) {
+		steps := fixtureSteps(t, "h264_aac.ts")
+		opt := fakeOptions(t, append(crashOnce(t, 60), lag)...)
+		opt.Renditions = []Rendition{encode240, encode180, copySrc}
+		s := start(t, opt)
+		out := s.feed(t, steps, 4)
+		assertOneExtraEpoch(t, s, out, steps)
+		// After 60 input frames the child has put out some epoch 1 video
+		// (the rest dies with it): every epoch of every hub has video.
+		assert.Zero(t, assertVideoFirst(t, out, names))
+		for i, fs := range out {
+			check(t, fs, names[i])
+		}
+	})
+}
+
 // The media counters each child reports in Stats are summed over the
 // children of the run (ruling R-T6a): the fake reports Counters once after
 // Configure and again on every tick, and crashes once.

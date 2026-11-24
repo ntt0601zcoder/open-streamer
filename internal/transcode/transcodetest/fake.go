@@ -63,6 +63,11 @@ const (
 	// EnvCounters makes every Stats carry the media counters in Counters,
 	// and the child send one such Stats right after Configure.
 	EnvCounters = "OS_TRANSCODE_FAKE_COUNTERS"
+	// EnvVideoLag makes the child hold its video outputs back until that
+	// many later input video frames have arrived, as an encoder's delay
+	// does, while audio goes out at once. The held video goes out at the
+	// end of the input and on Stop.
+	EnvVideoLag = "OS_TRANSCODE_FAKE_VIDEO_LAG"
 )
 
 // Counters are the media counters a child run with EnvCounters reports.
@@ -170,11 +175,27 @@ func Main() {
 		}
 	}()
 
+	lag, _ := strconv.Atoi(os.Getenv(EnvVideoLag))
+	var lagged []media.Frame
+	sendVideo := func(f media.Frame, rungs int) {
+		for i := range rungs {
+			if w.Write(wire.Frame{Rung: i, F: f}) != nil {
+				os.Exit(1)
+			}
+		}
+	}
 	var cfg wire.Configure
+	flushVideo := func() {
+		for _, f := range lagged {
+			sendVideo(f, len(cfg.Rungs))
+		}
+		lagged = nil
+	}
 	n := 0
 	for {
 		m, err := r.Read()
 		if errors.Is(err, io.EOF) {
+			flushVideo()
 			os.Exit(0)
 		}
 		if err != nil {
@@ -202,10 +223,10 @@ func Main() {
 				time.Sleep(delay)
 			}
 			if v.F.Kind() == media.KindVideo {
-				for i := range cfg.Rungs {
-					if w.Write(wire.Frame{Rung: i, F: v.F}) != nil {
-						os.Exit(1)
-					}
+				lagged = append(lagged, v.F)
+				for len(lagged) > lag {
+					sendVideo(lagged[0], len(cfg.Rungs))
+					lagged = lagged[1:]
 				}
 			} else if w.Write(wire.Frame{Rung: -1, F: v.F}) != nil {
 				os.Exit(1)
@@ -222,6 +243,7 @@ func Main() {
 				}
 			}
 		case wire.Stop:
+			flushVideo()
 			os.Exit(0)
 		default:
 		}
