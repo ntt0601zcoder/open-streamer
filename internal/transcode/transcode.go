@@ -53,6 +53,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -232,6 +233,9 @@ type Transcoder struct {
 	copyVideo  []int // renditions that copy video
 	configure  wire.Configure
 	childVideo bool
+
+	// writeMsg writes m to c; nil means c.w.Write. Tests replace it.
+	writeMsg func(c *child, m wire.Message) error
 
 	running  atomic.Bool
 	childOut atomic.Uint64 // frames received from children
@@ -951,12 +955,22 @@ func (t *Transcoder) writeChild(c *child) {
 // send writes m to the child and reports whether the child is still
 // usable. A frame the protocol cannot carry (wire.ErrLimit) is dropped and
 // counted in Stats.Oversize, and the child keeps running: nothing was
-// written, and a child would only be killed over a frame it never saw.
-// Called from the writer goroutine.
+// written, and a child would only be killed over a frame it never saw. Any
+// other error, wire.ErrConfigTable included (a respawn starts a fresh
+// table), means the child must go. Called from the writer goroutine.
 func (t *Transcoder) send(c *child, m wire.Message) bool {
-	err := c.w.Write(m)
+	var err error
+	if t.writeMsg != nil {
+		err = t.writeMsg(c, m)
+	} else {
+		err = c.w.Write(m)
+	}
 	if err == nil {
 		return true
+	}
+	if errors.Is(err, wire.ErrConfigTable) {
+		t.log.Warn("transcode: child's config table is full; restarting it", "pid", c.p.pid, "err", err)
+		return false
 	}
 	if _, frame := m.(wire.Frame); !frame || !errors.Is(err, wire.ErrLimit) {
 		return false
@@ -972,7 +986,7 @@ func (t *Transcoder) send(c *child, m wire.Message) bool {
 // wait reaps the process, then lets the reader drain what the child wrote.
 func (c *child) wait(readDone <-chan struct{}) {
 	err := c.p.cmd.Wait()
-	c.stderr.close() // Wait has copied all of the child's stderr
+	c.stderr.close(err != nil) // Wait has copied all of the child's stderr
 	c.reapMu.Lock()
 	c.reaped = true
 	c.waitErr = err
@@ -1016,11 +1030,17 @@ const (
 	stderrBurst = 10
 	// stderrSummaryEvery is how often suppressed lines are summarised.
 	stderrSummaryEvery = 10 * time.Second
+	// stderrKeep is how many of the last suppressed lines are kept, and
+	// logged if the child exits abnormally: a Go panic or a crash report
+	// goes only to stderr.
+	stderrKeep = 20
 )
 
 // logWriter logs one child's stderr, one record per line, at most
 // stderrBurst lines per second. Further lines are counted (onSuppress) and
-// summarised in one record every summary period, and once more by close.
+// summarised in one record every summary period, and once more by close;
+// the last stderrKeep of them are kept, and close logs them when the child
+// exited abnormally.
 // exec calls Write from its own goroutine, which may start before
 // startChild knows the pid, so Write waits for ready, closed by setPID.
 type logWriter struct {
@@ -1036,6 +1056,7 @@ type logWriter struct {
 	window     time.Time // start of the current one-second window
 	inWindow   int       // lines logged in it
 	suppressed uint64    // lines suppressed since the last summary
+	last       []string  // the last stderrKeep suppressed lines, oldest first
 	timer      *time.Timer
 	closed     bool
 }
@@ -1097,6 +1118,10 @@ func (w *logWriter) line(l []byte) bool {
 		return true
 	}
 	w.suppressed++
+	if len(w.last) == stderrKeep {
+		w.last = append(w.last[:0], w.last[1:]...)
+	}
+	w.last = append(w.last, string(l))
 	if w.timer == nil && !w.closed {
 		w.timer = time.AfterFunc(w.every, w.summary)
 	}
@@ -1122,9 +1147,11 @@ func (w *logWriter) report() {
 }
 
 // close handles a last line without a newline, stops the summary timer and
-// logs what is still suppressed. It is called once the child is reaped, when
-// exec has copied all of its stderr.
-func (w *logWriter) close() {
+// logs what is still suppressed; when the child exited abnormally (a
+// non-zero status or a signal), it first logs the last suppressed lines in
+// one record. It is called once the child is reaped, when exec has copied
+// all of its stderr.
+func (w *logWriter) close(abnormal bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -1141,5 +1168,10 @@ func (w *logWriter) close() {
 		}
 		w.buf = nil
 	}
+	if abnormal && len(w.last) > 0 {
+		w.log.Warn(fmt.Sprintf("transcode: child %d exited abnormally; last suppressed stderr lines", w.pid),
+			"pid", w.pid, "lines", strings.Join(w.last, "\n"))
+	}
+	w.last = nil
 	w.report()
 }

@@ -111,10 +111,20 @@ type session struct {
 // start builds a transcoder over a new source hub and runs it.
 func start(t *testing.T, opt Options) *session {
 	t.Helper()
+	return startWith(t, opt, nil)
+}
+
+// startWith is start, calling prepare, if set, on the transcoder before
+// Run.
+func startWith(t *testing.T, opt Options, prepare func(*Transcoder)) *session {
+	t.Helper()
 	s := &session{src: hub.New(hub.Options{}), ev: &events{}, errc: make(chan error, 1)}
 	opt.OnEvent = s.ev.add
 	tr, err := New(s.src, opt)
 	require.NoError(t, err)
+	if prepare != nil {
+		prepare(tr)
+	}
 	s.tr = tr
 	for _, h := range tr.Hubs() {
 		s.cols = append(s.cols, collect(h))
@@ -619,6 +629,30 @@ func (h *recordHandler) Handle(_ context.Context, r slog.Record) error {
 func (h *recordHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *recordHandler) WithGroup(string) slog.Handler      { return h }
 
+// text renders r as its message followed by its attributes.
+func recordText(r slog.Record) string {
+	var b strings.Builder
+	b.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		b.WriteString(" " + a.String())
+		return true
+	})
+	return b.String()
+}
+
+// texts returns the rendered records that contain sub.
+func (h *recordHandler) texts(sub string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, r := range h.recs {
+		if txt := recordText(r); strings.Contains(txt, sub) {
+			out = append(out, txt)
+		}
+	}
+	return out
+}
+
 // count returns the records whose message contains sub.
 func (h *recordHandler) count(sub string) int {
 	return len(h.matching(sub))
@@ -635,6 +669,22 @@ func (h *recordHandler) matching(sub string) []string {
 		}
 	}
 	return out
+}
+
+// A child that floods its stderr and then panics (exit 2) has its panic
+// line logged although the burst was spent.
+func TestSupervisorCrashAfterStderrFlood(t *testing.T) {
+	h := &recordHandler{}
+	opt := fakeOptions(t, transcodetest.EnvStderrLines+"=1000", transcodetest.EnvStderrPanic+"=1")
+	opt.Logger = slog.New(h)
+	opt.Renditions = []Rendition{encode240}
+	opt.RespawnMin = time.Hour // one child is enough
+	start(t, opt)
+	require.Eventually(t, func() bool { return len(h.texts("panic: boom")) > 0 }, 10*time.Second, time.Millisecond)
+	got := h.texts("panic: boom")
+	require.Len(t, got, 1)
+	assert.Contains(t, got[0], "last suppressed stderr lines")
+	assert.LessOrEqual(t, h.count("transcode: child stderr"), 3*stderrBurst)
 }
 
 // The child's stderr is logged at most stderrBurst lines per second; the
@@ -671,13 +721,35 @@ func TestLogWriterRateLimit(t *testing.T) {
 	// close logs a partial last line if the burst allows it, and the
 	// pending summary at once.
 	_, _ = w.Write([]byte("partial"))
-	w.close()
+	w.close(false)
 	assert.Equal(t, 2*stderrBurst, h.count("child stderr"))
 	assert.EqualValues(t, 31, suppressed.Load())
 	assert.Equal(t, []string{
 		"transcode: child 7: suppressed 15 stderr lines",
 		"transcode: child 7: suppressed 16 stderr lines",
 	}, h.matching("suppressed"))
+	assert.Zero(t, h.count("last suppressed"), "a clean exit logs no suppressed lines")
+}
+
+// A child that exits abnormally gets its last suppressed stderr lines
+// (at most stderrKeep) logged in one record, so a panic or a crash report
+// behind a burst of noise is not lost.
+func TestLogWriterKeepsLastLinesOnCrash(t *testing.T) {
+	h := &recordHandler{}
+	w := newLogWriter(slog.New(h), nil)
+	w.setPID(9)
+	for i := range 100 {
+		_, _ = w.Write([]byte("noise " + strconv.Itoa(i) + "\n"))
+	}
+	_, _ = w.Write([]byte("panic: boom\ngoroutine 1 [running]:"))
+	w.close(true)
+	got := h.texts("last suppressed")
+	require.Len(t, got, 1)
+	assert.Contains(t, got[0], "panic: boom")
+	assert.Contains(t, got[0], "goroutine 1 [running]:")
+	assert.Contains(t, got[0], "noise 82")
+	assert.NotContains(t, got[0], "noise 81", "only the last stderrKeep lines")
+	assert.Equal(t, stderrBurst, h.count("child stderr"))
 }
 
 // A child that floods its stderr (1000 lines at once) gets a burst of
@@ -760,6 +832,32 @@ func TestSupervisorOversizeFrame(t *testing.T) {
 			assert.Equal(t, srcVideo, copyVideo, "the copy rendition has every frame")
 		})
 	}
+}
+
+// A child whose wire config table is full (wire.ErrConfigTable) is
+// killed and respawned with a fresh table, with one bump; frames are not
+// silently dropped as for wire.ErrLimit.
+func TestSupervisorConfigTableFull(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	opt := fakeOptions(t)
+	opt.Renditions = []Rendition{encode240, copySrc}
+	opt.Audio.Copy = true
+	var sent atomic.Int64
+	s := startWith(t, opt, func(tr *Transcoder) {
+		tr.writeMsg = func(c *child, m wire.Message) error {
+			if _, ok := m.(wire.Frame); ok && sent.Add(1) == 60 {
+				return fmt.Errorf("wire: write: %w", wire.ErrConfigTable)
+			}
+			return c.w.Write(m)
+		}
+	})
+	out := s.feed(t, steps, 8)
+	st := s.tr.Stats()
+	assert.EqualValues(t, 2, st.Spawns, "respawned")
+	assert.EqualValues(t, 1, st.Exits)
+	assert.Zero(t, st.Oversize)
+	assert.EqualValues(t, 1, s.tr.bumps.Load())
+	assertOneExtraEpoch(t, s, out, steps)
 }
 
 // A child output for a rung that does not exist is logged once per child,

@@ -446,3 +446,22 @@ func TestWriterLimits(t *testing.T) {
 	cfg := &media.TrackConfig{Codec: media.CodecH264, SPS: sets(maxParamSets), PPS: sets(maxParamSets)}
 	require.NoError(t, NewWriter(io.Discard).Write(Frame{F: media.Frame{Config: cfg}}))
 }
+
+// A Writer whose config table is full refuses a frame with a new config
+// with ErrConfigTable, not ErrLimit: the stream needs a fresh Writer and
+// Reader, not a dropped frame. Frames with known configs still go out.
+func TestWriterConfigTableFull(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.configCap = 2
+	a, b := h264Config(t), h264Config(t)
+	require.NoError(t, w.Write(Frame{F: media.Frame{Config: a}}))
+	require.NoError(t, w.Write(Frame{F: media.Frame{Config: b}}))
+	n := buf.Len()
+	err := w.Write(Frame{F: media.Frame{Config: aacConfig(t)}})
+	require.ErrorIs(t, err, ErrConfigTable)
+	assert.NotErrorIs(t, err, ErrLimit)
+	assert.Equal(t, n, buf.Len(), "nothing written")
+	require.NoError(t, w.Write(Frame{F: media.Frame{Config: a}}))
+	assert.Equal(t, maxConfigs, NewWriter(io.Discard).configCap)
+}

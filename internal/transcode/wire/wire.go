@@ -31,10 +31,16 @@ var (
 	ErrMalformed = errors.New("wire: malformed message")
 	// ErrLimit means the Writer refused a message that the Reader would
 	// reject for one of its limits: too many NAL units, parameter sets,
-	// rungs, stats entries or distinct configs, an integer outside the
-	// field's range, or more than MaxMessage bytes (then also ErrTooLarge).
-	// Nothing was written; the stream is still usable.
+	// rungs or stats entries, an integer outside the field's range, or more
+	// than MaxMessage bytes (then also ErrTooLarge). Nothing was written;
+	// the stream is still usable.
 	ErrLimit = errors.New("wire: message exceeds a protocol limit")
+	// ErrConfigTable means the Writer has sent as many distinct configs as
+	// a Reader tracks, and refused a frame with a new one. Nothing was
+	// written, but no frame with a new config can follow on this stream:
+	// the peer must start over with a fresh Writer and Reader. It does not
+	// wrap ErrLimit.
+	ErrConfigTable = errors.New("wire: config table full")
 )
 
 // Limits that keep a hostile peer from forcing large allocations.
@@ -135,15 +141,16 @@ func (Stop) isMessage()          {}
 // Writer encodes messages. It is safe for concurrent use; each Write is one
 // io.Writer call.
 type Writer struct {
-	mu      sync.Mutex
-	w       io.Writer
-	configs map[*media.TrackConfig]uint32
-	buf     []byte
+	mu        sync.Mutex
+	w         io.Writer
+	configs   map[*media.TrackConfig]uint32
+	configCap int // distinct configs this Writer may send; tests lower it
+	buf       []byte
 }
 
 // NewWriter returns a Writer on w.
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{w: w, configs: make(map[*media.TrackConfig]uint32)}
+	return &Writer{w: w, configs: make(map[*media.TrackConfig]uint32), configCap: maxConfigs}
 }
 
 // Write encodes m. A Frame's config is included the first time this Writer
@@ -334,8 +341,8 @@ func (w *Writer) appendFrame(dst []byte, v Frame) (b []byte, newCfg *media.Track
 	if c := v.F.Config; c != nil {
 		id, seen := w.configs[c]
 		if !seen {
-			if len(w.configs) >= maxConfigs {
-				return nil, nil, 0, limit("more than %d distinct configs", maxConfigs)
+			if len(w.configs) >= w.configCap {
+				return nil, nil, 0, fmt.Errorf("wire: write: %w: %d distinct configs sent", ErrConfigTable, len(w.configs))
 			}
 			if c.Codec.Kind() == 0 {
 				return nil, nil, 0, fmt.Errorf("wire: write: config has unknown codec %d", c.Codec)

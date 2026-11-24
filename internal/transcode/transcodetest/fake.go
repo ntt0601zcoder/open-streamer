@@ -33,6 +33,10 @@ const (
 	// EnvStderrLines makes the child write that many numbered lines to
 	// stderr as fast as it can as it starts, as libav does on lossy input.
 	EnvStderrLines = "OS_TRANSCODE_FAKE_STDERR_LINES"
+	// EnvStderrPanic makes the child, after any EnvStderrLines lines, write
+	// "panic: boom" to stderr and exit 2 before its Hello, as a Go panic
+	// or a crash in libav would.
+	EnvStderrPanic = "OS_TRANSCODE_FAKE_STDERR_PANIC"
 	// EnvJunk makes the child write bytes that do not decode instead of
 	// Hello, then hang. With EnvCrashOnce, only while the file is absent.
 	EnvJunk = "OS_TRANSCODE_FAKE_JUNK"
@@ -113,6 +117,10 @@ func Main() {
 		for i := range n {
 			_, _ = os.Stderr.WriteString("stderr line " + strconv.Itoa(i) + "\n")
 		}
+	}
+	if os.Getenv(EnvStderrPanic) != "" {
+		_, _ = os.Stderr.WriteString("panic: boom\n")
+		os.Exit(2)
 	}
 	if misbehave && (os.Getenv(EnvJunk) != "" || os.Getenv(EnvNoHello) != "") {
 		markOnce()
