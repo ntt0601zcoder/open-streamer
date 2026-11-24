@@ -744,6 +744,24 @@ func TestSupervisorOversizeFrame(t *testing.T) {
 	}
 }
 
+// A child output for a rung that does not exist is logged once per child,
+// not once per frame, and dropped.
+func TestFromChildUnknownRungLoggedOnce(t *testing.T) {
+	h := &recordHandler{}
+	tr, err := New(hub.New(hub.Options{}), Options{
+		Renditions: []Rendition{copySrc}, Audio: Audio{Copy: true}, Logger: slog.New(h),
+	})
+	require.NoError(t, err)
+	for i, c := range []*child{{p: &proc{pid: 1}}, {p: &proc{pid: 2}}} {
+		for pts := range int64(5) {
+			tr.fromChild(c, wire.Frame{Rung: 3, F: vframe(1, pts*3600, pts == 0)})
+		}
+		assert.Equal(t, i+1, h.count("unknown rung"), "child %d", c.p.pid)
+	}
+	out, _ := tr.mergers[0].counts()
+	assert.Zero(t, out)
+}
+
 // tryChild never waits: a full queue, or no child, refuses the message.
 func TestTryChild(t *testing.T) {
 	tr, err := New(hub.New(hub.Options{}), Options{Renditions: []Rendition{copySrc}, Audio: Audio{Copy: true}})

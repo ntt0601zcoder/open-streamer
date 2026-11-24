@@ -664,9 +664,11 @@ func (t *Transcoder) toCopy(f media.Frame) {
 	}
 }
 
-// fromChild hands a child output to its renditions: a rung's video to that
-// rendition, audio (rung -1) to every rendition.
-func (t *Transcoder) fromChild(v wire.Frame) {
+// fromChild hands an output of child c to its renditions: a rung's video to
+// that rendition, audio (rung -1) to every rendition. An output for a rung
+// that does not exist is dropped, and logged once per child. Called from
+// c's reader goroutine.
+func (t *Transcoder) fromChild(c *child, v wire.Frame) {
 	t.childOut.Add(1)
 	switch {
 	case v.Rung == -1:
@@ -676,7 +678,10 @@ func (t *Transcoder) fromChild(v wire.Frame) {
 	case v.Rung >= 0 && v.Rung < len(t.encodeIdx):
 		t.mergers[t.encodeIdx[v.Rung]].push(v.F)
 	default:
-		t.log.Warn("transcode: child output for an unknown rung", "rung", v.Rung)
+		if !c.unknownRungLogged {
+			c.unknownRungLogged = true
+			t.log.Warn("transcode: child output for an unknown rung", "pid", c.p.pid, "rung", v.Rung)
+		}
 	}
 }
 
@@ -721,6 +726,9 @@ type child struct {
 
 	// Owned by the writer goroutine: an oversize frame was logged.
 	oversizeLogged bool
+	// Owned by the reader goroutine: an output for an unknown rung was
+	// logged.
+	unknownRungLogged bool
 
 	// lastProgress is when the child last reported consuming input (a
 	// rising Stats.In, or an output Frame), in Unix nanoseconds; Run reads
@@ -835,7 +843,7 @@ func (t *Transcoder) readChild(c *child) error {
 		switch v := m.(type) {
 		case wire.Frame:
 			c.lastProgress.Store(time.Now().UnixNano())
-			t.fromChild(v)
+			t.fromChild(c, v)
 		case wire.Stats:
 			if v.In > in {
 				in = v.In
