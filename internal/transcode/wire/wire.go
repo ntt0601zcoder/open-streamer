@@ -88,11 +88,22 @@ type Frame struct {
 // host to child.
 type Discontinuity struct{}
 
-// Stats is sent by the child every second.
+// Stats is sent by the child every second. Every counter is cumulative
+// over the child's life. Out has one entry per rung: the video frames
+// written. EncodeNanos has one entry per rung: the wall time spent in the
+// pipeline's calls, which encode the rungs one after another after a shared
+// decode, so every rung reports the same total. The media counters mirror
+// the native pipeline's: DroppedTracks (video tracks other than the first),
+// Reanchors (forward audio re-anchors), AudioDropped (input audio samples
+// dropped for backward drift), AudioCorrupt and VideoCorrupt (frames the
+// decoders rejected and skipped).
 type Stats struct {
 	In          uint64
 	Out         []uint64
 	EncodeNanos []int64
+
+	DroppedTracks, Reanchors, AudioDropped uint64
+	AudioCorrupt, VideoCorrupt             uint64
 }
 
 // Error reports a child failure.
@@ -315,7 +326,9 @@ func appendConfig(dst []byte, c *media.TrackConfig) []byte {
 }
 
 // Stats: 1 in (varint), 2 out (repeated varint, one per rung),
-// 3 encode_nanos (repeated sint64, one per rung).
+// 3 encode_nanos (repeated sint64, one per rung), then the media counters,
+// each a varint written only when non-zero: 4 dropped_tracks, 5 reanchors,
+// 6 audio_dropped, 7 audio_corrupt, 8 video_corrupt.
 func appendStats(dst []byte, s Stats) []byte {
 	dst = appendUint(dst, 1, s.In)
 	for _, o := range s.Out {
@@ -323,6 +336,11 @@ func appendStats(dst []byte, s Stats) []byte {
 	}
 	for _, n := range s.EncodeNanos {
 		dst = appendSint(dst, 3, n)
+	}
+	for i, v := range []uint64{s.DroppedTracks, s.Reanchors, s.AudioDropped, s.AudioCorrupt, s.VideoCorrupt} {
+		if v != 0 {
+			dst = appendUint(dst, protowire.Number(4+i), v)
+		}
 	}
 	return dst
 }
@@ -742,6 +760,16 @@ func decodeStats(b []byte) (Message, error) {
 			var v int64
 			v, err = f.sint()
 			s.EncodeNanos = append(s.EncodeNanos, v)
+		case 4:
+			s.DroppedTracks, err = f.uint()
+		case 5:
+			s.Reanchors, err = f.uint()
+		case 6:
+			s.AudioDropped, err = f.uint()
+		case 7:
+			s.AudioCorrupt, err = f.uint()
+		case 8:
+			s.VideoCorrupt, err = f.uint()
 		}
 		return err
 	})

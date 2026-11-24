@@ -53,7 +53,13 @@ const (
 	// EnvStatsInterval is how often the child sends Stats with its input
 	// count, as a time.Duration; default 1 s, as the real child.
 	EnvStatsInterval = "OS_TRANSCODE_FAKE_STATS_INTERVAL"
+	// EnvCounters makes every Stats carry the media counters in Counters,
+	// and the child send one such Stats right after Configure.
+	EnvCounters = "OS_TRANSCODE_FAKE_COUNTERS"
 )
+
+// Counters are the media counters a child run with EnvCounters reports.
+var Counters = wire.Stats{DroppedTracks: 1, Reanchors: 2, AudioDropped: 3, AudioCorrupt: 4, VideoCorrupt: 5}
 
 // Main runs the fake child on fd 3 and exits. It sends Hello, reads
 // Configure, then echoes every input video frame unchanged to every rung
@@ -127,13 +133,22 @@ func Main() {
 	}
 	var in atomic.Uint64
 	var stuck atomic.Bool
+	counters := os.Getenv(EnvCounters) != ""
+	stats := func() wire.Stats {
+		s := wire.Stats{In: in.Load()}
+		if counters {
+			s.DroppedTracks, s.Reanchors, s.AudioDropped = Counters.DroppedTracks, Counters.Reanchors, Counters.AudioDropped
+			s.AudioCorrupt, s.VideoCorrupt = Counters.AudioCorrupt, Counters.VideoCorrupt
+		}
+		return s
+	}
 	go func() {
 		for {
 			time.Sleep(statsEvery)
 			if stuck.Load() {
 				return
 			}
-			if w.Write(wire.Stats{In: in.Load()}) != nil {
+			if w.Write(stats()) != nil {
 				return
 			}
 		}
@@ -158,6 +173,9 @@ func Main() {
 				time.Sleep(50 * time.Millisecond)
 				_, _ = os.Stderr.WriteString("closing child exits\n")
 				os.Exit(2)
+			}
+			if counters && w.Write(stats()) != nil {
+				os.Exit(1)
 			}
 			if crashAfter == 0 {
 				crash()

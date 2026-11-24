@@ -331,6 +331,45 @@ func TestChildOverSocketpair(t *testing.T) {
 	t.Logf("rungs %v frames, audio %d frames, %d stats", counts, len(a), len(c.stats))
 }
 
+// The native pipeline's counters reach the host in Stats (ruling R-T6a): a
+// second video track is dropped, and an audio gap re-anchors once.
+func TestChildReportsMediaCounters(t *testing.T) {
+	var src []media.Frame
+	na := 0
+	for _, f := range source(t) {
+		if f.Kind() == media.KindAudio {
+			na++
+			if na > 100 && na <= 110 { // a 10-frame audio gap
+				continue
+			}
+		}
+		src = append(src, f)
+		if f.Kind() == media.KindVideo {
+			f.Track = 2
+			src = append(src, f)
+		}
+	}
+	h, errc := startChild(t, run)
+	require.NoError(t, h.send(wire.Configure{
+		Rungs: []wire.Rung{{Height: 120, BitrateKbps: 150}},
+		Audio: &wire.AudioEncode{BitrateKbps: 96},
+	}))
+	require.NoError(t, h.sendFrames(src))
+	require.NoError(t, h.send(wire.Stop{}))
+
+	e := h.wait(t, errc)
+	require.NoError(t, e.runErr)
+	c := collect(e.msgs)
+	require.Empty(t, c.errs)
+	require.NotEmpty(t, c.stats)
+	last := c.stats[len(c.stats)-1]
+	assert.Equal(t, wire.Stats{
+		In: uint64(len(src)), Out: last.Out, EncodeNanos: last.EncodeNanos,
+		DroppedTracks: 1, Reanchors: 1,
+	}, last)
+	assert.Equal(t, []uint64{uint64(len(c.frames[0]))}, last.Out)
+}
+
 func TestChildBadConfigure(t *testing.T) {
 	cases := map[string]wire.Configure{
 		"no rungs and no audio": {},

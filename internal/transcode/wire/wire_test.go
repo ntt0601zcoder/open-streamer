@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
@@ -117,6 +118,11 @@ func TestRoundTripEveryMessage(t *testing.T) {
 		Discontinuity{},
 		Stats{In: 1 << 50, Out: []uint64{10, 20, 0}, EncodeNanos: []int64{5, -6, 7000000000}},
 		Stats{},
+		Stats{
+			In: 7, Out: []uint64{3}, EncodeNanos: []int64{9},
+			DroppedTracks: 1, Reanchors: 2, AudioDropped: 3 << 40, AudioCorrupt: 4, VideoCorrupt: 5,
+		},
+		Stats{In: 1, VideoCorrupt: 1},
 		Error{Rung: -1, Message: "boom ✓", Fatal: true},
 		Error{Rung: 3},
 		Stop{},
@@ -138,7 +144,12 @@ func TestRoundTripEveryMessage(t *testing.T) {
 			continue
 		}
 		if ws, ok := want.(Stats); ok && ws.Out == nil {
-			assert.Equal(t, Stats{}, got[i])
+			gs, ok := got[i].(Stats)
+			require.True(t, ok, "message %d is %T", i, got[i])
+			assert.Empty(t, gs.Out, "message %d", i)
+			assert.Empty(t, gs.EncodeNanos, "message %d", i)
+			gs.Out, gs.EncodeNanos = nil, nil
+			assert.Equal(t, ws, gs, "message %d", i)
 			continue
 		}
 		assert.Equal(t, want, got[i], "message %d", i)
@@ -155,6 +166,37 @@ func TestEnvelopeFieldNumbers(t *testing.T) {
 		require.NoError(t, NewWriter(&buf).Write(m))
 		assert.Equal(t, tag[0], buf.Bytes()[4], "%T", m)
 	}
+}
+
+// The media counters (ruling R-T6a) were appended as Stats fields 4 to 8, so
+// a reader that predates them skips them, and they are absent when zero.
+func TestStatsCounterFieldNumbers(t *testing.T) {
+	body := func(s Stats) map[protowire.Number]uint64 {
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).Write(s))
+		env := buf.Bytes()[4:]
+		num, typ, n := protowire.ConsumeTag(env)
+		require.Positive(t, n)
+		require.Equal(t, protowire.Number(fStats), num)
+		require.Equal(t, protowire.BytesType, typ)
+		b, m := protowire.ConsumeBytes(env[n:])
+		require.Positive(t, m)
+		got := map[protowire.Number]uint64{}
+		for len(b) > 0 {
+			num, typ, n := protowire.ConsumeTag(b)
+			require.Positive(t, n)
+			require.Equal(t, protowire.VarintType, typ)
+			v, m := protowire.ConsumeVarint(b[n:])
+			require.Positive(t, m)
+			got[num] = v
+			b = b[n+m:]
+		}
+		return got
+	}
+	assert.Equal(t, map[protowire.Number]uint64{1: 0}, body(Stats{}))
+	assert.Equal(t, map[protowire.Number]uint64{1: 9, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5}, body(Stats{
+		In: 9, DroppedTracks: 1, Reanchors: 2, AudioDropped: 3, AudioCorrupt: 4, VideoCorrupt: 5,
+	}))
 }
 
 func TestConfigSentOnce(t *testing.T) {

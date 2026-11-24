@@ -265,6 +265,32 @@ func TestSupervisorRespawnOneEpoch(t *testing.T) {
 	assert.NotZero(t, s.ev.of(EventExited)[0].PID)
 }
 
+// The media counters each child reports in Stats are summed over the
+// children of the run (ruling R-T6a): the fake reports Counters once after
+// Configure and again on every tick, and crashes once.
+func TestSupervisorChildCounters(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	opt := fakeOptions(t, append(crashOnce(t, 50),
+		transcodetest.EnvCounters+"=1", transcodetest.EnvStatsInterval+"=10ms")...)
+	opt.Renditions = []Rendition{encode240, copySrc}
+	s := start(t, opt)
+	s.feed(t, steps, 4)
+	st := s.tr.Stats()
+	require.EqualValues(t, 2, st.Spawns)
+	c := transcodetest.Counters
+	assert.Equal(t, ChildStats{
+		DroppedTracks: 2 * c.DroppedTracks, Reanchors: 2 * c.Reanchors, AudioDropped: 2 * c.AudioDropped,
+		AudioCorrupt: 2 * c.AudioCorrupt, VideoCorrupt: 2 * c.VideoCorrupt,
+	}, st.Child)
+}
+
+func TestChildStatsAdd(t *testing.T) {
+	var s ChildStats
+	s.add(ChildStats{}, ChildStats{Reanchors: 2, AudioDropped: 10})
+	s.add(ChildStats{Reanchors: 2, AudioDropped: 10}, ChildStats{Reanchors: 3, AudioDropped: 4, VideoCorrupt: 1})
+	assert.Equal(t, ChildStats{Reanchors: 3, AudioDropped: 10, VideoCorrupt: 1}, s, "a falling counter adds nothing")
+}
+
 func TestSupervisorMixedRespawn(t *testing.T) {
 	plain := fixtureSteps(t, "h264_aac.ts")
 	copyVideo := []Rendition{copySrc}

@@ -164,13 +164,42 @@ type Event struct {
 // mark of the child's input channel (at most 256); it excludes the
 // pre-Hello backlog, which can hold up to 1500 frames. PID is the running
 // child's, or 0. DroppedBeforeKey also counts the frames given up on
-// because the child exited, stalled, or Run ended while they waited.
+// because the child exited, stalled, or Run ended while they waited. Child
+// holds the media counters the children reported.
 type Stats struct {
 	Spawns, Exits, Losses, DroppedBeforeKey, MergeDropped uint64
 	FramesIn                                              uint64
 	FramesOut                                             []uint64
 	MaxQueued                                             int
 	PID                                                   int
+	Child                                                 ChildStats
+}
+
+// ChildStats are the media counters the children report in their Stats
+// messages, summed over every child of the run (each child counts from
+// zero). DroppedTracks counts video tracks other than the first that a
+// child dropped, Reanchors forward audio re-anchors, AudioDropped input
+// audio samples dropped for backward drift, and AudioCorrupt and
+// VideoCorrupt the frames the child's decoders rejected and skipped. A
+// child's counts after its last Stats are not included.
+type ChildStats struct {
+	DroppedTracks, Reanchors, AudioDropped, AudioCorrupt, VideoCorrupt uint64
+}
+
+// add adds the rise from prev to cur, per counter, to s. Counters never
+// fall within one child; one that does is ignored.
+func (s *ChildStats) add(prev, cur ChildStats) {
+	rise := func(p, c uint64) uint64 {
+		if c < p {
+			return 0
+		}
+		return c - p
+	}
+	s.DroppedTracks += rise(prev.DroppedTracks, cur.DroppedTracks)
+	s.Reanchors += rise(prev.Reanchors, cur.Reanchors)
+	s.AudioDropped += rise(prev.AudioDropped, cur.AudioDropped)
+	s.AudioCorrupt += rise(prev.AudioCorrupt, cur.AudioCorrupt)
+	s.VideoCorrupt += rise(prev.VideoCorrupt, cur.VideoCorrupt)
 }
 
 // Transcoder turns one source hub into one hub per rendition.
@@ -770,6 +799,7 @@ func (t *Transcoder) readChild(c *child) error {
 	close(c.helloOK)
 	c.hello <- struct{}{}
 	var in uint64
+	var counted ChildStats // this child's media counters, as last reported
 	for {
 		m, err := r.Read()
 		if err != nil {
@@ -786,6 +816,14 @@ func (t *Transcoder) readChild(c *child) error {
 			if v.In > in {
 				in = v.In
 				c.lastProgress.Store(time.Now().UnixNano())
+			}
+			cur := ChildStats{
+				DroppedTracks: v.DroppedTracks, Reanchors: v.Reanchors, AudioDropped: v.AudioDropped,
+				AudioCorrupt: v.AudioCorrupt, VideoCorrupt: v.VideoCorrupt,
+			}
+			if cur != counted {
+				t.update(func(st *Stats) { st.Child.add(counted, cur) })
+				counted = cur
 			}
 		case wire.Error:
 			t.log.Warn("transcode: child error", "pid", c.p.pid, "rung", v.Rung, "fatal", v.Fatal, "msg", v.Message)

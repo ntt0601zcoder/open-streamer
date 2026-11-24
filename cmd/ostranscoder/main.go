@@ -210,8 +210,6 @@ type child struct {
 	out   []uint64 // video frames written, per rung
 	busy  int64    // nanoseconds spent in pipeline calls
 	nanos []int64  // scratch for Stats.EncodeNanos
-
-	logged native.Stats // native counters last logged
 }
 
 // handle processes one read result. It reports stop after Stop or EOF.
@@ -264,8 +262,7 @@ func (c *child) call(fn func() ([]native.Output, error)) error {
 	return nil
 }
 
-// writeStats writes the counters, and logs the native ones when they
-// changed: wire.Stats has no field for them.
+// writeStats writes the counters, the native pipeline's included.
 func (c *child) writeStats() error {
 	// The rungs are encoded one after another in each call, after a shared
 	// decode, so the time spent is not split per rung: every rung reports
@@ -273,15 +270,19 @@ func (c *child) writeStats() error {
 	for i := range c.nanos {
 		c.nanos[i] = c.busy
 	}
-	if err := c.w.Write(wire.Stats{In: c.in, Out: c.out, EncodeNanos: c.nanos}); err != nil {
+	if err := c.w.Write(c.stats()); err != nil {
 		return fmt.Errorf("ostranscoder: write stats: %w", err)
 	}
-	if st := c.p.Stats(); st != c.logged {
-		c.logged = st
-		slog.Warn("ostranscoder: pipeline counters",
-			"dropped_tracks", st.DroppedTracks, "reanchors", st.Reanchors,
-			"audio_dropped_samples", st.AudioDropped,
-			"audio_corrupt", st.AudioCorrupt, "video_corrupt", st.VideoCorrupt)
-	}
 	return nil
+}
+
+// stats builds the Stats message from the child's and the pipeline's
+// counters.
+func (c *child) stats() wire.Stats {
+	st := c.p.Stats()
+	return wire.Stats{
+		In: c.in, Out: c.out, EncodeNanos: c.nanos,
+		DroppedTracks: st.DroppedTracks, Reanchors: st.Reanchors, AudioDropped: st.AudioDropped,
+		AudioCorrupt: st.AudioCorrupt, VideoCorrupt: st.VideoCorrupt,
+	}
 }
