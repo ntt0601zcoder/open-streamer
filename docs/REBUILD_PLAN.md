@@ -208,9 +208,10 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   256 packets per 5 ms), so a GOP replay at join does not arrive as one burst
   that is too late at 120 ms latency. Vanished receivers are ended by the
   reader goroutine, stalled ones from `conn.Stats`. Stream IDs are taken
-  literally, never percent-decoded (ruling R-CI2): ffmpeg 6.x does not
-  URL-decode a URL's `streamid` (ffmpeg 8 does), so callers pass the ID raw
-  (`?streamid=#!::r=live/name`) or with `-streamid`.
+  literally, never percent-decoded (ruling R-CI2): ffmpeg 6.1 does not
+  URL-decode a URL's `streamid` (ffmpeg 8 does), so with ffmpeg pass the ID
+  raw (`?streamid=#!::r=live/name`) or with `-streamid` (clients whose URI
+  parser treats `#` as a fragment need their own stream ID setting).
 - DASH maps stream time to wallclock through the epoch anchors, with one fixed
   `availabilityStartTime` for the life of the stream. A period starts at
   `max(anchor, previous period end)`.

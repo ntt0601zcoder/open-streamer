@@ -84,14 +84,15 @@ docker run --rm --init --name "osv2-ci-peers-$$" --network host \
 	-v "$repo:/src" -w /src \
 	-e HOME=/tmp -e PATH=/usr/local/go/bin:/usr/bin:/bin \
 	-e GOCACHE=/gocache -e GOMODCACHE=/gomod -e GOFLAGS=-mod=mod -e GOPROXY=off \
-	-e GOTOOLCHAIN=local -e OS_REQUIRE_PEERS=1 $envs \
+	-e GOTOOLCHAIN=local $envs -e OS_REQUIRE_PEERS=1 \
 	"$image" go test $flags $pkgs || status=$?
 
 case " $flags " in
 *" -run"* | *" -skip"*) onhost=0 ;;
 esac
 if [ "$onhost" = 1 ]; then
-	# The top-level tests that call testpeer.FFmpeg8, per package.
+	# The top-level tests that call testpeer.FFmpeg8 directly, per package
+	# (a call through a helper would be missed; keep the call in the test).
 	for pkg in $pkgs; do
 		names=$(find "$pkg" -maxdepth 1 -name '*_test.go' -exec awk '
 			FNR == 1 { name = "" }

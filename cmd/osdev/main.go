@@ -154,7 +154,9 @@ rtsp://<host>:<port>/<app>/<name>, app from -rtsp-play-app (default live):
 Serve every stream to SRT receivers (ffplay, VLC, ffmpeg) with -srt-play, a
 UDP address whose port is not that of an SRT listen input on the same host
 or a wildcard. The stream ID is <app>/<name> or #!::r=<app>/<name>
-(percent-encode it in a URL), app from -srt-play-app (default live);
+(taken literally, never percent-decoded: with ffmpeg pass it raw,
+?streamid=#!::r=live/<name>, or with -streamid), app from -srt-play-app
+(default live);
 -srt-latency sets the latency:
   osdev -stream cam=in.ts -loop -srt-play :9000
   ffplay 'srt://<host>:9000?streamid=live/<name>'
