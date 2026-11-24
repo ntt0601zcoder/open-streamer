@@ -35,8 +35,10 @@
 //
 // A child that exits for any reason other than the end of Run is respawned
 // after a backoff: RespawnMin, doubling up to RespawnMax, back to RespawnMin
-// once a child has run for HealthyAfter. A child whose Hello announces
-// another wire version is a fatal error that Run returns. Stopping a child
+// once a child has run for HealthyAfter. A child that sends no Hello within
+// HelloTimeout, or anything the host cannot decode, is killed and counts as
+// an exit. A child whose Hello announces another wire version is a fatal
+// error that Run returns. Stopping a child
 // sends Stop, waits 2 s, then kills its process group.
 package transcode
 
@@ -46,12 +48,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
@@ -70,6 +74,7 @@ const (
 	defaultRespawnMax   = 5 * time.Second
 	defaultHealthyAfter = 30 * time.Second
 	defaultMergeHold    = 2 * time.Second
+	defaultHelloTimeout = 10 * time.Second
 
 	// childQueue is the length of the child's input channel.
 	childQueue = 256
@@ -116,6 +121,7 @@ type Options struct {
 	RespawnMax   time.Duration // 0 means 5 s
 	HealthyAfter time.Duration // 0 means 30 s
 	MergeHold    time.Duration // 0 means 2 s
+	HelloTimeout time.Duration // a child without Hello by then is killed; 0 means 10 s
 
 	Now   func() time.Time                     // nil means time.Now
 	After func(time.Duration) <-chan time.Time // nil means time.After
@@ -235,6 +241,7 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 	opt.RespawnMax = max(orDefault(opt.RespawnMax, defaultRespawnMax), opt.RespawnMin)
 	opt.HealthyAfter = orDefault(opt.HealthyAfter, defaultHealthyAfter)
 	opt.MergeHold = orDefault(opt.MergeHold, defaultMergeHold)
+	opt.HelloTimeout = orDefault(opt.HelloTimeout, defaultHelloTimeout)
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
@@ -412,6 +419,9 @@ func (s *run) exited() error {
 	if err == nil {
 		err = errors.New("exited")
 	}
+	if c.cause != nil {
+		err = fmt.Errorf("%w: %w", c.cause, err)
+	}
 	err = fmt.Errorf("transcode: child %d: %w", c.p.pid, err)
 	t.update(func(st *Stats) { st.Exits++ })
 	t.log.Warn("transcode: child exited", "pid", c.p.pid, "err", err)
@@ -541,20 +551,27 @@ type child struct {
 	started time.Time
 	stopped sync.Once
 
+	reapMu sync.Mutex
+	reaped bool // the waiter has reaped the process: its pgid may be reused
+
 	// Written before done is closed.
 	waitErr error
 	fatal   error
+	cause   error // why the host killed the child, if it did
 }
 
 // startChild spawns the child and starts its reader, writer and waiter.
 func (t *Transcoder) startChild(wg *sync.WaitGroup) (*child, error) {
 	env := append(os.Environ(), t.opt.Env...)
-	lw := &logWriter{log: t.log}
+	lw := &logWriter{log: t.log, ready: make(chan struct{})}
 	p, err := startProc(t.opt.Binary, t.opt.Args, env, lw)
 	if err != nil {
 		return nil, err
 	}
+	// exec copies stderr only once Start has succeeded; Write waits for the
+	// pid.
 	lw.pid = p.pid
+	close(lw.ready)
 	c := &child{
 		p:       p,
 		w:       wire.NewWriter(p.conn),
@@ -571,7 +588,9 @@ func (t *Transcoder) startChild(wg *sync.WaitGroup) (*child, error) {
 	go func() {
 		defer wg.Done()
 		defer close(readDone)
-		t.readChild(c)
+		c.cause = t.readChild(c)
+		// The socket has ended: a child still running is wedged.
+		c.kill()
 	}()
 	go func() {
 		defer wg.Done()
@@ -584,30 +603,52 @@ func (t *Transcoder) startChild(wg *sync.WaitGroup) (*child, error) {
 	return c, nil
 }
 
-// readChild reads the child's messages until its socket ends.
-func (t *Transcoder) readChild(c *child) {
+// readChild reads the child's messages until its socket ends; the caller
+// then kills the child if it is still running. It returns why the host gave
+// up on the child: no Hello within HelloTimeout, or input that does not
+// decode. An end of the socket (EOF, or ECONNRESET when the child exited
+// with input unread) is not an error: the exit is the event.
+func (t *Transcoder) readChild(c *child) error {
 	r := wire.NewReader(bufio.NewReaderSize(c.p.conn, 64<<10))
+	c.reapMu.Lock()
+	if !c.reaped {
+		_ = c.p.conn.SetReadDeadline(time.Now().Add(t.opt.HelloTimeout))
+	}
+	c.reapMu.Unlock()
 	m, err := r.Read()
 	if err != nil {
-		return
+		if socketEnded(err) || c.isExited() {
+			return nil
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return fmt.Errorf("transcode: hello: none within %v", t.opt.HelloTimeout)
+		}
+		return fmt.Errorf("transcode: hello: %w", err)
 	}
 	h, ok := m.(wire.Hello)
 	switch {
 	case !ok:
-		t.log.Warn("transcode: child did not start with Hello", "pid", c.p.pid)
-		c.p.killGroup()
-		return
+		return fmt.Errorf("transcode: hello: first message is %T", m)
 	case h.Version != wire.Version:
 		c.fatal = fmt.Errorf("transcode: hello: child speaks wire version %d, want %d", h.Version, wire.Version)
-		c.p.killGroup()
-		return
+		c.kill()
+		return nil
 	}
+	c.reapMu.Lock()
+	if !c.reaped {
+		// The waiter sets its own deadline once the child is reaped.
+		_ = c.p.conn.SetReadDeadline(time.Time{})
+	}
+	c.reapMu.Unlock()
 	close(c.helloOK)
 	c.hello <- struct{}{}
 	for {
 		m, err := r.Read()
 		if err != nil {
-			return
+			if socketEnded(err) || c.isExited() {
+				return nil
+			}
+			return fmt.Errorf("transcode: read: %w", err)
 		}
 		switch v := m.(type) {
 		case wire.Frame:
@@ -616,6 +657,32 @@ func (t *Transcoder) readChild(c *child) {
 			t.log.Warn("transcode: child error", "pid", c.p.pid, "rung", v.Rung, "fatal", v.Fatal, "msg", v.Message)
 		default:
 		}
+	}
+}
+
+// socketEnded reports a read error that only means the child closed its
+// end.
+func socketEnded(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
+}
+
+// isExited reports whether the child has been reaped.
+func (c *child) isExited() bool {
+	select {
+	case <-c.exited:
+		return true
+	default:
+		return false
+	}
+}
+
+// kill kills the child's process group, unless the child has already been
+// reaped, after which its pgid may belong to another group.
+func (c *child) kill() {
+	c.reapMu.Lock()
+	defer c.reapMu.Unlock()
+	if !c.reaped {
+		c.p.killGroup()
 	}
 }
 
@@ -630,7 +697,7 @@ func (t *Transcoder) writeChild(c *child) {
 		return
 	}
 	if err := c.w.Write(t.configure); err != nil {
-		c.p.killGroup()
+		c.kill()
 		return
 	}
 	for {
@@ -641,7 +708,7 @@ func (t *Transcoder) writeChild(c *child) {
 				return
 			}
 			if err := c.w.Write(m); err != nil {
-				c.p.killGroup()
+				c.kill()
 				return
 			}
 		case <-c.quit:
@@ -655,9 +722,13 @@ func (t *Transcoder) writeChild(c *child) {
 
 // wait reaps the process, then lets the reader drain what the child wrote.
 func (c *child) wait(readDone <-chan struct{}) {
-	c.waitErr = c.p.cmd.Wait()
-	close(c.exited)
+	err := c.p.cmd.Wait()
+	c.reapMu.Lock()
+	c.reaped = true
+	c.waitErr = err
 	_ = c.p.conn.SetReadDeadline(time.Now().Add(time.Second))
+	c.reapMu.Unlock()
+	close(c.exited)
 	<-readDone
 	_ = c.p.conn.Close()
 	close(c.done)
@@ -682,18 +753,22 @@ func (c *child) stop(graceful bool) {
 		return
 	case <-timer.C:
 	}
-	c.p.killGroup()
+	c.kill()
 	<-c.done
 }
 
-// logWriter logs the child's stderr, one record per line.
+// logWriter logs the child's stderr, one record per line. exec calls Write
+// from its own goroutine, which may start before startChild knows the pid,
+// so Write waits for ready, closed once pid is set.
 type logWriter struct {
-	log *slog.Logger
-	pid int
-	buf []byte
+	log   *slog.Logger
+	ready chan struct{}
+	pid   int
+	buf   []byte
 }
 
 func (w *logWriter) Write(b []byte) (int, error) {
+	<-w.ready
 	w.buf = append(w.buf, b...)
 	for {
 		i := bytes.IndexByte(w.buf, '\n')

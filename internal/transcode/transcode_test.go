@@ -208,7 +208,9 @@ func TestSupervisorLadderFake(t *testing.T) {
 func assertOneExtraEpoch(t *testing.T, s *session, out [][]media.Frame, steps []step) {
 	t.Helper()
 	want := len(srcEpochs(steps)) + 1
-	for i, fs := range out {
+	off := len(s.cols) - len(out) // out may be a tail of the hubs
+	for j, fs := range out {
+		i := j + off
 		eps := epochs(fs)
 		require.Len(t, eps, want, "hub %d epochs %v", i, eps)
 		last := eps[len(eps)-1]
@@ -251,17 +253,24 @@ func TestSupervisorRespawnOneEpoch(t *testing.T) {
 
 func TestSupervisorMixedRespawn(t *testing.T) {
 	plain := fixtureSteps(t, "h264_aac.ts")
+	copyVideo := []Rendition{copySrc}
+	encodeVideo := []Rendition{encode240}
 	for _, tc := range []struct {
-		name  string
-		steps []step
+		name       string
+		steps      []step
+		renditions []Rendition
+		copyAudio  bool
 	}{
-		{"plain", plain},
-		{"audio-leads-300ms", audioLead(plain, 27000)},
-		{"hevc-open-gop", fixtureSteps(t, "h265_aac51.ts")},
+		{"plain", plain, copyVideo, false},
+		{"audio-leads-300ms", audioLead(plain, 27000), copyVideo, false},
+		{"hevc-open-gop", fixtureSteps(t, "h265_aac51.ts"), copyVideo, false},
+		{"encoded-video-copied-audio", plain, encodeVideo, true},
+		{"encoded-video-copied-audio-leads", audioLead(plain, 27000), encodeVideo, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			opt := fakeOptions(t, crashOnce(t, 50)...)
-			opt.Renditions = []Rendition{copySrc}
+			opt.Renditions = tc.renditions
+			opt.Audio.Copy = tc.copyAudio
 			s := start(t, opt)
 			out := s.feed(t, tc.steps, 4)
 			assertOneExtraEpoch(t, s, out, tc.steps)
@@ -272,6 +281,15 @@ func TestSupervisorMixedRespawn(t *testing.T) {
 			}
 			assert.NotZero(t, s.tr.Stats().DroppedBeforeKey)
 			assert.EqualValues(t, 2, s.tr.Stats().Spawns)
+			if !tc.renditions[0].Video.Copy {
+				// The new epoch starts on the new child's IDR: a video
+				// keyframe whose config came over the wire, not the source's.
+				eps := epochs(out[0])
+				first := firstOfEpoch(out[0], eps[len(eps)-1])
+				for _, f := range frames(tc.steps) {
+					require.NotSame(t, f.Config, first.Config)
+				}
+			}
 		})
 	}
 }
@@ -502,7 +520,9 @@ func TestSupervisorCopyOnly(t *testing.T) {
 
 func TestLogWriterLines(t *testing.T) {
 	var buf strings.Builder
-	w := &logWriter{log: slog.New(slog.NewTextHandler(&buf, nil)), pid: 7}
+	ready := make(chan struct{})
+	close(ready)
+	w := &logWriter{log: slog.New(slog.NewTextHandler(&buf, nil)), ready: ready, pid: 7}
 	n, err := w.Write([]byte("one\ntw"))
 	require.NoError(t, err)
 	assert.Equal(t, 6, n)
@@ -524,4 +544,93 @@ func TestTryChild(t *testing.T) {
 	assert.True(t, s.tryChild(wire.Discontinuity{}))
 	assert.False(t, s.tryChild(wire.Discontinuity{}))
 	assert.Equal(t, 1, tr.Stats().MaxQueued)
+}
+
+// syncBuffer is a strings.Builder safe for concurrent writes.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+// A child that writes stderr as it starts is logged with its pid, without a
+// race against startChild (regression: exec's copy goroutine read the pid
+// before it was set).
+func TestSupervisorChildStderr(t *testing.T) {
+	for range 3 {
+		var buf syncBuffer
+		opt := fakeOptions(t, transcodetest.EnvStderr+"=hello-from-child")
+		opt.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+		opt.Renditions = []Rendition{encode240}
+		s := start(t, opt)
+		require.Eventually(t, func() bool { return strings.Contains(buf.String(), "line=hello-from-child") },
+			10*time.Second, time.Millisecond)
+		spawned := s.ev.of(EventSpawned)
+		require.NotEmpty(t, spawned)
+		assert.Contains(t, buf.String(), "pid="+strconv.Itoa(spawned[0].PID)+" line=hello-from-child")
+	}
+}
+
+// A child that sends junk, or no Hello, while it keeps running is killed and
+// counts as an exit: it is respawned, the renditions get one bump epoch, Run
+// stays responsive and the copy rendition keeps every source video frame.
+func TestSupervisorWedgedChild(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	for _, tc := range []struct {
+		name, env, cause string
+	}{
+		{"junk", transcodetest.EnvJunk + "=1", "malformed"},
+		{"no-hello", transcodetest.EnvNoHello + "=1", "none within"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opt := fakeOptions(t, tc.env,
+				transcodetest.EnvCrashOnce+"="+filepath.Join(t.TempDir(), "once"))
+			opt.HelloTimeout = 300 * time.Millisecond
+			opt.Renditions = []Rendition{encode240, copySrc}
+			opt.Audio.Copy = true
+			s := start(t, opt)
+			out := s.feed(t, steps, 4)
+			st := s.tr.Stats()
+			assert.EqualValues(t, 2, st.Spawns)
+			assert.EqualValues(t, 1, st.Exits)
+			exits := s.ev.of(EventExited)
+			require.Len(t, exits, 1)
+			assert.ErrorContains(t, exits[0].Err, tc.cause)
+			// The copy rendition gets the bump epoch on top of the source's.
+			// The encoded one may have nothing in the first epoch: a junk
+			// child dies before the first frame arrives.
+			assertOneExtraEpoch(t, s, out[1:], steps)
+			eps0, eps1 := epochs(out[0]), epochs(out[1])
+			require.NotEmpty(t, eps0)
+			assert.Equal(t, eps1[len(eps1)-1], eps0[len(eps0)-1])
+			first := firstOfEpoch(out[0], eps0[len(eps0)-1])
+			assert.True(t, first.Key && first.Kind() == media.KindVideo, "encoded rendition starts on a keyframe")
+			for i, fs := range out {
+				check(t, fs, opt.Renditions[i].Name)
+			}
+			var srcVideo, copyVideo int
+			for _, f := range frames(steps) {
+				if f.Kind() == media.KindVideo {
+					srcVideo++
+				}
+			}
+			for _, f := range out[1] {
+				if f.Kind() == media.KindVideo {
+					copyVideo++
+				}
+			}
+			assert.Equal(t, srcVideo, copyVideo, "copy rendition video")
+		})
+	}
 }

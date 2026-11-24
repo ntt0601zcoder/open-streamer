@@ -29,6 +29,9 @@ func (m *epochMap) bump() { m.pending = true }
 // isPending reports whether a bump waits for its K.
 func (m *epochMap) isPending() bool { return m.pending }
 
+// stale reports whether upstream epoch up is older than the current one.
+func (m *epochMap) stale(up uint32) bool { return m.started && up < m.up }
+
 // mapEpoch maps a frame of upstream epoch up that is not K. opened reports a
 // rendition epoch issued by this frame. ok is false for a frame of an
 // upstream epoch older than the current one, which has no place left.
@@ -40,7 +43,7 @@ func (m *epochMap) mapEpoch(up uint32) (r uint32, opened, ok bool) {
 		return up, true, true
 	case up == m.up:
 		return m.cur, false, true
-	case up < m.up:
+	case m.stale(up):
 		return 0, false, false
 	}
 	next := int64(up) + m.offset
@@ -53,7 +56,7 @@ func (m *epochMap) mapEpoch(up uint32) (r uint32, opened, ok bool) {
 }
 
 // take makes the pending bump take effect at K, a frame of upstream epoch
-// up, and returns the epoch it issues. newUp reports that K is the first
+// up that is not stale, and returns the epoch it issues. newUp reports that K is the first
 // frame of upstream epoch up: that upstream epoch is the bump's epoch, not
 // the one after it.
 func (m *epochMap) take(up uint32) (r uint32, newUp bool) {
@@ -195,7 +198,9 @@ func (r *router) deliver(d hub.Delivery) {
 	notK := false
 	if d.Lost > 0 {
 		r.onLoss()
-		if r.childFed {
+		// A loss absorbed into a pending bump needs no second Discontinuity:
+		// the child gets nothing more until K.
+		if r.childFed && !r.em.isPending() {
 			r.toChild(wire.Discontinuity{})
 		}
 		r.em.bump()
@@ -206,6 +211,12 @@ func (r *router) deliver(d hub.Delivery) {
 
 	if !r.em.isPending() {
 		r.normal(f)
+		return
+	}
+	if r.em.stale(f.Epoch) {
+		// A straggler from an older upstream epoch is never K: it would move
+		// the map backwards.
+		r.dropped(1)
 		return
 	}
 	if !notK && r.isK(f) {

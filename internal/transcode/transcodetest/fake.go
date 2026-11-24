@@ -27,6 +27,14 @@ const (
 	EnvDelay = "OS_TRANSCODE_FAKE_DELAY"
 	// EnvVersion overrides the wire version in Hello.
 	EnvVersion = "OS_TRANSCODE_FAKE_VERSION"
+	// EnvStderr is a line the child writes to stderr as it starts.
+	EnvStderr = "OS_TRANSCODE_FAKE_STDERR"
+	// EnvJunk makes the child write bytes that do not decode instead of
+	// Hello, then hang. With EnvCrashOnce, only while the file is absent.
+	EnvJunk = "OS_TRANSCODE_FAKE_JUNK"
+	// EnvNoHello makes the child hang without sending Hello. With
+	// EnvCrashOnce, only while the file is absent.
+	EnvNoHello = "OS_TRANSCODE_FAKE_NO_HELLO"
 )
 
 // Main runs the fake child on fd 3 and exits. It sends Hello, reads
@@ -50,18 +58,35 @@ func Main() {
 		crashAfter = n
 	}
 	once := os.Getenv(EnvCrashOnce)
+	misbehave := true
 	if once != "" {
 		if _, err := os.Stat(once); err == nil {
-			crashAfter = -1
+			crashAfter, misbehave = -1, false
 		}
 	}
 	delay, _ := time.ParseDuration(os.Getenv(EnvDelay))
-
-	crash := func() {
+	markOnce := func() {
 		if once != "" {
 			_ = os.WriteFile(once, nil, 0o600)
 		}
+	}
+	crash := func() {
+		markOnce()
 		os.Exit(2)
+	}
+
+	if line := os.Getenv(EnvStderr); line != "" {
+		_, _ = os.Stderr.WriteString(line + "\n")
+	}
+	if misbehave && (os.Getenv(EnvJunk) != "" || os.Getenv(EnvNoHello) != "") {
+		markOnce()
+		if os.Getenv(EnvJunk) != "" {
+			// A zero length is malformed.
+			_, _ = conn.Write([]byte{0, 0, 0, 0, 0xff, 0xff})
+		}
+		for { // hang until killed
+			time.Sleep(time.Hour)
+		}
 	}
 
 	if err := w.Write(wire.Hello{Version: version, PID: os.Getpid()}); err != nil {

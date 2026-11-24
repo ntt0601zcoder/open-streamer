@@ -243,3 +243,37 @@ func TestRouterSecondVideoTrack(t *testing.T) {
 	r.deliver(hub.Delivery{Frame: media.Frame{Track: 3}})
 	assert.Len(t, rt.copied, 1)
 }
+
+// A loss absorbed into a pending bump sends no second Discontinuity.
+func TestRouterAbsorbedLossNoDiscontinuity(t *testing.T) {
+	var rt routed
+	r := newTestRouter(&rt, true, false, true)
+	r.deliver(hub.Delivery{Frame: vframe(1, 0, true)})
+	r.deliver(hub.Delivery{Frame: vframe(1, 90000, true), Lost: 1})
+	r.deliver(hub.Delivery{Frame: vframe(1, 93600, true), Lost: 1})
+	var discs int
+	for _, m := range rt.child {
+		if _, ok := m.(wire.Discontinuity); ok {
+			discs++
+		}
+	}
+	assert.Equal(t, 1, discs)
+}
+
+// Without live video, a straggler from an older upstream epoch is never K:
+// it is dropped and the map does not move backwards.
+func TestRouterStaleNeverK(t *testing.T) {
+	var rt routed
+	r := newTestRouter(&rt, false, false, true)
+	r.deliver(hub.Delivery{Frame: aframe(1, 0)})
+	r.deliver(hub.Delivery{Frame: aframe(2, 1920)})
+	r.childExited()
+	r.childHello()
+	r.deliver(hub.Delivery{Frame: aframe(1, 3840)}) // stale: dropped, not K
+	assert.True(t, r.em.isPending())
+	assert.EqualValues(t, 1, rt.dropped)
+	r.deliver(hub.Delivery{Frame: aframe(2, 5760)}) // K
+	assert.False(t, r.em.isPending())
+	assert.Equal(t, uint32(2), r.em.up)
+	assert.Equal(t, uint32(3), r.em.cur)
+}
