@@ -155,6 +155,61 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The real transcoder child on linux/arm64: the arm64 bundle of
+  # transcoder-arm64 behind the supervisor (TestSupervisorRealChild) and the
+  # M4a scenarios (TestM4aMatrix, TestM4aKeyframesAligned, TestM4aRespawn).
+  # Their only peers are the bundle and apt's ffmpeg and ffprobe, so
+  # OS_REQUIRE_PEERS=1 turns a missing one into a failure. The VLC, SRT and
+  # RTSP rows stay amd64-only: TestM4aVLC is not in the pattern, and
+  # OS_TRANSCODE_E2E_ARM=1 skips TestM4aMatrix's t180/srt-steady and
+  # t180/rtsp-steady.
+  transcode-e2e-arm64:
+    needs: transcoder-arm64
+    runs-on: ubuntu-24.04-arm
+    env:
+      OS_REQUIRE_PEERS: "1"
+      OS_TRANSCODE_E2E_ARM: "1"
+      E2E_PKGS: ./internal/e2e/ ./internal/transcode/
+      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestSupervisorRealChild
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@v4
+        with:
+          name: ostranscoder-arm64
+          path: ${{ runner.temp }}/ostranscoder
+      - name: Unpack the transcoder bundle (OS_TRANSCODER)
+        run: |
+          mkdir -p dist
+          tar -C dist -xf "$RUNNER_TEMP/ostranscoder/ostranscoder-arm64.tar"
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-arm64/ostranscoder"
+          "$ostx" -version
+          echo "OS_TRANSCODER=$ostx" >> "$GITHUB_ENV"
+      # ffprobe for the b-frames rows, ffmpeg for the slow-consumer rows.
+      # The EC2 regional mirror is dropped as in the test job.
+      - name: Install ffmpeg
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          ffprobe -hide_banner -version | head -1
+      # go test -run passes when the pattern matches no test: a renamed test
+      # would go unrun.
+      - name: Check the tests exist
+        run: |
+          listed=$(go test -race -list '.*' $E2E_PKGS)
+          for name in $E2E_TESTS; do
+            if ! echo "$listed" | grep -qx "$name"; then
+              echo "$name is not a test in $E2E_PKGS" >&2
+              exit 1
+            fi
+          done
+      - name: go test -race (real child, arm64)
+        run: go test -race -count=1 -timeout=10m -run 'TestM4aMatrix|TestM4aKeyframesAligned|TestM4aRespawn|TestSupervisorRealChild' $E2E_PKGS
+
   test:
     needs: transcoder-amd64
     runs-on: ubuntu-24.04
