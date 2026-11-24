@@ -1,4 +1,4 @@
-.PHONY: test lint tools fmt tidy vet check cover covercheck fixtures
+.PHONY: test lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers
 
 test:
 	go test -race -shuffle=on -count=1 -timeout=10m ./...
@@ -28,3 +28,10 @@ covercheck:
 
 fixtures:
 	sh testdata/fixtures/gen.sh
+
+# The packages whose tests use ffmpeg, ffprobe, VLC or GStreamer, run in a
+# throwaway container of testdata/peers/Dockerfile.ci (CI's Ubuntu 24.04
+# peers: ffmpeg 6.1, VLC 3, GStreamer 1.24). See scripts/test-ci-peers.sh;
+# ARGS takes go test flags and packages.
+test-ci-peers:
+	sh scripts/test-ci-peers.sh $(ARGS)

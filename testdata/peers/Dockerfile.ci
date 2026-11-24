@@ -1,0 +1,20 @@
+# CI's test peers in one image, so that tool-dependent tests run locally
+# against the versions CI uses: Ubuntu 24.04's ffmpeg 6.1 (with libsrt),
+# VLC 3 and GStreamer 1.24, the packages ci.yml installs on ubuntu-24.04,
+# plus gcc for go test -race. It carries no Go toolchain: scripts/
+# test-ci-peers.sh mounts the host's, with the host's module cache, and runs
+# the tests as the host's user (VLC refuses to run as root):
+#
+#   docker build -t osv2-ci-peers:m3b3 -f testdata/peers/Dockerfile.ci testdata/peers
+#   make test-ci-peers
+FROM ubuntu:24.04
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ffmpeg \
+      vlc-bin vlc-plugin-base vlc-plugin-access-extra \
+      gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+      gcc libc6-dev ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home --uid 1001 peer
+USER peer
+WORKDIR /home/peer
