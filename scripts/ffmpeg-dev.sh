@@ -55,6 +55,12 @@ marker=$prefix/.osv2-verified
 if [ ! -f "$marker" ]; then
 	[ "$cached" = 0 ] || exit 1
 	mkdir -p "$cache"
+	# Serialise concurrent runs (parallel worktrees): only one downloads and
+	# unpacks; the others wait and then find the marker.
+	exec 9>"$cache/.lock"
+	flock 9
+fi
+if [ ! -f "$marker" ]; then
 	archive=$cache/$asset
 	if [ ! -f "$archive" ] || ! echo "$sum  $archive" | sha256sum -c --status; then
 		echo "ffmpeg-dev: downloading $url" >&2
