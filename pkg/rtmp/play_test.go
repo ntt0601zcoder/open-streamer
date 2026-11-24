@@ -520,7 +520,29 @@ func TestServerPlayFFmpeg(t *testing.T) {
 			t.Fatalf("ffmpeg did not see %q:\n%s", s, out)
 		}
 	}
-	if !strings.Contains(out, "time=00:00:03") {
-		t.Fatalf("ffmpeg did not read 3 s of media:\n%s", out)
+	// ffmpeg's -t 3 stops at the first packet at or past 3 s, and its last
+	// progress line reports how far it got: ffmpeg 8 prints 00:00:03.02
+	// for this clip, ffmpeg 6.1 the last packet written, 00:00:02.98, and
+	// both print the same reading the FLV file itself. The last packet
+	// before 3 s is less than one video frame (40 ms at 25 fps) short.
+	got := lastProgressTime(out)
+	if got < 3*time.Second-40*time.Millisecond {
+		t.Fatalf("ffmpeg read %v of media, want 3 s less one frame:\n%s", got, out)
 	}
+	t.Logf("ffmpeg read %v of media", got)
+}
+
+// lastProgressTime returns the time= value of ffmpeg's last progress line,
+// or 0 if it has none or it is negative.
+func lastProgressTime(out string) time.Duration {
+	i := strings.LastIndex(out, " time=")
+	if i < 0 {
+		return 0
+	}
+	var h, m int
+	var sec float64
+	if _, err := fmt.Sscanf(out[i+len(" time="):], "%d:%d:%f", &h, &m, &sec); err != nil || h < 0 || m < 0 || sec < 0 {
+		return 0
+	}
+	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(sec*float64(time.Second))
 }
