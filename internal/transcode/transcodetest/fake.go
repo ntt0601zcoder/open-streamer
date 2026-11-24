@@ -30,6 +30,9 @@ const (
 	EnvVersion = "OS_TRANSCODE_FAKE_VERSION"
 	// EnvStderr is a line the child writes to stderr as it starts.
 	EnvStderr = "OS_TRANSCODE_FAKE_STDERR"
+	// EnvStderrLines makes the child write that many numbered lines to
+	// stderr as fast as it can as it starts, as libav does on lossy input.
+	EnvStderrLines = "OS_TRANSCODE_FAKE_STDERR_LINES"
 	// EnvJunk makes the child write bytes that do not decode instead of
 	// Hello, then hang. With EnvCrashOnce, only while the file is absent.
 	EnvJunk = "OS_TRANSCODE_FAKE_JUNK"
@@ -105,6 +108,11 @@ func Main() {
 
 	if line := os.Getenv(EnvStderr); line != "" {
 		_, _ = os.Stderr.WriteString(line + "\n")
+	}
+	if n, err := strconv.Atoi(os.Getenv(EnvStderrLines)); err == nil {
+		for i := range n {
+			_, _ = os.Stderr.WriteString("stderr line " + strconv.Itoa(i) + "\n")
+		}
 	}
 	if misbehave && (os.Getenv(EnvJunk) != "" || os.Getenv(EnvNoHello) != "") {
 		markOnce()

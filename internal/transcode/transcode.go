@@ -164,11 +164,13 @@ type Event struct {
 // mark of the child's input channel (at most 256); it excludes the
 // pre-Hello backlog, which can hold up to 1500 frames. PID is the running
 // child's, or 0. DroppedBeforeKey also counts the frames given up on
-// because the child exited, stalled, or Run ended while they waited. Child
-// holds the media counters the children reported.
+// because the child exited, stalled, or Run ended while they waited.
+// StderrSuppressed counts the children's stderr lines not logged because
+// they came faster than 10 a second. Child holds the media counters the
+// children reported.
 type Stats struct {
 	Spawns, Exits, Losses, DroppedBeforeKey, MergeDropped uint64
-	FramesIn                                              uint64
+	FramesIn, StderrSuppressed                            uint64
 	FramesOut                                             []uint64
 	MaxQueued                                             int
 	PID                                                   int
@@ -687,6 +689,7 @@ type proc struct {
 // child is one transcoder subprocess and its goroutines.
 type child struct {
 	p       *proc
+	stderr  *logWriter
 	w       *wire.Writer
 	in      chan wire.Message
 	quit    chan struct{} // closed to stop at once
@@ -724,17 +727,19 @@ type child struct {
 // startChild spawns the child and starts its reader, writer and waiter.
 func (t *Transcoder) startChild(wg *sync.WaitGroup) (*child, error) {
 	env := append(os.Environ(), t.opt.Env...)
-	lw := &logWriter{log: t.log, ready: make(chan struct{})}
+	lw := newLogWriter(t.log, func(n uint64) {
+		t.update(func(st *Stats) { st.StderrSuppressed += n })
+	})
 	p, err := startProc(t.opt.Binary, t.opt.Args, env, lw)
 	if err != nil {
 		return nil, err
 	}
 	// exec copies stderr only once Start has succeeded; Write waits for the
 	// pid.
-	lw.pid = p.pid
-	close(lw.ready)
+	lw.setPID(p.pid)
 	c := &child{
 		p:         p,
+		stderr:    lw,
 		w:         wire.NewWriter(p.conn),
 		in:        make(chan wire.Message, childQueue),
 		quit:      make(chan struct{}),
@@ -929,6 +934,7 @@ func (t *Transcoder) writeChild(c *child) {
 // wait reaps the process, then lets the reader drain what the child wrote.
 func (c *child) wait(readDone <-chan struct{}) {
 	err := c.p.cmd.Wait()
+	c.stderr.close() // Wait has copied all of the child's stderr
 	c.reapMu.Lock()
 	c.reaped = true
 	c.waitErr = err
@@ -964,30 +970,138 @@ func (c *child) stop(graceful bool) {
 	<-c.done
 }
 
-// logWriter logs the child's stderr, one record per line. exec calls Write
-// from its own goroutine, which may start before startChild knows the pid,
-// so Write waits for ready, closed once pid is set.
+// Child stderr rate limit: a lossy source makes libav print about 10 lines
+// a second per stream.
+const (
+	// stderrBurst is how many stderr lines of one child are logged per
+	// second; the rest are counted and summarised.
+	stderrBurst = 10
+	// stderrSummaryEvery is how often suppressed lines are summarised.
+	stderrSummaryEvery = 10 * time.Second
+)
+
+// logWriter logs one child's stderr, one record per line, at most
+// stderrBurst lines per second. Further lines are counted (onSuppress) and
+// summarised in one record every summary period, and once more by close.
+// exec calls Write from its own goroutine, which may start before
+// startChild knows the pid, so Write waits for ready, closed by setPID.
 type logWriter struct {
-	log   *slog.Logger
-	ready chan struct{}
-	pid   int
-	buf   []byte
+	log        *slog.Logger
+	ready      chan struct{}
+	pid        int
+	now        func() time.Time
+	every      time.Duration
+	onSuppress func(n uint64)
+
+	mu         sync.Mutex
+	buf        []byte
+	window     time.Time // start of the current one-second window
+	inWindow   int       // lines logged in it
+	suppressed uint64    // lines suppressed since the last summary
+	timer      *time.Timer
+	closed     bool
+}
+
+func newLogWriter(log *slog.Logger, onSuppress func(n uint64)) *logWriter {
+	if onSuppress == nil {
+		onSuppress = func(uint64) {}
+	}
+	return &logWriter{
+		log: log, ready: make(chan struct{}), now: time.Now,
+		every: stderrSummaryEvery, onSuppress: onSuppress,
+	}
+}
+
+// setPID sets the child's pid and lets Write proceed.
+func (w *logWriter) setPID(pid int) {
+	w.pid = pid
+	close(w.ready)
 }
 
 func (w *logWriter) Write(b []byte) (int, error) {
 	<-w.ready
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var n uint64
 	w.buf = append(w.buf, b...)
 	for {
 		i := bytes.IndexByte(w.buf, '\n')
 		if i < 0 {
 			break
 		}
-		w.log.Warn("transcode: child stderr", "pid", w.pid, "line", string(w.buf[:i]))
+		if !w.line(w.buf[:i]) {
+			n++
+		}
 		w.buf = w.buf[i+1:]
 	}
 	if len(w.buf) > 4096 {
-		w.log.Warn("transcode: child stderr", "pid", w.pid, "line", string(w.buf))
+		if !w.line(w.buf) {
+			n++
+		}
 		w.buf = w.buf[:0]
 	}
+	if n > 0 {
+		w.onSuppress(n)
+	}
 	return len(b), nil
+}
+
+// line logs l, or counts it once the window's burst is spent, and reports
+// whether it was logged. Called with w.mu held.
+func (w *logWriter) line(l []byte) bool {
+	now := w.now()
+	if now.Sub(w.window) >= time.Second {
+		w.window, w.inWindow = now, 0
+	}
+	if w.inWindow < stderrBurst {
+		w.inWindow++
+		w.log.Warn("transcode: child stderr", "pid", w.pid, "line", string(l))
+		return true
+	}
+	w.suppressed++
+	if w.timer == nil && !w.closed {
+		w.timer = time.AfterFunc(w.every, w.summary)
+	}
+	return false
+}
+
+// summary logs the lines suppressed since the last summary.
+func (w *logWriter) summary() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.timer = nil
+	w.report()
+}
+
+// report logs the suppressed count, if any. Called with w.mu held.
+func (w *logWriter) report() {
+	if w.suppressed == 0 {
+		return
+	}
+	w.log.Warn(fmt.Sprintf("transcode: child %d: suppressed %d stderr lines", w.pid, w.suppressed),
+		"pid", w.pid, "suppressed", w.suppressed)
+	w.suppressed = 0
+}
+
+// close handles a last line without a newline, stops the summary timer and
+// logs what is still suppressed. It is called once the child is reaped, when
+// exec has copied all of its stderr.
+func (w *logWriter) close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+	w.closed = true
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
+	if len(w.buf) > 0 {
+		if !w.line(w.buf) {
+			w.onSuppress(1)
+		}
+		w.buf = nil
+	}
+	w.report()
 }

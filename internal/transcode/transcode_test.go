@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -568,9 +570,8 @@ func TestSupervisorCopyOnly(t *testing.T) {
 
 func TestLogWriterLines(t *testing.T) {
 	var buf strings.Builder
-	ready := make(chan struct{})
-	close(ready)
-	w := &logWriter{log: slog.New(slog.NewTextHandler(&buf, nil)), ready: ready, pid: 7}
+	w := newLogWriter(slog.New(slog.NewTextHandler(&buf, nil)), nil)
+	w.setPID(7)
 	n, err := w.Write([]byte("one\ntw"))
 	require.NoError(t, err)
 	assert.Equal(t, 6, n)
@@ -580,6 +581,112 @@ func TestLogWriterLines(t *testing.T) {
 	assert.Contains(t, out, "line=one")
 	assert.Contains(t, out, "line=two")
 	assert.Equal(t, 3, strings.Count(out, "pid=7"))
+}
+
+// recordHandler is a slog.Handler that keeps every record.
+type recordHandler struct {
+	mu   sync.Mutex
+	recs []slog.Record
+}
+
+func (h *recordHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.recs = append(h.recs, r.Clone())
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *recordHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordHandler) WithGroup(string) slog.Handler      { return h }
+
+// count returns the records whose message contains sub.
+func (h *recordHandler) count(sub string) int {
+	return len(h.matching(sub))
+}
+
+// matching returns the messages of the records that contain sub.
+func (h *recordHandler) matching(sub string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, r := range h.recs {
+		if strings.Contains(r.Message, sub) {
+			out = append(out, r.Message)
+		}
+	}
+	return out
+}
+
+// The child's stderr is logged at most stderrBurst lines per second; the
+// rest is counted, and summarised once per summary period and at the end.
+func TestLogWriterRateLimit(t *testing.T) {
+	h := &recordHandler{}
+	var suppressed atomic.Uint64
+	w := newLogWriter(slog.New(h), func(n uint64) { suppressed.Add(n) })
+	now := time.Unix(100, 0)
+	w.now = func() time.Time { return now }
+	w.every = 50 * time.Millisecond
+	w.setPID(7)
+	lines := func(n int) {
+		for i := range n {
+			_, err := w.Write([]byte("line " + strconv.Itoa(i) + "\n"))
+			require.NoError(t, err)
+		}
+	}
+	lines(25)
+	assert.Equal(t, stderrBurst, h.count("child stderr"))
+	assert.EqualValues(t, 15, suppressed.Load())
+	require.Eventually(t, func() bool { return h.count("suppressed") == 1 }, 2*time.Second, time.Millisecond)
+	assert.Equal(t, []string{"transcode: child 7: suppressed 15 stderr lines"}, h.matching("suppressed"))
+
+	// A new second allows a new burst. The next summary is left to close.
+	w.every = time.Hour
+	now = now.Add(time.Second)
+	lines(5)
+	assert.Equal(t, stderrBurst+5, h.count("child stderr"))
+	lines(20)
+	assert.Equal(t, 2*stderrBurst, h.count("child stderr"))
+	assert.EqualValues(t, 30, suppressed.Load())
+
+	// close logs a partial last line if the burst allows it, and the
+	// pending summary at once.
+	_, _ = w.Write([]byte("partial"))
+	w.close()
+	assert.Equal(t, 2*stderrBurst, h.count("child stderr"))
+	assert.EqualValues(t, 31, suppressed.Load())
+	assert.Equal(t, []string{
+		"transcode: child 7: suppressed 15 stderr lines",
+		"transcode: child 7: suppressed 16 stderr lines",
+	}, h.matching("suppressed"))
+}
+
+// A child that floods its stderr (1000 lines at once) gets a burst of
+// records, not one per line; the rest is counted in Stats.StderrSuppressed
+// and summarised when the child ends.
+func TestSupervisorStderrRateLimited(t *testing.T) {
+	h := &recordHandler{}
+	opt := fakeOptions(t, transcodetest.EnvStderrLines+"=1000")
+	opt.Logger = slog.New(h)
+	opt.Renditions = []Rendition{encode240}
+	s := start(t, opt)
+	s.feed(t, fixtureSteps(t, "h264_aac.ts"), 0)
+	logged := h.count("transcode: child stderr")
+	st := s.tr.Stats()
+	t.Logf("logged %d, suppressed %d", logged, st.StderrSuppressed)
+	assert.GreaterOrEqual(t, logged, stderrBurst)
+	assert.LessOrEqual(t, logged, 3*stderrBurst)
+	assert.EqualValues(t, 1000, uint64(logged)+st.StderrSuppressed)
+	var summed uint64
+	for _, m := range h.matching("stderr lines") {
+		var pid int
+		var n uint64
+		_, err := fmt.Sscanf(m, "transcode: child %d: suppressed %d stderr lines", &pid, &n)
+		require.NoError(t, err, m)
+		summed += n
+	}
+	assert.Equal(t, st.StderrSuppressed, summed, "every suppressed line is in a summary")
 }
 
 // tryChild never waits: a full queue, or no child, refuses the message.
