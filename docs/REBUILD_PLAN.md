@@ -674,7 +674,8 @@ Items accepted for later, not yet placed in a milestone:
   `hls/6.ts`; the 'no reference clock' pair follows in 1 of 30 runs).
   Measure with a seamless source. If the reset is real, start each TS
   segment's audio at or before the keyframe PTS (a TS-only layout; CMAF keeps
-  R-F3's cut). Normal priority.
+  R-F3's cut). Normal priority; before M7 if the soak uses a looping source
+  with VLC.
 - **Transcoder merger drops a child track it has not seen yet in an epoch**
   (`internal/transcode/merge.go`). The merger waits only for tracks already
   seen in the hub's current epoch. Since the M4a final fix wave, a burst of
@@ -688,6 +689,20 @@ Items accepted for later, not yet placed in a milestone:
   1 ms per frame drops all 282 epoch-1 audio frames. Live paced sources are
   not affected. Fix: seed each epoch's expected set with the child's tracks
   (with the item below).
+- **Root cause of VLC 3's "buffer deadlock prevented" on B-pyramid rungs,
+  before M4c** (ruling R-T7b'). `b-pyramid=none` cured it on our encoded
+  rungs (3 of 8 runs to 0 of 8), but treats a symptom: the trigger is
+  specific to our encoded output under x264's frame threads (the copied
+  source rendition showed it in 0 of 8 runs, and sliced threads with
+  B-pyramid cured it too). Find what in our output VLC trips on (for
+  example DTS spacing, or the reorder depth against what the SPS signals),
+  since NVENC's `b_ref_mode` in M4c may bring it back.
+- **Transcoder: drop and count a persistently failing audio track instead of
+  failing the pipeline.** An audio track the child cannot decode (or encode)
+  makes the child exit; it is respawned and fails again, so one bad track
+  crash-loops the whole ladder, video included. Drop that track after
+  repeated failures, count it, and keep the video rungs running (M4a final
+  review, M3).
 - **Transcoder merger: seed a new epoch's expected tracks with the rung's
   video.** After a respawn, the new child's audio reaches an encoded
   rendition's hub about 1.2 s (the x264 delay) before its first IDR. The
@@ -754,16 +769,16 @@ Items accepted for later, not yet placed in a milestone:
 
 #### M4a deferred minors
 
-- wire: the writer does not enforce the limits the reader does; an empty-body
-  Discontinuity or Stop is not rejected; unknown fixed32 and fixed64 fields
-  count as malformed rather than skipped.
+- wire: an empty-body Discontinuity or Stop is not rejected; unknown fixed32
+  and fixed64 fields count as malformed rather than skipped; the child exits
+  on an output frame the Writer refuses (`wire.ErrLimit`; not seen
+  from libav's encoders).
 - ostranscoder main: a dead nil branch after `os.NewFile(3)`;
   `TestMainOverFD3` waits on the child without a bound (kill it after
   `childTimeout`).
 - Build: add `xz-utils` and `CGO_ENABLED` to the arm64 job's environment; the
   stub test's `.exe` suffix matters on Windows only;
-  `testpeer.OSTranscoder` should use `Output()`, not `CombinedOutput()`;
-  make the `transcoder-*` CI jobs required checks (a repository setting).
+  `testpeer.OSTranscoder` should use `Output()`, not `CombinedOutput()`.
 - native: one skipped AAC frame leaves audio about 21 ms early until the next
   re-anchor (the threshold is more than one frame; pin it with an assertion
   or use at least one); `isCorruptData` could exclude `EINVAL` and
@@ -776,6 +791,10 @@ Items accepted for later, not yet placed in a milestone:
   and `place` (a lagging second video track: no hold, `Late()` 0), nor the
   promote cut with nothing moved (the `carry` case); a non-anchor video track
   is now carried at a non-key promote (harmless).
+
+**Note for the user:** make the `transcoder-amd64`, `transcoder-arm64` and
+`transcode-e2e-arm64` CI jobs required checks on the `rebuild` and `main`
+branches. That is a repository setting, which no commit can change.
 
 ### Carried from M1
 
