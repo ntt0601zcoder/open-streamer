@@ -161,6 +161,15 @@ func (h *host) send(ms ...wire.Message) error {
 	return nil
 }
 
+// frameMsgs wraps frames as host-to-child Frame messages.
+func frameMsgs(frames []media.Frame) []wire.Message {
+	out := make([]wire.Message, len(frames))
+	for i, f := range frames {
+		out[i] = wire.Frame{Rung: -1, F: f}
+	}
+	return out
+}
+
 func (h *host) sendFrames(frames []media.Frame) error {
 	for _, f := range frames {
 		if err := h.w.Write(wire.Frame{Rung: -1, F: f}); err != nil {
@@ -347,17 +356,36 @@ func TestChildBadConfigure(t *testing.T) {
 	}
 }
 
-// TestChildNotConfigureFirst: any message before Configure is fatal.
+// TestChildNotConfigureFirst: any message before Configure is fatal, except
+// Stop and EOF, which end the child cleanly without an Error.
 func TestChildNotConfigureFirst(t *testing.T) {
-	h, errc := startChild(t, run)
-	require.NoError(t, h.send(wire.Stop{}))
+	t.Run("frame is fatal", func(t *testing.T) {
+		h, errc := startChild(t, run)
+		require.NoError(t, h.sendFrames(source(t)[:1]))
 
-	end := h.wait(t, errc)
-	runErr, msgs := end.runErr, end.msgs
-	require.ErrorContains(t, runErr, "wire.Stop")
-	c := collect(msgs)
-	require.Len(t, c.errs, 1)
-	assert.True(t, c.errs[0].Fatal)
+		end := h.wait(t, errc)
+		require.ErrorContains(t, end.runErr, "wire.Frame")
+		requireHello(t, end.msgs, os.Getpid())
+		c := collect(end.msgs)
+		require.Len(t, c.errs, 1)
+		assert.True(t, c.errs[0].Fatal)
+	})
+	clean := map[string]func(h *host) error{
+		"stop": func(h *host) error { return h.send(wire.Stop{}) },
+		"eof":  func(h *host) error { return h.conn.CloseWrite() },
+	}
+	for name, end := range clean {
+		t.Run(name+" is clean", func(t *testing.T) {
+			h, errc := startChild(t, run)
+			require.NoError(t, end(h))
+
+			e := h.wait(t, errc)
+			require.NoError(t, e.runErr)
+			require.ErrorIs(t, e.readErr, io.EOF)
+			requireHello(t, e.msgs, os.Getpid())
+			assert.Len(t, e.msgs, 1, "only Hello, no Error")
+		})
+	}
 }
 
 // TestChildDiscontinuityEOF: a Discontinuity mid-GOP resumes at the next
@@ -464,13 +492,17 @@ func TestChildPipelineError(t *testing.T) {
 // TestMainOverFD3 runs main in a subprocess with the socketpair on fd 3, and
 // checks its exit status.
 func TestMainOverFD3(t *testing.T) {
+	audio := ofKind(source(t), media.KindAudio)[:20]
 	cases := []struct {
 		name string
-		cfg  wire.Configure
+		send []wire.Message
 		code int
+		// clean: the child writes only Hello and at most one stderr line.
+		clean bool
 	}{
-		{"stop", wire.Configure{Audio: &wire.AudioEncode{}}, 0},
-		{"bad configure", wire.Configure{}, 1},
+		{"stop", append(append([]wire.Message{wire.Configure{Audio: &wire.AudioEncode{}}}, frameMsgs(audio)...), wire.Stop{}), 0, false},
+		{"bad configure", []wire.Message{wire.Configure{}}, 1, false},
+		{"stop before configure", []wire.Message{wire.Stop{}}, 0, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -484,11 +516,7 @@ func TestMainOverFD3(t *testing.T) {
 			a.Close()
 			h := newHost(t, fileConn(t, b))
 
-			require.NoError(t, h.send(tc.cfg))
-			if tc.code == 0 {
-				require.NoError(t, h.sendFrames(ofKind(source(t), media.KindAudio)[:20]))
-				require.NoError(t, h.send(wire.Stop{}))
-			}
+			require.NoError(t, h.send(tc.send...))
 			err := cmd.Wait()
 			<-h.done
 			h.mu.Lock()
@@ -503,10 +531,14 @@ func TestMainOverFD3(t *testing.T) {
 			require.ErrorIs(t, h.readErr, io.EOF)
 			requireHello(t, h.msgs, cmd.Process.Pid)
 			c := collect(h.msgs)
-			if tc.code == 0 {
+			switch {
+			case tc.clean:
+				assert.Len(t, h.msgs, 1, "only Hello, no Error")
+				assert.LessOrEqual(t, bytes.Count(stderr.Bytes(), []byte("\n")), 1, "stderr: %s", stderr.String())
+			case tc.code == 0:
 				assert.Empty(t, c.errs)
 				assert.NotEmpty(t, c.frames[-1])
-			} else {
+			default:
 				require.Len(t, c.errs, 1)
 				assert.True(t, c.errs[0].Fatal)
 			}

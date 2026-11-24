@@ -113,6 +113,10 @@ func serve(conn io.ReadWriteCloser, every time.Duration) error {
 	if err != nil {
 		return err
 	}
+	if c == nil {
+		slog.Info("ostranscoder: stopped before configure")
+		return nil
+	}
 	defer c.p.Close()
 
 	wg.Add(1)
@@ -148,15 +152,25 @@ func serve(conn io.ReadWriteCloser, every time.Duration) error {
 	}
 }
 
-// configure reads the Configure message and builds the pipeline. On any
-// failure it writes a fatal Error and returns the failure.
+// configure reads the Configure message and builds the pipeline. Stop or EOF
+// instead of Configure, as when the host is cancelled during start-up,
+// returns a nil child and no error. On any other failure it writes a fatal
+// Error and returns the failure.
 func configure(r *wire.Reader, w *wire.Writer) (*child, error) {
 	m, err := r.Read()
+	if errors.Is(err, io.EOF) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fatal(w, fmt.Errorf("ostranscoder: read configure: %w", err))
 	}
-	cfg, ok := m.(wire.Configure)
-	if !ok {
+	var cfg wire.Configure
+	switch v := m.(type) {
+	case wire.Configure:
+		cfg = v
+	case wire.Stop:
+		return nil, nil
+	default:
 		return nil, fatal(w, fmt.Errorf("ostranscoder: configure: got %T first", m))
 	}
 	rungs := make([]native.Rung, len(cfg.Rungs))
