@@ -557,6 +557,24 @@ func TestNewRejects(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// New takes at most wire.MaxRungs encoded renditions, the most one
+// Configure carries; copied renditions do not count.
+func TestNewEncodedRenditionLimit(t *testing.T) {
+	ladder := func(n int) []Rendition {
+		out := make([]Rendition, 0, 1+n)
+		out = append(out, copySrc)
+		for i := range n {
+			out = append(out, Rendition{Name: "r" + strconv.Itoa(i), Video: Video{Height: 240, BitrateKbps: 300}})
+		}
+		return out
+	}
+	src := hub.New(hub.Options{})
+	_, err := New(src, Options{Binary: "x", Renditions: ladder(wire.MaxRungs)})
+	require.NoError(t, err)
+	_, err = New(src, Options{Binary: "x", Renditions: ladder(wire.MaxRungs + 1)})
+	require.ErrorContains(t, err, "65 encoded renditions, at most 64")
+}
+
 // A copy-only transcoder spawns no child and passes every frame through.
 func TestSupervisorCopyOnly(t *testing.T) {
 	steps := fixtureSteps(t, "h264_aac.ts")

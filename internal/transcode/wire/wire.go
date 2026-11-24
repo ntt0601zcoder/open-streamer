@@ -20,6 +20,9 @@ const Version = 1
 // MaxMessage is the largest envelope, in bytes after the 4-byte length.
 const MaxMessage = 32 << 20
 
+// MaxRungs is the most rungs a Configure carries.
+const MaxRungs = 64
+
 // Errors returned by the Reader and Writer.
 var (
 	// ErrTooLarge means a message exceeds MaxMessage.
@@ -37,7 +40,6 @@ var (
 // Limits that keep a hostile peer from forcing large allocations.
 const (
 	maxConfigs   = 1 << 16 // distinct configs one Writer or Reader tracks
-	maxRungs     = 64
 	maxNALs      = 1 << 16
 	maxParamSets = 256
 	maxStatsLen  = 64
@@ -274,8 +276,8 @@ func int32s(name string, vs ...int) error {
 // 4 bframes (sint64), 5 preset (string).
 // AudioEncode: 1 bitrate_kbps, 2 sample_rate, 3 channels (varint).
 func appendConfigure(dst []byte, c Configure) ([]byte, error) {
-	if len(c.Rungs) > maxRungs {
-		return nil, limit("%d rungs, at most %d", len(c.Rungs), maxRungs)
+	if len(c.Rungs) > MaxRungs {
+		return nil, limit("%d rungs, at most %d", len(c.Rungs), MaxRungs)
 	}
 	for _, r := range c.Rungs {
 		if err := nonNeg("rung", r.Height, r.BitrateKbps, r.MaxBitrateKbps); err != nil {
@@ -593,8 +595,8 @@ func decodeConfigure(b []byte) (Message, error) {
 	err := fields(b, func(f field) error {
 		switch f.num {
 		case 1:
-			if len(c.Rungs) >= maxRungs {
-				return bad("more than %d rungs", maxRungs)
+			if len(c.Rungs) >= MaxRungs {
+				return bad("more than %d rungs", MaxRungs)
 			}
 			raw, err := f.bytes()
 			if err != nil {

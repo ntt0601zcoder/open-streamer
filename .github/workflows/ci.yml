@@ -72,16 +72,13 @@ jobs:
           done
       - name: go vet -tags libav
         run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go vet -tags libav $OSTX_PKGS
-      # The lint and govulncheck jobs build without the tag, so they never
-      # see the libav packages: lint them here with the lint job's version,
-      # and scan the tagged build with the govulncheck job's version.
+      # The lint job builds without the tag, so it never sees the libav
+      # packages: lint them here with the lint job's version.
       - name: golangci-lint --build-tags libav
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.14.0
           args: --build-tags libav ${{ env.OSTX_PKGS }}
-      - name: govulncheck -tags libav
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -tags libav ./...
       - name: go test -race -tags libav
         run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go test -race -count=1 -tags libav $OSTX_PKGS
       - name: Bundle ostranscoder
@@ -488,6 +485,30 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  # govulncheck on the libav-tagged build, which the govulncheck job (no
+  # tag) never sees. The pinned FFmpeg and pkg-config let the cgo packages
+  # type-check. Ruling R-F1: no job depends on this one, so a newly
+  # published vulnerability cannot hold back the bundle or the tests.
+  govulncheck-libav:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The EC2 regional mirror is dropped as in the test job.
+      - name: Install pkg-config
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config
+      - name: Fetch the pinned FFmpeg 8.1
+        run: |
+          prefix=$(sh scripts/ffmpeg-dev.sh amd64)
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -tags libav ./...
 
   lint:
     name: golangci-lint

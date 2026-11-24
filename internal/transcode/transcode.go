@@ -242,6 +242,7 @@ type Transcoder struct {
 }
 
 // New validates opt and returns a Transcoder whose rendition hubs are open.
+// At most wire.MaxRungs renditions may be encoded.
 func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 	if src == nil {
 		return nil, errors.New("transcode: new: no source hub")
@@ -282,6 +283,10 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 			return nil, fmt.Errorf("transcode: new: audio: bitrate %d, rate %d, channels %d", a.BitrateKbps, a.SampleRate, a.Channels)
 		}
 		t.configure.Audio = &wire.AudioEncode{BitrateKbps: a.BitrateKbps, SampleRate: a.SampleRate, Channels: a.Channels}
+	}
+	if n := len(t.encodeIdx); n > wire.MaxRungs {
+		// The child's Configure could not carry them: it would never start.
+		return nil, fmt.Errorf("transcode: new: %d encoded renditions, at most %d", n, wire.MaxRungs)
 	}
 	t.childVideo = len(t.encodeIdx) > 0
 	t.needChild = t.childVideo || !opt.Audio.Copy
