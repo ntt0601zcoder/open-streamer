@@ -2,6 +2,7 @@ package testpeer
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -145,4 +146,38 @@ func TestRequireMuxer(t *testing.T) {
 			assert.Equal(t, tt.wantFail, rec.failed)
 		})
 	}
+}
+
+func TestParseFFmpegMajor(t *testing.T) {
+	for line, want := range map[string]int{
+		"ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers": 6,
+		"ffmpeg version 8.0.1-3ubuntu2 Copyright (c) 2000-2025 the FFmpeg developers": 8,
+		"ffprobe version n7.1 Copyright (c) 2007-2024 the FFmpeg developers":          7,
+		"ffmpeg version 7.0.2-static https://johnvansickle.com/ffmpeg/":               7,
+		"ffmpeg version 10 Copyright":                                                 10,
+		"ffmpeg version N-118000-g1234567 Copyright":                                  -1,
+		"ffmpeg version 2024-01-01-git-abc":                                           -1,
+		"ffmpeg version":                                                              -1,
+		"version 6.1":                                                                 -1,
+		"":                                                                            -1,
+	} {
+		got, ok := parseFFmpegMajor(line)
+		if want < 0 {
+			assert.False(t, ok, line)
+			continue
+		}
+		assert.True(t, ok, line)
+		assert.Equal(t, want, got, line)
+	}
+}
+
+func TestFFmpegMajor(t *testing.T) {
+	_, ok := FFmpegMajor(t, "false")
+	assert.False(t, ok, "a binary that fails")
+	dir := t.TempDir()
+	bin := dir + "/fakeffmpeg"
+	assert.NoError(t, os.WriteFile(bin, []byte("#!/bin/sh\necho 'ffmpeg version 6.1.1-3ubuntu5 Copyright'\necho second\n"), 0o755))
+	got, ok := FFmpegMajor(t, bin)
+	assert.True(t, ok)
+	assert.Equal(t, 6, got)
 }

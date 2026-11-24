@@ -432,3 +432,35 @@ func imageLacks(t testing.TB, img string, elements []string) string {
 	}
 	return ""
 }
+
+// FFmpegMajor returns the major version that binary (ffmpeg or ffprobe)
+// prints first for -version, as in "ffmpeg version 6.1.1-3ubuntu5" or
+// "ffmpeg version n7.1"; ok is false when it cannot be run or names no
+// release, as a git build's "N-12345-g…" does.
+func FFmpegMajor(t testing.TB, binary string) (major int, ok bool) {
+	t.Helper()
+	out, err := exec.CommandContext(t.Context(), binary, "-version").Output() //nolint:gosec // test peers
+	if err != nil {
+		return 0, false
+	}
+	line, _, _ := strings.Cut(string(out), "\n")
+	return parseFFmpegMajor(line)
+}
+
+// parseFFmpegMajor parses the major version of an ffmpeg -version line.
+func parseFFmpegMajor(line string) (int, bool) {
+	f := strings.Fields(line)
+	if len(f) < 3 || f[1] != "version" {
+		return 0, false
+	}
+	v := strings.TrimPrefix(f[2], "n")
+	end := strings.IndexFunc(v, func(r rune) bool { return r < '0' || r > '9' })
+	if end == 0 || end > 0 && v[end] != '.' {
+		return 0, false
+	}
+	if end > 0 {
+		v = v[:end]
+	}
+	major, err := strconv.Atoi(v)
+	return major, err == nil
+}

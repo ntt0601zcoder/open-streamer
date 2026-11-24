@@ -1132,6 +1132,11 @@ func largestGap(lines []framecrcLine, s int) (gap, from, to float64, n int) {
 	return gap, from, to, len(at)
 }
 
+// acrossGapFFmpeg is the oldest ffmpeg major that TestHLSFFmpegAcrossGap
+// was proven with: 8 resumes a rendition after segments it fails to load,
+// 6.1 does not, and 7 is untried.
+const acrossGapFFmpeg = 8
+
 // TestHLSFFmpegAcrossGap has ffmpeg read the HLS fMP4 master of a live
 // stream across a video-only stretch (gapSource: 12 s of A/V, 6 s of video
 // only, 12 s of A/V), from its first listed segment until EXT-X-ENDLIST,
@@ -1139,9 +1144,21 @@ func largestGap(lines []framecrcLine, s int) (gap, from, to float64, n int) {
 // before the stretch and after it, with the stretch as its only hole, and
 // video throughout. Its warnings (the gap entries it may try to load) are
 // recorded.
+//
+// It needs ffmpeg 8 (acrossGapFFmpeg) and is skipped on an older one:
+// ffmpeg 6.1 (Ubuntu 24.04's) loads gap entries' URIs, which fail, and its
+// HLS demuxer then reads no more of that rendition, so the audio ends at
+// the stretch. It does the same with a VOD playlist and segments written
+// by its own hls muxer, three audio segments missing and no EXT-X-GAP or
+// EXT-X-DISCONTINUITY (259 of 863 audio frames, none after the first
+// missing one), where ffmpeg 8 resumes after the hole.
 func TestHLSFFmpegAcrossGap(t *testing.T) {
 	t.Parallel()
 	ffmpeg := testpeer.Require(t, "ffmpeg")
+	if major, ok := testpeer.FFmpegMajor(t, ffmpeg); ok && major < acrossGapFFmpeg {
+		t.Skipf("ffmpeg %d: its HLS demuxer stops a rendition at the first segment it fails to load "+
+			"(a gap entry), also on its own hls muxer's output; the row needs ffmpeg %d", major, acrossGapFFmpeg)
+	}
 	r, p, origin := gapSource(t, ffmpeg, 2)
 	waitListed(t, p, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), runLimit)
