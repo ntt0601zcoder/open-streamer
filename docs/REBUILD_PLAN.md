@@ -37,6 +37,7 @@ of the five can exist.
 | Outputs | HLS (fMP4 and TS), DASH (fMP4), HTTP-TS, SRT, RTMP play, RTSP play, RTMP push-out |
 | Control | Declarative stream specs in a file store, REST API, per-stream supervisor, input failover by priority |
 | Operations | Prometheus metrics, `slog` JSON logs, pprof, conformance CLI |
+| Platforms | The server is pure Go and builds for any OS. The transcoder runs on Linux amd64 and arm64 with glibc 2.39 or later (Ubuntu 24.04+, Debian 13+); `internal/transcode` returns `errors.ErrUnsupported` on non-Unix systems. Encoding is software (libx264), with NVIDIA NVENC in M4c. macOS, Windows, VAAPI, QSV and VideoToolbox are out of v2.0 (ruling R-M4d) |
 | Later in v2.0 (M6) | DVR and timeshift, RTMP auto-publish by template, templates, playback sessions and tokens, webhooks |
 
 **Dropped:** `mixer://` (audio from another stream; revisit as a transcoder
@@ -231,16 +232,88 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 ### 3.5 Transcoder
 
 - One subprocess per stream (`cmd/ostranscoder`, cgo, go-astiav), so a libav
-  crash cannot take down the server.
+  crash cannot take down the server. cgo and libav are needed only by
+  `internal/transcode/native` and `cmd/ostranscoder`, behind the build tag
+  `libav`; without the tag everything else builds, vets and tests with no
+  libav, and `ostranscoder` is a stub that exits 2.
 - Frames go in and come out over a Unix socketpair passed as fd 3, as
-  length-prefixed protobuf messages. There is no gRPC server, no socket path and
-  no TS re-mux.
-- Output PTS are the input frame's PTS, carried through the encoder. Output
-  DTS come from the encoder (which reorders when B-frames are on) and are
-  checked against the same conformance rules. Epochs pass through unchanged.
-- A respawn opens a new epoch on every rendition hub. Rendition epoch numbers
-  must never collide (M4): for example, a respawn epoch is the largest epoch
-  seen + 1, and later upstream epochs are remapped above it.
+  length-prefixed protobuf messages (`internal/transcode/wire`, hand-coded with
+  `protowire`: no code generation, no gRPC server, no socket path, no TS
+  re-mux). Each record is a 4-byte length and one envelope that holds exactly
+  one message: Hello, Configure, Frame, Discontinuity, Stats, Error or Stop.
+  Configure, sent once, carries the ladder. Each `TrackConfig` travels once, by
+  ID, in the first Frame that uses it, and later Frames refer to the ID.
+  `Stats` carries the
+  counters `In`, `Out`, `EncodeNanos`, `DroppedTracks`, `Reanchors`,
+  `AudioDropped`, `AudioCorrupt` and `VideoCorrupt` (ruling R-T6a). The host
+  rejects a child whose Hello version differs.
+- **Time.** The host adds the rendition delay D = 45000 ticks (0.5 s, ruling
+  R-M4c) to every frame and anchor of every rendition, copy tracks included,
+  so renditions stay aligned with each other. D covers the encoder's reorder
+  delay (B-frames up to 3 at 8 fps or more), so encoder DTS is never negative,
+  also for sources without B-frames; `New` rejects more than 3 B-frames, and a
+  source below about 8 fps should use none. Output PTS are the input frame's
+  PTS, carried through the encoder. Output DTS come from the encoder and are
+  checked against the same conformance rules. Audio is re-anchored to the
+  input's PTS when it jumps forward by more than one frame, and input that
+  runs behind the prediction is dropped and counted, never re-anchored
+  backwards.
+- **IDRs at source keyframes.** Every rung encodes an IDR at exactly the PTS of
+  every source keyframe (matched by PTS, since the decoder's key flag misses
+  H.264 recovery points), so all rungs and the source segment identically.
+  libx264 runs with `scenecut=0:keyint=600:min-keyint=1:rc-lookahead=10:b-pyramid=none`;
+  `b-pyramid=none` is ruling R-T7b' (VLC 3 logged "buffer deadlock prevented"
+  on pyramid rungs; 0 of 8 runs after, against 3 of 8).
+- **Rendition epochs.** Rendition epoch numbers never collide. The host maps
+  each upstream epoch e to e + offset, and a *bump* opens a new rendition
+  epoch numbered (largest issued) + 1 and raises the offset. A respawn and the
+  loss of the source subscription (`Lost`) cause bumps. A bump takes effect at
+  K: the next source video keyframe, or the next frame when the upstream epoch
+  has no live video; for a respawn, the first keyframe after the new child's
+  Hello. K must lie above every PTS already sent in the old epoch, otherwise
+  the next keyframe that does is K. While a bump is pending, audio is held for
+  at most 1 s; at K, held audio below K is dropped and counted, and the rest
+  joins the new epoch. Bumps requested while one is pending coalesce, and one
+  anchor per rendition epoch is registered on every rendition hub before its
+  first frame. The host keeps one source subscription across respawns, and the
+  child passes epochs through. Child-bound audio is sent only when the child
+  queue has room, otherwise it is dropped and counted (ruling R-T5a).
+- **DTS merger.** Each rendition hub is written by a merger that merges the
+  child's output with the copied tracks of the same rendition into one
+  non-decreasing DTS order, holding up to `MergeHold` (2 s) of stream time for
+  a quiet track, so a rendition mixing copied video with encoded audio stays
+  aligned.
+- **Passthrough** (`name=label:copy`) needs no child: copy tracks go from the
+  host's subscription to the rendition's merger directly, and a stream whose
+  renditions all copy never starts a child.
+- **Child supervision.** The host feeds a child that has not said Hello yet
+  from a backlog of up to 1500 frames, the hub's GOP cache (ruling R-T5c), so
+  joining a live hub with a long GOP costs no epoch; only an overflow bumps.
+  `HelloTimeout` (10 s) kills a child that never says Hello. A send to a live
+  child that blocks for `InputStallTimeout` (10 s) kills it with the cause
+  "input stalled", where progress is the child's own report (`Stats.In`
+  rising, or any Frame output), not completed host writes (rulings R-T5d and
+  R-T5e). A dead child is respawned with backoff; a missing binary or a version
+  mismatch ends `Run` with an error.
+- **Decoder errors.** Corrupt input frames, audio and video, are skipped and
+  counted (`AudioCorrupt`, `VideoCorrupt`); a decoder fails the pipeline only
+  after 50 consecutive corrupt frames (ruling R-T4b). Encoder errors stay
+  fatal.
+- **Only the lowest-numbered video track** is encoded and copied; other video
+  tracks are dropped, logged once and counted. Every audio track is encoded
+  (AAC, native `aac` encoder) or copied.
+- **Build.** FFmpeg 8.1.3 shared, GPL, comes from a pinned FFmpeg-Builds
+  release instead of a compiled builder image (ruling R-M4b): release
+  `autobuild-2026-10-31-12-59`, archives
+  `ffmpeg-n8.1.3-27-g8dca1586f4-linux64-gpl-shared-8.1.tar.xz` (sha256
+  `202fe67679a0860b155817a0907ffcc5c1ea82e186acaa21cb87d307f54fd59a`) and
+  `ffmpeg-n8.1.3-27-g8dca1586f4-linuxarm64-gpl-shared-8.1.tar.xz` (sha256
+  `9d3161962e57f0f621b87c1fe4287ad14b4fd12c74c243436143319e4e14a0a0`).
+  `scripts/ffmpeg-dev.sh` verifies the sha256 before unpacking and checks that
+  libavcodec is 62.x. The release ships no libfdk-aac, so audio uses the
+  native encoder. `scripts/bundle-ostranscoder.sh` builds `ostranscoder` with
+  an `$ORIGIN/lib` rpath into `dist/ostranscoder-<arch>/`, with the libav
+  libraries and FFmpeg's license files.
 
 ### 3.6 Control plane
 
@@ -271,8 +344,8 @@ never as dependencies.
 | H.264, H.265, AAC parsing (SPS, PPS, VPS, ASC, ADTS); fMP4 boxes | `Eyevinn/mp4ff` |
 | RTP packets; SDP | `pion/rtp`, `pion/sdp/v3`; used from M2c by `pkg/rtsp` (`pion/rtp` parses and marshals RTP everywhere; its payloaders only in tests and `rtsptest`: the H.264, H.265 and AAC packetisers of the RTSP output are our own in `pkg/rtsp`, M3b2) |
 | SRT | `datarhei/gosrt` (approved: a standalone library repository); used from M2a by the SRT caller and listener inputs |
-| Transcoding | `asticode/go-astiav` |
-| Transcoder protocol messages | `google.golang.org/protobuf` (M4) |
+| Transcoding | `asticode/go-astiav` v0.41.0 on FFmpeg 8.1.3 shared (libavcodec 62), from FFmpeg-Builds (§3.5); cgo, behind the build tag `libav` (M4a) |
+| Transcoder protocol messages | `google.golang.org/protobuf`, `encoding/protowire` only: no codegen and no protoc (M4a) |
 | HTTP | `go-chi/chi/v5` |
 
 Our own libraries:
@@ -299,7 +372,7 @@ Dropped from v1: `bluenviron/*`, `q191201771/lal`, `yapingcat/gomedia`,
 
 ```
 cmd/openstreamer/      server
-cmd/ostranscoder/      transcoder subprocess (cgo)
+cmd/ostranscoder/      transcoder subprocess (cgo, tag libav)
 cmd/osconform/         conformance CLI: reads an output URL and runs the checks
 internal/media/        Frame, TrackConfig, codecs, timebase
 internal/clock/        Clock
@@ -317,11 +390,15 @@ internal/output/...    one package per output protocol (rtmpplay: RTMP players;
                        rtmppush: RTMP push-out; rtspplay: RTSP players;
                        srtout: SRT receivers; tsstream: the MPEG-TS streaming
                        loop shared by httpts and srtout)
-internal/transcode/    subprocess supervisor and protocol
+internal/transcode/    host side of the transcoder: supervisor, epoch map, DTS merger
+  wire/                length-prefixed protobuf protocol, shared with the child
+  native/              the libav pipeline (cgo, tag libav): decode once, encode N rungs
+  transcodetest/       fake child and fixtures for host tests
 internal/stream/       supervisor and failover
 internal/store/        spec storage
 internal/api/          REST API
 pkg/...                our own reusable libraries (§3.7); no imports from internal/
+scripts/               FFmpeg-Builds fetch, transcoder bundle, CI-peer test runner
 testdata/fixtures/     generated clips and the script that makes them
 ```
 
@@ -335,7 +412,9 @@ before the code they check.
 | M1 | Media core: Frame, TS demuxer, Clock, hub, frame checks, fixtures | – | Every fixture goes demux → Clock → hub with no check violation, including the PTS-wrap and looped-source fixtures |
 | M2 (done) | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change remaps the demuxer's tracks as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
 | M3 (done) | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg and VLC-class clients play every output, and MediaMTX pulls every output it can take as a source (DASH and HTTP-TS are not MediaMTX sources; see Out of M3b3); for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it. Proved by `TestM3Matrix` (every output under the four scenarios), `TestM3VLCClass` and `TestM3GStreamerClass` (VLC-class clients), `TestM3b3MediaMTXPull`, `TestM3b3SRTFFmpeg`, `TestHLSFFmpegAcrossGap` and `TestM3b3HLSAlignment`, with the M3a, M3b1 and M3b2 scenarios for the cells they cover |
-| M4 | Transcoder, watermark, thumbnails | M1, M3 | In CI (no GPU, builder image restored): a 3-rung software ladder and passthrough pass M3's scenarios. On the GPU host: the same with 3 NVENC rungs, run by a make target and recorded in the PR; a killed subprocess comes back as one new epoch; the watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
+| M4a ([plan](superpowers/plans/2026-11-24-m4a-transcoder-core.md), done) | Transcoder core: the segmenter fix that cuts audio at the video keyframe's PTS, `internal/transcode` (host, wire protocol, native libav pipeline, `cmd/ostranscoder`), a software H.264 ladder with AAC re-encode or copy, per-track passthrough, respawn, CI on Linux amd64 and arm64. Each rendition is served as its own stream, `<name>_<label>` | M1, M3 | A 3-rung software ladder plus a copied rendition passes M3's scenarios per rendition; the rungs' keyframes and segments align with the source's; a killed subprocess comes back as exactly one new epoch per rendition; the same on arm64 in CI. Proved by `TestM4aMatrix` (every rendition under steady-state, epoch-change, slow-consumer, no-B-frames and B-frames, plus SRT and RTSP on `t180`), `TestM4aKeyframesAligned`, `TestM4aRespawn`, `TestM4aVLC`, `TestSupervisorRealChild`, the native and supervisor suites (`internal/transcode/...`), and the `transcode-e2e-arm64` CI job |
+| M4b | ABR outputs: HLS multivariant playlist and DASH representations over the renditions | M4a | A ladder is served as one ABR presentation that passes M3's scenarios |
+| M4c | NVENC on the GPU host; watermark; thumbnails | M4a | On the GPU host (this machine, a GTX 1650): the same ladder with 3 NVENC rungs, run by a make target and recorded in the PR. The watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5 | Feature tests; DVR playback passes `osconform` |
 | M7 | Cutover | M1–M6 | The [soak plan](SOAK_TEST_PLAN.md) runs for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
@@ -451,6 +530,24 @@ Out of M3b3:
 | Play authentication and tokens | M6 sessions and tokens, as for the other outputs |
 | VLC-class playback across a video-only stretch | VLC 3 and GStreamer fail on it; see the Backlog's silent AAC placeholder and VLC 3 discontinuity items |
 | MediaMTX pulls of DASH and HTTP-TS | They are not MediaMTX sources; ffmpeg and the VLC-class clients cover them |
+
+M4a's rulings are in its plan (R-M4a to R-M4d, and R-T1c to R-T7b' made while
+it ran); the design is §3.5. The VLC-class check runs on `t180`'s HLS TS
+(`TestM4aVLC`, with ruling R-T1c's start-up tolerance). The arm64 job runs
+only ffprobe as a peer, so the VLC, SRT and RTSP rows are amd64-only.
+
+Out of M4a:
+
+| Item | Reason |
+|---|---|
+| HLS multivariant and DASH representations | M4b; M4a proves each rendition as its own stream |
+| NVENC, watermark, thumbnails | M4c |
+| macOS, Windows, VAAPI, QSV, VideoToolbox | Out of v2.0 (R-M4d) |
+| libfdk-aac | FFmpeg-Builds ships none (R-M4b); the native `aac` encoder is used |
+| Video encoders other than libx264 | Rungs are H.264 software; NVENC is M4c |
+| More than one encoded video track | Only the lowest-numbered video track is encoded or copied; the others are dropped and counted |
+| More than 3 B-frames, and B-frames below about 8 fps | Beyond what D covers (R-M4c); use none |
+| Merger audio on a long copy-video burst, and a new epoch's expected tracks | Backlog |
 
 M2 is split in three parts:
 
@@ -569,7 +666,8 @@ Items accepted for later, not yet placed in a milestone:
   HLS fMP4 it appears in about 20 % of runs whether or not segments are
   aligned (30-run R-F3 A/B: 7/30 before, 6/30 after). DASH was not part of
   that A/B; with R-F3 it appeared in 2 of 3 runs. `TestM3VLCClass` tolerates
-  it on both rows (ruling R-T1c). Next: investigate VLC's fMP4/DASH clock
+  it on the `hls-fmp4`, `hls-ts` and `dash` rows, and `TestM4aVLC` on HLS TS
+  (rulings R-T1c and R-T7a'). Next: investigate VLC's fMP4/DASH clock
   start, and measure DASH as HLS fMP4 was. Normal priority.
 - **VLC 3 HLS-TS: R-F3 adds one deterministic clock reset at live start** (in
   `TestM3VLCClass` it lands on the loop seam of the 4× concatenated source,
@@ -577,6 +675,20 @@ Items accepted for later, not yet placed in a milestone:
   Measure with a seamless source. If the reset is real, start each TS
   segment's audio at or before the keyframe PTS (a TS-only layout; CMAF keeps
   R-F3's cut). Normal priority.
+- **Transcoder merger drops child audio on a long copy-video burst**
+  (`internal/transcode/merge.go`, found in M4a Task 7). When more than 2 s of
+  copied video arrives in one burst before an epoch boundary, as when an
+  unpaced failover flushes, the stream-time hold runs out at once, the hub
+  moves to the next epoch, and the old epoch's late child audio is dropped
+  (`MergeDropped`): 220 audio frames on `src` for unpaced
+  `h264_aac_then_640.ts`. Live paced sources are not affected. Fix: hold on
+  arrival time as well, or flush the copy side in step with the child.
+- **Transcoder merger: seed a new epoch's expected tracks with the rung's
+  video.** After a respawn, the new child's audio reaches an encoded
+  rendition's hub about 1.2 s (the x264 delay) before its first IDR. The
+  packager copes, but direct outputs (HTTP-TS, SRT, RTSP, RTMP) get that
+  audio before any video. With the fix, add an HTTP-TS read to
+  `TestM4aRespawn`.
 - **DASH MPD stays `type="dynamic"` after the stream ends** (pre-existing;
   M3a). Players keep polling an MPD that will not change.
 - **VLC 3 stops at any fMP4 HLS discontinuity**, not only at gaps: every
@@ -609,7 +721,9 @@ Items accepted for later, not yet placed in a milestone:
   arm fix; `stepTo` (failback_test.go) syncs with `Run` only by waiting for
   the readers and a 50 µs sleep, so `Run` can fall behind the fake clock. Fix:
   a handshake that `Run` is idle after each step (13 call sites); raise if CI
-  hits it.
+  hits it. M4a runs added three that failed once under full parallel load and
+  passed alone: `TestM2bFailoverRTMPtoSRT`, `TestM3b1SharedPort` ("connection
+  starts at hub video frame 274") and rtspplay's tests.
 
 #### M3b3 deferred minors
 
@@ -633,6 +747,31 @@ Items accepted for later, not yet placed in a milestone:
 - `store.learn` keeps a nil `Init` when a track's first part in an epoch had
   none, so the gap's `EXT-X-MAP` gets 404 (only if `fmp4.Init` fails).
 
+#### M4a deferred minors
+
+- wire: the writer does not enforce the limits the reader does; an empty-body
+  Discontinuity or Stop is not rejected; unknown fixed32 and fixed64 fields
+  count as malformed rather than skipped.
+- ostranscoder main: a dead nil branch after `os.NewFile(3)`;
+  `TestMainOverFD3` waits on the child without a bound (kill it after
+  `childTimeout`).
+- Build: add `xz-utils` and `CGO_ENABLED` to the arm64 job's environment; the
+  stub test's `.exe` suffix matters on Windows only;
+  `testpeer.OSTranscoder` should use `Output()`, not `CombinedOutput()`;
+  make the `transcoder-*` CI jobs required checks (a repository setting).
+- native: one skipped AAC frame leaves audio about 21 ms early until the next
+  re-anchor (the threshold is more than one frame; pin it with an assertion
+  or use at least one); `isCorruptData` could exclude `EINVAL` and
+  `AVERROR_BUG`.
+- supervisor: `New` should reject an `InputStallTimeout` below 2 s; add a
+  `SlowChildNotKilled` subtest with the child's output muted, to isolate the
+  Stats path; start-up catch-up can exceed `MergeHold` (consistent with the
+  rule).
+- segmenter: no tests pin the audio-only restriction of `toHeld`, `waitsFor`
+  and `place` (a lagging second video track: no hold, `Late()` 0), nor the
+  promote cut with nothing moved (the `carry` case); a non-anchor video track
+  is now carried at a non-key promote (harmless).
+
 ### Carried from M1
 
 The M2 items are done in M2a.
@@ -651,7 +790,6 @@ The M2 items are done in M2a.
   tests.
 - **M2, Clock (done):** a track that joins an epoch after its `AlignWindow`
   release opens a late-join epoch (§3.2).
-- **M4, transcoder:** rendition epoch numbers never collide (§3.5).
 
 ### Conformance checks
 

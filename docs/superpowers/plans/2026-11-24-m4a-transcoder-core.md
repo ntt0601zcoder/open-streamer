@@ -180,7 +180,7 @@ Within a wave, merge in task-number order. After each wave, the controller runs 
 
 **Files:**
 - Modify: `internal/segment/segmenter.go` and `segmenter_test.go`.
-- Modify: `internal/e2e/vlc_test.go` (remove the R-T7e tolerance).
+- Modify: `internal/e2e/vlc_test.go` (replace the R-T7e matcher by ruling R-T1c's start-up tolerance).
 - Modify: `docs/REBUILD_PLAN.md` (§3.4 and Backlog).
 
 **Interfaces:**
@@ -220,9 +220,9 @@ Within a wave, merge in task-number order. After each wave, the controller runs 
 - [ ] **Step 3:** Implement the rule.
 - [ ] **Step 4:** Run `go test -race ./internal/segment/ ./internal/output/... ./internal/e2e/`. Expected: PASS.
   - Expectations that the rule itself changes may be updated, for example tighter per-track EXTINF. List each one in the report.
-- [ ] **Step 5:** Delete the R-T7e matcher and its cases. Then run `make test-ci-peers ARGS='-race -count=1 -run ^TestM3VLCClass$ ./internal/e2e/'` 3 times. Expected: PASS.
+- [ ] **Step 5:** Replace the R-T7e matcher by the start-up tolerance of ruling R-T1c (the segmenter rule is amended by R-T1d). Then run `make test-ci-peers ARGS='-race -count=1 -run ^TestM3VLCClass$ ./internal/e2e/'` 3 times. Expected: PASS.
   - If the "no reference clock" pair still appears, stop and report NEEDS_CONTEXT with the log.
-- [ ] **Step 6:** Update §3.4 Segmenter with one sentence on the rule. Delete the R-F3 Backlog item and every R-T7e mention.
+- [ ] **Step 6:** Update §3.4 Segmenter with one sentence on the rule. Rewrite the R-F3 Backlog item to the VLC start-up items of R-T1c.
 - [ ] **Step 7:** Commit: `fix(segment): cut audio at the video keyframe's PTS`.
 
 ---
