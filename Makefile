@@ -33,9 +33,10 @@ fixtures:
 # throwaway container of testdata/peers/Dockerfile.ci (CI's Ubuntu 24.04
 # peers: ffmpeg 6.1, VLC 3, GStreamer 1.24). See scripts/test-ci-peers.sh;
 # ARGS takes go test flags and packages, split on spaces and passed as
-# written: $(value ARGS) keeps make from expanding the $ of a pattern such
-# as -run '^TestX$' (it read "$ " as a variable and swallowed the package
-# after it), and the shell neither globs nor interprets | or ; in it.
+# written: $(value ARGS) keeps make from expanding the $ of a pattern (it
+# read "$ " as a variable and swallowed the package after it), and the
+# shell neither globs nor interprets | or ; in it. Quotes are not removed,
+# so write no inner quotes: ARGS='-run ^TestX$ ./pkg/rtsp/'.
 test-ci-peers: export TEST_CI_PEERS_ARGS := $(value ARGS)
 test-ci-peers:
 	@set -f; sh scripts/test-ci-peers.sh $$TEST_CI_PEERS_ARGS

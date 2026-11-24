@@ -229,6 +229,9 @@ func (c *Client) readSocket(t *clientTrack, conn *net.UDPConn, rtcp bool) {
 				return
 			}
 			idle = time.Now().Add(udpDrainIdle)
+			if idle.After(until) {
+				idle = until
+			}
 			_ = conn.SetReadDeadline(idle)
 		}
 		n, from, err := conn.ReadFromUDP(buf)
