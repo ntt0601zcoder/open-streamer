@@ -483,8 +483,11 @@ func assertTSMatchesHub(t *testing.T, hubFrames, got []media.Frame) {
 // tsResumes checks the frames of a TS reader that read to the hub's end but
 // lost frames on the way: every frame is a hub frame (by PTS, one offset
 // over the stream, tsOffset), with the hub frame's DTS and key flag; the
-// first video frame and the first after every gap are keyframes. It returns
-// the number of gaps.
+// first video frame and the first after every gap are keyframes. The
+// reader's last video frame lies in the hub's last GOP or the one before
+// it: a loss there leaves no keyframe to resume at, so the tail can be
+// missing, but a reader cut off earlier fails. It returns the number of
+// gaps.
 func tsResumes(t *testing.T, hubFrames, got []media.Frame) (gaps int) {
 	t.Helper()
 	hv, _ := byKind(hubFrames, media.KindVideo)
@@ -511,6 +514,16 @@ func tsResumes(t *testing.T, hubFrames, got []media.Frame) (gaps int) {
 		}
 		prev = j
 	}
+	var keys []int
+	for i, f := range hv {
+		if f.Key {
+			keys = append(keys, i)
+		}
+	}
+	tail := keys[max(0, len(keys)-2)]
+	require.GreaterOrEqual(t, prev, tail,
+		"the reader's last video frame (hub video %d of %d) is in the hub's last two GOPs (from hub video %d)",
+		prev, len(hv), tail)
 	ha, _ := byKind(hubFrames, media.KindAudio)
 	pts := map[int64]bool{}
 	for _, f := range ha {
@@ -528,7 +541,14 @@ func tsResumes(t *testing.T, hubFrames, got []media.Frame) (gaps int) {
 // (a keyframe), is a hub frame with the same DTS and key flag. The reader's
 // last frame is not aligned with the hub's, because a loss in the hub's
 // last GOP leaves no keyframe to resume at and the reader's tail is
-// missing. at maps each hub video PTS to its index in hv.
+// missing; tsResumes bounds it. at maps each hub video PTS to its index in
+// hv.
+//
+// It assumes that no run of the hub's GOPs repeats the reader's frames
+// under another offset. A stream that loops a clip comes close: two
+// offsets fit only when the reader got nothing from the last loop's span,
+// and then the test fails. The assumption can cause a false failure, never
+// a false pass.
 func tsOffset(t *testing.T, hv, gv []media.Frame, at map[int64]int) int64 {
 	t.Helper()
 	var offs []int64
@@ -549,7 +569,7 @@ func tsOffset(t *testing.T, hv, gv []media.Frame, at map[int64]int) int64 {
 			offs = append(offs, off)
 		}
 	}
-	require.Len(t, offs, 1, "one hub keyframe aligns every video frame the reader got")
+	require.Len(t, offs, 1, "one hub keyframe aligns every video frame the reader got; offsets %v", offs)
 	return offs[0]
 }
 

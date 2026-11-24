@@ -208,7 +208,7 @@ jobs:
             fi
           done
       - name: go test -race (real child, arm64)
-        run: go test -race -count=1 -timeout=10m -run 'TestM4aMatrix|TestM4aKeyframesAligned|TestM4aRespawn|TestSupervisorRealChild' $E2E_PKGS
+        run: go test -race -count=1 -timeout=10m -run "^($(echo $E2E_TESTS | tr ' ' '|'))\$" $E2E_PKGS
 
   test:
     needs: transcoder-amd64
