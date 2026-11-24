@@ -22,6 +22,8 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
+	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
@@ -791,4 +793,143 @@ func TestOsdevSRTPlay(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "connection rejected")
 	assert.Equal(t, 0, stop())
+}
+
+func TestOsdevLadderFlags(t *testing.T) {
+	cfg, code := parseArgs([]string{
+		"-stream", "a=" + fixture, "-stream", "b=" + fixture, "-ostranscoder", "/bin/true",
+		"-rung", "a=t240:240:600", "-rung", "a=src:copy", "-rung", "b=low:120:150",
+		"-audio", "a=aac:96", "-audio", "b=copy",
+		"-rtmp-push", "a_t240=rtmp://127.0.0.1:19352/live/key",
+	}, io.Discard)
+	require.NotNil(t, cfg, code)
+	require.Len(t, cfg.transcoders, 2)
+	assert.Equal(t, "a", cfg.transcoders[0].stream)
+	assert.Equal(t, "b", cfg.transcoders[1].stream)
+	names := make([]string, 0, len(cfg.renditions))
+	for _, s := range cfg.renditions {
+		names = append(names, s.name)
+		assert.NotNil(t, s.hub)
+		assert.NotNil(t, s.pack)
+	}
+	assert.Equal(t, []string{"a_t240", "a_src", "b_low"}, names)
+	assert.Same(t, cfg.transcoders[0].tr.Hubs()[0], cfg.renditions[0].hub)
+	require.Len(t, cfg.pushes, 1)
+	assert.Equal(t, "a_t240", cfg.pushes[0].stream, "a rendition can be pushed")
+
+	rung, label, video, err := parseRung("a=t240:240:600")
+	require.NoError(t, err)
+	assert.Equal(t, "a", rung)
+	assert.Equal(t, "t240", label)
+	assert.Equal(t, transcode.Video{Height: 240, BitrateKbps: 600}, video)
+	for v, want := range map[string]transcode.Audio{
+		"a=copy": {Copy: true}, "a=aac": {}, "a=aac:96": {BitrateKbps: 96},
+	} {
+		_, a, err := parseAudio(v)
+		require.NoError(t, err, v)
+		assert.Equal(t, want, a, v)
+	}
+
+	copyOnly, code := parseArgs([]string{"-stream", "a=" + fixture, "-rung", "a=src:copy", "-audio", "a=copy"}, io.Discard)
+	require.NotNil(t, copyOnly, code, "copies need no transcoder")
+	assert.Len(t, copyOnly.renditions, 1)
+
+	for name, args := range map[string][]string{
+		"unknown stream":   {"-stream", "a=" + fixture, "-ostranscoder", "/bin/true", "-rung", "b=x:240:600"},
+		"rung of rung":     {"-stream", "a=" + fixture, "-ostranscoder", "/bin/true", "-rung", "a=x:240:600", "-rung", "a_x=y:120:100"},
+		"no equals":        {"-stream", "a=" + fixture, "-rung", "x:240:600"},
+		"bad label":        {"-stream", "a=" + fixture, "-rung", "a=x/y:copy"},
+		"empty label":      {"-stream", "a=" + fixture, "-rung", "a=:copy"},
+		"zero height":      {"-stream", "a=" + fixture, "-ostranscoder", "/bin/true", "-rung", "a=x:0:600"},
+		"bad kbps":         {"-stream", "a=" + fixture, "-ostranscoder", "/bin/true", "-rung", "a=x:240:fast"},
+		"two fields":       {"-stream", "a=" + fixture, "-rung", "a=x:240"},
+		"duplicate label":  {"-stream", "a=" + fixture, "-rung", "a=x:copy", "-rung", "a=x:copy", "-audio", "a=copy"},
+		"name collision":   {"-stream", "a=" + fixture, "-stream", "a_x=" + fixture, "-rung", "a=x:copy", "-audio", "a=copy"},
+		"no transcoder":    {"-stream", "a=" + fixture, "-rung", "a=x:240:600"},
+		"aac no binary":    {"-stream", "a=" + fixture, "-rung", "a=x:copy"},
+		"audio no rung":    {"-stream", "a=" + fixture, "-audio", "a=copy"},
+		"bad audio":        {"-stream", "a=" + fixture, "-rung", "a=x:copy", "-audio", "a=mp3"},
+		"bad audio kbps":   {"-stream", "a=" + fixture, "-rung", "a=x:copy", "-audio", "a=aac:0"},
+		"audio no equals":  {"-stream", "a=" + fixture, "-rung", "a=x:copy", "-audio", "copy"},
+		"audio bad stream": {"-stream", "a=" + fixture, "-rung", "a=x:copy", "-audio", "b=copy"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var errw strings.Builder
+			cfg, code := parseArgs(args, &errw)
+			assert.Nil(t, cfg)
+			assert.Equal(t, 2, code)
+			assert.NotEmpty(t, errw.String())
+		})
+	}
+}
+
+// waitBody waits until the body at u contains want.
+func waitBody(t *testing.T, u, want string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		resp, err := httpGet(u)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode == 200 && strings.Contains(string(b), want)
+	}, 20*time.Second, 50*time.Millisecond, u)
+}
+
+// A ladder of copies runs without the transcoder child: the rendition is
+// served as <name>_<label> and ends with its stream.
+func TestOsdevCopyLadder(t *testing.T) {
+	var errw syncBuilder
+	addr, stop := startOsdev(t, []string{
+		"-stream", "v=../../testdata/fixtures/h264_640.ts", "-rung", "v=src:copy", "-audio", "v=copy",
+	}, &errw)
+	waitBody(t, "http://"+addr+"/live/v_src/hls/index.m3u8", "#EXT-X-ENDLIST")
+	assert.Equal(t, 0, stop())
+	out := errw.String()
+	assert.Contains(t, out, "osdev: stream v: renditions ended with the stream")
+	assert.Contains(t, out, "osdev: stream v: transcoder pid 0, spawns 0, exits 0")
+}
+
+// The real transcoder child encodes a rung, served on HTTP like any stream.
+func TestOsdevLadder(t *testing.T) {
+	bin := testpeer.OSTranscoder(t)
+	var errw syncBuilder
+	pr, pw := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	code := make(chan int, 1)
+	go func() {
+		code <- run(ctx, []string{
+			"-listen", "127.0.0.1:0", "-stream", "demo=" + fixture, "-loop", "-ostranscoder", bin,
+			"-rung", "demo=t180:180:300", "-rung", "demo=src:copy", "-audio", "demo=aac:96",
+		}, pw, &errw)
+		_ = pw.Close()
+	}()
+	sc := bufio.NewScanner(pr)
+	var lines []string
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+		if len(lines) == 13 {
+			break
+		}
+	}
+	go func() { _, _ = io.Copy(io.Discard, pr) }()
+	require.Len(t, lines, 13)
+	addr := strings.TrimPrefix(lines[0], "listening on ")
+	assert.Equal(t, "http://"+addr+"/live/demo_t180/hls/index.m3u8", lines[5])
+	assert.Equal(t, "http://"+addr+"/live/demo_src/stream.ts", lines[12])
+
+	waitBody(t, "http://"+addr+"/live/demo_t180/hls/index.m3u8", ".ts")
+	waitBody(t, "http://"+addr+"/live/demo_src/hls/index.m3u8", ".ts")
+	cancel()
+	select {
+	case c := <-code:
+		assert.Equal(t, 0, c, errw.String())
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return")
+	}
+	out := errw.String()
+	assert.Contains(t, out, "osdev: stream demo: transcoder pid 0, spawns 1, exits 0")
+	assert.NotContains(t, out, "stopped")
 }

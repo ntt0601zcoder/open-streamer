@@ -27,6 +27,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/transcodetest"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/wire"
 )
@@ -911,4 +912,74 @@ func TestSupervisorSlowChildNotKilled(t *testing.T) {
 	assert.Empty(t, s.ev.of(EventExited))
 	assert.EqualValues(t, 1, st.Spawns)
 	s.src.Close()
+}
+
+// The real child (cmd/ostranscoder) behind the supervisor: three encoded
+// rungs and AAC on h264_aac.ts. Every rendition hub conforms, carries the
+// source's video frame count in the source's epoch, and has an IDR at
+// exactly every source keyframe PTS + D, so the rungs stay segment-aligned.
+func TestSupervisorRealChild(t *testing.T) {
+	bin := testpeer.OSTranscoder(t)
+	steps := fixtureSteps(t, "h264_aac.ts")
+	opt := Options{
+		Binary: bin,
+		Renditions: []Rendition{
+			{Name: "t240", Video: Video{Height: 240, BitrateKbps: 600}},
+			{Name: "t180", Video: Video{Height: 180, BitrateKbps: 300}},
+			{Name: "t120", Video: Video{Height: 120, BitrateKbps: 150}},
+		},
+		Audio:  Audio{BitrateKbps: 96},
+		Queue:  2048,
+		Logger: slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	s := start(t, opt)
+	out := s.feed(t, steps, 0)
+
+	var srcVideo []media.Frame
+	for _, f := range shifted(frames(steps)) {
+		if f.Kind() == media.KindVideo {
+			srcVideo = append(srcVideo, f)
+		}
+	}
+	srcKeys := keyPTS(srcVideo)
+	require.NotEmpty(t, srcKeys)
+	heights := []int{240, 180, 120}
+	for i, fs := range out {
+		name := opt.Renditions[i].Name
+		check(t, fs, name)
+		assert.Equal(t, srcEpochs(steps), epochs(fs), name)
+		var video, audio []media.Frame
+		for _, f := range fs {
+			if f.Kind() == media.KindVideo {
+				video = append(video, f)
+			} else {
+				audio = append(audio, f)
+			}
+		}
+		require.Len(t, video, len(srcVideo), name)
+		assert.Equal(t, srcKeys, keyPTS(video), "%s: keyframe PTS = source keyframe PTS + D", name)
+		assert.Equal(t, heights[i], video[0].Config.Height, name)
+		assert.NotEmpty(t, audio, name)
+		t.Logf("%s: %d video (%d keys), %d audio, %dx%d", name, len(video), len(srcKeys), len(audio),
+			video[0].Config.Width, video[0].Config.Height)
+	}
+	st := s.tr.Stats()
+	assert.EqualValues(t, 1, st.Spawns)
+	assert.Zero(t, st.Exits)
+	assert.Zero(t, st.Losses)
+	assert.Zero(t, st.DroppedBeforeKey)
+	assert.Zero(t, st.MergeDropped)
+	assert.Equal(t, ChildStats{}, st.Child)
+}
+
+// keyPTS returns the PTS of the video keyframes, sorted.
+func keyPTS(fs []media.Frame) []int64 {
+	var out []int64
+	for _, f := range fs {
+		if f.Key && f.Kind() == media.KindVideo {
+			out = append(out, f.PTS)
+		}
+	}
+	slices.Sort(out)
+	return out
 }

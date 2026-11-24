@@ -799,19 +799,37 @@ func TestM3Matrix(t *testing.T) {
 				kindCounts(caps[out.name].Frames), len(pkts), len(want), reordered)
 		})
 	}
-	t.Run("http-ts/slow-consumer", testHTTPTSSlowConsumer)
-	t.Run("srt/steady-state", testSRTSteady)
+	t.Run("http-ts/slow-consumer", func(t *testing.T) {
+		testHTTPTSSlowConsumer(t, func(t *testing.T) *m2aRun {
+			t.Helper()
+			clip := loopClip(t, testpeer.Require(t, "ffmpeg"), "h264_aac.ts", 3, 0)
+			return startRun(t, runOptions{inputs: []string{fileURL(clip, "")}})
+		})
+	})
+	t.Run("srt/steady-state", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range srtSteadyClips {
+			t.Run(tc.name, func(t *testing.T) {
+				testSRTSteady(t, func(t *testing.T) *m2aRun {
+					t.Helper()
+					clip := loopClip(t, testpeer.Require(t, "ffmpeg"), tc.name, 2, 0)
+					return startRun(t, runOptions{inputs: []string{fileURL(clip, "")}})
+				}, tc.video, tc.probe)
+			})
+		}
+	})
 	t.Run("srt/epoch-change", testSRTEpochChange)
 	t.Run("srt/slow-consumer", testSRTSlowConsumer)
 	t.Run("srt/b-frames", testSRTBFrames)
 	t.Run("push-out/ffprobe", testPushOutFFprobe)
 }
 
-func testHTTPTSSlowConsumer(t *testing.T) {
+// testHTTPTSSlowConsumer runs the http-ts/slow-consumer cell on the run
+// that start starts: a single-epoch stream of about 18 s.
+func testHTTPTSSlowConsumer(t *testing.T, start func(t *testing.T) *m2aRun) {
 	t.Parallel()
 	ffmpeg := testpeer.Require(t, "ffmpeg")
-	clip := loopClip(t, ffmpeg, "h264_aac.ts", 3, 0)
-	r := startRun(t, runOptions{inputs: []string{fileURL(clip, "")}})
+	r := start(t)
 	origin := serveHTTP(t, "", map[string]*hub.Hub{"s": r.h}, nil, 32, shrinkSend)
 	waitAV(t, r.h)
 	normalCh := rawHTTP(origin + "/live/s/stream.ts")
@@ -837,45 +855,45 @@ func testHTTPTSSlowConsumer(t *testing.T) {
 		len(normal), len(slow), kindCounts(sf), resumes)
 }
 
-func testSRTSteady(t *testing.T) {
-	t.Parallel()
-	ffmpeg := testpeer.Require(t, "ffmpeg")
-	ffprobe := testpeer.Require(t, "ffprobe", "srt")
-	for _, tc := range []struct {
-		name  string
-		video media.Codec
-		probe []string
-	}{
-		{"h264_aac.ts", media.CodecH264, []string{"video:h264", "audio:aac"}},
-		{"h265_aac51.ts", media.CodecH265, []string{"video:hevc", "audio:aac"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			clip := loopClip(t, ffmpeg, tc.name, 2, 0)
-			r := startRun(t, runOptions{inputs: []string{fileURL(clip, "")}})
-			o := serveSRT(t, "", srtout.Options{}, map[string]*hub.Hub{"s": r.h})
-			waitAV(t, r.h)
-			capCh := readTS(o.url())
-			probeCh := inBackground(func(ctx context.Context) ([]string, error) {
-				return probeStreams(ctx, ffprobe, o.url())
-			})
+// srtSteadyClips are the srt/steady-state rows: the fixture looped twice,
+// its video codec, and what ffprobe lists.
+var srtSteadyClips = []struct {
+	name  string
+	video media.Codec
+	probe []string
+}{
+	{"h264_aac.ts", media.CodecH264, []string{"video:h264", "audio:aac"}},
+	{"h265_aac51.ts", media.CodecH265, []string{"video:hevc", "audio:aac"}},
+}
 
-			r.check(t, []uint32{1})
-			c := waitCapture(t, capCh)
-			assert.Empty(t, c.Violations)
-			assertCodecs(t, c.Frames, tc.video, media.CodecAAC)
-			assertTSMatchesHub(t, r.col.frames, c.Frames)
-			pr := <-probeCh
-			require.NoError(t, pr.err)
-			assert.ElementsMatch(t, tc.probe, pr.v)
-			require.Eventually(t, func() bool { return o.srv.Stats().Conns == 0 }, m3b3Read, 10*time.Millisecond)
-			st := o.srv.Stats()
-			assert.Zero(t, st.Resyncs)
-			assert.Zero(t, st.EndedStalled)
-			assert.Zero(t, st.EndedError)
-			t.Logf("hub %s; read %s; ffprobe %v; srt %+v", kindCounts(r.col.frames), kindCounts(c.Frames), pr.v, st)
-		})
-	}
+// testSRTSteady runs the srt/steady-state cell on the run that start
+// starts, a single-epoch stream with AAC audio and video in codec video,
+// which ffprobe lists as probe.
+func testSRTSteady(t *testing.T, start func(t *testing.T) *m2aRun, video media.Codec, probe []string) {
+	t.Parallel()
+	ffprobe := testpeer.Require(t, "ffprobe", "srt")
+	r := start(t)
+	o := serveSRT(t, "", srtout.Options{}, map[string]*hub.Hub{"s": r.h})
+	waitAV(t, r.h)
+	capCh := readTS(o.url())
+	probeCh := inBackground(func(ctx context.Context) ([]string, error) {
+		return probeStreams(ctx, ffprobe, o.url())
+	})
+
+	r.check(t, []uint32{1})
+	c := waitCapture(t, capCh)
+	assert.Empty(t, c.Violations)
+	assertCodecs(t, c.Frames, video, media.CodecAAC)
+	assertTSMatchesHub(t, r.col.frames, c.Frames)
+	pr := <-probeCh
+	require.NoError(t, pr.err)
+	assert.ElementsMatch(t, probe, pr.v)
+	require.Eventually(t, func() bool { return o.srv.Stats().Conns == 0 }, m3b3Read, 10*time.Millisecond)
+	st := o.srv.Stats()
+	assert.Zero(t, st.Resyncs)
+	assert.Zero(t, st.EndedStalled)
+	assert.Zero(t, st.EndedError)
+	t.Logf("hub %s; read %s; ffprobe %v; srt %+v", kindCounts(r.col.frames), kindCounts(c.Frames), pr.v, st)
 }
 
 // widths returns the distinct video widths of frames, in order.

@@ -395,6 +395,34 @@ func startRun(t *testing.T, o runOptions) *m2aRun {
 	return r
 }
 
+// startFeed starts fd writing into a hub with a collector, as startRun
+// starts a pipeline: the returned run has no pipeline, ends when fd returns,
+// and its check skips the pipeline's stats. prepare, when given, subscribes
+// to the hub before the first write, as runOptions.prepare.
+func startFeed(t *testing.T, fd feed, prepare ...func(h *hub.Hub)) *m2aRun {
+	t.Helper()
+	h := hub.New(hub.Options{})
+	r := &m2aRun{
+		h:      h,
+		col:    collect(h, "e2e"),
+		done:   make(chan error, 1),
+		ended:  make(chan struct{}),
+		stop:   make(chan struct{}),
+		active: make(chan int, 64),
+	}
+	for _, p := range prepare {
+		p(h)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), runLimit)
+	r.cancel = cancel
+	go func() { r.done <- fd(ctx, h) }()
+	t.Cleanup(func() {
+		cancel()
+		r.wait()
+	})
+	return r
+}
+
 func (r *m2aRun) onEvent(ev pipeline.Event) {
 	r.mu.Lock()
 	r.events = append(r.events, ev)
@@ -436,7 +464,9 @@ func (r *m2aRun) wait() {
 	r.waitOnce.Do(func() {
 		r.err = <-r.done
 		close(r.stop)
-		r.stats = r.p.Stats()
+		if r.p != nil {
+			r.stats = r.p.Stats()
+		}
 		r.h.Close()
 		<-r.col.done
 	})
@@ -467,7 +497,8 @@ func (r *m2aRun) failures() []string {
 }
 
 // check waits for the run to end and checks that the frames are clean, in
-// the given epochs, with nothing lost in the hub and no drift epoch.
+// the given epochs, with nothing lost in the hub and, for a pipeline, no
+// drift epoch.
 func (r *m2aRun) check(t *testing.T, wantEpochs []uint32) {
 	t.Helper()
 	r.wait()
@@ -479,6 +510,9 @@ func (r *m2aRun) check(t *testing.T, wantEpochs []uint32) {
 	assert.Zero(t, r.col.lost)
 	assert.Nil(t, conform.CheckFrames(r.col.frames, conform.FrameOptions{}))
 	assert.Equal(t, wantEpochs, epochs(r.col.frames))
+	if r.p == nil {
+		return // a feed: no pipeline, no Clock
+	}
 	assert.Zero(t, r.stats.Clock.DriftBreaks, "drift breaks")
 	assert.Zero(t, r.stats.Clock.DroppedDrift, "dropped by drift")
 }

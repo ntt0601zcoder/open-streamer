@@ -68,6 +68,18 @@
 // cut to its first 2 characters:
 //
 //	osdev -stream cam=in.ts -loop -rtmp-push cam=rtmp://a.example.com/live2/<stream-key>
+//
+// To transcode a stream into a ladder, give -rung name=label:height:kbps
+// once per encoded rendition, or name=label:copy for one that copies the
+// source video; -audio name=copy|aac[:kbps] sets the audio of every
+// rendition of the stream (default aac at 128 kbps). Each rendition is
+// served as its own stream, <name>_<label>, on every output. Encoding runs
+// in the transcoder child, cmd/ostranscoder, whose path -ostranscoder
+// gives (build it with make ostranscoder); a ladder of copies only needs
+// none. Renditions are presented 0.5 s behind the source:
+//
+//	osdev -stream cam=in.ts -loop -ostranscoder dist/ostranscoder-amd64/ostranscoder \
+//		-rung cam=720:720:3000 -rung cam=360:360:800 -rung cam=src:copy -audio cam=aac:96
 package main
 
 import (
@@ -76,6 +88,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -83,6 +96,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -101,6 +115,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/output/srtout"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
 )
@@ -124,6 +139,7 @@ const usageText = `usage: osdev -stream name=URL [-stream ...] [-listen addr] [-
              [-rtmp-play addr [-rtmp-play-app live]] [-rtmp-push name=rtmp://host/app/key ...]
              [-rtsp-play addr [-rtsp-play-app live] [-rtsp-udp]]
              [-srt-play addr [-srt-play-app live] [-srt-latency 120ms]]
+             [-ostranscoder path] [-rung name=label:height:kbps|name=label:copy ...] [-audio name=copy|aac[:kbps]]
 
 Accept an RTMP publisher (OBS or ffmpeg):
   osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen
@@ -164,6 +180,13 @@ or a wildcard. The stream ID is <app>/<name> or #!::r=<app>/<name>
 Push a stream to an RTMP server (repeat -rtmp-push for more targets; the
 URL is shown only redacted, and a failing target is retried):
   osdev -stream cam=in.ts -loop -rtmp-push cam=rtmp://<host>/<app>/<stream-key>
+
+Transcode a stream into renditions, each served as the stream <name>_<label>
+(-rung per rendition: label:height:kbps encodes, label:copy copies the
+video; -audio sets the audio of every rendition, default aac at 128 kbps;
+encoding needs the transcoder, built with make ostranscoder):
+  osdev -stream cam=in.ts -loop -ostranscoder dist/ostranscoder-amd64/ostranscoder \
+    -rung cam=360:360:800 -rung cam=src:copy -audio cam=aac:96
 `
 
 // streamFlags collects repeated -stream name=path values.
@@ -293,6 +316,139 @@ type config struct {
 	srtPlay, srtPlayApp string
 	srtLatency          time.Duration
 	pushes              []*push // in flag order
+	// renditions are the transcoders' rendition streams, in -rung order;
+	// transcoders the transcoders, in order of their stream's first -rung.
+	renditions  []*source
+	transcoders []*transcoder
+}
+
+// transcoder is the transcoder of one stream's -rung ladder.
+type transcoder struct {
+	stream   string
+	tr       *transcode.Transcoder
+	lastLine string // the last report line
+}
+
+// report writes the transcoder's counters when they differ from the last
+// report.
+func (x *transcoder) report(w io.Writer) {
+	st := x.tr.Stats()
+	c := st.Child
+	line := fmt.Sprintf("osdev: stream %s: transcoder pid %d, spawns %d, exits %d, losses %d, dropped before key %d, merge dropped %d, "+
+		"child dropped tracks %d, reanchors %d, audio samples dropped %d, corrupt audio %d, corrupt video %d",
+		x.stream, st.PID, st.Spawns, st.Exits, st.Losses, st.DroppedBeforeKey, st.MergeDropped,
+		c.DroppedTracks, c.Reanchors, c.AudioDropped, c.AudioCorrupt, c.VideoCorrupt)
+	if line == x.lastLine {
+		return
+	}
+	x.lastLine = line
+	_, _ = fmt.Fprintln(w, line)
+}
+
+// parseRung parses a -rung value, name=label:height:kbps or name=label:copy.
+func parseRung(v string) (stream, label string, video transcode.Video, err error) {
+	stream, spec, ok := strings.Cut(v, "=")
+	if !ok || !validName(stream) {
+		return "", "", video, fmt.Errorf("malformed -rung %q, want name=label:height:kbps or name=label:copy", v)
+	}
+	f := strings.Split(spec, ":")
+	label = f[0]
+	if !validName(label) {
+		return "", "", video, fmt.Errorf("-rung %q: invalid label %q", v, label)
+	}
+	switch {
+	case len(f) == 2 && f[1] == "copy":
+		return stream, label, transcode.Video{Copy: true}, nil
+	case len(f) == 3:
+		height, herr := strconv.Atoi(f[1])
+		kbps, kerr := strconv.Atoi(f[2])
+		if herr != nil || kerr != nil || height <= 0 || kbps <= 0 {
+			return "", "", video, fmt.Errorf("-rung %q: height and kbps must be positive integers", v)
+		}
+		return stream, label, transcode.Video{Height: height, BitrateKbps: kbps}, nil
+	default:
+		return "", "", video, fmt.Errorf("malformed -rung %q, want name=label:height:kbps or name=label:copy", v)
+	}
+}
+
+// parseAudio parses an -audio value, name=copy, name=aac or name=aac:kbps.
+func parseAudio(v string) (stream string, audio transcode.Audio, err error) {
+	stream, spec, ok := strings.Cut(v, "=")
+	if !ok || !validName(stream) {
+		return "", audio, fmt.Errorf("malformed -audio %q, want name=copy or name=aac[:kbps]", v)
+	}
+	switch codec, kbps, hasRate := strings.Cut(spec, ":"); {
+	case spec == "copy":
+		return stream, transcode.Audio{Copy: true}, nil
+	case codec == "aac" && !hasRate:
+		return stream, transcode.Audio{}, nil
+	case codec == "aac":
+		n, err := strconv.Atoi(kbps)
+		if err != nil || n <= 0 {
+			return "", audio, fmt.Errorf("-audio %q: kbps must be a positive integer", v)
+		}
+		return stream, transcode.Audio{BitrateKbps: n}, nil
+	default:
+		return "", audio, fmt.Errorf("malformed -audio %q, want name=copy or name=aac[:kbps]", v)
+	}
+}
+
+// parseLadders builds one transcoder per stream with -rung values, and
+// adds each rendition to byName as the stream <name>_<label>.
+func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, audios []string, log *slog.Logger) error {
+	ladders := map[string][]transcode.Rendition{}
+	var order []string
+	for _, v := range rungs {
+		stream, label, video, err := parseRung(v)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(cfg.sources, byName[stream]) {
+			return fmt.Errorf("-rung: unknown stream %s", stream)
+		}
+		name := stream + "_" + label
+		if byName[name] != nil {
+			return fmt.Errorf("-rung: rendition %s: the name is already a stream", name)
+		}
+		if _, ok := ladders[stream]; !ok {
+			order = append(order, stream)
+		}
+		ladders[stream] = append(ladders[stream], transcode.Rendition{Name: name, Video: video})
+		byName[name] = &source{name: name} // reserved; completed below
+	}
+	audio := map[string]transcode.Audio{}
+	for _, v := range audios {
+		stream, a, err := parseAudio(v)
+		if err != nil {
+			return err
+		}
+		if _, ok := ladders[stream]; !ok {
+			return fmt.Errorf("-audio: stream %s has no -rung", stream)
+		}
+		audio[stream] = a
+	}
+	for _, stream := range order {
+		encodes := !audio[stream].Copy
+		for _, r := range ladders[stream] {
+			encodes = encodes || !r.Video.Copy
+		}
+		if encodes && binary == "" {
+			return fmt.Errorf("stream %s: encoding needs -ostranscoder", stream)
+		}
+		tr, err := transcode.New(byName[stream].hub, transcode.Options{
+			Binary: binary, Renditions: ladders[stream], Audio: audio[stream], Logger: log,
+		})
+		if err != nil {
+			return fmt.Errorf("stream %s: %w", stream, err)
+		}
+		cfg.transcoders = append(cfg.transcoders, &transcoder{stream: stream, tr: tr})
+		for i, h := range tr.Hubs() {
+			s := byName[ladders[stream][i].Name]
+			s.hub, s.pack = h, live.NewPackager(h, live.Options{})
+			cfg.renditions = append(cfg.renditions, s)
+		}
+	}
+	return nil
 }
 
 // parseLayout parses a comma-separated list of video and audio.
@@ -351,6 +507,10 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	var streams, pushes streamFlags
 	fs.Var(&streams, "stream", "name=URL (or name=path.ts) to serve; repeat a name to add a lower-priority input")
 	fs.Var(&pushes, "rtmp-push", "name=rtmp://host/app/key: push stream name to an RTMP server; repeatable")
+	ostx := fs.String("ostranscoder", "", "path of the transcoder, cmd/ostranscoder: needed to encode a -rung or aac -audio")
+	var rungs, audios streamFlags
+	fs.Var(&rungs, "rung", "name=label:height:kbps (encode) or name=label:copy: a rendition of stream name, served as <name>_<label>; repeatable")
+	fs.Var(&audios, "audio", "name=copy or name=aac[:kbps]: the audio of stream name's renditions (default aac, 128 kbps)")
 	if err := fs.Parse(args); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return nil, 2
@@ -447,6 +607,11 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	}
 	if err := checkSRTPlayAddr(cfg); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: -srt-play: %v\n", err)
+		return nil, 2
+	}
+	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	if err := parseLadders(cfg, byName, *ostx, rungs, audios, log); err != nil {
+		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return nil, 2
 	}
 	for _, v := range pushes {
@@ -727,8 +892,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	warnPublishPaths(stderr, cfg)
 	order := cfg.sources
+	// every stream: the inputs' then the renditions'
+	all := slices.Concat(order, cfg.renditions)
 	srcs := map[string]*source{}
-	for _, s := range order {
+	for _, s := range all {
 		srcs[s.name] = s
 	}
 	hubLookup := func(n string) (*hub.Hub, bool) {
@@ -784,7 +951,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if tcp, ok := ln.Addr().(*net.TCPAddr); ok && tcp.IP.IsUnspecified() {
 		base = fmt.Sprintf("http://127.0.0.1:%d", tcp.Port)
 	}
-	for _, s := range order {
+	for _, s := range all {
 		for _, p := range []string{"hls/index.m3u8", "cmaf/master.m3u8", "cmaf/index.mpd", "stream.ts"} {
 			_, _ = fmt.Fprintf(stdout, "%s/live/%s/%s\n", base, s.name, p)
 		}
@@ -794,7 +961,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
 			host = "127.0.0.1"
 		}
-		for _, s := range order {
+		for _, s := range all {
 			_, _ = fmt.Fprintf(stdout, "rtmp://%s/%s/%s\n", net.JoinHostPort(host, port), cfg.rtmpPlayApp, s.name)
 		}
 	}
@@ -803,7 +970,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
 			host = "127.0.0.1"
 		}
-		for _, s := range order {
+		for _, s := range all {
 			_, _ = fmt.Fprintf(stdout, "rtsp://%s/%s/%s\n", net.JoinHostPort(host, port), cfg.rtspPlayApp, s.name)
 		}
 	}
@@ -812,7 +979,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
 			host = "127.0.0.1"
 		}
-		for _, s := range order {
+		for _, s := range all {
 			_, _ = fmt.Fprintf(stdout, "srt://%s?streamid=%s/%s\n", net.JoinHostPort(host, port), cfg.srtPlayApp, s.name)
 		}
 	}
@@ -880,6 +1047,28 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}()
 	}
 
+	// The transcoders start after their sources, and close their rendition
+	// hubs when they return.
+	var twg sync.WaitGroup
+	var transcodeFailed atomic.Bool
+	for _, s := range cfg.renditions {
+		sub := s.hub.Subscribe(s.name, subQueue)
+		wg.Go(func() { s.pack.Run(ctx, sub) })
+	}
+	for _, x := range cfg.transcoders {
+		twg.Go(func() {
+			err := x.tr.Run(ctx)
+			switch {
+			case ctx.Err() != nil:
+			case err == nil:
+				_, _ = fmt.Fprintf(stderr, "osdev: stream %s: renditions ended with the stream\n", x.stream)
+			default:
+				transcodeFailed.Store(true)
+				_, _ = fmt.Fprintf(stderr, "osdev: stream %s: transcoder stopped: %v\n", x.stream, err)
+			}
+		})
+	}
+
 	for _, p := range cfg.pushes {
 		_, _ = fmt.Fprintf(stderr, "osdev: stream %s: pushing to %s\n", p.stream, p.pusher)
 		wg.Add(1)
@@ -901,7 +1090,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				report(stderr, order, false)
+				report(stderr, all, false)
+				for _, x := range cfg.transcoders {
+					x.report(stderr)
+				}
 				for _, p := range cfg.pushes {
 					p.report(stderr)
 				}
@@ -932,6 +1124,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	for _, s := range order {
 		s.hub.Close()
 	}
+	twg.Wait()       // the transcoders closed their rendition hubs
 	unregisterPlay() // the players got end of stream; this waits for them
 	stopRTSP()       // the RTSP players got their BYEs; this waits for them
 	stopSRT()        // ends the SRT receivers and waits for them
@@ -941,11 +1134,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_ = srv.Close()
 	}
 	wg.Wait()
-	report(stderr, order, true)
+	report(stderr, all, true)
+	for _, x := range cfg.transcoders {
+		x.report(stderr)
+	}
 	for _, p := range cfg.pushes {
 		p.report(stderr)
 	}
-	if code == 0 && failed.Load() > 0 {
+	if code == 0 && (failed.Load() > 0 || transcodeFailed.Load()) {
 		code = 1
 	}
 	return code
