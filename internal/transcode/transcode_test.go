@@ -826,13 +826,15 @@ func TestBacklogOverflow(t *testing.T) {
 	assert.Equal(t, 1, len(s.c.in))
 }
 
-// A child that stops reading its input after its Hello is killed once Run
-// has waited InputStallTimeout without the writer making progress: the
+// A child that stops reading its input (and reporting Stats) after its Hello
+// is killed once Run has waited InputStallTimeout without the child
+// reporting progress: the
 // exit names the stall, the child is respawned with a bump, and Run never
 // stalls long enough for the source subscription to lose frames.
 func TestSupervisorStalledChild(t *testing.T) {
 	steps := longGOP(fixtureSteps(t, "h264_aac.ts"), 4, 1)
 	opt := fakeOptions(t, transcodetest.EnvStopReadingAfter+"=50",
+		transcodetest.EnvStatsInterval+"=100ms",
 		transcodetest.EnvCrashOnce+"="+filepath.Join(t.TempDir(), "once"))
 	opt.InputStallTimeout = 300 * time.Millisecond
 	opt.Renditions = []Rendition{encode240, copySrc}
@@ -863,4 +865,24 @@ func TestSupervisorStalledChild(t *testing.T) {
 		}
 	}
 	assert.Equal(t, srcVideo, copyVideo, "copy rendition video")
+}
+
+// A slow child that keeps consuming, and says so in its Stats, is never
+// killed, even though the host's socket writes complete only in bursts
+// seconds apart.
+func TestSupervisorSlowChildNotKilled(t *testing.T) {
+	loop := "h264_aac_loop.ts"
+	steps := fixtureSteps(t, loop, loop)
+	opt := fakeOptions(t, transcodetest.EnvDelay+"=20ms", transcodetest.EnvStatsInterval+"=100ms")
+	opt.InputStallTimeout = 500 * time.Millisecond
+	opt.Renditions = []Rendition{encode240, copySrc}
+	s := start(t, opt)
+	<-play(t.Context(), s.src, steps, 8, false)
+	st := s.tr.Stats()
+	t.Logf("losses %d, max queued %d", st.Losses, st.MaxQueued)
+	assert.EqualValues(t, st.MaxQueued, childQueue, "the child's queue filled: sends blocked")
+	assert.Zero(t, st.Exits, "a slow child that consumes is not killed")
+	assert.Empty(t, s.ev.of(EventExited))
+	assert.EqualValues(t, 1, st.Spawns)
+	s.src.Close()
 }

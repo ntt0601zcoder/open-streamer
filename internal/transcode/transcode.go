@@ -75,7 +75,7 @@ const (
 	defaultHealthyAfter = 30 * time.Second
 	defaultMergeHold    = 2 * time.Second
 	defaultHelloTimeout = 10 * time.Second
-	defaultInputStall   = 5 * time.Second
+	defaultInputStall   = 10 * time.Second
 
 	// childQueue is the length of the child's input channel.
 	childQueue = 256
@@ -127,8 +127,10 @@ type Options struct {
 	MergeHold    time.Duration // 0 means 2 s
 	HelloTimeout time.Duration // a child without Hello by then is killed; 0 means 10 s
 	// InputStallTimeout bounds how long Run waits to queue a frame for a
-	// child that takes none of its input: a child whose writer makes no
-	// progress for that long is killed ("input stalled"); 0 means 5 s.
+	// child that consumes none of its input. While a send to the child is
+	// blocked, a child that reports no progress (a rising Stats.In, or any
+	// output Frame) for that long is killed ("input stalled"); 0 means 10 s.
+	// The child reports Stats every second, so it must exceed that.
 	InputStallTimeout time.Duration
 
 	Now   func() time.Time                     // nil means time.Now
@@ -490,12 +492,15 @@ func (s *run) toChild(m wire.Message) bool {
 		return true
 	default:
 	}
-	// The queue is full: wait, but kill a child whose writer makes no
-	// progress for InputStallTimeout, so Run never stalls on it for longer.
+	// The queue is full: wait, but kill a child that reports consuming
+	// nothing for InputStallTimeout, so Run never stalls on it for longer.
+	// The host's own completed writes are no signal: a blocked socket writer
+	// only wakes once the child has drained most of the buffer, seconds
+	// later for a slow child.
 	stall := s.t.opt.InputStallTimeout
+	since := time.Now()
 	timer := time.NewTimer(stall)
 	defer timer.Stop()
-	seen := c.progress.Load()
 	for {
 		select {
 		case c.in <- m:
@@ -503,14 +508,17 @@ func (s *run) toChild(m wire.Message) bool {
 			return true
 		case <-c.done:
 		case <-s.ctx.Done():
-		case <-timer.C:
-			if p := c.progress.Load(); p != seen {
-				seen = p
-				timer.Reset(stall)
+		case now := <-timer.C:
+			last := since
+			if p := c.lastProgress.Load(); p > last.UnixNano() {
+				last = time.Unix(0, p)
+			}
+			if idle := now.Sub(last); idle < stall {
+				timer.Reset(stall - idle)
 				continue
 			}
 			c.stalled = fmt.Errorf("transcode: input stalled for %v", stall)
-			s.t.log.Warn("transcode: child stopped reading its input", "pid", c.p.pid, "after", stall)
+			s.t.log.Warn("transcode: child stopped consuming its input", "pid", c.p.pid, "after", stall)
 			c.kill()
 		}
 		s.droppedFrame(m)
@@ -663,9 +671,10 @@ type child struct {
 	// taking its input.
 	stalled error
 
-	// progress counts the writer's successful writes; Run reads it to tell
-	// a slow child from one that stopped reading.
-	progress atomic.Uint64
+	// lastProgress is when the child last reported consuming input (a
+	// rising Stats.In, or an output Frame), in Unix nanoseconds; Run reads
+	// it to tell a slow child from one that stopped.
+	lastProgress atomic.Int64
 }
 
 // startChild spawns the child and starts its reader, writer and waiter.
@@ -760,6 +769,7 @@ func (t *Transcoder) readChild(c *child) error {
 	c.reapMu.Unlock()
 	close(c.helloOK)
 	c.hello <- struct{}{}
+	var in uint64
 	for {
 		m, err := r.Read()
 		if err != nil {
@@ -770,7 +780,13 @@ func (t *Transcoder) readChild(c *child) error {
 		}
 		switch v := m.(type) {
 		case wire.Frame:
+			c.lastProgress.Store(time.Now().UnixNano())
 			t.fromChild(v)
+		case wire.Stats:
+			if v.In > in {
+				in = v.In
+				c.lastProgress.Store(time.Now().UnixNano())
+			}
 		case wire.Error:
 			t.log.Warn("transcode: child error", "pid", c.p.pid, "rung", v.Rung, "fatal", v.Fatal, "msg", v.Message)
 		default:
@@ -830,7 +846,6 @@ func (t *Transcoder) writeChild(c *child) {
 				c.kill()
 				return
 			}
-			c.progress.Add(1)
 		}
 	case <-c.quit:
 		_ = c.w.Write(wire.Stop{})
@@ -849,7 +864,6 @@ func (t *Transcoder) writeChild(c *child) {
 				c.kill()
 				return
 			}
-			c.progress.Add(1)
 		case <-c.quit:
 			_ = c.w.Write(wire.Stop{})
 			return

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
@@ -44,10 +45,14 @@ const (
 	// as the real child does on a pipeline error. With EnvCrashOnce, only
 	// while the file is absent.
 	EnvCloseThenExit = "OS_TRANSCODE_FAKE_CLOSE_THEN_EXIT"
-	// EnvStopReadingAfter makes the child stop reading its input, while it
-	// keeps running, after that many input frames. With EnvCrashOnce, only
-	// while the file is absent.
+	// EnvStopReadingAfter makes the child stop reading its input and
+	// sending Stats, while it keeps running, after that many input frames,
+	// as a child stuck in libav would. With EnvCrashOnce, only while the
+	// file is absent.
 	EnvStopReadingAfter = "OS_TRANSCODE_FAKE_STOP_READING_AFTER"
+	// EnvStatsInterval is how often the child sends Stats with its input
+	// count, as a time.Duration; default 1 s, as the real child.
+	EnvStatsInterval = "OS_TRANSCODE_FAKE_STATS_INTERVAL"
 )
 
 // Main runs the fake child on fd 3 and exits. It sends Hello, reads
@@ -116,6 +121,24 @@ func Main() {
 			time.Sleep(time.Hour)
 		}
 	}
+	statsEvery := time.Second
+	if d, err := time.ParseDuration(os.Getenv(EnvStatsInterval)); err == nil && d > 0 {
+		statsEvery = d
+	}
+	var in atomic.Uint64
+	var stuck atomic.Bool
+	go func() {
+		for {
+			time.Sleep(statsEvery)
+			if stuck.Load() {
+				return
+			}
+			if w.Write(wire.Stats{In: in.Load()}) != nil {
+				return
+			}
+		}
+	}()
+
 	var cfg wire.Configure
 	n := 0
 	for {
@@ -140,6 +163,7 @@ func Main() {
 				crash()
 			}
 		case wire.Frame:
+			in.Add(1)
 			if delay > 0 {
 				time.Sleep(delay)
 			}
@@ -157,6 +181,7 @@ func Main() {
 				crash()
 			}
 			if n == stopReading {
+				stuck.Store(true)
 				markOnce()
 				for { // alive, never reading again
 					time.Sleep(time.Hour)
