@@ -1398,11 +1398,11 @@ func TestM3b3HLSAlignment(t *testing.T) {
 // m3b3hls), HLS TS (m3b3hlsts) and SRT (m3b3srt) outputs of h264_aac.ts
 // looped four times, from the fixed ports 19364 (HTTP) and 19363 (SRT), and
 // our RTSP pull read each path over TCP: one epoch of violation-free frames
-// with no offset jump. DASH and HTTP-TS are not MediaMTX sources (ruling
-// R-PF2). Each path is warmed with a throwaway reader and joined 1 s later
-// (settleRTSP); an HLS path is warmed 1 s after a segment is listed, and an
-// HLS row whose read MediaMTX still ends runs once more (the retry is
-// logged).
+// (the tracks' start offset within mtxPullStartOffset) with no offset jump.
+// DASH and HTTP-TS are not MediaMTX sources (ruling R-PF2). Each path is
+// warmed with a throwaway reader and joined 1 s later (settleRTSP); an HLS
+// path is warmed 1 s after a segment is listed, and an HLS row whose read
+// MediaMTX still ends runs once more (the retry is logged).
 func TestM3b3MediaMTXPull(t *testing.T) {
 	t.Parallel()
 	mtx := testpeer.MediaMTXPull(t)
@@ -1427,6 +1427,22 @@ func TestM3b3MediaMTXPull(t *testing.T) {
 		})
 	}
 }
+
+// mtxPullStartOffset is the track-start-offset bound of the MediaMTX pull
+// rows: the default 40 ms plus 160 ms, h264_aac.ts's largest video PTS −
+// DTS (14400 ticks). MediaMTX's RTSP timing of these sources places audio
+// that much late against video: with the hub's frames matched by payload to
+// what our reader got, every frame of a row reads with audio 155 to 160 ms
+// later relative to video than in the hub, on the HLS fMP4, HLS TS and SRT
+// sources alike, before and after the segmenter's audio cut (ruling R-F3).
+// The PLAY response's RTP-Info and the sender reports both carry it, so a
+// receiver that follows them, as RFC 3550 asks, keeps it; that matches
+// MediaMTX timing video by decode time while its RTP timestamps carry the
+// PTS. A reader that joins up to 160 ms before a keyframe, and so keeps the
+// audio just ahead of it, sees its audio start up to 160 ms after its
+// video. The other rules, the single epoch and the absence of offset jumps
+// still hold exactly.
+const mtxPullStartOffset = 3600 + 14400
 
 // mediaMTXPullRow runs one row of TestM3b3MediaMTXPull. When mayRetry is
 // set and MediaMTX ended our read (unexpected EOF, its source stopped), it
@@ -1461,7 +1477,7 @@ func mediaMTXPullRow(t *testing.T, mtx, ffmpeg, path string, mayRetry bool) (ret
 		t.Logf("read %s; failures %v", r.col.counts(), r.failures())
 		return true
 	}
-	r.check(t, []uint32{1})
+	r.checkWith(t, []uint32{1}, conform.FrameOptions{MaxStartOffset: mtxPullStartOffset})
 	assertCodecs(t, r.col.frames, media.CodecH264, media.CodecAAC)
 	st := rl.stats()
 	assert.Zero(t, st["sync_jumps"], "offset jumps")

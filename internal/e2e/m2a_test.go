@@ -501,6 +501,12 @@ func (r *m2aRun) failures() []string {
 // drift epoch.
 func (r *m2aRun) check(t *testing.T, wantEpochs []uint32) {
 	t.Helper()
+	r.checkWith(t, wantEpochs, conform.FrameOptions{})
+}
+
+// checkWith is check with the frame rules tuned by opt.
+func (r *m2aRun) checkWith(t *testing.T, wantEpochs []uint32, opt conform.FrameOptions) {
+	t.Helper()
 	r.wait()
 	require.NotErrorIs(t, r.err, context.DeadlineExceeded, "the run did not end within %v", runLimit)
 	if r.err != nil {
@@ -508,7 +514,7 @@ func (r *m2aRun) check(t *testing.T, wantEpochs []uint32) {
 	}
 	require.NotEmpty(t, r.col.frames)
 	assert.Zero(t, r.col.lost)
-	assert.Nil(t, conform.CheckFrames(r.col.frames, conform.FrameOptions{}))
+	assert.Nil(t, conform.CheckFrames(r.col.frames, opt))
 	assert.Equal(t, wantEpochs, epochs(r.col.frames))
 	if r.p == nil {
 		return // a feed: no pipeline, no Clock
