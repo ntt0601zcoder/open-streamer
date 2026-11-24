@@ -166,11 +166,12 @@ type Event struct {
 // child's, or 0. DroppedBeforeKey also counts the frames given up on
 // because the child exited, stalled, or Run ended while they waited.
 // StderrSuppressed counts the children's stderr lines not logged because
-// they came faster than 10 a second. Child holds the media counters the
-// children reported.
+// they came faster than 10 a second. Oversize counts the frames dropped on
+// their way to a child because the wire protocol cannot carry them
+// (wire.ErrLimit). Child holds the media counters the children reported.
 type Stats struct {
 	Spawns, Exits, Losses, DroppedBeforeKey, MergeDropped uint64
-	FramesIn, StderrSuppressed                            uint64
+	FramesIn, StderrSuppressed, Oversize                  uint64
 	FramesOut                                             []uint64
 	MaxQueued                                             int
 	PID                                                   int
@@ -718,6 +719,9 @@ type child struct {
 	// taking its input.
 	stalled error
 
+	// Owned by the writer goroutine: an oversize frame was logged.
+	oversizeLogged bool
+
 	// lastProgress is when the child last reported consuming input (a
 	// rising Stats.In, or an output Frame), in Unix nanoseconds; Run reads
 	// it to tell a slow child from one that stopped.
@@ -900,7 +904,7 @@ func (t *Transcoder) writeChild(c *child) {
 	select {
 	case backlog := <-c.backlogCh:
 		for _, m := range backlog {
-			if err := c.w.Write(m); err != nil {
+			if !t.send(c, m) {
 				c.kill()
 				return
 			}
@@ -918,7 +922,7 @@ func (t *Transcoder) writeChild(c *child) {
 				_ = c.w.Write(wire.Stop{})
 				return
 			}
-			if err := c.w.Write(m); err != nil {
+			if !t.send(c, m) {
 				c.kill()
 				return
 			}
@@ -929,6 +933,27 @@ func (t *Transcoder) writeChild(c *child) {
 			return
 		}
 	}
+}
+
+// send writes m to the child and reports whether the child is still
+// usable. A frame the protocol cannot carry (wire.ErrLimit) is dropped and
+// counted in Stats.Oversize, and the child keeps running: nothing was
+// written, and a child would only be killed over a frame it never saw.
+// Called from the writer goroutine.
+func (t *Transcoder) send(c *child, m wire.Message) bool {
+	err := c.w.Write(m)
+	if err == nil {
+		return true
+	}
+	if _, frame := m.(wire.Frame); !frame || !errors.Is(err, wire.ErrLimit) {
+		return false
+	}
+	t.update(func(st *Stats) { st.Oversize++ })
+	if !c.oversizeLogged {
+		c.oversizeLogged = true
+		t.log.Warn("transcode: frame dropped: the wire protocol cannot carry it", "pid", c.p.pid, "err", err)
+	}
+	return true
 }
 
 // wait reaps the process, then lets the reader drain what the child wrote.

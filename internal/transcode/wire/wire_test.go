@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"io"
+	"math"
 	"runtime"
 	"testing"
 
@@ -371,3 +372,77 @@ func TestWriteFailureDoesNotRegisterConfig(t *testing.T) {
 type failWriter struct{}
 
 func (failWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+// The Writer refuses, with ErrLimit and without writing anything, every
+// message the Reader would reject for a limit, and accepts each one at the
+// limit, which the Reader then reads.
+func TestWriterLimits(t *testing.T) {
+	const big, small = math.MaxInt32 + 1, math.MinInt32 - 1
+	nals := func(n int) [][]byte { return make([][]byte, n) }
+	sets := func(n int) [][]byte {
+		out := make([][]byte, n)
+		for i := range out {
+			out[i] = unhex(t, h264SPSHex)
+		}
+		return out
+	}
+	rungs := func(n int) []Rung { return make([]Rung, n) }
+	over := map[string]Message{
+		"nals":           Frame{F: media.Frame{Data: nals(maxNALs + 1)}},
+		"frame rung hi":  Frame{Rung: big},
+		"frame rung lo":  Frame{Rung: small},
+		"track hi":       Frame{F: media.Frame{Track: big}},
+		"track negative": Frame{F: media.Frame{Track: -1}},
+		"sps":            Frame{F: media.Frame{Config: &media.TrackConfig{Codec: media.CodecH264, SPS: sets(maxParamSets + 1)}}},
+		"pps":            Frame{F: media.Frame{Config: &media.TrackConfig{Codec: media.CodecH264, PPS: sets(maxParamSets + 1)}}},
+		"vps":            Frame{F: media.Frame{Config: &media.TrackConfig{Codec: media.CodecH265, VPS: sets(maxParamSets + 1)}}},
+		"size":           Frame{F: media.Frame{Data: [][]byte{make([]byte, MaxMessage)}}},
+		"rungs":          Configure{Rungs: rungs(maxRungs + 1)},
+		"height":         Configure{Rungs: []Rung{{Height: big}}},
+		"height neg":     Configure{Rungs: []Rung{{Height: -1}}},
+		"bframes hi":     Configure{Rungs: []Rung{{BFrames: big}}},
+		"bframes lo":     Configure{Rungs: []Rung{{BFrames: small}}},
+		"audio":          Configure{Audio: &AudioEncode{SampleRate: big}},
+		"hello pid hi":   Hello{PID: big},
+		"hello pid lo":   Hello{PID: small},
+		"stats out":      Stats{Out: make([]uint64, maxStatsLen+1)},
+		"stats nanos":    Stats{EncodeNanos: make([]int64, maxStatsLen+1)},
+		"error rung hi":  Error{Rung: big},
+		"error rung lo":  Error{Rung: small},
+	}
+	for name, m := range over {
+		var buf bytes.Buffer
+		err := NewWriter(&buf).Write(m)
+		require.ErrorIs(t, err, ErrLimit, name)
+		assert.Zero(t, buf.Len(), name)
+	}
+	var tooLarge bytes.Buffer
+	require.ErrorIs(t, NewWriter(&tooLarge).Write(over["size"]), ErrTooLarge)
+
+	at := []Message{
+		Frame{Rung: math.MaxInt32, F: media.Frame{Track: math.MaxInt32, Data: nals(maxNALs)}},
+		Frame{Rung: math.MinInt32},
+		Frame{F: media.Frame{Data: [][]byte{make([]byte, MaxMessage-64)}}},
+		Configure{Rungs: rungs(maxRungs)},
+		Configure{Rungs: []Rung{{Height: math.MaxInt32, BFrames: math.MinInt32}, {BFrames: math.MaxInt32}}},
+		Hello{PID: math.MinInt32},
+		Hello{PID: math.MaxInt32},
+		Stats{Out: make([]uint64, maxStatsLen), EncodeNanos: make([]int64, maxStatsLen)},
+		Error{Rung: math.MinInt32},
+		Error{Rung: math.MaxInt32},
+	}
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	for i, m := range at {
+		require.NoError(t, w.Write(m), "message %d", i)
+	}
+	r := NewReader(&buf)
+	for i := range at {
+		_, err := r.Read()
+		require.NoError(t, err, "message %d", i)
+	}
+
+	// A config at the parameter-set limit is written.
+	cfg := &media.TrackConfig{Codec: media.CodecH264, SPS: sets(maxParamSets), PPS: sets(maxParamSets)}
+	require.NoError(t, NewWriter(io.Discard).Write(Frame{F: media.Frame{Config: cfg}}))
+}

@@ -689,6 +689,61 @@ func TestSupervisorStderrRateLimited(t *testing.T) {
 	assert.Equal(t, st.StderrSuppressed, summed, "every suppressed line is in a summary")
 }
 
+// A frame the wire protocol cannot carry (more NAL units than the child's
+// reader takes, or more than wire.MaxMessage bytes) is dropped on its way
+// to the child and counted in Stats.Oversize; the child is not killed, and
+// the copy rendition still gets the frame.
+func TestSupervisorOversizeFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data [][]byte
+	}{
+		{"70000 NALs", make([][]byte, 70000)},
+		{"33 MiB", [][]byte{make([]byte, 33<<20)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			steps := fixtureSteps(t, "h264_aac.ts")
+			var at int
+			for i, st := range steps {
+				if st.anchor == nil && st.f.Kind() == media.KindVideo && !st.f.Key && i > len(steps)/2 {
+					at = i
+					break
+				}
+			}
+			require.NotZero(t, at)
+			steps[at].f.Data = tc.data
+			opt := fakeOptions(t)
+			opt.Renditions = []Rendition{encode240, copySrc}
+			opt.Audio.Copy = true
+			s := start(t, opt)
+			out := s.feed(t, steps, 0)
+			st := s.tr.Stats()
+			assert.EqualValues(t, 1, st.Oversize)
+			assert.EqualValues(t, 1, st.Spawns)
+			assert.Zero(t, st.Exits, "the child is not killed")
+			assert.Empty(t, s.ev.of(EventExited))
+			var srcVideo, encVideo, copyVideo int
+			for _, f := range frames(steps) {
+				if f.Kind() == media.KindVideo {
+					srcVideo++
+				}
+			}
+			for _, f := range out[0] {
+				if f.Kind() == media.KindVideo {
+					encVideo++
+				}
+			}
+			for _, f := range out[1] {
+				if f.Kind() == media.KindVideo {
+					copyVideo++
+				}
+			}
+			assert.Equal(t, srcVideo-1, encVideo, "the encoded rendition lacks only the oversize frame")
+			assert.Equal(t, srcVideo, copyVideo, "the copy rendition has every frame")
+		})
+	}
+}
+
 // tryChild never waits: a full queue, or no child, refuses the message.
 func TestTryChild(t *testing.T) {
 	tr, err := New(hub.New(hub.Options{}), Options{Renditions: []Rendition{copySrc}, Audio: Audio{Copy: true}})

@@ -26,6 +26,12 @@ var (
 	ErrTooLarge = errors.New("wire: message too large")
 	// ErrMalformed means the bytes are not a valid message.
 	ErrMalformed = errors.New("wire: malformed message")
+	// ErrLimit means the Writer refused a message that the Reader would
+	// reject for one of its limits: too many NAL units, parameter sets,
+	// rungs, stats entries or distinct configs, an integer outside the
+	// field's range, or more than MaxMessage bytes (then also ErrTooLarge).
+	// Nothing was written; the stream is still usable.
+	ErrLimit = errors.New("wire: message exceeds a protocol limit")
 )
 
 // Limits that keep a hostile peer from forcing large allocations.
@@ -139,7 +145,9 @@ func NewWriter(w io.Writer) *Writer {
 }
 
 // Write encodes m. A Frame's config is included the first time this Writer
-// sees its pointer, and referenced by ID afterwards.
+// sees its pointer, and referenced by ID afterwards. A message the Reader
+// would reject for one of its limits is refused with an error wrapping
+// ErrLimit, before anything is written.
 func (w *Writer) Write(m Message) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -152,7 +160,9 @@ func (w *Writer) Write(m Message) error {
 	)
 	switch v := m.(type) {
 	case Hello:
-		body = appendEnvelope(body, fHello, appendHello(nil, v))
+		if err = int32s("hello pid", v.PID); err == nil {
+			body = appendEnvelope(body, fHello, appendHello(nil, v))
+		}
 	case Configure:
 		var b []byte
 		if b, err = appendConfigure(nil, v); err == nil {
@@ -167,9 +177,15 @@ func (w *Writer) Write(m Message) error {
 	case Discontinuity:
 		body = appendEnvelope(body, fDiscontinuity, nil)
 	case Stats:
-		body = appendEnvelope(body, fStats, appendStats(nil, v))
+		if len(v.Out) > maxStatsLen || len(v.EncodeNanos) > maxStatsLen {
+			err = limit("stats: %d out, %d encode_nanos entries, at most %d", len(v.Out), len(v.EncodeNanos), maxStatsLen)
+		} else {
+			body = appendEnvelope(body, fStats, appendStats(nil, v))
+		}
 	case Error:
-		body = appendEnvelope(body, fError, appendError(nil, v))
+		if err = int32s("error rung", v.Rung); err == nil {
+			body = appendEnvelope(body, fError, appendError(nil, v))
+		}
 	case Stop:
 		body = appendEnvelope(body, fStop, nil)
 	default:
@@ -180,7 +196,7 @@ func (w *Writer) Write(m Message) error {
 	}
 	n := len(body) - 4
 	if n > MaxMessage {
-		return fmt.Errorf("wire: write: %w (%d bytes)", ErrTooLarge, n)
+		return fmt.Errorf("wire: write: %w: %w (%d bytes)", ErrLimit, ErrTooLarge, n)
 	}
 	binary.BigEndian.PutUint32(body, uint32(n))
 	if cap(body) <= readChunk {
@@ -228,10 +244,26 @@ func appendHello(dst []byte, h Hello) []byte {
 	return appendSint(dst, 2, int64(h.PID))
 }
 
+// limit returns an error wrapping ErrLimit.
+func limit(format string, args ...any) error {
+	return fmt.Errorf("wire: write: %w: "+format, append([]any{ErrLimit}, args...)...)
+}
+
+// nonNeg checks values the Reader reads as non-negative int32s.
 func nonNeg(name string, vs ...int) error {
 	for _, v := range vs {
 		if v < 0 || v > maxInt {
-			return fmt.Errorf("wire: write: %s %d out of range", name, v)
+			return limit("%s %d out of range", name, v)
+		}
+	}
+	return nil
+}
+
+// int32s checks values the Reader reads as int32s.
+func int32s(name string, vs ...int) error {
+	for _, v := range vs {
+		if v < math.MinInt32 || v > maxInt {
+			return limit("%s %d out of range", name, v)
 		}
 	}
 	return nil
@@ -243,10 +275,13 @@ func nonNeg(name string, vs ...int) error {
 // AudioEncode: 1 bitrate_kbps, 2 sample_rate, 3 channels (varint).
 func appendConfigure(dst []byte, c Configure) ([]byte, error) {
 	if len(c.Rungs) > maxRungs {
-		return nil, fmt.Errorf("wire: write: %d rungs, at most %d", len(c.Rungs), maxRungs)
+		return nil, limit("%d rungs, at most %d", len(c.Rungs), maxRungs)
 	}
 	for _, r := range c.Rungs {
 		if err := nonNeg("rung", r.Height, r.BitrateKbps, r.MaxBitrateKbps); err != nil {
+			return nil, err
+		}
+		if err := int32s("rung bframes", r.BFrames); err != nil {
 			return nil, err
 		}
 		var b []byte
@@ -278,6 +313,12 @@ func (w *Writer) appendFrame(dst []byte, v Frame) (b []byte, newCfg *media.Track
 	if err = nonNeg("track", v.F.Track); err != nil {
 		return nil, nil, 0, err
 	}
+	if err = int32s("frame rung", v.Rung); err != nil {
+		return nil, nil, 0, err
+	}
+	if len(v.F.Data) > maxNALs {
+		return nil, nil, 0, limit("%d NAL units, at most %d", len(v.F.Data), maxNALs)
+	}
 	dst = appendSint(dst, 1, int64(v.Rung))
 	dst = appendUint(dst, 2, uint64(v.F.Track))
 	dst = appendUint(dst, 3, uint64(v.F.Epoch))
@@ -292,10 +333,13 @@ func (w *Writer) appendFrame(dst []byte, v Frame) (b []byte, newCfg *media.Track
 		id, seen := w.configs[c]
 		if !seen {
 			if len(w.configs) >= maxConfigs {
-				return nil, nil, 0, fmt.Errorf("wire: write: more than %d distinct configs", maxConfigs)
+				return nil, nil, 0, limit("more than %d distinct configs", maxConfigs)
 			}
 			if c.Codec.Kind() == 0 {
 				return nil, nil, 0, fmt.Errorf("wire: write: config has unknown codec %d", c.Codec)
+			}
+			if n := max(len(c.VPS), len(c.SPS), len(c.PPS)); n > maxParamSets {
+				return nil, nil, 0, limit("config: %d parameter sets of one kind, at most %d", n, maxParamSets)
 			}
 			id = uint32(len(w.configs)) + 1
 			newCfg, newID = c, id
