@@ -207,7 +207,10 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   bucket per connection (2.5 times the stream's bitrate, between 2 Mbit/s and
   256 packets per 5 ms), so a GOP replay at join does not arrive as one burst
   that is too late at 120 ms latency. Vanished receivers are ended by the
-  reader goroutine, stalled ones from `conn.Stats`.
+  reader goroutine, stalled ones from `conn.Stats`. Stream IDs are taken
+  literally, never percent-decoded (ruling R-CI2): ffmpeg 6.x does not
+  URL-decode a URL's `streamid` (ffmpeg 8 does), so callers pass the ID raw
+  (`?streamid=#!::r=live/name`) or with `-streamid`.
 - DASH maps stream time to wallclock through the epoch anchors, with one fixed
   `availabilityStartTime` for the life of the stream. A period starts at
   `max(anchor, previous period end)`.
@@ -579,6 +582,18 @@ Items accepted for later, not yet placed in a milestone:
   (M3b3 Task 7 audio-only-stretch rows); broadcast IRDs may lose lock. Fix: move the PCR
   PID to a live track, or send PCR-only adaptation-field packets on the PCR
   PID while its track is silent; add a conform PCR-interval rule.
+
+- **In-band SPS/PPS in the fMP4 video track** (`avc3`/`hev1`, or the
+  parameter sets repeated in keyframe samples), so that decoders which ignore
+  a new init segment decode resolution changes cleanly. ffmpeg's HLS demuxer
+  (6.1 and 8) feeds every `EXT-X-MAP` into one mov demuxer, which skips the
+  new `moov` ("Found duplicated MOOV Atom"), and decodes the 640x360 stretch
+  of `TestHLSFFmpegAcrossGap` with the 320x240 parameter sets ("Reference N
+  >= M", "corrupt decoded frame").
+- **Timing-sensitive tests to watch in CI**: `TestSRTOpenContextAbortsListener`,
+  `TestSRTLossyLink` (299 of 300 video frames) and `TestM3b2SteadyState`'s UDP
+  player (273 of 275 video frames, 0 RTP lost) each failed once locally, only
+  under soak load, and passed alone and in CI.
 
 #### M3b3 deferred minors
 

@@ -11,7 +11,10 @@
 // request, an unknown name, a stream that is not live yet (hub.Live) and
 // every cap are refused with the same reason, srt.REJ_RESOURCE, and no
 // detail. A caller that retransmits its request after a refusal may be
-// counted twice in Stats.
+// counted twice in Stats. Stream IDs are taken literally, never
+// percent-decoded: ffmpeg 6.x sends a URL's streamid value undecoded (ffmpeg
+// 8 decodes it), so callers pass the ID raw (?streamid=#!::r=live/name) or
+// with ffmpeg's -streamid option.
 //
 // Each accepted connection streams MPEG-TS through internal/output/tsstream
 // with a subscription that holds the hub's cached GOP
