@@ -49,9 +49,15 @@ jobs:
       # ffmpeg (with libsrt), and the VLC-class peers of TestM3VLCClass:
       # VLC 3 (its SRT access is in vlc-plugin-access-extra) and GStreamer
       # 1.24 with the libav decoders. The runner's user is not root, which
-      # VLC requires.
+      # VLC requires. Runners whose mirror list puts an EC2 regional mirror
+      # first spent 23 min here: that mirror timed out on most packages
+      # (Ign, then a fallback to archive.ubuntu.com after each timeout).
+      # Dropping it leaves archive.ubuntu.com and security.ubuntu.com.
       - name: Install ffmpeg, VLC and GStreamer
         run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
           sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg \
             vlc-bin vlc-plugin-base vlc-plugin-access-extra \
             gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
@@ -156,9 +162,15 @@ jobs:
       # ffmpeg (with libsrt), and the VLC-class peers of TestM3VLCClass:
       # VLC 3 (its SRT access is in vlc-plugin-access-extra) and GStreamer
       # 1.24 with the libav decoders. The runner's user is not root, which
-      # VLC requires.
+      # VLC requires. Runners whose mirror list puts an EC2 regional mirror
+      # first spent 23 min here: that mirror timed out on most packages
+      # (Ign, then a fallback to archive.ubuntu.com after each timeout).
+      # Dropping it leaves archive.ubuntu.com and security.ubuntu.com.
       - name: Install ffmpeg, VLC and GStreamer
         run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
           sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg \
             vlc-bin vlc-plugin-base vlc-plugin-access-extra \
             gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
