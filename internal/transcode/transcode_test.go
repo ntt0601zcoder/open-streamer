@@ -98,12 +98,11 @@ func (e *events) of(k EventKind) []Event {
 
 // session is one transcoder run over a fed source hub.
 type session struct {
-	noHello bool // the first child never says Hello: feed without waiting
-	tr      *Transcoder
-	src     *hub.Hub
-	cols    []*collector
-	ev      *events
-	errc    chan error
+	tr   *Transcoder
+	src  *hub.Hub
+	cols []*collector
+	ev   *events
+	errc chan error
 }
 
 // start builds a transcoder over a new source hub and runs it.
@@ -131,14 +130,9 @@ func start(t *testing.T, opt Options) *session {
 	return s
 }
 
-// feed plays steps into the source, closes it and waits for Run. With a
-// child that says Hello, it starts once the first Hello has arrived: before
-// it the host never waits on the child and would drop what does not fit.
+// feed plays steps into the source, closes it and waits for Run.
 func (s *session) feed(t *testing.T, steps []step, speed float64) [][]media.Frame {
 	t.Helper()
-	if s.tr.needChild && !s.noHello {
-		require.Eventually(t, func() bool { return s.tr.hellos.Load() > 0 }, 10*time.Second, time.Millisecond)
-	}
 	<-play(t.Context(), s.src, steps, speed, true)
 	select {
 	case err := <-s.errc:
@@ -560,7 +554,7 @@ func TestTryChild(t *testing.T) {
 	require.NoError(t, err)
 	s := &run{t: tr}
 	assert.False(t, s.tryChild(wire.Discontinuity{}))
-	s.c = &child{in: make(chan wire.Message, 1)}
+	s.c = &child{in: make(chan wire.Message, 1), handed: true}
 	assert.True(t, s.tryChild(wire.Discontinuity{}))
 	assert.False(t, s.tryChild(wire.Discontinuity{}))
 	assert.Equal(t, 1, tr.Stats().MaxQueued)
@@ -624,7 +618,6 @@ func TestSupervisorWedgedChild(t *testing.T) {
 			opt.Renditions = []Rendition{encode240, copySrc}
 			opt.Audio.Copy = true
 			s := start(t, opt)
-			s.noHello = true
 			out := s.feed(t, steps, 4)
 			st := s.tr.Stats()
 			assert.EqualValues(t, 2, st.Spawns)
@@ -697,4 +690,138 @@ func TestSupervisorClosingChildExits(t *testing.T) {
 	assert.Contains(t, buf.String(), "line=\"closing child exits\"")
 	took := s.ev.firstAt(EventExited).Sub(s.ev.firstAt(EventSpawned))
 	t.Logf("exit %v after the spawn", took)
+}
+
+// longGOP repeats a one-epoch clip n times on a continuous timeline, in
+// epoch 1, and keeps the Key flag only on every gop-th video keyframe: a
+// live source with a GOP of gop seconds (the fixture keys every 1 s).
+func longGOP(steps []step, n, gop int) []step {
+	var anchor *media.Anchor
+	var clip []media.Frame
+	for _, s := range steps {
+		if s.anchor != nil {
+			if anchor == nil {
+				anchor = s.anchor
+			}
+			continue
+		}
+		clip = append(clip, s.f)
+	}
+	first, end := clip[0].DTS, clip[0].DTS
+	for _, f := range clip {
+		first = min(first, f.DTS)
+		d := int64(3600)
+		if f.Kind() == media.KindAudio {
+			d = 1920
+		}
+		end = max(end, f.PTS+d)
+	}
+	span := end - first
+	out := make([]step, 0, 1+len(clip)*n)
+	out = append(out, step{anchor: anchor})
+	keys := 0
+	for k := range n {
+		for _, f := range clip {
+			f.PTS += int64(k) * span
+			f.DTS += int64(k) * span
+			f.Epoch = anchor.Epoch
+			if f.Kind() == media.KindVideo && f.Key {
+				f.Key = keys%gop == 0
+				keys++
+			}
+			out = append(out, step{f: f, at: f.DTS})
+		}
+	}
+	return out
+}
+
+// Joining a live hub whose GOP cache holds a long GOP (over the child's 256
+// queue): the replayed GOP is held for the starting child, so there is no
+// bump, nothing is dropped, and the encoded rendition starts at the cached
+// keyframe.
+func TestSupervisorJoinsLiveLongGOP(t *testing.T) {
+	for _, gop := range []int{4, 8} {
+		t.Run(strconv.Itoa(gop)+"s", func(t *testing.T) {
+			steps := longGOP(fixtureSteps(t, "h264_aac.ts"), 3, gop)
+			// Write up to the second keyframe: the cache holds one whole GOP.
+			cut, keys := 0, 0
+			for i, s := range steps {
+				if s.anchor == nil && s.f.Kind() == media.KindVideo && s.f.Key {
+					keys++
+					if keys == 2 {
+						cut = i
+						break
+					}
+				}
+			}
+			require.NotZero(t, cut)
+			src := hub.New(hub.Options{})
+			<-play(t.Context(), src, steps[:cut], 0, false)
+			var cachedKey int64
+			for _, s := range steps[:cut] {
+				if s.anchor == nil && s.f.Kind() == media.KindVideo && s.f.Key {
+					cachedKey = s.f.PTS
+				}
+			}
+
+			opt := fakeOptions(t)
+			opt.Renditions = []Rendition{encode240, copySrc}
+			ev := &events{}
+			opt.OnEvent = ev.add
+			tr, err := New(src, opt)
+			require.NoError(t, err)
+			cols := make([]*collector, 0, len(opt.Renditions))
+			for _, h := range tr.Hubs() {
+				cols = append(cols, collect(h))
+			}
+			errc := make(chan error, 1)
+			go func() { errc <- tr.Run(t.Context()) }()
+			waitSub(t, src, "transcode")
+			// The rest arrives live (8× real time): an unpaced burst could
+			// overflow the source subscription on its own.
+			<-play(t.Context(), src, steps[cut:], 8, true)
+			require.NoError(t, <-errc)
+
+			enc := cols[0].wait(t)
+			cols[1].wait(t)
+			st := tr.Stats()
+			assert.Equal(t, []uint32{1}, epochs(enc))
+			assert.Zero(t, st.DroppedBeforeKey)
+			assert.Zero(t, st.Losses)
+			assert.Zero(t, tr.bumps.Load())
+			var firstVideo media.Frame
+			for _, f := range enc {
+				if f.Kind() == media.KindVideo {
+					firstVideo = f
+					break
+				}
+			}
+			assert.True(t, firstVideo.Key)
+			assert.Equal(t, cachedKey+Delay, firstVideo.PTS, "starts at the cached GOP's keyframe")
+			check(t, enc, "t240")
+		})
+	}
+}
+
+// The pre-Hello backlog holds maxBacklog messages; the next one is dropped
+// and requests a bump that feeds the child again from K after its Hello.
+func TestBacklogOverflow(t *testing.T) {
+	tr, err := New(hub.New(hub.Options{}), Options{Renditions: []Rendition{copySrc}, Audio: Audio{Copy: true}})
+	require.NoError(t, err)
+	var rt routed
+	s := &run{t: tr, ctx: t.Context()}
+	s.r = newTestRouter(&rt, true, false, true)
+	s.c = &child{in: make(chan wire.Message, childQueue), backlogCh: make(chan []wire.Message, 1)}
+	for range maxBacklog {
+		require.True(t, s.toChild(wire.Discontinuity{}))
+	}
+	assert.False(t, s.tryChild(wire.Discontinuity{}))
+	assert.False(t, s.toChild(wire.Discontinuity{}))
+	assert.True(t, s.r.em.isPending())
+	assert.False(t, s.r.childFed)
+	assert.EqualValues(t, 1, rt.dropped)
+	s.c.handOver()
+	assert.Len(t, <-s.c.backlogCh, maxBacklog)
+	assert.True(t, s.toChild(wire.Discontinuity{}), "after the Hello, the queue")
+	assert.Equal(t, 1, len(s.c.in))
 }

@@ -154,7 +154,7 @@ type router struct {
 	upOK     bool
 
 	// Hooks.
-	toChild   func(wire.Message)
+	toChild   func(wire.Message) bool // false: not queued
 	tryChild  func(wire.Message) bool // toChild without waiting; false: not queued
 	toCopy    func(f media.Frame)
 	setAnchor func(a media.Anchor)
@@ -201,7 +201,7 @@ func (r *router) deliver(d hub.Delivery) {
 		// A loss absorbed into a pending bump needs no second Discontinuity:
 		// the child gets nothing more until K.
 		if r.childFed && !r.em.isPending() {
-			r.toChild(wire.Discontinuity{})
+			_ = r.toChild(wire.Discontinuity{})
 		}
 		r.em.bump()
 		// With live video, the Lost delivery is the resume keyframe and K is
@@ -234,9 +234,9 @@ func (r *router) childExited() {
 	r.em.bump()
 }
 
-// overflowBeforeHello records a message the current child could not take
-// before its Hello: it is no longer fed, and a bump feeds it again from K
-// once it says Hello.
+// overflowBeforeHello records a message dropped because the current child's
+// pre-Hello backlog is full: the child is no longer fed, and a bump feeds it
+// again from K once it says Hello.
 func (r *router) overflowBeforeHello() {
 	r.dropped(1)
 	if !r.childFed {
@@ -360,7 +360,7 @@ func (r *router) beforeK(f media.Frame) {
 					r.openUpstream(f, ep)
 				}
 				f.Epoch = ep
-				r.sendCopyVideo(f)
+				_ = r.sendCopyVideo(f)
 			}
 		}
 	}
@@ -398,40 +398,49 @@ func (r *router) sendEvicted(a media.Frame) {
 	r.noteSent(a.PTS)
 }
 
-// send hands f, already in its rendition epoch, to its paths.
+// send hands f, already in its rendition epoch, to its paths. Only a frame
+// that some path took counts as sent.
 func (r *router) send(f media.Frame) {
+	sent := false
 	switch f.Kind() {
 	case media.KindVideo:
 		if r.copyVideo {
-			r.sendCopyVideo(f)
+			sent = r.sendCopyVideo(f)
 		}
 		if r.childVideo {
-			if r.childFed {
-				r.toChild(wire.Frame{Rung: -1, F: f})
-			} else {
-				r.dropped(1)
-			}
+			sent = r.sendChild(f) || sent
 		}
 	case media.KindAudio:
-		switch {
-		case r.copyAudio:
+		if r.copyAudio {
 			r.toCopy(f)
-		case r.childFed:
-			r.toChild(wire.Frame{Rung: -1, F: f})
-		default:
-			r.dropped(1)
+			sent = true
+		} else {
+			sent = r.sendChild(f)
 		}
 	}
-	r.noteSent(f.PTS)
+	if sent {
+		r.noteSent(f.PTS)
+	}
+}
+
+// sendChild hands f to the child when it is fed, and reports whether it was
+// queued. A frame the child does not take is counted in DroppedBeforeKey
+// (an overflow counts itself).
+func (r *router) sendChild(f media.Frame) bool {
+	if !r.childFed {
+		r.dropped(1)
+		return false
+	}
+	return r.toChild(wire.Frame{Rung: -1, F: f})
 }
 
 // sendCopyVideo hands a video frame to the copy renditions, dropping the
 // RASL frames after K up to the first trailing picture, as the hub does on
 // resume.
-func (r *router) sendCopyVideo(f media.Frame) {
+func (r *router) sendCopyVideo(f media.Frame) bool {
 	if r.rasl {
 		if f.RASL {
-			return
+			return false
 		}
 		if f.PTS > r.raslKey {
 			r.rasl = false
@@ -439,6 +448,7 @@ func (r *router) sendCopyVideo(f media.Frame) {
 	}
 	r.toCopy(f)
 	r.noteSent(f.PTS)
+	return true
 }
 
 func (r *router) noteSent(pts int64) {

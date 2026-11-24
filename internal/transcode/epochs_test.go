@@ -98,7 +98,7 @@ func newTestRouter(rt *routed, childVideo, copyVideo, childAudio bool) *router {
 		childVideo: childVideo, copyVideo: copyVideo, childAudio: childAudio, copyAudio: !childAudio,
 		mainVideo: -1,
 		childFed:  true,
-		toChild:   func(m wire.Message) { rt.child = append(rt.child, m) },
+		toChild:   func(m wire.Message) bool { rt.child = append(rt.child, m); return true },
 		tryChild:  func(m wire.Message) bool { rt.child = append(rt.child, m); return true },
 		toCopy:    func(f media.Frame) { rt.copied = append(rt.copied, f) },
 		setAnchor: func(a media.Anchor) { rt.anchors = append(rt.anchors, a) },

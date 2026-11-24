@@ -78,6 +78,9 @@ const (
 
 	// childQueue is the length of the child's input channel.
 	childQueue = 256
+	// maxBacklog bounds the frames held for a child before its Hello: the
+	// hub's GOP cache, which Subscribe replays in one burst.
+	maxBacklog = 1500
 	// stopGrace is how long a stopping child has before it is killed.
 	stopGrace = 2 * time.Second
 	// maxBFrames is the largest BFrames that Delay covers.
@@ -178,7 +181,6 @@ type Transcoder struct {
 	running  atomic.Bool
 	childOut atomic.Uint64 // frames received from children
 	bumps    atomic.Uint64 // bumps that took effect
-	hellos   atomic.Uint64 // valid Hellos received
 
 	mu    sync.Mutex
 	stats Stats
@@ -372,6 +374,7 @@ func (s *run) loop(sub *hub.Sub) error {
 			t.update(func(st *Stats) { st.FramesIn++ })
 			s.r.deliver(d)
 		case <-hello:
+			s.c.handOver()
 			s.r.childHello()
 		case <-done:
 			if err := s.exited(); err != nil {
@@ -441,39 +444,56 @@ func (s *run) scheduleRespawn(uptime time.Duration) {
 	s.delay = min(2*s.delay, o.RespawnMax)
 }
 
-// toChild queues m for the current child, waiting while its queue is full.
+// toChild queues m for the current child and reports whether it was
+// queued.
 //
-// Before the child's Hello it never waits: a child that is slow to start, or
-// never says Hello, must not stall the copy renditions. A message that does
-// not fit is dropped, and the child is then fed again only from the K of a
-// bump after its Hello, so its input never has a gap.
-func (s *run) toChild(m wire.Message) {
+// Until Run has taken the child's Hello, m goes to the child's pre-Hello
+// backlog, up to maxBacklog messages, and toChild never waits: Subscribe
+// replays the source hub's GOP cache in one burst, and a child that is slow
+// to start, or never says Hello, must not stall the copy renditions. On its
+// Hello the backlog is handed to the writer, which sends it ahead of
+// everything queued later. A message beyond maxBacklog is dropped, and the
+// child is then fed again only from the K of a bump after its Hello, so its
+// input never has a gap.
+//
+// Afterwards toChild waits while the child's queue is full.
+func (s *run) toChild(m wire.Message) bool {
 	c := s.c
 	if c == nil {
-		return
+		return false
 	}
-	select {
-	case <-c.helloOK:
-	default:
-		if !s.tryChild(m) {
+	if !c.handed {
+		if len(c.backlog) >= maxBacklog {
 			s.r.overflowBeforeHello()
+			return false
 		}
-		return
+		c.backlog = append(c.backlog, m)
+		return true
 	}
 	select {
 	case c.in <- m:
 		n := len(c.in)
 		s.t.update(func(st *Stats) { st.MaxQueued = max(st.MaxQueued, n) })
+		return true
 	case <-c.done:
 	case <-s.ctx.Done():
 	}
+	return false
 }
 
-// tryChild queues m for the current child if its queue has room.
+// tryChild is toChild without waiting: it queues m only if there is room,
+// in the backlog before the child's Hello or in its queue after.
 func (s *run) tryChild(m wire.Message) bool {
 	c := s.c
 	if c == nil {
 		return false
+	}
+	if !c.handed {
+		if len(c.backlog) >= maxBacklog {
+			return false
+		}
+		c.backlog = append(c.backlog, m)
+		return true
 	}
 	select {
 	case c.in <- m:
@@ -483,6 +503,17 @@ func (s *run) tryChild(m wire.Message) bool {
 	default:
 		return false
 	}
+}
+
+// handOver gives the child's pre-Hello backlog to its writer, once. From
+// then on, messages go to its queue.
+func (c *child) handOver() {
+	if c.handed {
+		return
+	}
+	c.handed = true
+	c.backlogCh <- c.backlog
+	c.backlog = nil
 }
 
 func (t *Transcoder) newRouter(s *run) *router {
@@ -565,6 +596,12 @@ type child struct {
 	started time.Time
 	stopped sync.Once
 
+	// Owned by the Run goroutine: the frames queued before Run took the
+	// Hello, and whether they were handed to the writer through backlogCh.
+	backlog   []wire.Message
+	handed    bool
+	backlogCh chan []wire.Message
+
 	reapMu sync.Mutex
 	reaped bool // the waiter has reaped the process: its pgid may be reused
 
@@ -587,15 +624,16 @@ func (t *Transcoder) startChild(wg *sync.WaitGroup) (*child, error) {
 	lw.pid = p.pid
 	close(lw.ready)
 	c := &child{
-		p:       p,
-		w:       wire.NewWriter(p.conn),
-		in:      make(chan wire.Message, childQueue),
-		quit:    make(chan struct{}),
-		helloOK: make(chan struct{}),
-		hello:   make(chan struct{}, 1),
-		exited:  make(chan struct{}),
-		done:    make(chan struct{}),
-		started: t.opt.Now(),
+		p:         p,
+		w:         wire.NewWriter(p.conn),
+		in:        make(chan wire.Message, childQueue),
+		quit:      make(chan struct{}),
+		helloOK:   make(chan struct{}),
+		hello:     make(chan struct{}, 1),
+		backlogCh: make(chan []wire.Message, 1),
+		exited:    make(chan struct{}),
+		done:      make(chan struct{}),
+		started:   t.opt.Now(),
 	}
 	readDone := make(chan struct{})
 	wg.Add(3)
@@ -663,7 +701,6 @@ func (t *Transcoder) readChild(c *child) error {
 		_ = c.p.conn.SetReadDeadline(time.Time{})
 	}
 	c.reapMu.Unlock()
-	t.hellos.Add(1)
 	close(c.helloOK)
 	c.hello <- struct{}{}
 	for {
@@ -727,6 +764,22 @@ func (t *Transcoder) writeChild(c *child) {
 		c.kill()
 		return
 	}
+	// The backlog, handed over by Run on the Hello (or on stop), goes ahead
+	// of everything in c.in.
+	select {
+	case backlog := <-c.backlogCh:
+		for _, m := range backlog {
+			if err := c.w.Write(m); err != nil {
+				c.kill()
+				return
+			}
+		}
+	case <-c.quit:
+		_ = c.w.Write(wire.Stop{})
+		return
+	case <-c.exited:
+		return
+	}
 	for {
 		select {
 		case m, ok := <-c.in:
@@ -765,6 +818,7 @@ func (c *child) wait(readDone <-chan struct{}) {
 // once otherwise. After stopGrace it kills the child's process group. It
 // returns once the child is reaped and its reader has ended.
 func (c *child) stop(graceful bool) {
+	c.handOver() // a child that says Hello late still gets its backlog
 	c.stopped.Do(func() {
 		_ = c.p.conn.SetWriteDeadline(time.Now().Add(stopGrace))
 		if graceful {
