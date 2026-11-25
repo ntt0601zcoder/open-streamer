@@ -3,6 +3,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1045,4 +1046,228 @@ func TestM4bRungGap(t *testing.T) {
 	cmd.Stderr = &stderr
 	require.NoError(t, cmd.Run(), stderr.String())
 	assert.Empty(t, stderr.String(), "ffmpeg stderr")
+}
+
+// m4bPlayerPasses is how many times TestM4bPlayers replays the
+// presentation, at its pace, into each player's live packager: 4 (20 s), as
+// TestM4aVLC, rather than 3. GStreamer 1.28's DASH client joins
+// suggestedPresentationDelay (6 s) behind the live edge of a five-segment
+// window (10.08 s), so at 4.08 s, and buffers 10 s before its first buffer:
+// media up to 14.08 s, exactly the end of the last segment a 15 s replay
+// closes (the open one never closes). VLC's DASH dump held 5.3 s of the
+// 4 s it needs with 3.
+const m4bPlayerPasses = 4
+
+// gstDASHWindowLimit is GStreamer 1.24's defect with a live DASH
+// SegmentTimeline whose window slides (TestM4bPlayers' gstreamer/dash row).
+const gstDASHWindowLimit = "GStreamer 1.24's dashdemux2 (1.24.2) skips segments of a live DASH SegmentTimeline " +
+	"after each MPD update that evicted segments: it asks for fragments ahead of the live edge (Download waiting " +
+	"for 5 s, Seek to after last segment) and stalls, with no buffer at all or none after its first 8 s. Seen on " +
+	"the ABR presentation and on the plain M3 DASH of h264_aac.ts and of a seamless video-only loop; with a " +
+	"60-segment window that did not slide it played, but only after 8.5 s to over 12 s (it finds new segments " +
+	"only at each 2 s MPD refresh), past the pass rule's 10 s. GStreamer 1.28.2 passes the pass rule on the " +
+	"sliding window (first buffer after 4 to 6 s); see the Backlog for what it does over 30 s"
+
+// The gstreamer/dash limit probe (OS_PEER_LIMITS=1 on GStreamers before
+// 1.28) replays the presentation gstLimitPasses times (60 s), so that the
+// window slides for all of its gstLimitRun run: with a short replay the
+// window stops sliding when the replay ends and GStreamer 1.24 then fills
+// its buffer and plays. GStreamer 1.24.2 got no buffer, or 225 to 308
+// video buffers and none after 8.2 s (6 runs); 1.28.2, though it also
+// skipped ahead once, still got video buffers 24 s in (2 runs).
+const (
+	gstLimitPasses = 12
+	gstLimitRun    = 30 * time.Second
+	gstLimitTail   = 10 * time.Second
+)
+
+// liveABR replays steps passes times at their pace (pacedFeed) into a hub
+// packaged live, on the real clock, by an ABR packager subscribed before
+// the first write, serves it as stream s, and returns the packager and the
+// stream's base URL (ending in "/") once the hub has video and audio.
+func liveABR(t *testing.T, steps []step, passes int) (*live.Packager, string) {
+	t.Helper()
+	var p *live.Packager
+	done := make(chan struct{})
+	r := startFeed(t, pacedFeed(steps, passes), func(h *hub.Hub) {
+		p = live.NewPackager(h, live.Options{ABR: true})
+		sub := h.Subscribe("packager", bigQueue)
+		go func() {
+			defer close(done)
+			p.Run(context.Background(), sub)
+		}()
+	})
+	t.Cleanup(func() {
+		r.cancel()
+		r.wait()
+		<-done
+	})
+	origin := serveHTTP(t, "", map[string]*hub.Hub{"s": r.h}, map[string]*live.Packager{"s": p}, 0, nil)
+	waitAV(t, r.h)
+	return p, origin + "/live/s/"
+}
+
+// probeABR runs ffprobe on u and returns the heights of the video streams
+// it lists, sorted, the number of audio streams, and its stderr.
+func probeABR(t *testing.T, ffprobe, u string) (heights []int, audio int, stderr string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffprobe, "-v", "error", "-show_entries", "stream=index,codec_type,height",
+		"-of", "json", u)
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	out, err := cmd.Output()
+	require.NoError(t, err, "ffprobe %s: %s", u, errb.String())
+	var v struct {
+		Streams []struct {
+			Type   string `json:"codec_type"`
+			Height int    `json:"height"`
+		} `json:"streams"`
+	}
+	require.NoError(t, json.Unmarshal(out, &v), "ffprobe %s: %s", u, out)
+	for _, s := range v.Streams {
+		switch s.Type {
+		case "video":
+			heights = append(heights, s.Height)
+		case "audio":
+			audio++
+		}
+	}
+	slices.Sort(heights)
+	return heights, audio, errb.String()
+}
+
+// gstMinor returns the minor version of a GStreamer 1.x gst-launch-1.0
+// ("gst-launch-1.0 version 1.24.2"), and false when it does not parse.
+func gstMinor(t *testing.T, gst testpeer.Peer) (int, bool) {
+	t.Helper()
+	v := gst.Version(t)
+	_, rest, ok := strings.Cut(v, " version 1.")
+	if !ok {
+		return 0, false
+	}
+	minor, _, _ := strings.Cut(rest, ".")
+	n, err := strconv.Atoi(minor)
+	return n, err == nil
+}
+
+// TestM4bPlayers plays the ABR presentation of h264_aac.ts (the M4a
+// ladder: t240, t180, t120 and src, a copy of the 320x240 source), replayed
+// m4bPlayerPasses times at its pace into a live ABR packager per row, with
+// real players:
+//
+//   - ffprobe on hls/index.m3u8, cmaf/master.m3u8 and cmaf/index.mpd lists
+//     4 video streams, of heights 240, 180, 120 and the source's (240), and
+//     audio, with nothing on stderr.
+//   - VLC plays each of the three with TestM3VLCClass's pass rule (6 s to
+//     the stats, the dump of at least 4 s of each kind), tolerating its
+//     start-up pair as that test's adaptive rows and TestM4aVLC do (ruling
+//     R-T1c); any other decoder error fails.
+//   - GStreamer (uridecodebin3, as TestM3GStreamerClass) plays
+//     hls/index.m3u8 and cmaf/index.mpd with the GStreamer pass rule: each
+//     sink gets a buffer within 10 s, and no ERROR in 12 s. GStreamer 1.24
+//     cannot play a live DASH window that slides (gstDASHWindowLimit): on
+//     GStreamers before 1.28 the gstreamer/dash row skips naming it, or with
+//     OS_PEER_LIMITS=1 probes it (gstLimitPasses, gstLimitRun) and fails if
+//     that GStreamer still gets video buffers in the run's last
+//     gstLimitTail.
+//
+// The VLC rows run one after the other (as TestM3VLCClass's); the ffprobe
+// and GStreamer rows overlap them, each on its own replay.
+func TestM4bPlayers(t *testing.T) {
+	bin := testpeer.OSTranscoder(t)
+	ffprobe := testpeer.Require(t, "ffprobe")
+	steps := m4bRuns(t, bin, "h264_aac.ts")["h264_aac.ts"].presentation
+	srcHeight := 0
+	for _, f := range stepFrames(steps) {
+		if f.Track == transcode.PresentationTrack(len(m4bLadder(bin).Renditions)-1) && f.Config != nil {
+			srcHeight = f.Config.Height
+			break
+		}
+	}
+	require.Equal(t, 240, srcHeight, "h264_aac.ts is 320x240")
+	want := []int{120, 180, 240, srcHeight}
+	slices.Sort(want)
+
+	for _, f := range abrFormats {
+		t.Run("ffprobe/"+f.name, func(t *testing.T) {
+			t.Parallel()
+			p, base := liveABR(t, steps, m4bPlayerPasses)
+			waitListed(t, p, 3)
+			heights, audio, stderr := probeABR(t, ffprobe, base+f.path)
+			t.Logf("%s: video heights %v, %d audio streams; stderr %q", f.path, heights, audio, stderr)
+			assert.Equal(t, want, heights, "the 4 rungs' video")
+			assert.Positive(t, audio, "audio")
+			assert.Empty(t, stderr, "ffprobe stderr")
+		})
+	}
+	t.Run("vlc", func(t *testing.T) {
+		t.Parallel()
+		for _, row := range []struct {
+			name, path string
+			modules    []string
+		}{
+			{"hls-ts", "hls/index.m3u8", []string{"adaptive", "ts", "avcodec"}},
+			{"hls-fmp4", "cmaf/master.m3u8", []string{"adaptive", "mp4", "avcodec"}},
+			{"dash", "cmaf/index.mpd", []string{"adaptive", "mp4", "avcodec"}},
+		} {
+			t.Run(row.name, func(t *testing.T) {
+				vlc := testpeer.VLC(t, row.modules...)
+				p, base := liveABR(t, steps, m4bPlayerPasses)
+				// A window of five segments (10 s), as TestM3VLCClass:
+				// VLC's DASH client starts suggestedPresentationDelay (6 s)
+				// behind the live edge.
+				waitListed(t, p, 5)
+				vlcPlays(t, vlc, ffprobe, base+row.path, true)
+			})
+		}
+	})
+	hlsTS := []string{"uridecodebin3", "hlsdemux2", "tsdemux", "avdec_h264", "avdec_aac", "queue", "fakesink"}
+	dash := []string{"uridecodebin3", "dashdemux2", "qtdemux", "avdec_h264", "avdec_aac", "queue", "fakesink"}
+	for _, row := range []struct {
+		name, path string
+		elements   []string
+	}{
+		{"hls-ts", "hls/index.m3u8", hlsTS},
+		{"dash", "cmaf/index.mpd", dash},
+	} {
+		t.Run("gstreamer/"+row.name, func(t *testing.T) {
+			t.Parallel()
+			gst := testpeer.GStreamer(t, row.elements...)
+			limited, passes := false, m4bPlayerPasses
+			if row.name == "dash" {
+				minor, ok := gstMinor(t, gst)
+				require.True(t, ok, "%s: version %q", gst, gst.Version(t))
+				if minor < 28 {
+					peerLimit(t, gstDASHWindowLimit)
+					limited, passes = true, gstLimitPasses
+				}
+			}
+			p, base := liveABR(t, steps, passes)
+			// Five segments, as for VLC: GStreamer 1.28's dashdemux2 joins
+			// suggestedPresentationDelay (6 s) behind the live edge and
+			// buffers 10 s (adaptivedemux2's low watermark) before its
+			// first buffer, which came after 8 s of the pass rule's 10
+			// with three segments listed, and after 4 to 6 s with five.
+			waitListed(t, p, 5)
+			if !limited {
+				gstPlays(t, gst, hlsPipeline(base+row.path))
+				return
+			}
+			// The probe: a window that slides for all of a gstLimitRun run;
+			// a GStreamer that plays it still gets video buffers in the
+			// run's last gstLimitTail.
+			res := <-runGst(t, gst, hlsPipeline(base+row.path), gstLimitRun)
+			var last time.Duration
+			if ts := res.times["v"]; len(ts) > 0 {
+				last = ts[len(ts)-1].Sub(res.start)
+			}
+			t.Logf("%s: buffers %v in %v, the last video buffer after %v, errors %q (limit probe)", gst,
+				res.counts(), gstLimitRun, last.Round(time.Millisecond), res.errLines)
+			if last > gstLimitRun-gstLimitTail {
+				t.Errorf("%s now plays a sliding live DASH window: lift the skip", gst)
+			}
+		})
+	}
 }
