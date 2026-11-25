@@ -553,6 +553,24 @@ func buildTSMaster(s Snapshot) []byte {
 	return pl.Encode()
 }
 
+// tsVariantTargetDuration returns the EXT-X-TARGETDURATION shared by every
+// hls/v{track}.m3u8, computed like targetDuration over every listed
+// segment's duration, which is each gap entry's EXTINF, and every listed
+// variant TS's Duration, which is each real entry's. Whichever variant is
+// rendered first, every variant gets one value that bounds every EXTINF of
+// every one of them (RFC 8216 section 6.2.4), as cmafTargetDuration does
+// for the CMAF track playlists.
+func (p *Packager) tsVariantTargetDuration(s Snapshot) int {
+	var extinfs []time.Duration
+	for _, seg := range s.Segments[:s.Listed] {
+		extinfs = append(extinfs, media.ToDuration(seg.Duration))
+		for _, v := range seg.VariantTS {
+			extinfs = append(extinfs, media.ToDuration(v.Duration))
+		}
+	}
+	return p.targetDuration("hls-abr", s, extinfs)
+}
+
 // buildTSVariant renders hls/v{track}.m3u8 in ABR mode (ruling R-B4). It
 // returns nil when the snapshot is not ABR or track is not a tsVariants
 // track.
@@ -579,7 +597,6 @@ func buildTSVariant(p *Packager, s Snapshot, track int) []byte {
 		MediaSequence:         listed[0].Seq,
 		DiscontinuitySequence: s.EvictedDiscontinuities,
 	}
-	extinfs := make([]time.Duration, 0, len(listed))
 	name := strconv.Itoa(track) + "-" // Seq follows
 	for i, seg := range listed {
 		e := hls.Segment{
@@ -596,9 +613,8 @@ func buildTSVariant(p *Packager, s Snapshot, track int) []byte {
 			e.ProgramDateTime = pdt(s, seg.Epoch, seg.Start)
 		}
 		pl.Segments = append(pl.Segments, e)
-		extinfs = append(extinfs, e.Duration)
 	}
-	pl.TargetDuration = p.targetDuration("hls-abr", s, extinfs)
+	pl.TargetDuration = p.tsVariantTargetDuration(s)
 	pl.Independent = independent(s, listedEpochs(s))
 	pl.Ended = ended(s)
 	return pl.Encode()

@@ -1254,3 +1254,46 @@ func TestABRTSVariantOwnDuration(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, c.Violations)
 }
+
+// Every TS variant shows one TARGETDURATION (RFC 8216 section 6.2.4),
+// whichever is fetched first: rungs 0 and 1 stop right after their
+// keyframe at 4 s while rung 2 goes on for 6 s, past the 2 s target, until
+// epoch 2, so only v2 lists a 6 s EXTINF.
+func TestABRTSVariantsShareTargetDuration(t *testing.T) {
+	pack := func() http.Handler {
+		var ds []hub.Delivery
+		for _, d := range synthLadder(t, 1, 0, 250) {
+			if d.Frame.Track < 2 && d.Frame.PTS > 100*3600 {
+				continue
+			}
+			ds = append(ds, d)
+		}
+		ds = append(ds, synthLadder(t, 2, 250*3600, 100)...)
+		h := hub.New(hub.Options{})
+		h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+		h.SetAnchor(media.Anchor{Epoch: 2, Start: 250 * 3600, Wall: t0.Add(10 * time.Second)})
+		p := NewPackager(h, Options{Window: 100, Now: farFuture, ABR: true})
+		handleAll(p, ds)
+		p.End()
+		require.Zero(t, p.Errors())
+		seg := p.Snapshot().Segments[2]
+		require.EqualValues(t, 3600, seg.Duration)
+		return serve(p)
+	}
+	for _, first := range []int{0, 2} {
+		srv := pack()
+		order := []int{first}
+		for track := range ladderSizes {
+			if track != first {
+				order = append(order, track)
+			}
+		}
+		for _, track := range order {
+			pl := media3(t, srv, "/live/s/hls/v"+strconv.Itoa(track)+".m3u8")
+			assert.Equal(t, 6, pl.TargetDuration, "v%d fetched after v%d", track, first)
+			if track == 2 {
+				assert.Equal(t, 6*time.Second, pl.Segments[2].Duration, "v2's long EXTINF")
+			}
+		}
+	}
+}
