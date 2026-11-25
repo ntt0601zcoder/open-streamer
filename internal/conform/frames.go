@@ -51,6 +51,10 @@ func (v Violation) String() string {
 type FrameOptions struct {
 	MaxStartOffset int64    // 0 means 3600 (40 ms).
 	Skip           []string // Rule names not to check.
+	// LateStart, when set, reports a track whose late start in an epoch is
+	// declared (an HLS playlist whose first entry in the epoch is a gap):
+	// RuleStartOffset neither checks it nor measures the others from it.
+	LateStart func(track int, epoch uint32) bool
 }
 
 type trackState struct {
@@ -187,15 +191,22 @@ func CheckFrames(frames []media.Frame, opt FrameOptions) []Violation {
 	}
 
 	if on(RuleStartOffset) {
+		late := func(k trackEpoch) bool { return opt.LateStart != nil && opt.LateStart(k.track, k.epoch) }
 		earliest := map[uint32]int64{}
 		for _, k := range teOrder {
 			st := te[k]
+			if late(k) {
+				continue
+			}
 			if e, ok := earliest[k.epoch]; !ok || st.firstPTS < e {
 				earliest[k.epoch] = st.firstPTS
 			}
 		}
 		for _, k := range teOrder {
 			st := te[k]
+			if late(k) {
+				continue
+			}
 			if d := st.firstPTS - earliest[k.epoch]; d > maxOffset {
 				out = append(out, Violation{
 					Rule: RuleStartOffset, Track: k.track, Index: st.index,

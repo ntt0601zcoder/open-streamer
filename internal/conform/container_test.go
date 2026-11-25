@@ -1555,6 +1555,23 @@ func TestVariantAlignedIgnoresGaps(t *testing.T) {
 	assert.Equal(t, 1, c.HLSGaps)
 }
 
+// A playlist whose first entry in an epoch is a gap declares its media
+// missing there: its tracks start late in the epoch without breaking
+// track-start-offset, which still compares the playlists that start on
+// time.
+func TestStartOffsetAfterGap(t *testing.T) {
+	segs := videoSegs(t)
+	for _, tsSegs := range []bool{false, true} {
+		m := map[string][]byte{}
+		addHLS(t, m, "a", segs, tsSegs, nil)
+		addHLS(t, m, "b", segs, tsSegs, map[int]bool{0: true})
+		abrMaster(m)
+		c := readABR(t, m)
+		assert.Zero(t, countRule(c.Violations, RuleStartOffset), "ts %v: %v", tsSegs, c.Violations)
+		assert.Equal(t, 1, c.HLSGaps)
+	}
+}
+
 func TestVariantAlignedOpenGOP(t *testing.T) {
 	segs := videoSegs(t)
 	open := slices.Clone(segs)

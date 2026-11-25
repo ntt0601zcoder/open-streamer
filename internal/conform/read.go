@@ -198,6 +198,7 @@ type hlsPlaylist struct {
 	target   time.Duration
 	captured time.Duration
 	records  []tsRecord
+	real     map[uint32]bool // epochs with a real entry seen
 }
 
 // hlsEntry is what the gap-duration rule needs from one media playlist
@@ -311,7 +312,9 @@ type hlsVariant struct {
 // has ended.
 //
 // Gap entries (EXT-X-GAP) are counted in HLSGaps and never fetched; their
-// discontinuities count like any entry's. With AlignedSequences, a gap
+// discontinuities count like any entry's. A playlist whose first entry in
+// an epoch is a gap declares its media missing there, so its tracks are
+// left out of RuleStartOffset in that epoch. With AlignedSequences, a gap
 // entry's EXTINF must match the EXTINF of the same media sequence number
 // in every other playlist, within one frame of a real entry's track (1 ms
 // against another gap): RuleGapDuration.
@@ -773,6 +776,16 @@ func (c *hlsCapture) poll(ctx context.Context, pl *hlsPlaylist, p hls.MediaPlayl
 			pl.polled = true
 		}
 		pl.next = msn + 1
+		if pl.real == nil {
+			pl.real = map[uint32]bool{}
+		}
+		if s.Gap && !pl.real[epoch] {
+			// Its media starts late in the epoch, as the gap declares.
+			c.b.gapStart[srcEpoch{pl.src, epoch}] = true
+		}
+		if !s.Gap {
+			pl.real[epoch] = true
+		}
 		if s.Gap {
 			u, err := resolve(pl.url, s.URI)
 			if err != nil {

@@ -97,10 +97,33 @@ type builder struct {
 	// start rules apply to the first epoch.
 	fromStart  bool
 	firstEpoch uint32
+	// gapStart holds the sources (HLS playlists) whose first entry in an
+	// epoch is a gap: their tracks may start late in it.
+	gapStart map[srcEpoch]bool
+}
+
+// srcEpoch names one epoch of one source.
+type srcEpoch struct {
+	src   string
+	epoch uint32
 }
 
 func newBuilder() *builder {
-	return &builder{tracks: map[trackKey]int{}, last: map[int]cfgState{}, seen: map[string]bool{}}
+	return &builder{
+		tracks: map[trackKey]int{}, last: map[int]cfgState{}, seen: map[string]bool{},
+		gapStart: map[srcEpoch]bool{},
+	}
+}
+
+// lateStart reports whether capture track track comes from a source whose
+// first entry in epoch is a gap.
+func (b *builder) lateStart(track int, epoch uint32) bool {
+	for k, n := range b.tracks {
+		if n == track && b.gapStart[srcEpoch{k.src, epoch}] {
+			return true
+		}
+	}
+	return false
 }
 
 // track maps a source track to the capture's track number, in order of
@@ -229,7 +252,7 @@ func (b *builder) finish() Capture {
 	}
 	switch {
 	case b.httpTS || b.fromStart:
-		out = append(out, CheckFrames(frames, FrameOptions{Skip: skip})...)
+		out = append(out, CheckFrames(frames, FrameOptions{Skip: skip, LateStart: b.lateStart})...)
 	default:
 		// The first epoch was joined mid-way: the start rules apply only to
 		// the later epochs.
@@ -243,7 +266,7 @@ func (b *builder) finish() Capture {
 			}
 		}
 		only := slices.DeleteFunc(slices.Clone(frameRules), func(r string) bool { return slices.Contains(startRules, r) })
-		for _, v := range CheckFrames(later, FrameOptions{Skip: only}) {
+		for _, v := range CheckFrames(later, FrameOptions{Skip: only, LateStart: b.lateStart}) {
 			v.Index = index[v.Index]
 			out = append(out, v)
 		}
