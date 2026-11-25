@@ -483,26 +483,66 @@ func TestPlayJoinsAtKeyframe(t *testing.T) {
 }
 
 // A carried track's codec change ends the session with a BYE on every
-// track, then the connection closes; no H.265 reaches the player.
+// track, then the connection closes; no H.265 reaches the player. Every
+// H.264 frame reaches it unless the hub dropped some for it (under load):
+// then a GOP or more is missing, but never the cached one.
 func TestPlayCodecChangeEndsSession(t *testing.T) {
 	e := start(t, Options{}, false)
-	avc := looped(t, "h264_aac.ts", 1)
+	avc := tagged(looped(t, "h264_aac.ts", 1))
 	hevc := looped(t, "h265_aac51.ts", 1)
 	hevc = shift(hevc, lastDTS(avc)+3600-hevc[0].DTS, avc[len(avc)-1].Epoch+1)
 	gop, rest := firstGOP(avc)
 	for _, f := range gop {
 		e.h.Write(f)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	c := play(t, e.url, "tcp", nil)
 	s := sessionOf(c)
 	pkts := collect(c, nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// The session subscribes after the PLAY response: fed before that, it
+	// can start at the second GOP's keyframe, from the cache.
+	require.Eventually(t, func() bool { return len(e.h.Stats()) == 1 }, waitFor, time.Millisecond, "subscribed")
+	// The session's hub drops, polled until it unsubscribes.
+	var dropped uint64
+	polled := make(chan struct{})
+	go func() {
+		defer close(polled)
+		tk := time.NewTicker(time.Millisecond)
+		defer tk.Stop()
+		seen := false
+		for {
+			if st := e.h.Stats(); len(st) > 0 {
+				dropped, seen = st[len(st)-1].Dropped, true
+			} else if seen {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-tk.C:
+			}
+		}
+	}()
 	<-feed(ctx, e.h, append(rest, hevc...), 8, nil)
 	r := wait(t, pkts)
 	require.Error(t, r.err)
 	sum := check(t, s, r.pkts, true)
-	assert.Equal(t, 150, sum.videoAUs, "every H.264 frame, none after")
+	for _, i := range tagIndexes(t, s, r.pkts) { // H.265 frames carry no tag
+		require.Less(t, i, len(avc), "an H.264 frame")
+	}
+	select {
+	case <-polled:
+	case <-time.After(waitFor):
+		t.Fatal("the session did not unsubscribe")
+	}
+	if dropped == 0 {
+		assert.Equal(t, 150, sum.videoAUs, "every H.264 frame, none after")
+	} else {
+		t.Logf("the hub dropped %d frames; %d video access units", dropped, sum.videoAUs)
+		assert.GreaterOrEqual(t, sum.videoAUs, 25, "the cached GOP")
+		assert.Less(t, sum.videoAUs, 150, "a dropped GOP")
+	}
 	assert.Equal(t, 2, sum.byes, "a BYE per track")
 	last := r.pkts[len(r.pkts)-1]
 	require.NotNil(t, last.RTCP, "the BYEs come last")
