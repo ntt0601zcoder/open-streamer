@@ -60,6 +60,7 @@ package hub
 
 import (
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
@@ -155,6 +156,7 @@ type Hub struct {
 	anchor  int                // track the cache is anchored on, or -1 for the audio cache
 	cache   []media.Frame
 	anchors []media.Anchor // oldest first, at most maxAnchors
+	refused []string       // subscriber-name prefixes set by Refuse
 }
 
 // Sub is one subscriber. Its methods are safe for concurrent use.
@@ -231,8 +233,9 @@ func (h *Hub) Write(f media.Frame) {
 }
 
 // Subscribe adds a subscriber with a queue of the given length (0 means
-// 1024) and replays the cache into it when the cache fits. On a closed hub
-// it returns a subscriber whose channel is already closed.
+// 1024) and replays the cache into it when the cache fits. On a closed hub,
+// or under a name Refuse refuses, it returns a subscriber whose channel is
+// already closed.
 func (h *Hub) Subscribe(name string, queue int) *Sub {
 	if queue <= 0 {
 		queue = defaultQueue
@@ -299,7 +302,7 @@ func (h *Hub) Live() bool {
 // cache when replay is set and the cache fits. Called with h.mu held.
 func (h *Hub) subscribe(name string, queue int, replay bool) *Sub {
 	s := &Sub{h: h, name: name, ch: make(chan Delivery, queue), gates: map[int]trackGate{}}
-	if h.closed {
+	if h.closed || h.isRefused(name) {
 		s.closed = true
 		close(s.ch)
 		return s
@@ -318,6 +321,41 @@ func (h *Hub) subscribe(name string, queue int, replay bool) *Sub {
 	}
 	h.subs = append(h.subs, s)
 	return s
+}
+
+// Refuse replaces the set of refused subscriber-name prefixes. Every open
+// subscriber whose name starts with one of them is closed, as by Sub.Close,
+// and a later Subscribe, SubscribeLive or SubscribeCached under such a name
+// returns a closed Sub, as on a closed hub. Refuse() refuses nothing. It
+// returns the number of subscribers it closed.
+func (h *Hub) Refuse(prefixes ...string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refused = slices.Clone(prefixes)
+	kept := h.subs[:0]
+	for _, s := range h.subs {
+		if h.isRefused(s.name) {
+			s.closed = true
+			close(s.ch)
+			continue
+		}
+		kept = append(kept, s)
+	}
+	n := len(h.subs) - len(kept)
+	clear(h.subs[len(kept):])
+	h.subs = kept
+	return n
+}
+
+// isRefused reports whether a subscriber named name is refused. Called with
+// h.mu held.
+func (h *Hub) isRefused(name string) bool {
+	for _, p := range h.refused {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // Stats returns the counters of every open subscriber, in subscription

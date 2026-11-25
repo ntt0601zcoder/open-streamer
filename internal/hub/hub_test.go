@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -806,4 +807,181 @@ func TestHubSubscribeLive(t *testing.T) {
 	a.Close()
 	_, ok := <-a.SubscribeLive("late", 4).C()
 	assert.False(t, ok, "closed hub: closed channel")
+}
+
+// requireClosed checks that s's channel is closed with nothing queued.
+func requireClosed(t *testing.T, s *Sub) {
+	t.Helper()
+	select {
+	case d, ok := <-s.C():
+		require.False(t, ok, "delivery on a refused subscriber: %+v", d.Frame)
+	default:
+		require.FailNow(t, "channel open")
+	}
+}
+
+func statNames(h *Hub) []string {
+	stats := h.Stats()
+	out := make([]string, 0, len(stats))
+	for _, st := range stats {
+		out = append(out, st.Name)
+	}
+	return out
+}
+
+// Refuse closes every open subscriber whose name starts with a refused
+// prefix, as Sub.Close does, and leaves the others alone.
+func TestRefuseClosesMatching(t *testing.T) {
+	h := New(Options{})
+	defer h.Close()
+	ra, rb := h.Subscribe("rtsp a", 0), h.SubscribeCached("rtsp b", 0)
+	ma, px := h.SubscribeLive("rtmp a", 0), h.Subscribe("rtmppush x", 0)
+
+	assert.Equal(t, 2, h.Refuse("rtsp "))
+	requireClosed(t, ra)
+	requireClosed(t, rb)
+	ra.Close() // idempotent: already closed
+	rb.Close()
+
+	h.Write(vid(0, 0, true))
+	for _, s := range []*Sub{ma, px} {
+		d := recv(t, s)
+		assert.True(t, d.Frame.Key)
+	}
+	assert.Equal(t, []string{"rtmp a", "rtmppush x"}, statNames(h))
+	assert.Zero(t, h.Refuse("rtsp "), "nothing left to close")
+}
+
+// After Refuse, every way to subscribe under a refused name returns a closed
+// subscriber, as on a closed hub: nothing is replayed and it is not in Stats.
+func TestRefuseBlocksLaterSubscribes(t *testing.T) {
+	h := New(Options{})
+	defer h.Close()
+	writeGOP(h, 0, 5) // a cache that a subscriber would be replayed
+	assert.Zero(t, h.Refuse("srt "))
+
+	const name = "srt 1.2.3.4:5"
+	for _, s := range []*Sub{h.Subscribe(name, 0), h.SubscribeLive(name, 0), h.SubscribeCached(name, 0)} {
+		requireClosed(t, s)
+		s.Close()
+	}
+	assert.Empty(t, h.Stats())
+
+	m := h.Subscribe("rtmp a", 0)
+	defer m.Close()
+	got := drain(t, m, 5)
+	assert.True(t, got[0].Frame.Key, "the cache is replayed to a name not refused")
+	assert.Equal(t, []string{"rtmp a"}, statNames(h))
+}
+
+// Each Refuse replaces the set: Refuse() refuses nothing.
+func TestRefuseReplaces(t *testing.T) {
+	h := New(Options{})
+	defer h.Close()
+	h.Refuse("rtsp ")
+	requireClosed(t, h.Subscribe("rtsp a", 0))
+
+	assert.Zero(t, h.Refuse())
+	ra := h.Subscribe("rtsp a", 0)
+	m, sr := h.Subscribe("rtmp b", 0), h.SubscribeLive("srt c", 0)
+	assert.Equal(t, []string{"rtsp a", "rtmp b", "srt c"}, statNames(h))
+
+	assert.Equal(t, 2, h.Refuse("rtmp ", "srt "))
+	requireClosed(t, m)
+	requireClosed(t, sr)
+	requireClosed(t, h.SubscribeCached("rtmp d", 0))
+	requireClosed(t, h.Subscribe("srt e", 0))
+	assert.Equal(t, []string{"rtsp a"}, statNames(h), "the rtsp prefix is no longer refused")
+	h.Write(vid(0, 0, true))
+	recv(t, ra)
+}
+
+// A control: a hub on which Refuse is never called replays the cached GOP to
+// a late subscriber exactly as before.
+func TestRefuseNeverCalled(t *testing.T) {
+	h := New(Options{})
+	defer h.Close()
+	h.Write(vid(0, 0, false)) // before the first keyframe: never cached
+	writeGOP(h, vDur, 6)
+
+	for _, name := range []string{"rtsp a", "srt b", ""} {
+		s := h.Subscribe(name, 0)
+		got := drain(t, s, 6)
+		for i, d := range got {
+			assert.Equal(t, int64((i+1)*vDur), d.Frame.DTS)
+			assert.Equal(t, i == 0, d.Frame.Key)
+			assert.Zero(t, d.Lost)
+		}
+		s.Close()
+	}
+}
+
+// Writes, subscribes and Refuse race for 200 ms: under -race nothing panics
+// (no send on a closed channel, no double close) and nothing deadlocks.
+func TestRefuseRace(t *testing.T) {
+	h := New(Options{GOPCacheFrames: 64})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			dts := int64(i) * vDur
+			h.Write(vid(0, dts, i%30 == 0))
+			h.Write(aud(1, dts))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		names := []string{"rtsp a", "srt b", "rtmp c", "transcode"}
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var s *Sub
+			switch i % 3 {
+			case 0:
+				s = h.Subscribe(names[i%len(names)], 1+i%16)
+			case 1:
+				s = h.SubscribeLive(names[i%len(names)], 1+i%16)
+			default:
+				s = h.SubscribeCached(names[i%len(names)], 1+i%16)
+			}
+			select {
+			case <-s.C():
+			default:
+			}
+			if i%2 == 0 {
+				s.Close()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		sets := [][]string{{"rtsp "}, {}, {"srt ", "rtmp "}, {"transcode"}}
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			h.Refuse(sets[i%len(sets)]...)
+			if i%10 == 0 {
+				_ = h.Stats()
+			}
+		}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	h.Refuse("rtsp ", "srt ", "rtmp ", "transcode")
+	assert.Empty(t, h.Stats(), "every subscriber left open was refused")
+	h.Close()
 }
