@@ -201,7 +201,7 @@ func configure(r *wire.Reader, w *wire.Writer) (*child, error) {
 	if a := cfg.Audio; a != nil {
 		audio = &native.Audio{BitrateKbps: a.BitrateKbps, SampleRate: a.SampleRate, Channels: a.Channels}
 	}
-	p, err := native.NewWith(native.Config{Rungs: rungs, Audio: audio})
+	p, err := native.NewWith(native.Config{Rungs: rungs, Audio: audio, Watermark: cfg.Watermark})
 	if err != nil {
 		return nil, fatal(w, fmt.Errorf("ostranscoder: configure: %w", err))
 	}
@@ -243,6 +243,13 @@ func (c *child) handle(res readResult) (stop bool, err error) {
 		return false, c.call(func() ([]native.Output, error) { return c.p.Push(m.F) })
 	case wire.Discontinuity:
 		return false, c.call(c.p.Discontinuity)
+	case wire.SetWatermark:
+		// The host validated it: a watermark the child cannot take is
+		// fatal (R-C9), so the stream never goes out without it.
+		if err := c.p.SetWatermark(m.W); err != nil {
+			return true, fatal(c.w, fmt.Errorf("ostranscoder: %w", err))
+		}
+		return false, nil
 	case wire.Stop:
 		return true, c.finish()
 	default:

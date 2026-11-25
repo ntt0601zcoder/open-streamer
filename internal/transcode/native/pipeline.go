@@ -15,8 +15,10 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 )
 
 // Defaults of Rung and Audio.
@@ -49,9 +51,15 @@ type Rung struct {
 
 // Config is what a pipeline encodes: the video ladder and the audio. A nil
 // Audio ignores audio frames; at least one rung or Audio is required.
+//
+// Watermark is drawn on every decoded picture before the ladder, so every
+// rung carries it; it needs at least one rung. Now is the clock of a text
+// watermark's time directives; nil means time.Now.
 type Config struct {
-	Rungs []Rung
-	Audio *Audio
+	Rungs     []Rung
+	Audio     *Audio
+	Watermark *picture.Watermark
+	Now       func() time.Time
 }
 
 // Audio is the AAC encoding of every audio track. Zero values mean 128 kbps,
@@ -82,8 +90,9 @@ type Stats struct {
 	EncoderFallbacks                       uint64
 }
 
-// Pipeline decodes the source video once, encodes it per rung with libx264
-// or NVENC, and re-encodes every audio track to AAC. Its input is already
+// Pipeline decodes the source video once, draws the watermark on it when
+// one is set, encodes it per rung with libx264 or NVENC, and re-encodes
+// every audio track to AAC. Its input is already
 // in rendition time: epoch-mapped and shifted by D. Output PTS are the
 // input's; video output DTS are the encoder's. It is not safe for
 // concurrent use.
@@ -134,16 +143,23 @@ func NewWith(c Config) (*Pipeline, error) {
 		}
 		specs[i] = s
 	}
-	p := &Pipeline{audios: map[int]*audioTrack{}, vtrack: -1, dropped: map[int]bool{}}
-	if len(specs) > 0 {
-		p.video = newVideoPath(specs, &p.stats)
+	if c.Watermark != nil && len(specs) == 0 {
+		return nil, errors.New("transcode: new pipeline: a watermark needs video rungs")
 	}
+	p := &Pipeline{audios: map[int]*audioTrack{}, vtrack: -1, dropped: map[int]bool{}}
 	if audio != nil {
 		a, err := resolveAudio(*audio)
 		if err != nil {
 			return nil, fmt.Errorf("transcode: new pipeline: audio: %w", err)
 		}
 		p.audio = &a
+	}
+	if len(specs) > 0 {
+		wm := newWatermarker(c.Now)
+		if err := wm.set(c.Watermark); err != nil {
+			return nil, fmt.Errorf("transcode: new pipeline: %w", err)
+		}
+		p.video = newVideoPath(specs, &p.stats, wm)
 	}
 	return p, nil
 }
@@ -387,11 +403,32 @@ func (p *Pipeline) Flush() ([]Output, error) {
 	return out, nil
 }
 
+// SetWatermark replaces the watermark from the next decoded picture on; nil
+// removes it. The encoders, timestamps and epoch are untouched. An invalid
+// watermark, or one on a pipeline without rungs, is an error that leaves the
+// pipeline as it was. A watermark that then fails to build at the next
+// picture fails the pipeline.
+func (p *Pipeline) SetWatermark(w *picture.Watermark) error {
+	if err := p.usable("set watermark"); err != nil {
+		return err
+	}
+	if p.video == nil {
+		if w == nil {
+			return nil
+		}
+		return errors.New("transcode: set watermark: a watermark needs video rungs")
+	}
+	if err := p.video.wm.set(w); err != nil {
+		return fmt.Errorf("transcode: set watermark: %w", err)
+	}
+	return nil
+}
+
 // Stats returns the counters.
 func (p *Pipeline) Stats() Stats { return p.stats }
 
-// Close releases every libav resource without draining. The pipeline is
-// unusable afterwards.
+// Close releases every libav resource without draining and removes the
+// watermark's temp directory. The pipeline is unusable afterwards.
 func (p *Pipeline) Close() {
 	if p.closed {
 		return
@@ -404,6 +441,7 @@ func (p *Pipeline) Close() {
 func (p *Pipeline) release() {
 	if p.video != nil {
 		p.video.release()
+		p.video.wm.close()
 	}
 	for _, a := range p.audios {
 		a.release()

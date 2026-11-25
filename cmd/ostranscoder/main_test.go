@@ -25,6 +25,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/native"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/wire"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 )
@@ -655,4 +656,64 @@ func TestChildEncoderFallbacks(t *testing.T) {
 	require.NotEmpty(t, c.frames[0])
 	require.NotEmpty(t, c.stats)
 	assert.Equal(t, want, c.stats[len(c.stats)-1].EncoderFallbacks)
+}
+
+// TestServeSetWatermark: Configure with a watermark, frames, then
+// SetWatermark{nil}, frames, Stop: the child exits cleanly and writes as
+// many frames as without a watermark.
+func TestServeSetWatermark(t *testing.T) {
+	src := source(t)
+	video := ofKind(src, media.KindVideo)
+	h, errc := startChild(t, run)
+	require.NoError(t, h.send(wire.Configure{
+		Rungs:     []wire.Rung{{Height: 120, BitrateKbps: 150}},
+		Audio:     &wire.AudioEncode{},
+		Watermark: &picture.Watermark{Text: "live %H:%M:%S", Position: picture.BottomRight},
+	}))
+	half := len(src) / 2
+	require.NoError(t, h.sendFrames(src[:half]))
+	require.NoError(t, h.send(wire.SetWatermark{}))
+	require.NoError(t, h.sendFrames(src[half:]))
+	require.NoError(t, h.send(wire.Stop{}))
+
+	e := h.wait(t, errc)
+	require.NoError(t, e.runErr)
+	require.ErrorIs(t, e.readErr, io.EOF)
+	c := collect(e.msgs)
+	require.Empty(t, c.errs)
+	require.Len(t, c.frames[0], len(video))
+	assert.Equal(t, keys(video), keys(c.frames[0]))
+	requireConforms(t, c.rendition(0))
+}
+
+// TestServeSetWatermarkInvalid: a watermark the child cannot build is a
+// fatal error (R-C9).
+func TestServeSetWatermarkInvalid(t *testing.T) {
+	src := source(t)
+	h, errc := startChild(t, run)
+	require.NoError(t, h.send(wire.Configure{Rungs: []wire.Rung{{Height: 120, BitrateKbps: 150}}}))
+	require.NoError(t, h.sendFrames(src[:40]))
+	require.NoError(t, h.send(wire.SetWatermark{W: &picture.Watermark{Text: "%q"}}))
+
+	e := h.wait(t, errc)
+	require.Error(t, e.runErr)
+	c := collect(e.msgs)
+	require.Len(t, c.errs, 1)
+	assert.True(t, c.errs[0].Fatal)
+	assert.Contains(t, c.errs[0].Message, "watermark")
+}
+
+// TestChildConfigureBadWatermark: Configure with an invalid watermark is a
+// fatal error.
+func TestChildConfigureBadWatermark(t *testing.T) {
+	h, errc := startChild(t, run)
+	require.NoError(t, h.send(wire.Configure{
+		Rungs:     []wire.Rung{{Height: 120, BitrateKbps: 150}},
+		Watermark: &picture.Watermark{Text: "%q"},
+	}))
+	e := h.wait(t, errc)
+	require.Error(t, e.runErr)
+	c := collect(e.msgs)
+	require.Len(t, c.errs, 1)
+	assert.True(t, c.errs[0].Fatal)
 }

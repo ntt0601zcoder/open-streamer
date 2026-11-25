@@ -1,0 +1,659 @@
+//go:build libav
+
+package native
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"math"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/asticode/go-astiav"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
+)
+
+// rgb is a mean colour, per channel 0..255.
+type rgb [3]float64
+
+var magenta = rgb{255, 0, 255}
+
+// solidPNG returns a w × h PNG of one straight-alpha colour per half: left
+// for the left half, right for the right one.
+func solidPNG(t *testing.T, w, h int, left, right color.NRGBA) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		for x := range w {
+			c := left
+			if x >= w/2 {
+				c = right
+			}
+			img.SetNRGBA(x, y, c)
+		}
+	}
+	var b bytes.Buffer
+	require.NoError(t, png.Encode(&b, img))
+	return b.Bytes()
+}
+
+// magenta64 is a 64×64 opaque PNG of RGB 255,0,255.
+func magenta64(t *testing.T) []byte {
+	t.Helper()
+	m := color.NRGBA{255, 0, 255, 255}
+	return solidPNG(t, 64, 64, m, m)
+}
+
+// newWMPipeline builds a pipeline for c and closes it at the end of the test.
+func newWMPipeline(t *testing.T, c Config) *Pipeline {
+	t.Helper()
+	p, err := NewWith(c)
+	require.NoError(t, err)
+	t.Cleanup(p.Close)
+	return p
+}
+
+// toRGBA converts a decoded picture to straight RGBA.
+func toRGBA(t *testing.T, fr *astiav.Frame) *image.NRGBA {
+	t.Helper()
+	w, h := fr.Width(), fr.Height()
+	sws, err := astiav.CreateSoftwareScaleContext(w, h, fr.PixelFormat(), w, h, astiav.PixelFormatRgba,
+		astiav.NewSoftwareScaleContextFlags(astiav.SoftwareScaleContextFlagBicubic))
+	require.NoError(t, err)
+	defer sws.Free()
+	dst := astiav.AllocFrame()
+	defer dst.Free()
+	dst.SetWidth(w)
+	dst.SetHeight(h)
+	dst.SetPixelFormat(astiav.PixelFormatRgba)
+	require.NoError(t, dst.AllocBuffer(0))
+	require.NoError(t, sws.ScaleFrame(fr, dst))
+	img := &image.NRGBA{}
+	require.NoError(t, dst.Data().ToImage(img))
+	// ToImage aliases a buffer it allocated; copy to be safe.
+	out := image.NewNRGBA(image.Rect(0, 0, w, h))
+	copy(out.Pix, img.Pix)
+	return out
+}
+
+// decodeRung decodes a rung's output frames with libavcodec and returns its
+// pictures in presentation order.
+func decodeRung(t *testing.T, outs []Output, rung int) []image.Image {
+	t.Helper()
+	codec := astiav.FindDecoderByName("h264")
+	require.NotNil(t, codec)
+	cc := astiav.AllocCodecContext(codec)
+	require.NotNil(t, cc)
+	defer cc.Free()
+	cc.SetTimeBase(timeBase)
+	require.NoError(t, cc.Open(codec, nil))
+	pkt := newInPacket()
+	defer pkt.free()
+	fr := astiav.AllocFrame()
+	defer fr.Free()
+	var imgs []image.Image
+	receive := func() {
+		for {
+			err := cc.ReceiveFrame(fr)
+			if errors.Is(err, astiav.ErrEagain) || errors.Is(err, astiav.ErrEof) {
+				return
+			}
+			require.NoError(t, err)
+			imgs = append(imgs, toRGBA(t, fr))
+			fr.Unref()
+		}
+	}
+	for _, f := range rungFrames(outs, rung) {
+		require.NoError(t, pkt.fill(annexB(f), f.PTS, f.DTS))
+		require.NoError(t, pkt.send(cc))
+		receive()
+	}
+	require.NoError(t, cc.SendPacket(nil))
+	receive()
+	return imgs
+}
+
+// markRect is the rectangle a mark wPct % of the picture's width and hPct %
+// of its height occupies at pos, with the 2 % margin.
+func markRect(img image.Image, pos picture.Position, wPct, hPct float64) image.Rectangle {
+	b := img.Bounds()
+	bw, bh := b.Dx(), b.Dy()
+	w := int(math.Round(float64(bw) * wPct / 100))
+	h := int(math.Round(float64(bh) * hPct / 100))
+	m := picture.Margin(bh)
+	var x, y int
+	switch pos {
+	case picture.TopLeft:
+		x, y = m, m
+	case picture.TopRight:
+		x, y = bw-w-m, m
+	case picture.BottomLeft:
+		x, y = m, bh-h-m
+	case picture.BottomRight:
+		x, y = bw-w-m, bh-h-m
+	case picture.Center:
+		x, y = (bw-w)/2, (bh-h)/2
+	}
+	return image.Rect(x, y, x+w, y+h)
+}
+
+// inner is the middle half of r in each dimension.
+func inner(r image.Rectangle) image.Rectangle {
+	dx, dy := r.Dx()/4, r.Dy()/4
+	return image.Rect(r.Min.X+dx, r.Min.Y+dy, r.Max.X-dx, r.Max.Y-dy)
+}
+
+// meanRGB is the mean colour of r in img.
+func meanRGB(img image.Image, r image.Rectangle) rgb {
+	var s rgb
+	n := 0
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		for x := r.Min.X; x < r.Max.X; x++ {
+			c := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+			s[0] += float64(c.R)
+			s[1] += float64(c.G)
+			s[2] += float64(c.B)
+			n++
+		}
+	}
+	for i := range s {
+		s[i] /= float64(n)
+	}
+	return s
+}
+
+// region is the mean RGB of the inner half of the rectangle a mark of that
+// size would occupy at pos.
+func region(img image.Image, pos picture.Position, wPct, hPct float64) rgb {
+	return meanRGB(img, inner(markRect(img, pos, wPct, hPct)))
+}
+
+// near reports whether every channel of a is within tol of b.
+func near(a, b rgb, tol float64) bool {
+	for i := range a {
+		if math.Abs(a[i]-b[i]) > tol {
+			return false
+		}
+	}
+	return true
+}
+
+// squareHPct is the height in % of the picture of a square mark wPct % of
+// its width.
+func squareHPct(img image.Image, wPct float64) float64 {
+	b := img.Bounds()
+	return wPct * float64(b.Dx()) / float64(b.Dy())
+}
+
+// band is the mean absolute difference of two pictures over r, all
+// channels.
+func band(a, b image.Image, r image.Rectangle) float64 {
+	var s float64
+	n := 0
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		for x := r.Min.X; x < r.Max.X; x++ {
+			ca := color.NRGBAModel.Convert(a.At(x, y)).(color.NRGBA)
+			cb := color.NRGBAModel.Convert(b.At(x, y)).(color.NRGBA)
+			s += math.Abs(float64(ca.R)-float64(cb.R)) + math.Abs(float64(ca.G)-float64(cb.G)) +
+				math.Abs(float64(ca.B)-float64(cb.B))
+			n += 3
+		}
+	}
+	return s / float64(n)
+}
+
+// textBand is the rectangle a short text watermark at the bottom left of a
+// 320×240 picture covers, with the default size of 5 % (12 px).
+var textBand = image.Rect(5, 240-5-16, 90, 240-5)
+
+// topLeftBand is the same at the top left.
+var topLeftBand = image.Rect(5, 5, 90, 5+16)
+
+var ladder3 = []Rung{{Height: 240, BitrateKbps: 600}, {Height: 180, BitrateKbps: 300}, {Height: 120, BitrateKbps: 150}}
+
+func TestWatermarkImageOnEveryRung(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	p := newWMPipeline(t, Config{Rungs: ladder3, Watermark: &picture.Watermark{Image: magenta64(t), SizePct: 25}})
+	outs := run(t, p, src)
+	n := len(ofKind(src, media.KindVideo))
+	for rung := range ladder3 {
+		imgs := decodeRung(t, outs, rung)
+		require.Len(t, imgs, n, "rung %d", rung)
+		for _, i := range []int{0, len(imgs) - 1} {
+			img := imgs[i]
+			hp := squareHPct(img, 25)
+			got := region(img, picture.TopLeft, 25, hp)
+			assert.True(t, near(got, magenta, 40), "rung %d picture %d: mark %v", rung, i, got)
+			other := region(img, picture.BottomRight, 25, hp)
+			assert.False(t, near(other, magenta, 80), "rung %d picture %d: bottom right %v", rung, i, other)
+		}
+	}
+}
+
+func TestWatermarkPositions(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	for _, pos := range []picture.Position{picture.TopLeft, picture.TopRight, picture.BottomLeft, picture.BottomRight, picture.Center} {
+		p := newWMPipeline(t, Config{
+			Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+			Watermark: &picture.Watermark{Image: magenta64(t), SizePct: 20, Position: pos},
+		})
+		imgs := decodeRung(t, run(t, p, src), 0)
+		require.NotEmpty(t, imgs)
+		for _, i := range []int{0, len(imgs) - 1} {
+			img := imgs[i]
+			got := region(img, pos, 20, squareHPct(img, 20))
+			assert.True(t, near(got, magenta, 40), "position %d picture %d: %v", pos, i, got)
+		}
+	}
+}
+
+// unmarked runs src through one 240 rung with no watermark.
+func unmarked(t *testing.T, src []media.Frame) []image.Image {
+	t.Helper()
+	p := newWMPipeline(t, Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}})
+	return decodeRung(t, run(t, p, src), 0)
+}
+
+func TestWatermarkOpacity(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	plain := unmarked(t, src)
+	p := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Image: magenta64(t), SizePct: 25, OpacityPct: 50},
+	})
+	imgs := decodeRung(t, run(t, p, src), 0)
+	require.Len(t, imgs, len(plain))
+	for _, i := range []int{0, len(imgs) / 2, len(imgs) - 1} {
+		hp := squareHPct(imgs[i], 25)
+		got := region(imgs[i], picture.TopLeft, 25, hp)
+		base := region(plain[i], picture.TopLeft, 25, hp)
+		strict := 0
+		for c := range got {
+			lo, hi := min(base[c], magenta[c]), max(base[c], magenta[c])
+			if hi-lo < 60 {
+				continue
+			}
+			strict++
+			assert.Greater(t, got[c], lo+15, "picture %d channel %d: %v between %v and magenta", i, c, got, base)
+			assert.Less(t, got[c], hi-15, "picture %d channel %d: %v between %v and magenta", i, c, got, base)
+		}
+		require.Positive(t, strict, "picture %d: the unmarked region %v is too close to magenta", i, base)
+	}
+}
+
+func TestWatermarkImageAlpha(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	plain := unmarked(t, src)
+	img := solidPNG(t, 64, 64, color.NRGBA{255, 0, 255, 255}, color.NRGBA{255, 0, 255, 128})
+	p := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Image: img, SizePct: 25},
+	})
+	imgs := decodeRung(t, run(t, p, src), 0)
+	require.Len(t, imgs, len(plain))
+	for _, i := range []int{0, len(imgs) - 1} {
+		r := markRect(imgs[i], picture.TopLeft, 25, squareHPct(imgs[i], 25))
+		mid := (r.Min.X + r.Max.X) / 2
+		left := inner(image.Rect(r.Min.X, r.Min.Y, mid, r.Max.Y))
+		right := inner(image.Rect(mid, r.Min.Y, r.Max.X, r.Max.Y))
+		gl := meanRGB(imgs[i], left)
+		assert.True(t, near(gl, magenta, 40), "picture %d: left half %v", i, gl)
+		base := meanRGB(plain[i], right)
+		want := rgb{(base[0] + magenta[0]) / 2, (base[1] + magenta[1]) / 2, (base[2] + magenta[2]) / 2}
+		gr := meanRGB(imgs[i], right)
+		assert.True(t, near(gr, want, 40), "picture %d: right half %v, want about %v (unmarked %v)", i, gr, want, base)
+	}
+}
+
+// requireSameTiming checks that b has a's timing: as many frames, the same
+// DTS in order, the same PTS and the same keys. Which picture an encoder
+// codes as a B-frame depends on the picture (libx264's adaptive B-frame
+// placement), so the PTS are compared as a set: a watermark changes the
+// picture, never a timestamp.
+func requireSameTiming(t *testing.T, a, b []media.Frame, msg string) {
+	t.Helper()
+	require.Len(t, b, len(a), "%s: frames", msg)
+	dts := func(fs []media.Frame) []int64 {
+		out := make([]int64, len(fs))
+		for i, f := range fs {
+			out[i] = f.DTS
+		}
+		return out
+	}
+	assert.Equal(t, dts(a), dts(b), "%s: DTS", msg)
+	assert.Equal(t, ptsSet(a), ptsSet(b), "%s: PTS", msg)
+	assert.Equal(t, keys(a), keys(b), "%s: keys", msg)
+}
+
+func TestWatermarkKeepsTiming(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	plain := run(t, newWMPipeline(t, Config{Rungs: ladder3, Audio: &Audio{}}), src)
+	marked := run(t, newWMPipeline(t, Config{
+		Rungs: ladder3, Audio: &Audio{},
+		Watermark: &picture.Watermark{Text: "Open Streamer %H:%M:%S"},
+	}), src)
+	srcKeys := keys(ofKind(src, media.KindVideo))
+	for rung := -1; rung < len(ladder3); rung++ {
+		a, b := rungFrames(plain, rung), rungFrames(marked, rung)
+		require.NotEmpty(t, a)
+		if rung < 0 {
+			assert.Equal(t, a, b, "audio")
+			continue
+		}
+		requireSameTiming(t, a, b, fmt.Sprintf("rung %d", rung))
+		assert.Equal(t, srcKeys, keys(b), "rung %d keys", rung)
+	}
+}
+
+// fakeClock returns a clock that starts at 12:00:00 UTC and advances 1 s
+// every perSecond calls.
+func fakeClock(perSecond int) func() time.Time {
+	base := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	n := 0
+	return func() time.Time {
+		t := base.Add(time.Duration(n/perSecond) * time.Second)
+		n++
+		return t
+	}
+}
+
+// The fixture's top left holds testsrc2's own frame counter, which changes
+// on every picture, so the text is placed at the bottom left, over two
+// still colour bars.
+func TestWatermarkTextTicks(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	plain := unmarked(t, src)
+	p := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Text: "%H:%M:%S", Position: picture.BottomLeft},
+		Now:       fakeClock(25),
+	})
+	imgs := decodeRung(t, run(t, p, src), 0)
+	require.Len(t, imgs, len(plain))
+	assert.Less(t, band(imgs[0], imgs[24], textBand), 2.0, "pictures 0 and 24 show the same second")
+	assert.Greater(t, band(imgs[24], imgs[25], textBand), 2.0, "picture 25 shows the next second")
+	for i := range imgs {
+		require.Greater(t, band(imgs[i], plain[i], textBand), 2.0, "picture %d has no text", i)
+	}
+}
+
+func TestWatermarkTextIsLiteral(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	plain := unmarked(t, src)
+	cjk := strings.Repeat("字", 85) + "x"
+	require.Len(t, cjk, 256)
+	evil := ":'\\%%{localtime},[in]textfile=/etc/passwd"
+	for _, text := range []string{evil, cjk} {
+		p := newWMPipeline(t, Config{
+			Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+			Watermark: &picture.Watermark{Text: text},
+		})
+		outs := push(t, p, src)
+		desc := p.video.wm.desc
+		dir := p.video.wm.dir
+		o, err := p.Flush()
+		require.NoError(t, err)
+		outs = append(outs, o...)
+		imgs := decodeRung(t, outs, 0)
+		require.Len(t, imgs, len(plain))
+		for _, i := range []int{0, len(imgs) - 1} {
+			assert.Greater(t, band(imgs[i], plain[i], topLeftBand), 2.0, "picture %d has no text", i)
+		}
+
+		t.Logf("graph: %s", desc)
+		require.NotEmpty(t, desc)
+		assert.NotContains(t, desc, text)
+		for _, s := range []string{"%{localtime}", "/etc/passwd", "[in]", "localtime", "字"} {
+			assert.NotContains(t, desc, s)
+		}
+		paths := regexp.MustCompile(`([a-z]+)=(/[^:,]*)`).FindAllStringSubmatch(desc, -1)
+		require.Len(t, paths, 2, "absolute paths in %q", desc)
+		assert.Equal(t, []string{"fontfile", dir + "/font.ttf"}, paths[0][1:])
+		assert.Equal(t, []string{"textfile", dir + "/text"}, paths[1][1:])
+		assert.Equal(t, 1, strings.Count(desc, "/"+filepath.Base(dir)+"/font.ttf"))
+		got, err := os.ReadFile(filepath.Join(dir, "text"))
+		require.NoError(t, err)
+		assert.Equal(t, picture.FormatText(text, time.Now()), string(got), "the text file holds the text verbatim")
+	}
+}
+
+func TestWatermarkTextGraph(t *testing.T) {
+	src := source(t, "h264_aac.ts")[:40]
+	p := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Text: "%H", OpacityPct: 50, SizePct: 10, Position: picture.BottomRight},
+	})
+	push(t, p, src)
+	dir := p.video.wm.dir
+	want := "drawtext=fontfile=" + dir + "/font.ttf:textfile=" + dir + "/text:expansion=none:reload=1" +
+		":fontsize=24:fontcolor=white@0.50:borderw=1:bordercolor=black@0.50:x=w-tw-5:y=h-th-5,format=yuv420p"
+	assert.Equal(t, want, p.video.wm.desc)
+
+	q := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Text: "100%% on", SizePct: 50, Position: picture.Center},
+	})
+	push(t, q, src)
+	dir = q.video.wm.dir
+	want = "drawtext=fontfile=" + dir + "/font.ttf:textfile=" + dir + "/text:expansion=none" +
+		":fontsize=120:fontcolor=white@1.00:borderw=7:bordercolor=black@1.00:x=(w-tw)/2:y=(h-th)/2,format=yuv420p"
+	assert.Equal(t, want, q.video.wm.desc)
+}
+
+func TestWatermarkImageGraph(t *testing.T) {
+	src := source(t, "h264_aac.ts")[:40]
+	p := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Image: magenta64(t), OpacityPct: 30, Position: picture.TopRight},
+	})
+	push(t, p, src)
+	want := "[wm]scale=48:-1,format=yuva420p,colorchannelmixer=aa=0.30[o];[in][o]overlay=W-w-5:5:format=auto,format=yuv420p"
+	assert.Equal(t, want, p.video.wm.desc)
+}
+
+func TestWatermarkAcrossConfigChange(t *testing.T) {
+	src := source(t, "h264_aac_then_640.ts")
+	p := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Image: magenta64(t), SizePct: 25, Position: picture.TopRight},
+	})
+	imgs := decodeRung(t, run(t, p, src), 0)
+	plain := decodeRung(t, run(t, newWMPipeline(t, Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}}), src), 0)
+	require.Len(t, plain, len(imgs))
+	change := -1
+	for i := 1; i < len(imgs); i++ {
+		if imgs[i].Bounds() != imgs[i-1].Bounds() {
+			change = i
+			break
+		}
+	}
+	require.Positive(t, change, "no size change")
+	t.Logf("change at picture %d: %v to %v", change, imgs[change-1].Bounds(), imgs[change].Bounds())
+	for _, i := range []int{change - 1, change} {
+		img := imgs[i]
+		got := region(img, picture.TopRight, 25, squareHPct(img, 25))
+		assert.True(t, near(got, magenta, 40), "picture %d (%v): %v", i, img.Bounds(), got)
+		// The mark is 25 % of the width: just outside it to the left the
+		// picture is the unmarked one.
+		r := markRect(img, picture.TopRight, 25, squareHPct(img, 25))
+		outside := image.Rect(r.Min.X-r.Dx()/4, r.Min.Y+r.Dy()/4, r.Min.X-2, r.Max.Y-r.Dy()/4)
+		assert.Less(t, band(img, plain[i], outside), 8.0, "picture %d: the mark is wider than 25 %%", i)
+	}
+}
+
+// pushVideoCount feeds frames until n video frames have gone in, and returns
+// the outputs and the frames left.
+func pushVideoCount(t *testing.T, p *Pipeline, frames []media.Frame, n int) ([]Output, []media.Frame) {
+	t.Helper()
+	var out []Output
+	seen := 0
+	for i, f := range frames {
+		if f.Kind() == media.KindVideo {
+			if seen == n {
+				return out, frames[i:]
+			}
+			seen++
+		}
+		o, err := p.Push(f)
+		require.NoError(t, err)
+		out = append(out, o...)
+	}
+	return out, nil
+}
+
+func TestSetWatermark(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	rungs := []Rung{{Height: 240, BitrateKbps: 600}, {Height: 120, BitrateKbps: 150}}
+	plain := run(t, newWMPipeline(t, Config{Rungs: rungs, Audio: &Audio{}}), src)
+
+	p := newWMPipeline(t, Config{Rungs: rungs, Audio: &Audio{}})
+	outs, rest := pushVideoCount(t, p, src, 50)
+	require.NoError(t, p.SetWatermark(&picture.Watermark{Image: magenta64(t), SizePct: 25}))
+	o, rest := pushVideoCount(t, p, rest, 50)
+	outs = append(outs, o...)
+	require.NoError(t, p.SetWatermark(nil))
+	outs = append(outs, run(t, p, rest)...)
+
+	assert.Equal(t, rungFrames(plain, -1), rungFrames(outs, -1), "audio")
+	for rung := range rungs {
+		requireSameTiming(t, rungFrames(plain, rung), rungFrames(outs, rung), fmt.Sprintf("rung %d", rung))
+	}
+	// The decoder holds a few pictures (frame threads, reordering), so the
+	// swaps land some pictures before the 50th and 100th decoded one; both
+	// land the same number of pictures early, so the mark is on exactly 50
+	// consecutive pictures, the same ones on every rung.
+	var first []int
+	for rung := range rungs {
+		imgs := decodeRung(t, outs, rung)
+		require.Len(t, imgs, 150)
+		var on []int
+		for i, img := range imgs {
+			if near(region(img, picture.TopLeft, 25, squareHPct(img, 25)), magenta, 40) {
+				on = append(on, i)
+			}
+		}
+		require.Len(t, on, 50, "rung %d: marked pictures %v", rung, on)
+		assert.Equal(t, on[0]+49, on[49], "rung %d: the marked pictures are not consecutive: %v", rung, on)
+		assert.Greater(t, on[0], 20, "rung %d: marked from picture %d", rung, on[0])
+		assert.LessOrEqual(t, on[0], 50, "rung %d: marked from picture %d", rung, on[0])
+		if rung == 0 {
+			first = on
+		} else {
+			assert.Equal(t, first, on, "rung %d", rung)
+		}
+		t.Logf("rung %d: marked pictures %d to %d", rung, on[0], on[49])
+	}
+	assert.Equal(t, Stats{}, p.Stats())
+}
+
+func TestSetWatermarkInvalid(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	p := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Image: magenta64(t), SizePct: 25},
+	})
+	outs, rest := pushVideoCount(t, p, src, 50)
+	for _, w := range []picture.Watermark{
+		{},
+		{Text: "a", Image: magenta64(t)},
+		{Text: "%q"},
+		{Image: []byte("not an image")},
+		{Text: "a", TimeZone: "Nowhere/City"},
+	} {
+		require.Error(t, p.SetWatermark(&w), "%+v", w)
+	}
+	outs = append(outs, run(t, p, rest)...)
+	imgs := decodeRung(t, outs, 0)
+	require.Len(t, imgs, 150)
+	last := imgs[len(imgs)-1]
+	assert.True(t, near(region(last, picture.TopLeft, 25, squareHPct(last, 25)), magenta, 40), "the previous watermark stays")
+
+	audio := newWMPipeline(t, Config{Audio: &Audio{}})
+	require.Error(t, audio.SetWatermark(&picture.Watermark{Text: "a"}))
+	require.NoError(t, audio.SetWatermark(nil))
+}
+
+func TestWatermarkNeedsRungs(t *testing.T) {
+	_, err := NewWith(Config{Audio: &Audio{}, Watermark: &picture.Watermark{Text: "a"}})
+	require.Error(t, err)
+	_, err = NewWith(Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}, Watermark: &picture.Watermark{Text: "%q"}})
+	require.Error(t, err, "an invalid watermark")
+}
+
+// ostxDirs returns the ostx-wm-* directories in the temp directory.
+func ostxDirs(t *testing.T) []string {
+	t.Helper()
+	m, err := filepath.Glob(filepath.Join(os.TempDir(), "ostx-wm-*"))
+	require.NoError(t, err)
+	return m
+}
+
+func TestWatermarkTempDirRemoved(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	p, err := NewWith(Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}, Watermark: &picture.Watermark{Text: "x"}})
+	require.NoError(t, err)
+	push(t, p, source(t, "h264_aac.ts")[:40])
+	dirs := ostxDirs(t)
+	require.Len(t, dirs, 1)
+	assert.Equal(t, dirs[0], p.video.wm.dir)
+	font, err := os.ReadFile(filepath.Join(dirs[0], "font.ttf"))
+	require.NoError(t, err)
+	assert.Equal(t, dejaVuSans, font)
+	p.Close()
+	_, err = os.Stat(dirs[0])
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	// An image watermark needs no directory; a text one set later makes it.
+	q, err := NewWith(Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}, Watermark: &picture.Watermark{Image: magenta64(t)}})
+	require.NoError(t, err)
+	assert.Empty(t, ostxDirs(t))
+	require.NoError(t, q.SetWatermark(&picture.Watermark{Text: "y"}))
+	require.Len(t, ostxDirs(t), 1)
+	q.Close()
+	assert.Empty(t, ostxDirs(t))
+}
+
+// A temp directory whose path has a character outside [A-Za-z0-9_./-] is
+// refused: it would be written into the filter-graph string.
+func TestWatermarkTempDirChars(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "a b")
+	require.NoError(t, os.Mkdir(tmp, 0o700))
+	t.Setenv("TMPDIR", tmp)
+	_, err := NewWith(Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}, Watermark: &picture.Watermark{Text: "x"}})
+	require.ErrorContains(t, err, "character")
+	m, err := filepath.Glob(filepath.Join(tmp, "*"))
+	require.NoError(t, err)
+	assert.Empty(t, m, "the refused directory is removed")
+}
+
+// A watermark that cannot be built is fatal (R-C9): here the text file is
+// gone when the next text watermark's graph is built. (A missing font would
+// not do: drawtext falls back to fontconfig.)
+func TestWatermarkBuildFailureIsFatal(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	p := newWMPipeline(t, Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}, Watermark: &picture.Watermark{Text: "a"}})
+	_, rest := pushVideoCount(t, p, src, 30)
+	require.NoError(t, os.Remove(filepath.Join(p.video.wm.dir, "text")))
+	require.NoError(t, p.SetWatermark(&picture.Watermark{Text: "a", Position: picture.Center}))
+	var err error
+	for _, f := range rest {
+		if _, err = p.Push(f); err != nil {
+			break
+		}
+	}
+	require.ErrorContains(t, err, "watermark")
+	_, err2 := p.Push(rest[len(rest)-1])
+	assert.Equal(t, err, err2, "the error is permanent")
+}

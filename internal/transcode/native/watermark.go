@@ -1,0 +1,351 @@
+//go:build libav
+
+package native
+
+import (
+	"errors"
+	"fmt"
+	"image"
+	"math"
+	"os"
+	"path/filepath"
+	"regexp"
+	"time"
+
+	"github.com/asticode/go-astiav"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
+)
+
+// Watermark sizes in pixels.
+const (
+	minFontPx     = 8 // smallest text glyph height
+	minMarkW      = 2 // narrowest image mark
+	borderDivisor = 16
+)
+
+// safePath is what a path the child writes into a filter-graph string may
+// hold: nothing a graph parser treats as syntax.
+var safePath = regexp.MustCompile(`^[A-Za-z0-9_./-]+$`)
+
+// graphKey is what a watermark graph is built for, besides the watermark.
+type graphKey struct {
+	w, h int
+	pf   astiav.PixelFormat
+	sar  astiav.Rational
+	cr   astiav.ColorRange
+	cs   astiav.ColorSpace
+}
+
+// watermarker draws one watermark on decoded pictures through a libavfilter
+// graph, built for one watermark and one picture format and rebuilt when
+// either changes. Text goes through drawtext from a file the child writes,
+// so it never enters the graph string.
+type watermarker struct {
+	now func() time.Time
+	// dir holds font.ttf and text; "" until a text watermark needs it.
+	dir string
+
+	wm  *picture.Watermark // resolved; nil when off
+	loc *time.Location
+	img *image.NRGBA // the decoded image of an image watermark
+
+	written    string // the text in <dir>/text
+	hasWritten bool
+
+	graph *astiav.FilterGraph // nil until the next picture
+	key   graphKey
+	src   *astiav.BuffersrcFilterContext
+	sink  *astiav.BuffersinkFilterContext
+	out   *astiav.Frame
+	desc  string // the graph string, for tests
+}
+
+func newWatermarker(now func() time.Time) *watermarker {
+	if now == nil {
+		now = time.Now
+	}
+	return &watermarker{now: now}
+}
+
+// active reports whether a watermark is set.
+func (m *watermarker) active() bool { return m.wm != nil }
+
+// set validates w and makes it the watermark from the next picture; nil
+// removes it. An error leaves the current watermark in place.
+func (m *watermarker) set(w *picture.Watermark) error {
+	if w == nil {
+		m.wm, m.loc, m.img = nil, nil, nil
+		m.freeGraph()
+		return nil
+	}
+	if err := w.Validate(); err != nil {
+		return err
+	}
+	r := w.Resolved()
+	loc, err := r.Location()
+	if err != nil {
+		return err
+	}
+	var img *image.NRGBA
+	if len(r.Image) > 0 {
+		if img, err = picture.DecodeImage(r.Image); err != nil {
+			return fmt.Errorf("watermark: %w", err)
+		}
+	} else if err := m.ensureDir(); err != nil {
+		return err
+	}
+	m.wm, m.loc, m.img = &r, loc, img
+	m.freeGraph()
+	return nil
+}
+
+// ensureDir creates the private directory and writes the font into it.
+func (m *watermarker) ensureDir() error {
+	if m.dir != "" {
+		return nil
+	}
+	dir, err := os.MkdirTemp("", "ostx-wm-")
+	if err != nil {
+		return fmt.Errorf("watermark: temp dir: %w", err)
+	}
+	if !safePath.MatchString(dir) {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("watermark: temp dir %q has a character outside [A-Za-z0-9_./-]", dir)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "font.ttf"), dejaVuSans, 0o600); err != nil {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("watermark: write font: %w", err)
+	}
+	m.dir = dir
+	return nil
+}
+
+// apply draws the watermark on fr and returns the result, valid until the
+// next call. fr is not changed. Exactly one picture comes out, with fr's
+// PTS.
+func (m *watermarker) apply(fr *astiav.Frame) (*astiav.Frame, error) {
+	if m.wm.Text != "" {
+		if err := m.writeText(); err != nil {
+			return nil, err
+		}
+	}
+	k := graphKey{
+		w: fr.Width(), h: fr.Height(), pf: fr.PixelFormat(), sar: fr.SampleAspectRatio(),
+		cr: fr.ColorRange(), cs: fr.ColorSpace(),
+	}
+	if m.graph == nil || k != m.key {
+		m.freeGraph()
+		if err := m.build(k); err != nil {
+			m.freeGraph()
+			return nil, err
+		}
+		m.key = k
+	}
+	m.out.Unref()
+	if err := m.src.AddFrame(fr, astiav.NewBuffersrcFlags(astiav.BuffersrcFlagKeepRef)); err != nil {
+		return nil, fmt.Errorf("watermark: add frame: %w", err)
+	}
+	err := m.sink.GetFrame(m.out, astiav.NewBuffersinkFlags())
+	switch {
+	case errors.Is(err, astiav.ErrEagain):
+		return nil, errors.New("watermark: graph held a frame")
+	case err != nil:
+		return nil, fmt.Errorf("watermark: get frame: %w", err)
+	case m.out.Pts() != fr.Pts():
+		return nil, fmt.Errorf("watermark: graph returned PTS %d for %d", m.out.Pts(), fr.Pts())
+	}
+	return m.out, nil
+}
+
+// writeText formats the text for now and, when it changed, replaces
+// <dir>/text atomically.
+func (m *watermarker) writeText() error {
+	s := picture.FormatText(m.wm.Text, m.now().In(m.loc))
+	if m.hasWritten && s == m.written {
+		return nil
+	}
+	tmp := filepath.Join(m.dir, "text.tmp")
+	if err := os.WriteFile(tmp, []byte(s), 0o600); err != nil {
+		return fmt.Errorf("watermark: write text: %w", err)
+	}
+	if err := os.Rename(tmp, filepath.Join(m.dir, "text")); err != nil {
+		return fmt.Errorf("watermark: write text: %w", err)
+	}
+	m.written, m.hasWritten = s, true
+	return nil
+}
+
+// opacity is OpacityPct as a libavfilter alpha with two decimals.
+func opacity(pct int) string { return fmt.Sprintf("%.2f", float64(pct)/100) }
+
+// textGraph is the drawtext graph string for a picture of height h: only
+// numbers and the child's own paths.
+func (m *watermarker) textGraph(h int) string {
+	w := m.wm
+	px := max(minFontPx, int(math.Round(float64(h)*float64(w.SizePct)/100)))
+	a := opacity(w.OpacityPct)
+	x, y := picture.PositionExpr(w.Position, "w", "h", "tw", "th", picture.Margin(h))
+	reload := ""
+	if picture.HasTime(w.Text) {
+		reload = ":reload=1"
+	}
+	return fmt.Sprintf("drawtext=fontfile=%s:textfile=%s:expansion=none%s:fontsize=%d"+
+		":fontcolor=white@%s:borderw=%d:bordercolor=black@%s:x=%s:y=%s,format=yuv420p",
+		filepath.Join(m.dir, "font.ttf"), filepath.Join(m.dir, "text"), reload, px,
+		a, max(1, px/borderDivisor), a, x, y)
+}
+
+// imageGraph is the overlay graph string for a picture of width w and
+// height h.
+func (m *watermarker) imageGraph(w, h int) string {
+	wm := m.wm
+	mw := max(minMarkW, int(math.Round(float64(w)*float64(wm.SizePct)/100)))
+	x, y := picture.PositionExpr(wm.Position, "W", "H", "w", "h", picture.Margin(h))
+	return fmt.Sprintf("[wm]scale=%d:-1,format=yuva420p,colorchannelmixer=aa=%s[o];"+
+		"[in][o]overlay=%s:%s:format=auto,format=yuv420p", mw, opacity(wm.OpacityPct), x, y)
+}
+
+// build makes the graph for pictures of k. On an error the caller frees
+// what was built.
+func (m *watermarker) build(k graphKey) error {
+	g := astiav.AllocFilterGraph()
+	if g == nil {
+		return errors.New("watermark: alloc filter graph")
+	}
+	m.graph = g
+	src, err := newSource(g, "in", k)
+	if err != nil {
+		return err
+	}
+	m.src = src
+	sink, err := g.NewBuffersinkFilterContext(astiav.FindFilterByName("buffersink"), "out")
+	if err != nil {
+		return fmt.Errorf("watermark: buffersink: %w", err)
+	}
+	m.sink = sink
+
+	outputs := astiav.AllocFilterInOut()
+	defer outputs.Free()
+	outputs.SetName("in")
+	outputs.SetFilterContext(src.FilterContext())
+	outputs.SetPadIdx(0)
+	outputs.SetNext(nil)
+	inputs := astiav.AllocFilterInOut()
+	defer inputs.Free()
+	inputs.SetName("out")
+	inputs.SetFilterContext(sink.FilterContext())
+	inputs.SetPadIdx(0)
+	inputs.SetNext(nil)
+
+	var mark *astiav.BuffersrcFilterContext
+	if m.img != nil {
+		b := m.img.Bounds()
+		mark, err = newSource(g, "wm", graphKey{
+			w: b.Dx(), h: b.Dy(), pf: astiav.PixelFormatRgba, sar: astiav.NewRational(1, 1),
+		})
+		if err != nil {
+			return err
+		}
+		wmOut := astiav.AllocFilterInOut()
+		wmOut.SetName("wm")
+		wmOut.SetFilterContext(mark.FilterContext())
+		wmOut.SetPadIdx(0)
+		wmOut.SetNext(nil)
+		outputs.SetNext(wmOut) // freed with outputs
+		m.desc = m.imageGraph(k.w, k.h)
+	} else {
+		m.desc = m.textGraph(k.h)
+	}
+	if err := g.Parse(m.desc, inputs, outputs); err != nil {
+		return fmt.Errorf("watermark: parse graph: %w", err)
+	}
+	if err := g.Configure(); err != nil {
+		return fmt.Errorf("watermark: configure graph: %w", err)
+	}
+	if mark != nil {
+		if err := m.addImage(mark); err != nil {
+			return err
+		}
+	}
+	if m.out == nil {
+		m.out = astiav.AllocFrame()
+	}
+	return nil
+}
+
+// newSource adds a buffer source for pictures of k, in 90 kHz time.
+func newSource(g *astiav.FilterGraph, name string, k graphKey) (*astiav.BuffersrcFilterContext, error) {
+	src, err := g.NewBuffersrcFilterContext(astiav.FindFilterByName("buffer"), name)
+	if err != nil {
+		return nil, fmt.Errorf("watermark: buffer %s: %w", name, err)
+	}
+	par := astiav.AllocBuffersrcFilterContextParameters()
+	defer par.Free()
+	par.SetWidth(k.w)
+	par.SetHeight(k.h)
+	par.SetPixelFormat(k.pf)
+	par.SetSampleAspectRatio(k.sar)
+	par.SetTimeBase(timeBase)
+	par.SetColorRange(k.cr)
+	par.SetColorSpace(k.cs)
+	if err := src.SetParameters(par); err != nil {
+		return nil, fmt.Errorf("watermark: buffer %s parameters: %w", name, err)
+	}
+	if err := src.Initialize(nil); err != nil {
+		return nil, fmt.Errorf("watermark: buffer %s init: %w", name, err)
+	}
+	return src, nil
+}
+
+// addImage adds the image once, at PTS 0, and ends the mark's input, so
+// that overlay repeats it on every picture.
+func (m *watermarker) addImage(mark *astiav.BuffersrcFilterContext) error {
+	b := m.img.Bounds()
+	f := astiav.AllocFrame()
+	defer f.Free()
+	f.SetWidth(b.Dx())
+	f.SetHeight(b.Dy())
+	f.SetPixelFormat(astiav.PixelFormatRgba)
+	f.SetSampleAspectRatio(astiav.NewRational(1, 1))
+	if err := f.AllocBuffer(0); err != nil {
+		return fmt.Errorf("watermark: alloc image frame: %w", err)
+	}
+	if err := f.Data().FromImage(m.img); err != nil {
+		return fmt.Errorf("watermark: image frame: %w", err)
+	}
+	f.SetPts(0)
+	if err := mark.AddFrame(f, astiav.NewBuffersrcFlags()); err != nil {
+		return fmt.Errorf("watermark: add image: %w", err)
+	}
+	if err := mark.AddFrame(nil, astiav.NewBuffersrcFlags()); err != nil {
+		return fmt.Errorf("watermark: end image: %w", err)
+	}
+	return nil
+}
+
+// freeGraph frees the graph; the next picture builds a new one.
+func (m *watermarker) freeGraph() {
+	if m.out != nil {
+		m.out.Unref()
+	}
+	if m.graph != nil {
+		m.graph.Free()
+	}
+	m.graph, m.src, m.sink, m.key = nil, nil, nil, graphKey{}
+}
+
+// close frees everything and removes the private directory. It may be
+// called more than once.
+func (m *watermarker) close() {
+	m.freeGraph()
+	if m.out != nil {
+		m.out.Free()
+		m.out = nil
+	}
+	if m.dir != "" {
+		_ = os.RemoveAll(m.dir)
+		m.dir = ""
+	}
+	m.hasWritten = false
+}

@@ -69,13 +69,17 @@ type videoPath struct {
 	encs     []*rungEncoder // opened at the build's first decoded picture
 	corrupt  corruptRun     // the decoder's consecutive corrupt frames
 
+	// wm draws the watermark, when one is set, on every picture before the
+	// rungs. It outlives builds; its graph does not.
+	wm *watermarker
+
 	// The framerate, estimated once per source config.
 	fpsCfg *media.TrackConfig
 	fps    astiav.Rational
 }
 
-func newVideoPath(rungs []Rung, st *Stats) *videoPath {
-	return &videoPath{stats: st, rungs: rungs, caches: make([]media.ConfigCache, len(rungs))}
+func newVideoPath(rungs []Rung, st *Stats, wm *watermarker) *videoPath {
+	return &videoPath{stats: st, rungs: rungs, caches: make([]media.ConfigCache, len(rungs)), wm: wm}
 }
 
 // push feeds one frame of the encoded video track.
@@ -261,8 +265,9 @@ func (v *videoPath) receive(epoch uint32) ([]Output, error) {
 	}
 }
 
-// encode sends one decoded picture to every rung. A picture at the PTS of a
-// source key is forced to an IDR.
+// encode sends one decoded picture to every rung, through the watermark
+// when one is set. A picture at the PTS of a source key is forced to an
+// IDR.
 func (v *videoPath) encode(fr *astiav.Frame, epoch uint32) ([]Output, error) {
 	pts := fr.Pts()
 	if pts == astiav.NoPtsValue || pts < v.startPTS {
@@ -278,9 +283,17 @@ func (v *videoPath) encode(fr *astiav.Frame, epoch uint32) ([]Output, error) {
 		force = force || v.keys[0] == pts
 		v.keys = v.keys[1:]
 	}
+	pic := fr
+	if v.wm.active() {
+		marked, err := v.wm.apply(fr)
+		if err != nil {
+			return nil, err
+		}
+		pic = marked
+	}
 	var out []Output
 	for _, e := range v.encs {
-		o, err := e.encode(fr, pts, force, epoch, v.track)
+		o, err := e.encode(pic, pts, force, epoch, v.track)
 		out = append(out, o...)
 		if err != nil {
 			return out, err
@@ -338,6 +351,9 @@ func (v *videoPath) release() {
 	}
 	v.cfg, v.dec, v.pkt, v.frm = nil, nil, nil, nil
 	v.keys, v.pending, v.seenDTS, v.encs = nil, nil, nil, nil
+	// The next build's timestamps may start over: the graph starts over
+	// with them.
+	v.wm.freeGraph()
 }
 
 // rungEncoder scales decoded pictures to one rung and encodes them with
