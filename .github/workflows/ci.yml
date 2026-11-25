@@ -163,13 +163,15 @@ jobs:
           retention-days: 7
 
   # The real transcoder child on linux/arm64: the arm64 bundle of
-  # transcoder-arm64 behind the supervisor (TestSupervisorRealChild) and the
-  # M4a scenarios (TestM4aMatrix, TestM4aKeyframesAligned, TestM4aRespawn).
-  # Their only peers are the bundle and apt's ffmpeg and ffprobe, so
-  # OS_REQUIRE_PEERS=1 turns a missing one into a failure. The VLC, SRT and
-  # RTSP rows stay amd64-only: TestM4aVLC is not in the pattern, and
-  # OS_TRANSCODE_E2E_ARM=1 skips TestM4aMatrix's t180/srt-steady and
-  # t180/rtsp-steady.
+  # transcoder-arm64 behind the supervisor (TestSupervisorRealChild), the
+  # M4a scenarios (TestM4aMatrix, TestM4aKeyframesAligned, TestM4aRespawn)
+  # and the M4b ABR scenarios that need no other peer (TestM4bMatrix,
+  # TestM4bRespawn). Their only peers are the bundle and apt's ffmpeg and
+  # ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a failure. The
+  # VLC, GStreamer, SRT and RTSP rows stay amd64-only: TestM4aVLC,
+  # TestM4bPlayers, TestM4bSwitchTS and TestM4bRungGap are not in the
+  # pattern (they run in the test job), and OS_TRANSCODE_E2E_ARM=1 skips
+  # TestM4aMatrix's t180/srt-steady and t180/rtsp-steady.
   transcode-e2e-arm64:
     needs: transcoder-arm64
     runs-on: ubuntu-24.04-arm
@@ -177,7 +179,7 @@ jobs:
       OS_REQUIRE_PEERS: "1"
       OS_TRANSCODE_E2E_ARM: "1"
       E2E_PKGS: ./internal/e2e/ ./internal/transcode/
-      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestSupervisorRealChild
+      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestSupervisorRealChild
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
