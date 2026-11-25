@@ -494,7 +494,7 @@ before the code they check.
 | M2 (done) | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change remaps the demuxer's tracks as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
 | M3 (done) | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg and VLC-class clients play every output, and MediaMTX pulls every output it can take as a source (DASH and HTTP-TS are not MediaMTX sources; see Out of M3b3); for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it. Proved by `TestM3Matrix` (every output under the four scenarios), `TestM3VLCClass` and `TestM3GStreamerClass` (VLC-class clients), `TestM3b3MediaMTXPull`, `TestM3b3SRTFFmpeg`, `TestHLSFFmpegAcrossGap` and `TestM3b3HLSAlignment`, with the M3a, M3b1 and M3b2 scenarios for the cells they cover |
 | M4a ([plan](superpowers/plans/2026-11-24-m4a-transcoder-core.md), done) | Transcoder core: the segmenter fix that cuts audio at the video keyframe's PTS, `internal/transcode` (host, wire protocol, native libav pipeline, `cmd/ostranscoder`), a software H.264 ladder with AAC re-encode or copy, per-track passthrough, respawn, CI on Linux amd64 and arm64. Each rendition is served as its own stream, `<name>_<label>` | M1, M3 | A 3-rung software ladder plus a copied rendition passes M3's scenarios per rendition; the rungs' keyframes and segments align with the source's; a killed subprocess comes back as exactly one new epoch per rendition; the same on arm64 in CI. Proved by `TestM4aMatrix` (every rendition under steady-state, epoch-change, slow-consumer, no-B-frames and B-frames, plus SRT and RTSP on `t180`), `TestM4aKeyframesAligned`, `TestM4aRespawn`, `TestM4aVLC`, `TestSupervisorRealChild`, the native and supervisor suites (`internal/transcode/...`), and the `transcode-e2e-arm64` CI job |
-| M4b ([plan](superpowers/plans/2026-11-25-m4b-abr-outputs.md), done) | ABR outputs: the transcoder's presentation hub with its keyframe barrier, the segmenter's `AlignVideo` (a rung that misses a segment start lists a gap), the packager's ABR mode (HLS TS variants under a multivariant playlist, the HLS fMP4 master, DASH Representations in one video set), `osconform`'s ABR rules (variants aligned, BANDWIDTH honest), osdev's `<name>_abr` | M4a | A ladder is served as one ABR presentation that passes M3's scenarios. Proved by `TestM4bMatrix` (steady-state, epoch-change, slow-consumer, no-B-frames and B-frames, each read back over HLS TS, HLS fMP4 and DASH with the ABR rules, every frame once, discontinuities at the same media sequence number in every playlist), `TestM4bSwitchTS` (segments from alternating TS variants decode as one stream), `TestM4bRespawn` (the clip fed twice; a killed child is exactly one new epoch, at one media sequence number in every variant, opened by rung 0's IDR), `TestM4bRungGap` (a rung whose IDR a loss swallowed lists a gap, end to end), `TestM4bPlayers` (ffprobe, VLC and GStreamer), the segmenter, transcoder, packager, conform and osdev suites, and the `transcode-e2e-arm64` CI job (`TestM4bMatrix`, `TestM4bRespawn`) |
+| M4b ([plan](superpowers/plans/2026-11-25-m4b-abr-outputs.md), done) | ABR outputs: the transcoder's presentation hub with its keyframe barrier, the segmenter's `AlignVideo` (a rung that misses a segment start lists a gap), the packager's ABR mode (HLS TS variants under a multivariant playlist, the HLS fMP4 master, DASH Representations in one video set), `osconform`'s ABR rules (variants aligned, BANDWIDTH honest), osdev's `<name>_abr` | M4a | A ladder is served as one ABR presentation that passes M3's scenarios. Proved by `TestM4bMatrix` (steady-state, epoch-change, slow-consumer, no-B-frames and B-frames, each read back over HLS TS, HLS fMP4 and DASH with the ABR rules, every frame once, discontinuities at the same media sequence number in every playlist), `TestM4bSwitchTS` (segments from alternating TS variants decode as one stream), `TestM4bRespawn` (the clip fed twice; a killed child is exactly one new epoch, at one media sequence number in every variant, opened by rung 0's IDR), `TestM4bRungGap` (a rung whose IDR a loss swallowed lists a gap, end to end), `TestM4bPlayers` (ffprobe, VLC and GStreamer; GStreamer DASH on 1.28 only, ruling R-B9), the segmenter, transcoder, packager, conform and osdev suites, and the `transcode-e2e-arm64` CI job (`TestM4bMatrix`, `TestM4bRespawn`, `TestM4bSwitchTS`, `TestM4bRungGap`) |
 | M4c | NVENC on the GPU host; watermark; thumbnails | M4a | On the GPU host (this machine, a GTX 1650): the same ladder with 3 NVENC rungs, run by a make target and recorded in the PR. The watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5 | Feature tests; DVR playback passes `osconform` |
@@ -631,7 +631,8 @@ Out of M4a:
 | More than 3 B-frames, and B-frames below about 8 fps | Beyond what D covers (R-M4c); use none |
 | Merger audio on a long copy-video burst | Backlog |
 
-M4b's rulings are in its plan (R-B1 to R-B8); the design is §3.4's ABR
+M4b's rulings are in its plan (R-B1 to R-B8, and R-B9 made while it ran);
+the design is §3.4's ABR
 presentation and §3.5's presentation hub. Every M4b scenario records one
 transcoder run per fixture through the M4a ladder with the presentation on,
 requires a clean run (no loss, nothing dropped by the presentation's merger,
@@ -643,18 +644,30 @@ of its own end (S@t + S@d) and the next S@t, since a Representation's
 timeline may overlap itself (Backlog: DASH timeline overlapping itself); and
 an HLS playlist whose first entry in an epoch is a gap is exempt from
 `track-start-offset` in that epoch, since R-B8 starts that rung late by
-design. `TestM4bRespawn`
-feeds h264_aac.ts twice at its pace, so that seven source keyframes remain
-after the kill for the respawn's backoff and start-up. The players
+design. `TestM4bRespawn` feeds h264_aac.ts twice at its pace, so that seven
+source keyframes remain after the kill for the respawn's backoff and
+start-up. The players
 (`TestM4bPlayers`) run on the h264_aac.ts presentation replayed four times at
 its pace into a live packager per row: ffprobe lists the four rungs and the
 audio on every output; VLC 3.0.20 plays all three with M3's pass rule and
 ruling R-T1c's start-up tolerance; GStreamer plays HLS TS, and DASH on 1.28.
-GStreamer 1.24's dashdemux2 cannot play a live DASH window that slides
-(Backlog), so on GStreamers before 1.28 the DASH row skips naming it, or
-probes it with `OS_PEER_LIMITS=1`. The arm64 job runs `TestM4bMatrix` and
-`TestM4bRespawn`, whose only peers are ffmpeg and ffprobe; the player,
-switch and rung-gap tests run in the amd64 `test` job.
+**Ruling R-B9:** GStreamer 1.24's dashdemux2 cannot play a live DASH
+window that slides, so on GStreamers before 1.28 `TestM4bPlayers`'
+gstreamer/dash row skips naming the limitation, and with `OS_PEER_LIMITS=1`
+probes it (a 60 s replay, a 30 s run; it fails if GStreamer still gets video
+buffers in the last 10 s, or logs an ERROR). Evidence:
+
+| Live DASH, sliding window | GStreamer 1.24.2 | GStreamer 1.28.2 | VLC 3.0.20 |
+|---|---|---|---|
+| Ours (the ABR presentation; also plain M3 DASH and a seamless video-only loop) | No buffer, or 225 to 308 video buffers and none after 8.2 s, in 30 s (6 probe runs); asks for fragments ahead of the live edge after each MPD update that evicts segments ("Seek to after last segment") | Passes the 12 s rule, first buffer after 4 to 6 s; over 30 to 40 s, 300 to 390 video buffers and once a 17 s jump forward | Plays (`TestM4bPlayers/vlc/dash`) |
+| Reference: ffmpeg 6.1.1's dash muxer (`-window_size 5 -extra_window_size 0 -seg_duration 2 -use_template 1 -use_timeline 1`, two libx264 Representations, AAC) | No buffer in any of 4 sessions (12 s, 30 s and 40 s runs); fetched one segment per stream and stopped | No buffer in 12 s, 30 s and 40 s runs (3 sessions); "Download waiting for 28 s", then "Seek to after last segment" 14 times | Plays segments 3 to 17 in order in 25 s, no decoder error |
+
+The reference stalls both GStreamers, while VLC plays it, so the limit is
+GStreamer's live sliding-window handling, not our MPD. 1.28's long-run
+behaviour on our output is in the Backlog, as a gate before M7 if the soak
+uses GStreamer. The arm64 job runs `TestM4bMatrix`, `TestM4bRespawn`,
+`TestM4bSwitchTS` and `TestM4bRungGap`, whose only peers are ffmpeg and
+ffprobe; `TestM4bPlayers` runs in the amd64 `test` job.
 
 Out of M4b:
 
@@ -909,26 +922,26 @@ Items accepted for later, not yet placed in a milestone:
   next S@t could render up to the jump twice. Making S@d the presentation
   span instead would break `timeline-matches-media`; a ruling for DASH as a
   whole.
-- **GStreamer on a sliding live DASH window** (found by `TestM4bPlayers`;
-  not ABR-specific, and M3 had no GStreamer DASH row). GStreamer 1.24.2's
-  dashdemux2 skips segments after each MPD update that evicts some, asks
-  for fragments ahead of the live edge and stalls: no buffer, or none after
-  its first 8 s (`TestM4bPlayers/gstreamer/dash` skips on GStreamers before
-  1.28, and `OS_PEER_LIMITS=1` probes it). With a window that does not slide
-  it plays, but its first buffer comes 8.5 to over 12 s in (it finds new
-  segments only at each 2 s MPD refresh while joining 6 s behind the edge
-  with a 10 s buffer). 1.28.2 passes the 12 s pass rule (first buffer after
-  4 to 6 s), but over 30 to 40 s runs it decoded 300 to 390 video buffers
-  and once jumped forward 17 s (PTS 14.4 to 31.8). Our MPDs were checked
-  across refreshes (fixed `availabilityStartTime`, `startNumber` advancing
-  with each evicted S, every S@t unchanged, segments listed after their
-  availability time), and 1.24 failed on a seamless video-only loop too, so
-  no defect of ours is known. Next, before M7 if the soak uses GStreamer:
-  compare with another packager's live DASH (an ffmpeg dash muxer run with
-  `-c copy` from a TS loop was not usable as a reference), and check whether
-  the replay's loop-seam gaps (S@t above the previous S@t + S@d by 96 ms
-  for video and 80 ms for audio) explain 1.28's jump. VLC 3.0.20 and
-  ffprobe play the same output.
+- **GStreamer on a sliding live DASH window** (ruling R-B9; found by
+  `TestM4bPlayers`, not ABR-specific, and M3 had no GStreamer DASH row).
+  GStreamer 1.24.2's dashdemux2 skips segments after each MPD update that
+  evicts some, asks for fragments ahead of the live edge and stalls, on our
+  output and on ffmpeg's dash muxer alike (`TestM4bPlayers/gstreamer/dash`
+  skips on GStreamers before 1.28; `OS_PEER_LIMITS=1` probes it). With a
+  window that does not slide it plays ours, but its first buffer comes 8.5
+  to over 12 s in (it finds new segments only at each 2 s MPD refresh while
+  joining 6 s behind the edge with a 10 s buffer). 1.28.2 passes the 12 s
+  pass rule on ours (first buffer after 4 to 6 s), but over 30 to 40 s runs
+  it decoded 300 to 390 video buffers and once jumped forward 17 s (PTS
+  14.4 to 31.8), and it stalled on ffmpeg's reference altogether. Our MPDs
+  were checked across refreshes (fixed `availabilityStartTime`,
+  `startNumber` advancing with each evicted S, every S@t unchanged,
+  segments listed after their availability time). **Gate before M7 if the
+  soak uses GStreamer:** settle 1.28's long-run behaviour on our live DASH
+  (check whether the replay's loop-seam gaps, S@t above the previous S@t +
+  S@d by 96 ms for video and 80 ms for audio, explain the jump, and run it
+  against a seamless source); otherwise the soak's GStreamer clients use
+  HLS. VLC 3.0.20 and ffprobe play the same output.
 
 #### M3b3 deferred minors
 

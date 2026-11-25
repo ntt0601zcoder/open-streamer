@@ -1059,14 +1059,16 @@ func TestM4bRungGap(t *testing.T) {
 const m4bPlayerPasses = 4
 
 // gstDASHWindowLimit is GStreamer 1.24's defect with a live DASH
-// SegmentTimeline whose window slides (TestM4bPlayers' gstreamer/dash row).
+// SegmentTimeline whose window slides (TestM4bPlayers' gstreamer/dash row,
+// ruling R-B9).
 const gstDASHWindowLimit = "GStreamer 1.24's dashdemux2 (1.24.2) skips segments of a live DASH SegmentTimeline " +
 	"after each MPD update that evicted segments: it asks for fragments ahead of the live edge (Download waiting " +
 	"for 5 s, Seek to after last segment) and stalls, with no buffer at all or none after its first 8 s. Seen on " +
-	"the ABR presentation and on the plain M3 DASH of h264_aac.ts and of a seamless video-only loop; with a " +
-	"60-segment window that did not slide it played, but only after 8.5 s to over 12 s (it finds new segments " +
-	"only at each 2 s MPD refresh), past the pass rule's 10 s. GStreamer 1.28.2 passes the pass rule on the " +
-	"sliding window (first buffer after 4 to 6 s); see the Backlog for what it does over 30 s"
+	"the ABR presentation and on the plain M3 DASH of h264_aac.ts and of a seamless video-only loop; and on the " +
+	"reference, ffmpeg 6.1's own live DASH muxer (2 video Representations and AAC, window 5, 2 s segments), it " +
+	"got no buffer in 12 s and 40 s runs while VLC 3.0.20 played that MPD's segments in order (ruling R-B9). " +
+	"GStreamer 1.28.2 passes the pass rule on our sliding window (first buffer after 4 to 6 s); see the Backlog " +
+	"for what it does over 30 s"
 
 // The gstreamer/dash limit probe (OS_PEER_LIMITS=1 on GStreamers before
 // 1.28) replays the presentation gstLimitPasses times (60 s), so that the
@@ -1138,18 +1140,25 @@ func probeABR(t *testing.T, ffprobe, u string) (heights []int, audio int, stderr
 	return heights, audio, errb.String()
 }
 
-// gstMinor returns the minor version of a GStreamer 1.x gst-launch-1.0
-// ("gst-launch-1.0 version 1.24.2"), and false when it does not parse.
-func gstMinor(t *testing.T, gst testpeer.Peer) (int, bool) {
+// gstBefore128 reports whether gst-launch-1.0 ("gst-launch-1.0 version
+// 1.24.2") is a GStreamer before 1.28; a major version of 2 or more counts
+// as 1.28 or later. ok is false when the version does not parse.
+func gstBefore128(t *testing.T, gst testpeer.Peer) (before, ok bool) {
 	t.Helper()
-	v := gst.Version(t)
-	_, rest, ok := strings.Cut(v, " version 1.")
-	if !ok {
-		return 0, false
+	_, v, found := strings.Cut(gst.Version(t), " version ")
+	if !found {
+		return false, false
 	}
-	minor, _, _ := strings.Cut(rest, ".")
-	n, err := strconv.Atoi(minor)
-	return n, err == nil
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) < 2 {
+		return false, false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false, false
+	}
+	return major < 1 || major == 1 && minor < 28, true
 }
 
 // TestM4bPlayers plays the ABR presentation of h264_aac.ts (the M4a
@@ -1171,7 +1180,7 @@ func gstMinor(t *testing.T, gst testpeer.Peer) (int, bool) {
 //     GStreamers before 1.28 the gstreamer/dash row skips naming it, or with
 //     OS_PEER_LIMITS=1 probes it (gstLimitPasses, gstLimitRun) and fails if
 //     that GStreamer still gets video buffers in the run's last
-//     gstLimitTail.
+//     gstLimitTail, or logs an ERROR (ruling R-B9).
 //
 // The VLC rows run one after the other (as TestM3VLCClass's); the ffprobe
 // and GStreamer rows overlap them, each on its own replay.
@@ -1237,9 +1246,9 @@ func TestM4bPlayers(t *testing.T) {
 			gst := testpeer.GStreamer(t, row.elements...)
 			limited, passes := false, m4bPlayerPasses
 			if row.name == "dash" {
-				minor, ok := gstMinor(t, gst)
+				before, ok := gstBefore128(t, gst)
 				require.True(t, ok, "%s: version %q", gst, gst.Version(t))
-				if minor < 28 {
+				if before {
 					peerLimit(t, gstDASHWindowLimit)
 					limited, passes = true, gstLimitPasses
 				}
@@ -1250,6 +1259,9 @@ func TestM4bPlayers(t *testing.T) {
 			// buffers 10 s (adaptivedemux2's low watermark) before its
 			// first buffer, which came after 8 s of the pass rule's 10
 			// with three segments listed, and after 4 to 6 s with five.
+			// The replay ends about 9.5 s into the 12 s run, and the window
+			// stops sliding then, so the first buffer within 10 s, not the
+			// rest of the run, is the signal that tests the sliding window.
 			waitListed(t, p, 5)
 			if !limited {
 				gstPlays(t, gst, hlsPipeline(base+row.path))
@@ -1266,8 +1278,13 @@ func TestM4bPlayers(t *testing.T) {
 			t.Logf("%s: buffers %v in %v, the last video buffer after %v, errors %q (limit probe)", gst,
 				res.counts(), gstLimitRun, last.Round(time.Millisecond), res.errLines)
 			if last > gstLimitRun-gstLimitTail {
-				t.Errorf("%s now plays a sliding live DASH window: lift the skip", gst)
+				t.Errorf("%s now plays a sliding live DASH window: lift the skip (ruling R-B9)", gst)
+				return
 			}
+			// The known failure mode is a silent stall: no ERROR (a 404, a
+			// missing element or a pipeline error is another failure), and
+			// no video buffer in the run's last gstLimitTail.
+			assert.Empty(t, res.errLines, "the known failure mode: a stall without ERROR")
 		})
 	}
 }
