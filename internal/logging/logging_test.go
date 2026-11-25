@@ -211,3 +211,25 @@ func TestHandlerTypedNil(t *testing.T) {
 		t.Errorf("output = %s", out)
 	}
 }
+
+func TestHandlerScrubsURLValue(t *testing.T) {
+	u := url.URL{Scheme: "srt", Host: "h:9", RawQuery: "passphrase=qsecret&x=1", Path: "/live/pathsecret"}
+	r := url.URL{Scheme: "rtmp", Host: "h", Path: "/live/streamkeyval"}
+	for _, format := range []string{"json", "text"} {
+		var buf bytes.Buffer
+		log, err := New(&buf, "info", format)
+		if err != nil {
+			t.Fatal(err)
+		}
+		log.Info("m", "u", u, "r", r)
+		out := buf.String()
+		for _, s := range []string{"qsecret", "streamkeyval"} {
+			if strings.Contains(out, s) {
+				t.Errorf("%s: %q leaked: %s", format, s, out)
+			}
+		}
+		if !strings.Contains(out, "x=1") {
+			t.Errorf("%s: x=1 lost: %s", format, out)
+		}
+	}
+}

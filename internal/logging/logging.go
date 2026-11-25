@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"reflect"
 	"regexp"
 	"strings"
@@ -119,6 +120,8 @@ func scrubAttr(a slog.Attr) slog.Attr {
 		switch x := v.Any().(type) {
 		case error:
 			return slog.String(a.Key, Scrub(safeString(x, x.Error)))
+		case url.URL:
+			return slog.String(a.Key, Scrub(safeString(&x, x.String)))
 		case fmt.Stringer:
 			return slog.String(a.Key, Scrub(safeString(x, x.String)))
 		default:
