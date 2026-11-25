@@ -229,6 +229,33 @@ func TestOsdevReport(t *testing.T) {
 	assert.NotContains(t, sb.String(), "stream q")
 }
 
+// An ABR presentation whose packager left a rung out reports it, once per
+// change and again at shutdown.
+func TestOsdevReportRungs(t *testing.T) {
+	cfg := &media.TrackConfig{Codec: media.CodecH264}
+	p := live.NewPackager(nil, live.Options{ABR: true, Now: func() time.Time { return time.Unix(1e9, 0) }})
+	src := &source{name: "s_abr", pack: p}
+	var sb strings.Builder
+	src.reportRungs(&sb, true)
+	assert.Empty(t, sb.String())
+	// Track 1 anchors the segment; track 0 never delivers a keyframe, so
+	// its frames are left out.
+	for i := range 3 {
+		ts := int64(i) * 3600
+		for _, track := range []int{1, 0} {
+			p.Handle(hub.Delivery{Frame: media.Frame{Track: track, Config: cfg, PTS: ts, DTS: ts, Key: i == 0 && track == 1, Data: [][]byte{{0x65}}, Epoch: 1}})
+		}
+	}
+	p.Flush()
+	require.Equal(t, map[int]live.RungStats{0: {Gaps: 1, LeftOut: 3}}, p.Rungs())
+	src.reportRungs(&sb, false)
+	assert.Equal(t, "osdev: stream s_abr: rungs left out of segments: track 0: 1 segments without it, 3 frames left out\n", sb.String())
+	src.reportRungs(&sb, false)
+	assert.Equal(t, 1, strings.Count(sb.String(), "\n"), "unchanged: not repeated")
+	src.reportRungs(&sb, true)
+	assert.Equal(t, 2, strings.Count(sb.String(), "\n"), "repeated at shutdown")
+}
+
 func TestOsdevServerTimeouts(t *testing.T) {
 	srv := newServer(http.NotFoundHandler())
 	assert.Positive(t, srv.ReadHeaderTimeout)

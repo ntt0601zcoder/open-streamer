@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1175,4 +1176,55 @@ func TestABRTSNoCombinedTS(t *testing.T) {
 	}
 	code, _ := get(t, srv, "/live/s/hls/v0.m3u8")
 	assert.Equal(t, http.StatusNotFound, code)
+}
+
+// Finding I2: an ABR packager counts, per rung, the segments without it and
+// the frames the segmenter left out, and warns about them at most once
+// every 10 s. Rung 2 has no frame in segment 1 (a gap, nothing left out);
+// rung 1 loses its keyframe at segment 3's start, so its 49 other frames
+// there are left out and the segment lists a gap.
+func TestABRRungStats(t *testing.T) {
+	ds := synthLadder(t, 1, 0, 250)
+	ds = slices.DeleteFunc(ds, func(d hub.Delivery) bool {
+		f := d.Frame
+		return f.Track == 2 && f.PTS >= 50*3600 && f.PTS < 100*3600 ||
+			f.Track == 1 && f.PTS == 150*3600
+	})
+	var logs bytes.Buffer
+	now := farFuture()
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+	p := NewPackager(h, Options{
+		Window: 100, ABR: true, Now: func() time.Time { return now },
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	handleAll(p, ds) // segments 0..3
+	assert.Equal(t, map[int]RungStats{0: {}, 1: {Gaps: 1, LeftOut: 49}, 2: {Gaps: 1}}, p.Rungs())
+	assert.Zero(t, p.Errors())
+	// One warning, at segment 1; segment 3's loss came within 10 s of it.
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	require.Len(t, lines, 1, logs.String())
+	assert.Contains(t, lines[0], "level=WARN")
+	assert.Contains(t, lines[0], "rungs left out of segments")
+	assert.Contains(t, lines[0], "seq=1")
+	assert.Contains(t, lines[0], "track 2: 1 segments without it (+1), 0 frames left out (+0)")
+	assert.NotContains(t, lines[0], "track 1")
+
+	// After 10 s the next segment reports what the limit held back.
+	now = now.Add(rungWarnEvery)
+	p.Flush() // segment 4
+	lines = strings.Split(strings.TrimSpace(logs.String()), "\n")
+	require.Len(t, lines, 2, logs.String())
+	assert.Contains(t, lines[1], "seq=4")
+	assert.Contains(t, lines[1], "track 1: 1 segments without it (+1), 49 frames left out (+49)")
+	assert.NotContains(t, lines[1], "track 2")
+	assert.Equal(t, map[int]RungStats{0: {}, 1: {Gaps: 1, LeftOut: 49}, 2: {Gaps: 1}}, p.Rungs())
+
+	// A whole ladder loses nothing and logs nothing; a packager that is not
+	// in ABR mode has no rungs.
+	logs.Reset()
+	whole := packLadder(t, Options{ABR: true, Logger: slog.New(slog.NewTextHandler(&logs, nil))}, nil)
+	assert.Equal(t, map[int]RungStats{0: {}, 1: {}, 2: {}}, whole.Rungs())
+	assert.Empty(t, logs.String())
+	assert.Empty(t, packLadder(t, Options{}, nil).Rungs())
 }

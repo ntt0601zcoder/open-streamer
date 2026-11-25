@@ -32,6 +32,9 @@ package live
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
+	"maps"
 	"slices"
 	"sort"
 	"sync"
@@ -48,6 +51,10 @@ import (
 const (
 	defaultTarget = 2 * media.ClockRate
 	defaultWindow = 6
+
+	// rungWarnEvery is the least time between two warnings about rungs
+	// left out of segments.
+	rungWarnEvery = 10 * time.Second
 )
 
 // Options configures a Packager.
@@ -63,6 +70,21 @@ type Options struct {
 	// muxes one TS per video track instead of a combined one (R-B4):
 	// hls/index.m3u8 becomes a multivariant playlist over hls/v{track}.m3u8.
 	ABR bool
+	// Logger receives the ABR warning about rungs left out of segments, at
+	// most once every 10 s; nil discards.
+	Logger *slog.Logger
+}
+
+// RungStats counts what an ABR presentation lost of one video track (a
+// rung). Gaps is the number of segments packaged without a part of the
+// track since the track was first seen (its variant lists a gap there, and
+// its DASH timeline a hole). LeftOut is the number of the track's frames
+// that the segmenter discarded to keep every part starting on a keyframe at
+// its segment's start (ruling R-B8; segment.Segmenter.LeftOut). A rung that
+// keeps arriving too late for the keyframe barrier shows as both rising
+// steadily.
+type RungStats struct {
+	Gaps, LeftOut uint64
 }
 
 // epochState is the writer's working copy of one epoch.
@@ -107,6 +129,13 @@ type Packager struct {
 	tsSeq   uint64                 // TSSeq of the next segment with TS bytes
 	tsGap   bool                   // a TS segment was dropped since the last good one
 
+	// ABR rung losses. rungs is guarded by rungMu; the rest by work.
+	log      *slog.Logger
+	rungMu   sync.Mutex
+	rungs    map[int]RungStats
+	warned   map[int]RungStats // rungs at the last warning
+	warnedAt time.Time
+
 	// TARGETDURATION per playlist; it never shrinks. Guarded by tdMu.
 	tdMu sync.Mutex
 	td   map[string]int
@@ -129,6 +158,11 @@ func NewPackager(h *hub.Hub, opt Options) *Packager {
 		nextN:   map[int]uint64{},
 		pending: map[int]bool{},
 		vtsm:    map[int]*ts.Muxer{},
+		log:     opt.Logger,
+		rungs:   map[int]RungStats{},
+	}
+	if p.log == nil {
+		p.log = slog.New(slog.DiscardHandler)
 	}
 	if p.target <= 0 {
 		p.target = defaultTarget
@@ -155,6 +189,78 @@ func (p *Packager) FallbackAnchors() uint64 { return p.fallback.Load() }
 // not be built, counted once each when the track's first part is packaged.
 // The DASH MPD leaves such a track out, and the HLS master's CODECS lacks it.
 func (p *Packager) CodecErrors() uint64 { return p.codecErr.Load() }
+
+// Rungs returns, for an ABR presentation, what each video track lost: the
+// tracks that had a part in some segment or had frames left out. It is
+// empty when not in ABR mode. The counts are as of the last segment
+// packaged.
+func (p *Packager) Rungs() map[int]RungStats {
+	p.rungMu.Lock()
+	defer p.rungMu.Unlock()
+	return maps.Clone(p.rungs)
+}
+
+// noteRungs updates the rung counters after segment seq was packaged with
+// parts: a gap for every known video track without a part, and the
+// segmenter's left-out frames. When a counter rose, it warns, at most once
+// every rungWarnEvery. Called with work held.
+func (p *Packager) noteRungs(ep *epochState, seq uint64, parts []CMAFPart) {
+	leftOut := p.seg.LeftOut()
+	p.rungMu.Lock()
+	in := map[int]bool{}
+	for _, part := range parts {
+		et := ep.tracks[part.Track]
+		if et == nil || et.Config == nil || et.Config.Codec.Kind() != media.KindVideo {
+			continue
+		}
+		in[part.Track] = true
+		if _, ok := p.rungs[part.Track]; !ok {
+			p.rungs[part.Track] = RungStats{}
+		}
+	}
+	for track, n := range leftOut {
+		r := p.rungs[track]
+		r.LeftOut = n
+		p.rungs[track] = r
+	}
+	for track, r := range p.rungs {
+		if !in[track] {
+			r.Gaps++
+			p.rungs[track] = r
+		}
+	}
+	cur := maps.Clone(p.rungs)
+	p.rungMu.Unlock()
+	if sameLosses(cur, p.warned) {
+		return
+	}
+	t := p.now()
+	if !p.warnedAt.IsZero() && t.Sub(p.warnedAt) < rungWarnEvery {
+		return
+	}
+	tracks := slices.Sorted(maps.Keys(cur))
+	list := make([]string, 0, len(tracks))
+	for _, track := range tracks {
+		r, w := cur[track], p.warned[track]
+		if r != w {
+			list = append(list, fmt.Sprintf("track %d: %d segments without it (+%d), %d frames left out (+%d)",
+				track, r.Gaps, r.Gaps-w.Gaps, r.LeftOut, r.LeftOut-w.LeftOut))
+		}
+	}
+	p.log.Warn("live: abr: rungs left out of segments", "seq", seq, "rungs", list)
+	p.warned, p.warnedAt = cur, t
+}
+
+// sameLosses reports whether every track of a has the same counts in b, a
+// track that b lacks counting as zero there.
+func sameLosses(a, b map[int]RungStats) bool {
+	for track, r := range a {
+		if b[track] != r {
+			return false
+		}
+	}
+	return true
+}
 
 // Handle feeds one delivery and packages the segments it completes. It
 // returns when they are in the window.
@@ -254,6 +360,9 @@ func (p *Packager) pack(s segment.Segment) {
 	}
 
 	info.Parts = slices.Clip(info.Parts)
+	if p.abr {
+		p.noteRungs(ep, s.Seq, info.Parts)
+	}
 	p.mu.Lock()
 	p.st.ast = p.ast
 	p.st.add(info, ep.publish(), p.window)

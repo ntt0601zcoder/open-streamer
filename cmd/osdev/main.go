@@ -11,7 +11,8 @@
 // stderr; osdev then exits 1 at shutdown, or at once when every stream has
 // failed. Every 30 s, and at shutdown, osdev reports on stderr each stream's
 // active input, switches, drift breaks and reader counters when they changed,
-// and the packager's mux errors and fallback anchors while they grow.
+// the packager's mux errors and fallback anchors while they grow, and the
+// rungs an ABR presentation left out of segments (see live.RungStats).
 //
 // To accept an RTMP publisher (OBS, ffmpeg), serve a listen input and point
 // the publisher at it, with a stream key of your choice:
@@ -92,6 +93,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -212,6 +214,7 @@ type source struct {
 	pack     *live.Packager
 	pipe     *pipeline.Pipeline
 	reported [3]uint64 // Errors, CodecErrors and FallbackAnchors at the last report
+	rungLine string    // the last rungs report line
 	lastLine string    // the last pipeline report line
 }
 
@@ -261,6 +264,7 @@ func report(w io.Writer, srcs []*source, final bool) {
 		if s.pipe != nil {
 			s.reportPipeline(w, s.pipe.Stats())
 		}
+		s.reportRungs(w, final)
 		now := [3]uint64{s.pack.Errors(), s.pack.CodecErrors(), s.pack.FallbackAnchors()}
 		if now == ([3]uint64{}) || (!final && now == s.reported) {
 			continue
@@ -269,6 +273,25 @@ func report(w io.Writer, srcs []*source, final bool) {
 		_, _ = fmt.Fprintf(w, "osdev: stream %s: %d packager mux errors (dropped segment outputs), %d tracks without a codec string, %d epochs placed without a hub anchor\n",
 			s.name, now[0], now[1], now[2])
 	}
+}
+
+// reportRungs writes one line for an ABR presentation whose packager left
+// rungs out of segments: on every call when final, else only when the
+// counts grew since the last report.
+func (s *source) reportRungs(w io.Writer, final bool) {
+	rungs := s.pack.Rungs()
+	var list []string
+	for _, track := range slices.Sorted(maps.Keys(rungs)) {
+		if r := rungs[track]; r != (live.RungStats{}) {
+			list = append(list, fmt.Sprintf("track %d: %d segments without it, %d frames left out", track, r.Gaps, r.LeftOut))
+		}
+	}
+	line := strings.Join(list, "; ")
+	if line == "" || (!final && line == s.rungLine) {
+		return
+	}
+	s.rungLine = line
+	_, _ = fmt.Fprintf(w, "osdev: stream %s: rungs left out of segments: %s\n", s.name, line)
 }
 
 // newServer returns the HTTP server. It sets no ReadTimeout or WriteTimeout:
@@ -476,7 +499,7 @@ func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, 
 		ph := tr.Presentation()
 		cfg.presentations = append(cfg.presentations, &source{
 			name: stream + "_" + abrLabel, from: stream, hub: ph,
-			pack: live.NewPackager(ph, live.Options{ABR: true}),
+			pack: live.NewPackager(ph, live.Options{ABR: true, Logger: log}),
 		})
 	}
 	return nil
