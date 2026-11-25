@@ -636,6 +636,36 @@ func TestM4cNVENCMixed(t *testing.T) {
 	assertNVENCLadder(t, opt, run, "h264_pyramid.ts")
 }
 
+// TestM4cNVENCEpochChangeABR transcodes h264_aac_then_640.ts, whose
+// resolution changes mid-stream, through nvencLadder with B-frames (copy +
+// three NVENC rungs, the presentation on), so that every NVENC encoder is
+// reopened at the epoch change while the copy rung runs on. It validates the
+// presentation merger's 2 s learned-hold opener against NVENC's reopen
+// time: the run is clean with PresentationDropped 0 and EncoderFallbacks 0
+// (serialRuns), and the presentation read back in ABR mode has every frame,
+// epochs [1 2] in every format, one aligned discontinuity, and no rung left
+// out of any segment (Packager.Rungs all zero).
+func TestM4cNVENCEpochChangeABR(t *testing.T) {
+	bin := nvencBinary(t)
+	opt := nvencLadder(bin, 0)
+	const fixture = "h264_aac_then_640.ts"
+	run := serialRuns(t, opt, fixture)[fixture]
+	steps := run.presentation
+	p, base, caps := feedABR(t, steps, 0)
+	assertCompleteABR(t, caps, stepFrames(steps))
+	assert.Len(t, p.Snapshot().Epochs, 2)
+	for _, f := range abrFormats {
+		assert.Equal(t, []uint32{1, 2}, epochs(caps[f.name].Frames), f.name)
+	}
+	assert.Len(t, assertDiscontinuitiesAligned(t, base), 1)
+	rungs := p.Rungs()
+	assert.Len(t, rungs, len(opt.Renditions))
+	for track, r := range rungs {
+		assert.Zero(t, r, "rung %d left out", track)
+	}
+	t.Logf("rungs %+v", rungs)
+}
+
 // envNVENCFFmpeg names the ffmpeg TestM4cNVENCLongGOP makes its clip with:
 // scripts/test-nvenc.sh sets it to the pinned GPL FFmpeg build
 // (<prefix>/bin/ffmpeg, whose shared libraries are in <prefix>/lib), so
