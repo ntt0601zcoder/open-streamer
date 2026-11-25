@@ -717,3 +717,58 @@ func TestChildConfigureBadWatermark(t *testing.T) {
 	require.Len(t, c.errs, 1)
 	assert.True(t, c.errs[0].Fatal)
 }
+
+// corruptKey returns a copy of the key frame f with every byte of its slice
+// NAL units after the NAL header zeroed.
+func corruptKey(f media.Frame) media.Frame {
+	data := make([][]byte, len(f.Data))
+	for i, n := range f.Data {
+		n = bytes.Clone(n)
+		if t := n[0] & 0x1f; t == 1 || t == 5 {
+			clear(n[1:])
+		}
+		data[i] = n
+	}
+	f.Data = data
+	return f
+}
+
+// TestServeShots: a Configure with a thumbnail alone asks for shots from
+// the keys the host sends; a key that gives no shot is counted, not fatal.
+func TestServeShots(t *testing.T) {
+	var ks []media.Frame
+	for _, f := range ofKind(source(t), media.KindVideo) {
+		if f.Key {
+			ks = append(ks, f)
+		}
+	}
+	require.GreaterOrEqual(t, len(ks), 5)
+	h, errc := startChild(t, run)
+	require.NoError(t, h.send(wire.Configure{Thumbnail: &picture.Thumbnail{Height: 120}}))
+	require.NoError(t, h.sendFrames([]media.Frame{ks[0], ks[2], ks[4], corruptKey(ks[1])}))
+	require.NoError(t, h.send(wire.Stop{}))
+
+	e := h.wait(t, errc)
+	require.NoError(t, e.runErr)
+	require.ErrorIs(t, e.readErr, io.EOF)
+	var shots []picture.Shot
+	for _, m := range e.msgs {
+		if s, ok := m.(wire.Shot); ok {
+			shots = append(shots, s.S)
+		}
+	}
+	require.Len(t, shots, 3)
+	for i, s := range shots {
+		assert.Equal(t, ks[2*i].PTS, s.PTS)
+		assert.Equal(t, [2]int{160, 120}, [2]int{s.Width, s.Height})
+		assert.NotEmpty(t, s.JPEG)
+	}
+	c := collect(e.msgs)
+	require.Empty(t, c.errs)
+	assert.Empty(t, c.frames)
+	require.NotEmpty(t, c.stats)
+	last := c.stats[len(c.stats)-1]
+	assert.Equal(t, uint64(3), last.Thumbnails)
+	assert.Equal(t, uint64(1), last.ThumbnailsFailed)
+	assert.Equal(t, uint64(4), last.In)
+}

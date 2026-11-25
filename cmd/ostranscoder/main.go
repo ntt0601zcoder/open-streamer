@@ -201,7 +201,9 @@ func configure(r *wire.Reader, w *wire.Writer) (*child, error) {
 	if a := cfg.Audio; a != nil {
 		audio = &native.Audio{BitrateKbps: a.BitrateKbps, SampleRate: a.SampleRate, Channels: a.Channels}
 	}
-	p, err := native.NewWith(native.Config{Rungs: rungs, Audio: audio, Watermark: cfg.Watermark})
+	p, err := native.NewWith(native.Config{
+		Rungs: rungs, Audio: audio, Watermark: cfg.Watermark, Thumbnail: cfg.Thumbnail,
+	})
 	if err != nil {
 		return nil, fatal(w, fmt.Errorf("ostranscoder: configure: %w", err))
 	}
@@ -265,14 +267,20 @@ func (c *child) finish() error {
 	return c.writeStats()
 }
 
-// call runs one pipeline call, timing it, and writes its outputs. A pipeline
-// error is written to the host as a fatal Error after the outputs that came
-// with it.
+// call runs one pipeline call, timing it, and writes its outputs: frames as
+// Frame, thumbnails as Shot. A pipeline error is written to the host as a
+// fatal Error after the outputs that came with it.
 func (c *child) call(fn func() ([]native.Output, error)) error {
 	start := time.Now()
 	outs, perr := fn()
 	c.busy += int64(time.Since(start))
 	for _, o := range outs {
+		if o.Rung == native.RungShot {
+			if err := c.w.Write(wire.Shot{S: *o.Shot}); err != nil {
+				return fmt.Errorf("ostranscoder: write shot: %w", err)
+			}
+			continue
+		}
 		if err := c.w.Write(wire.Frame{Rung: o.Rung, F: o.F}); err != nil {
 			return fmt.Errorf("ostranscoder: write frame: %w", err)
 		}
@@ -309,5 +317,6 @@ func (c *child) stats() wire.Stats {
 		DroppedTracks: st.DroppedTracks, Reanchors: st.Reanchors, AudioDropped: st.AudioDropped,
 		AudioCorrupt: st.AudioCorrupt, VideoCorrupt: st.VideoCorrupt,
 		EncoderFallbacks: st.EncoderFallbacks,
+		Thumbnails:       st.Thumbnails, ThumbnailsFailed: st.ThumbnailsFailed,
 	}
 }

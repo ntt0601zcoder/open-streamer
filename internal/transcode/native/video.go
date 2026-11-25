@@ -72,14 +72,17 @@ type videoPath struct {
 	// wm draws the watermark, when one is set, on every picture before the
 	// rungs. It outlives builds; its graph does not.
 	wm *watermarker
+	// thumb shoots the pictures its schedule finds due, before the
+	// watermark; nil without a thumbnail. It outlives builds.
+	thumb *thumbnailer
 
 	// The framerate, estimated once per source config.
 	fpsCfg *media.TrackConfig
 	fps    astiav.Rational
 }
 
-func newVideoPath(rungs []Rung, st *Stats, wm *watermarker) *videoPath {
-	return &videoPath{stats: st, rungs: rungs, caches: make([]media.ConfigCache, len(rungs)), wm: wm}
+func newVideoPath(rungs []Rung, st *Stats, wm *watermarker, thumb *thumbnailer) *videoPath {
+	return &videoPath{stats: st, rungs: rungs, caches: make([]media.ConfigCache, len(rungs)), wm: wm, thumb: thumb}
 }
 
 // push feeds one frame of the encoded video track.
@@ -125,16 +128,9 @@ func (v *videoPath) push(f media.Frame, epoch uint32) ([]Output, error) {
 
 // build opens a decoder for the key frame f.
 func (v *videoPath) build(f media.Frame) error {
-	var name string
-	switch f.Config.Codec {
-	case media.CodecH264:
-		name = "h264"
-	case media.CodecH265:
-		name = "hevc"
-	case media.CodecAAC:
-		return fmt.Errorf("video decoder: codec %s is not video", f.Config.Codec)
-	default:
-		return fmt.Errorf("video decoder: unknown codec %d", f.Config.Codec)
+	name, err := videoDecoderName(f.Config.Codec)
+	if err != nil {
+		return fmt.Errorf("video decoder: %w", err)
 	}
 	codec := astiav.FindDecoderByName(name)
 	if codec == nil {
@@ -156,6 +152,20 @@ func (v *videoPath) build(f media.Frame) error {
 	v.startPTS, v.skipRASL = f.PTS, true
 	v.corrupt = corruptRun{}
 	return nil
+}
+
+// videoDecoderName returns the libavcodec decoder of a video codec.
+func videoDecoderName(c media.Codec) (string, error) {
+	switch c {
+	case media.CodecH264:
+		return "h264", nil
+	case media.CodecH265:
+		return "hevc", nil
+	case media.CodecAAC:
+		return "", fmt.Errorf("codec %s is not video", c)
+	default:
+		return "", fmt.Errorf("unknown codec %d", c)
+	}
 }
 
 // feedPending estimates the framerate from the DTS received so far and
@@ -267,7 +277,8 @@ func (v *videoPath) receive(epoch uint32) ([]Output, error) {
 
 // encode sends one decoded picture to every rung, through the watermark
 // when one is set. A picture at the PTS of a source key is forced to an
-// IDR.
+// IDR. A thumbnail due is shot from the picture before the watermark, and
+// comes out before the rungs' frames.
 func (v *videoPath) encode(fr *astiav.Frame, epoch uint32) ([]Output, error) {
 	pts := fr.Pts()
 	if pts == astiav.NoPtsValue || pts < v.startPTS {
@@ -283,15 +294,20 @@ func (v *videoPath) encode(fr *astiav.Frame, epoch uint32) ([]Output, error) {
 		force = force || v.keys[0] == pts
 		v.keys = v.keys[1:]
 	}
+	var out []Output
+	if v.thumb != nil && v.thumb.due(epoch, pts) {
+		if o, ok := v.thumb.shoot(fr, pts, epoch); ok {
+			out = append(out, o)
+		}
+	}
 	pic := fr
 	if v.wm.active() {
 		marked, err := v.wm.apply(fr)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		pic = marked
 	}
-	var out []Output
 	for _, e := range v.encs {
 		o, err := e.encode(pic, pts, force, epoch, v.track)
 		out = append(out, o...)

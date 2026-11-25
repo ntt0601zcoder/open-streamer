@@ -50,15 +50,24 @@ type Rung struct {
 }
 
 // Config is what a pipeline encodes: the video ladder and the audio. A nil
-// Audio ignores audio frames; at least one rung or Audio is required.
+// Audio ignores audio frames; at least one rung, Audio or Thumbnail is
+// required.
 //
 // Watermark is drawn on every decoded picture before the ladder, so every
 // rung carries it; it needs at least one rung. Now is the clock of a text
 // watermark's time directives; nil means time.Now.
+//
+// Thumbnail asks for JPEG shots, taken from the decoded picture before the
+// watermark. With rungs the pipeline shoots a picture every IntervalSec of
+// stream time and at the first picture of each epoch. Without rungs it is
+// key-only: it keeps no schedule and shoots every key frame of the
+// lowest-numbered video track it is given, decoded alone, and drops the
+// rest of the video.
 type Config struct {
 	Rungs     []Rung
 	Audio     *Audio
 	Watermark *picture.Watermark
+	Thumbnail *picture.Thumbnail
 	Now       func() time.Time
 }
 
@@ -66,11 +75,14 @@ type Config struct {
 // 48000 Hz and 2 channels. Channels must be 1, 2, 6 or 8.
 type Audio struct{ BitrateKbps, SampleRate, Channels int }
 
-// Output is one encoded frame. Rung is the index of the video rung, or −1
-// for audio. F.Track is the source track the frame was made from.
+// Output is one encoded frame or one thumbnail. Rung is the index of the
+// video rung, −1 for audio, or RungShot for a thumbnail. F.Track is the
+// source track the frame was made from. Shot is non-nil exactly when Rung
+// is RungShot, and F is then zero.
 type Output struct {
 	Rung int
 	F    media.Frame
+	Shot *picture.Shot
 }
 
 // Stats counts what the pipeline dropped or corrected.
@@ -83,22 +95,29 @@ type Output struct {
 // error but ENOMEM. Damage a video decoder conceals is not counted. A
 // decoder that rejects 50 frames in a row fails the pipeline.
 // EncoderFallbacks counts the rung encoder opens that fell back from NVENC
-// to libx264: one per rung per build.
+// to libx264: one per rung per build. Thumbnails counts the shots made and
+// ThumbnailsFailed the attempts that gave none; a failed shot never fails
+// the pipeline and never counts in VideoCorrupt.
 type Stats struct {
 	DroppedTracks, Reanchors, AudioDropped uint64
 	AudioCorrupt, VideoCorrupt             uint64
 	EncoderFallbacks                       uint64
+	Thumbnails, ThumbnailsFailed           uint64
 }
 
-// Pipeline decodes the source video once, draws the watermark on it when
-// one is set, encodes it per rung with libx264 or NVENC, and re-encodes
-// every audio track to AAC. Its input is already in rendition time:
-// epoch-mapped and shifted by D. Output PTS are the input's; video output
-// DTS are the encoder's. It is not safe for concurrent use.
+// Pipeline decodes the source video once, takes thumbnails from it when
+// asked, draws the watermark on it when one is set, encodes it per rung
+// with libx264 or NVENC, and re-encodes every audio track to AAC. Its
+// input is already in rendition time: epoch-mapped and shifted by D.
+// Output PTS are the input's; video output DTS are the encoder's. It is not
+// safe for concurrent use.
 type Pipeline struct {
 	video  *videoPath // nil without rungs
 	audio  *Audio     // resolved; nil when audio is ignored
 	audios map[int]*audioTrack
+	// thumb makes the thumbnails; nil without. Without rungs it shoots
+	// key frames alone.
+	thumb *thumbnailer
 
 	started bool
 	epoch   uint32
@@ -131,8 +150,8 @@ func New(rungs []Rung, audio *Audio) (*Pipeline, error) {
 // NewWith builds a pipeline for c.
 func NewWith(c Config) (*Pipeline, error) {
 	rungs, audio := c.Rungs, c.Audio
-	if len(rungs) == 0 && audio == nil {
-		return nil, errors.New("transcode: new pipeline: no rungs and no audio")
+	if len(rungs) == 0 && audio == nil && c.Thumbnail == nil {
+		return nil, errors.New("transcode: new pipeline: no rungs, no audio and no thumbnail")
 	}
 	specs := make([]Rung, len(rungs))
 	for i, r := range rungs {
@@ -146,6 +165,12 @@ func NewWith(c Config) (*Pipeline, error) {
 		return nil, errors.New("transcode: new pipeline: a watermark needs video rungs")
 	}
 	p := &Pipeline{audios: map[int]*audioTrack{}, vtrack: -1, dropped: map[int]bool{}}
+	if t := c.Thumbnail; t != nil {
+		if err := t.Validate(); err != nil {
+			return nil, fmt.Errorf("transcode: new pipeline: %w", err)
+		}
+		p.thumb = newThumbnailer(t.Resolved(), &p.stats, len(specs) > 0)
+	}
 	if audio != nil {
 		a, err := resolveAudio(*audio)
 		if err != nil {
@@ -158,7 +183,7 @@ func NewWith(c Config) (*Pipeline, error) {
 		if err := wm.set(c.Watermark); err != nil {
 			return nil, fmt.Errorf("transcode: new pipeline: %w", err)
 		}
-		p.video = newVideoPath(specs, &p.stats, wm)
+		p.video = newVideoPath(specs, &p.stats, wm, p.thumb)
 	}
 	return p, nil
 }
@@ -288,6 +313,9 @@ func (p *Pipeline) push(f media.Frame) ([]Output, error) {
 
 func (p *Pipeline) pushVideo(f media.Frame) ([]Output, error) {
 	if p.video == nil {
+		if p.thumb != nil {
+			return p.shootKey(f), nil
+		}
 		return nil, nil
 	}
 	var out []Output
@@ -316,6 +344,31 @@ func (p *Pipeline) pushVideo(f media.Frame) ([]Output, error) {
 	}
 	o, err := p.video.push(f, p.epoch)
 	return append(out, o...), err
+}
+
+// shootKey takes a shot from a key frame of the lowest-numbered video
+// track, for a pipeline without rungs, and drops every other video frame.
+// A higher-numbered track is dropped and counted as with rungs. It leaves
+// the epoch's video and gate state alone: audio goes on as in an
+// audio-only pipeline. A failed shot is counted, never returned.
+func (p *Pipeline) shootKey(f media.Frame) []Output {
+	switch {
+	case p.vtrack < 0:
+		p.vtrack = f.Track
+	case f.Track > p.vtrack:
+		p.dropTrack(f.Track)
+		return nil
+	case f.Track < p.vtrack:
+		p.dropTrack(p.vtrack)
+		p.vtrack = f.Track
+	}
+	if !f.Key {
+		return nil
+	}
+	if o, ok := p.thumb.fromKey(f); ok {
+		return []Output{o}
+	}
+	return nil
 }
 
 func (p *Pipeline) dropTrack(track int) {
@@ -441,6 +494,9 @@ func (p *Pipeline) release() {
 	if p.video != nil {
 		p.video.release()
 		p.video.wm.close()
+	}
+	if p.thumb != nil {
+		p.thumb.release()
 	}
 	for _, a := range p.audios {
 		a.release()
