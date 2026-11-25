@@ -10,10 +10,13 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
 
-// pendingFrame is one frame waiting in a merger, with its arrival time.
+// pendingFrame is one frame waiting in a merger, with its arrival time
+// and, in the presentation merger, its order key (b, phase).
 type pendingFrame struct {
-	f  media.Frame
-	at time.Time
+	f     media.Frame
+	at    time.Time
+	b     int64
+	phase uint8
 }
 
 // merger writes one rendition hub in DTS order from frames that arrive from
@@ -39,7 +42,17 @@ type pendingFrame struct {
 // above the last one written on its track, is dropped and counted. Before
 // an epoch's first frame the merger sets the epoch's anchor on the hub.
 //
-// push and flush are safe for concurrent use; run arms the wall-time holds.
+// The presentation merger (newPresentationMerger) writes every rendition's
+// video on its own track behind a keyframe barrier; see presOrder. It
+// differs from a rendition merger in two ways only: frames go out in order
+// of their presOrder key instead of (epoch, DTS), and while the next frame
+// opens an epoch above the hub's current one (or the hub has none yet), it
+// waits for that epoch's expected tracks with only the wall-time hold, so
+// that a burst of the copy rung's frames cannot release its IDR ahead of
+// rung 0's.
+//
+// push, expect, barrier and flush are safe for concurrent use; run arms the
+// wall-time holds.
 type merger struct {
 	h         *hub.Hub
 	hold      time.Duration
@@ -56,6 +69,7 @@ type merger struct {
 	written bool
 	out     uint64
 	dropped uint64
+	pres    *presOrder // the presentation merger's barriers; nil otherwise
 }
 
 func newMerger(h *hub.Hub, hold time.Duration, now func() time.Time, anchor func(uint32) (media.Anchor, bool)) *merger {
@@ -72,6 +86,14 @@ func newMerger(h *hub.Hub, hold time.Duration, now func() time.Time, anchor func
 	}
 }
 
+// newPresentationMerger returns a merger for the presentation hub: a
+// rendition merger that orders its frames behind keyframe barriers.
+func newPresentationMerger(h *hub.Hub, hold time.Duration, now func() time.Time, anchor func(uint32) (media.Anchor, bool)) *merger {
+	m := newMerger(h, hold, now, anchor)
+	m.pres = newPresOrder(maxBarriers)
+	return m
+}
+
 // push adds f and writes every frame that no longer has to wait.
 func (m *merger) push(f media.Frame) {
 	m.mu.Lock()
@@ -86,7 +108,11 @@ func (m *merger) push(f media.Frame) {
 		m.seen[f.Epoch] = s
 	}
 	s[f.Track] = true
-	m.q[f.Track] = append(m.q[f.Track], pendingFrame{f: f, at: m.now()})
+	p := pendingFrame{f: f, at: m.now()}
+	if m.pres != nil {
+		p.b, p.phase = m.pres.key(f)
+	}
+	m.q[f.Track] = append(m.q[f.Track], p)
 	m.release(m.now(), false)
 	waiting := m.pending()
 	m.mu.Unlock()
@@ -112,6 +138,19 @@ func (m *merger) expect(e uint32, track int) {
 		m.seen[e] = s
 	}
 	s[track] = true
+}
+
+// barrier records a barrier of epoch e at pts, the PTS of a source
+// main-video keyframe after the Delay shift, in the presentation merger. A
+// rendition merger keeps no barrier, and an epoch below the hub's current
+// one is ignored.
+func (m *merger) barrier(e uint32, pts int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pres == nil || m.written && e < m.epoch {
+		return
+	}
+	m.pres.addBarrier(e, pts)
 }
 
 // flush writes every pending frame, in order, without holding.
@@ -175,16 +214,24 @@ func (m *merger) pending() bool {
 }
 
 // candidate returns the track whose head frame comes next: the smallest
-// (epoch, DTS), video before audio on a tie, then the lowest track. Called
-// with m.mu held.
+// (epoch, DTS), video before audio on a tie, then the lowest track; in the
+// presentation merger, the smallest presOrder key. Called with m.mu held.
 func (m *merger) candidate() (int, bool) {
 	best, found := 0, false
 	for t, q := range m.q {
 		if len(q) == 0 {
 			continue
 		}
-		if !found || before(q[0].f, t, m.q[best][0].f, best) {
+		if !found {
 			best, found = t, true
+			continue
+		}
+		if m.pres != nil {
+			if keyBefore(q[0], t, m.q[best][0], best) {
+				best = t
+			}
+		} else if before(q[0].f, t, m.q[best][0].f, best) {
+			best = t
 		}
 	}
 	return best, found
@@ -203,13 +250,27 @@ func before(a media.Frame, at int, b media.Frame, bt int) bool {
 	}
 }
 
+// waitEpoch returns the epoch whose expected tracks f, the head frame that
+// comes next, waits for: the hub's current epoch, or f's before the first
+// write. In the presentation merger, a frame of an epoch above the hub's
+// current one (or before the first write) waits for its own epoch's
+// tracks, and newEpoch reports that only the wall-time hold applies.
+// Called with m.mu held.
+func (m *merger) waitEpoch(f media.Frame) (e uint32, newEpoch bool) {
+	switch {
+	case !m.written:
+		return f.Epoch, m.pres != nil
+	case m.pres != nil && f.Epoch > m.epoch:
+		return f.Epoch, true
+	default:
+		return m.epoch, false
+	}
+}
+
 // missing returns the expected tracks other than c with nothing pending.
 // Called with m.mu held.
 func (m *merger) missing(c int) []int {
-	e := m.epoch
-	if !m.written {
-		e = m.q[c][0].f.Epoch
-	}
+	e, _ := m.waitEpoch(m.q[c][0].f)
 	var out []int
 	for t := range m.seen[e] {
 		if t != c && len(m.q[t]) == 0 {
@@ -255,12 +316,9 @@ func (m *merger) release(now time.Time, all bool) {
 		}
 		p := m.q[c][0]
 		if miss := m.missing(c); len(miss) > 0 && !all {
-			e := m.epoch
-			if !m.written {
-				e = p.f.Epoch
-			}
+			e, newEpoch := m.waitEpoch(p.f)
 			// The stream-time bound only holds within the current epoch.
-			streamUp := p.f.Epoch == e && m.maxPendingDTS(e)-p.f.DTS >= m.holdTicks
+			streamUp := !newEpoch && p.f.Epoch == e && m.maxPendingDTS(e)-p.f.DTS >= m.holdTicks
 			if !streamUp && now.Sub(p.at) < m.hold {
 				return
 			}
@@ -297,8 +355,164 @@ func (m *merger) write(f media.Frame) {
 				delete(m.seen, e)
 			}
 		}
+		if m.pres != nil {
+			m.pres.dropBefore(m.epoch)
+		}
 	}
 	m.last[f.Track] = f.DTS
 	m.h.Write(f)
 	m.out++
+}
+
+// maxBarriers is how many barriers the presentation merger keeps per epoch.
+const maxBarriers = 64
+
+// barrierMark is one barrier: its sequence number in its epoch (1, 2, …) and
+// its PTS.
+type barrierMark struct {
+	seq, pts int64
+}
+
+// epochBarriers are one epoch's barriers.
+type epochBarriers struct {
+	list []barrierMark // the last cap barriers, oldest first
+	next int64         // sequence number of the next barrier
+	base barrierMark   // the newest pruned barrier; seq 0 when none
+}
+
+// trackPass is one track's progress through its epoch's barriers.
+type trackPass struct {
+	epoch  uint32
+	passed int64 // the largest barrier sequence the track has passed
+}
+
+// presOrder gives each frame of the presentation merger its order key, so
+// that every rendition's IDR at a source keyframe K goes out after every
+// frame below K, of every track, with rung 0's IDR first (rulings R-B1,
+// R-B3).
+//
+// The router announces a barrier at K (after the Delay shift) for every
+// source main-video keyframe it routes, before the keyframe goes to the
+// child or the copy path, so a barrier always precedes every rung's frame
+// at K. Each epoch numbers its barriers 1, 2, … and keeps its last cap; the
+// newest pruned one stays as the epoch's base, and a track that has not
+// passed the base passes it with its first frame at or above the base's
+// PTS. A frame's key is (epoch, b, phase, then the track for phase 0 or
+// the DTS for phase 1), where b is:
+//
+//   - for a video keyframe whose PTS equals an unpassed barrier: that
+//     barrier, which the track passes with every lower one, in phase 0;
+//   - for another video keyframe: the highest unpassed barrier below its
+//     PTS, if any, else the track's last; phase 1;
+//   - for a video non-keyframe: the highest unpassed barrier at or below
+//     its PTS, if any, else the track's last (a rung without an IDR at K
+//     catches up this way); phase 1;
+//   - for audio (and anything else): the largest barrier at or below its
+//     PTS, never below the track's last; phase 1.
+//
+// A track's key never decreases, so the merger's wait for the expected
+// tracks still finds the smallest key. It is used under the merger's lock.
+type presOrder struct {
+	cap      int
+	barriers map[uint32]*epochBarriers
+	tracks   map[int]trackPass
+}
+
+func newPresOrder(capacity int) *presOrder {
+	return &presOrder{cap: capacity, barriers: map[uint32]*epochBarriers{}, tracks: map[int]trackPass{}}
+}
+
+// addBarrier records the next barrier of epoch e at pts.
+func (p *presOrder) addBarrier(e uint32, pts int64) {
+	eb := p.barriers[e]
+	if eb == nil {
+		eb = &epochBarriers{next: 1}
+		p.barriers[e] = eb
+	}
+	eb.list = append(eb.list, barrierMark{seq: eb.next, pts: pts})
+	eb.next++
+	if len(eb.list) > p.cap {
+		eb.base = eb.list[0]
+		eb.list[0] = barrierMark{}
+		eb.list = eb.list[1:]
+	}
+}
+
+// dropBefore forgets the barriers and track progress of epochs below e.
+func (p *presOrder) dropBefore(e uint32) {
+	for id := range p.barriers {
+		if id < e {
+			delete(p.barriers, id)
+		}
+	}
+	for t, tp := range p.tracks {
+		if tp.epoch < e {
+			delete(p.tracks, t)
+		}
+	}
+}
+
+// key returns f's barrier sequence b and phase, and records the track's
+// progress.
+func (p *presOrder) key(f media.Frame) (b int64, phase uint8) {
+	tp := p.tracks[f.Track]
+	if tp.epoch != f.Epoch {
+		tp = trackPass{epoch: f.Epoch}
+	}
+	phase = 1
+	if eb := p.barriers[f.Epoch]; eb != nil {
+		if tp.passed < eb.base.seq && f.PTS >= eb.base.pts {
+			tp.passed = eb.base.seq
+		}
+		video := f.Kind() == media.KindVideo
+		var equal, below, atOrBelow int64 // unpassed barriers, 0 for none
+		var reached int64                 // any barrier at or below f.PTS
+		for _, br := range eb.list {
+			if br.pts <= f.PTS {
+				reached = br.seq
+			}
+			if br.seq <= tp.passed {
+				continue
+			}
+			switch {
+			case br.pts == f.PTS:
+				equal = br.seq
+				atOrBelow = br.seq
+			case br.pts < f.PTS:
+				below = br.seq
+				atOrBelow = br.seq
+			}
+		}
+		switch {
+		case video && f.Key && equal > 0:
+			tp.passed, phase = equal, 0
+		case video && f.Key:
+			tp.passed = max(tp.passed, below)
+		case video:
+			tp.passed = max(tp.passed, atOrBelow)
+		default:
+			tp.passed = max(tp.passed, reached)
+		}
+	}
+	p.tracks[f.Track] = tp
+	return tp.passed, phase
+}
+
+// keyBefore reports whether pending frame a, on track at, comes before b,
+// on track bt, in the presentation merger's order: (epoch, b, phase), then
+// the track in phase 0, or the DTS (video before audio on a tie, then the
+// lowest track) in phase 1.
+func keyBefore(a pendingFrame, at int, b pendingFrame, bt int) bool {
+	switch {
+	case a.f.Epoch != b.f.Epoch:
+		return a.f.Epoch < b.f.Epoch
+	case a.b != b.b:
+		return a.b < b.b
+	case a.phase != b.phase:
+		return a.phase < b.phase
+	case a.phase == 0:
+		return at < bt
+	default:
+		return before(a.f, at, b.f, bt)
+	}
 }

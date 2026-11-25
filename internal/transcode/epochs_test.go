@@ -316,3 +316,48 @@ func TestRouterExpectsChildVideo(t *testing.T) {
 		assert.Empty(t, rt.expected)
 	})
 }
+
+// The router announces a barrier at every main-video keyframe it routes,
+// at K + D, before the keyframe goes to the child or the copy path, in
+// the old epoch too while a bump waits for K. It announces the encoded
+// tracks before it pushes the copy video, so a presentation merger never
+// sees a new epoch's copy IDR without the encoded rungs expected.
+func TestRouterBarriers(t *testing.T) {
+	var rt routed
+	r := newTestRouter(&rt, true, true, true)
+	type call struct {
+		what  string
+		epoch uint32
+		pts   int64
+	}
+	var calls []call
+	r.barrier = func(e uint32, pts int64) { calls = append(calls, call{"barrier", e, pts}) }
+	r.expectVideo = func(e uint32, _ int) { calls = append(calls, call{"expect", e, 0}) }
+	r.toCopy = func(f media.Frame) { calls = append(calls, call{"copy", f.Epoch, f.PTS}) }
+	r.toChild = func(m wire.Message) bool {
+		if v, ok := m.(wire.Frame); ok {
+			calls = append(calls, call{"child", v.F.Epoch, v.F.PTS})
+		}
+		return true
+	}
+	r.deliver(hub.Delivery{Frame: vframe(1, 0, true)})
+	r.deliver(hub.Delivery{Frame: vframe(1, 3600, false)})
+	r.childExited()
+	r.deliver(hub.Delivery{Frame: vframe(1, 90000, true)}) // before Hello: old epoch, copy only
+	r.childHello()
+	r.deliver(hub.Delivery{Frame: vframe(1, 180000, true)}) // K of epoch 2
+	assert.Equal(t, []call{
+		{"barrier", 1, Delay},
+		{"expect", 1, 0},
+		{"copy", 1, Delay},
+		{"child", 1, Delay},
+		{"copy", 1, 3600 + Delay},
+		{"child", 1, 3600 + Delay},
+		{"barrier", 1, 90000 + Delay},
+		{"copy", 1, 90000 + Delay},
+		{"barrier", 2, 180000 + Delay},
+		{"expect", 2, 0},
+		{"copy", 2, 180000 + Delay},
+		{"child", 2, 180000 + Delay},
+	}, calls)
+}

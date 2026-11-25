@@ -10,6 +10,21 @@
 // to every rendition. A merger per rendition writes its hub in DTS order and
 // sets each epoch's anchor before the epoch's first frame.
 //
+// # Presentation
+//
+// With Options.Presentation, one more hub carries the whole ladder for an
+// ABR packager (rulings R-B1, R-B3, R-B7): rendition i's video as track
+// PresentationTrack(i) and each source audio track once, as
+// PresentationAudioTrack. Its merger gets the same frames as the rendition
+// mergers, relabelled, and the same anchors, so its epochs, anchors, PTS and
+// DTS are the rendition hubs'. It orders them behind a keyframe barrier that
+// the router announces at every source main-video keyframe K + Delay: every
+// frame below K, of every track, goes out before the rungs' IDRs at K, and
+// those go out together, rung 0's first, so a packager can cut every
+// variant at the same keyframe and a late subscriber's GOP cache, anchored
+// on track 0, holds every rung's IDR. A rung late by more than MergeHold,
+// or without an IDR at K, is not waited for.
+//
 // # Rendition epochs
 //
 // Upstream epoch e maps to e + offset. A child exit or a loss on the source
@@ -53,6 +68,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -119,6 +135,8 @@ type Options struct {
 
 	Renditions []Rendition
 	Audio      Audio
+	// Presentation adds the presentation hub (see Presentation).
+	Presentation bool
 
 	Queue int // source subscription queue; 0 means 1024
 
@@ -161,7 +179,10 @@ type Event struct {
 }
 
 // Stats counts the transcoder's work. FramesOut has one entry per
-// rendition: the frames written to its hub. MaxQueued is the high-water
+// rendition: the frames written to its hub. PresentationOut and
+// PresentationDropped count the presentation hub's merger alone: the frames
+// it wrote, and those it dropped (they are not in FramesOut or
+// MergeDropped). MaxQueued is the high-water
 // mark of the child's input channel (at most 256); it excludes the
 // pre-Hello backlog, which can hold up to 1500 frames. PID is the running
 // child's, or 0. DroppedBeforeKey also counts the frames given up on
@@ -173,6 +194,7 @@ type Event struct {
 type Stats struct {
 	Spawns, Exits, Losses, DroppedBeforeKey, MergeDropped uint64
 	FramesIn, StderrSuppressed, Oversize                  uint64
+	PresentationOut, PresentationDropped                  uint64
 	FramesOut                                             []uint64
 	MaxQueued                                             int
 	PID                                                   int
@@ -226,6 +248,7 @@ type Transcoder struct {
 	log     *slog.Logger
 	hubs    []*hub.Hub
 	mergers []*merger
+	pres    *merger // the presentation hub's, or nil
 	anchors anchorStore
 
 	needChild  bool
@@ -330,8 +353,24 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 		t.hubs = append(t.hubs, h)
 		t.mergers = append(t.mergers, newMerger(h, opt.MergeHold, opt.Now, t.anchors.get))
 	}
+	if opt.Presentation {
+		h := hub.New(hub.Options{GOPCacheFrames: presentationCacheFrames(len(opt.Renditions))})
+		t.pres = newPresentationMerger(h, opt.MergeHold, opt.Now, t.anchors.get)
+	}
 	return t, nil
 }
+
+// presentationCacheFrames is the presentation hub's GOP cache for n
+// renditions (ruling R-B7): every rung's GOP and the audio.
+func presentationCacheFrames(n int) int { return 1500 * (n + 1) }
+
+// PresentationTrack is the presentation's track for the video of
+// rendition i, in Options.Renditions order.
+func PresentationTrack(rendition int) int { return rendition }
+
+// PresentationAudioTrack is the presentation's track for source audio
+// track srcTrack, with renditions renditions.
+func PresentationAudioTrack(renditions, srcTrack int) int { return renditions + srcTrack }
 
 func orDefault(d, def time.Duration) time.Duration {
 	if d <= 0 {
@@ -344,6 +383,23 @@ func orDefault(d, def time.Duration) time.Duration {
 // them when it returns.
 func (t *Transcoder) Hubs() []*hub.Hub { return append([]*hub.Hub(nil), t.hubs...) }
 
+// Presentation returns the presentation hub, or nil without
+// Options.Presentation. Run closes it when it returns.
+func (t *Transcoder) Presentation() *hub.Hub {
+	if t.pres == nil {
+		return nil
+	}
+	return t.pres.h
+}
+
+// everyMerger returns the rendition mergers and the presentation's.
+func (t *Transcoder) everyMerger() []*merger {
+	if t.pres == nil {
+		return t.mergers
+	}
+	return append(slices.Clip(t.mergers), t.pres)
+}
+
 // Stats returns the current counters.
 func (t *Transcoder) Stats() Stats {
 	t.mu.Lock()
@@ -354,6 +410,9 @@ func (t *Transcoder) Stats() Stats {
 		out, dropped := m.counts()
 		s.FramesOut[i] = out
 		s.MergeDropped += dropped
+	}
+	if t.pres != nil {
+		s.PresentationOut, s.PresentationDropped = t.pres.counts()
 	}
 	return s
 }
@@ -384,7 +443,7 @@ type run struct {
 
 // Run transcodes until the source hub closes (it returns nil) or ctx ends
 // (it returns ctx.Err()). It stops the child, flushes the mergers and closes
-// the rendition hubs before returning. A child that announces another wire
+// the rendition hubs and the presentation hub before returning. A child that announces another wire
 // version is fatal: Run returns that error. Run may be called once.
 func (t *Transcoder) Run(ctx context.Context) error {
 	if !t.running.CompareAndSwap(false, true) {
@@ -396,7 +455,7 @@ func (t *Transcoder) Run(ctx context.Context) error {
 	// The merger timers run until the child is stopped, after ctx ends.
 	mctx, mcancel := context.WithCancel(context.WithoutCancel(ctx))
 	var mwg sync.WaitGroup
-	for _, m := range t.mergers {
+	for _, m := range t.everyMerger() {
 		mwg.Add(1)
 		go func() {
 			defer mwg.Done()
@@ -417,7 +476,7 @@ func (t *Transcoder) Run(ctx context.Context) error {
 	s.wg.Wait()
 	mcancel()
 	mwg.Wait()
-	for _, m := range t.mergers {
+	for _, m := range t.everyMerger() {
 		m.flush()
 		m.h.Close()
 	}
@@ -630,6 +689,10 @@ func (c *child) handOver() {
 }
 
 func (t *Transcoder) newRouter(s *run) *router {
+	var barrier func(uint32, int64)
+	if t.pres != nil {
+		barrier = t.pres.barrier
+	}
 	return &router{
 		childVideo: t.childVideo,
 		copyVideo:  len(t.copyVideo) > 0,
@@ -642,8 +705,12 @@ func (t *Transcoder) newRouter(s *run) *router {
 		expectVideo: func(epoch uint32, track int) {
 			for _, i := range t.encodeIdx {
 				t.mergers[i].expect(epoch, track)
+				if t.pres != nil {
+					t.pres.expect(epoch, PresentationTrack(i))
+				}
 			}
 		},
+		barrier:   barrier,
 		setAnchor: t.anchors.set,
 		srcAnchor: t.src.Anchor,
 		now:       t.opt.Now,
@@ -665,21 +732,44 @@ func (t *Transcoder) newRouter(s *run) *router {
 }
 
 // toCopy hands a copied frame to its renditions: video to those that copy
-// video, audio to every rendition.
+// video, audio to every rendition; and to the presentation, relabelled.
 func (t *Transcoder) toCopy(f media.Frame) {
 	if f.Kind() == media.KindVideo {
 		for _, i := range t.copyVideo {
 			t.mergers[i].push(f)
+			t.toPresentationVideo(i, f)
 		}
 		return
 	}
 	for _, m := range t.mergers {
 		m.push(f)
 	}
+	t.toPresentationAudio(f)
+}
+
+// toPresentationVideo hands rendition i's video frame f to the
+// presentation, as track PresentationTrack(i).
+func (t *Transcoder) toPresentationVideo(i int, f media.Frame) {
+	if t.pres == nil {
+		return
+	}
+	f.Track = PresentationTrack(i)
+	t.pres.push(f)
+}
+
+// toPresentationAudio hands audio frame f to the presentation, as track
+// PresentationAudioTrack of its source track.
+func (t *Transcoder) toPresentationAudio(f media.Frame) {
+	if t.pres == nil {
+		return
+	}
+	f.Track = PresentationAudioTrack(len(t.mergers), f.Track)
+	t.pres.push(f)
 }
 
 // fromChild hands an output of child c to its renditions: a rung's video to
-// that rendition, audio (rung -1) to every rendition. An output for a rung
+// that rendition, audio (rung -1) to every rendition; and to the
+// presentation, relabelled. An output for a rung
 // that does not exist is dropped, and logged once per child. Called from
 // c's reader goroutine.
 func (t *Transcoder) fromChild(c *child, v wire.Frame) {
@@ -689,8 +779,11 @@ func (t *Transcoder) fromChild(c *child, v wire.Frame) {
 		for _, m := range t.mergers {
 			m.push(v.F)
 		}
+		t.toPresentationAudio(v.F)
 	case v.Rung >= 0 && v.Rung < len(t.encodeIdx):
-		t.mergers[t.encodeIdx[v.Rung]].push(v.F)
+		i := t.encodeIdx[v.Rung]
+		t.mergers[i].push(v.F)
+		t.toPresentationVideo(i, v.F)
 	default:
 		if !c.unknownRungLogged {
 			c.unknownRungLogged = true

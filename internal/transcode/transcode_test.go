@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,8 +105,11 @@ type session struct {
 	tr   *Transcoder
 	src  *hub.Hub
 	cols []*collector
+	pres *collector // the presentation hub's, when it has one
 	ev   *events
 	errc chan error
+
+	presOut []media.Frame // what the presentation hub delivered, set by feed
 }
 
 // start builds a transcoder over a new source hub and runs it.
@@ -128,6 +132,9 @@ func startWith(t *testing.T, opt Options, prepare func(*Transcoder)) *session {
 	s.tr = tr
 	for _, h := range tr.Hubs() {
 		s.cols = append(s.cols, collect(h))
+	}
+	if h := tr.Presentation(); h != nil {
+		s.pres = collect(h)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	go func() { s.errc <- tr.Run(ctx) }()
@@ -160,6 +167,12 @@ func (s *session) feed(t *testing.T, steps []step, speed float64) [][]media.Fram
 		c.mu.Lock()
 		assert.Empty(t, c.missing, "hub %d: epochs without an anchor before their first frame", i)
 		c.mu.Unlock()
+	}
+	if s.pres != nil {
+		s.presOut = s.pres.wait(t)
+		s.pres.mu.Lock()
+		assert.Empty(t, s.pres.missing, "presentation: epochs without an anchor before their first frame")
+		s.pres.mu.Unlock()
 	}
 	return out
 }
@@ -1341,4 +1354,222 @@ func keyPTS(fs []media.Frame) []int64 {
 	}
 	slices.Sort(out)
 	return out
+}
+
+var encode120 = Rendition{Name: "t120", Video: Video{Height: 120, BitrateKbps: 200}}
+
+// presLadder is the presentation tests' ladder: two encoded rungs and the
+// copy rung.
+func presLadder(t *testing.T, env ...string) Options {
+	t.Helper()
+	opt := fakeOptions(t, env...)
+	opt.Renditions = []Rendition{encode240, encode120, copySrc}
+	opt.Presentation = true
+	return opt
+}
+
+// ofTrack returns the frames of fs on track, relabelled to as.
+func ofTrack(fs []media.Frame, track, as int, kind media.Kind) []media.Frame {
+	var out []media.Frame
+	for _, f := range fs {
+		if f.Track == track && f.Kind() == kind {
+			f.Track = as
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func TestPresentationOff(t *testing.T) {
+	opt := fakeOptions(t)
+	opt.Renditions = []Rendition{encode240, copySrc}
+	tr, err := New(hub.New(hub.Options{}), opt)
+	require.NoError(t, err)
+	assert.Nil(t, tr.Presentation())
+	assert.Nil(t, tr.pres)
+	for i, m := range tr.mergers {
+		assert.Nil(t, m.pres, "rendition %d keeps no barrier", i)
+	}
+	assert.Nil(t, tr.newRouter(&run{t: tr}).barrier)
+	assert.Zero(t, tr.Stats().PresentationOut)
+
+	opt.Presentation = true
+	tr, err = New(hub.New(hub.Options{}), opt)
+	require.NoError(t, err)
+	require.NotNil(t, tr.Presentation())
+	require.NotNil(t, tr.pres.pres)
+	for i, m := range tr.mergers {
+		assert.Nil(t, m.pres, "rendition %d keeps no barrier", i)
+	}
+	assert.NotNil(t, tr.newRouter(&run{t: tr}).barrier)
+	assert.Equal(t, 1500*3, presentationCacheFrames(2))
+	assert.Equal(t, 0, PresentationTrack(0))
+	assert.Equal(t, 2, PresentationTrack(2))
+	assert.Equal(t, 4, PresentationAudioTrack(3, 1))
+}
+
+// Per track, the presentation holds exactly rendition i's video
+// relabelled to i, and the audio once, relabelled to 3 + its source track.
+func TestPresentationTracks(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	opt := presLadder(t)
+	s := start(t, opt)
+	out := s.feed(t, steps, 0)
+	pres := s.presOut
+	n := len(opt.Renditions)
+	total := 0
+	for i := range n {
+		want := ofTrack(out[i], 0, PresentationTrack(i), media.KindVideo)
+		require.NotEmpty(t, want)
+		assertSameFrames(t, want, ofTrack(pres, PresentationTrack(i), PresentationTrack(i), media.KindVideo), opt.Renditions[i].Name)
+		total += len(want)
+	}
+	var audioTracks []int
+	for _, f := range out[0] {
+		if f.Kind() == media.KindAudio && !slices.Contains(audioTracks, f.Track) {
+			audioTracks = append(audioTracks, f.Track)
+		}
+	}
+	require.NotEmpty(t, audioTracks)
+	for _, a := range audioTracks {
+		pa := PresentationAudioTrack(n, a)
+		want := ofTrack(out[0], a, pa, media.KindAudio)
+		assertSameFrames(t, want, ofTrack(pres, pa, pa, media.KindAudio), "audio")
+		total += len(want)
+	}
+	assert.Len(t, pres, total, "nothing else")
+	assert.Equal(t, srcEpochs(steps), epochs(pres))
+}
+
+// assertRungZeroFirst checks that each epoch of the presentation starts
+// its video with track 0's IDR, followed at once by the other video tracks'
+// IDRs at the same PTS, in track order.
+func assertRungZeroFirst(t *testing.T, pres []media.Frame, videoTracks int) {
+	t.Helper()
+	for _, e := range epochs(pres) {
+		i := slices.IndexFunc(pres, func(f media.Frame) bool { return f.Epoch == e && f.Kind() == media.KindVideo })
+		require.GreaterOrEqual(t, i, 0, "epoch %d has video", e)
+		require.LessOrEqual(t, i+videoTracks, len(pres))
+		k := pres[i].PTS
+		for n := range videoTracks {
+			f := pres[i+n]
+			assert.True(t, f.Kind() == media.KindVideo && f.Track == n && f.Key && f.PTS == k && f.Epoch == e,
+				"epoch %d: frame %d is track %d's IDR at %d, got track %d key %v PTS %d", e, i+n, n, k, f.Track, f.Key, f.PTS)
+		}
+	}
+}
+
+// At the start and after a respawn, with the copy rung's IDR reaching the
+// merger long before the encoded rungs' (the fake child holds its video
+// back 25 frames), the presentation's first video frame of each epoch is
+// rung 0's IDR, followed by the other rungs' IDRs at the same PTS.
+func TestPresentationStartsOnRungZero(t *testing.T) {
+	lag := transcodetest.EnvVideoLag + "=25"
+	t.Run("start", func(t *testing.T) {
+		steps := fixtureSteps(t, "h264_aac.ts")
+		s := start(t, presLadder(t, lag))
+		s.feed(t, steps, 0)
+		assertRungZeroFirst(t, s.presOut, 3)
+	})
+	t.Run("respawn", func(t *testing.T) {
+		steps := fixtureSteps(t, "h264_aac.ts")
+		s := start(t, presLadder(t, append(crashOnce(t, 60), lag)...))
+		s.feed(t, steps, 4)
+		require.Len(t, epochs(s.presOut), len(srcEpochs(steps))+1)
+		assertRungZeroFirst(t, s.presOut, 3)
+	})
+	t.Run("slow respawn", func(t *testing.T) {
+		// The new child comes over 2 s of stream time after the crash: the
+		// old epoch's encoded tracks have run out their hold and left its
+		// expected set, so only the new epoch's announcement holds the copy
+		// IDR back.
+		steps := fixtureSteps(t, "h264_aac.ts")
+		opt := presLadder(t, append(crashOnce(t, 60), lag)...)
+		opt.RespawnMin = 1500 * time.Millisecond
+		s := start(t, opt)
+		s.feed(t, steps, 2)
+		require.Len(t, epochs(s.presOut), len(srcEpochs(steps))+1)
+		assertRungZeroFirst(t, s.presOut, 3)
+	})
+}
+
+// After a respawn the presentation has the rendition hubs' epochs, and
+// each epoch's anchor is rendition 0's.
+func TestPresentationEpochsMatchRenditions(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	s := start(t, presLadder(t, crashOnce(t, 50)...))
+	out := s.feed(t, steps, 4)
+	require.EqualValues(t, 2, s.tr.Stats().Spawns)
+	assert.Equal(t, epochs(out[0]), epochs(s.presOut))
+	assert.Len(t, epochs(s.presOut), len(srcEpochs(steps))+1)
+	s.cols[0].mu.Lock()
+	want := maps.Clone(s.cols[0].anchors)
+	s.cols[0].mu.Unlock()
+	s.pres.mu.Lock()
+	got := maps.Clone(s.pres.anchors)
+	s.pres.mu.Unlock()
+	assert.Equal(t, want, got)
+	for _, e := range epochs(s.presOut) {
+		a, ok := s.tr.anchors.get(e)
+		require.True(t, ok)
+		assert.Equal(t, a, got[e])
+	}
+}
+
+// A subscriber that joins the presentation after 3 GOPs gets the GOP
+// cache: it starts with rung 0's IDR and holds every rung's IDR of that
+// GOP.
+func TestPresentationLateSubscriber(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	s := start(t, presLadder(t))
+	h := s.tr.Presentation()
+	done := play(t.Context(), s.src, steps, 2, true)
+	defer func() { <-done }()
+	require.Eventually(t, func() bool {
+		s.pres.mu.Lock()
+		defer s.pres.mu.Unlock()
+		return len(keyPTS(ofTrack(s.pres.frames, 0, 0, media.KindVideo))) >= 4
+	}, 10*time.Second, time.Millisecond)
+	sub := h.SubscribeCached("late", 0)
+	defer sub.Close()
+	var got []media.Frame
+	timeout := time.After(10 * time.Second)
+	for len(got) < 3 || !slices.ContainsFunc(got[1:], func(f media.Frame) bool { return f.Track == 0 && f.Key }) {
+		select {
+		case d, ok := <-sub.C():
+			if !ok {
+				t.Fatal("hub closed before the next GOP")
+			}
+			got = append(got, d.Frame)
+		case <-timeout:
+			t.Fatal("no next GOP")
+		}
+	}
+	first := got[0]
+	require.True(t, first.Track == 0 && first.Key, "replay starts with IDR_0, got %+v", first)
+	next := slices.IndexFunc(got[1:], func(f media.Frame) bool { return f.Track == 0 && f.Key }) + 1
+	for _, track := range []int{1, 2} {
+		assert.True(t, slices.ContainsFunc(got[:next], func(f media.Frame) bool {
+			return f.Track == track && f.Key && f.PTS == first.PTS
+		}), "track %d's IDR of the cached GOP", track)
+	}
+	assert.True(t, got[1].Track == 1 && got[1].Key && got[2].Track == 2 && got[2].Key, "the IDRs follow at once")
+}
+
+// The presentation counts its writes in PresentationOut; FramesOut and
+// MergeDropped are what they are without it.
+func TestPresentationStats(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	s := start(t, presLadder(t))
+	out := s.feed(t, steps, 0)
+	st := s.tr.Stats()
+	assert.EqualValues(t, len(s.presOut), st.PresentationOut)
+	assert.Zero(t, st.PresentationDropped)
+	want := len(frames(steps))
+	require.Len(t, st.FramesOut, 3)
+	for i := range out {
+		assert.EqualValues(t, want, st.FramesOut[i])
+		assert.Len(t, out[i], want)
+	}
+	assert.Zero(t, st.MergeDropped)
 }

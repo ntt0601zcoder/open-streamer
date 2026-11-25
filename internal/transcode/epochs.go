@@ -162,13 +162,17 @@ type router struct {
 	// expectVideo announces the main video track of a rendition epoch to
 	// the encoded renditions' mergers; see send.
 	expectVideo func(epoch uint32, track int)
-	setAnchor   func(a media.Anchor)
-	srcAnchor   func(up uint32) (media.Anchor, bool)
-	now         func() time.Time
-	onEpoch     func(epoch uint32, bump bool)
-	onLoss      func()
-	dropped     func(n uint64) // DroppedBeforeKey
-	warn        func(msg string, args ...any)
+	// barrier announces a barrier at a main-video keyframe's PTS (after the
+	// Delay shift) in its rendition epoch, before the keyframe goes to the
+	// child or the copy path; nil without a presentation.
+	barrier   func(epoch uint32, pts int64)
+	setAnchor func(a media.Anchor)
+	srcAnchor func(up uint32) (media.Anchor, bool)
+	now       func() time.Time
+	onEpoch   func(epoch uint32, bump bool)
+	onLoss    func()
+	dropped   func(n uint64) // DroppedBeforeKey
+	warn      func(msg string, args ...any)
 }
 
 // deliver handles one source delivery.
@@ -365,6 +369,7 @@ func (r *router) beforeK(f media.Frame) {
 					r.openUpstream(f, ep)
 				}
 				f.Epoch = ep
+				r.announceBarrier(f)
 				_ = r.sendCopyVideo(f)
 			}
 		}
@@ -405,17 +410,23 @@ func (r *router) sendEvicted(a media.Frame) {
 
 // send hands f, already in its rendition epoch, to its paths. Only a frame
 // that some path took counts as sent. Before the first video frame of a
-// rendition epoch goes to the child, the encoded renditions' mergers are
-// told to expect that video track in the epoch (expectVideo).
+// rendition epoch goes anywhere, the encoded renditions' mergers are told
+// to expect that video track in the epoch (expectVideo): the copy video
+// never reaches an encoded rendition's merger, but it does reach the
+// presentation's, which must not take a new epoch's copy IDR for the
+// epoch's first video frame. A keyframe announces its barrier first.
 func (r *router) send(f media.Frame) {
 	sent := false
 	switch f.Kind() {
 	case media.KindVideo:
+		r.announceBarrier(f)
+		if r.childVideo {
+			r.expectChildVideo(f)
+		}
 		if r.copyVideo {
 			sent = r.sendCopyVideo(f)
 		}
 		if r.childVideo {
-			r.expectChildVideo(f)
 			sent = r.sendChild(f) || sent
 		}
 	case media.KindAudio:
@@ -428,6 +439,14 @@ func (r *router) send(f media.Frame) {
 	}
 	if sent {
 		r.noteSent(f.PTS)
+	}
+}
+
+// announceBarrier announces a barrier at video keyframe f, when there is a
+// presentation.
+func (r *router) announceBarrier(f media.Frame) {
+	if f.Key && r.barrier != nil {
+		r.barrier(f.Epoch, f.PTS)
 	}
 }
 
