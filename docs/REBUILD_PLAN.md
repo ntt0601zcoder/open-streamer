@@ -218,7 +218,28 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
     lowest video track, cuts every rung at the same frame. This holds for
     sources whose keyframes are IDRs (closed GOP); an open-GOP copy rung's
     leading pictures land after the barrier, so its segments there do not
-    decode on their own.
+    decode on their own. The barrier waits for a late rung, and what it
+    waits follows the encoder's delay (M4b final review, finding C1): an
+    encoder trails the copy rung by a number of frames (about 30 with
+    x264), which is 1.2 s of stream time at 25 fps, 2 s at 15 fps and 3 s
+    at 10 fps, so a fixed 2 s hold released the copy rung ahead of the
+    barrier at every keyframe from 15 fps down, and the encoded rungs were
+    out of every segment. The merger measures each track's lag behind the
+    furthest frame pushed and holds 1.5 × the largest, at least `MergeHold`
+    (2 s; 25 fps is unchanged) and at most 4 × `MergeHold` (8 s); a new
+    epoch's first frame waits that cap for the rungs announced for it. The
+    costs: the presentation runs as far behind its source as its slowest
+    rung (it did already, for every rung but the copy); a rung that falls
+    silent, or a respawned child that never delivers, stalls it for up to
+    the hold once (2 s at 25 fps, at most 8 s) before the rung is given up
+    until it delivers again; and the copy rung's frames wait in the merger
+    for that long. An encoder more than 8 s of stream time behind (below
+    about 4 fps with x264's defaults) is beyond the cap: the copy rung is
+    then released ahead of *every* barrier, and the rungs that miss it are
+    out of every segment, not one, for as long as the lag lasts; the copy
+    rung can also open the epoch and keep the anchor. That is accepted,
+    and visible: `live.Packager.Rungs` counts each rung's gaps and frames
+    left out, and the packager warns about them (below).
   - *A rung that misses the segment start is left out* (R-B8,
     `segment.Options.AlignVideo`). (1) A lower video track takes the anchor
     only at a keyframe at or above the open segment's Start (strictly above
@@ -229,10 +250,23 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
     segment that is not Forced, a video track other than the epoch's anchor
     enters only at a keyframe whose PTS equals the segment's Start; until
     then its frames are dropped, and a track whose first keyframe in the
-    segment has another PTS is left out of it. A rung that missed the
-    barrier (past `MergeHold`, swallowed by a slow subscriber, or with no
-    IDR at K) therefore lists a gap entry for one segment, never a part that
-    does not decode from its start. Under AlignVideo a segment closed
+    segment has another PTS is left out of it. (3) A rung that leads the
+    anchor (its IDR at K reached the segmenter before rung 0's): at a cut
+    at K, its frames from its keyframe at K on move to the next segment,
+    as audio does, so its part of the closing segment ends at K and the
+    next starts on its keyframe. A rung that missed the barrier at one K
+    (past the merger's hold, swallowed by a slow subscriber, or with no IDR
+    at K) therefore costs, at that K: when it trails the anchor, its frames
+    below K that came after rung 0's IDR (its previous part is cut short by
+    them), or a gap entry for that one segment when its IDR at K is missing
+    or lost; when it leads the anchor, nothing. Never a part that does not
+    decode from its start, and never a part running past its segment. A
+    rung that misses every barrier (an encoder beyond the merger's cap,
+    above) pays that at every segment. The packager counts it per rung
+    (`live.Packager.Rungs`: segments without the rung, and frames left
+    out, from `segment.Segmenter.LeftOut`) and logs a warning when the
+    counts rise, at most once every 10 s; osdev reports them with its
+    packager counters. Under AlignVideo a segment closed
     without a cut records each video track's own span where it differs from
     the anchor's (`VideoDurations`).
   - *HLS TS* (R-B4). One TS per segment per video track that has frames in
@@ -355,8 +389,10 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   (ruling R-B1). The router announces a barrier at every source main-video
   keyframe PTS K (+D) before the keyframe goes to the child or the copy
   path; the merger releases every rung's frames before K first, then the
-  rungs' IDRs at K in track order, waiting at most `MergeHold` for a late
-  rung (R-B3). The rendition mergers do not use the barrier. The hub's
+  rungs' IDRs at K in track order, waiting for a late rung 1.5 × the lag
+  it measures between the tracks, between `MergeHold` and 4 × `MergeHold`
+  (R-B3; §3.4 has the reason and the costs). The rendition mergers do not
+  use the barrier and keep the fixed `MergeHold`. The hub's
   `GOPCacheFrames` is 1500 × (renditions + 1), so a late subscriber gets
   every rung's IDR of the cached GOP (rung 0's IDR, where the cache starts,
   comes first), and the merger counts into `Stats.PresentationOut` and
@@ -494,7 +530,7 @@ before the code they check.
 | M2 (done) | Ingest: `pkg/h26x`, `pkg/rtmp` server and client, `pkg/rtsp` client; every input protocol to Frames; input failover; H.264 open GOP in the TS demuxer | M1 | Our RTMP and RTSP libraries interoperate with ffmpeg and MediaMTX as peers; each input, fed by MediaMTX or ffmpeg in tests, produces violation-free frames; failover produces exactly one epoch change; a PMT change remaps the demuxer's tracks as one epoch change; an H.264 open-GOP broadcast feed starts video at its first recovery point |
 | M3 (done) | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg and VLC-class clients play every output, and MediaMTX pulls every output it can take as a source (DASH and HTTP-TS are not MediaMTX sources; see Out of M3b3); for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it. Proved by `TestM3Matrix` (every output under the four scenarios), `TestM3VLCClass` and `TestM3GStreamerClass` (VLC-class clients), `TestM3b3MediaMTXPull`, `TestM3b3SRTFFmpeg`, `TestHLSFFmpegAcrossGap` and `TestM3b3HLSAlignment`, with the M3a, M3b1 and M3b2 scenarios for the cells they cover |
 | M4a ([plan](superpowers/plans/2026-11-24-m4a-transcoder-core.md), done) | Transcoder core: the segmenter fix that cuts audio at the video keyframe's PTS, `internal/transcode` (host, wire protocol, native libav pipeline, `cmd/ostranscoder`), a software H.264 ladder with AAC re-encode or copy, per-track passthrough, respawn, CI on Linux amd64 and arm64. Each rendition is served as its own stream, `<name>_<label>` | M1, M3 | A 3-rung software ladder plus a copied rendition passes M3's scenarios per rendition; the rungs' keyframes and segments align with the source's; a killed subprocess comes back as exactly one new epoch per rendition; the same on arm64 in CI. Proved by `TestM4aMatrix` (every rendition under steady-state, epoch-change, slow-consumer, no-B-frames and B-frames, plus SRT and RTSP on `t180`), `TestM4aKeyframesAligned`, `TestM4aRespawn`, `TestM4aVLC`, `TestSupervisorRealChild`, the native and supervisor suites (`internal/transcode/...`), and the `transcode-e2e-arm64` CI job |
-| M4b ([plan](superpowers/plans/2026-11-25-m4b-abr-outputs.md), done) | ABR outputs: the transcoder's presentation hub with its keyframe barrier, the segmenter's `AlignVideo` (a rung that misses a segment start lists a gap), the packager's ABR mode (HLS TS variants under a multivariant playlist, the HLS fMP4 master, DASH Representations in one video set), `osconform`'s ABR rules (variants aligned, BANDWIDTH honest), osdev's `<name>_abr` | M4a | A ladder is served as one ABR presentation that passes M3's scenarios. Proved by `TestM4bMatrix` (steady-state, epoch-change, slow-consumer, no-B-frames and B-frames, each read back over HLS TS, HLS fMP4 and DASH with the ABR rules, every frame once, discontinuities at the same media sequence number in every playlist), `TestM4bSwitchTS` (segments from alternating TS variants decode as one stream), `TestM4bRespawn` (the clip fed twice; a killed child is exactly one new epoch, at one media sequence number in every variant, opened by rung 0's IDR), `TestM4bRungGap` (a rung whose IDR a loss swallowed lists a gap, end to end), `TestM4bPlayers` (ffprobe, VLC and GStreamer; GStreamer DASH on 1.28 only, ruling R-B9), the segmenter, transcoder, packager, conform and osdev suites, and the `transcode-e2e-arm64` CI job (`TestM4bMatrix`, `TestM4bRespawn`, `TestM4bSwitchTS`, `TestM4bRungGap`) |
+| M4b ([plan](superpowers/plans/2026-11-25-m4b-abr-outputs.md), done) | ABR outputs: the transcoder's presentation hub with its keyframe barrier, the segmenter's `AlignVideo` (a rung that misses a segment start lists a gap), the packager's ABR mode (HLS TS variants under a multivariant playlist, the HLS fMP4 master, DASH Representations in one video set), `osconform`'s ABR rules (variants aligned, BANDWIDTH honest), osdev's `<name>_abr` | M4a | A ladder is served as one ABR presentation that passes M3's scenarios. Proved by `TestM4bMatrix` (steady-state, epoch-change, slow-consumer, no-B-frames, B-frames, and 15 fps and 10 fps sources, whose encoders trail by 2 s and 3 s of stream time, each read back over HLS TS, HLS fMP4 and DASH with the ABR rules, every frame once, discontinuities at the same media sequence number in every playlist), `TestM4bSwitchTS` (segments from alternating TS variants decode as one stream), `TestM4bRespawn` (the clip fed twice; a killed child is exactly one new epoch, at one media sequence number in every variant, opened by rung 0's IDR), `TestM4bRungGap` (a rung whose IDR a loss swallowed lists a gap, end to end), `TestM4bPlayers` (ffprobe, VLC and GStreamer; GStreamer DASH on 1.28 only, ruling R-B9), the segmenter, transcoder, packager, conform and osdev suites, and the `transcode-e2e-arm64` CI job (`TestM4bMatrix`, `TestM4bRespawn`, `TestM4bSwitchTS`, `TestM4bRungGap`) |
 | M4c | NVENC on the GPU host; watermark; thumbnails | M4a | On the GPU host (this machine, a GTX 1650): the same ladder with 3 NVENC rungs, run by a make target and recorded in the PR. The watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5 | Feature tests; DVR playback passes `osconform` |
@@ -642,9 +678,11 @@ meaning while it ran, both removing false positives with a unit test that
 keeps the true positive: `variant-aligned` ends a DASH segment at the earlier
 of its own end (S@t + S@d) and the next S@t, since a Representation's
 timeline may overlap itself (Backlog: DASH timeline overlapping itself); and
-an HLS playlist whose first entry in an epoch is a gap is exempt from
-`track-start-offset` in that epoch, since R-B8 starts that rung late by
-design. `TestM4bRespawn` feeds h264_aac.ts twice at its pace, so that seven
+an HLS playlist whose first entry in an epoch is a gap may start late in
+that epoch, since R-B8 starts that rung late by design: by the summed
+EXTINF of its gaps before its first real entry, plus the usual offset
+(bounded by the final review; a track starting later than its gaps declare
+is flagged). `TestM4bRespawn` feeds h264_aac.ts twice at its pace, so that seven
 source keyframes remain after the kill for the respawn's backoff and
 start-up. The players
 (`TestM4bPlayers`) run on the h264_aac.ts presentation replayed four times at
@@ -901,6 +939,59 @@ Items accepted for later, not yet placed in a milestone:
   so it lists a gap for one segment. Fix: raise `keyint` above any accepted
   source GOP, or let only the forced IDRs at source keyframes cut
   (`keyint=infinite`).
+- **ABR: an encoder beyond the presentation merger's cap** (M4b final
+  review, C1; ruled). The presentation merger's hold follows the encoded
+  rungs' lag up to 4 × `MergeHold` (8 s). An encoder further behind in
+  stream time (x264's default delay of about 30 frames below about 4 fps,
+  or a longer lookahead) misses every barrier: the rungs that miss are out
+  of every segment while it lasts, and when the copy rung opens the epoch
+  it keeps the anchor (R-B8 (1) lets rung 0 in only at a keyframe at or
+  above the open segment's Start, which a rung more than a segment late
+  never has). Visible in `live.Packager.Rungs` and its warning. Fix if it
+  matters: have the child report its encoder delay in Hello and size the
+  hold from it, bound the encoder's delay at low frame rates
+  (`rc-lookahead`, `sync-lookahead`), or delay the copy rung by the
+  measured lag instead of holding it.
+- **ABR: the presentation waits up to 8 s for a new epoch's rungs** (M4b
+  final review, C1; ruled). A new epoch's first frame waits 4 × `MergeHold`
+  of wall time for the encoded rungs announced for it, since no lag is
+  known yet and a 10 fps encoder needs 3 s. A respawned child that says
+  Hello and is fed but never delivers therefore stalls the presentation
+  for 8 s (2 s before) before the copy rung opens the epoch. Fix if it
+  matters: start from the last epoch's measured lag.
+- **Low-fps A/V interleave in the rendition hubs** (M4b final review). The
+  rendition mergers keep the fixed `MergeHold` (M4a is frozen). Where an
+  encoded rung trails its audio by 2 s or more of stream time (15 fps and
+  below), the rendition hub's audio is written ahead of its video, up to
+  the encoder's delay, and can open the epoch (`requireVideoFirst` is off
+  for the M4b low-fps fixtures' rendition hubs). Cost: outputs that
+  interleave by arrival (HTTP-TS, RTMP, SRT) carry audio that far ahead of
+  video; the packagers place audio by PTS. Fix: give the rendition mergers
+  the presentation merger's lag-following hold.
+- **ABR segmenter and packager, degraded paths** (M4b final review, ruled
+  Backlog):
+  - the take-back (`uncut` then `openAt`) drops audio below the new Start
+    that the taken-back segment had kept as Late. Cost: an audio blip
+    after a take-back;
+  - the promote-cut path closes the segment with `duration` −1, so
+    `finish` fills `VideoDurations` there although the doc says a cut
+    never does. Cost: a variant EXTINF from the rung's own span at that
+    one segment;
+  - `buildTSMaster`'s BANDWIDTH is inflated by a one-frame variant part (a
+    part's bytes over a one-frame duration). Cost: a briefly over-stated
+    BANDWIDTH after a respawn;
+  - a rung that leads the anchor and has no keyframe at the cut K keeps
+    its frames past K in the closing segment (R-B8 (3) moves only from a
+    keyframe at K) and is left out of the next. Cost: one part running
+    past its segment, flagged by conform (`extinf-matches`,
+    `variant-aligned`); needs a merger miss and a missing IDR at once;
+  - when copy audio opens an epoch the barrier's rung-0-first step is
+    skipped, so a copy IDR can precede rung 0's (R-B8 (1) and (3) catch
+    it, degraded).
+- **osdev tests: `free()` has a port race** (M4b final review). The helper
+  closes a listener to learn a free port, which another test can take
+  before osdev binds it. Cost: a rare osdev test flake. Fix: let osdev
+  bind `:0` and report the port.
 - **HLS fMP4 gap EXTINF after heavy loss** (pre-existing M3b3 behaviour,
   ruled outside M4b's frozen non-ABR scope). After a slow consumer on a tiny
   queue loses every audio frame of a segment, the audio playlist's gap
@@ -1007,9 +1098,7 @@ Items accepted for later, not yet placed in a milestone:
   (benign); the open-GOP DASH test could say why mutating frame 2 works;
   the `track-start-offset` exemption could still compare the exempt
   tracks among themselves.
-- packager: the ABR tests' synthetic ladder has equal frame sizes across
-  rungs, so per-variant BANDWIDTH assertions are weak; an ABR variant for a
-  track with no codec string; an all-gap rung's BANDWIDTH is the audio's
+- packager: an ABR variant for a track with no codec string; an all-gap rung's BANDWIDTH is the audio's
   only (fMP4) or 1 (TS); the TS variants' audio PID can shift when a lower
   audio track appears later (R-B4's rank rule); variant muxers are never
   pruned; the TS TARGETDURATION includes the segment's Duration even when
@@ -1061,16 +1150,22 @@ milestone and by `osconform`:
 - Codec strings match the content.
 - A discontinuity, period or init change appears at every epoch change, and
   nowhere else.
-- ABR presentations (M4b, `ReadOptions.AlignedSequences`):
-  `variant-aligned`: in HLS, the first video frame of a media sequence
-  number has the same PTS in every playlist whose entry starts with a
-  keyframe; in DASH, no segment of a video Representation contains
+- ABR presentations (M4b). `variant-aligned`: in HLS, with
+  `ReadOptions.AlignedSequences` (`osconform -aligned`), the first video
+  frame of a media sequence number has the same PTS in every playlist that
+  carries video there; a media sequence number is compared only when every
+  one of its video entries starts with a keyframe, and skipped otherwise
+  (a Forced segment). In DASH, always (the rule is not gated by
+  `AlignedSequences`): no segment of a video Representation contains
   another's segment start strictly inside it, a segment ending at the
   earlier of S@t + S@d and the next S@t (with `segmentAlignment` the
-  timelines must be equal). `variant-bandwidth`: an HLS variant's measured
-  peak bitrate, with its default audio rendition, is at most 1.1 times its
-  BANDWIDTH, checked against the final master. A playlist whose first entry
-  in an epoch is a gap is exempt from the track start offset in that epoch.
+  timelines must be equal). `variant-bandwidth` (HLS, with
+  `AlignedSequences`): a variant's measured peak bitrate, with its default
+  audio rendition, is at most 1.1 times its BANDWIDTH, checked against the
+  final master. A playlist whose first entry in an epoch is a gap may
+  start late in that epoch by the summed EXTINF of its leading gaps there,
+  plus the usual track start offset; the other tracks are not measured
+  from it.
 
 ## 6. Risks
 
