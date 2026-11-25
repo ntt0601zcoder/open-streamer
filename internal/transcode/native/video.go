@@ -24,16 +24,19 @@ const (
 	// live edge of HLS TS, VLC resets its clock when a new segment arrives
 	// ("ES_OUT_SET_(GROUP_)PCR is called too late"), flushes its decoders
 	// and buffers 1000 ms of PCR time again. Our PCR runs 700 ms behind
-	// the DTS, so only the first 300 ms of the new segment reach the
-	// decoder: 8 or 9 pictures at 25 fps. es_out then waits for the
-	// decoder's second picture, which libavcodec's 6 frame threads give
-	// after 5 + reorder + 2 packets: 8 with depth 1, 9 with depth 2. When
-	// that is more than it was fed, VLC logs "buffer deadlock prevented".
+	// the DTS, so only about the first 300 ms of the new segment reach
+	// the decoder: 8 pictures at 25 fps in the resets that logged the
+	// line, at least 9 in the others. es_out then waits for the decoder's
+	// second picture, which libavcodec's 6 frame threads give after
+	// 5 + reorder + 2 packets: 8 with depth 1, 9 with depth 2. When that
+	// is more than it was fed, VLC logs "buffer deadlock prevented"; the
+	// play goes on.
 	// Measured on the tree before this setting: 17 of 46 plays with the
 	// pyramid, 0 of 16 without; 0 of 16 with the pyramid and 5 decoder
-	// threads, 4 of 16 without it and 7. A larger depth, a lower frame
-	// rate or a longer PCR lead brings the line back. The measurements are
-	// in docs/superpowers/notes/2026-11-25-r-t7b-root-cause.md.
+	// threads, 4 of 16 without it and 7. A larger depth or a longer PCR
+	// lead brings the line back, and so does a lower frame rate: 16 of 16
+	// plays at 15 fps with this setting. The measurements are in
+	// docs/superpowers/notes/2026-11-25-r-t7b-root-cause.md.
 	x264Params = "scenecut=0:keyint=600:min-keyint=1:rc-lookahead=10:b-pyramid=none"
 	// fpsDeltas is how many DTS deltas of the source estimate its framerate.
 	fpsDeltas = 8

@@ -165,7 +165,8 @@ func hasIDR(f media.Frame) bool {
 
 // x264Params carries b-pyramid=none (ruling R-T7b'): with B-frames 2 the
 // output SPS announces a reorder depth of 1, not the B-pyramid's 2, which
-// VLC 3 failed to decode without a "buffer deadlock".
+// leaves VLC 3's decoder a picture short after a clock reset at the live
+// edge, where it logs "buffer deadlock prevented".
 func TestPipelineNoBPyramid(t *testing.T) {
 	src := source(t, "h264_aac.ts")
 	p := newPipeline(t, []Rung{{Height: 120, BitrateKbps: 150, BFrames: 2}}, nil)
