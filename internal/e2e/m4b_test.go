@@ -44,6 +44,14 @@ func m4bLadder(binary string) transcode.Options {
 	return opt
 }
 
+// m4bLowFPS are the fixtures whose encoded rungs trail their source by
+// MergeHold or more of stream time. The rendition hubs' mergers keep the
+// fixed hold (M4a is frozen), so an encoded rendition's hub there can start
+// with audio, ahead of its video: m4bRuns does not require video first on
+// the rendition hubs of these (Backlog: low-fps A/V interleave in the
+// rendition hubs). The presentation is held to every requirement.
+var m4bLowFPS = map[string]bool{"h264_aac_15fps.ts": true, "h264_aac_10fps.ts": true}
+
 // m4bRun is one transcoder run over a fixture with the presentation on.
 type m4bRun struct {
 	presentation []step
@@ -54,6 +62,7 @@ type m4bRun struct {
 // Each run must be clean as transcodeSteps requires, with nothing dropped
 // by the presentation's merger, and every epoch of the presentation must
 // start with rung 0's IDR, followed by the other rungs' IDRs at its PTS.
+// The rendition hubs must start with video, except for m4bLowFPS.
 func m4bRuns(t *testing.T, bin string, names ...string) map[string]m4bRun {
 	t.Helper()
 	out := map[string]m4bRun{}
@@ -66,7 +75,9 @@ func m4bRuns(t *testing.T, bin string, names ...string) map[string]m4bRun {
 				opt := m4bLadder(bin)
 				run := recordTranscode(t, m4aSource(t, name), opt, nil)
 				for i, s := range run.renditions {
-					requireVideoFirst(t, stepFrames(s), opt.Renditions[i].Name)
+					if !m4bLowFPS[name] {
+						requireVideoFirst(t, stepFrames(s), opt.Renditions[i].Name)
+					}
 					t.Logf("%s: %s", opt.Renditions[i].Name, kindCounts(stepFrames(s)))
 				}
 				requireCleanRun(t, run.stats)
@@ -618,10 +629,16 @@ const (
 //   - no-bframes (h264_aac_nob.ts), b-frames (h264_pyramid.ts): no
 //     violation, every frame once, and presentation track i holds exactly
 //     rendition i's video frames of the same run.
+//   - 15-fps (h264_aac_15fps.ts), 10-fps (h264_aac_10fps.ts): the same,
+//     for sources whose encoded rungs trail the copy rung by 2 s and 3 s of
+//     stream time, MergeHold and more (finding C1): the presentation's
+//     merger follows that lag, so every epoch still starts on rung 0's IDR
+//     (m4bRuns) and no rung is left out of any segment (Packager.Rungs).
 func TestM4bMatrix(t *testing.T) {
 	t.Parallel()
 	bin := testpeer.OSTranscoder(t)
-	runs := m4bRuns(t, bin, "h264_aac.ts", "h264_aac_then_640.ts", "h264_aac_nob.ts", "h264_pyramid.ts")
+	runs := m4bRuns(t, bin, "h264_aac.ts", "h264_aac_then_640.ts", "h264_aac_nob.ts", "h264_pyramid.ts",
+		"h264_aac_15fps.ts", "h264_aac_10fps.ts")
 	n := len(m4bLadder(bin).Renditions)
 	t.Run("steady-state", func(t *testing.T) {
 		t.Parallel()
@@ -659,14 +676,22 @@ func TestM4bMatrix(t *testing.T) {
 	for _, row := range []struct{ name, fixture string }{
 		{"no-bframes", "h264_aac_nob.ts"},
 		{"b-frames", "h264_pyramid.ts"},
+		{"15-fps", "h264_aac_15fps.ts"},
+		{"10-fps", "h264_aac_10fps.ts"},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
 			run := runs[row.fixture]
 			assertPresentationIsRenditions(t, run)
-			_, base, caps := feedABR(t, run.presentation, 0)
+			p, base, caps := feedABR(t, run.presentation, 0)
 			assertCompleteABR(t, caps, stepFrames(run.presentation))
 			assert.Empty(t, assertDiscontinuitiesAligned(t, base))
+			// Every rung is in every segment: none left out, no gap.
+			rungs := p.Rungs()
+			assert.Len(t, rungs, n)
+			for track, r := range rungs {
+				assert.Zero(t, r, "rung %d", track)
+			}
 		})
 	}
 }

@@ -13,6 +13,7 @@ make fixtures
 |------|----------|-----------|
 | `h264_aac.ts` | 6 s, H.264 Main 320x240 25 fps, AAC-LC stereo 48 kHz | B-frames (`-bf 2`) and closed GOP (25 frames, no scenecut); baseline demux |
 | `h264_aac_nob.ts` | 6 s, same as `h264_aac.ts` but `-bf 0` (ffmpeg 8.0.1): no B-frames, so video DTS = PTS | A source without B-frames: the transcoder's encoders add their own reorder delay, which the rendition delay D must cover (M4a `TestPipelineNoBFrames`, `TestM4aMatrix/*/no-bframes`) |
+| `h264_aac_15fps.ts`, `h264_aac_10fps.ts` | 8 s, as `h264_aac.ts` but 15 and 10 fps with 2 s GOPs (`-g 30`, `-g 20`; ffmpeg 8.0.1) | Low frame rates: an x264 encoder's delay of about 30 frames is 2 s and 3 s of stream time, at and past the merger's 2 s hold, so the ABR presentation's merger must follow the encoder's lag to keep the rungs aligned (M4b finding C1, `TestM4bMatrix/15-fps`, `/10-fps`) |
 | `h265_aac51.ts` | 6 s, HEVC 320x240 25 fps, AAC 5.1 44.1 kHz | Open GOP (CRA plus RASL pictures); HEVC parameter sets; 6-channel AAC |
 | `h264_aacmono_wrap.ts` | 6 s, H.264 320x240, AAC mono 44.1 kHz, timestamps offset by 95440 s | PTS wrap about 2.4 s into the clip (33-bit 90 kHz rollover) |
 | `h264_640.ts` | 2 s, H.264 640x360, no audio | Video-only stream; second resolution |

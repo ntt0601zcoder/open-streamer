@@ -34,6 +34,11 @@ $F $(v 320x240) $(a 48000) -t 6 -c:v libx264 -profile:v main -g 25 -keyint_min 2
 dts h264_pyramid.ts h264_pyramid_dts.txt
 N=$(( $(stat -c%s h264_opengop.ts) / 188 ))
 tail -c +$(( 188 * (N * 3 / 8) + 1 )) h264_opengop.ts > h264_opengop_midgop.ts
+# Low frame rates, 2 s GOPs: an x264 encoder's delay of about 30 frames is 2 s
+# of stream time at 15 fps and 3 s at 10 fps.
+vr() { echo "-f lavfi -i testsrc2=size=320x240:rate=$1"; }
+$F $(vr 15) $(a 48000) -t 8 -c:v libx264 -profile:v main -bf 2 -g 30 -keyint_min 30 -sc_threshold 0 -c:a aac -ac 2 -b:a 64k $BX h264_aac_15fps.ts
+$F $(vr 10) $(a 48000) -t 8 -c:v libx264 -profile:v main -bf 2 -g 20 -keyint_min 20 -sc_threshold 0 -c:a aac -ac 2 -b:a 64k $BX h264_aac_10fps.ts
 # PMT-change fixtures: the appended 3 s clip continues the timeline
 # (-output_ts_offset 6), so only the PMT signals the change.
 $F $(v 320x240) $(a 48000) -t 3 $X264 -c:a aac -ac 2 -b:a 64k -output_ts_offset 6 -mpegts_start_pid 0x200 -mpegts_pmt_start_pid 0x1100 $BX tmp_pmtchange.ts
