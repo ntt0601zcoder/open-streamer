@@ -219,6 +219,15 @@ func layoutOf(sp spec.Stream) ([]media.Kind, error) {
 	return out, nil
 }
 
+// inputsOf returns the spec's input URLs, by priority.
+func inputsOf(sp spec.Stream) []string {
+	out := make([]string, len(sp.Inputs))
+	for i, in := range sp.Inputs {
+		out[i] = in.URL
+	}
+	return out
+}
+
 // encodes reports whether the spec's ladder needs the transcoder child: a
 // rendition or the audio is encoded.
 func encodes(sp spec.Stream) bool {
