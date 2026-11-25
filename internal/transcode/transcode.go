@@ -22,8 +22,9 @@
 // frame below K, of every track, goes out before the rungs' IDRs at K, and
 // those go out together, rung 0's first, so a packager can cut every
 // variant at the same keyframe and a late subscriber's GOP cache, anchored
-// on track 0, holds every rung's IDR. A rung late by more than MergeHold,
-// or without an IDR at K, is not waited for.
+// on track 0, holds every rung's IDR. A rung is waited for as long as the
+// encoder's delay asks, between MergeHold and four times MergeHold (see
+// merger); one later than that, or without an IDR at K, is not.
 //
 // # Rendition epochs
 //
@@ -143,7 +144,10 @@ type Options struct {
 	RespawnMin   time.Duration // 0 means 250 ms
 	RespawnMax   time.Duration // 0 means 5 s
 	HealthyAfter time.Duration // 0 means 30 s
-	MergeHold    time.Duration // 0 means 2 s
+	// MergeHold is how long a merger holds a frame for a quiet track; 0
+	// means 2 s. The presentation's merger holds up to four times as long
+	// when the encoded rungs trail further (see merger).
+	MergeHold    time.Duration
 	HelloTimeout time.Duration // a child without Hello by then is killed; 0 means 10 s
 	// InputStallTimeout bounds how long Run waits to queue a frame for a
 	// child that consumes none of its input. While a send to the child is

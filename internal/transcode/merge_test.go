@@ -704,7 +704,8 @@ func TestMergerBarrierPruneKeepsOrder(t *testing.T) {
 
 // Track 1 is announced and silent: before the first write only the
 // wall-time hold applies, so 3 s of the other tracks do not release the
-// epoch; after MergeHold (fake clock) the others go out, IDR_0 first.
+// epoch; after presHoldFactor × MergeHold (fake clock) the others go out,
+// IDR_0 first.
 func TestMergerBarrierHoldRunsOut(t *testing.T) {
 	ft := newFakeTime()
 	m, sub := newTestPresMerger(ft)
@@ -733,7 +734,7 @@ func TestMergerBarrierHoldRunsOut(t *testing.T) {
 	}
 	<-ft.asked
 	assert.Empty(t, drain(sub), "held for track 1")
-	ft.advance(2 * time.Second)
+	ft.advance(presHoldFactor * 2 * time.Second)
 	ft.fireLast()
 	var out []media.Frame
 	require.Eventually(t, func() bool {
@@ -782,4 +783,200 @@ func TestPresOrderKeyRules(t *testing.T) {
 	p.dropBefore(2)
 	assert.NotContains(t, p.barriers, uint32(1))
 	assert.NotContains(t, p.tracks, baudio)
+}
+
+// lagFeed drives a presentation merger like a paced ladder with a copy
+// rung: video tracks 0..2 are encoded and come out delay frames behind the
+// copy rung, track 3; the fake clock advances one frame duration per slot.
+// GOPs are closed, gop frames long, from tick 90000, without B-frames.
+type lagFeed struct {
+	ft       *fakeTime
+	m        *merger
+	fd       int64 // frame duration in ticks
+	gop      int
+	delay    int // frames the encoded rungs trail the copy rung
+	epoch    uint32
+	from     int  // the epoch's first slot
+	slot     int  // next slot
+	silent   bool // the encoded rungs deliver nothing
+	announce bool // the encoded rungs were announced for the epoch
+}
+
+const lagCopy = 3
+
+func (lf *lagFeed) key(g int) int64 { return bbase + int64(g*lf.gop)*lf.fd }
+
+func (lf *lagFeed) frame(track, n int) media.Frame {
+	pts := bbase + int64(n)*lf.fd
+	return media.Frame{Track: track, Config: testVideoCfg, Epoch: lf.epoch, PTS: pts, DTS: pts, Key: n%lf.gop == 0}
+}
+
+// step plays n slots: the barrier of a keyframe, the copy rung's frame,
+// then the encoded rungs' frames of delay slots ago.
+func (lf *lagFeed) step(n int) {
+	if !lf.announce {
+		lf.announce = true
+		for track := range 3 {
+			lf.m.expect(lf.epoch, track)
+		}
+	}
+	for range n {
+		s := lf.slot
+		lf.slot++
+		if s%lf.gop == 0 {
+			lf.m.barrier(lf.epoch, lf.key(s/lf.gop))
+		}
+		lf.m.push(lf.frame(lagCopy, s))
+		if d := s - lf.delay; d >= lf.from && !lf.silent {
+			for track := range 3 {
+				lf.m.push(lf.frame(track, d))
+			}
+		}
+		lf.ft.advance(media.ToDuration(lf.fd))
+	}
+}
+
+// assertLadderOrder checks the barrier order of every GOP whose keyframes
+// all came out.
+func assertLadderOrder(t *testing.T, out []media.Frame, lf *lagFeed, gops int) {
+	t.Helper()
+	tracks := []int{0, 1, 2, lagCopy}
+	for g := range gops {
+		k := lf.key(g)
+		i0 := keyIndex(out, 0, k)
+		require.GreaterOrEqual(t, i0, 0, "gop %d: IDR of track 0", g)
+		for j := range i0 {
+			require.Less(t, out[j].PTS, k, "gop %d: frame %d (track %d) before the first IDR", g, j, out[j].Track)
+		}
+		for n, track := range tracks {
+			f := out[i0+n]
+			require.True(t, f.Track == track && f.Key && f.PTS == k, "gop %d: frame %d is track %d's IDR, got %+v", g, i0+n, track, f)
+		}
+	}
+}
+
+// Finding C1: x264 trails the copy rung by about 30 frames, which is more
+// stream time than MergeHold from 15 fps down. The presentation merger's
+// hold follows the lag, so every barrier still holds: 15, 12, 10 and 5 fps.
+func TestMergerPresHoldFollowsLag(t *testing.T) {
+	for _, fps := range []int{15, 12, 10, 5} {
+		ft := newFakeTime()
+		m, sub := newTestPresMerger(ft)
+		lf := &lagFeed{ft: ft, m: m, fd: int64(media.ClockRate / fps), gop: 2 * fps, delay: 30, epoch: 1}
+		const gops = 8
+		lf.step(gops*lf.gop + lf.delay + 1)
+		out := drain(sub)
+		assertLadderOrder(t, out, lf, gops)
+		assertTrackDTS(t, out)
+		_, dropped := m.counts()
+		assert.Zero(t, dropped, "%d fps", fps)
+		m.mu.Lock()
+		hold, ticks := m.holds(false)
+		m.mu.Unlock()
+		lag := int64(lf.delay) * lf.fd
+		assert.Equal(t, min(lag+lag/2, 8*media.ClockRate), ticks, "%d fps: hold in ticks", fps)
+		assert.Equal(t, media.ToDuration(ticks), hold, "%d fps", fps)
+	}
+}
+
+// At 25 fps the encoder's lag (30 frames, 1.2 s) stays below MergeHold: the
+// hold is MergeHold, as before, and a rung that falls silent is given up
+// once 2 s of the copy rung wait, not later.
+func TestMergerPresHoldUnchangedAt25(t *testing.T) {
+	ft := newFakeTime()
+	m, sub := newTestPresMerger(ft)
+	lf := &lagFeed{ft: ft, m: m, fd: 3600, gop: 50, delay: 30, epoch: 1}
+	lf.step(4*lf.gop + lf.delay + 1)
+	out := drain(sub)
+	assertLadderOrder(t, out, lf, 4)
+	m.mu.Lock()
+	hold, ticks := m.holds(false)
+	m.mu.Unlock()
+	assert.Equal(t, 2*time.Second, hold)
+	assert.Equal(t, int64(2*media.ClockRate), ticks)
+
+	// The encoded rungs stop. The copy rung's head waits; it has 30 frames
+	// pending already, and goes out when the pending span reaches 2 s.
+	lf.silent = true
+	lf.step(19)
+	assert.Empty(t, drain(sub), "1.96 s pending: held")
+	lf.step(2)
+	got := drain(sub)
+	require.NotEmpty(t, got, "2 s pending: released")
+	assert.True(t, slices.ContainsFunc(got, func(f media.Frame) bool { return f.Track == lagCopy }), "the copy rung goes on")
+}
+
+// An encoder that trails by more than the cap (here 10 s, with MergeHold
+// 2 s and so a cap of 8 s) is not waited for: the copy rung goes out after
+// 8 s, at the start of the epoch and within it, and the hold stays at the
+// cap.
+func TestMergerPresHoldCap(t *testing.T) {
+	ft := newFakeTime()
+	m, sub := newTestPresMerger(ft)
+	lf := &lagFeed{ft: ft, m: m, fd: 9000, gop: 20, delay: 100, epoch: 1} // 10 fps, 10 s behind
+	lf.step(79)
+	assert.Empty(t, drain(sub), "7.9 s: the epoch's first frame still waits for rung 0")
+	lf.step(2)
+	out := drain(sub)
+	require.NotEmpty(t, out, "8 s: released")
+	assert.True(t, out[0].Track == lagCopy && out[0].Key, "the copy rung opens the epoch")
+	lf.step(100)
+	m.mu.Lock()
+	hold, ticks := m.holds(false)
+	m.mu.Unlock()
+	assert.Equal(t, 8*time.Second, hold)
+	assert.Equal(t, int64(8*media.ClockRate), ticks)
+	// Everything pushed comes out at flush, each track in DTS order.
+	m.flush()
+	assertTrackDTS(t, append(out, drain(sub)...))
+	_, dropped := m.counts()
+	assert.Zero(t, dropped)
+}
+
+// A respawn at 10 fps: the new epoch's copy IDR waits for rung 0's, which
+// comes 3 s later (more than MergeHold, less than the cap), so every
+// variant starts the epoch on its IDR, rung 0's first.
+func TestMergerPresHoldRespawn(t *testing.T) {
+	ft := newFakeTime()
+	m, sub := newTestPresMerger(ft)
+	lf := &lagFeed{ft: ft, m: m, fd: 9000, gop: 20, delay: 30, epoch: 1}
+	lf.step(3*lf.gop + lf.delay + 1)
+	drain(sub)
+
+	// The child dies: epoch 1's copy rung goes on alone, then epoch 2
+	// starts at a keyframe once the new child is fed.
+	lf.silent = true
+	lf.step(9)
+	lf2 := &lagFeed{ft: ft, m: m, fd: 9000, gop: 20, delay: 30, epoch: 2, from: 100, slot: 100}
+	lf2.step(29)
+	for _, f := range drain(sub) {
+		require.Equal(t, uint32(1), f.Epoch, "epoch 2 waits for its rungs: %+v", f)
+	}
+	lf2.step(lf2.gop + 2)
+	var e2 []media.Frame
+	for _, f := range drain(sub) {
+		if f.Epoch == 2 {
+			e2 = append(e2, f)
+		}
+	}
+	require.GreaterOrEqual(t, len(e2), 4)
+	for n, track := range []int{0, 1, 2, lagCopy} {
+		assert.True(t, e2[n].Track == track && e2[n].Key && e2[n].PTS == lf2.key(5), "epoch 2 frame %d: %+v", n, e2[n])
+	}
+}
+
+// A rendition merger's hold is fixed.
+func TestMergerRenditionHoldFixed(t *testing.T) {
+	ft := newFakeTime()
+	m, _ := newTestMerger(ft)
+	for i := range 100 {
+		m.push(vframe(1, int64(i)*9000, i%20 == 0))
+		m.push(aframe(2, int64(i)*9000+900000))
+	}
+	for _, newEpoch := range []bool{false, true} {
+		hold, ticks := m.holds(newEpoch)
+		assert.Equal(t, 2*time.Second, hold)
+		assert.Equal(t, int64(2*media.ClockRate), ticks)
+	}
+	assert.Nil(t, m.lag)
 }
