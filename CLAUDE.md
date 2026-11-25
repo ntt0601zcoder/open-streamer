@@ -36,6 +36,7 @@ The v1 code lives on `main`. Read it with `git show main:<path>`; never copy it 
 - `hub.Write` never blocks, under any subscriber behaviour.
 - Audio frames always have `Key == true` and `RASL == false`.
 - Video `Frame.Data` never contains VPS, SPS, PPS or AUD NAL units; they live only in `TrackConfig`.
+- `internal/transcode/picture` is pure Go; operator text never enters a libavfilter graph string.
 - Fixtures are opened from tests as `../../testdata/fixtures/<name>` (or `../../../` from deeper packages).
 
 ## Conventions

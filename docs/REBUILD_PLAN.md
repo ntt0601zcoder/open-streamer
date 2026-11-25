@@ -33,11 +33,11 @@ of the five can exist.
 | Inputs | RTMP push and pull, RTSP pull, SRT pull and listen, UDP (unicast and multicast), HLS pull, HTTP-TS, file loop, `copy://` |
 | Codecs | H.264, H.265, AAC. Any other track is skipped at ingest with a logged reason |
 | Transcoding | Per-stream subprocess on libav: decode once, encode an N-rung ladder, NVENC and software, audio AAC re-encode, passthrough per track |
-| Picture features (M4c) | Watermark (text with time directives, image from an asset library), applied before the ladder so every rung carries it. Thumbnails: a JPEG every N seconds from the decoder, also for passthrough streams by decoding keyframes only |
+| Picture features (M4c) | Watermark (text with time directives, image from an asset library), applied before the ladder so every encoded rung carries it (a ladder with a copy-video rendition rejects it). Thumbnails: a JPEG every N seconds from the decoder, also for passthrough streams by decoding keyframes only |
 | Outputs | HLS (fMP4 and TS), DASH (fMP4), HTTP-TS, SRT, RTMP play, RTSP play, RTMP push-out |
 | Control | Declarative stream specs in a file store, REST API, per-stream supervisor, input failover by priority |
 | Operations | Prometheus metrics, `slog` JSON logs, pprof, conformance CLI |
-| Platforms | The server is pure Go and builds for any OS. The transcoder runs on Linux amd64 and arm64 with glibc 2.39 or later (Ubuntu 24.04+, Debian 13+); `internal/transcode` returns `errors.ErrUnsupported` on non-Unix systems. Encoding is software (libx264), with NVIDIA NVENC in M4c. macOS, Windows, VAAPI, QSV and VideoToolbox are out of v2.0 (ruling R-M4d) |
+| Platforms | The server is pure Go and builds for any OS. The transcoder runs on Linux amd64 and arm64 with glibc 2.39 or later (Ubuntu 24.04+, Debian 13+); `internal/transcode` returns `errors.ErrUnsupported` on non-Unix systems. Encoding is software (libx264) and NVIDIA NVENC (`h264_nvenc`, per rung). macOS, Windows, VAAPI, QSV and VideoToolbox are out of v2.0 (ruling R-M4d) |
 | Later in v2.0 (M6) | DVR and timeshift, RTMP auto-publish by template, templates, playback sessions and tokens, webhooks |
 
 **Dropped:** `mixer://` (audio from another stream; revisit as a transcoder
@@ -335,8 +335,10 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 
 ### 3.5 Transcoder
 
-- One subprocess per stream (`cmd/ostranscoder`, cgo, go-astiav), so a libav
-  crash cannot take down the server. cgo and libav are needed only by
+- One subprocess per stream (the transcoding child; a stream with no
+  transcoding child and thumbnails on runs one thumbnail-only child instead,
+  R-C10a): `cmd/ostranscoder`, cgo, go-astiav, so a libav crash cannot take
+  down the server. cgo and libav are needed only by
   `internal/transcode/native` and `cmd/ostranscoder`, behind the build tag
   `libav`; without the tag everything else builds, vets and tests with no
   libav, and `ostranscoder` is a stub that exits 2.
@@ -344,13 +346,20 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   length-prefixed protobuf messages (`internal/transcode/wire`, hand-coded with
   `protowire`: no code generation, no gRPC server, no socket path, no TS
   re-mux). Each record is a 4-byte length and one envelope that holds exactly
-  one message: Hello, Configure, Frame, Discontinuity, Stats, Error or Stop.
-  Configure, sent once, carries the ladder. Each `TrackConfig` travels once, by
-  ID, in the first Frame that uses it, and later Frames refer to the ID.
-  `Stats` carries the
-  counters `In`, `Out`, `EncodeNanos`, `DroppedTracks`, `Reanchors`,
-  `AudioDropped`, `AudioCorrupt` and `VideoCorrupt` (ruling R-T6a). The host
-  rejects a child whose Hello version differs.
+  one message: Hello, Configure, Frame, Discontinuity, Stats, Error, Stop,
+  SetWatermark (host to child) or Shot (child to host). Configure, sent once,
+  carries the ladder (each rung with its encoder), the audio encode, the
+  watermark and the thumbnail settings; one with no rungs and no audio but a
+  thumbnail asks for shots only. SetWatermark replaces or removes the
+  watermark of a running child, and Shot carries one thumbnail. Each
+  `TrackConfig` travels once, by ID, in the first Frame that uses it, and
+  later Frames refer to the ID. `Stats` carries the counters `In`, `Out`,
+  `EncodeNanos`, `DroppedTracks`, `Reanchors`, `AudioDropped`, `AudioCorrupt`
+  and `VideoCorrupt` (ruling R-T6a), and `EncoderFallbacks`, `Thumbnails` and
+  `ThumbnailsFailed`. The wire is version 2 (R-C13): every field version 2
+  added is absent when empty, so a Configure of x264 rungs with no watermark
+  and no thumbnail has version 1's bytes. The host rejects a child whose
+  Hello version differs, so server and bundle are deployed together.
 - **Time.** The host adds the rendition delay D = 45000 ticks (0.5 s, ruling
   R-M4c) to every frame and anchor of every rendition, copy tracks included,
   so renditions stay aligned with each other. D covers the encoder's reorder
@@ -366,8 +375,21 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   every source keyframe (matched by PTS, since the decoder's key flag misses
   H.264 recovery points), so all rungs and the source segment identically.
   libx264 runs with `scenecut=0:keyint=600:min-keyint=1:rc-lookahead=10:b-pyramid=none`;
-  `b-pyramid=none` is ruling R-T7b' (VLC 3 logged "buffer deadlock prevented"
-  on pyramid rungs; 0 of 8 runs after, against 3 of 8).
+  `b-pyramid=none` is ruling R-T7b', whose cause M4c found
+  ([notes](superpowers/notes/2026-11-25-r-t7b-root-cause.md)). VLC 3 logs
+  "buffer deadlock prevented" at a clock reset at the live edge, never at the
+  start of a play, when its re-buffer feeds the video decoder fewer packets
+  than its frame-threaded H.264 decoder needs for a second picture: with
+  VLC's 6 threads, 8 at reorder depth 1 and 9 at depth 2. Our PCR runs 700 ms
+  behind the DTS, so of the 1000 ms re-buffered only about 300 ms are video
+  of the new segment: 8 access units at 25 fps. It is a limit of VLC 3
+  reached by a conformant stream, and the line does not stop playback. With
+  the pyramid (depth 2) it was logged in 17 of 46 plays on the tree before
+  the setting, and in 0 of 16 without it. Depth 1 fits at 25 fps with no
+  frame to spare; a lower frame rate feeds fewer frames, and at 15 fps the
+  line follows VLC's one reset in every play (Backlog: low frame rates in
+  VLC 3). Every encoded rung's SPS announces a reorder depth of at most 1,
+  pinned by a test (R-C11).
 - **Rendition epochs.** Rendition epoch numbers never collide. The host maps
   each upstream epoch e to e + offset, and a *bump* opens a new rendition
   epoch numbered (largest issued) + 1 and raises the offset. A respawn and the
@@ -416,7 +438,8 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   find it, and the label `abr` is reserved (R-B2; product naming is M5's).
 - **Passthrough** (`name=label:copy`) needs no child: copy tracks go from the
   host's subscription to the rendition's merger directly, and a stream whose
-  renditions all copy never starts a child.
+  renditions all copy never starts a transcoding child; with thumbnails on it
+  runs a thumbnail-only child.
 - **Child supervision.** The host feeds a child that has not said Hello yet
   from a backlog of up to 1500 frames, the hub's GOP cache (ruling R-T5c), so
   joining a live hub with a long GOP costs no epoch; only an overflow bumps.
@@ -433,6 +456,90 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 - **Only the lowest-numbered video track** is encoded and copied; other video
   tracks are dropped, logged once and counted. Every audio track is encoded
   (AAC, native `aac` encoder) or copied.
+- **NVENC (M4c).** The encoder is chosen per rung (R-C1):
+  `transcode.Video.Encoder` is `""` or `"x264"` (libx264) or `"nvenc"`
+  (`h264_nvenc`), and a ladder may mix them; each rung is its own encoder
+  context, and the presentation's barrier already orders rungs with
+  different decode delays. Frames stay on the CPU (R-C2): the child decodes
+  in software, applies the watermark and scales with swscale as for x264,
+  and gives `yuv420p` system-memory frames to `h264_nvenc`, which uploads
+  them itself; there is no `hwupload`, cuvid decode or `scale_cuda`. The
+  options are fixed (R-C3): `preset` is `Video.Preset`, `""` (→ `p4`) or
+  `p1`…`p7`, and `New` rejects an x264 preset name on an nvenc rung;
+  `tune=hq`; `rc=vbr` with bitrate, maxrate (0 → bitrate) and bufsize
+  2 × maxrate, as x264; `profile=high`; GOP 600, as x264's `keyint=600`;
+  `forced-idr=1` with an IDR at each source keyframe PTS, as on x264 rungs;
+  `no-scenecut=1`, `rc-lookahead=0`, `strict_gop=1`, `delay=0`, `aud=0`.
+  B-frames follow the x264 rungs' rule (`BFrames` 0 means 2, −1 none, at
+  most 3, under the same D), and `b_ref_mode=disabled` always, NVENC's
+  analogue of `b-pyramid=none` under R-T7b'. A failed NVENC open falls back
+  to libx264 for that rung and that build (R-C4): same height, rates and
+  B-frames, preset `veryfast`. `Stats.Child.EncoderFallbacks` rises by 1 for
+  each rung that fell back, the child logs one warning per build naming
+  those rungs, and the next build (a source config change, a discontinuity,
+  a respawn) tries NVENC again. The driver's session limit, sessions held by
+  another process, a resolution below NVENC's minimum, a card without
+  B-frames, a missing driver and a build without the encoder all end in this
+  fallback; a rung or a stream is never failed for them. `ostranscoder
+  -probe nvenc` opens and closes one NVENC encoder and exits 0 (`nvenc: ok`)
+  or 3 (`nvenc: <error>`).
+- **Watermark (M4c).** It is drawn once, on the decoded picture before the
+  ladder (R-C5), so every encoded rung carries it, scaled with the picture.
+  A copy rung cannot carry it, so `New` and `SetWatermark` reject a
+  watermark on a ladder with a copy-video rendition. The spec,
+  `picture.Watermark` (R-C6), is `Text` or `Image`, never both. Text is at
+  most 256 bytes of valid UTF-8 on one line, with the directives
+  `%Y %m %d %H %M %S` and `%%` (any other `%x` is rejected), formatted in
+  `TimeZone` (an IANA name, `""` = UTC; both binaries embed `time/tzdata`)
+  from the child's wall clock and re-rendered when the formatted string
+  changes; it is white with a black border of max(1, size/16) px. An image
+  is PNG (alpha kept) or JPEG file bytes, at most 1 MiB and 2048 px per side.
+  `Position` is top-left (the zero value), top-right, bottom-left,
+  bottom-right or centre, with a margin of 2 % of the picture height;
+  `OpacityPct` is 1…100 (0 → 100); `SizePct` is the text's glyph height in %
+  of the picture height (0 → 5, 1…50) or the image's width in % of the
+  picture width (0 → 15, 1…100), its height following the aspect ratio. Text
+  is rendered by libavfilter `drawtext` with the embedded DejaVu Sans
+  (R-C7), written to a private temp directory, with `expansion=none` and the
+  text read from a `textfile` that the child rewrites atomically (`reload=1`
+  when the text has a time directive). Operator text never enters a
+  filter-graph string: the graph is built only from numbers and the paths
+  the child makes, and a temp path with a character outside
+  `[A-Za-z0-9_./-]` is refused. Images come from an asset library, a
+  directory (R-C8): an asset name matches
+  `^[a-z0-9][a-z0-9_-]{0,63}\.(png|jpg|jpeg)$` and the file is read once at
+  stream start by `picture.LoadAsset`; `transcode.Options` and the wire
+  carry the bytes, so the transcoder never sees a path, and a changed file
+  is not reloaded. Live update (R-C9): `Transcoder.SetWatermark` sends one
+  SetWatermark message and the child swaps its filter graph at the next
+  decoded picture, with no drain, no IDR and no epoch. The host keeps the
+  latest watermark and sends it in the next child's Configure, so a
+  respawned child starts with it. A watermark the child cannot build is a
+  fatal child error: a stream configured with a watermark never goes out
+  without it. `internal/transcode/picture` is pure Go.
+- **Thumbnails (M4c).** `picture.Thumbnail{IntervalSec, Height, Quality}`
+  (R-C10): 0 means 10 s, 180 px and 80; the interval is 1…3600, the height
+  even, 2…720 and capped at the source's, the quality 1…100. A shot is taken
+  from the decoded picture before the watermark, scaled by swscale to
+  full-range YUV 4:2:0 at the display aspect ratio, and encoded with Go's
+  `image/jpeg`. The schedule runs in stream time: a shot is due at the first
+  picture, at a new epoch, and when PTS ≥ last shot + interval. Only the
+  latest shot is kept, in memory; osdev serves it at
+  `GET /live/{stream}/thumbnail.jpg` under the source stream's name. A
+  stream still runs one subprocess (R-C10a). Whenever it has a transcoding
+  child, that child takes the thumbnails: from every decoded picture when it
+  encodes video; when it encodes only audio (copy video), the host also
+  sends it the main video track's keyframe whenever a shot is due, and the
+  child decodes that keyframe alone (*key-only*). On every key-only path the
+  host's `picture.Schedule` is the only schedule and the child shoots every
+  keyframe it is sent, so one keyframe per interval crosses the socket and
+  the interval is N rounded up to the next keyframe. A full child queue
+  skips the keyframe (the next one is tried), never the audio, and a
+  keyframe that does not decode alone costs a thumbnail, never the child.
+  Only a stream with no transcoding child (no ladder, or a ladder that
+  copies everything) gets a child of its own, in thumbnail-only mode, run by
+  `transcode.Thumbnailer` on the source hub and fed keyframes only; `New`
+  rejects thumbnails on a ladder that needs no child.
 - **Build.** FFmpeg 8.1.3 shared, GPL, comes from a pinned FFmpeg-Builds
   release instead of a compiled builder image (ruling R-M4b): release
   `autobuild-2026-10-31-12-59`, archives
@@ -545,7 +652,7 @@ before the code they check.
 | M3 (done) | Outputs: `pkg/hls`, `pkg/dash`, segmenter, muxers, `pkg/rtsp` server, RTMP play and push, every output protocol, `osconform` | M1 (M2's `pkg/rtmp` and `pkg/rtsp` for the RTMP and RTSP outputs) | ffmpeg and VLC-class clients play every output, and MediaMTX pulls every output it can take as a source (DASH and HTTP-TS are not MediaMTX sources; see Out of M3b3); for every output, `osconform` passes the steady-state, epoch-change, slow-consumer and B-frame scenarios, and ffprobe reads it. Proved by `TestM3Matrix` (every output under the four scenarios), `TestM3VLCClass` and `TestM3GStreamerClass` (VLC-class clients), `TestM3b3MediaMTXPull`, `TestM3b3SRTFFmpeg`, `TestHLSFFmpegAcrossGap` and `TestM3b3HLSAlignment`, with the M3a, M3b1 and M3b2 scenarios for the cells they cover |
 | M4a ([plan](superpowers/plans/2026-11-24-m4a-transcoder-core.md), done) | Transcoder core: the segmenter fix that cuts audio at the video keyframe's PTS, `internal/transcode` (host, wire protocol, native libav pipeline, `cmd/ostranscoder`), a software H.264 ladder with AAC re-encode or copy, per-track passthrough, respawn, CI on Linux amd64 and arm64. Each rendition is served as its own stream, `<name>_<label>` | M1, M3 | A 3-rung software ladder plus a copied rendition passes M3's scenarios per rendition; the rungs' keyframes and segments align with the source's; a killed subprocess comes back as exactly one new epoch per rendition; the same on arm64 in CI. Proved by `TestM4aMatrix` (every rendition under steady-state, epoch-change, slow-consumer, no-B-frames and B-frames, plus SRT and RTSP on `t180`), `TestM4aKeyframesAligned`, `TestM4aRespawn`, `TestM4aVLC`, `TestSupervisorRealChild`, the native and supervisor suites (`internal/transcode/...`), and the `transcode-e2e-arm64` CI job |
 | M4b ([plan](superpowers/plans/2026-11-25-m4b-abr-outputs.md), done) | ABR outputs: the transcoder's presentation hub with its keyframe barrier, the segmenter's `AlignVideo` (a rung that misses a segment start lists a gap), the packager's ABR mode (HLS TS variants under a multivariant playlist, the HLS fMP4 master, DASH Representations in one video set), `osconform`'s ABR rules (variants aligned, BANDWIDTH honest), osdev's `<name>_abr` | M4a | A ladder is served as one ABR presentation that passes M3's scenarios. Proved by `TestM4bMatrix` (steady-state, epoch-change, slow-consumer, no-B-frames, B-frames, and 15 fps and 10 fps sources, whose encoders trail by 2 s and 3 s of stream time, each read back over HLS TS, HLS fMP4 and DASH with the ABR rules, every frame once, discontinuities at the same media sequence number in every playlist), `TestM4bSwitchTS` (segments from alternating TS variants decode as one stream), `TestM4bRespawn` (the clip fed twice; a killed child is exactly one new epoch, at one media sequence number in every variant, opened by rung 0's IDR), `TestM4bRungGap` (a rung whose IDR a loss swallowed lists a gap, end to end), `TestM4bPlayers` (ffprobe, VLC and GStreamer; GStreamer DASH on 1.28 only, ruling R-B9), the segmenter, transcoder, packager, conform and osdev suites, and the `transcode-e2e-arm64` CI job (`TestM4bMatrix`, `TestM4bRespawn`, `TestM4bSwitchTS`, `TestM4bRungGap`) |
-| M4c | NVENC on the GPU host; watermark; thumbnails | M4a | On the GPU host (this machine, a GTX 1650): the same ladder with 3 NVENC rungs, run by a make target and recorded in the PR. The watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams |
+| M4c ([plan](superpowers/plans/2026-11-25-m4c-picture-features.md), done) | Picture features: NVENC rungs (`h264_nvenc`, chosen per rung, with a per-rung fallback to libx264), the watermark (text with time directives, or an image from the asset library) drawn before the ladder and updated live, thumbnails from the decoder for transcoded, copy-video and passthrough streams, wire version 2, osdev's `-watermark`, `-thumbnail` and `/live/<name>/thumbnail.jpg`, and the root cause of R-T7b' | M4a | On the GPU host (this machine, a GTX 1650): the same ladder with 3 NVENC rungs, run by a make target and recorded in the PR. The watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams. Proved by `TestM4cNVENCMatrix`, `TestM4cNVENCProbe` and `TestM4cNVENCSessions` (run by `make test-nvenc`, evidence below), `TestM4cWatermarkEveryRung`, `TestM4cWatermarkABR`, `TestM4cThumbnailsTranscoded`, `TestM4cThumbnailsPassthrough` and `TestM4cThumbnailsCopyVideo`, with `TestM4cWatermarkLiveUpdate`, `TestM4cWatermarkRespawn`, `TestM4cFrozen` (no watermark, no thumbnails and x264 rungs give M4b's output), the picture, native, transcode and osdev suites, and the `transcode-e2e-arm64` CI job |
 | M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5 | Feature tests; DVR playback passes `osconform` |
 | M7 | Cutover | M1–M6 | The [soak plan](SOAK_TEST_PLAN.md) runs for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
@@ -673,10 +780,10 @@ Out of M4a:
 | Item | Reason |
 |---|---|
 | HLS multivariant and DASH representations | M4b (done); M4a proves each rendition as its own stream |
-| NVENC, watermark, thumbnails | M4c |
+| NVENC, watermark, thumbnails | M4c (done) |
 | macOS, Windows, VAAPI, QSV, VideoToolbox | Out of v2.0 (R-M4d) |
 | libfdk-aac | FFmpeg-Builds ships none (R-M4b); the native `aac` encoder is used |
-| Video encoders other than libx264 | Rungs are H.264 software; NVENC is M4c |
+| Video encoders other than libx264 | Rungs are H.264 software; NVENC is M4c (done) |
 | More than one encoded video track | Only the lowest-numbered video track is encoded or copied; the others are dropped and counted |
 | More than 3 B-frames, and B-frames below about 8 fps | Beyond what D covers (R-M4c); use none |
 | Merger audio on a long copy-video burst | Backlog |
@@ -731,6 +838,168 @@ Out of M4b:
 | ABR over RTMP, RTSP, SRT and HTTP-TS | Single-rendition protocols: each rendition stays its own stream, `<name>_<label>`; R-B2 |
 | LL-HLS | Not part of the M4b row, as for M3 |
 | Product naming of the presentation | osdev's `<name>_abr` is a development name (R-B2); M5 names it |
+
+M4c's rulings are in its plan (R-C1 to R-C13 and R-C10a); the design is
+§3.5's NVENC, watermark and thumbnail bullets, and §3.5's keyframes bullet
+states the cause found for R-T7b'. The software scenarios run in CI: the
+`test` job runs them all, and `transcode-e2e-arm64` runs `TestM4cWatermarkEveryRung`,
+`TestM4cThumbnailsTranscoded`, `TestM4cThumbnailsPassthrough`,
+`TestM4cThumbnailsCopyVideo` and `TestM4cFrozen`. libx264 does not repeat
+its bytes between runs of the same input (Backlog), so `TestM4cFrozen`
+compares an encoded rung by its PTS, DTS, key flags, epochs, configs and
+x264 options SEI exactly and by its decoded pictures within a mean
+difference of 4 of 255, and the audio and copied video by their bytes.
+The runners have no NVIDIA device: the NVENC scenarios skip there with
+their reason, and both transcoder jobs require the bundle's
+`ostranscoder -probe nvenc` to exit 3 with an `nvenc: ` line. The GPU proof
+is `make test-nvenc` on this host (R-C12): it refuses to start unless
+`nvidia-smi` reports no encoder session and no compute process, runs the
+NVENC scenarios one after another with `OS_REQUIRE_NVENC=1` (at most 3
+sessions open), has VLC 3.0.20 in the peers image play the recorded NVENC
+presentation with B-frames on (`TestM4cNVENCRecordedVLC`), and writes
+`dist/nvenc-report/report.md`. ffprobe 8 does not finish reading the
+two-period live DASH of h264_aac_then_640.ts (ffmpeg's DASH demuxer), so
+that one cell of `TestM4cNVENCMatrix` reads DASH with `conform.ReadDASH`
+instead (no violation, every frame in order with its key flag, DTS equal to
+PTS); every other cell uses ffprobe. The recorded evidence is the body of
+`dist/nvenc-report/report.md` from the run that closed M4c, below, with its
+level-two headings set in bold. It ran at a629ae8 (`ci: run the M4c
+scenarios and the NVENC probe`); its uncommitted changes were only the
+`docs: M4c done` edits of `CLAUDE.md` and this file.
+
+- Date: 2026-11-25T15:17:17Z
+- GPU: NVIDIA GeForce GTX 1650, 595.99.02, 4096 MiB
+- FFmpeg: ffmpeg-n8.1.3-27-g8dca1586f4-linux64-gpl-shared-8.1.tar.xz
+- ostranscoder: ostranscoder wire 2 libavcodec 62.28.103
+- Commit: a629ae8169013e4fa57ace9b0e7cd0c53bfea2f1 (with uncommitted changes)
+- NVENC sessions: before 0; during (TestM4cNVENCSessions) base=0 peak=3 after=0 (51 polls, 49 before the feed ended at 2026-11-25T15:15:13Z); after 0
+- The two-period DASH cell of h264_aac_then_640.ts (TestM4cNVENCMatrix/noB no-reorder) is read with conform instead of ffprobe: ffprobe 8 does not finish reading that MPD.
+
+**NVENC rungs (TestM4cNVENCProbe, h264_aac.ts)**
+
+```
+nvenc-rung noB t240 h264 High 320x240 has_b_frames=0 kbps=594
+nvenc-rung noB t180 h264 High 240x180 has_b_frames=0 kbps=297
+nvenc-rung noB t120 h264 High 160x120 has_b_frames=0 kbps=145
+nvenc-rung B t240 h264 High 320x240 has_b_frames=1 kbps=601
+nvenc-rung B t180 h264 High 240x180 has_b_frames=1 kbps=299
+nvenc-rung B t120 h264 High 160x120 has_b_frames=1 kbps=146
+```
+
+**Results**
+
+```
+--- PASS: TestM4cNVENCMatrix (44.53s)
+--- PASS: TestM4cNVENCProbe (14.48s)
+--- PASS: TestM4cNVENCSessions (13.06s)
+--- PASS: TestM4cNVENCMixed (7.33s)
+--- PASS: TestM4cNVENCLongGOP (32.04s)
+--- PASS: TestM4cNVENCWatermarkThumbnails (25.57s)
+--- PASS: TestM4cNVENCKeep (27.54s)
+--- PASS: TestNVENCOptions (0.00s)
+--- PASS: TestNVENCFallback (0.39s)
+--- PASS: TestNVENCMissingEncoder (0.06s)
+--- PASS: TestNVENCRung (0.89s)
+--- PASS: TestNVENCBFrames (0.85s)
+--- PASS: TestNVENCMixedLadder (1.05s)
+--- PASS: TestNVENCAcrossConfigChange (1.01s)
+--- PASS: TestProbeNVENC (0.23s)
+--- PASS: TestM4cNVENCRecordedVLC (20.34s)
+```
+
+<details><summary>Subtests</summary>
+
+```
+    --- PASS: TestM4cNVENCMatrix/noB (28.07s)
+        --- PASS: TestM4cNVENCMatrix/noB/transcode (28.07s)
+            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_aac.ts (6.55s)
+            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_aac_then_640.ts (8.55s)
+            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_aac_nob.ts (6.45s)
+            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_pyramid.ts (6.51s)
+        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_pyramid.ts (0.65s)
+        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_aac_nob.ts (0.66s)
+        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_aac.ts (0.70s)
+        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_aac_then_640.ts (0.87s)
+        --- PASS: TestM4cNVENCMatrix/noB/t180 (0.01s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-bframes (0.25s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_pyramid.ts (0.57s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/steady-state (0.18s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/epoch-change (0.24s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_aac_nob.ts (0.61s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_aac.ts (0.56s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_aac_then_640.ts (0.52s)
+        --- PASS: TestM4cNVENCMatrix/noB/src (0.01s)
+            --- PASS: TestM4cNVENCMatrix/noB/src/steady-state (0.22s)
+            --- PASS: TestM4cNVENCMatrix/noB/src/no-bframes (0.23s)
+            --- PASS: TestM4cNVENCMatrix/noB/src/epoch-change (0.37s)
+            --- PASS: TestM4cNVENCMatrix/noB/src/b-frames (1.44s)
+        --- PASS: TestM4cNVENCMatrix/noB/t240 (0.01s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-bframes (0.24s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/epoch-change (0.31s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_aac_then_640.ts (0.55s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/steady-state (0.27s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_aac.ts (0.63s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_aac_nob.ts (0.67s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_pyramid.ts (0.68s)
+        --- PASS: TestM4cNVENCMatrix/noB/t120 (0.02s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/epoch-change (0.16s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-bframes (0.16s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/steady-state (0.12s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_pyramid.ts (0.47s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_aac_then_640.ts (0.40s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_aac.ts (0.42s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_aac_nob.ts (0.50s)
+    --- PASS: TestM4cNVENCMatrix/B (13.03s)
+        --- PASS: TestM4cNVENCMatrix/B/transcode (13.03s)
+            --- PASS: TestM4cNVENCMatrix/B/transcode/h264_pyramid.ts (6.49s)
+            --- PASS: TestM4cNVENCMatrix/B/transcode/h264_aac.ts (6.54s)
+        --- PASS: TestM4cNVENCMatrix/B/ladder/h264_aac.ts (0.58s)
+        --- PASS: TestM4cNVENCMatrix/B/ladder/h264_pyramid.ts (0.59s)
+        --- PASS: TestM4cNVENCMatrix/B/t120 (0.00s)
+            --- PASS: TestM4cNVENCMatrix/B/t120/steady-state (0.21s)
+            --- PASS: TestM4cNVENCMatrix/B/t120/b-frames (1.07s)
+        --- PASS: TestM4cNVENCMatrix/B/src (0.00s)
+            --- PASS: TestM4cNVENCMatrix/B/src/b-frames (1.08s)
+        --- PASS: TestM4cNVENCMatrix/B/t180 (0.00s)
+            --- PASS: TestM4cNVENCMatrix/B/t180/steady-state (0.29s)
+            --- PASS: TestM4cNVENCMatrix/B/t180/b-frames (1.08s)
+        --- PASS: TestM4cNVENCMatrix/B/t240 (0.01s)
+            --- PASS: TestM4cNVENCMatrix/B/t240/steady-state (0.27s)
+            --- PASS: TestM4cNVENCMatrix/B/t240/b-frames (1.17s)
+    --- PASS: TestM4cNVENCProbe/noB (7.01s)
+        --- PASS: TestM4cNVENCProbe/noB/transcode (6.56s)
+            --- PASS: TestM4cNVENCProbe/noB/transcode/h264_aac.ts (6.56s)
+    --- PASS: TestM4cNVENCProbe/B (6.99s)
+        --- PASS: TestM4cNVENCProbe/B/transcode (6.54s)
+            --- PASS: TestM4cNVENCProbe/B/transcode/h264_aac.ts (6.54s)
+    --- PASS: TestM4cNVENCMixed/transcode (6.44s)
+        --- PASS: TestM4cNVENCMixed/transcode/h264_pyramid.ts (6.44s)
+    --- PASS: TestM4cNVENCKeep/transcode (24.81s)
+        --- PASS: TestM4cNVENCKeep/transcode/h264_aac.ts*4 (24.81s)
+    --- PASS: TestNVENCFallback/one_rung (0.23s)
+    --- PASS: TestNVENCFallback/two_rungs (0.14s)
+    --- PASS: TestNVENCBFrames/default_2 (0.31s)
+    --- PASS: TestNVENCBFrames/3 (0.30s)
+    --- PASS: TestM4cNVENCRecordedVLC/index.m3u8 (10.16s)
+    --- PASS: TestM4cNVENCRecordedVLC/v0.m3u8 (10.16s)
+```
+
+</details>
+
+Out of M4c:
+
+| Item | Reason |
+|---|---|
+| NVENC reference B-frames (`b_ref_mode`) | R-C3: disabled always, as `b-pyramid=none` on x264 (R-T7b'); Backlog |
+| The full-GPU path (cuvid, `scale_cuda`, `overlay_cuda`) | R-C2: frames stay on the CPU; needs a watermark that renders on the GPU; Backlog |
+| HEVC and AV1 NVENC | Rungs encode H.264 only; add on demand |
+| An operator font, and non-Latin text | R-C7: the embedded DejaVu Sans only, so CJK and Arabic shaping render as empty boxes; Backlog |
+| Several watermarks, colours, rotation, tiling | R-C6: one watermark, white text with a black border or an image |
+| A watermark on a copy rung | R-C5: `New` rejects it; a branded source resolution needs one more encoded rung |
+| Thumbnail history, sprite sheets, files | R-C10: the latest shot only, in memory |
+| The asset API (upload, listing, replacement) | M5, in front of the same directory (R-C8) |
+| Metrics for `EncoderFallbacks` | M5 exports metrics; until then `Stats` and the child's warning (R-C4); Backlog |
+| NVENC in CI | The runners have no NVIDIA device; `make test-nvenc` is run by hand on this host (R-C12) |
 
 M2 is split in three parts:
 
@@ -878,14 +1147,65 @@ Items accepted for later, not yet placed in a milestone:
   hub's current epoch's expected set until the new epoch's first frame is
   written. Fix: when a candidate's epoch is above the hub's, check the union
   of both epochs' expected sets; add a copy-audio respawn subtest.
-- **Root cause of VLC 3's "buffer deadlock prevented" on B-pyramid rungs,
-  before M4c** (ruling R-T7b'). `b-pyramid=none` cured it on our encoded
-  rungs (3 of 8 runs to 0 of 8), but treats a symptom: the trigger is
-  specific to our encoded output under x264's frame threads (the copied
-  source rendition showed it in 0 of 8 runs, and sliced threads with
-  B-pyramid cured it too). Find what in our output VLC trips on (for
-  example DTS spacing, or the reorder depth against what the SPS signals),
-  since NVENC's `b_ref_mode` in M4c may bring it back.
+- **Root cause of VLC 3's "buffer deadlock prevented" on B-pyramid rungs
+  (closed in M4c**, ruling R-T7b', Task 9:
+  [notes](superpowers/notes/2026-11-25-r-t7b-root-cause.md), `Outcome: (a)`).
+  It is a limit of VLC 3 reached by a conformant stream, not a defect in our
+  output. At a clock reset at the live edge VLC flushes its decoders and
+  re-buffers 1000 ms of PCR time; with our PCR 700 ms behind the DTS that
+  feeds the decoder about 300 ms of the new segment's video, 8 access units
+  at 25 fps, and with 6 frame threads libavcodec needs 8 packets for the
+  second picture at reorder depth 1 and 9 at depth 2. With 8 fed and 9
+  needed the line is logged; playback goes on. Proved both ways on the tree
+  before the setting: on the pyramid with 5 decoder threads, or with the PCR 400 ms behind the DTS,
+  0 of 16; without the pyramid with 7 threads 4 of 16, or with the PCR
+  780 ms behind 16 of 16. The earlier reading is superseded: the copied
+  source has depth 2 too and passes because, with no encoder lag, its passes
+  start without an audio lead, which moves VLC's reset one frame later;
+  sliced threads only shortened that lead. `b-pyramid=none` (x264) and
+  `b_ref_mode=disabled` (NVENC) stay. Why VLC resets at the live edge, and
+  what a viewer sees at a reset, are VLC's side and stay under "Not
+  determined" in the notes. Follow-ups: the PCR lead, low frame rates in
+  VLC 3 and NVENC reference B-frames, below.
+- **PCR lead (`internal/ts/mux.go`, `pcrOffset`, 700 ms today): proposal to
+  shorten it** (R-T7b'). A shorter lead feeds VLC 3 more video after a
+  live-edge reset: one cell at 400 ms gave 0 of 16 plays with the line on
+  pyramid rungs. Not changed in M4c (controller ruling): it changes every TS
+  output and narrows the A/V skew the mux tolerates, and one 16-play cell is
+  its only evidence. Weigh those costs, and measure more cells, before
+  taking it.
+- **Low frame rates in VLC 3** (R-T7b'). At 15 fps with shipping settings
+  (`b-pyramid=none`, the audio hold on) every VLC 3 play resets its clock
+  once, at about 6 s, and logs "buffer deadlock prevented" (16 of 16 plays),
+  since only 4 to 6 packets are fed against the 8 needed; at that reset the
+  dump instance also logs about 5 pictures too late to be displayed, 544 to
+  833 ms late. What a viewer sees there was not observed (no display
+  capture). `TestM4bMatrix`'s 15 and 10 fps rows have no VLC play, and a VLC
+  row there would fail on the line today. The lever on our side is the PCR
+  lead above.
+- **NVENC reference B-frames (`b_ref_mode`), once R-T7b' is understood.**
+  NVENC rungs run `b_ref_mode=disabled` always (R-C3), NVENC's analogue of
+  `b-pyramid=none`: reference B-frames raise the announced reorder depth as
+  the pyramid does, and depth 2 needs one packet more than VLC 3's
+  live-edge re-buffer feeds at 25 fps. R-T7b''s cause is known; what is not
+  is a margin that would admit depth 2 (the PCR lead and low frame rates,
+  above), and `b_ref_mode` itself was not measured. Turning it on gives back
+  NVENC's efficiency on cards that have it, and needs the VLC rows
+  (`TestM4aVLC`, `TestM4bPlayers`, `TestM4cNVENCRecordedVLC`) and a ruling
+  on R-C11's depth limit.
+- **Full-GPU transcode path** (R-C2). cuvid decode → `scale_cuda` →
+  `h264_nvenc`, with `overlay_cuda`, so the decode, the scalers and the
+  per-rung upload leave the CPU and the bus. It needs a watermark that
+  renders on the GPU, and thumbnails taken from GPU frames.
+- **Operator fonts for the watermark** (R-C7). Text renders only with the
+  embedded DejaVu Sans, so glyphs outside it (CJK, Arabic shaping) are empty
+  boxes. Let an operator pick a font from the asset library (M5's API in
+  front of the same directory).
+- **A fallback to libx264 can overload a host sized for NVENC** (R-C4):
+  export `EncoderFallbacks` and let a stream refuse the fallback (M5). Today
+  the overflow silently pays CPU for every rung that fell back, and
+  `Stats.Child.EncoderFallbacks` and the child's warning are the only
+  signals.
 - **Transcoder: drop and count a persistently failing audio track instead of
   failing the pipeline.** An audio track the child cannot decode (or encode)
   makes the child exit; it is respawned and fails again, so one bad track
@@ -923,7 +1243,9 @@ Items accepted for later, not yet placed in a milestone:
 - **Timing-sensitive tests to watch in CI**: `TestSRTOpenContextAbortsListener`,
   `TestSRTLossyLink` (299 of 300 video frames) and `TestM3b2SteadyState`'s UDP
   player (273 of 275 video frames, 0 RTP lost) each failed once locally, only
-  under soak load, and passed alone and in CI.
+  under soak load, and passed alone and in CI. `TestShotsFromAudioOnlyChild`'s
+  respawn row (M4c, `internal/transcode`) compares two paced runs, so it is
+  a flake risk under load; it has not failed yet.
 - **`TestFailoverSearchSkipsRunningProbe` flake** (internal/pipeline, from
   M2a): about 1–2 % under parallel race load (7 of 320), before and after the
   arm fix; `stepTo` (failback_test.go) syncs with `Run` only by waiting for
@@ -966,13 +1288,16 @@ Items accepted for later, not yet placed in a milestone:
   hold from it, bound the encoder's delay at low frame rates
   (`rc-lookahead`, `sync-lookahead`), or delay the copy rung by the
   measured lag instead of holding it.
-- **ABR: the presentation waits up to 8 s for a new epoch's rungs** (M4b
-  final review, C1; ruled). A new epoch's first frame waits 4 × `MergeHold`
-  of wall time for the encoded rungs announced for it, since no lag is
-  known yet and a 10 fps encoder needs 3 s. A respawned child that says
-  Hello and is fed but never delivers therefore stalls the presentation
-  for 8 s (2 s before) before the copy rung opens the epoch. Fix if it
-  matters: start from the last epoch's measured lag.
+- **ABR: the presentation waits up to 8 s for the first epoch's rungs**
+  (M4b final review, C1; ruled; narrowed in M4c). Since M4c a new epoch's
+  first frame waits 1.5 × the lag learned in an earlier epoch (§3.5), so
+  only an epoch with no lag learned before it waits the full 4 × `MergeHold`
+  of wall time for the encoded rungs announced for it: the first epoch of a
+  run, or one after every earlier track's lag was pruned, since a 10 fps
+  encoder needs 3 s. A child that says Hello and is fed but never delivers
+  in that epoch stalls the presentation for 8 s before the copy rung opens
+  it. Fix if it matters: have the child report its encoder delay in Hello
+  and size the first hold from it.
 - **Low-fps A/V interleave in the rendition hubs** (M4b final review). The
   rendition mergers keep the fixed `MergeHold` (M4a is frozen). Where an
   encoded rung trails its audio by 2 s or more of stream time (15 fps and
@@ -1047,6 +1372,29 @@ Items accepted for later, not yet placed in a milestone:
   S@d by 96 ms for video and 80 ms for audio, explain the jump, and run it
   against a seamless source); otherwise the soak's GStreamer clients use
   HLS. VLC 3.0.20 and ffprobe play the same output.
+- **libx264 output varies between runs of the same input** (M4c Task 10).
+  Two transcodes of the same clip gave byte-identical t180 frames in
+  150 of 150 in one run and 5 to 60 of 150 in others, with every PTS, DTS,
+  key flag and epoch equal and the decoded pictures within a mean difference
+  of 0.94. libx264 is meant to repeat its output for the same input and
+  settings with threads (its `non-deterministic` option is off), so the
+  encoder's input may vary between runs (the decoder, the scaler or side
+  data). `TestM4cFrozen` and the native rung tests compare encoded rungs by
+  timing exactly and by decoded picture within 4 of 255 for that reason.
+  Find what varies; a deterministic path would let them compare bytes.
+- **Thumbnails read BT.709 sources with the BT.601 matrix** (M4c Task 6).
+  The shot scaler converts the range to full but keeps the source's YUV
+  samples, and a JPEG (JFIF) is decoded with the BT.601 matrix, so an HD
+  (BT.709) source's thumbnail has a slight hue shift. Fix: convert the
+  matrix in the scaler (`sws_setColorspaceDetails` with the frame's colour
+  space as source and BT.601 as destination).
+- **`make test-nvenc`: shared mode and the refusal guard** (M4c Task 11).
+  `OS_NVENC_SHARED=1` (warn instead of refusing when other NVENC sessions
+  exist; session assertions become "rose by 3") is untested. The refusal is
+  the script's: a plain `go test` of the NVENC scenarios on the GPU host
+  bypasses it and opens up to 3 sessions next to whatever runs there. Add an
+  opt-in environment gate to the NVENC tests themselves if the soak ever
+  uses NVENC.
 
 #### M3b3 deferred minors
 
