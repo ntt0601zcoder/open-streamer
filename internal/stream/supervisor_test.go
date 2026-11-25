@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics/metricstest"
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/transcodetest"
@@ -1073,8 +1074,11 @@ func TestStatusRedacts(t *testing.T) {
 	require.Len(t, st.Inputs, 2)
 	require.Len(t, st.Pushes, 1)
 	require.Len(t, st.Outputs.Push, 1)
+	// The ID is keyed per process: compared with this process's, and not
+	// the plain hash of the URL.
+	assert.Equal(t, pushID(pushURL), st.Pushes[0].ID)
 	sum := sha256.Sum256([]byte(pushURL))
-	assert.Equal(t, hex.EncodeToString(sum[:])[:8], st.Pushes[0].ID)
+	assert.NotEqual(t, hex.EncodeToString(sum[:])[:8], st.Pushes[0].ID)
 	assert.Regexp(t, `^[0-9a-f]{8}$`, st.Pushes[0].ID)
 	assert.Contains(t, st.Pushes[0].Target, sink.Addr)
 	assert.Contains(t, st.Inputs[0], "cam.test")
@@ -1160,4 +1164,18 @@ func TestSupervisorShot(t *testing.T) {
 			assert.Nil(t, s.Status().Transcoder)
 		})
 	}
+}
+
+// TestPushIDIsKeyed: the label is the same for the same URL within the
+// process, differs between URLs, and is not the plain hash of the URL,
+// which holds a stream key.
+func TestPushIDIsKeyed(t *testing.T) {
+	const url = "rtmp://h/live/secretkey"
+	id := pushID(url)
+	assert.Regexp(t, `^[0-9a-f]{8}$`, id)
+	assert.Equal(t, id, pushID(url))
+	assert.NotEqual(t, id, pushID(url+"2"))
+	sum := sha256.Sum256([]byte(url))
+	assert.NotEqual(t, hex.EncodeToString(sum[:4]), id, "unkeyed")
+	assert.Equal(t, hex.EncodeToString(redact.Tag([]byte(url))[:4]), id)
 }

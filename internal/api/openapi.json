@@ -3,7 +3,7 @@
   "info": {
     "title": "Open Streamer API",
     "version": "1",
-    "description": "The REST API of Open Streamer: the streams, the config editor, the reload and the status documents. Every route but /healthz needs HTTP Basic credentials of a user in the config file; a viewer reads, an editor reads and writes (x-role on each operation). Every response has Cache-Control: no-store (the thumbnail: no-cache) and X-Content-Type-Options: nosniff. A request no route answers gets a plain-text 404 or 405, without authentication. The editor also has net/http/pprof under /debug/pprof/."
+    "description": "The REST API of Open Streamer: the streams, the config editor, the reload and the status documents. Every route but /healthz needs HTTP Basic credentials of a user in the config file; a viewer reads, an editor reads and writes (x-role on each operation). A viewer's ?secrets=1 is 403 on every authenticated route, not only on the stream routes. Every response has Cache-Control: no-store (the thumbnail: no-cache) and X-Content-Type-Options: nosniff. A request no route answers gets a plain-text 404 or 405, without authentication. The editor also has net/http/pprof under /debug/pprof/."
   },
   "security": [
     {
@@ -808,7 +808,7 @@
     },
     "headers": {
       "ETag": {
-        "description": "The entity tag of the document, for If-Match and If-None-Match.",
+        "description": "The entity tag of the document, for If-Match and If-None-Match. A stream's tag is keyed per process: it changes when the server restarts.",
         "schema": {
           "type": "string"
         }

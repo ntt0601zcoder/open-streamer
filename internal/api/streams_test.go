@@ -395,7 +395,9 @@ func TestPutRejectsMaskedSecrets(t *testing.T) {
 	require.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
 	doc := errOf(t, rec)
 	assert.Equal(t, codeInvalidConf, doc.Code)
-	require.Len(t, doc.Errors, 1)
+	// The API refuses it before the Backend's Validate would: one error
+	// per masked URL.
+	require.Len(t, doc.Errors, 2)
 	assert.Contains(t, doc.Errors[0], "redaction mask")
 
 	rec = e.do(http.MethodGet, "/api/v1/streams/cam?secrets=1", editor...)
@@ -455,4 +457,43 @@ func TestStatusAndThumbnail(t *testing.T) {
 	assert.Equal(t, codeNotFound, errOf(t, rec).Code)
 	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
 	assert.Equal(t, http.StatusNotFound, e.do(http.MethodGet, "/api/v1/streams/nope/thumbnail.jpg", viewer...).Code)
+}
+
+// TestAPIRefusesMaskedSecrets: the API refuses a masked document itself,
+// with a Backend that would store anything.
+func TestAPIRefusesMaskedSecrets(t *testing.T) {
+	e := newEnv(t)
+	rec := e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, jsonBody(secretSpec))...)
+	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+	rec = e.do(http.MethodGet, "/api/v1/streams/cam", editor...)
+	require.Equal(t, http.StatusOK, rec.Code)
+	redacted := bytes.Clone(rec.Body.Bytes())
+	var doc spec.Stream
+	require.NoError(t, json.Unmarshal(redacted, &doc))
+
+	e.be.reset()
+	rec = e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, body("application/json", redacted))...)
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
+	got := errOf(t, rec)
+	assert.Equal(t, codeInvalidConf, got.Code)
+	// spec.Validate's own words for the first, and one per masked URL.
+	assert.Equal(t, doc.Validate().Error(), got.Errors[0])
+	assert.Equal(t, []string{
+		"spec: validate: inputs[0].url: holds the redaction mask, not the secret; send the real value",
+		"spec: validate: outputs.push[0].url: holds the redaction mask, not the secret; send the real value",
+	}, got.Errors)
+	assert.Empty(t, e.be.callList(), "the backend is not asked")
+	assert.Empty(t, rec.Header().Get("ETag"))
+
+	// Only the push masked: still refused. With ?secrets=1 too.
+	for _, target := range []string{"/api/v1/streams/cam", "/api/v1/streams/cam?secrets=1", "/api/v1/streams/new"} {
+		rec = e.do(http.MethodPut, target, with(editor, jsonBody(
+			`{"inputs":[{"url":"udp://239.0.0.1:5000"}],"outputs":{"push":[{"url":"`+doc.Outputs.Push[0].URL+`"}]}}`))...)
+		require.Equal(t, http.StatusUnprocessableEntity, rec.Code, target)
+		assert.Len(t, errOf(t, rec).Errors, 1)
+	}
+	assert.Empty(t, e.be.callList())
+	stored, _ := e.be.Get("cam")
+	assert.Equal(t, "rtsp://u:hunter2@h/a", stored.Inputs[0].URL)
+	assert.Equal(t, "rtmp://h/live/secretkey", stored.Outputs.Push[0].URL)
 }

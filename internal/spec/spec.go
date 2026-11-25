@@ -2,7 +2,6 @@ package spec
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -151,9 +150,13 @@ func (s Stream) Redacted() Stream {
 	return c
 }
 
-// ETag is the document's entity tag: `"` + the first 16 hex digits of the
-// SHA-256 of its JSON + `"`. Nil and empty slices are encoded alike, so
-// documents that Diff finds equal have equal ETags.
+// ETag is the document's entity tag: `"` + the first 16 hex digits of
+// redact.Tag of its JSON + `"`. Nil and empty slices are encoded alike, so
+// documents that Diff finds equal have equal ETags. The tag is keyed with
+// a key that is random per process, because a viewer gets it beside the
+// redacted document and must not be able to test guesses of the secrets
+// against it; so it is the same for the same document within one process,
+// and changes when the server restarts.
 func (s Stream) ETag() string {
 	b, err := json.Marshal(s.normal())
 	if err != nil {
@@ -161,8 +164,7 @@ func (s Stream) ETag() string {
 		// pointers to structs of those, which always encode.
 		panic(fmt.Sprintf("spec: etag: %v", err))
 	}
-	sum := sha256.Sum256(b)
-	return `"` + hex.EncodeToString(sum[:8]) + `"`
+	return `"` + hex.EncodeToString(redact.Tag(b)[:8]) + `"`
 }
 
 // Served returns the names the stream is served under (R-D3): its name,

@@ -1,6 +1,9 @@
 package redact
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -112,4 +115,34 @@ func TestMasked(t *testing.T) {
 	assert.True(t, Masked("rtsp://user:xxxxx@host/a"))
 	assert.True(t, Masked("rtmp://h/app/abxxxxx"))
 	assert.False(t, Masked("http://[::1"), "an invalid URL")
+}
+
+func TestTag(t *testing.T) {
+	a := Tag([]byte("rtmp://h/live/secretkey"))
+	if len(a) != sha256.Size {
+		t.Fatalf("a tag of %d bytes", len(a))
+	}
+	if !bytes.Equal(a, Tag([]byte("rtmp://h/live/secretkey"))) {
+		t.Error("not a pure function of its input within one process")
+	}
+	if bytes.Equal(a, Tag([]byte("rtmp://h/live/secretkez"))) {
+		t.Error("two values, one tag")
+	}
+	// Keyed: not the plain hash, which a guess could be tested against.
+	if plain := sha256.Sum256([]byte("rtmp://h/live/secretkey")); bytes.Equal(a, plain[:]) {
+		t.Error("the tag is the unkeyed SHA-256")
+	}
+	if !bytes.Equal(Tag(nil), Tag([]byte{})) {
+		t.Error("nil and empty differ")
+	}
+	// The key is made once: tags from many goroutines agree.
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			if !bytes.Equal(a, Tag([]byte("rtmp://h/live/secretkey"))) {
+				t.Error("a different key")
+			}
+		})
+	}
+	wg.Wait()
 }

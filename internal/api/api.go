@@ -285,8 +285,9 @@ func methodLabel(m string) string {
 }
 
 // ServeHTTP is the outer wrapper: it counts and logs every request, turns a
-// panic into a 500, and runs the request in the order the package
-// documentation gives.
+// panic into a 500, or, once a part of the answer is written, into an
+// aborted connection (http.ErrAbortHandler), and runs the request in the
+// order the package documentation gives.
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := a.now()
 	rec := &recorder{ResponseWriter: w, code: http.StatusOK}
@@ -294,10 +295,15 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route := unmatched
 	defer func() {
 		v := recover()
-		if v != nil && v != http.ErrAbortHandler { //nolint:errorlint // a panic value, compared as net/http does
+		abort := v == http.ErrAbortHandler //nolint:errorlint // a panic value, compared as net/http does
+		if v != nil && !abort {
 			a.log.Error("api: panic", "route", route,
 				"panic", logging.Scrub(fmt.Sprint(v)), "stack", string(debug.Stack()))
-			if !rec.wrote {
+			if rec.wrote {
+				// A part of an answer is out already: the connection is
+				// aborted, so that it does not end as a whole answer.
+				abort = true
+			} else {
 				writeError(rec, http.StatusInternalServerError, codeInternal, msgInternal, nil)
 			}
 		}
@@ -313,8 +319,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			attrs = append(attrs, "user", info.user)
 		}
 		a.log.Info("api: request", attrs...)
-		if v == http.ErrAbortHandler { //nolint:errorlint // as above
-			panic(v)
+		if abort {
+			panic(http.ErrAbortHandler)
 		}
 	}()
 

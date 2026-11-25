@@ -2,12 +2,18 @@ package spec
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
 
 // full is a valid document that uses every part of the spec.
@@ -164,4 +170,42 @@ func TestYAMLTagsEqualJSONTags(t *testing.T) {
 	} {
 		assert.True(t, seen[typ], "%s was not walked", typ.Name())
 	}
+}
+
+// TestETagIsKeyedAndFollowsDiff: the tag is a pure function of the
+// document within the process, equal exactly when Diff finds no change, and
+// not the plain hash of the document, which a reader of the redacted
+// document could test guesses of its secrets against.
+func TestETagIsKeyedAndFollowsDiff(t *testing.T) {
+	base := full()
+	variants := map[string]Stream{"the same": full()}
+	empty := full()
+	empty.Layout, empty.Outputs.Push = []string{}, []Push{}
+	none := full()
+	none.Layout, none.Outputs.Push = nil, nil
+	variants["empty slices"], variants["nil slices"] = empty, none
+	reordered := full()
+	slices.Reverse(reordered.Outputs.Push)
+	variants["pushes reordered"] = reordered
+	secret := full()
+	secret.Inputs[0].URL = "rtsp://u:pw2@h/a"
+	variants["another password"] = secret
+	off := full()
+	off.Outputs.HLS = !off.Outputs.HLS
+	variants["an output"] = off
+
+	for name, a := range variants {
+		for other, b := range variants {
+			same := Diff(a, b) == ChangeNone
+			assert.Equal(t, same, a.ETag() == b.ETag(), "%s and %s", name, other)
+		}
+		assert.Equal(t, a.ETag(), a.ETag(), name)
+	}
+	assert.NotEqual(t, base.ETag(), secret.ETag(), "the secret is part of the document")
+
+	b, err := json.Marshal(base.normal())
+	require.NoError(t, err)
+	sum := sha256.Sum256(b)
+	assert.NotEqual(t, `"`+hex.EncodeToString(sum[:8])+`"`, base.ETag(), "unkeyed")
+	assert.Equal(t, `"`+hex.EncodeToString(redact.Tag(b)[:8])+`"`, base.ETag())
 }

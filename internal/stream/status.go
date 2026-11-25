@@ -74,7 +74,7 @@ type Transcoder struct {
 
 // Push is the state of one push.
 type Push struct {
-	ID        string `json:"id"`     // the first 8 hex digits of sha256(URL): the metrics' target label
+	ID        string `json:"id"`     // the first 8 hex digits of a keyed tag of the URL (new at every start): the metrics' target label
 	Target    string `json:"target"` // redacted
 	State     string `json:"state"`
 	Connects  uint64 `json:"connects"`

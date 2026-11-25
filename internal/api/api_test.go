@@ -786,3 +786,46 @@ func TestRecorder(t *testing.T) {
 }
 
 type noFlush struct{ http.ResponseWriter }
+
+// TestPanicAfterTheHeader: a panic once a part of the answer is out aborts
+// the connection, so the client does not take a cut answer for a whole one.
+func TestPanicAfterTheHeader(t *testing.T) {
+	e := newEnv(t)
+	a, err := New(Options{
+		Backend: e.be, Users: func() *auth.Users { return e.users.Load() }, Limiter: e.lim,
+		Logger: slog.New(slog.NewJSONHandler(e.logs, nil)),
+		Metrics: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("# a part of the metrics\n"))
+			w.(http.Flusher).Flush()
+			panic("the collector broke: rtsp://u:hunter2@h/a")
+		}),
+	})
+	require.NoError(t, err)
+	e.api = a
+
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil)
+	r.SetBasicAuth("eye", viPass)
+	rec := httptest.NewRecorder()
+	assert.PanicsWithValue(t, http.ErrAbortHandler, func() { a.ServeHTTP(rec, r) })
+	assert.Equal(t, http.StatusOK, rec.Code, "the header was out already")
+	assert.NotContains(t, rec.Body.String(), "internal", "no error document after a part of the answer")
+	panics := e.logs.lines(t, "api: panic")
+	require.Len(t, panics, 1)
+	assert.Contains(t, panics[0]["panic"], "the collector broke")
+	assert.NotContains(t, e.logs.String(), "hunter2")
+	assert.Len(t, e.logs.lines(t, "api: request"), 1, "still logged")
+	assert.InDelta(t, 1, e.counter(requestsTotal, "route", "/metrics", "code", "200"), 0)
+
+	// Over a real connection the client gets an error, not a clean end.
+	srv := httptest.NewServer(a)
+	t.Cleanup(srv.Close)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/metrics", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth("eye", viPass)
+	res, err := srv.Client().Do(req)
+	if err == nil {
+		_, err = io.ReadAll(res.Body)
+		require.NoError(t, res.Body.Close())
+	}
+	require.Error(t, err, "the connection is aborted")
+}

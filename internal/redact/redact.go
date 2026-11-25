@@ -3,10 +3,38 @@
 package redact
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 )
+
+// tagKey is the key of Tag: random, made once per process, never exported
+// and never logged.
+var tagKey = sync.OnceValue(func() []byte {
+	k := make([]byte, sha256.Size)
+	if _, err := rand.Read(k); err != nil {
+		// crypto/rand never fails on a supported platform; without a key
+		// a tag would be an unkeyed hash of a secret.
+		panic("redact: crypto/rand failed: " + err.Error())
+	}
+	return k
+})
+
+// Tag returns the HMAC-SHA-256 of b under a key that is random per
+// process: a tag for a value that may hold a secret (a stream document, a
+// push URL) and that is shown to those who must not learn it. Within one
+// process it is a pure function of b, so equal values have equal tags;
+// without the key a guess of the secret cannot be tested against it. The
+// key is new at every start, so tags do not survive a restart.
+func Tag(b []byte) []byte {
+	m := hmac.New(sha256.New, tagKey())
+	m.Write(b)
+	return m.Sum(nil)
+}
 
 // mask replaces a hidden value.
 const mask = "xxxxx"

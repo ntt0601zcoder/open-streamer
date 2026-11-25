@@ -2,7 +2,6 @@ package stream
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,6 +16,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/rtmppush"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
@@ -54,11 +54,14 @@ type pushRun struct {
 	done   chan struct{}
 }
 
-// pushID is the label of a push target: the first 8 hex digits of the
-// SHA-256 of its URL, which shows nothing of the URL.
+// pushID is the label of a push target: the first 8 hex digits of
+// redact.Tag of its URL. The tag is keyed with a key that is random per
+// process, since the URL holds a stream key and the label is in the
+// metrics and the status: it shows nothing of the URL and no guess can be
+// tested against it. It is the same for the same URL within one process,
+// and changes when the server restarts.
 func pushID(url string) string {
-	sum := sha256.Sum256([]byte(url))
-	return hex.EncodeToString(sum[:4])
+	return hex.EncodeToString(redact.Tag([]byte(url))[:4])
 }
 
 // generation is one build of a stream: the source hub, the pipeline, the
