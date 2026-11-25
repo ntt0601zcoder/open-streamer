@@ -29,12 +29,12 @@
 |---|---|---|
 | R-B1 | The ABR presentation is one hub written by the transcoder: rendition i's video is track i (in `Options.Renditions` order), each source audio track a is track len(Renditions) + a. One packager packages it. Rejected: a manifest layer over the N rendition packagers, whose independent segmenters and losses can disagree on segment numbers and discontinuities (RFC 8216 §6.2.4) | One more merger per transcoder, and every rendition's bytes held a second time in the presentation's GOP cache and packager window |
 | R-B2 | osdev serves the presentation of stream `<name>` as `<name>_abr`, on HLS (TS and fMP4) and DASH only; RTMP, RTSP, SRT, HTTP-TS and `copy://` do not find it. The label `abr` is reserved. Product naming is M5's | M5 renames it; the M4b tests use the osdev name only through `packLookup` |
-| R-B3 | Alignment is made by the presentation's merger, not the segmenter: a keyframe barrier at every source main-video keyframe PTS K (+D), announced by the router before the keyframe goes to the child or the copy path. Rejected: a segmenter that cuts each video track at its own keyframe (review round 1: the first-arriving rung becomes the epoch's anchor, the hub's cache and loss resume start at the anchor's keyframe, and several held segments made the routing ambiguous) | The barrier waits at most MergeHold (2 s) for a late rung; past that, or for a rung without an IDR at K, that rung is left out of the segment (R-B8) and lists a gap |
+| R-B3 | Alignment is made by the presentation's merger, not the segmenter: a keyframe barrier at every source main-video keyframe PTS K (+D), announced by the router before the keyframe goes to the child or the copy path. Guaranteed for sources whose video keyframes are IDRs (closed GOP); an open-GOP copy rung's leading pictures land after the barrier, so its segments there do not decode on their own. Rejected: a segmenter that cuts each video track at its own keyframe (review round 1: the first-arriving rung becomes the epoch's anchor, the hub's cache and loss resume start at the anchor's keyframe, and several held segments made the routing ambiguous) | The barrier waits at most MergeHold (2 s) for a late rung; past that, or for a rung without an IDR at K, that rung is left out of the segment (R-B8) and lists a gap |
 | R-B4 | HLS-TS in ABR mode: one TS per segment per video track that has frames in it (that track plus every audio track), muxed with the video at track index 0 and audio at 1 + its rank among the window's known audio tracks, so every variant has the same PIDs. `hls/index.m3u8` is the multivariant playlist; `hls/v{track}.m3u8` lists one entry per segment, `{track}-{Seq}.ts`, or a `gap-{track}-{Seq}.ts` placeholder when the variant's video has no frames in the segment or its mux failed. MEDIA-SEQUENCE = first Seq. No combined TS is muxed. Continuity counters are per variant | TS bytes muxed N times; a client splicing variants sees a CC jump at each switch, which HLS clients reset at segment boundaries |
 | R-B5 | Variants are listed in rendition order. BANDWIDTH is the window's peak over segments of (variant video part bytes + default audio part bytes) × 8 / duration, as `buildMaster` does today; for TS, the variant TS's bytes. RESOLUTION is the largest over the window, as today. No AVERAGE-BANDWIDTH or FRAME-RATE | A player that starts on the first variant starts on rung 0; ABR heuristics lack the average |
-| R-B6 | DASH in ABR mode: video tracks with the same `media.Codec` share an AdaptationSet (`segmentAlignment="true"`), each Representation with its own SegmentTemplate (init, media, startNumber, timeline, presentationTimeOffset). Audio and non-ABR streams keep today's one-set-per-track layout | An H.265 copy rung among H.264 rungs gives two video sets, so a player switches only within one |
+| R-B6 | DASH in ABR mode: video tracks with the same `media.Codec` share an AdaptationSet, each Representation with its own SegmentTemplate (init, media, startNumber, timeline, presentationTimeOffset). The set says `segmentAlignment="true"` in a period only when every Representation's timeline there is identical (`t`, `d`). Part numbers stay per track (a gap cannot be expressed in a `$Number$` timeline), so after a gap the Representations' numbers differ by a constant. Audio and non-ABR streams keep today's one-set-per-track layout | ISO 23009-1 phrases alignment by segment number; a player that aligns by number rather than time (dash.js and Shaka align by time) would switch to the wrong segment after a gap. An H.265 copy rung among H.264 rungs gives two video sets |
 | R-B7 | The presentation hub's `GOPCacheFrames` is 1500 × (renditions + 1). The presentation's merger counts into `Stats.PresentationOut` and `Stats.PresentationDropped`, not `FramesOut` or `MergeDropped` | Memory: N rungs' GOP in one cache |
-| R-B8 | `segment.Options.AlignVideo`: in a segment that is not Forced, a video track other than the anchor whose first frame in the segment is not a keyframe with PTS equal to the segment's Start is left out of that segment; its frames until the next segment are dropped and counted in `Dropped`. Nothing else changes | A rung that misses the barrier (late beyond 2 s, lost by a slow subscriber, or with no IDR at K) shows a gap entry for one segment instead of a part that would not decode from its start |
+| R-B8 | `segment.Options.AlignVideo`, two rules. (1) *Leading video:* a segment opened by a video anchor before any segment of its epoch closed is leading, like the audio-anchored one today: when a lower video track arrives, the segment is taken back (`uncut`, its frames to the carry, where `openAt` keeps those with PTS ≥ the new Start) instead of cut. (2) *Late rung:* in a segment that is not Forced, a video track other than the epoch's anchor (`s.anchor`) enters the segment only at a keyframe with PTS equal to the segment's Start. Until it delivers a keyframe, its frames are dropped (`Dropped`); if its first keyframe in the segment has another PTS, the track is left out of the segment. A frame counts once actually added, after `place`'s post-loss drop and the carry filter | A rung that misses the barrier (beyond MergeHold, swallowed by a slow subscriber, or with no IDR at K) shows a gap entry for one segment, or a previous part cut short by the frames dropped, instead of a part that would not decode from its start |
 
 **Respawn and the anchor rung (known cost):** while the child respawns, the copy rung goes on in the old epoch but the anchor rung (rendition 0, encoded) is silent, so the presentation's segment closes only at the epoch change or MaxDuration. That segment can exceed the target and raise the shared TARGETDURATION, which never shrinks. Recorded in the Backlog by Task 8.
 
@@ -53,7 +53,7 @@ Each parallel task runs in its own worktree; the controller merges.
 ## Review Focus
 
 1. **A rung lagging or leading the anchor in decode order** (B-frames 3 on a copy rung, 2 on the encoded ones, or none): the presentation still delivers every pre-K frame before any IDR at K, and rung 0's IDR first. Task 2 tests both directions; Task 7's b-frames row proves it end to end.
-2. **One slow packager subscription** (`Lost`) in a presentation: one discontinuity, at the same media sequence number, in every variant; a rung whose IDR the loss swallowed lists a gap rather than a part that starts mid-GOP. Task 1 and Task 7's slow-consumer row test it.
+2. **One slow packager subscription** (`Lost`) in a presentation: one discontinuity, at the same media sequence number, in every variant; a rung whose IDR the loss swallowed lists a gap rather than a part that starts mid-GOP. Task 1 and Task 7's slow-consumer row test it. Known: after a resume the hub passes audio only once every live video track has delivered a keyframe, so a rung with no IDR at the resume point costs that subscriber up to a GOP of audio, without a `Lost`.
 3. **A respawned child**: the presentation gets exactly one new epoch, at one media sequence number in every variant. Task 7 tests it.
 4. **Switching variants at a segment boundary** decodes cleanly. Task 7 tests it with segments from alternating TS variants.
 5. **A late subscriber** to the presentation (the hub's GOP cache) gets every rung's IDR of the cached GOP, since rung 0's IDR, where the cache starts, comes first. Task 2 tests it.
@@ -76,14 +76,21 @@ func TestAlignVideoBarrierOrder(t *testing.T)
 // AlignVideo, tracks 0..2, GOP 1 s, target 2 s, arrival as the barrier delivers it (all pre-K frames,
 // then IDR_0, IDR_1, IDR_2, then the rest by DTS): every segment holds, per track, a run starting with
 // its keyframe at seg.Start; Dropped() == 0. The same frames with AlignVideo off give identical segments.
-func TestAlignVideoLeavesOutLateTrack(t *testing.T)
-// track 2's frames 2 behind (its pre-K frames arrive after IDR_0(K)): each segment cut at such a K has
-// no track-2 frame; Dropped() counts them; the next segment where track 2 starts on its keyframe at Start keeps it.
-func TestAlignVideoAfterLost(t *testing.T)
-// a Lost delivery on IDR_0(K) whose group lost IDR_1(K): the segment opened at K has no track-1 frame;
-// the next segment has track 1 from its keyframe.
+func TestAlignVideoLateTrackAtOneCut(t *testing.T)
+// at one K only, track 2's last 2 pre-K frames arrive after IDR_0(K): they are dropped (Dropped() == 2),
+// track 2 enters the new segment at its IDR at Start; every other segment is untouched.
+func TestAlignVideoLeadingRungTakenBack(t *testing.T)
+// a new epoch whose first video frame is IDR_2(K) then IDR_0(K), IDR_1(K): one segment opens at K with
+// anchor 0 and holds all three tracks from their IDRs; Seq has no hole; no one-frame segment.
+func TestAlignVideoResumeOnHigherTrack(t *testing.T)
+// a Lost delivery on IDR_2(K) (the hub resumes track 2 first): nothing opens until IDR_0's next keyframe
+// K2; the segment at K2 holds every track from its keyframe at K2.
+func TestAlignVideoTrackResumesLate(t *testing.T)
+// after a Lost, track 1's first keyframe in the segment opened at K is at K+GOP (< K+Target): track 1 is
+// left out of that segment and present in the next.
 func TestAlignVideoMissingKeyframe(t *testing.T)
-// track 1 has no keyframe at K=180000: that segment has no track-1 frame; the following one has.
+// track 1 has no keyframe at K=180000 (its next is K+GOP, inside the segment): that segment has no track-1
+// frame; the following one has.
 func TestAlignVideoForcedSegmentKeepsAll(t *testing.T)
 // GOP 20 s, MaxDuration 10 s: Forced segments keep every track's frames, as with AlignVideo off.
 func TestAlignVideoAudioUntouched(t *testing.T)
@@ -91,7 +98,7 @@ func TestAlignVideoAudioUntouched(t *testing.T)
 ```
 
 - [ ] **Step 2: Run** `go test -race -count=1 -run 'TestAlignVideo' ./internal/segment/` — compile failure.
-- [ ] **Step 3: Implement** R-B8: per open segment, the set of non-anchor video tracks left out; decided at the track's first frame in the segment.
+- [ ] **Step 3: Implement** R-B8: the leading-video uncut, and per open segment each non-anchor video track's state (waiting, in, out).
 - [ ] **Step 4: Run** `go test -race -count=1 ./internal/segment/` — all pass.
 - [ ] **Step 5: Commit** `feat(segment): leave out a video track that misses the segment's start`
 
@@ -106,11 +113,13 @@ func TestAlignVideoAudioUntouched(t *testing.T)
 
 The presentation merger gets the same frames as the rendition mergers, each copied with `Track` relabelled: a rendition's video (child rung or copy path) to `PresentationTrack(i)`, audio once to `PresentationAudioTrack`. Anchors come from the shared `anchorStore`. `expectVideo` also announces the relabelled tracks of every encoded rendition. Hub option `GOPCacheFrames: 1500 * (len(Renditions)+1)`.
 
-**Barrier.** The router calls `barrier(epoch, K)` for every source main-video keyframe it routes (K after the D shift), before the frame goes to the child or the copy path; only the presentation merger keeps barriers. Each frame gets an order key at push:
-- video: `b` = the number of barriers of its epoch its track has passed; a keyframe whose PTS is a barrier not yet passed by its track passes it (phase 0, ordered by track); a non-keyframe with PTS above the track's next unpassed barrier passes it too (a rung without an IDR at K: phase 1), so keys never block other tracks;
+**Barrier.** The router calls `barrier(epoch, K)` for every source main-video keyframe it routes (K after the D shift), before the frame goes to the child or the copy path; only the presentation merger keeps barriers. Barriers get absolute sequence numbers per epoch (1, 2, …, kept with a base offset when old ones are pruned). Each frame gets an order key at push:
+- video: `b` = the largest barrier sequence its track has passed. A keyframe whose PTS equals an unpassed barrier passes it and every lower one (phase 0, ordered by track). A non-keyframe whose PTS is above unpassed barriers passes the highest of them below its PTS (a rung without an IDR at K: phase 1), so a track never falls behind for the rest of the epoch;
 - every other video frame: phase 1, ordered by DTS;
-- audio: `b` = the number of barriers of its epoch at or below its PTS when pushed, phase 1, ordered by DTS.
-Frames are released in (epoch, b, phase, track for phase 0 | DTS for phase 1) order, under the merger's existing wait-for-expected-tracks rule and MergeHold. Per track the key never decreases, so the existing rule stays correct. Barriers below the last released key are pruned.
+- audio: `b` = the largest barrier sequence at or below its PTS when pushed (never below the track's previous `b`), phase 1, ordered by DTS.
+Frames are released in (epoch, b, phase, track for phase 0 | DTS for phase 1) order, under the merger's existing wait-for-expected-tracks rule and MergeHold. Per track the key never decreases, so the existing rule stays correct.
+
+**Start and new epochs.** Two changes make rung 0's IDR the first video frame of every presentation epoch: (a) `router.send` announces the encoded tracks (`expectChildVideo`) before it pushes the copy video, for every merger (rendition mergers are unaffected: copy video never reaches an encoded rendition's merger); (b) in the presentation merger only, when the candidate frame is in an epoch above the hub's current one, `missing()` waits for that epoch's expected tracks (`seen[candidate.Epoch]`), within MergeHold. The segmenter's leading-video rule (R-B8 (1)) covers what MergeHold lets through.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -121,6 +130,12 @@ func TestMergerBarrierLaggingTrack(t *testing.T)
 func TestMergerBarrierLeadingTrack(t *testing.T)   // track 2 leads by 2 frames: same order
 func TestMergerBarrierMissingIDR(t *testing.T)
 // track 1 has no IDR at K: tracks 0 and 2 are not held past their own frames; nothing waits for MergeHold.
+func TestMergerBarrierPruneKeepsOrder(t *testing.T)
+// 50 barriers with pruning: audio and video keys never decrease per track; a track that skipped barrier 3
+// (no IDR) is ordered with the others again from barrier 4.
+func TestPresentationStartsOnRungZero(t *testing.T)
+// run start and a fake-child respawn, copy rung present: the presentation's first video frame of each epoch
+// is track 0's IDR, followed by the other tracks' IDRs at the same PTS.
 func TestMergerBarrierHoldRunsOut(t *testing.T)
 // track 1 silent: after MergeHold the others are released (fake clock), as the M4a hold tests do.
 func TestPresentationOff(t *testing.T)            // Presentation() == nil; the rendition mergers keep no barrier
@@ -149,8 +164,8 @@ func TestPresentationStats(t *testing.T)           // PresentationOut counts its
 - Produces: `RuleVariantAlignment = "variant-aligned"`, `RuleVariantBandwidth = "variant-bandwidth"`.
 
 Rules:
-- **variant-aligned, HLS** (only with `AlignedSequences`): for each media sequence number with a real (non-gap) entry in two or more playlists that carry video, the PTS of each entry's first video frame in decode order (its keyframe) is equal, exactly, in 90 kHz.
-- **variant-aligned, DASH:** in each period, for an AdaptationSet with `segmentAlignment="true"` and two or more Representations, no segment of one Representation contains another's segment start strictly inside it, over their common span (ISO 23009-1 segment alignment). Missing segments are allowed.
+- **variant-aligned, HLS** (only with `AlignedSequences`): for each media sequence number with a real (non-gap) entry in two or more playlists that carry video, the PTS of each entry's first video frame in decode order is equal, exactly, in 90 kHz; an msn is compared only when every compared entry starts with a keyframe (Forced segments do not).
+- **variant-aligned, DASH:** in each period, for an AdaptationSet with `segmentAlignment="true"` and two or more Representations, the Representations list the same segments: equal resolved timelines (`t`, `d`, in 90 kHz) over the period. `$Number$` may differ by a constant (R-B6).
 - **variant-bandwidth, HLS** (only with `AlignedSequences`): for each variant, the measured peak over media sequence numbers of Σ(bytes × 8 / EXTINF) over its own playlist and its audio group's DEFAULT rendition playlist does not exceed 1.1 × the largest BANDWIDTH any master read gave that variant URI.
 - Each rule reports once per pair of playlists or Representations (as `b.once`).
 
@@ -161,7 +176,8 @@ func TestVariantAlignedHLS(t *testing.T)         // two TS variants, equal start
 func TestVariantMisalignedHLS(t *testing.T)      // variant B's segment 3 starts 3600 later: one RuleVariantAlignment
 func TestVariantAlignedIgnoresGaps(t *testing.T)  // B has a gap at msn 2: no violation
 func TestVariantAlignedOpenGOP(t *testing.T)      // B's segment carries leading pictures below its keyframe's PTS: no violation
-func TestVariantAlignedDASH(t *testing.T)         // 2 reps, equal timelines: none; rep 2 missing one segment: none; rep 2 shifted 3600: one
+func TestVariantAlignedSkipsForced(t *testing.T)   // entries not starting with a keyframe are not compared
+func TestVariantAlignedDASH(t *testing.T)         // 2 reps, equal timelines (startNumbers differing): none; rep 2 missing one segment: one; same with segmentAlignment absent: none; rep 2 shifted 3600: one
 func TestVariantBandwidth(t *testing.T)           // BANDWIDTH below 1/1.1 of the measured peak: one RuleVariantBandwidth; at the peak: none
 ```
 
@@ -195,6 +211,9 @@ func TestABRMasterNonABRUnchanged(t *testing.T)
 func TestABRMPD(t *testing.T)
 // one video AdaptationSet with 3 Representations (ids "0","1","2", width/height, codecs), segmentAlignment,
 // per-Representation SegmentTemplate whose timelines are equal; one audio set as before.
+func TestABRMPDGapDropsAlignment(t *testing.T)
+// track 1 left out of one segment: in that period the set has no segmentAlignment; rep 1's timeline lacks that
+// segment and its media numbers still resolve to served parts.
 func TestABRMPDTwoCodecs(t *testing.T)
 // tracks 0,1 H.264 and 2 H.265: two video sets.
 func TestABRMPDFFprobe(t *testing.T)
@@ -227,8 +246,8 @@ func TestABRTSVariants(t *testing.T)
 // answers 200, starts with PAT/PMT, video PID 0x100 in every variant, first video PES is a keyframe
 // at the segment's Start.
 func TestABRTSMuxFailureLeavesGap(t *testing.T)
-// one segment whose track-1 frames carry a Config the TS muxer rejects (a codec without a stream type,
-// mux.go streamType): v1 lists gap-1-{seq}.ts there; v0, v2 real; Errors() == 1.
+// one track-1 video frame with empty Data in one segment (the TS muxer rejects it, mux.go "video frame has no
+// data"): v1 lists gap-1-{seq}.ts there; v0, v2 real; Errors() counts the TS failure (and CMAF's, asserted separately).
 func TestABRTSNoCombinedTS(t *testing.T)  // SegmentInfo.TS nil, {seq}.ts answers 404 in ABR mode
 func TestABRTSConform(t *testing.T)
 // conform.ReadHLS(hls/index.m3u8, AlignedSequences, Once) over a served ABR packager: no violation,
@@ -249,7 +268,7 @@ func TestABRTSConform(t *testing.T)
 **Interfaces:**
 - Consumes: `transcode.Options.Presentation`, `Transcoder.Presentation()` (Task 2); `live.Options.ABR` (Task 4).
 
-Every stream with `-rung` gets `transcode.Options.Presentation: true`; its presentation is packaged with `live.Options{ABR: true}` and found by `packLookup` as `<name>_abr` only. The RTMP, RTSP, SRT, HTTP-TS lookups and `copy://` resolution do not find it. `parseRung` rejects the label `abr`; a stream named `<name>_abr` that already exists is an error, as for renditions. The usage text and package doc name the presentation.
+Every stream with `-rung` gets `transcode.Options.Presentation: true`; its presentation is packaged with `live.Options{ABR: true}` through a subscription of `subQueue × (renditions + 1)` and found by `packLookup` as `<name>_abr` only. The RTMP, RTSP, SRT, HTTP-TS lookups and `copy://` resolution do not find it. `parseRung` rejects the label `abr`; a stream named `<name>_abr` that already exists is an error, as for renditions. The usage text and package doc name the presentation.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -295,12 +314,14 @@ func TestM4bMatrix(t *testing.T)
 //                  Lost > 0, no violation, every variant's discontinuities at equal msn (completeness not asserted)
 //   no-bframes, b-frames: no violation; presentation track i's frames equal rendition i's video frames of the same run
 func TestM4bSwitchTS(t *testing.T)
-// fetch segment n from variant n%4 of hls/index.m3u8 for every listed n into files, list them for
+// fetch segment n from variant n%4 of hls/index.m3u8 (the next variant with a real entry when that one is a
+// gap; at least 3 distinct variants used) for every listed n into files, list them for
 // ffmpeg's concat demuxer and decode with `ffmpeg -v error -f concat -safe 0 -i list -f null -`: exit 0,
 // empty stderr; ffprobe on the same list: video frame PTS strictly increase.
 func TestM4bRespawn(t *testing.T)
-// kill the child once mid-run (as TestM4aRespawn): the presentation has exactly 2 epochs, and in hls-ts,
-// hls-fmp4 and dash every variant has its one discontinuity at the same msn / a second period.
+// h264_aac.ts fed once at its pace, the child killed once after its 3rd output keyframe (TestM4aRespawn's
+// kill helper): the presentation's epochs are [1 2]; in hls-ts and hls-fmp4 every variant has exactly one
+// discontinuity, at the same msn; the MPD has 2 periods, each with the 4 video Representations.
 ```
 
 - [ ] **Step 2: Run** `make test-transcode` scoped: `OS_TRANSCODER=$PWD/dist/ostranscoder-amd64/ostranscoder go test -race -count=1 -run 'TestM4b' ./internal/e2e/` — pass.
@@ -324,5 +345,5 @@ func TestM4bPlayers(t *testing.T)
 
 - [ ] **Step 2: Run** on the host and in `make test-ci-peers` — pass.
 - [ ] **Step 3: CI:** add `TestM4bMatrix TestM4bRespawn` to `E2E_TESTS` of `transcode-e2e-arm64` (the switch and players tests need ffmpeg/VLC peers that job lacks; they run in `test`).
-- [ ] **Step 4: Spec:** in `docs/REBUILD_PLAN.md`: §3.4 a bullet "ABR presentation (M4b)" with R-B1, R-B3, R-B4, R-B6 and R-B8 as rules; §3.5 the presentation hub; §5 row M4b → done with this plan's link and the tests that prove it; an "Out of M4b" table (AVERAGE-BANDWIDTH and FRAME-RATE; I-frame playlists; several audio languages; ABR over RTMP/RTSP/SRT/HTTP-TS; LL-HLS); Backlog: the respawn segment that can raise TARGETDURATION (see Rulings), and a rung's extra x264 IDR at `keyint=600` that is not a barrier (harmless: not a cut point).
+- [ ] **Step 4: Spec:** in `docs/REBUILD_PLAN.md`: §3.4 a bullet "ABR presentation (M4b)" with R-B1, R-B3, R-B4, R-B6 and R-B8 as rules; §3.5 the presentation hub; §5 row M4b → done with this plan's link and the tests that prove it; an "Out of M4b" table (AVERAGE-BANDWIDTH and FRAME-RATE; I-frame playlists; several audio languages; ABR over RTMP/RTSP/SRT/HTTP-TS; LL-HLS); Backlog: the respawn segment that can raise TARGETDURATION (see Rulings), and rung 0's extra x264 IDR at `keyint=600` (a source GOP above 600 frames), which cuts the presentation where the other rungs have no keyframe, so R-B8 leaves them out of that segment.
 - [ ] **Step 5: Commit** `docs: M4b done` and `ci: run the M4b scenarios on arm64`
