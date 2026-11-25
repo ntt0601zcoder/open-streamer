@@ -62,7 +62,9 @@ type Rung struct {
 // stream time and at the first picture of each epoch. Without rungs it is
 // key-only: it keeps no schedule and shoots every key frame of the
 // lowest-numbered video track it is given, decoded alone, and drops the
-// rest of the video.
+// rest of the video. A key that gives no picture counts in
+// Stats.ThumbnailsFailed; a damaged key the decoder conceals still gives a
+// shot.
 type Config struct {
 	Rungs     []Rung
 	Audio     *Audio
@@ -87,17 +89,20 @@ type Output struct {
 
 // Stats counts what the pipeline dropped or corrected.
 //
-// DroppedTracks is the number of video tracks that are not encoded (only the
-// lowest-numbered video track is). Reanchors counts audio re-anchors after a
-// forward gap, and AudioDropped the audio samples (at the output rate)
-// dropped because the input ran early. AudioCorrupt and VideoCorrupt count
-// the input frames a decoder rejected and that were skipped: any decoder
-// error but ENOMEM. Damage a video decoder conceals is not counted. A
+// DroppedTracks is the number of video tracks that are not encoded, or in
+// a key-only pipeline not shot (only the lowest-numbered video track is).
+// Reanchors counts audio re-anchors after a forward gap, and AudioDropped
+// the audio samples (at the output rate) dropped because the input ran
+// early. AudioCorrupt and VideoCorrupt count the input frames a decoder
+// rejected and that were skipped: any decoder error but ENOMEM. Damage a video decoder conceals is not counted. A
 // decoder that rejects 50 frames in a row fails the pipeline.
 // EncoderFallbacks counts the rung encoder opens that fell back from NVENC
 // to libx264: one per rung per build. Thumbnails counts the shots made and
 // ThumbnailsFailed the attempts that gave none; a failed shot never fails
-// the pipeline and never counts in VideoCorrupt.
+// the pipeline and never counts in VideoCorrupt. A key-only attempt fails
+// only when the key gives no picture at all: the decoder outputs damaged
+// pictures (SHOW_ALL, OUTPUT_CORRUPT), so a key it conceals still gives a
+// shot, of the concealed picture.
 type Stats struct {
 	DroppedTracks, Reanchors, AudioDropped uint64
 	AudioCorrupt, VideoCorrupt             uint64
@@ -371,14 +376,20 @@ func (p *Pipeline) shootKey(f media.Frame) []Output {
 	return nil
 }
 
+// dropTrack drops a video track that is not the lowest-numbered one, which
+// alone is encoded, or in a key-only pipeline shot.
 func (p *Pipeline) dropTrack(track int) {
 	if p.dropped[track] {
 		return
 	}
 	p.dropped[track] = true
 	p.stats.DroppedTracks++
-	slog.Warn("transcode: dropping a video track: only the lowest-numbered video track is encoded",
-		"track", track, "encoded", p.vtrack)
+	use := "encoded"
+	if p.video == nil {
+		use = "shot"
+	}
+	slog.Warn("transcode: dropping a video track: only the lowest-numbered video track is "+use,
+		"track", track, "kept", p.vtrack)
 }
 
 func (p *Pipeline) pushAudio(f media.Frame) ([]Output, error) {

@@ -20,7 +20,10 @@
 // encoded frames and, when Configure asks for a thumbnail, Shot messages
 // (from keys alone when there are no rungs), drains on Discontinuity,
 // swaps the watermark at the next picture on SetWatermark (one it cannot
-// take is fatal), and writes Stats every second. It exits 0 after flushing on Stop or EOF from the host, 1
-// after writing a fatal Error, and 2 on bad usage. libav logs go to stderr
-// at warning level.
+// take is fatal), and writes Stats every second. A shot that cannot be made
+// is counted in Stats.ThumbnailsFailed, never fatal; from keys alone that is
+// a key that gives no picture, while a damaged key the decoder conceals
+// still gives a shot. It exits 0 after flushing on Stop or EOF from the
+// host, 1 after writing a fatal Error, and 2 on bad usage. libav logs go to
+// stderr at warning level.
 package main

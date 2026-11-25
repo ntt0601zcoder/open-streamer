@@ -5,11 +5,13 @@ package native
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"slices"
 	"testing"
 
+	"github.com/asticode/go-astiav"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -419,4 +421,108 @@ func TestThumbnailFailureWithRungs(t *testing.T) {
 	assert.Zero(t, st.VideoCorrupt)
 	requireSameRung(t, plain, outs)
 	assert.Len(t, w.matching("thumbnail"), 1, "one warning per pipeline")
+}
+
+// rangeLevels are the luma levels of rangeFrame's four 64-pixel columns.
+var rangeLevels = [4]uint8{0, 16, 235, 255}
+
+// rangeFrame returns a 256×64 picture of pixel format pf and colour range
+// cr, with neutral chroma and one column per rangeLevels entry.
+func rangeFrame(t *testing.T, pf astiav.PixelFormat, cr astiav.ColorRange) *astiav.Frame {
+	t.Helper()
+	const w, h = 256, 64
+	img := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+	for y := range h {
+		for x := range w {
+			img.Y[y*img.YStride+x] = rangeLevels[x/64]
+		}
+	}
+	for i := range img.Cb {
+		img.Cb[i], img.Cr[i] = 128, 128
+	}
+	fr := astiav.AllocFrame()
+	t.Cleanup(fr.Free)
+	fr.SetWidth(w)
+	fr.SetHeight(h)
+	fr.SetPixelFormat(pf)
+	fr.SetColorRange(cr)
+	fr.SetSampleAspectRatio(astiav.NewRational(1, 1))
+	require.NoError(t, fr.AllocBuffer(0))
+	require.NoError(t, fr.Data().FromImage(img))
+	return fr
+}
+
+// shotLevels shoots fr and returns the mean luma of the middle of each
+// column, whatever the shot's size.
+func shotLevels(t *testing.T, th *thumbnailer, fr *astiav.Frame) [4]float64 {
+	t.Helper()
+	s, err := th.make(fr)
+	require.NoError(t, err)
+	require.Equal(t, th.t.Height, s.Height)
+	require.Equal(t, 4*s.Height, s.Width)
+	img, err := jpeg.Decode(bytes.NewReader(s.JPEG))
+	require.NoError(t, err)
+	yc, ok := img.(*image.YCbCr)
+	require.True(t, ok, "%T", img)
+	var out [4]float64
+	cw := s.Width / 4
+	for c := range out {
+		n := 0
+		for y := s.Height / 4; y < s.Height*3/4; y++ {
+			for x := c*cw + cw/4; x < c*cw+cw*3/4; x++ {
+				out[c] += float64(yc.Y[yc.YOffset(x, y)])
+				n++
+			}
+		}
+		out[c] /= float64(n)
+	}
+	return out
+}
+
+// TestThumbnailColourRange: a full-range source keeps its levels in the
+// full-range JPEG, black at 0 and white at 255 and nothing stretched; a
+// limited-range source is stretched, 16 to 0 and 235 to 255. Both at the
+// source's size (swscale's unscaled path) and scaled down.
+func TestThumbnailColourRange(t *testing.T) {
+	full := [4]float64{0, 16, 235, 255}
+	limited := [4]float64{0, 0, 255, 255}
+	for _, tc := range []struct {
+		name string
+		pf   astiav.PixelFormat
+		cr   astiav.ColorRange
+		want [4]float64
+	}{
+		{"yuv420p jpeg range", astiav.PixelFormatYuv420P, astiav.ColorRangeJpeg, full},
+		{"yuvj420p", astiav.PixelFormatYuvj420P, astiav.ColorRangeUnspecified, full},
+		{"yuvj420p jpeg range", astiav.PixelFormatYuvj420P, astiav.ColorRangeJpeg, full},
+		{"yuv420p mpeg range", astiav.PixelFormatYuv420P, astiav.ColorRangeMpeg, limited},
+		{"yuv420p unspecified", astiav.PixelFormatYuv420P, astiav.ColorRangeUnspecified, limited},
+	} {
+		for _, height := range []int{64, 32} {
+			t.Run(fmt.Sprintf("%s %d", tc.name, height), func(t *testing.T) {
+				var st Stats
+				th := newThumbnailer(picture.Thumbnail{IntervalSec: 10, Height: height, Quality: 95}, &st, false)
+				t.Cleanup(th.release)
+				got := shotLevels(t, th, rangeFrame(t, tc.pf, tc.cr))
+				for c := range got {
+					assert.InDelta(t, tc.want[c], got[c], 3, "column %d (level %d): %v", c, rangeLevels[c], got)
+				}
+			})
+		}
+	}
+
+	// The scaler follows a range change on the same size and format.
+	var st Stats
+	th := newThumbnailer(picture.Thumbnail{IntervalSec: 10, Height: 64, Quality: 95}, &st, false)
+	t.Cleanup(th.release)
+	for _, cr := range []astiav.ColorRange{astiav.ColorRangeMpeg, astiav.ColorRangeJpeg, astiav.ColorRangeMpeg} {
+		want := limited
+		if cr == astiav.ColorRangeJpeg {
+			want = full
+		}
+		got := shotLevels(t, th, rangeFrame(t, astiav.PixelFormatYuv420P, cr))
+		for c := range got {
+			assert.InDelta(t, want[c], got[c], 3, "range %v column %d: %v", cr, c, got)
+		}
+	}
 }
