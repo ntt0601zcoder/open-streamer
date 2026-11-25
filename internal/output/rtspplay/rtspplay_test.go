@@ -616,6 +616,9 @@ func TestPlayManyPlayers(t *testing.T) {
 		sessions[i] = sessionOf(c)
 		chans[i] = collect(c, nil)
 	}
+	// A session subscribes after its PLAY response: fed before that, a
+	// player can start at a later GOP's keyframe, from the cache.
+	require.Eventually(t, func() bool { return len(e.h.Stats()) == n }, waitFor, time.Millisecond, "every player subscribed")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	<-feed(ctx, e.h, rest, 4, nil)
