@@ -980,3 +980,164 @@ func TestMergerRenditionHoldFixed(t *testing.T) {
 	}
 	assert.Nil(t, m.lag)
 }
+
+// lagFrame returns track's video frame of epoch at dts, with PTS = DTS.
+func lagFrame(track int, epoch uint32, dts int64, key bool) media.Frame {
+	return media.Frame{Track: track, Config: testVideoCfg, Epoch: epoch, PTS: dts, DTS: dts, Key: key}
+}
+
+// learnLag plays epoch 1 into m at 10 fps: track 1 trails track 0 by 25
+// frames (225000 ticks, 2.5 s) for 20 frames; then it flushes. It returns
+// the DTS after track 0's last frame.
+func learnLag(m *merger) int64 {
+	const fd = 9000
+	for i := range 45 {
+		m.push(lagFrame(0, 1, int64(i)*fd, i%20 == 0))
+		if d := i - 25; d >= 0 {
+			m.push(lagFrame(1, 1, int64(d)*fd, d%20 == 0))
+		}
+	}
+	m.flush()
+	return 45 * fd
+}
+
+// startRun runs m with ft's timers until the test ends.
+func startRun(t *testing.T, m *merger, ft *fakeTime) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.run(ctx, ft.After)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
+// lastTimer returns the duration of the latest timer run armed.
+func lastTimer(ft *fakeTime) time.Duration {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	return ft.calls[len(ft.calls)-1]
+}
+
+// waitsFor checks that the head frame, pushed just now with run started,
+// is not written after before (the timer fires early) and is written at
+// hold.
+func waitsFor(t *testing.T, ft *fakeTime, sub *hub.Sub, before, hold time.Duration) {
+	t.Helper()
+	<-ft.asked
+	assert.Equal(t, hold, lastTimer(ft), "the armed hold")
+	ft.advance(before)
+	ft.fireLast()
+	<-ft.asked
+	assert.Empty(t, drain(sub), "held at %v", before)
+	ft.advance(hold - before)
+	ft.fireLast()
+	require.Eventually(t, func() bool { return len(drain(sub)) == 1 }, 2*time.Second, time.Millisecond, "written at %v", hold)
+}
+
+// A new epoch's opener waits 1.5 × the lag learned in the previous epoch
+// for the tracks announced for it, not presHoldFactor × MergeHold.
+func TestMergerNewEpochUsesLearnedHold(t *testing.T) {
+	ft := newFakeTime()
+	m, sub := newTestPresMerger(ft)
+	next := learnLag(m)
+	drain(sub)
+	m.expect(2, 0)
+	m.expect(2, 1)
+	m.push(lagFrame(0, 2, next, true))
+	assert.Empty(t, drain(sub), "the opener waits for track 1")
+	startRun(t, m, ft)
+	waitsFor(t, ft, sub, 3700*time.Millisecond, 3750*time.Millisecond)
+}
+
+// The first epoch's opener has no lag to learn from: it waits
+// presHoldFactor × MergeHold, although its own push has put its track in
+// the lag map.
+func TestMergerNewEpochBeforeAnyLag(t *testing.T) {
+	ft := newFakeTime()
+	m, sub := newTestPresMerger(ft)
+	m.expect(1, 0)
+	m.expect(1, 1)
+	m.push(lagFrame(0, 1, 0, true))
+	m.mu.Lock()
+	e, ok := m.lag[0]
+	m.mu.Unlock()
+	require.True(t, ok, "the opener's track has a lag entry")
+	assert.Equal(t, uint32(1), e.epoch)
+	assert.Empty(t, drain(sub))
+	startRun(t, m, ft)
+	waitsFor(t, ft, sub, 7900*time.Millisecond, presHoldFactor*2*time.Second)
+}
+
+// A track that pushed once, 5 s behind, then fell silent sets the hold to
+// 7.5 s until the others have run more than the 8 s cap of stream time
+// without it; then its lag is forgotten and the hold is MergeHold again.
+func TestMergerStaleLagPruned(t *testing.T) {
+	const fd = 3600 // 25 fps
+	ft := newFakeTime()
+	m, sub := newTestPresMerger(ft)
+	both := func(from, to int) {
+		for d := from; d <= to; d++ {
+			m.push(lagFrame(0, 1, int64(d)*fd, d%25 == 0))
+			m.push(lagFrame(2, 1, int64(d)*fd, d%25 == 0))
+		}
+	}
+	both(0, 125)                    // 5 s, to DTS 450000
+	m.push(lagFrame(1, 1, 0, true)) // 450000 ticks behind
+	headHold := func() time.Duration {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		c, ok := m.candidate()
+		require.True(t, ok)
+		require.NotEmpty(t, m.missing(c), "the head waits")
+		dl, _ := m.deadline()
+		return dl.Sub(m.q[c][0].at)
+	}
+	both(126, 125+200) // 8 s of stream time since track 1's push: not more
+	assert.Equal(t, 7500*time.Millisecond, headHold(), "8 s: track 1's lag still counts")
+	both(125+201, 125+225) // 9 s
+	m.push(lagFrame(0, 1, int64(125+226)*fd, false))
+	assert.Equal(t, 2*time.Second, headHold(), "9 s: track 1's lag is forgotten")
+	m.mu.Lock()
+	assert.NotContains(t, m.lag, 1)
+	m.mu.Unlock()
+	drain(sub)
+	startRun(t, m, ft)
+	waitsFor(t, ft, sub, 1900*time.Millisecond, 2*time.Second)
+}
+
+// The lag learned in epoch 1 survives into epoch 2's start, and is
+// forgotten once epoch 2 has run more than the cap without the track.
+func TestMergerLagSurvivesEpochChange(t *testing.T) {
+	const fd = 9000
+	ft := newFakeTime()
+	m, _ := newTestPresMerger(ft)
+	next := learnLag(m)
+	hold := func() (time.Duration, int64) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.holds(false)
+	}
+	for k := range 11 { // 1 s of epoch 2
+		m.push(lagFrame(0, 2, next+int64(k)*fd, k%20 == 0))
+	}
+	d, ticks := hold()
+	assert.Equal(t, 3750*time.Millisecond, d, "epoch 2 after 1 s")
+	assert.Equal(t, int64(337500), ticks)
+	for k := 11; k <= 80; k++ { // 8 s: not more than the cap
+		m.push(lagFrame(0, 2, next+int64(k)*fd, k%20 == 0))
+	}
+	d, _ = hold()
+	assert.Equal(t, 3750*time.Millisecond, d, "epoch 2 after 8 s")
+	m.push(lagFrame(0, 2, next+81*fd, false))
+	d, ticks = hold()
+	assert.Equal(t, 2*time.Second, d, "epoch 2 after 8.1 s")
+	assert.Equal(t, int64(2*media.ClockRate), ticks)
+	m.mu.Lock()
+	assert.NotContains(t, m.lag, 1, "track 1's entry is gone")
+	m.mu.Unlock()
+}

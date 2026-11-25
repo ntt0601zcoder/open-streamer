@@ -227,9 +227,12 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
     out of every segment. The merger measures each track's lag behind the
     furthest frame pushed and holds 1.5 × the largest, at least `MergeHold`
     (2 s; 25 fps is unchanged) and at most 4 × `MergeHold` (8 s); a new
-    epoch's first frame waits that cap for the rungs announced for it. The
-    costs: the presentation runs as far behind its source as its slowest
-    rung (it did already, for every rung but the copy); a rung that falls
+    epoch's first frame waits, in wall time, 1.5 × the largest lag learnt
+    in an earlier epoch for the rungs announced for it, or that cap when
+    none is known (the first epoch). A track's lag is forgotten once it has
+    been silent for more than the cap of stream time. The costs: the
+    presentation runs as far behind its source as its slowest rung (it did
+    already, for every rung but the copy); a rung that falls
     silent, or a respawned child that never delivers, stalls it for up to
     the hold once (2 s at 25 fps, at most 8 s) before the rung is given up
     until it delivers again; and the copy rung's frames wait in the merger
@@ -260,13 +263,14 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
     below K that came after rung 0's IDR (its previous part is cut short by
     them), or a gap entry for that one segment when its IDR at K is missing
     or lost; when it leads the anchor, nothing. Never a part that does not
-    decode from its start, and never a part running past its segment. A
-    rung that misses every barrier (an encoder beyond the merger's cap,
-    above) pays that at every segment. The packager counts it per rung
-    (`live.Packager.Rungs`: segments without the rung, and frames left
-    out, from `segment.Segmenter.LeftOut`) and logs a warning when the
-    counts rise, at most once every 10 s; osdev reports them with its
-    packager counters. Under AlignVideo a segment closed
+    decode from its start, and never a part running past its segment,
+    except a leading rung with no keyframe at K, whose frames are not moved
+    (Backlog). A rung that misses every barrier (an encoder beyond the
+    merger's cap, above) pays that at every segment. The packager counts
+    it per rung (`live.Packager.Rungs`: segments without the rung, and
+    frames left out, from `segment.Segmenter.LeftOut`) and logs a warning
+    when the counts rise, at most once every 10 s; osdev reports them with
+    its packager counters. Under AlignVideo a segment closed
     without a cut records each video track's own span where it differs from
     the anchor's (`VideoDurations`).
   - *HLS TS* (R-B4). One TS per segment per video track that has frames in
@@ -391,12 +395,22 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   path; the merger releases every rung's frames before K first, then the
   rungs' IDRs at K in track order, waiting for a late rung 1.5 × the lag
   it measures between the tracks, between `MergeHold` and 4 × `MergeHold`
-  (R-B3; §3.4 has the reason and the costs). The rendition mergers do not
-  use the barrier and keep the fixed `MergeHold`. The hub's
-  `GOPCacheFrames` is 1500 × (renditions + 1), so a late subscriber gets
-  every rung's IDR of the cached GOP (rung 0's IDR, where the cache starts,
-  comes first), and the merger counts into `Stats.PresentationOut` and
-  `Stats.PresentationDropped`, not `FramesOut` or `MergeDropped` (R-B7).
+  (R-B3; §3.4 has the reason and the costs). A new epoch's first frame
+  waits, in wall time only, for the rungs announced for it: 1.5 × the
+  largest lag recorded in an earlier epoch, within the same bounds, or 4 ×
+  `MergeHold` when there is none (the first epoch of a run, or every
+  earlier track's lag forgotten). Stale lag is pruned: a track's lag is
+  forgotten once, in the latest epoch, the furthest frame has moved more
+  than 4 × `MergeHold` of stream time past the track's last push, or,
+  when the track last pushed in an older epoch, once the latest epoch has
+  run that long; so the previous epoch's lag carries into the new epoch's
+  start, and a rung that falls silent stops raising the hold. The
+  rendition mergers do not use the barrier and keep the fixed `MergeHold`.
+  The hub's `GOPCacheFrames` is 1500 × (renditions + 1), so a late
+  subscriber gets every rung's IDR of the cached GOP (rung 0's IDR, where
+  the cache starts, comes first), and the merger counts into
+  `Stats.PresentationOut` and `Stats.PresentationDropped`, not `FramesOut`
+  or `MergeDropped` (R-B7).
   osdev serves the presentation of stream `<name>` as `<name>_abr`, on HLS
   (TS and fMP4) and DASH only; RTMP, RTSP, SRT, HTTP-TS and `copy://` do not
   find it, and the label `abr` is reserved (R-B2; product naming is M5's).

@@ -60,13 +60,19 @@ type pendingFrame struct {
 // minus the frame's DTS, as an envelope that rises at once and falls by an
 // eighth of the difference per frame, and holds for one and a half times
 // the largest lag: never less than hold, never more than presHoldFactor ×
-// hold (8 s by default), in stream time and in wall time alike. A new
-// epoch's first frame, for which no lag is known yet, waits presHoldFactor ×
-// hold of wall time for the tracks announced for it. The costs: a silent
-// rung stalls the presentation for up to that long, once, before it is
-// given up; and when an encoder trails by more than the cap (x264's
-// defaults below about 4 fps), the copy rung is released ahead of every
-// barrier, which the packager reports as rungs left out.
+// hold (8 s by default), in stream time and in wall time alike. A track
+// silent for more than that cap of stream time is forgotten (pruneLag),
+// and a track that has not pushed in a new epoch keeps the previous
+// epoch's lag until the new epoch has run that long. A new epoch's first
+// frame waits, as wall time only, for the tracks announced for it: one and
+// a half times the largest lag recorded in an earlier epoch, within the
+// same bounds, or presHoldFactor × hold when there is none (the first
+// epoch, or every earlier track forgotten). The costs: a silent rung
+// stalls the presentation for up to the hold, once, before it is given up,
+// and its lag keeps every hold raised until it is forgotten, at most the
+// cap of stream time later; and when an encoder trails by more than the cap
+// (x264's defaults below about 4 fps), the copy rung is released ahead of
+// every barrier, which the packager reports as rungs left out.
 //
 // push, expect, barrier and flush are safe for concurrent use; run arms the
 // wall-time holds.
@@ -92,14 +98,24 @@ type merger struct {
 	maxHold      time.Duration
 	maxHoldTicks int64
 	lead         map[uint32]int64 // epoch → largest DTS pushed
-	lag          map[int]int64    // track → lag envelope, in ticks
+	first        map[uint32]int64 // epoch → first DTS pushed
+	lag          map[int]lagEntry // track → its lag envelope
+}
+
+// lagEntry is one track's lag envelope in the presentation merger, with the
+// epoch of the track's last push and that epoch's lead (m.lead) after it.
+type lagEntry struct {
+	env   int64 // in ticks
+	epoch uint32
+	lead  int64
 }
 
 // presHoldFactor is how many times its hold the presentation merger may
 // wait: the cap of the hold that follows the encoder's delay, and the wait
-// for a new epoch's announced tracks. With the default hold of 2 s it is
-// 8 s: x264's delay of about 30 frames is 6 s at 5 fps, which leaves a
-// third to spare, and reaches the cap at about 4 fps.
+// for a new epoch's announced tracks when no earlier lag is known. With
+// the default hold of 2 s it is 8 s: x264's delay of about 30 frames is
+// 6 s at 5 fps, which leaves a third to spare, and reaches the cap at
+// about 4 fps.
 const presHoldFactor = 4
 
 func newMerger(h *hub.Hub, hold time.Duration, now func() time.Time, anchor func(uint32) (media.Anchor, bool)) *merger {
@@ -124,7 +140,8 @@ func newPresentationMerger(h *hub.Hub, hold time.Duration, now func() time.Time,
 	m.maxHold = presHoldFactor * hold
 	m.maxHoldTicks = media.FromDuration(m.maxHold)
 	m.lead = map[uint32]int64{}
-	m.lag = map[int]int64{}
+	m.first = map[uint32]int64{}
+	m.lag = map[int]lagEntry{}
 	return m
 }
 
@@ -337,35 +354,80 @@ func (m *merger) maxPendingDTS(e uint32) int64 {
 // difference. Called with m.mu held.
 func (m *merger) noteLag(f media.Frame) {
 	lead, ok := m.lead[f.Epoch]
+	if !ok {
+		m.first[f.Epoch] = f.DTS
+	}
 	if !ok || f.DTS > lead {
 		lead = f.DTS
 		m.lead[f.Epoch] = lead
 	}
-	lag, env := lead-f.DTS, m.lag[f.Track]
+	lag, env := lead-f.DTS, m.lag[f.Track].env
 	if lag >= env {
 		env = lag
 	} else {
 		env -= (env - lag + 7) / 8
 	}
-	m.lag[f.Track] = env
+	m.lag[f.Track] = lagEntry{env: env, epoch: f.Epoch, lead: lead}
+}
+
+// pruneLag forgets the lag of a track that has been silent for more than
+// maxHold of stream time. With E the largest epoch pushed, an entry is
+// stale when it is of E and its lead is more than maxHoldTicks below E's,
+// or when it is of an older epoch and E has run more than maxHoldTicks
+// since its first frame; so the previous epoch's lag survives into the new
+// epoch's start. Called with m.mu held.
+func (m *merger) pruneLag() {
+	var top uint32
+	found := false
+	for e := range m.lead {
+		if !found || e > top {
+			top, found = e, true
+		}
+	}
+	if !found {
+		return
+	}
+	lead := m.lead[top]
+	ranLong := lead-m.first[top] > m.maxHoldTicks
+	for t, e := range m.lag {
+		if e.epoch == top && lead-e.lead > m.maxHoldTicks || e.epoch < top && ranLong {
+			delete(m.lag, t)
+		}
+	}
 }
 
 // holds returns how long the head frame waits for a missing track, as wall
 // time and as stream time. A rendition merger waits hold. The presentation
-// merger waits one and a half times the largest lag envelope of its tracks,
-// at least hold and at most presHoldFactor × hold; and presHoldFactor ×
-// hold for a frame that opens an epoch (newEpoch), whose lag is not known
-// yet. Called with m.mu held.
+// merger first forgets stale lag (pruneLag), then waits one and a half
+// times the largest lag envelope of its tracks, at least hold and at most
+// presHoldFactor × hold. For a frame that opens an epoch (newEpoch) only
+// the entries recorded in an epoch below the frame's count, the lag learnt
+// before it; with none (the first epoch, or every older entry forgotten)
+// it waits presHoldFactor × hold. Called with m.mu held.
 func (m *merger) holds(newEpoch bool) (time.Duration, int64) {
-	switch {
-	case m.pres == nil:
+	if m.pres == nil {
 		return m.hold, m.holdTicks
-	case newEpoch:
-		return m.maxHold, m.maxHoldTicks
 	}
+	m.pruneLag()
 	var lag int64
-	for _, l := range m.lag {
-		lag = max(lag, l)
+	if newEpoch {
+		c, ok := m.candidate()
+		if !ok {
+			return m.maxHold, m.maxHoldTicks
+		}
+		opener, learnt := m.q[c][0].f.Epoch, false
+		for _, e := range m.lag {
+			if e.epoch < opener {
+				lag, learnt = max(lag, e.env), true
+			}
+		}
+		if !learnt {
+			return m.maxHold, m.maxHoldTicks
+		}
+	} else {
+		for _, e := range m.lag {
+			lag = max(lag, e.env)
+		}
 	}
 	ticks := min(max(lag+lag/2, m.holdTicks), m.maxHoldTicks)
 	if ticks == m.holdTicks {
@@ -441,6 +503,7 @@ func (m *merger) write(f media.Frame) {
 			for e := range m.lead {
 				if e < m.epoch {
 					delete(m.lead, e)
+					delete(m.first, e)
 				}
 			}
 		}
