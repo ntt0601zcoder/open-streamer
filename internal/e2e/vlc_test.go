@@ -143,16 +143,37 @@ func TestM3VLCClass(t *testing.T) {
 // the video-only stretch of gapSource GStreamer loads the EXT-X-GAP URIs and
 // stops (ruling R-T7a): that row skips, or with OS_PEER_LIMITS=1 probes the
 // limitation. It runs alongside TestM3VLCClass's serial VLC rows.
+//
+// A run of the RTSP play row that fails the pass rule because gst-launch-1.0
+// itself failed (gstResult.void) proves nothing about the output: the row
+// then plays again, with a new stream and server, at most gstAttempts times
+// in all, and the last attempt gets no such allowance (the retry is
+// logged).
 func TestM3GStreamerClass(t *testing.T) {
 	t.Parallel()
 	t.Run("rtsp-play", func(t *testing.T) {
 		t.Parallel()
 		gst := testpeer.GStreamer(t, rtspElements...)
 		ffmpeg := testpeer.Require(t, "ffmpeg")
-		r := startRun(t, runOptions{inputs: []string{fileURL(loopClip(t, ffmpeg, "h264_aac.ts", 3, 0), "")}})
-		o := serveRTSP(t, "", rtspplay.Options{}, map[string]*hub.Hub{"s": r.h})
-		waitAV(t, r.h)
-		gstPlays(t, gst, rtspPipeline(o.url()))
+		// Each attempt is a subtest, so that its stream and server end
+		// with it.
+		for n := 1; ; n++ {
+			void := ""
+			t.Run(fmt.Sprintf("attempt-%d", n), func(t *testing.T) {
+				r := startRun(t, runOptions{inputs: []string{fileURL(loopClip(t, ffmpeg, "h264_aac.ts", 3, 0), "")}})
+				o := serveRTSP(t, "", rtspplay.Options{}, map[string]*hub.Hub{"s": r.h})
+				waitAV(t, r.h)
+				// Logged when the attempt fails too: whether a session
+				// played, and how it ended, tells a stalled player from a
+				// silent server.
+				defer func() { t.Logf("play %+v", o.srv.Stats()) }()
+				void = gstPlaysOnce(t, gst, rtspPipeline(o.url()), n < gstAttempts)
+			})
+			if void == "" {
+				return
+			}
+			t.Logf("gst-launch-1.0 failed on its own during attempt %d (%s): playing again", n, void)
+		}
 	})
 	t.Run("push-out", func(t *testing.T) {
 		t.Parallel()
@@ -314,7 +335,10 @@ type gstResult struct {
 	start    time.Time
 	times    map[string][]time.Time // when each sink logged a buffer
 	errLines []string
-	exit     error
+	// void is the first line that tells gst-launch-1.0 failed on its own,
+	// or "": see gstVoidMarks.
+	void string
+	exit error
 }
 
 func (r gstResult) counts() map[string]int {
@@ -341,6 +365,40 @@ func (r gstResult) check() error {
 		errs = append(errs, fmt.Errorf("ERROR messages: %q", r.errLines))
 	}
 	return errors.Join(errs...)
+}
+
+// gstVoidMarks are the lines of gst-launch-1.0 that tell it failed on its
+// own. Its delayed links (the "s. ! ..." of a pipeline) are not safe
+// against pads added from two threads at once, which rtspsrc does when both
+// tracks' first packets come together, as in a TCP session's GOP replay:
+// each pad-added runs every pending delayed link on its own thread.
+//
+// "Delayed linking failed" (GStreamer 1.24.2: 4 of 1440 runs of
+// rtspPipeline, 7 of 960 runs of the RTSP play row). A delayed link with a
+// caps filter is two links through a capsfilter of its own, and the second
+// is made even when the first failed. The thread of the video pad tries
+// the audio link before the audio pad is there: no pad for its filter, but
+// its filter takes the depayloader's sink. The thread of the audio pad
+// links that pad to its own filter, finds the depayloader's sink taken, and
+// undoes; the first undoes too. No pad-added follows, and no-more-pads
+// leaves the pad unlinked. Its sink never prerolls, which holds the other
+// sink in preroll: neither gets a buffer, and gst-launch -e waits for an
+// EOS that cannot come until it is killed. (A pad added after
+// no-more-pads still gets linked: that run has the line and plays.)
+//
+// "Caught SIGSEGV" (1 of 3360 runs of rtspPipeline without its caps
+// filters): gst-launch crashes in a streaming thread and spins, and the
+// pad that thread was adding never comes.
+var gstVoidMarks = []string{"Delayed linking failed", "Caught SIGSEGV"}
+
+// gstVoids reports whether a line of gst-launch-1.0 is one of gstVoidMarks.
+func gstVoids(line string) bool {
+	for _, m := range gstVoidMarks {
+		if strings.Contains(line, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // runGst runs gst-launch-1.0 -v -e with pipeline, stopped by SIGINT after
@@ -370,6 +428,9 @@ func runGst(t *testing.T, gst testpeer.Peer, pipeline []string, run time.Duratio
 			if strings.Contains(line, "ERROR") {
 				res.errLines = append(res.errLines, line)
 			}
+			if res.void == "" && gstVoids(line) {
+				res.void = line
+			}
 		}
 		_ = pr.Close()
 		res.exit = cmd.Wait()
@@ -390,6 +451,9 @@ const (
 	// for each sink's first buffer.
 	gstRun    = 12 * time.Second
 	gstWithin = 10 * time.Second
+	// gstAttempts is how many times a row plays while gst-launch-1.0
+	// fails on its own (gstResult.void).
+	gstAttempts = 3
 	// m3b3PushPath is the path of the RTSP MediaMTX that pulls, on demand,
 	// the push-out's target on the RTMP MediaMTX (OS_MEDIAMTX_RTMP):
 	// live/m3b3push (MTX_PATHS_M3B3PUSH_SOURCE).
@@ -830,13 +894,28 @@ func vlcPlays(t *testing.T, vlc testpeer.Peer, ffprobe, u string, tolerate bool)
 // gstPlays applies the GStreamer pass rule to a pipeline.
 func gstPlays(t *testing.T, gst testpeer.Peer, pipeline []string) {
 	t.Helper()
+	gstPlaysOnce(t, gst, pipeline, false)
+}
+
+// gstPlaysOnce applies the GStreamer pass rule to a pipeline. A run that
+// fails it while again is set and gst-launch-1.0 failed on its own is not
+// failed: the line that tells so (gstResult.void) is returned, for the
+// caller to play again. Otherwise it returns "".
+func gstPlaysOnce(t *testing.T, gst testpeer.Peer, pipeline []string, again bool) string {
+	t.Helper()
 	res := <-runGst(t, gst, pipeline, gstRun)
 	first := map[string]time.Duration{}
 	for sink, ts := range res.times {
 		first[sink] = ts[0].Sub(res.start)
 	}
-	t.Logf("%s: buffers %v, first after %v, exit %v", gst, res.counts(), first, res.exit)
-	require.NoError(t, res.check())
+	t.Logf("%s: buffers %v, first after %v, exit %v, void %q", gst, res.counts(), first, res.exit, res.void)
+	err := res.check()
+	if err != nil && again && res.void != "" {
+		t.Logf("not held against the output: %v", err)
+		return res.void
+	}
+	require.NoError(t, err)
+	return ""
 }
 
 // testVLCAudioOnlyStretch plays HTTP-TS, or SRT when srt is set, of A/V,
