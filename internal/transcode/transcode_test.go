@@ -2169,18 +2169,27 @@ func TestShotsFromAudioOnlyChild(t *testing.T) {
 		opt.OnShot = shots.add
 		var cfgs <-chan wire.Configure
 		s := startWith(t, opt, func(tr *Transcoder) { cfgs = captureConfigure(tr) })
+		// The feed starts once the child has said Hello (its Configure is
+		// written after it): at 4 times real time the six keys are 0.25 s
+		// apart, and a child slow to start on a loaded runner would
+		// otherwise miss the first ones.
+		var cfg wire.Configure
+		select {
+		case cfg = <-cfgs:
+		case <-time.After(10 * time.Second):
+			t.Fatal("no Configure: the child never said Hello")
+		}
 		got := s.feed(t, steps, 4)
 
-		cfg := <-cfgs
 		assert.Empty(t, cfg.Rungs)
 		assert.NotNil(t, cfg.Audio)
 		assert.Equal(t, thumbnail, cfg.Thumbnail)
 
 		video, audio := frameLogVideo(t, log)
 		assert.Equal(t, srcAudio, audio, "the child got every audio frame")
-		// At 4 times real time the child says Hello within the first second
-		// or two of the stream: of the six keys, one second apart, it gets
-		// every other one from then on.
+		// Of the six keys, one second apart, the child gets every other
+		// one from the first it is offered: 3 (at least 2 is asserted, as
+		// before, for a writer slow to take a key).
 		require.GreaterOrEqual(t, len(video), 2, "%v", video)
 		require.LessOrEqual(t, len(video), 3, "%v", video)
 		keys := videoKeys(shifted(src))
