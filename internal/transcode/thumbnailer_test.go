@@ -4,13 +4,11 @@ package transcode
 
 import (
 	"context"
-	"errors"
-	"io/fs"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -431,15 +429,44 @@ func TestThumbnailerVersionMismatch(t *testing.T) {
 	}
 }
 
-// A binary that does not exist ends Run: a respawn would not find it either.
+// A binary that does not exist is retried with the backoff, as the
+// Transcoder's is (TestSupervisorMissingBinary): every spawn counts as an
+// exit, each failure is logged with startProc's error, and Run goes on
+// until ctx ends.
 func TestThumbnailerMissingBinary(t *testing.T) {
+	ra := &recordAfter{n: 3, full: make(chan struct{})}
 	opt := thumbOptions(t, 2)
 	opt.Binary = "/nonexistent"
+	opt.RespawnMin = 0 // default 250 ms
+	opt.After = ra.After
+	var logs syncBuffer
+	opt.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	th, err := NewThumbnailer(hub.New(hub.Options{}), opt)
 	require.NoError(t, err)
-	err = th.Run(t.Context())
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist), "%v", err)
+	ctx, cancel := context.WithCancel(t.Context())
+	errc := make(chan error, 1)
+	go func() { errc <- th.Run(ctx) }()
+	select {
+	case <-ra.full:
+	case err := <-errc:
+		t.Fatalf("Run returned: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no respawns")
+	}
+	ra.mu.Lock()
+	// The 4th spawn's After returns nil: Run waits for ctx there.
+	assert.Equal(t, []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second}, ra.delays)
+	ra.mu.Unlock()
+	assert.Equal(t, ThumbnailerStats{Spawns: 4, Exits: 4}, th.Stats())
+	assert.Equal(t, 4, strings.Count(logs.String(), "transcode: thumbnailer: spawn failed"), logs.String())
+	assert.Contains(t, logs.String(), "/nonexistent")
+	cancel()
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return")
+	}
 }
 
 // A child that never says Hello is killed after HelloTimeout and respawned.

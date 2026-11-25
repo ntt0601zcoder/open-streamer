@@ -5,10 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
-	"os/exec"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,8 +71,9 @@ type ThumbnailerStats struct{ Spawns, Exits, KeysSent, KeysSkipped, Shots, Faile
 // child shoots every key it gets. A shot the child reports as failed is
 // retried under shotRetry.
 //
-// A child that exits is respawned after a backoff, as the Transcoder's is,
-// and the schedule starts over. A child that sends no Hello within
+// A child that exits, or cannot be started (a binary that does not exist
+// included), is respawned after a backoff, as the Transcoder's is, and the
+// schedule starts over. A child that sends no Hello within
 // HelloTimeout, nothing for SilenceTimeout after it, or anything the host
 // cannot decode, is killed and counts as an exit. No hub is written.
 type Thumbnailer struct {
@@ -174,9 +173,10 @@ type thumbRun struct {
 }
 
 // Run makes thumbnails until the source hub closes or ctx ends; it returns
-// nil for both, after it has stopped its child. A binary that does not
-// exist and a child that announces another wire version are fatal: Run
-// returns that error. Run may be called once.
+// nil for both, after it has stopped its child. A child that announces another wire version is fatal: Run
+// returns that error. A binary that does not exist is not: like any spawn
+// failure it is logged and retried after the backoff, so that a binary
+// installed later is picked up. Run may be called once.
 func (t *Thumbnailer) Run(ctx context.Context) error {
 	if !t.running.CompareAndSwap(false, true) {
 		return errors.New("transcode: thumbnailer: run: called twice")
@@ -195,9 +195,7 @@ func (t *Thumbnailer) Run(ctx context.Context) error {
 
 func (s *thumbRun) loop(ctx context.Context, sub *hub.Sub) error {
 	t := s.t
-	if err := s.spawn(); err != nil {
-		return err
-	}
+	s.spawn()
 	for {
 		var done, hello <-chan struct{}
 		if s.c != nil {
@@ -227,9 +225,7 @@ func (s *thumbRun) loop(ctx context.Context, sub *hub.Sub) error {
 			}
 		case <-s.respawn:
 			s.respawn = nil
-			if err := s.spawn(); err != nil {
-				return err
-			}
+			s.spawn()
 		}
 	}
 }
@@ -283,23 +279,20 @@ func (s *thumbRun) checkSilence() {
 	c.kill()
 }
 
-// spawn starts a child. A binary that does not exist is fatal; any other
-// failure counts as an exit.
-func (s *thumbRun) spawn() error {
+// spawn starts a child. A failure, a binary that does not exist included,
+// counts as an exit and schedules a respawn after the backoff, as the
+// Transcoder's spawn does.
+func (s *thumbRun) spawn() {
 	t := s.t
 	t.update(func(st *ThumbnailerStats) { st.Spawns++ })
 	c, err := t.startChild(&s.wg)
 	if err != nil {
-		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
-			return err // startProc's: "transcode: spawn: …"
-		}
 		t.update(func(st *ThumbnailerStats) { st.Exits++ })
 		t.log.Warn("transcode: thumbnailer: spawn failed", "err", err)
 		s.respawn = t.opt.After(s.backoff.next(0))
-		return nil
+		return
 	}
 	s.c = c
-	return nil
 }
 
 // exited handles the end of the current child: a fatal error ends Run, any

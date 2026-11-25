@@ -448,8 +448,10 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   child that blocks for `InputStallTimeout` (10 s) kills it with the cause
   "input stalled", where progress is the child's own report (`Stats.In`
   rising, or any Frame output), not completed host writes (rulings R-T5d and
-  R-T5e). A dead child is respawned with backoff; a missing binary or a version
-  mismatch ends `Run` with an error.
+  R-T5e). A dead child, and a child that cannot be started (a missing
+  binary included, so that a binary installed later is picked up), is
+  respawned with backoff (250 ms doubling to 5 s), each failure logged and
+  counted as an exit; a version mismatch ends `Run` with an error.
 - **Decoder errors.** Corrupt input frames, audio and video, are skipped and
   counted (`AudioCorrupt`, `VideoCorrupt`); a decoder fails the pipeline only
   after 50 consecutive corrupt frames (ruling R-T4b). Encoder errors stay
@@ -553,9 +555,10 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   child. The Thumbnailer supervises its child: a
   child without Hello after `HelloTimeout` (10 s), or silent after Hello
   for `SilenceTimeout` (10 s; it sends `Stats` every second), is killed; a
-  child that exits is respawned with backoff (250 ms doubling to 5 s), and
-  the schedule is reset; a missing binary or a wire-version mismatch ends
-  `Run` with an error.
+  child that exits, or cannot be started (a missing binary included), is
+  respawned with backoff (250 ms doubling to 5 s), as the Transcoder's is,
+  and the schedule is reset; a wire-version mismatch ends `Run` with an
+  error.
 - **Build.** FFmpeg 8.1.3 shared, GPL, comes from a pinned FFmpeg-Builds
   release instead of a compiled builder image (ruling R-M4b): release
   `autobuild-2026-10-31-12-59`, archives
