@@ -1448,7 +1448,7 @@
         "properties": {
           "id": {
             "type": "string",
-            "description": "The first 8 hex digits of the SHA-256 of the URL: the target label of the metrics."
+            "description": "The first 8 hex digits of a keyed tag of the URL, which changes when the server restarts: the target label of the metrics."
           },
           "target": {
             "type": "string",

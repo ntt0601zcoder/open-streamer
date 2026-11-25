@@ -95,7 +95,7 @@ func TestSupervisorLadderNames(t *testing.T) {
 	r := newRig(t)
 	fakeChild(t, &r.env)
 	s := r.start(ladderSpec("720", "360"))
-	waitState(t, s, "running")
+	waitRunning(t, s)
 	v := s.View()
 	names := []string{"cam", "cam_360", "cam_720"}
 	assert.Equal(t, names, slices.Sorted(maps.Keys(v.Single)))
@@ -189,7 +189,7 @@ func TestSupervisorOutputEditInPlace(t *testing.T) {
 	urlA, urlB := sinkA.URL("live/"+vKey+"a"), sinkB.URL("live/"+vKey+"b")
 	sp.Outputs.Push = []spec.Push{{URL: urlA}, {URL: urlB}}
 	s := r.start(sp)
-	waitState(t, s, "running")
+	waitRunning(t, s)
 	v := s.View()
 	h := v.Single["cam"]
 	require.Eventually(t, func() bool {
@@ -322,7 +322,7 @@ func TestSupervisorRebuildOnOtherEdits(t *testing.T) {
 	r := newRig(t)
 	sp := camSpec()
 	s := r.start(sp)
-	waitState(t, s, "running")
+	waitRunning(t, s)
 	old := s.View()
 
 	next := sp
@@ -436,7 +436,7 @@ func TestSupervisorInputLoss(t *testing.T) {
 	assert.Regexp(t, `^input 0: .*connection reset`, s.Status().LastError)
 
 	r.sc.set(func(s *script) { s.readErr, s.openErr = nil, nil })
-	waitState(t, s, "running")
+	waitRunning(t, s)
 	assert.Equal(t, float64(1), metric(t, s, "openstreamer_stream_up", "stream", "cam"))
 	assert.Equal(t, uint64(1), s.View().Gen)
 	assert.Zero(t, s.Status().Restarts)
@@ -583,7 +583,7 @@ func TestSupervisorAssetGone(t *testing.T) {
 	sp := ladderSpec("720")
 	sp.Transcode.Watermark = &spec.Watermark{Image: "logo.png"}
 	s := r.start(sp)
-	waitState(t, s, "running")
+	waitRunning(t, s)
 	first := s.View()
 	g := currentGen(s)
 
@@ -1140,7 +1140,7 @@ func TestSupervisorShot(t *testing.T) {
 			r := newRig(t)
 			fakeChild(t, &r.env, transcodetest.EnvShots+"=1", transcodetest.EnvStatsInterval+"=50ms")
 			s := r.start(row.sp)
-			waitState(t, s, "running")
+			waitRunning(t, s)
 			g := currentGen(s)
 			assert.Equal(t, row.thumbnails, g.nailer != nil)
 			require.Eventually(t, func() bool {

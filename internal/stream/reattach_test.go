@@ -80,7 +80,7 @@ func TestSupervisorPackagerEdit(t *testing.T) {
 	r := newRig(t)
 	sp := camSpec()
 	s := r.start(sp)
-	waitState(t, s, "running")
+	waitRunning(t, s)
 	v := s.View()
 	h := v.Single["cam"]
 	session := tap(t, h, "rtmp cam")

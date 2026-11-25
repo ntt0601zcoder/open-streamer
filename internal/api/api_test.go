@@ -829,3 +829,29 @@ func TestPanicAfterTheHeader(t *testing.T) {
 	}
 	require.Error(t, err, "the connection is aborted")
 }
+
+// TestPanicAfterAFlush: a flush alone sends the header, so a panic after it
+// aborts the connection and appends no error document.
+func TestPanicAfterAFlush(t *testing.T) {
+	e := newEnv(t)
+	a, err := New(Options{
+		Backend: e.be, Users: func() *auth.Users { return e.users.Load() }, Limiter: e.lim,
+		Metrics: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.(http.Flusher).Flush()
+			panic("broke after the flush")
+		}),
+	})
+	require.NoError(t, err)
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil)
+	r.SetBasicAuth("eye", viPass)
+	rec := httptest.NewRecorder()
+	assert.PanicsWithValue(t, http.ErrAbortHandler, func() { a.ServeHTTP(rec, r) })
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.True(t, rec.Flushed)
+	assert.Empty(t, rec.Body.String(), "no 500 document after the header went out")
+
+	w := &recorder{ResponseWriter: httptest.NewRecorder(), code: http.StatusTeapot}
+	w.Flush()
+	assert.True(t, w.wrote)
+	assert.Equal(t, http.StatusOK, w.code)
+}

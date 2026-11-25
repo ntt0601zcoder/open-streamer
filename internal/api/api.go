@@ -267,8 +267,12 @@ func (r *recorder) Write(b []byte) (int, error) {
 // Unwrap is for http.ResponseController.
 func (r *recorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
-// Flush is for the handlers that stream (pprof).
+// Flush is for the handlers that stream (pprof). A flush sends the header,
+// so it counts as written: a panic after it aborts the connection.
 func (r *recorder) Flush() {
+	if !r.wrote {
+		r.code, r.wrote = http.StatusOK, true
+	}
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}

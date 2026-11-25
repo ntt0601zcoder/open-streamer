@@ -375,6 +375,18 @@ func waitState(t testing.TB, s *Supervisor, state string) {
 		"state %q, want %q (last error %q)", s.Status().State, state, s.Status().LastError)
 }
 
+// waitRunning waits until s is running and its View is that of the running
+// generation. Status says "running" a moment before the View is published,
+// so a test that reads the View next waits with this, not with waitState.
+func waitRunning(t testing.TB, s *Supervisor) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		st, v := s.Status(), s.View()
+		return st.State == "running" && v.Gen != 0 && v.Gen == st.Generation
+	}, waitFor, time.Millisecond,
+		"state %q, generation %d, view %d (last error %q)", s.Status().State, s.Status().Generation, s.View().Gen, s.Status().LastError)
+}
+
 // waitGen waits until s serves generation gen.
 func waitGen(t testing.TB, s *Supervisor, gen uint64) {
 	t.Helper()
