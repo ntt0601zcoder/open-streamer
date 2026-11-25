@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"maps"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/transcodetest"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/wire"
 )
@@ -1651,4 +1653,298 @@ func TestNewEncoderValidation(t *testing.T) {
 		require.NoError(t, wire.NewWriter(&buf).Write(sentConfigure(t, opt)))
 		assert.Equal(t, m4b, hex.EncodeToString(buf.Bytes()), "encoder %q", enc)
 	}
+}
+
+// logLines returns the lines of a fake child's log file; none while it does
+// not exist.
+func logLines(t *testing.T, path string) []string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	require.NoError(t, err)
+	return strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+}
+
+// waitLog waits until the log at path is exactly want.
+func waitLog(t *testing.T, path string, want ...string) {
+	t.Helper()
+	if !assert.Eventually(t, func() bool { return slices.Equal(logLines(t, path), want) }, 10*time.Second, time.Millisecond) {
+		require.Equal(t, want, logLines(t, path))
+	}
+}
+
+// watermarkLog adds the fake child's watermark log to opt and returns its
+// path.
+func watermarkLog(t *testing.T, opt *Options) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "watermark.log")
+	opt.Env = append(opt.Env, transcodetest.EnvWatermarkLog+"="+path)
+	return path
+}
+
+// end closes the source and waits for Run, so that the child has been sent
+// everything queued for it.
+func (s *session) end(t *testing.T) {
+	t.Helper()
+	s.src.Close()
+	select {
+	case err := <-s.errc:
+		require.NoError(t, err)
+		s.errc <- nil
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run did not return after the source closed")
+	}
+}
+
+func text(s string) *picture.Watermark { return &picture.Watermark{Text: s} }
+
+// A watermark cannot be drawn on a rendition that copies its video (R-C5).
+func TestWatermarkRejectsCopyRung(t *testing.T) {
+	src := hub.New(hub.Options{})
+	ladder := []Rendition{encode240, copySrc}
+	const want = `rendition "src" copies video and cannot carry the watermark`
+	_, err := New(src, Options{Binary: "x", Renditions: ladder, Watermark: text("live")})
+	require.EqualError(t, err, "transcode: new: "+want)
+	tr, err := New(src, Options{Binary: "x", Renditions: ladder})
+	require.NoError(t, err)
+	require.EqualError(t, tr.SetWatermark(text("live")), "transcode: set watermark: "+want)
+	require.NoError(t, tr.SetWatermark(nil), "no watermark is fine with a copy rung")
+
+	// One that does not validate is refused the same way, and changes
+	// nothing.
+	_, err = New(src, Options{Binary: "x", Renditions: []Rendition{encode240}, Watermark: &picture.Watermark{}})
+	require.EqualError(t, err, "transcode: new: watermark: neither text nor image")
+	tr, err = New(src, Options{Binary: "x", Renditions: []Rendition{encode240}, Watermark: text("kept")})
+	require.NoError(t, err)
+	require.EqualError(t, tr.SetWatermark(text("50%")), "transcode: set watermark: watermark: text ends in a lone %")
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	assert.Equal(t, text("kept"), tr.watermark)
+	assert.Zero(t, tr.watermarkVersion)
+}
+
+func TestWatermarkInConfigure(t *testing.T) {
+	opt := fakeOptions(t)
+	opt.Renditions = []Rendition{encode240}
+	opt.Watermark = text("hello world %H:%M")
+	log := watermarkLog(t, &opt)
+	s := start(t, opt)
+	waitLog(t, log, "configure text:hello world %H:%M")
+	s.end(t)
+	assert.Equal(t, []string{"configure text:hello world %H:%M"}, logLines(t, log))
+}
+
+func TestSetWatermarkReachesChild(t *testing.T) {
+	opt := fakeOptions(t)
+	opt.Renditions = []Rendition{encode240}
+	log := watermarkLog(t, &opt)
+	s := start(t, opt)
+	waitLog(t, log, "configure none")
+	require.NoError(t, s.tr.SetWatermark(text("live")))
+	waitLog(t, log, "configure none", "set text:live")
+	require.NoError(t, s.tr.SetWatermark(nil))
+	waitLog(t, log, "configure none", "set text:live", "set none")
+	s.end(t)
+	assert.Equal(t, []string{"configure none", "set text:live", "set none"}, logLines(t, log))
+}
+
+func TestSetWatermarkLatestWins(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	// Before the child is spawned: its Configure carries the last call's,
+	// and nothing is set afterwards.
+	t.Run("before the child", func(t *testing.T) {
+		opt := fakeOptions(t)
+		opt.Renditions = []Rendition{encode240}
+		log := watermarkLog(t, &opt)
+		s := startWith(t, opt, func(tr *Transcoder) {
+			for _, w := range []string{"first", "second", "third"} {
+				require.NoError(t, tr.SetWatermark(text(w)))
+			}
+		})
+		s.feed(t, steps, 0)
+		assert.Equal(t, []string{"configure text:third"}, logLines(t, log))
+	})
+	// The writer is held before its snapshot while Run handles the hello
+	// event: Run sends nothing for a child without a recorded version, and
+	// a call made there is in the Configure.
+	t.Run("before the snapshot", func(t *testing.T) {
+		opt := fakeOptions(t)
+		opt.Renditions = []Rendition{encode240}
+		log := watermarkLog(t, &opt)
+		reached, hold := make(chan struct{}), make(chan struct{})
+		s := startWith(t, opt, func(tr *Transcoder) {
+			for _, w := range []string{"first", "second", "third"} {
+				require.NoError(t, tr.SetWatermark(text(w)))
+			}
+			tr.beforeConfigure = func(*child) {
+				close(reached)
+				<-hold
+			}
+		})
+		<-reached
+		// Frames are queued for the child only once Run has handed over on
+		// its Hello; before, they go to the backlog.
+		ctx, cancel := context.WithCancel(t.Context())
+		played := play(ctx, s.src, steps, 1, false)
+		require.Eventually(t, func() bool { return s.tr.Stats().MaxQueued > 0 }, 10*time.Second, time.Millisecond)
+		cancel()
+		<-played
+		require.NoError(t, s.tr.SetWatermark(text("fourth")))
+		time.Sleep(20 * time.Millisecond) // Run takes the wake, and must send nothing
+		close(hold)
+		s.end(t)
+		assert.Equal(t, []string{"configure text:fourth"}, logLines(t, log))
+	})
+	// While a child runs and its writer is blocked: the calls collapse or
+	// follow each other in order, and the last set is the last call's.
+	t.Run("while the queue is blocked", func(t *testing.T) {
+		opt := fakeOptions(t)
+		opt.Renditions = []Rendition{encode240}
+		log := watermarkLog(t, &opt)
+		reached, hold := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		s := startWith(t, opt, func(tr *Transcoder) {
+			tr.writeMsg = func(c *child, m wire.Message) error {
+				if _, ok := m.(wire.Frame); ok {
+					once.Do(func() {
+						close(reached)
+						<-hold
+					})
+				}
+				return c.w.Write(m)
+			}
+		})
+		ctx, cancel := context.WithCancel(t.Context())
+		played := play(ctx, s.src, steps, 1, false)
+		<-reached
+		cancel()
+		<-played
+		calls := []string{"first", "second", "third"}
+		for _, w := range calls {
+			require.NoError(t, s.tr.SetWatermark(text(w)))
+			time.Sleep(time.Millisecond)
+		}
+		close(hold)
+		s.end(t)
+		lines := logLines(t, log)
+		require.GreaterOrEqual(t, len(lines), 2, "%v", lines)
+		require.LessOrEqual(t, len(lines), 4, "%v", lines)
+		assert.Equal(t, "configure none", lines[0])
+		last := -1
+		for _, l := range lines[1:] {
+			i := slices.Index(calls, strings.TrimPrefix(l, "set text:"))
+			require.GreaterOrEqual(t, i, 0, "%v", lines)
+			assert.Greater(t, i, last, "a later line carries an older watermark: %v", lines)
+			last = i
+		}
+		assert.Equal(t, "set text:third", lines[len(lines)-1])
+	})
+}
+
+// A call that lands after the writer's snapshot, whether or not Run has
+// handled the hello event, becomes exactly one set; one that lands before
+// it is in the Configure and is not set again.
+func TestSetWatermarkBetweenConfigureAndHello(t *testing.T) {
+	t.Run("after the Configure is written", func(t *testing.T) {
+		opt := fakeOptions(t)
+		opt.Renditions = []Rendition{encode240}
+		log := watermarkLog(t, &opt)
+		reached, hold := make(chan struct{}), make(chan struct{})
+		s := startWith(t, opt, func(tr *Transcoder) {
+			tr.writeMsg = func(c *child, m wire.Message) error {
+				err := c.w.Write(m)
+				if _, ok := m.(wire.Configure); ok {
+					close(reached)
+					<-hold
+				}
+				return err
+			}
+		})
+		<-reached
+		require.NoError(t, s.tr.SetWatermark(text("live")))
+		close(hold)
+		s.end(t)
+		assert.Equal(t, []string{"configure none", "set text:live"}, logLines(t, log))
+	})
+	t.Run("at a random moment", func(t *testing.T) {
+		opt := fakeOptions(t)
+		opt.Renditions = []Rendition{encode240}
+		opt.Logger = nil
+		dir := t.TempDir()
+		inConfigure, set := 0, 0
+		for i := range 200 {
+			log := filepath.Join(dir, strconv.Itoa(i))
+			o := opt
+			o.Env = append(slices.Clone(opt.Env), transcodetest.EnvWatermarkLog+"="+log)
+			src := hub.New(hub.Options{})
+			tr, err := New(src, o)
+			require.NoError(t, err)
+			reached := make(chan struct{})
+			// The writer and the caller both wait a random moment from the
+			// same point, just before the snapshot.
+			writer, caller := time.Duration(rand.IntN(200))*time.Microsecond, time.Duration(rand.IntN(200))*time.Microsecond
+			tr.beforeConfigure = func(*child) {
+				close(reached)
+				time.Sleep(writer)
+			}
+			errc := make(chan error, 1)
+			go func() { errc <- tr.Run(t.Context()) }()
+			<-reached
+			time.Sleep(caller)
+			require.NoError(t, tr.SetWatermark(text("live")))
+			src.Close()
+			require.NoError(t, <-errc)
+			switch lines := logLines(t, log); {
+			case slices.Equal(lines, []string{"configure text:live"}):
+				inConfigure++
+			case slices.Equal(lines, []string{"configure none", "set text:live"}):
+				set++
+			default:
+				t.Fatalf("run %d: the child's watermark log is %q", i, lines)
+			}
+		}
+		t.Logf("in the Configure %d times, set %d times", inConfigure, set)
+	})
+}
+
+// A watermark set while a child ran is in the next child's Configure.
+func TestWatermarkSurvivesRespawn(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	opt := fakeOptions(t, crashOnce(t, 30)...)
+	opt.Renditions = []Rendition{encode240}
+	log := watermarkLog(t, &opt)
+	s := start(t, opt)
+	waitLog(t, log, "configure none")
+	require.NoError(t, s.tr.SetWatermark(text("live")))
+	waitLog(t, log, "configure none", "set text:live")
+	s.feed(t, steps, 4)
+	assert.EqualValues(t, 2, s.tr.Stats().Spawns)
+	assert.Equal(t, []string{"configure none", "set text:live", "configure text:live"}, logLines(t, log))
+}
+
+func TestSetWatermarkBeforeAndAfterRun(t *testing.T) {
+	opt := fakeOptions(t)
+	opt.Renditions = []Rendition{encode240}
+	log := watermarkLog(t, &opt)
+	src := hub.New(hub.Options{})
+	tr, err := New(src, opt)
+	require.NoError(t, err)
+	// Before Run: more calls than the wake channel holds.
+	for _, w := range []string{"a", "b", "before"} {
+		require.NoError(t, tr.SetWatermark(text(w)))
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- tr.Run(t.Context()) }()
+	waitLog(t, log, "configure text:before")
+	src.Close()
+	require.NoError(t, <-errc)
+	// After Run: nothing reads the wake channel any more.
+	for _, w := range []string{"c", "d", "after"} {
+		require.NoError(t, tr.SetWatermark(text(w)))
+	}
+	require.NoError(t, tr.SetWatermark(nil))
+	require.Error(t, tr.SetWatermark(&picture.Watermark{}))
+	assert.Equal(t, []string{"configure text:before"}, logLines(t, log))
 }

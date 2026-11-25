@@ -78,6 +78,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/wire"
 )
 
@@ -146,6 +147,9 @@ type Options struct {
 	Audio      Audio
 	// Presentation adds the presentation hub (see Presentation).
 	Presentation bool
+	// Watermark is drawn on every encoded picture; nil means none. No
+	// rendition may then copy its video. SetWatermark replaces it.
+	Watermark *picture.Watermark
 
 	Queue int // source subscription queue; 0 means 1024
 
@@ -264,13 +268,21 @@ type Transcoder struct {
 	anchors anchorStore
 
 	needChild  bool
-	encodeIdx  []int // rung index → rendition index
-	copyVideo  []int // renditions that copy video
+	encodeIdx  []int    // rung index → rendition index
+	copyVideo  []int    // renditions that copy video
+	copyNames  []string // their names
 	configure  wire.Configure
 	childVideo bool
 
 	// writeMsg writes m to c; nil means c.w.Write. Tests replace it.
 	writeMsg func(c *child, m wire.Message) error
+	// beforeConfigure, when set by a test, is called by c's writer after
+	// c's Hello and before the writer snapshots the watermark.
+	beforeConfigure func(c *child)
+
+	// wake tells the Run goroutine to look at the watermark versions. It
+	// holds one token and every send is non-blocking.
+	wake chan struct{}
 
 	running  atomic.Bool
 	childOut atomic.Uint64 // frames received from children
@@ -278,6 +290,12 @@ type Transcoder struct {
 
 	mu    sync.Mutex
 	stats Stats
+	// The watermark the children are to draw, and its version, raised by
+	// every SetWatermark. A child's Configure carries the watermark of the
+	// version its writer records in child.watermarkVersion; Run brings a
+	// child that has a version up to the current one with wire.SetWatermark.
+	watermark        *picture.Watermark
+	watermarkVersion uint64
 }
 
 // New validates opt and returns a Transcoder whose rendition hubs are open.
@@ -289,7 +307,7 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 	if len(opt.Renditions) == 0 {
 		return nil, errors.New("transcode: new: no rendition")
 	}
-	t := &Transcoder{src: src}
+	t := &Transcoder{src: src, wake: make(chan struct{}, 1)}
 	names := map[string]bool{}
 	for i, r := range opt.Renditions {
 		if r.Name == "" || names[r.Name] {
@@ -333,6 +351,14 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 	}
 	t.childVideo = len(t.encodeIdx) > 0
 	t.needChild = t.childVideo || !opt.Audio.Copy
+	t.copyNames = make([]string, len(t.copyVideo))
+	for j, i := range t.copyVideo {
+		t.copyNames[j] = opt.Renditions[i].Name
+	}
+	if err := t.checkWatermark(opt.Watermark); err != nil {
+		return nil, fmt.Errorf("transcode: new: %w", err)
+	}
+	t.watermark = cloneWatermark(opt.Watermark)
 	if t.needChild {
 		if !spawnSupported {
 			return nil, fmt.Errorf("transcode: new: %w", errors.ErrUnsupported)
@@ -390,6 +416,59 @@ func wireEncoder(v Video) (string, error) {
 		return EncoderNVENC, nil
 	default:
 		return "", fmt.Errorf("encoder %q is not x264 or nvenc", v.Encoder)
+	}
+}
+
+// checkWatermark reports why w cannot be the transcoder's watermark: it
+// does not validate, or a rendition copies its video (ruling R-C5). A nil w,
+// no watermark, always can.
+func (t *Transcoder) checkWatermark(w *picture.Watermark) error {
+	if w == nil {
+		return nil
+	}
+	if err := w.Validate(); err != nil {
+		return err // the callers wrap it
+	}
+	if len(t.copyNames) > 0 {
+		return fmt.Errorf("rendition %q copies video and cannot carry the watermark", t.copyNames[0])
+	}
+	return nil
+}
+
+// cloneWatermark copies w, so that the caller may change its own.
+func cloneWatermark(w *picture.Watermark) *picture.Watermark {
+	if w == nil {
+		return nil
+	}
+	c := *w
+	c.Image = slices.Clone(w.Image)
+	return &c
+}
+
+// SetWatermark replaces the watermark drawn on every encoded picture; nil
+// removes it. It validates w as New does, and an error changes nothing. The
+// running child is told in order with its frames, and a child spawned later
+// starts with it; calls that pile up collapse to the latest. It is safe
+// from any goroutine, also before Run and after Run has ended.
+func (t *Transcoder) SetWatermark(w *picture.Watermark) error {
+	if err := t.checkWatermark(w); err != nil {
+		return fmt.Errorf("transcode: set watermark: %w", err)
+	}
+	w = cloneWatermark(w)
+	t.mu.Lock()
+	t.watermark = w
+	t.watermarkVersion++
+	t.mu.Unlock()
+	t.wakeRun()
+	return nil
+}
+
+// wakeRun asks the Run goroutine to look at the watermark versions. It
+// never blocks: a token already waiting does for every caller.
+func (t *Transcoder) wakeRun() {
+	select {
+	case t.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -536,6 +615,9 @@ func (s *run) loop(sub *hub.Sub) error {
 		case <-hello:
 			s.c.handOver()
 			s.r.childHello()
+			s.syncWatermark()
+		case <-t.wake:
+			s.syncWatermark()
 		case <-done:
 			if err := s.exited(); err != nil {
 				return err
@@ -545,6 +627,43 @@ func (s *run) loop(sub *hub.Sub) error {
 			s.spawn()
 		}
 	}
+}
+
+// syncWatermark brings the current child up to the current watermark, at
+// its hello event and after every wake.
+//
+// A child's writer snapshots the watermark and its version into the
+// child's Configure and records that version, under the transcoder's mutex.
+// Until it has, Run sends nothing: the reader closes helloOK and then
+// signals Run, so Run may get here before the writer, whose snapshot, still
+// to come, will carry the current watermark. Once the child has a version
+// that is not the current one, Run sends the current watermark in order
+// with the frames and, only if it was queued, records the version it read
+// together with that watermark; a call that landed while toChild waited has
+// left its own wake. The writer wakes Run after its snapshot, so a call
+// that landed between Run's look and the snapshot does not wait for the
+// next call. So a call before the snapshot is in the Configure and is never
+// set, and a call after it becomes exactly one set, or collapses into a
+// later one.
+func (s *run) syncWatermark() {
+	t, c := s.t, s.c
+	if c == nil {
+		return // the next child's Configure carries it
+	}
+	t.mu.Lock()
+	configured, has := c.configured, c.watermarkVersion
+	w, cur := t.watermark, t.watermarkVersion
+	t.mu.Unlock()
+	if !configured || has == cur {
+		return
+	}
+	// Never tryChild: a watermark is not droppable.
+	if !s.toChild(wire.SetWatermark{W: w}) {
+		return // the child is going, or its backlog is full: see toChild
+	}
+	t.mu.Lock()
+	c.watermarkVersion = cur
+	t.mu.Unlock()
 }
 
 // spawn starts a child. The first child is fed from the start of the run;
@@ -860,6 +979,12 @@ type child struct {
 	// taking its input.
 	stalled error
 
+	// Under the transcoder's mutex: whether the writer has snapshot the
+	// watermark into this child's Configure, and the version of the
+	// watermark the child has, written by the writer and then by Run.
+	configured       bool
+	watermarkVersion uint64
+
 	// Owned by the writer goroutine: an oversize frame was logged.
 	oversizeLogged bool
 	// Owned by the reader goroutine: an output for an unknown rung was
@@ -1030,7 +1155,18 @@ func (t *Transcoder) writeChild(c *child) {
 	case <-c.exited:
 		return
 	}
-	if err := t.write(c, t.configure); err != nil {
+	if t.beforeConfigure != nil {
+		t.beforeConfigure(c)
+	}
+	// One look at the watermark: what the Configure carries is what the
+	// child is recorded to have.
+	cfg := t.configure
+	t.mu.Lock()
+	cfg.Watermark = t.watermark
+	c.configured, c.watermarkVersion = true, t.watermarkVersion
+	t.mu.Unlock()
+	t.wakeRun()
+	if err := t.write(c, cfg); err != nil {
 		c.kill()
 		return
 	}
