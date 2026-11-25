@@ -381,8 +381,9 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   start of a play, when its re-buffer feeds the video decoder fewer packets
   than its frame-threaded H.264 decoder needs for a second picture: with
   VLC's 6 threads, 8 at reorder depth 1 and 9 at depth 2. Our PCR runs 700 ms
-  behind the DTS, so of the 1000 ms re-buffered only about 300 ms are video
-  of the new segment: 8 access units at 25 fps. It is a limit of VLC 3
+  behind the written DTS (`timeOffset` − `pcrOffset`), so of the 1000 ms
+  re-buffered only about 300 ms are video of the new segment: 8 access units
+  at 25 fps. It is a limit of VLC 3
   reached by a conformant stream, and the line does not stop playback. With
   the pyramid (depth 2) it was logged in 17 of 46 plays on the tree before
   the setting, and in 0 of 16 without it. Depth 1 fits at 25 fps with no
@@ -523,7 +524,8 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   from the decoded picture before the watermark, scaled by swscale to
   full-range YUV 4:2:0 at the display aspect ratio, and encoded with Go's
   `image/jpeg`. The schedule runs in stream time: a shot is due at the first
-  picture, at a new epoch, and when PTS ≥ last shot + interval. Only the
+  picture, at a new epoch, when PTS ≥ last shot + interval, and when PTS is
+  below the last shot's (the stream time went back). Only the
   latest shot is kept, in memory; osdev serves it at
   `GET /live/{stream}/thumbnail.jpg` under the source stream's name. A
   stream still runs one subprocess (R-C10a). Whenever it has a transcoding
@@ -536,10 +538,21 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   the interval is N rounded up to the next keyframe. A full child queue
   skips the keyframe (the next one is tried), never the audio, and a
   keyframe that does not decode alone costs a thumbnail, never the child.
-  Only a stream with no transcoding child (no ladder, or a ladder that
-  copies everything) gets a child of its own, in thumbnail-only mode, run by
-  `transcode.Thumbnailer` on the source hub and fed keyframes only; `New`
-  rejects thumbnails on a ladder that needs no child.
+  The child reports such failures in `Stats`, and the host retries by one
+  rule: the first failure after a success (or after the child's start)
+  resets the schedule, so the next keyframe is tried at once; while failures
+  stay consecutive the schedule stands, so a source whose keyframes never
+  decode alone costs one attempt per interval. The schedule is also reset
+  when the child exits. Only a stream with no transcoding child (no ladder,
+  or a ladder that copies everything) gets a child of its own, in
+  thumbnail-only mode, run by `transcode.Thumbnailer` on the source hub and
+  fed keyframes only; `New` rejects thumbnails on a ladder that needs no
+  child. The Thumbnailer supervises its child: a
+  child without Hello after `HelloTimeout` (10 s), or silent after Hello
+  for `SilenceTimeout` (10 s; it sends `Stats` every second), is killed; a
+  child that exits is respawned with backoff (250 ms doubling to 5 s), and
+  the schedule is reset; a missing binary or a wire-version mismatch ends
+  `Run` with an error.
 - **Build.** FFmpeg 8.1.3 shared, GPL, comes from a pinned FFmpeg-Builds
   release instead of a compiled builder image (ruling R-M4b): release
   `autobuild-2026-10-31-12-59`, archives
@@ -842,37 +855,38 @@ Out of M4b:
 M4c's rulings are in its plan (R-C1 to R-C13 and R-C10a); the design is
 §3.5's NVENC, watermark and thumbnail bullets, and §3.5's keyframes bullet
 states the cause found for R-T7b'. The software scenarios run in CI: the
-`test` job runs them all, and `transcode-e2e-arm64` runs `TestM4cWatermarkEveryRung`,
+`test` job runs them all, and `transcode-e2e-arm64` runs
+`TestM4cWatermarkEveryRung`, `TestM4cWatermarkABR`,
 `TestM4cThumbnailsTranscoded`, `TestM4cThumbnailsPassthrough`,
 `TestM4cThumbnailsCopyVideo` and `TestM4cFrozen`. libx264 does not repeat
 its bytes between runs of the same input (Backlog), so `TestM4cFrozen`
 compares an encoded rung by its PTS, DTS, key flags, epochs, configs and
 x264 options SEI exactly and by its decoded pictures within a mean
-difference of 4 of 255, and the audio and copied video by their bytes.
-The runners have no NVIDIA device: the NVENC scenarios skip there with
-their reason, and both transcoder jobs require the bundle's
-`ostranscoder -probe nvenc` to exit 3 with an `nvenc: ` line. The GPU proof
-is `make test-nvenc` on this host (R-C12): it refuses to start unless
-`nvidia-smi` reports no encoder session and no compute process, runs the
-NVENC scenarios one after another with `OS_REQUIRE_NVENC=1` (at most 3
-sessions open), has VLC 3.0.20 in the peers image play the recorded NVENC
-presentation with B-frames on (`TestM4cNVENCRecordedVLC`), and writes
-`dist/nvenc-report/report.md`. ffprobe 8 does not finish reading the
-two-period live DASH of h264_aac_then_640.ts (ffmpeg's DASH demuxer), so
-that one cell of `TestM4cNVENCMatrix` reads DASH with `conform.ReadDASH`
-instead (no violation, every frame in order with its key flag, DTS equal to
-PTS); every other cell uses ffprobe. The recorded evidence is the body of
-`dist/nvenc-report/report.md` from the run that closed M4c, below, with its
-level-two headings set in bold. It ran at a629ae8 (`ci: run the M4c
-scenarios and the NVENC probe`); its uncommitted changes were only the
-`docs: M4c done` edits of `CLAUDE.md` and this file.
+difference of 4 of 255, and the audio and copied video by their bytes. The
+runners have no NVIDIA device: the NVENC scenarios skip there with their
+reason, and both transcoder jobs require the bundle's `ostranscoder -probe
+nvenc` to exit 3 with an `nvenc: ` line. The GPU proof is `make test-nvenc`
+on this host (R-C12): it refuses to start unless `nvidia-smi` reports no
+encoder session and no compute process, runs the NVENC scenarios one after
+another with `OS_REQUIRE_NVENC=1` (at most 3 sessions open), has VLC 3.0.20
+in the peers image play the recorded NVENC presentation with B-frames on
+(`TestM4cNVENCRecordedVLC`), and writes `dist/nvenc-report/report.md`.
+ffprobe 8 does not finish reading the two-period live DASH of
+h264_aac_then_640.ts (ffmpeg's DASH demuxer), so that one cell of
+`TestM4cNVENCMatrix` reads DASH with `conform.ReadDASH` instead (no
+violation, every frame in order with its key flag, DTS equal to PTS); every
+other cell uses ffprobe. The recorded evidence is the body of
+`dist/nvenc-report/report.md` from the clean-tree run at 9f13022 (Task 11's
+last commit; the same tree was cherry-picked as 219414a), below, with its
+level-two headings set in bold. The same target passed again, 16 of 16 with
+sessions 0, 3 and 0, at a629ae8 when M4c closed.
 
-- Date: 2026-11-25T15:17:17Z
+- Date: 2026-11-25T14:55:56Z
 - GPU: NVIDIA GeForce GTX 1650, 595.99.02, 4096 MiB
 - FFmpeg: ffmpeg-n8.1.3-27-g8dca1586f4-linux64-gpl-shared-8.1.tar.xz
 - ostranscoder: ostranscoder wire 2 libavcodec 62.28.103
-- Commit: a629ae8169013e4fa57ace9b0e7cd0c53bfea2f1 (with uncommitted changes)
-- NVENC sessions: before 0; during (TestM4cNVENCSessions) base=0 peak=3 after=0 (51 polls, 49 before the feed ended at 2026-11-25T15:15:13Z); after 0
+- Commit: 9f13022ac32acd43bc7890c77269a2e200548acd
+- NVENC sessions: before 0; during (TestM4cNVENCSessions) base=0 peak=3 after=0 (51 polls, 49 before the feed ended at 2026-11-25T14:53:52Z); after 0
 - The two-period DASH cell of h264_aac_then_640.ts (TestM4cNVENCMatrix/noB no-reorder) is read with conform instead of ffprobe: ffprobe 8 does not finish reading that MPD.
 
 **NVENC rungs (TestM4cNVENCProbe, h264_aac.ts)**
@@ -889,99 +903,99 @@ nvenc-rung B t120 h264 High 160x120 has_b_frames=1 kbps=146
 **Results**
 
 ```
---- PASS: TestM4cNVENCMatrix (44.53s)
---- PASS: TestM4cNVENCProbe (14.48s)
---- PASS: TestM4cNVENCSessions (13.06s)
---- PASS: TestM4cNVENCMixed (7.33s)
---- PASS: TestM4cNVENCLongGOP (32.04s)
---- PASS: TestM4cNVENCWatermarkThumbnails (25.57s)
---- PASS: TestM4cNVENCKeep (27.54s)
+--- PASS: TestM4cNVENCMatrix (44.72s)
+--- PASS: TestM4cNVENCProbe (14.39s)
+--- PASS: TestM4cNVENCSessions (13.12s)
+--- PASS: TestM4cNVENCMixed (7.29s)
+--- PASS: TestM4cNVENCLongGOP (31.91s)
+--- PASS: TestM4cNVENCWatermarkThumbnails (25.58s)
+--- PASS: TestM4cNVENCKeep (27.76s)
 --- PASS: TestNVENCOptions (0.00s)
---- PASS: TestNVENCFallback (0.39s)
+--- PASS: TestNVENCFallback (0.35s)
 --- PASS: TestNVENCMissingEncoder (0.06s)
---- PASS: TestNVENCRung (0.89s)
---- PASS: TestNVENCBFrames (0.85s)
---- PASS: TestNVENCMixedLadder (1.05s)
---- PASS: TestNVENCAcrossConfigChange (1.01s)
---- PASS: TestProbeNVENC (0.23s)
+--- PASS: TestNVENCRung (0.86s)
+--- PASS: TestNVENCBFrames (0.84s)
+--- PASS: TestNVENCMixedLadder (1.06s)
+--- PASS: TestNVENCAcrossConfigChange (0.95s)
+--- PASS: TestProbeNVENC (0.22s)
 --- PASS: TestM4cNVENCRecordedVLC (20.34s)
 ```
 
 <details><summary>Subtests</summary>
 
 ```
-    --- PASS: TestM4cNVENCMatrix/noB (28.07s)
-        --- PASS: TestM4cNVENCMatrix/noB/transcode (28.07s)
-            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_aac.ts (6.55s)
-            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_aac_then_640.ts (8.55s)
-            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_aac_nob.ts (6.45s)
-            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_pyramid.ts (6.51s)
-        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_pyramid.ts (0.65s)
-        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_aac_nob.ts (0.66s)
-        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_aac.ts (0.70s)
-        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_aac_then_640.ts (0.87s)
-        --- PASS: TestM4cNVENCMatrix/noB/t180 (0.01s)
-            --- PASS: TestM4cNVENCMatrix/noB/t180/no-bframes (0.25s)
-            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_pyramid.ts (0.57s)
-            --- PASS: TestM4cNVENCMatrix/noB/t180/steady-state (0.18s)
-            --- PASS: TestM4cNVENCMatrix/noB/t180/epoch-change (0.24s)
-            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_aac_nob.ts (0.61s)
-            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_aac.ts (0.56s)
-            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_aac_then_640.ts (0.52s)
+    --- PASS: TestM4cNVENCMatrix/noB (28.12s)
+        --- PASS: TestM4cNVENCMatrix/noB/transcode (28.11s)
+            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_aac.ts (6.54s)
+            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_aac_then_640.ts (8.60s)
+            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_aac_nob.ts (6.47s)
+            --- PASS: TestM4cNVENCMatrix/noB/transcode/h264_pyramid.ts (6.50s)
+        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_pyramid.ts (0.61s)
+        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_aac.ts (0.66s)
+        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_aac_nob.ts (0.72s)
+        --- PASS: TestM4cNVENCMatrix/noB/ladder/h264_aac_then_640.ts (0.82s)
+        --- PASS: TestM4cNVENCMatrix/noB/t180 (0.02s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/steady-state (0.21s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_aac_then_640.ts (0.55s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-bframes (0.22s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_pyramid.ts (0.60s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/epoch-change (0.26s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_aac_nob.ts (0.63s)
+            --- PASS: TestM4cNVENCMatrix/noB/t180/no-reorder/h264_aac.ts (0.58s)
         --- PASS: TestM4cNVENCMatrix/noB/src (0.01s)
-            --- PASS: TestM4cNVENCMatrix/noB/src/steady-state (0.22s)
             --- PASS: TestM4cNVENCMatrix/noB/src/no-bframes (0.23s)
-            --- PASS: TestM4cNVENCMatrix/noB/src/epoch-change (0.37s)
-            --- PASS: TestM4cNVENCMatrix/noB/src/b-frames (1.44s)
-        --- PASS: TestM4cNVENCMatrix/noB/t240 (0.01s)
-            --- PASS: TestM4cNVENCMatrix/noB/t240/no-bframes (0.24s)
-            --- PASS: TestM4cNVENCMatrix/noB/t240/epoch-change (0.31s)
-            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_aac_then_640.ts (0.55s)
+            --- PASS: TestM4cNVENCMatrix/noB/src/steady-state (0.26s)
+            --- PASS: TestM4cNVENCMatrix/noB/src/epoch-change (0.33s)
+            --- PASS: TestM4cNVENCMatrix/noB/src/b-frames (1.39s)
+        --- PASS: TestM4cNVENCMatrix/noB/t240 (0.02s)
             --- PASS: TestM4cNVENCMatrix/noB/t240/steady-state (0.27s)
-            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_aac.ts (0.63s)
-            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_aac_nob.ts (0.67s)
-            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_pyramid.ts (0.68s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-bframes (0.27s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_pyramid.ts (0.59s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_aac_then_640.ts (0.57s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/epoch-change (0.33s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_aac.ts (0.60s)
+            --- PASS: TestM4cNVENCMatrix/noB/t240/no-reorder/h264_aac_nob.ts (0.61s)
         --- PASS: TestM4cNVENCMatrix/noB/t120 (0.02s)
-            --- PASS: TestM4cNVENCMatrix/noB/t120/epoch-change (0.16s)
-            --- PASS: TestM4cNVENCMatrix/noB/t120/no-bframes (0.16s)
-            --- PASS: TestM4cNVENCMatrix/noB/t120/steady-state (0.12s)
-            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_pyramid.ts (0.47s)
-            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_aac_then_640.ts (0.40s)
-            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_aac.ts (0.42s)
-            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_aac_nob.ts (0.50s)
-    --- PASS: TestM4cNVENCMatrix/B (13.03s)
-        --- PASS: TestM4cNVENCMatrix/B/transcode (13.03s)
-            --- PASS: TestM4cNVENCMatrix/B/transcode/h264_pyramid.ts (6.49s)
-            --- PASS: TestM4cNVENCMatrix/B/transcode/h264_aac.ts (6.54s)
-        --- PASS: TestM4cNVENCMatrix/B/ladder/h264_aac.ts (0.58s)
-        --- PASS: TestM4cNVENCMatrix/B/ladder/h264_pyramid.ts (0.59s)
-        --- PASS: TestM4cNVENCMatrix/B/t120 (0.00s)
-            --- PASS: TestM4cNVENCMatrix/B/t120/steady-state (0.21s)
-            --- PASS: TestM4cNVENCMatrix/B/t120/b-frames (1.07s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-bframes (0.13s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/steady-state (0.13s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/epoch-change (0.12s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_aac.ts (0.48s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_aac_then_640.ts (0.39s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_pyramid.ts (0.45s)
+            --- PASS: TestM4cNVENCMatrix/noB/t120/no-reorder/h264_aac_nob.ts (0.46s)
+    --- PASS: TestM4cNVENCMatrix/B (13.05s)
+        --- PASS: TestM4cNVENCMatrix/B/transcode (13.04s)
+            --- PASS: TestM4cNVENCMatrix/B/transcode/h264_pyramid.ts (6.52s)
+            --- PASS: TestM4cNVENCMatrix/B/transcode/h264_aac.ts (6.52s)
+        --- PASS: TestM4cNVENCMatrix/B/ladder/h264_aac.ts (0.57s)
+        --- PASS: TestM4cNVENCMatrix/B/ladder/h264_pyramid.ts (0.57s)
+        --- PASS: TestM4cNVENCMatrix/B/t120 (0.01s)
+            --- PASS: TestM4cNVENCMatrix/B/t120/steady-state (0.20s)
+            --- PASS: TestM4cNVENCMatrix/B/t120/b-frames (1.12s)
+        --- PASS: TestM4cNVENCMatrix/B/t180 (0.01s)
+            --- PASS: TestM4cNVENCMatrix/B/t180/steady-state (0.20s)
+            --- PASS: TestM4cNVENCMatrix/B/t180/b-frames (1.18s)
         --- PASS: TestM4cNVENCMatrix/B/src (0.00s)
-            --- PASS: TestM4cNVENCMatrix/B/src/b-frames (1.08s)
-        --- PASS: TestM4cNVENCMatrix/B/t180 (0.00s)
-            --- PASS: TestM4cNVENCMatrix/B/t180/steady-state (0.29s)
-            --- PASS: TestM4cNVENCMatrix/B/t180/b-frames (1.08s)
+            --- PASS: TestM4cNVENCMatrix/B/src/b-frames (1.22s)
         --- PASS: TestM4cNVENCMatrix/B/t240 (0.01s)
-            --- PASS: TestM4cNVENCMatrix/B/t240/steady-state (0.27s)
-            --- PASS: TestM4cNVENCMatrix/B/t240/b-frames (1.17s)
-    --- PASS: TestM4cNVENCProbe/noB (7.01s)
-        --- PASS: TestM4cNVENCProbe/noB/transcode (6.56s)
-            --- PASS: TestM4cNVENCProbe/noB/transcode/h264_aac.ts (6.56s)
-    --- PASS: TestM4cNVENCProbe/B (6.99s)
-        --- PASS: TestM4cNVENCProbe/B/transcode (6.54s)
-            --- PASS: TestM4cNVENCProbe/B/transcode/h264_aac.ts (6.54s)
+            --- PASS: TestM4cNVENCMatrix/B/t240/steady-state (0.38s)
+            --- PASS: TestM4cNVENCMatrix/B/t240/b-frames (1.30s)
+    --- PASS: TestM4cNVENCProbe/noB (7.00s)
+        --- PASS: TestM4cNVENCProbe/noB/transcode (6.52s)
+            --- PASS: TestM4cNVENCProbe/noB/transcode/h264_aac.ts (6.52s)
+    --- PASS: TestM4cNVENCProbe/B (6.96s)
+        --- PASS: TestM4cNVENCProbe/B/transcode (6.52s)
+            --- PASS: TestM4cNVENCProbe/B/transcode/h264_aac.ts (6.52s)
     --- PASS: TestM4cNVENCMixed/transcode (6.44s)
         --- PASS: TestM4cNVENCMixed/transcode/h264_pyramid.ts (6.44s)
-    --- PASS: TestM4cNVENCKeep/transcode (24.81s)
-        --- PASS: TestM4cNVENCKeep/transcode/h264_aac.ts*4 (24.81s)
-    --- PASS: TestNVENCFallback/one_rung (0.23s)
+    --- PASS: TestM4cNVENCKeep/transcode (24.82s)
+        --- PASS: TestM4cNVENCKeep/transcode/h264_aac.ts*4 (24.82s)
+    --- PASS: TestNVENCFallback/one_rung (0.20s)
     --- PASS: TestNVENCFallback/two_rungs (0.14s)
     --- PASS: TestNVENCBFrames/default_2 (0.31s)
-    --- PASS: TestNVENCBFrames/3 (0.30s)
-    --- PASS: TestM4cNVENCRecordedVLC/index.m3u8 (10.16s)
-    --- PASS: TestM4cNVENCRecordedVLC/v0.m3u8 (10.16s)
+    --- PASS: TestNVENCBFrames/3 (0.29s)
+    --- PASS: TestM4cNVENCRecordedVLC/index.m3u8 (10.17s)
+    --- PASS: TestM4cNVENCRecordedVLC/v0.m3u8 (10.13s)
 ```
 
 </details>
@@ -1152,14 +1166,14 @@ Items accepted for later, not yet placed in a milestone:
   [notes](superpowers/notes/2026-11-25-r-t7b-root-cause.md), `Outcome: (a)`).
   It is a limit of VLC 3 reached by a conformant stream, not a defect in our
   output. At a clock reset at the live edge VLC flushes its decoders and
-  re-buffers 1000 ms of PCR time; with our PCR 700 ms behind the DTS that
-  feeds the decoder about 300 ms of the new segment's video, 8 access units
+  re-buffers 1000 ms of PCR time; with our PCR 700 ms behind the written DTS
+  (`timeOffset` − `pcrOffset` in `internal/ts/mux.go`) that feeds the decoder about 300 ms of the new segment's video, 8 access units
   at 25 fps, and with 6 frame threads libavcodec needs 8 packets for the
   second picture at reorder depth 1 and 9 at depth 2. With 8 fed and 9
   needed the line is logged; playback goes on. Proved both ways on the tree
-  before the setting: on the pyramid with 5 decoder threads, or with the PCR 400 ms behind the DTS,
-  0 of 16; without the pyramid with 7 threads 4 of 16, or with the PCR
-  780 ms behind 16 of 16. The earlier reading is superseded: the copied
+  before the setting: on the pyramid with 5 decoder threads, or with the PCR
+  400 ms behind the DTS, 0 of 16; without the pyramid with 7 threads 4 of
+  16, or with the PCR 780 ms behind, 16 of 16. The earlier reading is superseded: the copied
   source has depth 2 too and passes because, with no encoder lag, its passes
   start without an audio lead, which moves VLC's reset one frame later;
   sliced threads only shortened that lead. `b-pyramid=none` (x264) and
@@ -1167,10 +1181,12 @@ Items accepted for later, not yet placed in a milestone:
   what a viewer sees at a reset, are VLC's side and stay under "Not
   determined" in the notes. Follow-ups: the PCR lead, low frame rates in
   VLC 3 and NVENC reference B-frames, below.
-- **PCR lead (`internal/ts/mux.go`, `pcrOffset`, 700 ms today): proposal to
-  shorten it** (R-T7b'). A shorter lead feeds VLC 3 more video after a
-  live-edge reset: one cell at 400 ms gave 0 of 16 plays with the line on
-  pyramid rungs. Not changed in M4c (controller ruling): it changes every TS
+- **PCR lead: proposal to shorten it** (R-T7b'). In `internal/ts/mux.go`
+  the written DTS is the stream DTS + `timeOffset` (126000) and the PCR is
+  the stream DTS + `pcrOffset` (63000), so the lead = `timeOffset` −
+  `pcrOffset`, 700 ms today; shortening it raises `pcrOffset`. A shorter
+  lead feeds VLC 3 more video after a live-edge reset: one cell at 400 ms
+  (`pcrOffset` 90000) gave 0 of 16 plays with the line on pyramid rungs. Not changed in M4c (controller ruling): it changes every TS
   output and narrows the A/V skew the mux tolerates, and one 16-play cell is
   its only evidence. Weigh those costs, and measure more cells, before
   taking it.
@@ -1374,9 +1390,9 @@ Items accepted for later, not yet placed in a milestone:
   HLS. VLC 3.0.20 and ffprobe play the same output.
 - **libx264 output varies between runs of the same input** (M4c Task 10).
   Two transcodes of the same clip gave byte-identical t180 frames in
-  150 of 150 in one run and 5 to 60 of 150 in others, with every PTS, DTS,
+  150 of 150 in some runs and 5 to 60 of 150 in others, with every PTS, DTS,
   key flag and epoch equal and the decoded pictures within a mean difference
-  of 0.94. libx264 is meant to repeat its output for the same input and
+  under 1 (at most 0.99). libx264 is meant to repeat its output for the same input and
   settings with threads (its `non-deterministic` option is off), so the
   encoder's input may vary between runs (the decoder, the scaler or side
   data). `TestM4cFrozen` and the native rung tests compare encoded rungs by
@@ -1472,6 +1488,42 @@ Items accepted for later, not yet placed in a milestone:
   audio tracks would need per-track checks); `TestM4bSwitchTS` reruns a
   transcode `TestM4bMatrix` already does; `TestM4bRungGap` checks hls-ts
   audio by counts only.
+
+#### M4c deferred minors
+
+- picture: `DecodeImage`'s errors are prefixed `image:`, not `picture:`;
+  `LoadAsset` does not check that the asset is a regular file;
+  `NewSchedule` with an interval of 0 or less is always due (document it);
+  no test for `EncodeJPEG` over `MaxShotBytes` or `ShotSize`'s zero guard;
+  `TimeZone` is validated for image watermarks too, where it is unused.
+- wire: the field numbers of Watermark (5, 6), Thumbnail (1, 3) and Shot
+  (1, 4) are pinned only by round trips (add hex goldens); a watermark text
+  with a newline would split the fake child's log line (the e2e tests use
+  no multi-line text); the fake child's tests duplicate fixtures.
+- merger and rtspplay tests (M4c Task 1): rtspplay's no-H.265 tag check
+  misses a trailing access unit in the drop branch; one `require.Less` is
+  vacuous; the drop rule's audio-only edge is a flake risk; a poller may
+  outlive its test after `Fatal`; `merge.go`'s doc at line 72 is imprecise.
+- native NVENC: no check for options an NVENC open leaves unused;
+  `TestChildEncoderFallbacks` probes, then opens, so a session freed or
+  taken between the two can flip it; the two-rungs subtest of
+  `TestNVENCFallback` would panic on an `IndexFunc` of −1 instead of
+  failing; High profile is not asserted with B-frames on.
+- native thumbnails: in key-only mode, extra video tracks count into
+  `DroppedTracks`.
+- transcode host: `TestShotsFromAudioOnlyChild` proves a negative with a
+  20 ms sleep; an oversize key for the Thumbnailer's child is lost silently
+  after `Took`; a SetWatermark sent while the pre-Hello backlog is full
+  adds 1 to `DroppedBeforeKey`; `KeysSkipped` and `ShotKeysSkipped` count
+  differently (document it); `helloFailed` is missing from the plan's list
+  of shared helpers.
+- osdev: `If-Modified-Since` has 1 s resolution, so a newer shot in the same
+  second can get 304; the thumbnail counters are printed only when not zero;
+  the usage text says opacity is 1-100 while 0 means the default; "until the
+  stream ends" in the doc, while the last shot stays served; the 404 before
+  the first shot of `TestThumbnailHTTP` is proved only by a unit test;
+  `TestThumbnailFromChild` waits 300 ms for a Stats (flake risk).
+- e2e: the watermark's text band check scales with the picture width.
 
 **Note for the user:** make the `transcoder-amd64`, `transcoder-arm64` and
 `transcode-e2e-arm64` CI jobs required checks on the `rebuild` and `main`

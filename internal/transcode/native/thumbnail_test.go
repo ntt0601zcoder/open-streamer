@@ -117,8 +117,9 @@ const rungNoise = 4.0
 
 // requireSameRung checks that rung 0 of outs is rung 0 of plain: the same
 // timing and, picture by picture, the same image within the noise of the
-// encoder. libx264's threads make two runs of the same input differ in a
-// few bits, so the frames cannot be compared byte for byte.
+// encoder. Two runs of the same input can differ in a few bits, probably
+// because the encoder's input varies between runs (see the spec's
+// Backlog), so the frames cannot be compared byte for byte.
 func requireSameRung(t *testing.T, plain, outs []Output) {
 	t.Helper()
 	requireSameTiming(t, rungFrames(plain, 0), rungFrames(outs, 0), "rung 0")

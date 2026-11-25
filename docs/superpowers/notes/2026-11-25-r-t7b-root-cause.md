@@ -35,7 +35,9 @@ pictures in 15 of 16 plays.
    again (`Stream buffering done (1002 ms in 1 ms)`).
 2. **What the decoder is fed.** After the flush the video decoder is fed from
    the new segment's IDR. Our mux writes the PCR 700 ms behind the DTS
-   (`internal/ts/mux.go`, `pcrOffset`), so of the 1000 ms only about 300 ms
+   (`internal/ts/mux.go`: the written DTS is the stream DTS + `timeOffset`,
+   126000, and the PCR the stream DTS + `pcrOffset`, 63000, so the lead is
+   `timeOffset` − `pcrOffset`), so of the 1000 ms only about 300 ms
    are video of the new segment. At 25 fps that was **8 access units** in
    every reset that logged the line, and at least 9 in the others (the
    exact count is only known where the line was logged, see Step 3).
@@ -200,8 +202,8 @@ logged all the same. That is 1 of about 700 resets in the display logs.
 |---|---|---|
 | A (pyramid on) with `--avcodec-threads=5`: second picture after 8 packets | 0 | **0 of 16** (6 resets without a stray picture) |
 | B (pyramid off) with `--avcodec-threads=7`: needs 9 | the line returns | **4 of 16**, in all 4 resets without a stray picture |
-| A with the PCR 400 ms behind the DTS: more video fed, at least 9 packets | 0 | **0 of 16** (4 resets without a stray picture) |
-| B with the PCR 780 ms behind: 5 or 6 slices parsed before the line | the line returns | **16 of 16** |
+| A with the PCR 400 ms behind the DTS (`pcrOffset` 90000): more video fed, at least 9 packets | 0 | **0 of 16** (4 resets without a stray picture) |
+| B with the PCR 780 ms behind (`pcrOffset` 55800): 5 or 6 slices parsed before the line | the line returns | **16 of 16** |
 | HEAD A with `--avcodec-threads=7`: 10 needed | the line returns | **2 of 16**, in 2 of 4 resets without a stray picture |
 
 One change on the decoder's side and one on the stream's each take the line
@@ -276,8 +278,9 @@ the reset lands one frame later, as in C.
   that sliced threads "cured it" are superseded: the copy has depth 2 and
   passes because it has no audio lead, and sliced threads only shorten that
   lead.
-- New Backlog entry, **PCR lead**: proposal to shorten `pcrOffset`
-  (`internal/ts/mux.go`, 700 ms today). Evidence: one cell, 400 ms, 0 of 16
+- New Backlog entry, **PCR lead**: proposal to shorten the lead, which is
+  `timeOffset` − `pcrOffset` (`internal/ts/mux.go`, 700 ms today), so
+  shortening it raises `pcrOffset`. Evidence: one cell, 400 ms, 0 of 16
   with the pyramid. Costs to weigh: every TS output changes and the A/V
   skew tolerance narrows.
 - New Backlog entry, **low frame rates in VLC 3**: at 15 fps with shipping

@@ -843,8 +843,9 @@ func TestM4cThumbnailsCopyVideo(t *testing.T) {
 }
 
 // m4cNoise bounds the mean difference, per channel 0..255, between two
-// encodes of the same picture: libx264's threads make two runs of the same
-// input differ in a few bits (as the native tests' rungNoise).
+// encodes of the same picture: two runs of the same input can differ in a
+// few bits, probably because the encoder's input varies between runs (see
+// the spec's Backlog; as the native tests' rungNoise).
 const m4cNoise = 4.0
 
 // TestM4cFrozen transcodes h264_aac.ts through m4aLadder twice, once as M4b
@@ -852,10 +853,11 @@ const m4cNoise = 4.0
 // spelled out on every encoded rung. Per rendition and track, the frames
 // have the same PTS, DTS, Key, Epoch and Config (codec, size, VPS, SPS,
 // PPS, rate, channels, ASC); the audio and the copied video the same Data.
-// An encoded rung's Data cannot be compared byte for byte (libx264's
-// threads): its first IDR's x264 options SEI must be the same, which pins
-// the encoder's settings (preset, refs, profile, rate control), and its
-// pictures, all decoded, must match within m4cNoise.
+// An encoded rung's Data cannot be compared byte for byte (runs of the
+// same input differ, see m4cNoise): its first IDR's x264 options SEI must
+// be the same, which pins the encoder's settings (preset, refs, profile,
+// rate control), and its pictures, all decoded, must match within
+// m4cNoise.
 func TestM4cFrozen(t *testing.T) {
 	t.Parallel()
 	bin := testpeer.OSTranscoder(t)

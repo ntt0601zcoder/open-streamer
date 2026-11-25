@@ -199,13 +199,14 @@ jobs:
   # The real transcoder child on linux/arm64: the arm64 bundle of
   # transcoder-arm64 behind the supervisor (TestSupervisorRealChild), the
   # M4a scenarios (TestM4aMatrix, TestM4aKeyframesAligned, TestM4aRespawn)
-  # and the M4b ABR scenarios (TestM4bMatrix, TestM4bRespawn,
-  # TestM4bSwitchTS, TestM4bRungGap; about 40 s together on amd64, well
-  # inside the 10 min timeout) and the M4c software-encoder scenarios
-  # (TestM4cWatermarkEveryRung, TestM4cThumbnailsTranscoded,
-  # TestM4cThumbnailsPassthrough, TestM4cThumbnailsCopyVideo, TestM4cFrozen;
-  # the live-update and respawn ones run in the test job, the NVENC ones
-  # skip without a device). Their only peers are the bundle and apt's
+  # the M4b ABR scenarios (TestM4bMatrix, TestM4bRespawn, TestM4bSwitchTS,
+  # TestM4bRungGap) and the M4c software-encoder scenarios
+  # (TestM4cWatermarkEveryRung, TestM4cWatermarkABR,
+  # TestM4cThumbnailsTranscoded, TestM4cThumbnailsPassthrough,
+  # TestM4cThumbnailsCopyVideo, TestM4cFrozen; the live-update and respawn
+  # ones run in the test job, the NVENC ones skip without a device). The
+  # whole set took about 55 s with -race on an amd64 workstation, well
+  # inside the 10 min timeout. Their only peers are the bundle and apt's
   # ffmpeg and ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a
   # failure. The VLC, GStreamer, SRT and RTSP rows stay amd64-only:
   # TestM4aVLC and TestM4bPlayers are not in the pattern (they run in the
@@ -218,7 +219,7 @@ jobs:
       OS_REQUIRE_PEERS: "1"
       OS_TRANSCODE_E2E_ARM: "1"
       E2E_PKGS: ./internal/e2e/ ./internal/transcode/
-      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen
+      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cWatermarkABR TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

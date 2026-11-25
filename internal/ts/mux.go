@@ -15,7 +15,9 @@ const (
 	// timeOffset is added to every stream time before it is written (1.4 s),
 	// so that a decoder never sees a negative DTS at a stream start.
 	timeOffset = 126000
-	// pcrOffset is added to the DTS to get the PCR (0.7 s of decoder buffer).
+	// pcrOffset is added to the stream DTS to get the PCR. The PCR therefore
+	// runs timeOffset − pcrOffset (0.7 s) behind the written DTS, which is
+	// the decoder's buffer: raising pcrOffset shortens it.
 	pcrOffset = 63000
 	// tableInterval is the longest span without tables when the PCR PID is
 	// audio.
