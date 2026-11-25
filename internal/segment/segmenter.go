@@ -34,6 +34,23 @@
 // epoch change, Lost > 0 or Flush; those closes neither move frames nor
 // hold, so a segment they close may hold audio past its end.
 //
+// Options.AlignVideo (ruling R-B8) is for an ABR presentation, whose video
+// tracks are rungs keyed at the same PTS: it keeps every rung's part of a
+// segment starting on a keyframe at the segment's Start, with two rules.
+// First, while the anchor is a video track, a lower video track takes the
+// anchor only at a keyframe presented at or after the open segment's Start,
+// or after the newest closed segment's Start when none is open (any
+// keyframe before the epoch's first segment); its frames before that are
+// dropped. At the open segment's Start that segment is taken back and
+// reopened by the new anchor, with its frames presented at or after Start;
+// after Start it is cut there. So no segment starts at or before its
+// predecessor's Start. A leading audio anchor is superseded as without
+// AlignVideo. Second, in a segment that is not Forced, a video track other
+// than the anchor enters only at a keyframe presented at the segment's
+// Start: its frames before its first keyframe in the segment are dropped,
+// and if that keyframe has another PTS, the track is left out of the
+// segment. Audio is not affected.
+//
 // The Segmenter starts no goroutines and is not safe for concurrent use.
 package segment
 
@@ -59,6 +76,9 @@ const (
 type Options struct {
 	Target      int64 // ticks; 0 means 180000 (2 s)
 	MaxDuration int64 // ticks; 0 means 5 × Target; never below Target
+	// AlignVideo keeps every video track's part of a segment starting on a
+	// keyframe at the segment's Start (ruling R-B8; see the package doc).
+	AlignVideo bool
 }
 
 // Segment is one run of frames from every track, cut on an anchor keyframe.
@@ -111,7 +131,19 @@ type open struct {
 	// of its epoch closed: a video anchor supersedes it instead of cutting it.
 	leading bool
 	tracks  map[int]*trackAcc
+	// rungs holds, under AlignVideo, the state of each video track other
+	// than the anchor; a track not in it is waiting.
+	rungs map[int]rung
 }
+
+// rung is a video track's state in an open segment under AlignVideo.
+type rung uint8
+
+const (
+	rungWaiting rung = iota // no keyframe yet: its frames are dropped
+	rungIn                  // entered at a keyframe at the segment's Start
+	rungOut                 // first keyframe elsewhere: left out of the segment
+)
 
 // held is a segment closed by a cut at K, waiting for the other tracks to
 // reach K.
@@ -125,6 +157,7 @@ type held struct {
 type Segmenter struct {
 	target  int64
 	maxDur  int64
+	align   bool
 	cur     *open
 	held    []held // in Seq order
 	seq     uint64
@@ -138,6 +171,7 @@ type Segmenter struct {
 	disc        bool          // next segment is a discontinuity
 	lost        bool          // next segment opens after Lost > 0
 	closed      bool          // a segment of this epoch has closed
+	lastStart   int64         // Start of the newest closed segment, when closed
 	carry       []media.Frame // leading audio waiting for the video anchor's keyframe
 	reached     map[int]int64 // per track of the epoch: its largest PTS so far
 	audio       map[int]bool  // tracks of the epoch that carry audio
@@ -155,13 +189,14 @@ func New(opt Options) *Segmenter {
 		m = 5 * t
 	}
 	return &Segmenter{
-		target: t, maxDur: max(m, t), anchor: -1,
+		target: t, maxDur: max(m, t), anchor: -1, align: opt.AlignVideo,
 		reached: map[int]int64{}, audio: map[int]bool{}, timedOut: map[int]bool{},
 	}
 }
 
 // Dropped returns the number of frames discarded: those that arrived before
-// a segment could open, and early non-anchor frames after a loss.
+// a segment could open, early non-anchor frames after a loss, and, under
+// AlignVideo, the video frames its rules leave out.
 func (s *Segmenter) Dropped() uint64 { return s.dropped }
 
 // Late returns the number of non-anchor audio frames put in a segment that
@@ -190,6 +225,10 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 		s.dropCarry()
 		s.disc, s.lost = true, true
 	}
+	if s.belowAnchor(f) {
+		s.dropped++
+		return s.release(out)
+	}
 	if r, ok := s.reached[f.Track]; !ok || f.PTS > r {
 		s.reached[f.Track] = f.PTS
 	}
@@ -197,8 +236,11 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 		s.audio[f.Track] = true
 	}
 	delete(s.timedOut, f.Track)
+	wasVideo := s.anchorVideo
 	if s.promote(f) && s.cur != nil {
-		if s.cur.leading {
+		// Under AlignVideo a lower video track reaches here only on a
+		// keyframe at or after the open segment's Start.
+		if s.cur.leading || (s.align && wasVideo && f.PTS == s.cur.seg.Start) {
 			s.uncut()
 		} else {
 			s.cut(f.PTS, -1)
@@ -237,7 +279,7 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 func (s *Segmenter) cut(k, duration int64) {
 	c := s.cur
 	s.cur = nil
-	s.closed = true
+	s.closed, s.lastStart = true, c.seg.Start
 	moved := []media.Frame{}
 	kept := c.seg.Frames[:0]
 	for _, f := range c.seg.Frames {
@@ -272,7 +314,8 @@ func (s *Segmenter) toHeld(f media.Frame) bool {
 }
 
 // place adds a frame to c. A non-anchor frame presented before c's start is
-// dropped after a loss, else kept, and counted late if it is audio.
+// dropped after a loss, else kept, and counted late if it is audio. Under
+// AlignVideo a video frame that admits rejects is dropped.
 func (s *Segmenter) place(c *open, f media.Frame) {
 	if f.Track != s.anchor && f.PTS < c.seg.Start {
 		if c.lost {
@@ -283,7 +326,55 @@ func (s *Segmenter) place(c *open, f media.Frame) {
 			s.late++
 		}
 	}
+	if !s.admits(c, f) {
+		s.dropped++
+		return
+	}
 	addTo(c, f)
+}
+
+// belowAnchor reports whether, under AlignVideo, f is a frame of a video
+// track below the video anchor that may not take the anchor (ruling R-B8):
+// only a keyframe presented at or after the open segment's Start may, or
+// after the newest closed segment's Start when none is open, or any
+// keyframe when the epoch has no segment yet.
+func (s *Segmenter) belowAnchor(f media.Frame) bool {
+	if !s.align || !s.anchorVideo || f.Kind() != media.KindVideo || f.Track >= s.anchor {
+		return false
+	}
+	switch {
+	case !f.Key:
+		return true
+	case s.cur != nil:
+		return f.PTS < s.cur.seg.Start
+	case s.closed:
+		return f.PTS <= s.lastStart
+	default:
+		return false
+	}
+}
+
+// admits reports whether frame f may go into c under AlignVideo's late-rung
+// rule (ruling R-B8): in a segment that is not Forced, a video track other
+// than the epoch's anchor enters only at a keyframe presented at c's Start,
+// and is left out of c when its first keyframe in c has another PTS. It
+// records the track's state on that keyframe.
+func (s *Segmenter) admits(c *open, f media.Frame) bool {
+	if !s.align || c.seg.Forced || f.Track == s.anchor || f.Kind() != media.KindVideo {
+		return true
+	}
+	st := c.rungs[f.Track]
+	if st == rungWaiting && f.Key {
+		st = rungOut
+		if f.PTS == c.seg.Start {
+			st = rungIn
+		}
+		if c.rungs == nil {
+			c.rungs = map[int]rung{}
+		}
+		c.rungs[f.Track] = st
+	}
+	return st == rungIn
 }
 
 // release emits the held segments, in order, while the first one no longer
@@ -389,7 +480,7 @@ func (s *Segmenter) openAt(f media.Frame) {
 	carry := s.carry
 	s.carry = nil
 	for _, c := range carry {
-		if c.PTS < f.PTS {
+		if c.PTS < f.PTS || !s.admits(s.cur, c) {
 			s.dropped++
 			continue
 		}
@@ -398,8 +489,10 @@ func (s *Segmenter) openAt(f media.Frame) {
 	s.add(f)
 }
 
-// uncut takes back the open leading audio segment: its frames wait in carry
-// for the video anchor's first keyframe and its Seq is released.
+// uncut takes back the open segment, the newest Seq: its frames wait in
+// carry for the next segment to open and its Seq is released. It serves a
+// leading audio segment superseded by the video anchor, and under AlignVideo
+// a segment whose Start a lower video track's keyframe takes over.
 func (s *Segmenter) uncut() {
 	c := s.cur
 	s.cur = nil
@@ -455,7 +548,7 @@ func defaultDelta(f media.Frame) int64 {
 func (s *Segmenter) closeOpen(duration int64) Segment {
 	c := s.cur
 	s.cur = nil
-	s.closed = true
+	s.closed, s.lastStart = true, c.seg.Start
 	return s.finish(c, duration)
 }
 

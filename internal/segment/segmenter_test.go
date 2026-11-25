@@ -787,3 +787,430 @@ func TestPromoteCutCarriesMovedAudio(t *testing.T) {
 		}
 	}
 }
+
+// arrival is a delivery with its arrival time, for ordering.
+type arrival struct {
+	at int
+	d  hub.Delivery
+}
+
+// arrive returns the deliveries sorted by arrival time; ties keep their
+// order in as.
+func arrive(as []arrival) []hub.Delivery {
+	slices.SortStableFunc(as, func(a, b arrival) int { return cmp.Compare(a.at, b.at) })
+	out := make([]hub.Delivery, len(as))
+	for i, a := range as {
+		out[i] = a.d
+	}
+	return out
+}
+
+// ladderDeliveries returns n frames of each track in tracks (ascending) from
+// start, epoch 1: 25 fps H.264 with a keyframe every gopFrames frames on
+// tracks 0..2, so every rung keys at the same PTS, and AAC frames over the
+// same span on track 3. order gives frame i of a track its arrival time;
+// ties go by track, then by i; a negative time leaves the frame out.
+func ladderDeliveries(tracks []int, start int64, n, gopFrames int, order func(track, i int) int) []hub.Delivery {
+	var as []arrival
+	for _, tr := range tracks {
+		count, cfg, step := n, h264, int64(3600)
+		if tr == 3 {
+			count, cfg, step = int(int64(n)*3600/aDur), aac, aDur
+		}
+		for i := 0; i < count; i++ {
+			at := order(tr, i)
+			if at < 0 {
+				continue
+			}
+			pts := start + int64(i)*step
+			as = append(as, arrival{at, frame(tr, cfg, pts, pts, tr == 3 || i%gopFrames == 0)})
+		}
+	}
+	return arrive(as)
+}
+
+// ladder pushes ladderDeliveries from PTS 0 and returns every segment,
+// Flush included.
+func ladder(s *Segmenter, tracks []int, n, gopFrames int, order func(track, i int) int) []Segment {
+	return pushDeliveries(s, ladderDeliveries(tracks, 0, n, gopFrames, order))
+}
+
+// inDTS is the order the keyframe barrier delivers ladder frames in (ruling
+// R-B3): by DTS, so every pre-K frame of every track comes before the
+// keyframes at K, which come in track order.
+func inDTS(track, i int) int {
+	if track == 3 {
+		return i * aDur
+	}
+	return i * 3600
+}
+
+// pushEach pushes ds and returns the segments they completed.
+func pushEach(s *Segmenter, ds []hub.Delivery) []Segment {
+	segs := make([]Segment, 0, 8)
+	for _, d := range ds {
+		segs = append(segs, s.Push(d)...)
+	}
+	return segs
+}
+
+// pushDeliveries pushes ds and returns every segment, Flush included.
+func pushDeliveries(s *Segmenter, ds []hub.Delivery) []Segment {
+	return append(pushEach(s, ds), s.Flush()...)
+}
+
+// at returns the index of track tr's delivery with PTS pts.
+func at(t *testing.T, ds []hub.Delivery, tr int, pts int64) int {
+	t.Helper()
+	i := slices.IndexFunc(ds, func(d hub.Delivery) bool { return d.Frame.Track == tr && d.Frame.PTS == pts })
+	require.GreaterOrEqual(t, i, 0, "no frame of track %d at %d", tr, pts)
+	return i
+}
+
+// perTrack counts a segment's frames by track.
+func perTrack(g Segment) map[int]int {
+	n := map[int]int{}
+	for _, f := range g.Frames {
+		n[f.Track]++
+	}
+	return n
+}
+
+// assertRungsAligned checks ruling R-B8 on the segments that are not Forced:
+// every video track with frames in a segment starts there with a keyframe
+// at the segment's Start.
+func assertRungsAligned(t *testing.T, segs []Segment) {
+	t.Helper()
+	for _, g := range segs {
+		if g.Forced {
+			continue
+		}
+		seen := map[int]bool{}
+		for _, f := range g.Frames {
+			if f.Kind() != media.KindVideo || seen[f.Track] {
+				continue
+			}
+			seen[f.Track] = true
+			assert.True(t, f.Key && f.PTS == g.Start,
+				"segment %d (Start %d): track %d starts at %d, key %v", g.Seq, g.Start, f.Track, f.PTS, f.Key)
+		}
+	}
+}
+
+// assertStartsRise checks that every segment starts after its predecessor.
+func assertStartsRise(t *testing.T, segs []Segment) {
+	t.Helper()
+	for i := 1; i < len(segs); i++ {
+		assert.Greater(t, segs[i].Start, segs[i-1].Start, "segment %d starts at or before segment %d", segs[i].Seq, segs[i-1].Seq)
+	}
+}
+
+// pushRung pushes track tr's 25 fps frames with PTS in [from, to), with a
+// keyframe every second on the shared timeline.
+func pushRung(s *Segmenter, tr int, from, to int64) []Segment {
+	var segs []Segment
+	for pts := from; pts < to; pts += 3600 {
+		segs = append(segs, s.Push(frame(tr, h264, pts, pts, pts%90000 == 0))...)
+	}
+	return segs
+}
+
+// pushRungs pushes tracks 0 and 2 interleaved in DTS order, track 0 first,
+// as pushRung does for one track.
+func pushRungs(s *Segmenter, from, to int64) []Segment {
+	var segs []Segment
+	for pts := from; pts < to; pts += 3600 {
+		segs = append(segs, pushRung(s, 0, pts, pts+1)...)
+		segs = append(segs, pushRung(s, 2, pts, pts+1)...)
+	}
+	return segs
+}
+
+// Ruling R-B8: frames in the barrier's order give segments where every rung
+// starts on its keyframe at the segment's Start, as without AlignVideo.
+func TestAlignVideoBarrierOrder(t *testing.T) {
+	tracks := []int{0, 1, 2}
+	s := New(Options{AlignVideo: true})
+	segs := ladder(s, tracks, 250, 25, inDTS)
+	require.Len(t, segs, 5)
+	assertSeqs(t, segs)
+	assertRungsAligned(t, segs)
+	for _, g := range segs {
+		assert.Equal(t, map[int]int{0: 50, 1: 50, 2: 50}, perTrack(g), "segment %d", g.Seq)
+	}
+	assert.Zero(t, s.Dropped())
+	assert.Equal(t, ladder(New(Options{}), tracks, 250, 25, inDTS), segs)
+}
+
+// Ruling R-B8 (2): track 2's last two frames before K = 360000 arrive after
+// IDR_0(K): they are dropped and track 2 enters the segment at its IDR.
+func TestAlignVideoLateTrackAtOneCut(t *testing.T) {
+	tracks := []int{0, 1, 2}
+	order := func(tr, i int) int {
+		if tr == 2 && (i == 98 || i == 99) {
+			return 100 * 3600
+		}
+		return inDTS(tr, i)
+	}
+	s := New(Options{AlignVideo: true})
+	segs := ladder(s, tracks, 250, 25, order)
+	off := ladder(New(Options{}), tracks, 250, 25, order)
+	require.Len(t, segs, 5)
+	require.Len(t, off, 5)
+	assertSeqs(t, segs)
+	assertRungsAligned(t, segs)
+	assert.EqualValues(t, 2, s.Dropped())
+	for i := range segs {
+		if i == 2 {
+			continue
+		}
+		assert.Equal(t, off[i], segs[i], "segment %d", i)
+	}
+	g := segs[2]
+	require.EqualValues(t, 360000, g.Start)
+	want := slices.DeleteFunc(slices.Clone(off[2].Frames), func(f media.Frame) bool {
+		return f.Track == 2 && f.PTS < 360000
+	})
+	assert.Equal(t, want, g.Frames)
+	assert.Equal(t, map[int]int{0: 50, 1: 50, 2: 50}, perTrack(g))
+}
+
+// Ruling R-B8 (1): track 2 alone, then track 0 with frames from an older K.
+// Track 0 takes the anchor only at a keyframe at or above the open
+// segment's Start (strictly above the newest closed one's when a Lost has
+// closed it), so no segment starts at or before its predecessor.
+func TestAlignVideoLowerTrackAfterClose(t *testing.T) {
+	t.Run("at-start", func(t *testing.T) {
+		s := New(Options{AlignVideo: true})
+		segs := pushRung(s, 2, 0, 363600) // seg 2 opens on IDR_2(360000)
+		require.Len(t, segs, 2)
+		segs = append(segs, pushRung(s, 0, 270000, 360000)...)
+		assert.EqualValues(t, 25, s.Dropped(), "track 0 below the open segment's Start")
+		assert.Equal(t, 2, s.anchor)
+		segs = append(segs, pushRung(s, 0, 360000, 363600)...) // IDR_0 at Start: seg 2 reopens
+		assert.Equal(t, 0, s.anchor)
+		segs = append(segs, pushRungs(s, 363600, 900000)...)
+		segs = append(segs, s.Flush()...)
+		assertSeqs(t, segs)
+		assertStartsRise(t, segs)
+		require.GreaterOrEqual(t, len(segs), 3)
+		assert.EqualValues(t, 360000, segs[2].Start)
+		assertRungsAligned(t, segs[2:])
+		assert.Equal(t, 2, segs[2].Frames[0].Track, "the old anchor's frames come back from the carry")
+		assert.EqualValues(t, 50, perTrack(segs[2])[2])
+	})
+	t.Run("above-start", func(t *testing.T) {
+		s := New(Options{AlignVideo: true})
+		segs := pushRung(s, 2, 0, 363600)
+		require.Len(t, segs, 2)
+		segs = append(segs, pushRungs(s, 363600, 720000)...)
+		segs = append(segs, s.Flush()...)
+		assert.EqualValues(t, 24, s.Dropped(), "track 0 before its keyframe at 450000")
+		assertSeqs(t, segs)
+		assertStartsRise(t, segs)
+		require.Len(t, segs, 5)
+		assert.EqualValues(t, 360000, segs[2].Start)
+		assert.EqualValues(t, 90000, segs[2].Duration)
+		assert.Equal(t, map[int]int{2: 25}, perTrack(segs[2]))
+		assert.EqualValues(t, 450000, segs[3].Start)
+		assert.Equal(t, map[int]int{0: 50, 2: 50}, perTrack(segs[3]))
+		assertRungsAligned(t, segs)
+	})
+	t.Run("after-lost", func(t *testing.T) {
+		s := New(Options{AlignVideo: true})
+		segs := pushRung(s, 2, 0, 399600)
+		require.Len(t, segs, 2)
+		d := frame(0, h264, 270000, 270000, true)
+		d.Lost = 5
+		segs = append(segs, s.Push(d)...)
+		require.Len(t, segs, 3, "the Lost closes seg 2")
+		segs = append(segs, pushRung(s, 0, 273600, 450000)...)
+		assert.EqualValues(t, 50, s.Dropped(), "IDR_0(360000) is not above the closed segment's Start")
+		segs = append(segs, pushRungs(s, 450000, 810000)...)
+		segs = append(segs, s.Flush()...)
+		assert.Equal(t, 0, s.anchor)
+		assertSeqs(t, segs)
+		assertStartsRise(t, segs)
+		require.Len(t, segs, 5)
+		assert.EqualValues(t, 450000, segs[3].Start)
+		assert.True(t, segs[3].Discontinuity)
+		assert.Equal(t, map[int]int{0: 50, 2: 50}, perTrack(segs[3]))
+		assertRungsAligned(t, segs)
+	})
+}
+
+// Ruling R-B8: a leading audio anchor keeps today's behaviour; the first
+// video frame takes over, above or below the audio's first PTS.
+func TestAlignVideoLeadingAudioUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		k    int64
+	}{{"above", 36000}, {"below", 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var as []arrival
+			for i := int64(0); i < 450; i++ { // audio from 18000, 0.6 s ahead
+				pts := 18000 + i*aDur
+				as = append(as, arrival{int(pts - 54000), frame(3, aac, pts, pts, true)})
+			}
+			for _, tr := range []int{0, 1, 2} {
+				for i := int64(0); i < 200; i++ {
+					pts := tc.k + i*3600
+					as = append(as, arrival{int(pts), frame(tr, h264, pts, pts, i%25 == 0)})
+				}
+			}
+			ds := arrive(as)
+			require.Equal(t, 3, ds[0].Frame.Track, "audio leads")
+			on := New(Options{AlignVideo: true})
+			off := New(Options{})
+			segs := pushDeliveries(on, ds)
+			require.NotEmpty(t, segs)
+			assertSeqs(t, segs)
+			assert.Equal(t, pushDeliveries(off, ds), segs)
+			assert.Equal(t, off.Dropped(), on.Dropped())
+			assert.Equal(t, off.Late(), on.Late())
+		})
+	}
+}
+
+// Ruling R-B8 (1): a new epoch whose first video frame is IDR_2(K), then
+// IDR_0(K) and IDR_1(K): the segment opened by track 2 is taken back and
+// reopened by track 0 with all three rungs, without a Seq hole or a
+// one-frame segment.
+func TestAlignVideoLeadingRungTakenBack(t *testing.T) {
+	tracks := []int{0, 1, 2}
+	s := New(Options{AlignVideo: true})
+	segs := pushEach(s, ladderDeliveries(tracks, 0, 100, 25, inDTS))
+	const k = 10_000_000
+	ds := ladderDeliveries(tracks, k, 100, 25, func(tr, i int) int {
+		if tr == 2 && i == 0 {
+			return 0
+		}
+		return inDTS(tr, i) + 1
+	})
+	for i := range ds {
+		ds[i].Frame.Epoch = 2
+	}
+	require.Equal(t, 2, ds[0].Frame.Track)
+	segs = append(segs, pushEach(s, ds)...)
+	assert.Equal(t, 0, s.anchor)
+	segs = append(segs, s.Flush()...)
+	require.Len(t, segs, 4)
+	assertSeqs(t, segs)
+	assertRungsAligned(t, segs)
+	g := segs[2]
+	assert.EqualValues(t, 2, g.Epoch)
+	assert.True(t, g.Discontinuity)
+	assert.EqualValues(t, k, g.Start)
+	assert.EqualValues(t, 180000, g.Duration)
+	assert.Equal(t, map[int]int{0: 50, 1: 50, 2: 50}, perTrack(g))
+	assert.EqualValues(t, k+180000, segs[3].Start)
+	for _, g := range segs {
+		assert.Greater(t, len(g.Frames), 1, "segment %d", g.Seq)
+	}
+	assert.Zero(t, s.Dropped())
+}
+
+// Ruling R-B8: a Lost delivery on IDR_2(K), the hub resuming track 2 first:
+// nothing opens until track 0's next keyframe K2, and the segment at K2
+// holds every rung from its keyframe at K2.
+func TestAlignVideoResumeOnHigherTrack(t *testing.T) {
+	const k, k2 = 540000, 630000
+	ds := ladderDeliveries([]int{0, 1, 2}, 0, 300, 25, func(tr, i int) int {
+		if (i >= 140 && i < 150) || (tr != 2 && i >= 150 && i < 175) {
+			return -1
+		}
+		return inDTS(tr, i)
+	})
+	i := at(t, ds, 2, k)
+	require.Equal(t, 2, ds[i-1].Frame.Track, "IDR_2(K) is the first frame after the gap")
+	ds[i].Lost = 30
+	s := New(Options{AlignVideo: true})
+	segs := pushDeliveries(s, ds)
+	assertSeqs(t, segs)
+	assertStartsRise(t, segs)
+	assertRungsAligned(t, segs)
+	require.Len(t, segs, 6)
+	assert.EqualValues(t, 360000, segs[2].Start)
+	g := segs[3]
+	assert.EqualValues(t, k2, g.Start)
+	assert.True(t, g.Discontinuity)
+	assert.Equal(t, map[int]int{0: 50, 1: 50, 2: 50}, perTrack(g))
+	assert.EqualValues(t, 25, s.Dropped(), "track 2 from K to K2")
+}
+
+// Ruling R-B8 (2): after a Lost, track 1 resumes at K + GOP, inside the
+// segment opened at K: it is left out of that segment and is in the next.
+func TestAlignVideoTrackResumesLate(t *testing.T) {
+	const k = 540000
+	ds := ladderDeliveries([]int{0, 1, 2}, 0, 300, 25, func(tr, i int) int {
+		if (i >= 140 && i < 150) || (tr == 1 && i >= 150 && i < 175) {
+			return -1
+		}
+		return inDTS(tr, i)
+	})
+	ds[at(t, ds, 0, k)].Lost = 30
+	s := New(Options{AlignVideo: true})
+	segs := pushDeliveries(s, ds)
+	off := pushDeliveries(New(Options{}), ds)
+	assertSeqs(t, segs)
+	assertRungsAligned(t, segs)
+	require.Len(t, segs, 6)
+	g := segs[3]
+	assert.EqualValues(t, k, g.Start)
+	assert.True(t, g.Discontinuity)
+	assert.Equal(t, map[int]int{0: 50, 2: 50}, perTrack(g))
+	assert.Equal(t, map[int]int{0: 50, 1: 50, 2: 50}, perTrack(segs[4]))
+	assert.EqualValues(t, 25, s.Dropped())
+	assert.Equal(t, 25, perTrack(off[3])[1], "without AlignVideo the part starts mid-segment")
+}
+
+// Ruling R-B8 (2): track 1 has no keyframe at K = 180000 (its next is at
+// K + GOP): the segment at K has no track-1 frame; the next one has.
+func TestAlignVideoMissingKeyframe(t *testing.T) {
+	ds := ladderDeliveries([]int{0, 1, 2}, 0, 250, 25, inDTS)
+	ds[at(t, ds, 1, 180000)].Frame.Key = false
+	s := New(Options{AlignVideo: true})
+	segs := pushDeliveries(s, ds)
+	require.Len(t, segs, 5)
+	assertSeqs(t, segs)
+	assertRungsAligned(t, segs)
+	assert.Equal(t, map[int]int{0: 50, 2: 50}, perTrack(segs[1]))
+	assert.Equal(t, map[int]int{0: 50, 1: 50, 2: 50}, perTrack(segs[2]))
+	assert.EqualValues(t, 50, s.Dropped())
+}
+
+// Ruling R-B8 (2) does not apply to Forced segments: with GOP 20 s and
+// MaxDuration 10 s they keep every rung's frames, as without AlignVideo.
+func TestAlignVideoForcedSegmentKeepsAll(t *testing.T) {
+	tracks := []int{0, 1, 2}
+	s := New(Options{AlignVideo: true, MaxDuration: 900000})
+	segs := ladder(s, tracks, 750, 500, inDTS)
+	require.Len(t, segs, 3)
+	assertSeqs(t, segs)
+	require.True(t, segs[1].Forced)
+	assert.Equal(t, map[int]int{0: 250, 1: 250, 2: 250}, perTrack(segs[1]))
+	assert.Equal(t, ladder(New(Options{MaxDuration: 900000}), tracks, 750, 500, inDTS), segs)
+	assert.Zero(t, s.Dropped())
+}
+
+// AlignVideo leaves audio alone: with AAC track 3 0.5 s behind the rungs,
+// audio is placed as without it.
+func TestAlignVideoAudioUntouched(t *testing.T) {
+	tracks := []int{0, 1, 2, 3}
+	order := func(tr, i int) int {
+		if tr == 3 {
+			return i*aDur + 45000
+		}
+		return inDTS(tr, i)
+	}
+	on := New(Options{AlignVideo: true})
+	off := New(Options{})
+	segs := ladder(on, tracks, 250, 25, order)
+	require.Len(t, segs, 5)
+	assertSeqs(t, segs)
+	assertRungsAligned(t, segs)
+	assertAudioInside(t, segs[:len(segs)-1])
+	assert.Equal(t, ladder(off, tracks, 250, 25, order), segs)
+	assert.Equal(t, off.Late(), on.Late())
+	assert.Zero(t, on.Dropped())
+}
