@@ -442,7 +442,7 @@ type run struct {
 	c       *child
 	spawned bool
 	respawn <-chan time.Time
-	delay   time.Duration
+	backoff backoff
 }
 
 // Run transcodes until the source hub closes (it returns nil) or ctx ends
@@ -467,7 +467,8 @@ func (t *Transcoder) Run(ctx context.Context) error {
 		}()
 	}
 
-	s := &run{t: t, ctx: ctx, delay: t.opt.RespawnMin}
+	s := &run{t: t, ctx: ctx}
+	s.backoff = backoff{min: t.opt.RespawnMin, max: t.opt.RespawnMax, healthy: t.opt.HealthyAfter}
 	s.r = t.newRouter(s)
 	if t.needChild {
 		s.spawn()
@@ -570,12 +571,7 @@ func (s *run) exited() error {
 }
 
 func (s *run) scheduleRespawn(uptime time.Duration) {
-	o := s.t.opt
-	if uptime >= o.HealthyAfter {
-		s.delay = o.RespawnMin
-	}
-	s.respawn = o.After(s.delay)
-	s.delay = min(2*s.delay, o.RespawnMax)
+	s.respawn = s.t.opt.After(s.backoff.next(uptime))
 }
 
 // toChild queues m for the current child and reports whether it was
@@ -914,24 +910,15 @@ func (t *Transcoder) readChild(c *child) error {
 		_ = c.p.conn.SetReadDeadline(time.Now().Add(t.opt.HelloTimeout))
 	}
 	c.reapMu.Unlock()
-	m, err := r.Read()
-	if err != nil {
-		if socketEnded(err) || c.isExited() {
+	if _, err := readHello(r); err != nil {
+		// The version first: a child that exits right after a Hello with
+		// another version must not lose its fatal error to its exit.
+		if errors.Is(err, errVersion) {
+			c.fatal = err
+			c.kill()
 			return nil
 		}
-		if errors.Is(err, os.ErrDeadlineExceeded) {
-			return fmt.Errorf("transcode: hello: none within %v", t.opt.HelloTimeout)
-		}
-		return fmt.Errorf("transcode: hello: %w", err)
-	}
-	h, ok := m.(wire.Hello)
-	switch {
-	case !ok:
-		return fmt.Errorf("transcode: hello: first message is %T", m)
-	case h.Version != wire.Version:
-		c.fatal = fmt.Errorf("transcode: hello: child speaks wire version %d, want %d", h.Version, wire.Version)
-		c.kill()
-		return nil
+		return helloFailed(err, c.isExited(), t.opt.HelloTimeout)
 	}
 	c.reapMu.Lock()
 	if !c.reaped {
@@ -1113,14 +1100,7 @@ func (c *child) stop(graceful bool) {
 			close(c.quit)
 		}
 	})
-	timer := time.NewTimer(stopGrace)
-	defer timer.Stop()
-	select {
-	case <-c.done:
-		return
-	case <-timer.C:
-	}
-	c.kill()
+	waitOrKill(c.done, c.kill)
 	<-c.done
 }
 
