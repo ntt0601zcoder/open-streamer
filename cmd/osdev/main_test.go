@@ -956,3 +956,69 @@ func TestOsdevLadder(t *testing.T) {
 	assert.Contains(t, out, "osdev: stream demo: transcoder pid 0, spawns 1, exits 0")
 	assert.NotContains(t, out, "stopped")
 }
+
+func TestParseRungRejectsABRLabel(t *testing.T) {
+	_, _, _, err := parseRung("cam=abr:360:800")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"abr"`)
+}
+
+func TestABRNameTaken(t *testing.T) {
+	var errw strings.Builder
+	cfg, code := parseArgs([]string{
+		"-stream", "cam=" + fixture, "-stream", "cam_abr=" + fixture,
+		"-rung", "cam=src:copy", "-audio", "cam=copy",
+	}, &errw)
+	assert.Nil(t, cfg)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, errw.String(), "cam_abr")
+}
+
+// The presentation of a ladder is served as <name>_abr over HLS and DASH
+// only.
+func TestABRServedOnlyOverHTTP(t *testing.T) {
+	free := func() int {
+		ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer ln.Close()
+		return ln.Addr().(*net.TCPAddr).Port
+	}
+	rtmpPort, rtspPort := free(), free()
+	var errw syncBuilder
+	addr, stop := startOsdev(t, []string{
+		"-stream", "v=../../testdata/fixtures/h264_640.ts", "-rung", "v=src:copy", "-audio", "v=copy",
+		"-rtmp-play", fmt.Sprintf("127.0.0.1:%d", rtmpPort),
+		"-rtsp-play", fmt.Sprintf("127.0.0.1:%d", rtspPort),
+	}, &errw)
+	waitBody(t, "http://"+addr+"/live/v_abr/cmaf/master.m3u8", "#EXT-X-STREAM-INF")
+	waitBody(t, "http://"+addr+"/live/v_abr/hls/index.m3u8", "#EXTM3U")
+	waitBody(t, "http://"+addr+"/live/v_abr/cmaf/index.mpd", "<MPD")
+
+	resp, err := httpGet("http://" + addr + "/live/v_abr/stream.ts")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = rtmp.Play(ctx, fmt.Sprintf("rtmp://127.0.0.1:%d/live/v_abr", rtmpPort))
+	var rst *rtmp.StatusError
+	require.ErrorAs(t, err, &rst)
+	assert.Equal(t, "NetStream.Play.StreamNotFound", rst.Code)
+	_, err = rtsp.Dial(ctx, fmt.Sprintf("rtsp://127.0.0.1:%d/live/v_abr", rtspPort), rtsp.Config{})
+	var st *rtsp.StatusError
+	require.ErrorAs(t, err, &st)
+	assert.Equal(t, 404, st.Code)
+	assert.Equal(t, 0, stop())
+
+	// copy:// does not find it either: its input fails.
+	var cerr syncBuilder
+	_, cstop := startOsdev(t, []string{
+		"-stream", "v=../../testdata/fixtures/h264_640.ts", "-rung", "v=src:copy", "-audio", "v=copy",
+		"-stream", "w=copy://v_abr",
+	}, &cerr)
+	require.Eventually(t, func() bool {
+		return strings.Contains(cerr.String(), "stream w: input 0 copy://v_abr failed")
+	}, 10*time.Second, 50*time.Millisecond, cerr.String())
+	cstop()
+}

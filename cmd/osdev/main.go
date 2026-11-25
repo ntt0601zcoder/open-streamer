@@ -77,7 +77,9 @@
 // Encoding runs in the transcoder child, cmd/ostranscoder, whose path
 // -ostranscoder gives (build it with make ostranscoder). A ladder that only
 // copies, with -audio name=copy (the default audio is AAC), needs none.
-// Renditions are presented 0.5 s behind the source:
+// Renditions are presented 0.5 s behind the source. The ladder is also
+// served as one adaptive presentation, <name>_abr, over HLS and DASH only
+// (not RTMP, RTSP, SRT, HTTP-TS or copy://), so the label abr is reserved:
 //
 //	osdev -stream cam=in.ts -loop -ostranscoder dist/ostranscoder-amd64/ostranscoder \
 //		-rung cam=720:720:3000 -rung cam=360:360:800 -rung cam=src:copy -audio cam=aac:96
@@ -123,6 +125,7 @@ import (
 
 const (
 	subQueue       = 1024
+	abrLabel       = "abr" // the presentation of stream <name> is <name>_abr
 	reportInterval = 30 * time.Second
 	// maxSRTLatency is the largest SRT latency: the handshake carries it
 	// in 16-bit milliseconds.
@@ -184,9 +187,13 @@ URL is shown only redacted, and a failing target is retried):
 
 Transcode a stream into renditions, each served as the stream <name>_<label>
 (-rung per rendition: label:height:kbps encodes, label:copy copies the
-video; -audio sets the audio of every rendition, default aac at 128 kbps;
-encoding needs the transcoder, built with make ostranscoder, so a ladder
-without it must copy both video and audio, -audio name=copy):
+video; the label abr is reserved; -audio sets the audio of every rendition,
+default aac at 128 kbps; encoding needs the transcoder, built with make
+ostranscoder, so a ladder without it must copy both video and audio,
+-audio name=copy). The whole ladder is also served as one adaptive
+presentation, <name>_abr, over HLS and DASH only (hls/index.m3u8,
+cmaf/master.m3u8, cmaf/index.mpd), not over RTMP, RTSP, SRT, HTTP-TS or
+copy://:
   osdev -stream cam=in.ts -loop -ostranscoder dist/ostranscoder-amd64/ostranscoder \
     -rung cam=360:360:800 -rung cam=src:copy -audio cam=aac:96
 `
@@ -323,6 +330,9 @@ type config struct {
 	// transcoders the transcoders, in order of their stream's first -rung.
 	renditions  []*source
 	transcoders []*transcoder
+	// presentations are the ladders' ABR presentations, <name>_abr, in
+	// the order of transcoders. They are served by packLookup only.
+	presentations []*source
 }
 
 // transcoder is the transcoder of one stream's -rung ladder.
@@ -358,6 +368,9 @@ func parseRung(v string) (stream, label string, video transcode.Video, err error
 	label = f[0]
 	if !validName(label) {
 		return "", "", video, fmt.Errorf("-rung %q: invalid label %q", v, label)
+	}
+	if label == abrLabel {
+		return "", "", video, fmt.Errorf("-rung %q: the label %q is reserved for the ABR presentation", v, label)
 	}
 	switch {
 	case len(f) == 2 && f[1] == "copy":
@@ -440,11 +453,16 @@ func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, 
 		for _, r := range ladders[stream] {
 			encodes = encodes || !r.Video.Copy
 		}
+		abrName := stream + "_" + abrLabel
+		if byName[abrName] != nil {
+			return fmt.Errorf("-rung: stream %s: the name %s is already a stream", stream, abrName)
+		}
 		if encodes && binary == "" {
 			return fmt.Errorf("stream %s: encoding needs -ostranscoder", stream)
 		}
 		tr, err := transcode.New(byName[stream].hub, transcode.Options{
 			Binary: binary, Renditions: ladders[stream], Audio: audio[stream], Logger: log,
+			Presentation: true,
 		})
 		if err != nil {
 			return fmt.Errorf("stream %s: %w", stream, err)
@@ -455,6 +473,11 @@ func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, 
 			s.hub, s.pack = h, live.NewPackager(h, live.Options{})
 			cfg.renditions = append(cfg.renditions, s)
 		}
+		ph := tr.Presentation()
+		cfg.presentations = append(cfg.presentations, &source{
+			name: stream + "_" + abrLabel, from: stream, hub: ph,
+			pack: live.NewPackager(ph, live.Options{ABR: true}),
+		})
 	}
 	return nil
 }
@@ -926,6 +949,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	for _, s := range all {
 		srcs[s.name] = s
 	}
+	// The presentations are served over HLS and DASH only: packLookup finds
+	// them, no other lookup does.
+	pres := map[string]*source{}
+	for _, s := range cfg.presentations {
+		pres[s.name] = s
+	}
 	hubLookup := func(n string) (*hub.Hub, bool) {
 		if s := srcs[n]; s != nil {
 			return s.hub, true
@@ -981,6 +1010,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	for _, s := range all {
 		for _, p := range []string{"hls/index.m3u8", "cmaf/master.m3u8", "cmaf/index.mpd", "stream.ts"} {
+			_, _ = fmt.Fprintf(stdout, "%s/live/%s/%s\n", base, s.name, p)
+		}
+	}
+	for _, s := range cfg.presentations {
+		for _, p := range []string{"hls/index.m3u8", "cmaf/master.m3u8", "cmaf/index.mpd"} {
 			_, _ = fmt.Fprintf(stdout, "%s/live/%s/%s\n", base, s.name, p)
 		}
 	}
@@ -1083,6 +1117,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		sub := s.hub.Subscribe(s.name, subQueue)
 		wg.Go(func() { s.pack.Run(ctx, sub) })
 	}
+	// A presentation's subscription holds a frame queue per rendition and
+	// its own.
+	for i, s := range cfg.presentations {
+		sub := s.hub.Subscribe(s.name, subQueue*(len(cfg.transcoders[i].tr.Hubs())+1))
+		wg.Go(func() { s.pack.Run(ctx, sub) })
+	}
 	for _, x := range cfg.transcoders {
 		twg.Go(func() {
 			err := x.tr.Run(ctx)
@@ -1118,7 +1158,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				report(stderr, all, false)
+				report(stderr, slices.Concat(all, cfg.presentations), false)
 				for _, x := range cfg.transcoders {
 					x.report(stderr)
 				}
@@ -1130,6 +1170,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}()
 	packLookup := func(n string) (*live.Packager, bool) {
 		if s := srcs[n]; s != nil {
+			return s.pack, true
+		}
+		if s := pres[n]; s != nil {
 			return s.pack, true
 		}
 		return nil, false
@@ -1162,7 +1205,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_ = srv.Close()
 	}
 	wg.Wait()
-	report(stderr, all, true)
+	report(stderr, slices.Concat(all, cfg.presentations), true)
 	for _, x := range cfg.transcoders {
 		x.report(stderr)
 	}
