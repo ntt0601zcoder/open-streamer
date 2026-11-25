@@ -1,6 +1,7 @@
 package testpeer
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -271,5 +272,47 @@ func TestOSTranscoderPeer(t *testing.T) {
 				assert.Equal(t, tt.want, got)
 			}
 		})
+	}
+}
+
+// TestNVENCProbeSkipsOrFails: a transcoder whose -probe nvenc exits 3 skips
+// the test, or fails it with OS_REQUIRE_NVENC=1; one that exits 0 does
+// neither.
+func TestNVENCProbeSkipsOrFails(t *testing.T) {
+	ok := fakeTranscoder(t, `[ "$1 $2" = "-probe nvenc" ] || exit 2; echo 'nvenc: ok'`)
+	none := fakeTranscoder(t, `[ "$1 $2" = "-probe nvenc" ] || exit 2; echo 'nvenc: no device'; exit 3`)
+	for _, tt := range []struct {
+		name, bin, require string
+		wantSkip, wantFail bool
+	}{
+		{"absent", none, "", true, false},
+		{"absent required", none, "1", false, true},
+		{"present", ok, "", false, false},
+		{"present required", ok, "1", false, false},
+		{"not runnable", "/nonexistent/ostranscoder", "", true, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(EnvRequireNVENC, tt.require)
+			t.Setenv(EnvRequire, "1") // OS_REQUIRE_PEERS has no say
+			rec := &recorder{TB: t}
+			NVENC(rec, tt.bin)
+			assert.Equal(t, tt.wantSkip, rec.skipped, "skipped")
+			assert.Equal(t, tt.wantFail, rec.failed, "failed")
+		})
+	}
+}
+
+func TestProbeReason(t *testing.T) {
+	err := errors.New("exit status 3")
+	for _, tt := range []struct{ out, want string }{
+		{
+			"[h264_nvenc @ 0x1] Cannot load libcuda.so.1\nnvenc: open: Operation not permitted\n",
+			"nvenc: open: Operation not permitted ([h264_nvenc @ 0x1] Cannot load libcuda.so.1)",
+		},
+		{"nvenc: no device\n", "nvenc: no device"},
+		{"something\nelse\n", "something; else"},
+		{"", "exit status 3"},
+	} {
+		assert.Equal(t, tt.want, probeReason(tt.out, err), "%q", tt.out)
 	}
 }

@@ -552,3 +552,56 @@ func transcoderVersion(t testing.TB, binary string) error {
 	}
 	return nil
 }
+
+// EnvRequireNVENC names the environment variable that, set to "1", turns a
+// missing NVENC device from a skip into a failure. Only make test-nvenc
+// sets it; CI has no GPU.
+const EnvRequireNVENC = "OS_REQUIRE_NVENC"
+
+// NVENC runs transcoder -probe nvenc, which opens and closes an NVENC
+// encoder. When it exits 0 NVENC returns; otherwise the test is skipped
+// with the probe's reason (probeReason), or failed when
+// OS_REQUIRE_NVENC=1. OS_REQUIRE_PEERS does not apply: a missing GPU is
+// not a missing peer.
+func NVENC(t testing.TB, transcoder string) {
+	t.Helper()
+	out, err := exec.CommandContext(t.Context(), transcoder, "-probe", "nvenc").CombinedOutput() //nolint:gosec // test peers
+	if err == nil {
+		return
+	}
+	line := probeReason(string(out), err)
+	if os.Getenv(EnvRequireNVENC) == "1" {
+		t.Fatalf("no NVENC device: %s (%s=1)", line, EnvRequireNVENC)
+		return
+	}
+	t.Skipf("no NVENC device: %s", line)
+}
+
+// probeReason is the reason a probe failed, from its output: the line that
+// starts with "nvenc:" (the probe's verdict) followed by libav's other
+// lines in parentheses, or every line when none does, or err when it
+// printed nothing.
+func probeReason(out string, err error) string {
+	var verdict string
+	var other []string
+	for line := range strings.SplitSeq(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "":
+		case verdict == "" && strings.HasPrefix(line, "nvenc:"):
+			verdict = line
+		default:
+			other = append(other, line)
+		}
+	}
+	switch {
+	case verdict != "" && len(other) > 0:
+		return verdict + " (" + strings.Join(other, "; ") + ")"
+	case verdict != "":
+		return verdict
+	case len(other) > 0:
+		return strings.Join(other, "; ")
+	default:
+		return err.Error()
+	}
+}
