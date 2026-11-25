@@ -123,11 +123,15 @@ func TestLimiter(t *testing.T) {
 	_, blocked = l.Blocked(key)
 	assert.False(t, blocked)
 
-	// Succeed clears it at once; the next failure counts from 1.
+	// An Attempt.Succeed (a real verification) clears it at once; the next
+	// failure counts from 1.
 	failOnce(t, l, key)
-	_, blocked = l.Blocked(key)
+	ra, blocked = l.Blocked(key)
 	require.True(t, blocked)
-	l.Succeed(key)
+	clk.add(ra)
+	a, ok = l.Reserve(key)
+	require.True(t, ok)
+	a.Succeed()
 	_, blocked = l.Blocked(key)
 	assert.False(t, blocked)
 	assert.Equal(t, 5, places(t, l, key))
@@ -137,7 +141,7 @@ func TestLimiter(t *testing.T) {
 	assert.Equal(t, 1, e.failures)
 	assert.Equal(t, 4, places(t, l, key))
 
-	// An Attempt.Succeed clears it too.
+	// Below the threshold too.
 	failOnce(t, l, key)
 	a, ok = l.Reserve(key)
 	require.True(t, ok)
@@ -172,8 +176,7 @@ func TestLimiterInFlightAndSucceed(t *testing.T) {
 		require.True(t, ok)
 		held = append(held, a)
 	}
-	l.Succeed(key)
-	assert.Equal(t, 2, places(t, l, key), "Limiter.Succeed dropped attempts in flight")
+	assert.Equal(t, 2, places(t, l, key))
 	held[0].Succeed()
 	assert.Equal(t, 3, places(t, l, key), "Attempt.Succeed dropped the other attempts in flight")
 	for range 3 {
@@ -185,35 +188,19 @@ func TestLimiterInFlightAndSucceed(t *testing.T) {
 	assert.False(t, ok, "5 in flight")
 	held[1].Fail()
 	held[2].Abandon()
-	held[3].Succeed()
 	held[4].Fail()
+	held[3].Succeed()
 	held[5].Abandon()
 	// Resolving twice counts once.
 	held[0].Fail()
 	held[1].Fail()
 	held[3].Abandon()
-	l.Succeed(key)
 	e, tracked := l.entryFor(key)
 	if tracked {
 		assert.Equal(t, 0, e.inFlight)
 		assert.Equal(t, 0, e.failures)
 	}
 	assert.Equal(t, 5, places(t, l, key), "inFlight is not back to exactly 0")
-
-	// 10000 keys that never failed: Limiter.Succeed adds nothing, and a key
-	// with 4 failures keeps them.
-	l2 := NewLimiter(clk.now)
-	k4 := l2.Key("10.0.0.2:1", "ops")
-	for range 4 {
-		failOnce(t, l2, k4)
-	}
-	for i := range 10000 {
-		l2.Succeed(l2.Key(fmt.Sprintf("10.1.%d.%d:1", i/256, i%256), "ops"))
-	}
-	assert.Equal(t, 1, l2.size())
-	e, ok = l2.entryFor(k4)
-	require.True(t, ok)
-	assert.Equal(t, 4, e.failures)
 }
 
 func TestLimiterReservesBeforeVerifying(t *testing.T) {
@@ -356,7 +343,6 @@ func TestLimiterConcurrent(t *testing.T) {
 			for i := range 500 {
 				key := l.Key(fmt.Sprintf("10.0.%d.%d:1", g, i%7), "ops")
 				l.Blocked(key)
-				l.Succeed(key)
 				if a, ok := l.Reserve(key); ok {
 					switch i % 3 {
 					case 0:
@@ -391,4 +377,85 @@ func TestClientKey(t *testing.T) {
 	assert.Equal(t, "1.2.3.4", ClientKey("1.2.3.4"), "a bare address")
 	assert.Equal(t, ClientKey("[2001:db8:1:2::9]:7"), ClientKey("2001:db8:1:2::1"))
 	assert.NotEqual(t, ClientKey("1.2.3.4:5"), ClientKey("1.2.3.5:5"))
+}
+
+func TestAttemptNil(t *testing.T) {
+	var a *Attempt
+	assert.NotPanics(t, func() {
+		a.Abandon()
+		a.Fail()
+		a.Succeed()
+	})
+}
+
+// TestLimiterEvictsBlockedLast: an address blocked on one user name cannot
+// flush that block out by presenting 4096 other names.
+func TestLimiterEvictsBlockedLast(t *testing.T) {
+	clk := newFakeClock()
+	l := NewLimiter(clk.now)
+	blockedKey := l.Key("203.0.113.9:1", "admin")
+	for range 5 {
+		failOnce(t, l, blockedKey)
+	}
+	_, blocked := l.Blocked(blockedKey)
+	require.True(t, blocked)
+
+	others := make([]string, maxKeys)
+	for i := range others {
+		others[i] = l.Key("203.0.113.9:1", fmt.Sprintf("name%d", i))
+		clk.add(time.Millisecond)
+		failOnce(t, l, others[i])
+	}
+	assert.Equal(t, maxKeys, l.size())
+	e, ok := l.entryFor(blockedKey)
+	require.True(t, ok, "the blocked key was evicted")
+	assert.Equal(t, 5, e.failures)
+	_, ok = l.entryFor(others[0])
+	assert.False(t, ok, "the oldest key under 5 failures goes first")
+	_, ok = l.entryFor(others[len(others)-1])
+	assert.True(t, ok)
+
+	// With only keys at 5 or more failures left to evict, the oldest of
+	// them goes, never one with an attempt in flight.
+	l = NewLimiter(clk.now)
+	keys := make([]string, maxKeys)
+	for i := range keys {
+		keys[i] = l.Key(fmt.Sprintf("10.%d.%d.1:1", i/256, i%256), "ops")
+		for range 5 {
+			failOnce(t, l, keys[i])
+		}
+		clk.add(time.Millisecond) // each newer than the last, all inside 15 min
+	}
+	clk.add(time.Second) // keys[0]'s 1 s backoff has run out
+	hold, ok := l.Reserve(keys[0])
+	require.True(t, ok)
+	_, ok = l.Reserve(l.Key("192.168.0.1:1", "ops"))
+	require.True(t, ok)
+	assert.Equal(t, maxKeys, l.size())
+	_, ok = l.entryFor(keys[0])
+	assert.True(t, ok, "a key with an attempt in flight was dropped")
+	_, ok = l.entryFor(keys[1])
+	assert.False(t, ok, "the oldest blocked key without an attempt in flight goes")
+	hold.Abandon()
+}
+
+// TestLimiterRefusedReserveEvictsNothing: a Reserve that is refused leaves
+// a full table as it was.
+func TestLimiterRefusedReserveEvictsNothing(t *testing.T) {
+	clk := newFakeClock()
+	l := NewLimiter(clk.now)
+	keys := make([]string, maxKeys)
+	for i := range keys {
+		keys[i] = l.Key(fmt.Sprintf("10.%d.%d.1:1", i/256, i%256), "ops")
+		clk.add(time.Millisecond)
+		failOnce(t, l, keys[i])
+	}
+	for range 4 {
+		failOnce(t, l, keys[len(keys)-1])
+	}
+	_, ok := l.Reserve(keys[len(keys)-1])
+	require.False(t, ok, "blocked")
+	_, ok = l.entryFor(keys[0])
+	assert.True(t, ok, "a refused Reserve evicted a key")
+	assert.Equal(t, maxKeys, l.size())
 }

@@ -133,11 +133,23 @@ func (l *Limiter) Blocked(key string) (retryAfter time.Duration, blocked bool) {
 // Reserve takes one in-flight attempt for key, unless the key is blocked
 // or its counted failures plus its attempts in flight are already 5. Past
 // 5 failures, once the backoff has run out, failures count as 4, so the
-// key gets one attempt at a time. When the table is full, the key whose
-// last failure is oldest and that has nothing in flight is dropped to make
-// room; when every key has an attempt in flight, Reserve refuses. The
-// caller resolves every Attempt it gets (a defer that abandons it is the
-// safe default): an unresolved one holds its place for ever.
+// key gets one attempt at a time.
+//
+// The caller defers attempt.Abandon() right after a successful Reserve:
+// an unresolved Attempt holds its place for ever, and Abandon after
+// Succeed or Fail does nothing.
+//
+// Eviction: a key the table does not hold is always admitted (it has no
+// failures and nothing in flight), so Reserve evicts only when it is about
+// to insert, never for a refusal. When the table is full it drops, among
+// the keys with nothing in flight, the one with the oldest last failure
+// under 5 failures, or failing that the one with the oldest last failure
+// at 5 or more, so a client cannot flush its own block out with other
+// names. When every key has an attempt in flight, Reserve refuses. The
+// new key's attempt may still end in ErrBusy and be abandoned, which
+// deletes the new key; that leaves a vacancy the next new key fills
+// without evicting, so abandoned attempts cost at most one eviction per
+// vacancy they create, and only failures that are counted grow the table.
 func (l *Limiter) Reserve(key string) (*Attempt, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -160,40 +172,38 @@ func (l *Limiter) Reserve(key string) (*Attempt, bool) {
 	return &Attempt{l: l, key: key}, true
 }
 
-// evict drops the key whose last failure is oldest among those with
-// nothing in flight. The caller holds l.mu.
+// evict drops, among the keys with nothing in flight, the one with the
+// oldest last failure under maxAttempts failures, or when there is none
+// the one with the oldest last failure at maxAttempts or more. It reports
+// false when every key has an attempt in flight. The caller holds l.mu.
 func (l *Limiter) evict() bool {
 	var (
 		victim string
-		oldest *entry
+		best   *entry
 	)
 	for k, e := range l.entries {
 		if e.inFlight > 0 {
 			continue
 		}
-		if oldest == nil || e.lastFail.Before(oldest.lastFail) {
-			victim, oldest = k, e
+		if best == nil || evictBefore(e, best) {
+			victim, best = k, e
 		}
 	}
-	if oldest == nil {
+	if best == nil {
 		return false
 	}
 	delete(l.entries, victim)
 	return true
 }
 
-// Succeed records a remembered login: it zeroes the key's failures, and
-// its attempts in flight stay counted. It does nothing for a key that is
-// not tracked, so ordinary remembered traffic never fills the table.
-func (l *Limiter) Succeed(key string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	e := l.lookup(key, l.now())
-	if e == nil {
-		return
+// evictBefore reports whether a goes before b: a key under maxAttempts
+// failures before one at or over it, then the older last failure.
+func evictBefore(a, b *entry) bool {
+	aLow, bLow := a.failures < maxAttempts, b.failures < maxAttempts
+	if aLow != bLow {
+		return aLow
 	}
-	e.failures = 0
-	l.dropIfEmpty(key, e)
+	return a.lastFail.Before(b.lastFail)
 }
 
 // dropIfEmpty deletes an entry that holds nothing. An entry with an
@@ -206,7 +216,9 @@ func (l *Limiter) dropIfEmpty(key string, e *entry) {
 }
 
 // Attempt is one reserved login attempt. Exactly one of Succeed, Fail and
-// Abandon resolves it; later calls do nothing.
+// Abandon resolves it; later calls do nothing, so the caller can defer
+// Abandon right after Reserve and still call Succeed or Fail. All three
+// do nothing on a nil *Attempt.
 type Attempt struct {
 	l    *Limiter
 	key  string
@@ -222,6 +234,9 @@ const (
 )
 
 func (a *Attempt) resolve(o outcome) {
+	if a == nil || a.l == nil {
+		return
+	}
 	l := a.l
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -245,7 +260,8 @@ func (a *Attempt) resolve(o outcome) {
 	l.dropIfEmpty(a.key, e)
 }
 
-// Succeed gives the place back and zeroes the key's failures.
+// Succeed gives the place back and zeroes the key's failures. Only a real
+// verification calls it; a remembered login touches no limiter state.
 func (a *Attempt) Succeed() { a.resolve(succeeded) }
 
 // Fail gives the place back, counts one failure and starts or lengthens

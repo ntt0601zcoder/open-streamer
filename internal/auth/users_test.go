@@ -79,7 +79,7 @@ func TestNewUsers(t *testing.T) {
 		"none":         {},
 		"no key":       {{Name: "ops", Role: Editor, Hash: Hash{Iterations: 1000, Salt: h.Salt}}},
 		"no iter":      {{Name: "ops", Role: Editor, Hash: Hash{Salt: h.Salt, Key: h.Key}}},
-		"short salt":   {{Name: "ops", Role: Editor, Hash: Hash{Iterations: 1000, Salt: []byte("1234567"), Key: h.Key}}},
+		"short salt":   {{Name: "ops", Role: Editor, Hash: Hash{Iterations: 1000, Salt: []byte("0123456789abcde"), Key: h.Key}}},
 		"iter high":    {{Name: "ops", Role: Editor, Hash: Hash{Iterations: MaxIterations + 1, Salt: h.Salt, Key: h.Key}}},
 	}
 	many := make([]User, 0, MaxUsers+1)

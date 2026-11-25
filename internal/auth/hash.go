@@ -27,7 +27,7 @@ const (
 )
 
 // minSaltBytes is the shortest salt ParseHash and NewUsers accept.
-const minSaltBytes = 8
+const minSaltBytes = SaltBytes
 
 // b64 is the encoding of salt and key: standard alphabet, no padding,
 // strict about trailing bits.
@@ -71,11 +71,13 @@ func (h Hash) String() string {
 	return Prefix + "$" + strconv.Itoa(h.Iterations) + "$" + b64.EncodeToString(h.Salt) + "$" + b64.EncodeToString(h.Key)
 }
 
-// ParseHash refuses anything but the format String writes, a salt under 8
-// bytes, a key that is not KeyBytes long, and an iteration count outside
-// [minIterations, MaxIterations] (a floor under 1 counts as 1). Its errors
-// say what is wrong and never contain s, so a password pasted where a hash
-// belongs does not reach a log.
+// ParseHash refuses anything but the format String writes, a salt under
+// SaltBytes, a key that is not KeyBytes long, and an iteration count
+// outside [minIterations, MaxIterations] (a floor under 1 counts as 1).
+// It also refuses a string String would not write back byte for byte,
+// such as one with a newline the base64 decoder skips. Its errors say what
+// is wrong and never contain s, so a password pasted where a hash belongs
+// does not reach a log.
 func ParseHash(s string, minIterations int) (Hash, error) {
 	minIterations = max(minIterations, 1)
 	fields := strings.Split(s, "$")
@@ -106,7 +108,11 @@ func ParseHash(s string, minIterations int) (Hash, error) {
 	if len(key) != KeyBytes {
 		return Hash{}, errors.New("auth: parse hash: key has the wrong length")
 	}
-	return Hash{Iterations: iter, Salt: salt, Key: key}, nil
+	h := Hash{Iterations: iter, Salt: salt, Key: key}
+	if h.String() != s {
+		return Hash{}, errors.New("auth: parse hash: not in canonical form")
+	}
+	return h, nil
 }
 
 // parseDecimal accepts only digits, no sign and no leading zero, of at
@@ -198,8 +204,10 @@ func dummyHash() Hash {
 	return b.h
 }
 
-// WarmDummy is for tests only; no production code calls it. It makes the
-// per-process dummy hash now, if it does not exist yet.
+// WarmDummy makes the per-process dummy hash now, if it does not exist
+// yet. The server calls it once at start-up so the first request with an
+// unknown name is not slow; tests also use it, before SetHashHook, so
+// their counts never include the dummy's making.
 func WarmDummy() { dummyHash() }
 
 // randomBytes fills b from crypto/rand, which never fails on a supported

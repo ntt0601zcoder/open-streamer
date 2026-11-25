@@ -85,6 +85,10 @@ func TestParseHashRefuses(t *testing.T) {
 		"padded salt":    "pbkdf2-sha256$600000$" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef")) + "$" + key32,
 		"padded key":     "pbkdf2-sha256$600000$" + salt16 + "$" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")),
 		"7-byte salt":    "pbkdf2-sha256$600000$" + b64([]byte("0123456")) + "$" + key32,
+		"15-byte salt":   "pbkdf2-sha256$600000$" + b64([]byte("0123456789abcde")) + "$" + key32,
+		"newline salt":   "pbkdf2-sha256$600000$" + salt16[:10] + "\n" + salt16[10:] + "$" + key32,
+		"newline key":    "pbkdf2-sha256$600000$" + salt16 + "$" + key32[:20] + "\r\n" + key32[20:],
+		"trailing nl":    "pbkdf2-sha256$600000$" + salt16 + "$" + key32 + "\n",
 		"31-byte key":    "pbkdf2-sha256$600000$" + salt16 + "$" + b64([]byte("0123456789abcdef0123456789abcde")),
 		"33-byte key":    "pbkdf2-sha256$600000$" + salt16 + "$" + b64([]byte("0123456789abcdef0123456789abcdefg")),
 		"bad salt b64":   "pbkdf2-sha256$600000$!!!!!!!!!!!!!!!!!!!!!!$" + key32,
@@ -114,8 +118,8 @@ func TestParseHashRefuses(t *testing.T) {
 	require.NoError(t, err)
 	_, err = ParseHash("pbkdf2-sha256$10000000$"+salt16+"$"+key32, MinIterations)
 	require.NoError(t, err)
-	_, err = ParseHash("pbkdf2-sha256$600000$"+b64([]byte("01234567"))+"$"+key32, MinIterations)
-	require.NoError(t, err, "an 8-byte salt is enough")
+	_, err = ParseHash("pbkdf2-sha256$600000$"+b64([]byte("0123456789abcdef0123"))+"$"+key32, MinIterations)
+	require.NoError(t, err, "a salt over 16 bytes is fine")
 	// minIterations is the caller's floor.
 	_, err = ParseHash("pbkdf2-sha256$1000$"+salt16+"$"+key32, 1000)
 	require.NoError(t, err)
