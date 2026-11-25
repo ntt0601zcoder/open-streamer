@@ -35,13 +35,13 @@
 | ID | Ruling | Cost if wrong |
 |---|---|---|
 | R-D1 | **M5 is split in three.** **M5a (this plan)** is the control-plane core and delivers the M5 row's exit criterion: spec, the one config file with its users, supervisor, manager, API with its config editor, metrics (with `EncoderFallbacks`), logs, `cmd/openstreamer`, and the product names of a ladder. Done when a spec created over the API serves every output, an output edit interrupts no other output, and a restart restores every stream (Task 11's tests). **M5b, live edits and assets:** a running pipeline's inputs changed in place (`Pipeline.SetInputs`, §3.6), the watermark edited in place over the API (`Transcoder.SetWatermark` exists), the asset API (R-C8) with operator fonts (R-C7), a rung that refuses the x264 fallback (wire version 3), and audio language in the spec, the HLS masters and the MPD. Done when replacing a running stream's inputs is exactly one epoch change and ends no output session, an uploaded image and font appear on every rung, a strict NVENC rung fails instead of falling back and is counted, and `osconform` reads the languages. **M5c, transport security:** HTTPS for the API and the HTTP outputs, RTMPS (listen, pull, push), RTSPS with SRTP by its own ruling, SRT encryption (input and output), redaction of credentials in URL paths and queries (the M2c note), and secrets as write-only spec fields. Done when ffmpeg publishes and plays over each secured protocol against our server, and no secret appears in a response, log or metric. M6 and the M7 soak need only M5a; M5b and M5c may run beside M6 | Three plans and three reviews instead of one. Until M5b an input edit rebuilds the stream (R-D6), and assets are files the operator copies into a directory. Until M5c the Basic credentials (base64, not encrypted) and every stream key cross the network in clear, so the API listens on loopback by default (R-D8) |
-| R-D2 | **One binary, one config file** (user decisions 3 and 4). The binary is `cmd/openstreamer` (§4); `cmd/osdev` stays the development harness. **All configuration is one YAML file**, `-config path`, with a `version` and three sections: `server` (the listen addresses and apps of the shared servers, the transcoder binary, the assets directory, logging; keys and defaults in Task 6), `users` (R-D8) and `streams` (a list of stream documents, R-D3). There is no data directory and no separate store. The file is decoded strictly (`KnownFields`: an unknown key is an error), is at most 4 MiB, and on Unix must be mode 0600. **The rule for formats:** the config document is YAML, in the file and on `GET`/`PUT /api/v1/config`; every other request and response body is JSON, and a stream has the same keys in both (the `yaml` and `json` tags of `internal/spec` are equal, by a test). The library is `go.yaml.in/yaml/v3`, already in `go.mod` as an indirect dependency. Rejected: JSON for the file (no comments, which decision 4 requires to survive) | The service user must be able to write the file **and its directory** (the rename), so the file lives in a directory the service owns, not a root-owned `/etc`. A change in `server` needs a restart (R-D4). YAML's looser typing (an unquoted `no`, a leading-zero number) is the operator's to quote; strict decoding into typed fields catches most of it |
+| R-D2 | **One binary, one config file** (user decisions 3 and 4). The binary is `cmd/openstreamer` (§4); `cmd/osdev` stays the development harness. **All configuration is one YAML file**, `-config path`, with a `version` and three sections: `server` (the listen addresses and apps of the shared servers, the transcoder binary, the assets directory, logging; keys and defaults in Task 6), `users` (R-D8) and `streams` (a list of stream documents, R-D3). There is no data directory and no separate store. The file is decoded strictly (`KnownFields`: an unknown key is an error), is at most 4 MiB, and on Unix must be mode 0600, checked at start and at every reload. **The rule for formats:** the config document is YAML, in the file and on `GET`/`PUT /api/v1/config`; every other request and response body is JSON, and a stream has the same keys in both (the `yaml` and `json` tags of `internal/spec` are equal, by a test). The library is `go.yaml.in/yaml/v3`, already in `go.mod` as an indirect dependency. Rejected: JSON for the file (no comments, which decision 4 requires to survive) | The service user must be able to write the file **and its directory** (the rename), so the file lives in a directory the service owns, not a root-owned `/etc`. A change in `server` needs a restart (R-D4). YAML's looser typing (an unquoted `no`, a leading-zero number) is the operator's to quote; strict decoding into typed fields catches most of it |
 | R-D3 | **Product names (closes R-B2).** A stream name and a rendition label each match `^[a-z0-9][a-z0-9-]{0,62}$` and are none of the Windows device names (`con`, `prn`, `aux`, `nul`, `com1`…`com9`, `lpt1`…`lpt9`), so `_` separates them without ambiguity and a name is a safe file name on every system the server builds for. A stream **without** a ladder is served as `<name>` on every output. A stream **with** a ladder is served as `<name>`: over HLS and DASH that is the ABR presentation, over HTTP-TS, RTMP, RTSP, SRT and RTMP push it is rendition 0, the first in the spec; and each rendition is also its own stream `<name>_<label>` on every enabled output. **The source of a laddered stream is not served to players** (with a watermark it is the unbranded picture, R-C5); `copy://<name>` reads it, and `copy://<name>_<label>` reads a rendition. There is no `<name>_abr` in the product and `abr` is an ordinary label; osdev keeps its names. The thumbnail is an operator preview of the source, so it is served by the API, behind its authentication, not under `/live/` | An operator who wants the raw source out next to a ladder adds a `copy` rendition (not possible with a watermark, by R-C5). A ladder of N rungs runs N + 1 packagers when HLS or DASH is on, as osdev does; a switch that stops serving the renditions on their own is a Backlog item |
-| R-D4 | **How the file is loaded, written and reloaded** (user decisions 3 and 4). **Write:** every API edit writes the whole file: a temp file `.<base>.<random>.tmp` in the same directory with mode 0600, write, `fsync`, rename over the target, `fsync` the directory (Unix); a crash leaves the old file or the new one, never a partial one, and a leftover temp file is removed at the next start. A whole-config `PUT` writes **the exact bytes the client sent**, so comments and formatting survive; a per-stream `PUT` or `DELETE` edits the YAML node tree of the current text (comments on untouched nodes survive; the edited stream's own comments do not, and the first such edit may normalise indentation to 2 spaces) and writes the result. **Hand edits** are applied by a reload: SIGHUP, or `POST /api/v1/reload` (the same function; Windows has no SIGHUP). **Stale detection:** the server remembers the SHA-256 of the text it last loaded, reloaded or wrote; an API write finds the file's hash different and is refused with 409 until a reload, so neither side silently overwrites the other. **Validity.** A reload and every API write are all or nothing on the *document*: YAML syntax, the `version`, `server`, `users`, every stream's `Validate`, and duplicate names; any error is reported (all of them, not the first), nothing is applied and nothing is written. An invalid file at reload keeps the running state and is reported in the log, in `GET /api/v1/config/status` and in `openstreamer_config_reloads_total{result="error"}`. **Only the start is lenient about streams**, so one bad stream cannot keep every other stream offline after a reboot: a stream entry that does not decode, fails `Validate` or repeats a name is skipped and reported; errors in `version`, `server` or `users` stop the start. While the file holds such an entry, API writes and reloads are refused with those errors until it is fixed (by hand, or with a `PUT /api/v1/config`). **`server` changes are not applied while running:** a reload or `PUT` whose `server` section differs from the one the process started with applies users and streams and lists the changed keys as `restart_required` (in the response, the log and the status). Migrations: `version` is the only switch; version 1 is the only one accepted. Rejected: a store beside the config (two sources of truth), and merging hand edits with API edits (no safe merge of two texts) | Every API edit rewrites the whole file, which is small. The window between the stale check and the rename is not closed: a hand edit saved in those microseconds is lost. A stream that is skipped at start is absent until someone reads the log, the status or `openstreamer_config_load_errors`. No history: an overwritten config is gone |
+| R-D4 | **How the file is loaded, written and reloaded** (user decisions 3 and 4). **Write:** every API edit writes the whole file: a temp file `.<base>.<random>.tmp` in the same directory with mode 0600, write, `fsync`, rename over the target, `fsync` the directory (Unix); a crash leaves the old file or the new one, never a partial one, and a leftover temp file is removed at the next start. A whole-config `PUT` writes **the exact bytes the client sent**, so comments and formatting survive; a per-stream `PUT` or `DELETE` edits the YAML node tree of the current text and writes the result: the comment lines above keys and entries survive, but the library re-emits the document, so blank lines are dropped, sequences re-indented to 2 spaces, the spacing of line comments normalised, and the comments inside the edited stream (and a line comment on its `name:`) lost. An operator who cares about the file's layout edits it whole. **Hand edits** are applied by a reload: SIGHUP, or `POST /api/v1/reload` (the same function; Windows has no SIGHUP). **Stale detection:** the server remembers the SHA-256 of the text it last loaded, reloaded or wrote; an API write finds the file's hash different and is refused with 409 until a reload, so neither side silently overwrites the other. **Validity.** A reload and every API write are all or nothing on the *document*: YAML syntax, the `version`, `server`, `users`, every stream's `Validate`, and duplicate names; any error is reported (all of them, not the first), nothing is applied and nothing is written. An invalid file at reload keeps the running state and is reported in the log, in `GET /api/v1/config/status` and in `openstreamer_config_reloads_total{result="error"}`. **Only the start is lenient about streams**, so one bad stream cannot keep every other stream offline after a reboot: a stream entry that does not decode, fails `Validate` or repeats a name is skipped and reported; errors in `version`, `server` or `users` stop the start. While the file holds such an entry, API writes and reloads are refused with those errors until it is fixed: by hand, with a `PUT /api/v1/config`, or with a per-stream `PUT` or `DELETE` of that entry's own name, which replaces or removes it. Anchors, aliases and merge keys are refused everywhere, and numbers must be plain decimal integers (Task 6). **`server` changes are not applied while running:** a reload or `PUT` whose `server` section differs from the one the process started with applies users and streams and lists the changed keys as `restart_required` (in the response, the log and the status). Migrations: `version` is the only switch; version 1 is the only one accepted. Rejected: a store beside the config (two sources of truth), and merging hand edits with API edits (no safe merge of two texts) | Every API edit rewrites the whole file, which is small. The window between the stale check and the rename is not closed: a hand edit saved in those microseconds is lost. If the directory `fsync` fails after the rename, the new text is on disk but was not applied: the API answers 409 until a reload. The file's symlinks are resolved once at start, and the rename needs the directory: a container must mount the directory, not the single file (a bind-mounted file cannot be renamed over: `EBUSY`). A stream that is skipped at start is absent until someone reads the log, the status or `openstreamer_config_load_errors`. No history: an overwritten config is gone |
 | R-D5 | **Supervisor (§3.6).** One goroutine per enabled stream owns everything of that stream and takes edits from a mailbox (`Submit`), in order; readers (the output servers' lookups, the API's status, the metrics) see only an immutable `View` and a `Status` behind atomic pointers. There is no lock shared between streams, and **no periodic reconciler**: a supervisor exists for exactly the enabled specs in the manager's map, by construction, and its loop ends only with its context. **Restart policy:** inside a generation, a failed input is the pipeline's business (retry and failover, M2a) and a dead child the transcoder's (respawn, M4a). The supervisor rebuilds the whole generation only when one of its long-lived parts returns before the context ends (the pipeline's `Run`, the transcoder's `Run`, for example on a child of another wire version, or the thumbnailer's `Run`), or when building it fails (an asset that was there at validation and is gone now): it tears the generation down, waits 1 s, doubling up to 30 s, back to 1 s once a generation has lived 60 s, and builds again, forever. An edit during the wait is applied at once. **Two supervisors of one name never overlap:** a supervisor started for a name waits, before it builds, for the previous supervisor of that name to have stopped completely (its pipeline's `Run` returned, so its listen sockets and RTMP publish routes are released). A stream never ends: `EndOnEOF` is false, so a file input without `loop` restarts at its end as a new epoch. A panic is not recovered | A generation that fails at once is rebuilt every 30 s for as long as the spec stands; `state: backoff`, `last_error` and `openstreamer_stream_restarts_total{reason="failure"}` are the signals. A rebuild, for an edit or a failure, starts a new packager, so the HLS `MEDIA-SEQUENCE` and the DASH timeline of the same URL start again (Backlog). A bug that panics in one stream takes the process, and every stream, down; the service manager restarts it and the config file brings every stream back |
 | R-D6 | **How an edit is applied.** `spec.Diff(old, new)` is `ChangeNone` when the documents are equal, `ChangeOutputs` when they differ only in `outputs`, and `ChangeRebuild` otherwise. **Outputs, in place** (Task 7's `reattach`): packagers are started when the first of HLS and DASH is enabled and stopped when the last is disabled, and left alone otherwise; each of HTTP-TS, RTMP, RTSP and SRT is a flag in the view, and disabling one makes each served hub refuse that output's subscribers, which ends its sessions and no others; pushes are keyed by URL, so an added target starts, a removed one stops, and an unchanged one keeps its connection. The source hub, the pipeline, the transcoder and its child are not touched. **Rebuild:** the generation is torn down and built from the new spec at once (no backoff); every session of the stream ends and HLS media sequence numbers start again. **In M5a an input edit is a rebuild**; §3.6's "changing inputs … is applied in place" is M5b's. `disabled` stops and removes the supervisor, or starts one. Rejected: v1's field-by-field diff routing (the source of most of v1's lifecycle findings); here there are two routes | Any edit outside `outputs` (a rung's bitrate, a thumbnail interval, one more failover input) interrupts every viewer of that stream for a few seconds. Disabling HLS while DASH stays on stops serving the HLS paths but keeps the packager's work |
 | R-D7 | **API** (user decision 4 for the config editor). Base path `/api/v1`. **The config editor:** `GET /api/v1/config` returns the file text as `application/yaml`, verbatim (stream secrets and password hashes included), with an `ETag` that is the content hash; editors only. `PUT /api/v1/config` (editors, `Content-Type: application/yaml`, **`If-Match` required**) validates the whole document, applies it through the one apply path (R-D4) and writes the exact bytes; it answers with a per-stream outcome (`unchanged`, `outputs`, `rebuild`, `created`, `started`, `stopped`, `deleted`) and `restart_required`. A stale `If-Match` is 412, a missing one 428, a file changed on disk 409, an unparsable body 400, an invalid document 422 with every error. **Per-stream endpoints are thin wrappers** over the same path: `PUT /streams/{name}` (a JSON stream document, idempotent, creates or replaces; no PATCH, no POST) and `DELETE /streams/{name}` edit the YAML node tree and go the same way; they honour an optional `If-Match` on the stream's own `ETag`. Reads: `GET /streams`, `GET /streams/{name}`, `GET /streams/{name}/status`, `GET /streams/{name}/thumbnail.jpg`, `GET /config/status`, `GET /version`, `GET /openapi.json`; `POST /reload`; outside the base path `/healthz`, `/metrics` and `/debug/pprof/`. **Stream URLs are redacted in every JSON response** unless an editor asks with `?secrets=1` (for an edit round trip); a per-stream `PUT` whose URL carries the redaction mask where a secret would be is refused, so a redacted document cannot be written back by mistake. Users have no endpoints of their own: they change only as part of the whole config (`PUT /api/v1/config`, or a hand edit and reload), and a document without an editor is refused. The router is `net/http.ServeMux`, not chi. The OpenAPI 3.1 document is hand-written as JSON, embedded and served, and a test keeps it equal to the registered routes and the spec's fields. Task 12 edits §3.6 and §3.7 to say so | Two ways to edit, which must agree: one apply path is what keeps them from diverging. A per-stream edit loses that stream's comments. An editor can lock every other editor out, or change a password hash, with one `PUT`; that is the role. No middleware library: auth, the body limit and the request counter are hand-written wrappers |
-| R-D8 | **Auth** (user decisions 1 and 2). HTTP Basic auth against the `users` of the config file, each `{name, role, password}`. **Two roles:** `viewer` may do every read (streams with URLs redacted, status, thumbnail, config status, version, the OpenAPI document, `/metrics`); `editor` may do everything a viewer can, plus every write (`PUT`, `DELETE`, `POST /reload`), plus what returns stored secrets or process internals (`GET /api/v1/config`, `?secrets=1`, `/debug/pprof/`). `/healthz` is open. **The password field is a hash, never plaintext:** `pbkdf2-sha256$<iterations>$<salt>$<key>`, salt and key in unpadded standard base64, PBKDF2-HMAC-SHA-256 from `crypto/pbkdf2`, a random 16-byte salt per user, a 32-byte key, **600000 iterations** (OWASP's 2023 figure; about 0.2 s of one core per verification); the prefix versions the format. The config loader refuses a password that is not in that format (so plaintext cannot be configured), fewer than 600000 or more than 10000000 iterations, an unknown role, a duplicate or malformed name, more than 64 users, and a config with no editor; its errors never quote the field. `openstreamer hash-password` makes the hash: it reads the password from stdin, never from argv; on a terminal it turns echo off and asks twice; it refuses fewer than 12 bytes. **Verification:** in constant time; a request for an unknown user is verified against a dummy hash of the same cost, so timing does not reveal names. Because Basic auth sends the password on every request, a successful verification is remembered in the user set: HMAC-SHA-256, under a per-process random key, of name and password, mapped to the role, at most one entry per user, dropped when the users are reloaded; a failed one is never remembered. At most 2 verifications run at once. **Failed-login backoff, per client IP** (the connection's remote address, an IPv6 address by its /64; no forwarded header is trusted): after 5 consecutive failures the IP is refused with 429 and `Retry-After`, before any hashing, for 1 s, doubling with each further failure up to 5 min; a success clears it; an entry idle for 15 min is dropped; at most 4096 IPs are tracked and the one that failed longest ago is dropped first. A 401 carries `WWW-Authenticate: Basic realm="openstreamer"`; an authenticated user without the role gets 403. The API has its own listener, default `127.0.0.1:8081`, apart from the media listener (`/live/`, default `:8080`, no auth: playback tokens are M6). **Basic credentials are base64, not encrypted: until M5c's HTTPS the API listener stays on loopback by default.** The soak's Prometheus scrapes `/metrics` with `basic_auth` as a viewer | The first request of each user after a start or reload costs 0.2 s of CPU, and every wrong password costs that again, which the limiter and the cap of 2 bound. Behind a reverse proxy every client shares the proxy's IP, so one client's failures lock out all of them for up to 5 min. With 4096 IPs tracked, an attacker with more addresses resets its own counters. An editor is a full operator: it can point a stream at any URL or local media file the server can read. No rotation other than editing the file |
+| R-D8 | **Auth** (user decisions 1 and 2). HTTP Basic auth against the `users` of the config file, each `{name, role, password}`. **Two roles:** `viewer` may do every read (streams with URLs redacted, status, thumbnail, config status, version, the OpenAPI document, `/metrics`); `editor` may do everything a viewer can, plus every write (`PUT`, `DELETE`, `POST /reload`), plus what returns stored secrets or process internals (`GET /api/v1/config`, `?secrets=1`, `/debug/pprof/`). `/healthz` is open. **The password field is a hash, never plaintext:** `pbkdf2-sha256$<iterations>$<salt>$<key>`, salt and key in unpadded standard base64, PBKDF2-HMAC-SHA-256 from `crypto/pbkdf2`, a random 16-byte salt per user, a 32-byte key, **600000 iterations** (OWASP's 2023 figure; about 0.2 s of one core per verification); the prefix versions the format. The config loader refuses a password that is not in that format (so plaintext cannot be configured), fewer than 600000 or more than 10000000 iterations, an unknown role, a duplicate or malformed name, more than 64 users, and a config with no editor; its errors never quote the field. `openstreamer hash-password` makes the hash: it reads the password from stdin, never from argv; on a terminal it turns echo off and asks twice; it refuses fewer than 12 bytes. **Verification:** in constant time; a request for an unknown user is verified against a dummy hash (made once per process, at 600000 iterations), so timing does not reveal names. Because Basic auth sends the password on every request, a successful verification is remembered in the user set: HMAC-SHA-256, under a per-process random key, of name and password, mapped to the role, at most one entry per user, kept across config edits that leave the users section unchanged and dropped when it changes; a failed one is never remembered. At most 2 verifications run at once and at most 16 wait (beyond that: 503 with `Retry-After`); a request that goes away gives up its place. **Failed-login backoff, per client address and presented user name** (controller ruling; the connection's remote address, an IPv6 address by its /64, no forwarded header trusted; the pair is kept only as an HMAC): a login takes one of the pair's 5 places before it is verified, so 200 simultaneous wrong logins run at most 5 verifications; after 5 failures the pair is refused with 429 and `Retry-After`, before anything is compared (not even against a remembered login), for 1 s, doubling with each further failure up to 5 min; a success clears it; an entry idle for 15 min is dropped; at most 4096 pairs are tracked and the one that failed longest ago is dropped first. **Every `PUT`, `DELETE` and `POST` must carry an `X-Requested-By` header** (any value): a browser that has cached the Basic credentials would otherwise send them with a cross-site form or a bodyless `POST /api/v1/reload`, which need no preflight; a custom header does. A 401 carries `WWW-Authenticate: Basic realm="openstreamer"`; an authenticated user without the role gets 403. The API has its own listener, default `127.0.0.1:8081`, apart from the media listener (`/live/`, default `:8080`, no auth: playback tokens are M6). **Basic credentials are base64, not encrypted: until M5c's HTTPS the API listener stays on loopback by default.** The soak's Prometheus scrapes `/metrics` with `basic_auth` as a viewer | The first request of each user after a start, or after an edit that changes the users, costs 0.2 s of CPU, and every wrong password costs that again, which the limiter and the cap of 2 bound. Because the key includes the presented name, a client can try 5 passwords for each name it invents, each costing a dummy verification: that cannot find a password of a real user faster, but it can keep both verification slots busy, and then a real user's *first* login waits or gets 503 (a remembered login is not affected). Wrong passwords for one user from one address lock out that pair, the right password included, for up to 5 min; behind a reverse proxy, or on loopback, every client of that user shares the address. With 4096 pairs tracked, an attacker with more pairs resets its own counters. `curl` users must add `-H 'X-Requested-By: curl'` to writes. An editor is a full operator: it can point a stream at any URL or local media file the server can read. No rotation other than editing the file |
 | R-D9 | **Metrics.** `internal/metrics` writes the Prometheus text format 0.0.4 itself: counters and gauges, collected at scrape time from the `Stats` the packages already keep. No histograms. Every name starts `openstreamer_`, except the conventional `go_*` and `process_*` (so stock dashboards and the soak's leak panels work). **Labels come only from configuration:** `stream` (a spec name), `name` (a served name), `rendition` (a label), `output`, `reason`, `state`, `kind`, `result`, `target` (the first 8 hex digits of the SHA-256 of a push's URL: stable when another push is removed, and never the URL), and for the API `method` (one of `GET`, `PUT`, `DELETE`, `POST`, `HEAD`, `OPTIONS`, or `other` for anything else a client sends), `route` (the mux pattern, never the path; `unmatched` when none matches) and `code`. Nothing a client sends becomes a label value. With S streams of at most 8 rungs and 8 pushes the stream series are bounded by about 60 × S. Counters that come from a generation's objects start again at 0 when the stream is rebuilt, which Prometheus treats as a counter reset. `EncoderFallbacks` is `openstreamer_transcoder_encoder_fallbacks_total{stream}` (closes the Backlog's export; refusing the fallback is M5b). The catalogue is in Task 7 and Task 10. Rejected: `prometheus/client_golang` (Apache-2.0): about ten transitive modules for a job that is two hundred lines when every value is already a snapshot | We own the exposition code and its escaping. No latency histograms; if they are wanted, switching to `client_golang` is a contained change behind `metrics.Writer`. Per-stream session counts are not exported (the output servers count per server, not per stream): M6's sessions |
 | R-D10 | **Logs.** `log/slog`, JSON on stderr by default (`text` for a terminal), level `info` by default. Attributes: `stream`, `component`, `input`, `err`. The API logs one line per request at `info`: method, route pattern, status, duration, remote address; never a header, a query or a body. Media requests are not logged per request. **Redaction is two layers:** code that logs a URL passes it through `redact.URL`, and the handler from `logging.New` scrubs every message, string attribute and error text: each URL-shaped substring (`scheme://…`) goes through `redact.URL`, and an attribute named `token`, `password`, `passphrase`, `secret` or `authorization` (any case) is replaced by the mask | A regular expression runs over every logged string, which is fine at log rates and would not be on a per-frame path (nothing logs per frame). A secret that is not URL-shaped and not under one of those keys is not caught by the second layer |
 | R-D11 | **Validation happens before anything is stored or started,** in two steps: `spec.Stream.Validate` (structure, names, limits; no I/O) and `stream.Check` (what needs the v2 packages or the server's config: `ingest.Parse` on every input, a dry `transcode.New` and `rtmppush.New` on scratch hubs, the asset read, the transcoder binary being configured). The manager then checks `copy://` cycles and **listen claims**, for the streams an edit changes or adds, against the server's listeners and the streams that hold their claims (a stream holds its claims while it has a supervisor: a disabled stream and one left stopped at load hold none, and are judged when they are next edited), under one rule for TCP and UDP: two claims overlap when they have the same protocol family and port and the same host, or a wildcard host on either side. The rule is seeded with the server's own bound listeners (HTTP, API, RTMP, RTSP on TCP; SRT on UDP), runs between the inputs of one spec as well as between streams, and runs over the file's streams in name order at load, where the stream that comes second is left stopped with the reason. Two exceptions: RTMP listen inputs on the *same* address share one listener (and the server's RTMP play listener) and collide only on an equal publish path; and a UDP input on a multicast group claims nothing (several streams may read one group). After that the config file is written, and only then is the supervisor told; a supervisor is never given a spec that failed a check, so building a generation cannot fail on the spec. An unreachable source is **not** a validation error: the stream is created and waits | A check the dry run misses surfaces as a stream in `backoff` rather than a 422. Listen overlaps the claims do not see, each of which ends as a bind error the pipeline retries and shows in `last_error`: a multicast input against a unicast or wildcard socket on the same port; host names (`localhost` and `127.0.0.1` are different hosts to the rule); the RTSP server's UDP port pair, chosen at start; and the moment an address passes from one stream to another in one edit, when the new owner may try to bind before the old one has let go. Two multicast inputs that differ only in a source filter are not told apart. `copy://` of a stream that does not exist yet is accepted, and the copying stream waits for it |
@@ -55,7 +55,7 @@
 | 1 | 1 (carry items), 2 (`spec`, `redact.Masked`), 3 (`metrics`), 4 (`logging`), 5 (`hub.Refuse`, the Thumbnailer's `OnEvent`), 13 (`auth`) | Disjoint files: Task 1 has `native/watermark*`, `cmd/ostranscoder/main_test.go`, `rtspplay_test.go` and one Backlog line; Tasks 2, 3, 4 and 13 are new packages (Task 2 also `internal/redact`); Task 5 has `internal/hub` and `internal/transcode/thumbnailer*.go`. Task 13 has its number because it was added in review round 2; it stands after Task 5 in this document |
 | 2 | 6 (`config`), 7 (`stream.Supervisor`) | 6 needs Task 2's types and Task 13's hashes, and makes yaml a direct dependency (`go.mod`: only Task 6 touches it); 7 needs Tasks 2, 3, 4 (`logging.Scrub`) and 5. New, separate packages |
 | 3 | 8 (`stream.Manager`) | Same package as 7 |
-| 4 | 9 (`api`) | Needs 8's `Outcome` and `Status`, 13's `auth.Users` and `Limiter`, 3's `metrics.Writer` and 4's `logging.Scrub` |
+| 4 | 9 (`api`) | Needs 8's `Outcome` and `Status`, 6's error types (`config.SyntaxError`, `Errors`, `ErrStale`, `ErrNoStream`, `MaxBytes`), 13's `auth.Users` and `Limiter`, 3's `metrics.Writer` and 4's `logging.Scrub` |
 | 5 | 10 (`server`, `cmd/openstreamer`) | Needs 3, 4, 6, 8, 9 and 13 |
 | 6 | 11 (M5a scenarios) | Needs 10 |
 | 7 | 12 (CI, docs, spec, done) | Needs 11 |
@@ -119,6 +119,7 @@ const (
 	MaxInputs, MaxRenditions, MaxPushes = 8, 8, 8
 	MaxURLBytes   = 2048
 	MaxSpecBytes  = 1 << 20
+	MaxStreams    = 1000 // streams in one config
 )
 
 type Stream struct {
@@ -414,18 +415,39 @@ type Users struct{ /* unexported */ }
 // NewUsers refuses: a name not matching ^[a-z0-9][a-z0-9._-]{0,31}$, a duplicate name, a role other than viewer or editor,
 // more than MaxUsers, and a list without an editor.
 func NewUsers(list []User) (*Users, error)
-func (u *Users) Authenticate(name, password string) (Role, bool) // R-D8: dummy hash for an unknown name, remembered successes, at most 2 at once
 func (u *Users) Len() int
+func (u *Users) Equal(list []User) bool // the same names with the same role and the same hash string, in any order
+// Remembered reports a login this set has already verified: no PBKDF2, constant time. It is never true for a wrong password.
+func (u *Users) Remembered(name, password string) (Role, bool)
+// Verify runs PBKDF2 (against the dummy hash for an unknown name) and remembers a success. At most 2 run at once and at
+// most 16 wait: ErrBusy beyond that. A waiter whose ctx ends leaves the queue and gets ctx.Err().
+func (u *Users) Verify(ctx context.Context, name, password string) (Role, error)
+var (
+	ErrBadCredentials = errors.New("auth: bad credentials")
+	ErrBusy           = errors.New("auth: too many logins waiting")
+)
 
 type Limiter struct{ /* unexported */ }
-func NewLimiter(now func() time.Time) *Limiter  // nil means time.Now
-func (l *Limiter) Allow(key string) (retryAfter time.Duration, ok bool)
-func (l *Limiter) Fail(key string)
-func (l *Limiter) Succeed(key string)
-func ClientKey(remoteAddr string) string // the IP of a host:port; an IPv6 address masked to its /64; the input itself when it does not parse
+func NewLimiter(now func() time.Time) *Limiter // nil means time.Now
+// Key is the limiter's key for a client and the user name it presents: hex(HMAC-SHA-256(process key, ClientKey ‖ 0x00 ‖
+// user)). Hashed, so the table holds no names and a long name costs no memory.
+func (l *Limiter) Key(remoteAddr, user string) string
+func (l *Limiter) Blocked(key string) (retryAfter time.Duration, blocked bool) // in a backoff now
+// Reserve takes one in-flight attempt for key, unless its counted failures plus its attempts in flight are already 5.
+func (l *Limiter) Reserve(key string) (*Attempt, bool)
+func (l *Limiter) Succeed(key string) // a remembered login: clears the key
+type Attempt struct{ /* unexported */ }
+func (a *Attempt) Succeed() // clears the key
+func (a *Attempt) Fail()    // counts one failure and starts or lengthens the backoff
+func (a *Attempt) Abandon() // neither: the request went away, or the server was busy
+func ClientKey(remoteAddr string) string // the IP of a host:port, Unmap()ped first, the zone dropped; an IPv6 address masked to its /64; the input itself when it does not parse
 ```
 
-`Authenticate`: compute `tag = HMAC-SHA-256(processKey, name ‖ 0x00 ‖ password)`; if the user has a remembered tag and `hmac.Equal` says it is this one, return the role (no PBKDF2). Otherwise take one of 2 slots, verify against the user's hash, or against the dummy hash when the name is unknown (the dummy is made in `NewUsers` with the iteration count of the first user, so both paths cost the same), and on success remember the tag for that user, replacing an older one. `processKey` is 32 random bytes made in `NewUsers`. The limiter's rule is R-D8's: failures 1 to 5 are free; from the 5th on, `Allow` is false for `min(1 s × 2^(failures−5), 5 min)` after the last failure; `Succeed` deletes the key; a key idle for 15 min is deleted; with 4096 keys the one whose last failure is oldest is deleted to make room.
+**Remembered logins.** `tag = HMAC-SHA-256(processKey, name ‖ 0x00 ‖ password)`. `Remembered` is true when the user has a remembered tag and `hmac.Equal` says it is this one. `Verify` takes one of 2 slots (or waits, at most 16 deep), verifies against the user's hash, or against the dummy hash when the name is unknown, and on success remembers the tag for that user, replacing an older one. `processKey` (32 random bytes) and **the dummy hash are made once per process**, at first use (`sync.Once`), the dummy at `auth.Iterations`: they are not remade when a `Users` is built, so building one costs no PBKDF2. A `Users` is immutable apart from its remembered tags; the server keeps the same `*Users` across config edits that leave the users section equal (`Equal`, Task 10), so an editor's own writes do not forget its login.
+
+**The limiter.** A key is a client address **and the user name presented** (controller ruling): on the loopback default every local client has the same address, and one scraper with a stale password must not lock out the others. Per key: `failures` (counted), `inFlight` (reserved, not yet resolved), the time of the last failure. `Blocked` is true for `min(1 s × 2^(failures−5), 5 min)` after the last failure once `failures ≥ 5`. `Reserve` refuses when `failures + inFlight ≥ 5`: so of N simultaneous wrong logins for one key at most 5 are verified, however they are timed, because each takes its place before it is verified, not after. `Fail` adds a failure; `Succeed` deletes the key; `Abandon` only gives the place back. A key idle for 15 min (and with nothing in flight) is deleted; with 4096 keys the one whose last failure is oldest and that has nothing in flight is deleted to make room.
+
+**The order a caller follows** (Task 9 does; it is stated here because the pieces only make sense together): (1) `Blocked(key)` → refuse, **before anything is compared**: a blocked client must not learn whether its guess equals a remembered password; (2) `Remembered` → success, `Limiter.Succeed(key)`, no reservation (so many parallel requests of a logged-in client never meet the limit of 5); (3) `Reserve(key)` → refuse when false; (4) `Verify`, then `Succeed`, `Fail` (on `ErrBadCredentials`) or `Abandon` (on `ErrBusy` and on a ctx error).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -443,19 +465,36 @@ func TestParseHashRefuses(t *testing.T)
 // input or any 6-byte piece of it.
 func TestNewUsers(t *testing.T)
 // refuses: names "", "Bob", "a b", 33 bytes; two "ops"; role "admin" and ""; 65 users; viewers only. Accepts one editor.
-func TestAuthenticate(t *testing.T)
-// (hashes at 1000 iterations) the editor with its password → (Editor, true); a wrong password, an unknown name and an empty
-// name → false; the viewer → (Viewer, true). A counter on the verify function (an unexported hook) shows: one PBKDF2 for the
-// first success, none for the next 100 of the same user, one for every failure, and one for every unknown name.
-func TestAuthenticateConcurrency(t *testing.T) // 16 goroutines with wrong passwords: the hook never sees more than 2 verifications at once
-func TestAuthenticateTiming(t *testing.T)
-// not a wall-clock test: by the hook, an unknown name and a known name with a wrong password each run exactly one
-// verification with the same iteration count.
+func TestVerifyAndRemember(t *testing.T)
+// (hashes at 1000 iterations) Verify of the editor with its password → Editor; a wrong password, an unknown name and an
+// empty name → ErrBadCredentials; the viewer → Viewer. Remembered is false before the first Verify, true after it for that
+// password only, and never true after a failed Verify. A counter on the PBKDF2 call (an unexported hook) shows one call per
+// Verify and none per Remembered.
+func TestVerifyBounded(t *testing.T)
+// the hook blocks. 30 goroutines call Verify with wrong passwords: at most 2 are inside PBKDF2, 16 wait, and the other 12
+// get ErrBusy at once. A waiter whose ctx is cancelled returns ctx.Err() and its place is taken by a new caller; when the
+// hook is released, every waiter finishes.
+func TestDummyOncePerProcess(t *testing.T)
+// NewUsers called 50 times runs no PBKDF2 (the hook); the first Verify of an unknown name anywhere in the process makes the
+// dummy (one extra call, at auth.Iterations), later ones do not. An unknown name and a known name with a wrong password
+// each cost exactly one verification.
+func TestUsersEqual(t *testing.T) // equal for the same list reordered; not equal when a hash string, a role or a name differs, or a user is added
 func TestLimiter(t *testing.T)
-// fake clock: 4 Fails → Allow ok; the 5th → blocked 1 s; at +1 s ok; a 6th Fail → 2 s; … the 14th and later → 5 min, never
-// more; Succeed → ok at once and the next Fail counts from 1; an idle key is gone after 15 min; two keys are independent.
-func TestLimiterBounded(t *testing.T) // 5000 keys failing once each: at most 4096 tracked, and the survivors are the latest
-func TestClientKey(t *testing.T)     // "1.2.3.4:5" → "1.2.3.4"; "[2001:db8:1:2:3:4:5:6]:7" and "[2001:db8:1:2::9]:7" → the same key; "garbage" → "garbage"
+// fake clock, one key, each attempt Reserve then Fail: 4 failures → not Blocked; the 5th → Blocked for 1 s; at +1 s not
+// blocked; a 6th → 2 s; … the 14th and later → 5 min, never more; Succeed → clear at once and the next failure counts from
+// 1; an idle key is gone after 15 min; Abandon changes nothing.
+func TestLimiterReservesBeforeVerifying(t *testing.T)
+// 200 goroutines Reserve the same key at once and hold their attempt: exactly 5 get one. After those 5 Fail, the key is
+// Blocked and Reserve is false. With 3 counted failures, only 2 more can be in flight. An Abandon gives a place back.
+func TestLimiterKeyIsAddressAndUser(t *testing.T)
+// Key("127.0.0.1:1", "scraper") and Key("127.0.0.1:2", "ops") differ; 5 failures on the first leave the second neither
+// Blocked nor short of places. Key of the same address and user from two ports is equal. A key is 64 hex digits whatever the
+// user name's length (1 MiB of name included), and holds neither the address nor the name.
+func TestLimiterBounded(t *testing.T) // 5000 keys failing once each: at most 4096 tracked, the survivors are the latest, and a key with an attempt in flight is never the one dropped
+func TestClientKey(t *testing.T)
+// "1.2.3.4:5" → "1.2.3.4"; "[::ffff:1.2.3.4]:5" → "1.2.3.4" (unmapped first); "[2001:db8:1:2:3:4:5:6]:7" and
+// "[2001:db8:1:2::9]:7" → the same key; "[fe80::1%eth0]:5" and "[fe80::2%eth1]:5" → the same key, without a zone;
+// "garbage" → "garbage"
 ```
 
 - [ ] **Step 2: Run** `go test -race -count=1 ./internal/auth/` — compile failure.
@@ -471,7 +510,7 @@ func TestClientKey(t *testing.T)     // "1.2.3.4:5" → "1.2.3.4"; "[2001:db8:1:
 - Test: `internal/config/document_test.go`, `server_test.go`, `edit_test.go`, `file_test.go`
 
 **Interfaces:**
-- Consumes: Task 2 (`spec.Stream`, `Validate`, `spec.MaxStreams`: **add `const MaxStreams = 1000` to `internal/spec` in this task**, its only edit there), Task 13 (`auth.ParseHash`, `auth.NewUsers`).
+- Consumes: Task 2 (`spec.Stream`, `Validate`, `spec.MaxStreams`), Task 13 (`auth.ParseHash`, `auth.NewUsers`).
 - Produces:
 
 ```go
@@ -502,12 +541,18 @@ type Server struct {
 }
 func (s Server) Resolved() Server      // the defaults filled in
 func (s Server) Diff(o Server) []string // the dotted keys whose resolved values differ, sorted: "server.rtmp.listen"
+// CheckFiles looks at the file system, which Parse never does: a transcoder.binary that is given must be a regular file (and
+// on Unix have an execute bit), and assets_dir, when given, a directory. The server calls it once, at start.
+func (s Server) CheckFiles() error
 
 type Options struct{ MinIterations int } // 0 means auth.MinIterations. Tests pass less; cmd/openstreamer never does.
 
-type Parsed struct { Doc Document; Users *auth.Users }
+type Parsed struct { Doc Document; Users *auth.Users; UserList []auth.User } // UserList: the parsed users, for auth.Users.Equal
 
-type SyntaxError struct{ Err error } // the text is not one YAML document of the expected shape
+// SyntaxError: the text is not one YAML document of the expected shape. Its Error() replaces every backquoted value of the
+// library's message by `…`: yaml quotes the offending scalar ("cannot unmarshal !!str `hunter2` into int"), which may be a
+// secret typed on the wrong line.
+type SyntaxError struct{ Err error }
 type Errors []error                   // every validation error of a document; Error() joins them with "; "
 
 // Parse is strict (R-D4): one document, known keys only, at most MaxBytes; then every check, collecting every error.
@@ -527,22 +572,31 @@ var ErrNoStream = errors.New("config: no such stream")
 
 var ErrStale = errors.New("config: the file changed on disk")
 type File struct{ /* unexported */ }
-// Open reads the file (at most MaxBytes), removes the temp files a crashed write of this file left, and remembers the
-// text's hash. On Unix it refuses a file whose mode has any group or other bit ("config: <path> must be mode 0600").
+// Open resolves path's symlinks once (filepath.EvalSymlinks: the rename must replace the real file, not the link), reads the
+// file (at most MaxBytes), removes the temp files a crashed write of this file left, and remembers the text's hash. On Unix
+// it refuses a file whose mode has any group or other bit ("config: <path> must be mode 0600").
 func Open(path string) (*File, []byte, error)
-func (f *File) Read() ([]byte, error)   // the text on disk now
+func (f *File) Read() ([]byte, error)   // the text on disk now; the same mode check as Open, every time (a reload reads through it)
 func (f *File) Stale() (bool, error)    // the text on disk has another hash than the remembered one
 func (f *File) Write(text []byte) error // ErrStale when stale; else R-D4's atomic write, and the hash is remembered
 func (f *File) Adopt(text []byte)       // remember text's hash: after a reload took the file as it is
 ```
 
-**Checks** (`Parse`; each error names its place, as `server.srt.latency_ms: …` or `users[1].role: …`, and never quotes a password field): `version` is 1; each listen address is empty or `host:port` with a port of 0 to 65535, `http.listen` and `api.listen` not empty after defaults; apps not empty and without `/` at their ends; `rtsp.udp` needs `rtsp.listen`; `srt.latency_ms` 1…65535; `log.level` one of `debug`, `info`, `warn`, `error` and `log.format` one of `json`, `text`; a `transcoder.binary` that is given must be a regular file, and on Unix (`exec_unix.go`) have an execute bit, while elsewhere (`exec_other.go`: Windows has no such bit) being a regular file is the whole check; `assets_dir`, when given, is a directory; each user's `password` passes `auth.ParseHash(…, MinIterations)` and the list passes `auth.NewUsers`; at most `spec.MaxStreams` streams, each passing `Validate`, with distinct names. `Parse` does no `stream.Check` and no claims: those need the running server and are `Manager.Replace`'s.
+**Checks** (`Parse`; each error names its place, as `server.srt.latency_ms: …` or `users[1].role: …`, and never quotes a password field): `version` is 1; each listen address is empty or `host:port` with a port of 0 to 65535, `http.listen` and `api.listen` not empty after defaults; apps not empty and without `/` at their ends; `rtsp.udp` needs `rtsp.listen`; `srt.latency_ms` 1…65535; `log.level` one of `debug`, `info`, `warn`, `error` and `log.format` one of `json`, `text`; each user's `password` passes `auth.ParseHash(…, MinIterations)` and the list passes `auth.NewUsers`; at most `spec.MaxStreams` streams, each passing `Validate`, with distinct names. `Parse` does no `stream.Check` and no claims: those need the running server and are `Manager.Replace`'s. **`Parse` never touches the file system**: whether `transcoder.binary` and `assets_dir` exist is `Server.CheckFiles`' question (on Unix, `exec_unix.go`, an execute bit; elsewhere, `exec_other.go`, a regular file is the whole check: Windows has no such bit), asked once at start. So a binary that disappears while the server runs does not make every later edit of the config fail; the stream that needs it reports it (Review Focus 5).
 
-**Strict decoding.** `yaml.NewDecoder` with `KnownFields(true)`; a second document in the text is a `*SyntaxError`; duplicate keys and excessive aliasing are refused by the library and surface as `*SyntaxError`. `ParseLenient` decodes `streams` as `[]yaml.Node` first, and each entry by marshalling the node back to text and decoding that with a strict decoder (a `Node` cannot be decoded strictly by itself).
+**Two checks on the node tree**, made by walking the decoded `yaml.Node` before anything else, each an entry of `Errors` with its line:
+- **No anchors, aliases or merge keys** (`&a`, `*a`, `<<:`): a node with an `Anchor`, an `AliasNode`, or a mapping key tagged `!!merge` is refused with `line N: anchors, aliases and merge keys are not supported`. They would make a stream entry's text depend on another place in the file, which the per-entry lenient decoding and the node edits of `SetStream` and `DeleteStream` cannot keep whole (an edit could leave an alias dangling).
+- **Numbers are plain decimal integers.** The config has no fractional field, and YAML converts silently: `0720` is 464, `1.5` and `1.0` become 1, `1_000` is 1000. Every scalar the library resolved as `!!int` or `!!float` must match `^-?(0|[1-9][0-9]*)$`, or it is refused with `line N: write the number as a plain decimal integer`. A quoted scalar is a string and is not affected.
 
-**`SetStream`.** Decode `text` into a `yaml.Node`; find the top-level `streams` sequence (append the key when it is missing); find the entry whose `name` scalar is `sp.Name`. Replace: encode `sp` to a node and put its `Content` in place of the entry's, keeping the entry node's own head, line and foot comments. Append otherwise. Encode with `SetIndent(2)`. What is not touched keeps its comments and order; comments inside the replaced entry are lost (R-D4).
+**Strict decoding.** `yaml.NewDecoder` with `KnownFields(true)`; a second document in the text is a `*SyntaxError`; duplicate keys are refused by the library and surface as `*SyntaxError`. `ParseLenient` decodes `streams` as `[]yaml.Node` first, and each entry by marshalling the node back to text and decoding that with a strict decoder (a `Node` cannot be decoded strictly by itself).
 
-**`File.Write`.** Steps, each followed by a call of an unexported `hook func(step string) error` that tests set (nil in production): create `.<base>.<8 random hex>.tmp` in the file's directory with `O_WRONLY|O_CREATE|O_EXCL`, 0600 (`created`); write (`written`); `fsync` (`synced`); rename over the file (`renamed`); `fsync` the directory. A real error removes the temp file; a hook error returns at once and removes nothing, which is what a crash leaves. Calls are serialised by a mutex in `File`.
+**`SetStream`.** Decode `text` into a `yaml.Node`; find the top-level `streams` sequence (append the key when it is missing); find the entry whose `name` scalar is `sp.Name`. Replace: encode `sp` to a node and put its `Content` in place of the entry's, keeping the entry node's own head and foot comments; when several entries have that name (a duplicate the start skipped), the first is replaced and the others removed. Append otherwise. `DeleteStream` removes every entry of the name. Encode with `SetIndent(2)`.
+
+**What a node round trip keeps and loses** (measured in review; R-D4): the library re-emits the whole document, so head comments (the lines above a key or an entry) and the order of keys and entries survive, while **blank lines are dropped, sequences are re-indented, the spacing before a line comment is normalised, comments inside the replaced entry are lost, and so is a line comment on the replaced entry's `name:`**. Only a text that is already in the library's own formatting comes back byte-equal outside the edited entry. A whole-config `PUT` is not affected: it never goes through a node.
+
+**Repairing a skipped entry.** Because `SetStream` and `DeleteStream` find an entry by its `name` scalar alone, a per-stream `PUT` or `DELETE` of the name of an entry the start skipped replaces or removes that entry, and if it was the only fault the document then parses and the edit goes through. An entry whose `name` cannot be read is repaired with a whole-config `PUT` or by hand.
+
+**`File.Write`.** Steps, each followed by a call of an unexported `hook func(step string) error` that tests set (nil in production): create `.<base>.<8 random hex>.tmp` in the file's directory with `O_WRONLY|O_CREATE|O_EXCL`, 0600 (`created`); write (`written`); `fsync` (`synced`); rename over the file (`renamed`); `fsync` the directory (`dirsynced`). A real error before the rename removes the temp file; a hook error returns at once and removes nothing, which is what a crash leaves. **An error after the rename** (the directory `fsync` failing) is returned, and the hash is **not** remembered: the new text is on disk, the caller's edit was not applied (`commit` failed), so the file is stale and API writes answer 409 until a reload takes the file as it is. Calls are serialised by a mutex in `File`.
 
 - [ ] **Step 1: Write the failing tests** (each in `t.TempDir()`; hashes at 1000 iterations with `Options{MinIterations: 1000}` unless the test is about the floor)
 
@@ -552,11 +606,18 @@ func TestParseMinimal(t *testing.T)
 // apps "live", latency 120, level "info", format "json"; Users.Len() is 1.
 func TestParseStrict(t *testing.T)
 // an unknown top-level key, an unknown key inside server.rtmp, inside a user and inside a stream's rendition; a duplicate
-// key; two documents; a tab-indented line; 4 MiB + 1 byte: each is a *SyntaxError or Errors naming the key or line. A
-// comment, an anchor used once and a quoted hash are accepted.
+// key; two documents; a tab-indented line; 4 MiB + 1 byte: each is a *SyntaxError or Errors naming the key or line.
+// Anchors, aliases and merge keys, each refused with its line: a stream written as `- &cam {…}` with a later `- *cam`; a
+// `<<: *defaults` inside a stream; an anchor that is never used. Numbers, each refused with its line: height 0720, 0x2d0,
+// 1_080, 720.0, 720.5 and 7.2e2; bitrate_kbps "800" (a string where an int is wanted is the library's type error). Height
+// 720 and latency_ms 120 pass. A comment and a quoted hash are accepted.
+func TestSyntaxErrorHidesValues(t *testing.T)
+// `latency_ms: hunter2` and a password written under the wrong key as a bare scalar: the error names the line and the
+// types and contains neither "hunter2" nor the scalar; every backquoted piece of the library's message reads `…`.
 func TestParseServer(t *testing.T)
-// one row per server check above; a transcoder.binary that does not exist, is a directory, and on Unix a regular file
-// without an execute bit, are errors, and a regular executable file passes (on Windows: a regular file passes).
+// one row per server check above. Parse does not look at the file system: a transcoder.binary and an assets_dir that do
+// not exist pass Parse. Server.CheckFiles refuses a binary that does not exist, is a directory, and on Unix a regular file
+// without an execute bit; a regular executable file passes (on Windows: a regular file passes); assets_dir must be a directory.
 func TestParseUsers(t *testing.T)
 // a plaintext password ("hunter2-plaintext"), a bcrypt hash, 599999 iterations (with the default Options), role "admin", two
 // users "ops", no editor, 65 users: each is in Errors under its users[i] path, and no error text contains "hunter2" or any
@@ -569,17 +630,27 @@ func TestParseLenientSkipsBadStreams(t *testing.T)
 // returned. Parse of the same text returns Errors with those three.
 func TestHash(t *testing.T) // quoted 64 hex digits; one changed byte (a comment) changes it
 func TestSetStreamKeepsComments(t *testing.T)
-// a text with a header comment, a comment above server, a line comment on a user, comments above streams "a" and "b" and
-// inside "a". SetStream(b changed): every comment but those inside b is still there, a is byte-for-byte the same block,
-// the order of keys and streams is kept, and Parse of the result has the new b. SetStream(c, new) appends c after b.
-// SetStream on a text without a streams key adds one. The result of every edit parses.
-func TestDeleteStream(t *testing.T) // removes b and its comments only; ErrNoStream for an unknown name; the last stream leaves "streams: []"
-func TestOpenMode(t *testing.T)    // Unix only: 0644 and 0640 are refused with the path and "0600"; 0600 and 0400 pass
+// fixture 1, already in the library's formatting (made by encoding a node once: 2-space indent, no blank lines, one space
+// before a line comment), with a header comment, a comment above server, a line comment on a user, comments above streams
+// "a" and "b" and inside "a": after SetStream(b changed) the text is byte-for-byte equal outside b's entry, and b's head
+// comment is kept. Fixture 2, hand-formatted (blank lines between sections, 4-space sequences, aligned line comments, a
+// line comment on b's `name:`): every head comment is still there and the order of keys and streams is kept, and the test
+// pins the losses so that a library upgrade that changes them is noticed: the blank lines are gone, the indentation is 2,
+// the comments inside b and on b's `name:` are gone. In both, Parse of the result has the new b. SetStream(c, new) appends
+// c after b; SetStream on a text without a streams key adds one; SetStream of a name that two entries have leaves one.
+func TestSetStreamRepairsSkippedEntry(t *testing.T)
+// a text whose entry "cam" has an unknown key (ParseLenient skips it): SetStream(cam, valid) gives a text that Parse
+// accepts; DeleteStream("cam") too. An entry without a name is not found by either.
+func TestDeleteStream(t *testing.T) // removes b and its comments only (fixture 1: byte-equal otherwise); ErrNoStream for an unknown name; the last stream leaves "streams: []"
+func TestOpenMode(t *testing.T)    // Unix only: 0644 and 0640 are refused with the path and "0600"; 0600 and 0400 pass; a file chmodded to 0644 after Open makes the next Read fail the same way
+func TestOpenSymlink(t *testing.T) // Unix: Open of a symlink to the file; after Write the link is still a link, the real file has the new text, and the temp file was made next to the real file
 func TestWriteAtomic(t *testing.T) // Write replaces the text; the file is still 0600; no temp file is left; Stale is false after; with the directory read-only (skip as root) Write fails and the old text is intact
 func TestWriteCrashPoints(t *testing.T)
-// for each hook step (created, written, synced, renamed) with the hook returning an error: the file on disk reads back
-// byte-equal to the old text (before "renamed") or to the new one (at "renamed"), never anything else, and Parse accepts it;
-// a temp file may be left; a new Open of the path removes it and loads the surviving text.
+// for each hook step (created, written, synced, renamed, dirsynced) with the hook returning an error: the file on disk reads
+// back byte-equal to the old text (before "renamed") or to the new one (from "renamed" on), never anything else, and Parse
+// accepts it; a temp file may be left; a new Open of the path removes it and loads the surviving text. At "renamed" and
+// "dirsynced" Write returned an error although the new text is on disk: Stale is then true, a second Write is ErrStale, and
+// Adopt of the text on disk clears it.
 func TestStale(t *testing.T)
 // after Open: Stale false. The test rewrites the file by hand: Stale true and Write returns ErrStale, the hand edit intact.
 // Adopt(the hand-edited text): Stale false and Write works. A hand edit that restores the same bytes is not stale.
@@ -908,7 +979,9 @@ func (m *Manager) Load(streams []spec.Stream) []error
 // Replace makes streams the whole set, all or nothing. It judges the streams that are new or changed (below); on any error
 // it returns every one of them, joined, and changes nothing. Otherwise it calls commit, when not nil; if commit fails,
 // its error is returned and nothing changed. Then it applies the difference and returns one Outcome per name of the old and
-// the new set, sorted by name. The streams have passed Validate and have distinct names (config.Parse).
+// the new set, sorted by name. **Once commit has succeeded, Replace returns a nil error, whatever happens to ctx**: the edit
+// is in the file and in force, and a caller that saw an error would keep stale bookkeeping. The streams have passed Validate
+// and have distinct names (config.Parse).
 func (m *Manager) Replace(ctx context.Context, streams []spec.Stream, commit func() error) ([]Outcome, error)
 func (m *Manager) Get(name string) (spec.Stream, bool)
 func (m *Manager) List() []spec.Stream                    // sorted by name
@@ -929,7 +1002,7 @@ The manager does not know the file: `commit` is how the caller (Task 10) writes 
 2. **Judge only what the edit touches.** For each created or changed stream that is enabled: `Check`; its claims against `env.Reserved`, against each other inside its own spec, against the other created or changed enabled streams of this call, and against the **holders**: the streams that have a supervisor now and are neither deleted nor changed by this call. Then the `copy://` cycles of the new set. An unchanged stream is not judged again, whatever its state. **One rule for streams without a supervisor:** a disabled stream and a stream left stopped at load hold no claims and are not judged while they stay as they are; they are judged like any other when an edit changes them, and an unchanged one stays stopped (its `LastError` kept). So a conflict that the start left in the file does not make every later edit fail; it only keeps its own stream down until that stream is edited or the server restarts.
 3. `commit()`.
 4. Apply: cancel the supervisors of deleted and newly disabled streams (no wait); create a supervisor for each created or newly enabled stream, and for a changed stream that had none, chained on its name's tail; `Submit` the changed spec to a running one; swap the map.
-5. Release `edit`; wait for the `Submit` answers, or for `ctx` (the edits stay applied); return the outcomes: `deleted`; `created`; `started` (a stream that existed without a supervisor and has one now); `stopped` (it had one and is now disabled); `unchanged`; `outputs` or `rebuild` as `spec.Diff` says.
+5. Release `edit`; wait for the `Submit` answers, or for `ctx`. `ctx` ending here (the client hung up during a rebuild) is **not an error**: the edits are applied and committed, the outcomes do not depend on the answers (they come from the classification of step 1 and from `spec.Diff`), and the supervisors finish on their own. Return the outcomes with a nil error: `deleted`; `created`; `started` (a stream that existed without a supervisor and has one now); `stopped` (it had one and is now disabled); `unchanged`; `outputs` or `rebuild` as `spec.Diff` says.
 
 **One supervisor per name at a time (R-D5).** The manager keeps, per name, the **tail**: the `Done()` of the last supervisor it created for that name, also after that stream was stopped or deleted. A new supervisor of the name gets the tail as `after`, and becomes the tail. Because a supervisor's `Done` never closes before its own `after` (Task 7), the tail is closed only when every earlier supervisor of the name has stopped, however many were created and cancelled in between. Stopping and deleting only cancel; nothing in `Replace` waits for a teardown. A tail that is closed and whose name has no stream any more is dropped from the map at the next edit, so the map does not grow with deleted names.
 
@@ -966,6 +1039,11 @@ func TestManagerReplaceAllOrNothing(t *testing.T)
 // a set with one good new stream and two bad ones (an encoded rung with Transcoder "", a UDP claim on a Reserved port):
 // the error wraps ErrInvalid and ErrConflict and names both streams; commit was not called; the good one was not created.
 func TestManagerCommitFails(t *testing.T) // commit returning an error: Replace returns it; Get still returns the old spec, no generation moved, nothing was created
+func TestManagerReplaceCtxEndsAfterCommit(t *testing.T)
+// a rebuild edit whose teardown is held (a blocking reader Close), with a ctx the test cancels once commit has been called:
+// Replace returns within 1 s with a nil error and [{cam rebuild}]; Get returns the new spec at once; when the teardown is
+// released the stream reaches generation 2 with the new spec. The same with a ctx already cancelled before the call: commit
+// is still called, the error is nil, and the edit is applied (Replace does not look at ctx before the wait).
 func TestConflict(t *testing.T)
 // the rule alone, as a table of claim pairs. Conflict: UDP :P / UDP :P; UDP 0.0.0.0:P / UDP 127.0.0.1:P; UDP 10.0.0.1:P twice;
 // RTMP 127.0.0.1:P path a twice; RTMP :P path a / RTMP 127.0.0.1:P path b; RTMP :P path a / TCP :P (the HTTP listener);
@@ -1028,7 +1106,7 @@ func TestManagerCollect(t *testing.T)  // openstreamer_streams{state="running"} 
 - Test: `internal/api/api_test.go`, `auth_test.go`, `streams_test.go`, `config_test.go`, `openapi_test.go`
 
 **Interfaces:**
-- Consumes: Task 8 (`stream.Outcome`, `stream.Status`, `stream.ErrInvalid`, `ErrConflict`, `ErrClosed`), Task 6 (`config.SyntaxError`, `config.Errors`, `config.ErrStale`, `config.ErrNoStream`, `config.MaxBytes`), Task 13 (`auth.Users`, `auth.Limiter`, `auth.ClientKey`, the roles), Task 2 (`spec`), Task 3 (`metrics.Writer`), Task 4 (`logging.Scrub`, for error messages).
+- Consumes: Task 8 (`stream.Outcome`, `stream.Status`, `stream.ErrInvalid`, `ErrConflict`, `ErrClosed`), Task 6 (`config.SyntaxError`, `config.Errors`, `config.ErrStale`, `config.ErrNoStream`, `config.MaxBytes`), Task 13 (`auth.Users` with `Remembered` and `Verify`, `auth.Limiter` with `Key`, `Blocked`, `Reserve` and `Attempt`, `auth.ErrBadCredentials`, `auth.ErrBusy`, the roles), Task 2 (`spec`), Task 3 (`metrics.Writer`), Task 4 (`logging.Scrub`, for error messages).
 - Produces:
 
 ```go
@@ -1108,23 +1186,25 @@ Routes, roles and answers (JSON unless said otherwise):
 | `GET /debug/pprof/…` | editor | `net/http/pprof`'s `Index`, `Cmdline`, `Profile`, `Symbol`, `Trace` | |
 
 **The order of one request** (the outer wrapper; this order is what the tests pin):
-1. **Route first.** `mux.Handler(r)` gives the matched pattern before anything else; its path is the `route` of the access log and of the counter, `unmatched` when there is none. So a 401, a 403 and a 429 are counted under the route they were aimed at.
-2. An open route is served. An unmatched request is answered 404 without authentication.
-3. `Limiter.Allow(auth.ClientKey(r.RemoteAddr))`: when blocked, 429 with `Retry-After` (whole seconds, rounded up), and no password is looked at.
-4. Basic credentials (`r.BasicAuth()`): missing or malformed is 401; `Users().Authenticate` false is 401 after `Limiter.Fail`; success calls `Limiter.Succeed`. A request without credentials is not a failed login and does not count against the IP.
-5. The route's role, and an editor for `?secrets=1`: 403 otherwise.
-6. The handler.
+1. **Route first, from the pattern only.** `_, pattern := mux.Handler(r)` is called for the pattern and nothing else (the handler it returns has no path values and is never called). The pattern is `"GET /api/v1/streams/{name}"`: the wrapper cuts the method off and looks `(method, path)` up in the table behind `Routes()`. Found: that path is the `route` of the access log and the counter, and its role is the one required. Anything else is `unmatched`: no pattern (an unknown path), **a known path with another method** (the mux then returns an empty pattern and its 405 handler), and a path the mux wants to redirect (a trailing slash, a `..` or a doubled slash: its 307 handler).
+2. An `unmatched` request is handed to `mux.ServeHTTP` and gets the mux's own answer, **without authentication**: 404, 405 with `Allow`, or 307, as plain text. It is counted under `route="unmatched"` with that code. (It tells a stranger which paths exist, which the OpenAPI document does anyway; it never reaches a handler of ours.) An open route (`/healthz`) is dispatched the same way.
+3. A `PUT`, `DELETE` or `POST` without an `X-Requested-By` header is 400 `bad_request` ("the X-Requested-By header is required"), before any credential is looked at (R-D8).
+4. Credentials: `r.BasicAuth()`. Missing or malformed is 401; it is not a failed login and counts against nobody.
+5. The limiter and the users, in the order Task 13 fixes, with `key := Limiter.Key(r.RemoteAddr, name)`: `Blocked(key)` → 429 with `Retry-After` (whole seconds, rounded up), nothing compared; `Users().Remembered` → authenticated, `Limiter.Succeed(key)`; else `Reserve(key)` false → 429 with `Retry-After: 1`; else `Users().Verify(r.Context(), …)`: a role → `Succeed`; `auth.ErrBadCredentials` → `Fail`, 401; `auth.ErrBusy` → `Abandon`, 503 `unavailable` with `Retry-After: 1`; a context error → `Abandon` (the client is gone).
+6. The route's role, and an editor for `?secrets=1`: 403 otherwise.
+7. `mux.ServeHTTP(w, r)`: the real dispatch, which is what fills `r.PathValue`.
 
-The access log line (R-D10) has the method, route, status, duration, remote address and, once authenticated, the user's name; never a header, the query or a body. The counter's `method` is the request's when it is `GET`, `PUT`, `DELETE`, `POST`, `HEAD` or `OPTIONS` and `other` for anything else. A failed login is logged at `warn` at most once every 10 s (`Options.Now`), with the remote address and the presented name passed through `logging.Scrub` and cut to 32 bytes, never the password.
+The access log line (R-D10) has the method, route, status, duration, remote address and, once authenticated, the user's name; never a header, the query or a body. The counter's `method` is the request's when it is `GET`, `PUT`, `DELETE`, `POST`, `HEAD` or `OPTIONS` and `other` for anything else. `HEAD` matches the `GET` patterns, as in the mux. A failed login is logged at `warn` at most once every 10 s (`Options.Now`), with the remote address and the presented name passed through `logging.Scrub` and cut to 32 bytes, never the password.
 
 Errors are `{"error":{"code":"…","message":"…","errors":["…"]}}` (`errors` only where the table says), `Content-Type: application/json`, every text passed through `logging.Scrub`:
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `bad_request` | a stream body that is not one JSON document or has an unknown field or a `name` other than the path's; a config body that is not one YAML document of the expected shape (`*config.SyntaxError`) |
+| 400 | `bad_request` | a stream body that is not one JSON document or has an unknown field or a `name` other than the path's; a config body that is not one YAML document of the expected shape (`*config.SyntaxError`, its message with the values hidden); a `PUT`, `DELETE` or `POST` without `X-Requested-By` |
 | 401 | `unauthorized` | no, malformed or wrong credentials; with `WWW-Authenticate: Basic realm="openstreamer"` |
 | 403 | `forbidden` | a viewer on an editor's route, or with `?secrets=1` |
-| 404 | `not_found` | `ErrNotFound`, `config.ErrNoStream`, an unknown stream, an invalid name in the path, no thumbnail yet, no route |
+| 404 | `not_found` | `ErrNotFound`, `config.ErrNoStream`, an unknown stream, an invalid name in the path, no thumbnail yet |
+| 404, 405, 307 | (the mux's plain text) | an `unmatched` request: an unknown path, a known path with another method (405 with `Allow`), a path the mux redirects. Not authenticated, not JSON |
 | 409 | `conflict` | `stream.ErrConflict` (a listen claim, a `copy://` cycle); `errors` lists each |
 | 409 | `config_changed` | `config.ErrStale`: the file was edited by hand; reload first |
 | 412 | `precondition_failed` | `ErrPrecondition` |
@@ -1133,9 +1213,9 @@ Errors are `{"error":{"code":"…","message":"…","errors":["…"]}}` (`errors`
 | 422 | `invalid_config` | `config.Errors` (the whole document is judged, also for a per-stream edit); `errors` lists every one |
 | 422 | `invalid_spec` | `stream.ErrInvalid` (`Check`); `errors` lists every one |
 | 428 | `precondition_required` | `ErrPreconditionRequired` |
-| 429 | `too_many_attempts` | the limiter; with `Retry-After` |
+| 429 | `too_many_attempts` | the limiter: the pair of address and user is in a backoff, or already has 5 logins counted or in flight; with `Retry-After` |
 | 500 | `internal` | anything else (a failed file write); the cause is logged, the message is "internal error" |
-| 503 | `unavailable` | `stream.ErrClosed` |
+| 503 | `unavailable` | `stream.ErrClosed`; `auth.ErrBusy` (with `Retry-After: 1`) |
 
 Every response sets `Cache-Control: no-store` (except the thumbnail) and `X-Content-Type-Options: nosniff`. JSON stream responses redact (`spec.Stream.Redacted`) unless the query is exactly `secrets=1` from an editor.
 
@@ -1147,18 +1227,30 @@ Every response sets `Cache-Control: no-store` (except the thumbnail) and `X-Cont
 func TestAuth(t *testing.T)
 // every route but /healthz: no header, "Bearer x", a Basic header that is not base64, an unknown user and a wrong password
 // → 401 with WWW-Authenticate exactly `Basic realm="openstreamer"` and the error body; /healthz is 200 without a header; an
-// unmatched path is 404 without a header. New with a nil Users is an error. 100 failed logins log one warning, which holds
+// unmatched path is the mux's 404 without a header. New with a nil Users is an error. 100 failed logins, from 100 addresses within 10 s, log one warning, which holds
 // the name and not the password.
 func TestRoles(t *testing.T)
 // from Routes(): the viewer gets 200 on every viewer route and 403 on every editor route (PUT and DELETE of a stream,
 // GET and PUT of the config, POST reload, pprof), and 403 for GET streams?secrets=1; the editor gets no 403 anywhere.
 // Routes() has exactly the table's roles.
-func TestUsersReload(t *testing.T) // Options.Users returning a new set: the old password is 401 on the next request and the new one 200
+func TestUsersReload(t *testing.T) // Options.Users returning a new set: the old password is 401 on the next request and the new one 200; returning the same set again: the next request of a remembered login runs no PBKDF2
 func TestLoginBackoff(t *testing.T)
-// 5 wrong passwords from 10.0.0.1 → 401 each; the 6th request, even with the right password, is 429 with Retry-After "1" and
-// Authenticate was not called for it (a counter on the fake users); after 1 s the right password is 200 and clears it;
-// 10.0.0.2 was never affected; requests without any credentials never count; the 429s are in
-// openstreamer_api_auth_blocked_total and the 401s in openstreamer_api_auth_failures_total.
+// 5 wrong passwords for "ops" from 10.0.0.1 → 401 each; the 6th request, with the right password, and even though "ops" has
+// a remembered login from 10.0.0.2, is 429 with Retry-After "1" and nothing was compared (a counter on PBKDF2 and one on
+// Remembered); after 1 s the right password is 200 and clears it. Never affected: "ops" from 10.0.0.2, and "eye" from
+// 10.0.0.1 (the same address, another user: the scraper with a stale password does not block its neighbour). Requests
+// without credentials never count. The 429s are in openstreamer_api_auth_blocked_total, the 401s in
+// openstreamer_api_auth_failures_total.
+func TestLoginBurst(t *testing.T)
+// 200 simultaneous requests with wrong passwords for "ops" from one address: the PBKDF2 counter ends at 5 or less; the rest
+// are 429. 100 simultaneous requests of a remembered login: all 200, no 429, no PBKDF2 (a remembered login reserves nothing).
+func TestLoginBusy(t *testing.T)
+// PBKDF2 held by the hook, 30 simultaneous first logins of 30 different unknown names: 2 inside, 16 waiting, 12 answered
+// 503 unavailable with Retry-After "1" and counted against nobody; a waiting request whose client hangs up frees its place.
+func TestWritesNeedRequestedBy(t *testing.T)
+// every PUT, DELETE and POST route from Routes(), as the editor, without X-Requested-By → 400 bad_request, the Backend is
+// not called and no PBKDF2 ran; with the header (any value) it works; GET routes never need it. A bodyless
+// POST /api/v1/reload with only an Authorization header, which a cross-site form could send, is among the refused.
 func TestStreamCRUD(t *testing.T)
 // PUT → 201, applied "created", ETag equal to the spec's; GET returns it with the same ETag; PUT again → 200 "unchanged";
 // list holds it; DELETE → 204; GET → 404. PUT with a body name "other" → 400; with no name → the path's. The Backend got
@@ -1195,7 +1287,13 @@ func TestRequestCounter(t *testing.T)
 // route="/api/v1/streams/{name}",code="200"} 2 and a route="unmatched" series; no series holds a stream name or a user name.
 // Requests with the methods "BREW", "get" and a 40-byte random token all land in method="other". A request without
 // credentials to /api/v1/streams/x is counted under route="/api/v1/streams/{name}",code="401": the route is resolved
-// before authentication.
+// before authentication, and the label has no method in it. Unmatched, each without credentials and each counted under
+// route="unmatched": POST /api/v1/streams/x → 405 with an Allow header naming GET, PUT and DELETE; GET /api/v1/nope → 404;
+// GET /api/v1/streams/ and GET /api/v1//streams → a redirect or 404 as the mux decides, never a handler of ours.
+func TestPathValuesReachHandlers(t *testing.T)
+// GET, PUT and DELETE of /api/v1/streams/cam and GET of its status and thumbnail: the Backend is called with "cam", not ""
+// (the dispatch goes through mux.ServeHTTP, not through the handler mux.Handler returned). HEAD /api/v1/streams/cam is
+// authenticated and counted under the GET route.
 func TestAccessLog(t *testing.T) // one info line per request with method, route, status, duration and the user; a request with Authorization and ?secrets=1 logs neither the header, the password nor the query
 func TestOpenAPIMatchesRoutes(t *testing.T)
 // the embedded document parses; its set of method and path equals Routes() minus the pprof routes; every operation except
@@ -1247,7 +1345,7 @@ func (s *Server) Run(ctx context.Context) error
 func LiveOutputs(dir, file string) []stream.Output
 ```
 
-**The one apply path** (`apply.go`). The state it guards, under one mutex `cfg`: the `config.File`; `applied`, the text in force (also behind an atomic pointer, for `ConfigText`); `started`, the resolved `server` section the process started with; the users (an `atomic.Pointer[auth.Users]`, which `api.Options.Users` reads); the status fields.
+**The one apply path** (`apply.go`). The state it guards, under one mutex `cfg`: the `config.File`; `applied`, the text in force (also behind an atomic pointer, for `ConfigText`); `started`, the resolved `server` section the process started with; the users (an `atomic.Pointer[auth.Users]`, which `api.Options.Users` reads); the status fields, published after every change as one immutable `api.ConfigStatus` behind an atomic pointer, so `ConfigStatus()` and `ConfigText()` never take `cfg` and a viewer's status request does not wait for an apply that is waiting for a rebuild.
 
 ```go
 // apply makes text the config in force. write says whether the text came over the API (and must be written) or from the
@@ -1260,10 +1358,14 @@ func (s *Server) apply(ctx context.Context, text []byte, write bool) (api.ApplyR
 		return s.file.Write(text)                     // ErrStale if the file changed since the stale check
 	}
 	out, err := s.manager.Replace(ctx, p.Doc.Streams, commit)
-	if err != nil { return api.ApplyResult{}, err }   // nothing applied, nothing written
+	if err != nil { return api.ApplyResult{}, err }   // nothing applied, nothing written. After a successful commit Replace
+	                                                  // never fails (Task 8), so from here on the bookkeeping always runs,
+	                                                  // also when ctx has ended: the client hanging up changes nothing.
 	if !write { s.file.Adopt(text) }
-	s.users.Store(p.Users)                            // the old users' remembered logins go with them
-	s.setApplied(text)                                // applied, its hash, LoadedAt
+	if !s.users.Load().Equal(p.UserList) {            // only a changed users section replaces the set: an unchanged one
+		s.users.Store(p.Users)                        // keeps its remembered logins, so an edit costs its author no PBKDF2
+	}
+	s.setApplied(text)                                // applied, its hash, LoadedAt; publishes the status snapshot
 	s.restart = s.started.Diff(p.Doc.Server.Resolved())
 	return api.ApplyResult{Streams: out, RestartRequired: s.restart, ETag: config.Hash(text)}, nil
 }
@@ -1272,10 +1374,11 @@ func (s *Server) apply(ctx context.Context, text []byte, write bool) (api.ApplyR
 The four entries, each taking `s.cfg` for its whole length, so two writers are never interleaved:
 - **`PutConfig(text, ifMatch)`:** an empty `ifMatch` is `api.ErrPreconditionRequired`; `s.file.Stale()` true is `config.ErrStale` (checked **before** `If-Match`: a client whose `ETag` is current still must not overwrite a hand edit); `ifMatch` other than `config.Hash(applied)` is `api.ErrPrecondition`; then `apply(text, true)`. The file ends up byte-equal to `text`.
 - **`PutStream(sp, ifMatch)`:** stale → `config.ErrStale`; `ifMatch`, when not empty, must be `*` or the current stream's `ETag()`, and a missing stream fails it; `text := config.SetStream(applied, sp)`; `apply(text, true)`; the outcome is the one of `sp.Name`.
-- **`DeleteStream(name, ifMatch)`:** the same with `config.DeleteStream`; an unknown name is `api.ErrNotFound`.
+- **`DeleteStream(name, ifMatch)`:** the same with `config.DeleteStream`; a name that neither the manager nor the text has is `api.ErrNotFound` (`config.ErrNoStream`).
+- A per-stream `PUT` or `DELETE` of **the name of an entry the start skipped** is allowed and is how that entry is repaired one stream at a time (Task 6): the edit replaces or removes the bad entry, and if nothing else is wrong the document parses and is applied; the outcome is `created` for a `PUT` (the manager did not have it), and a `DELETE` answers 204.
 - **`Reload()`:** `text := s.file.Read()`; `apply(text, false)`. On an error nothing changed: it is logged at `error`, kept as `LastReloadError` with its time, and counted; on success `LastReloadError` is cleared, and a non-empty `restart_required` is logged at `warn` as `restart required: server.rtmp.listen, …`. A reload of a file equal to `applied` answers with every stream `unchanged`.
 
-A change in `server` is therefore never applied while running: `started` does not move, the listeners stay, and `restart_required` says so until the process restarts with the new file. `New` uses `config.ParseLenient` and `Manager.Load`; what they skipped or left stopped is `LoadErrors` (each also logged at `error`). While the file holds an entry the start skipped, `apply` fails with those errors for every entry point (R-D4); `PUT /api/v1/config` with a fixed document is how an editor repairs it without a shell.
+A change in `server` is therefore never applied while running: `started` does not move, the listeners stay, and `restart_required` says so until the process restarts with the new file. `New` uses `config.ParseLenient`, then `Server.CheckFiles` on the resolved section (a transcoder binary or assets directory that is missing at start is a start-up error; `apply` never asks again, so one that disappears later fails no edit), and `Manager.Load`; what they skipped or left stopped is `LoadErrors` (each also logged at `error`). While the file holds an entry the start skipped, `apply` fails with those errors for every entry point (R-D4); `PUT /api/v1/config` with a fixed document is how an editor repairs it without a shell.
 
 Wiring, following osdev's `run`: the media mux has `GET /live/{stream}/stream.ts` → `httpts.Handler(func(n) { return m.Hub(OutHTTPTS, n) }, 0)` and `/live/` → a gate in front of `live.Handler`: for `/live/{stream}/{dir}/{file}`, 404 unless `m.Packager(out, stream)` finds a packager for one `out` of `LiveOutputs(dir, file)`; the `live.Handler` behind it looks the packager up with either output. RTMP play registers `rtmpplay.New(lookup(OutRTMP), …)` on `rtmpsrv.Default` (the registry ingest's listen inputs share), on a concrete address: `resolveRTMP(addr string) (string, error)` returns `addr` unchanged when its port is not 0 and otherwise does R-D13's bind, read, close; **when the configured port is 0, `New` retries the pair resolve-and-register up to 5 times on any error of `RegisterPlay`**, not only "address in use": two servers of one process share `rtmpsrv.Default`, and the second to be given the same free port gets "already registered". With a configured port there is no retry. RTSP and SRT start as osdev's `startRTSP` and `startSRT`, on listeners `New` binds itself. `New` then fills the manager's `Env` from what was bound: `RTMPPlay` (the concrete address) and `RTMPApp`, `Transcoder` and `AssetsDir` from the resolved config, and `Reserved` with one `stream.Claim` per listener, owner `server`: HTTP, API and RTSP as TCP claims, RTMP as `{RTMP: true}` with an empty path, SRT as a UDP claim, each with the host normalised (a wildcard is `""`) and the real port. The media server has osdev's `newServer` limits (no read or write timeout: HTTP-TS responses are long-lived); the API server has `ReadHeaderTimeout` 10 s, `ReadTimeout` 30 s, `WriteTimeout` 60 s, `IdleTimeout` 2 min, `MaxHeaderBytes` 64 KiB. The metrics registry gets `metrics.Process`, `Manager.Collect`, `API.Collect`, `openstreamer_build_info{version,goversion} 1`, and from `collect.go`:
 
@@ -1292,10 +1395,10 @@ Wiring, following osdev's `run`: the media mux has `GET /live/{stream}/stream.ts
 
 Shutdown order when `ctx` ends: stop accepting API requests (`Shutdown`, 2 s, then `Close`); cancel the manager's context and wait for `Manager.Run` (every hub closes); unregister RTMP play, stop RTSP, stop SRT (each waits for its sessions, which ended with their hubs); shut the media server down (2 s, then `Close`). A listener that fails after start-up ends `Run` with that error, after the same stop.
 
-**`cmd/openstreamer`.** `func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, hup <-chan os.Signal) int`. `main` passes `os.Stdin`, `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)` and a channel fed by `signal.Notify(…, syscall.SIGHUP)` on Unix (`nil` elsewhere: use `POST /api/v1/reload`).
-- `openstreamer -config path` prints one line per bound listener to stdout (`http <addr>`, `api <addr>`, `rtmp <addr>`, `rtsp <addr>`, `srt <addr>`), then runs; each value from `hup` calls `Reload` and logs its outcome. Exit codes: 0 after a clean stop, 1 when `Run` returns an error, 2 for a usage, config or start-up error (printed to stderr, scrubbed).
+**`cmd/openstreamer`.** `func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, hup <-chan os.Signal) int`. `main` passes `os.Stdin`, `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)` and, on Unix, `hup := make(chan os.Signal, 1)` with `signal.Notify(hup, syscall.SIGHUP)` (`nil` elsewhere: use `POST /api/v1/reload`). **SIGHUP rules:** the channel has a buffer of exactly 1, so signals that arrive during a reload coalesce into one pending reload and none is lost (with no buffer the runtime would drop a signal that arrives while the loop is inside `Reload`; the default action of an unhandled SIGHUP would end the process); `signal.Notify` is called **before** `server.New`, so a HUP during start-up is kept, not fatal; `signal.Stop` is never called (between it and the exit a HUP would kill a process that is shutting down cleanly); and the loop that reads `hup` selects on `ctx.Done()` as well and stops reading once it is closed, so no reload starts during shutdown.
+- `openstreamer -config path` prints one line per bound listener to stdout (`http <addr>`, `api <addr>`, `rtmp <addr>`, `rtsp <addr>`, `srt <addr>`), then runs; each value from `hup` calls `Reload` (one at a time, in the loop's goroutine) and logs its outcome. Exit codes: 0 after a clean stop, 1 when `Run` returns an error, 2 for a usage, config or start-up error (printed to stderr, scrubbed).
 - `openstreamer -version` prints the version.
-- `openstreamer hash-password` takes **no argument** (any is a usage error, exit 2, and is not echoed back: it may be a password). When stdin is a terminal it writes `Password: ` to stderr, reads a line with echo off, writes `Again: `, reads again, and fails on a mismatch; echo is restored on every path, a signal included. When stdin is not a terminal it reads at most 1024 bytes and strips one trailing `\n` or `\r\n`. A password under `auth.MinPasswordBytes` is refused. It prints the hash and a newline to stdout, exit 0. `tty_linux.go` and `tty_darwin.go` implement `isTerminal(fd)` and `readNoEcho(fd)` with `syscall` termios ioctls (`TCGETS`/`TCSETS`; `TIOCGETA`/`TIOCSETA`); `tty_other.go` reports a terminal by `os.ModeCharDevice` and refuses it with `hash-password: echo cannot be turned off on this system; pipe the password on stdin`.
+- `openstreamer hash-password` takes **no argument** (any is a usage error, exit 2, and is not echoed back: it may be a password). When stdin is a terminal it writes `Password: ` to stderr, reads a line with echo off, writes `Again: `, reads again, and fails on a mismatch; echo is restored on every path: a normal return, an error, and SIGINT or SIGTERM while it waits (it catches them for the length of the read, restores the terminal, and exits 130 or 143). When stdin is not a terminal it reads at most 1024 bytes and strips one trailing `\n` or `\r\n`. A password under `auth.MinPasswordBytes` is refused. It prints the hash and a newline to stdout, exit 0. `tty_linux.go` and `tty_darwin.go` implement `isTerminal(fd)` and `readNoEcho(fd)` with `syscall` termios ioctls (`TCGETS`/`TCSETS`; `TIOCGETA`/`TIOCSETA`); `tty_other.go` reports a terminal by `os.ModeCharDevice` and refuses it with `hash-password: echo cannot be turned off on this system; pipe the password on stdin`.
 
 `openstreamer.example.yaml` is a commented example: `version: 1`; `server` with `http.listen` `:8080`, `api.listen` `127.0.0.1:8081`, `rtmp.listen` `:19350`, `rtsp.listen` `:5554`, `srt.listen` `:9999`; one editor and one viewer whose `password` is the placeholder text `REPLACE-WITH-OUTPUT-OF-openstreamer-hash-password` (so the example does not load until it is replaced, and ships no working credential); one stream. **It never names 1935, 554 or 8554**, and no test starts a server from it.
 
@@ -1321,10 +1424,16 @@ func TestServerReserved(t *testing.T)
 // API and the RTSP port, are each refused with 409; one with rtmp://<Addrs().RTMP>/in/key?mode=listen is accepted (it shares
 // the play listener) and one publishing at live/anything there is refused with 422.
 func TestStartIsLenient(t *testing.T)
-// a file with a good stream, a stream with an unknown key, and two streams on one UDP port: New succeeds; the good stream
-// and the first of the pair run; config/status has three load_errors and openstreamer_config_load_errors is 3; and a
-// per-stream PUT is refused with 422 naming the bad entry until a PUT /api/v1/config with that entry fixed succeeds.
-// A file whose users have no editor, or whose server section is bad, makes New fail, without printing a hash.
+// a file with a good stream, a stream "bad" with an unknown key, and two streams on one UDP port: New succeeds; the good
+// stream and the first of the pair run; config/status has two load_errors (the bad entry, and the second of the pair, left
+// stopped) and openstreamer_config_load_errors is 2. While "bad" is in the file, a per-stream PUT of another stream is
+// refused with 422 naming the bad entry. Three repairs, each on a fresh server: PUT /api/v1/streams/bad with a valid
+// document → 201 "created" and the file parses; DELETE /api/v1/streams/bad → 204; a PUT /api/v1/config with the entry
+// fixed. After each, the other per-stream PUT succeeds. A file whose users have no editor, whose server section is bad, or
+// whose transcoder.binary does not exist, makes New fail, without printing a hash.
+func TestBinaryGoneLaterBlocksNoEdit(t *testing.T)
+// started with a transcoder.binary that exists; the test deletes it; a per-stream PUT of a passthrough stream, a
+// PUT /api/v1/config and a Reload all still succeed (apply does not look at the file system).
 func TestApplyPathsAgree(t *testing.T)
 // the same edit (cam's rtsp output off) made three ways on three servers started from the same file: PUT /api/v1/config
 // with the edited text, PUT /api/v1/streams/cam, and a hand edit of the file followed by Reload. In all three: the outcome
@@ -1339,6 +1448,19 @@ func TestPutConfigPreconditions(t *testing.T)
 // no If-Match → ErrPreconditionRequired; an old ETag → ErrPrecondition; after a hand edit of the file, a current ETag →
 // config.ErrStale (the stale check comes first), and with an old ETag as well → still config.ErrStale. In each case the
 // file and the running streams are untouched.
+func TestEditKeepsRememberedLogin(t *testing.T)
+// the editor logs in (one PBKDF2, by auth's hook), then does a per-stream PUT, a PUT /api/v1/config that changes a stream
+// only, and a Reload of an unchanged users section: no further PBKDF2 for any of its requests, and the *auth.Users pointer
+// is the same. A PUT /api/v1/config that changes the viewer's hash replaces the set: the editor's next request costs one.
+func TestClientGoneDuringRebuild(t *testing.T)
+// a per-stream PUT that rebuilds a stream whose teardown the test holds; the test cancels the request's context after the
+// file was written. Then: ConfigText() and its ETag equal the file on disk; config.Parse(file) holds the new spec and so
+// does Manager.Get; a following PutStream of another stream keeps the first edit (nothing is reverted); when the teardown
+// is released the stream runs the new spec.
+func TestStatusDoesNotWaitForApply(t *testing.T) // while an apply waits for a held rebuild: ConfigStatus() and ConfigText() return within 100 ms
+func TestDirSyncFails(t *testing.T)
+// the directory fsync fails after the rename (config's hook): PutStream returns an error (a 500 to a client), no stream
+// changed, config/status says stale, the next write is config.ErrStale, and Reload then applies the text that is on disk.
 func TestHandEditThenWrite(t *testing.T)
 // the test rewrites the file by hand (a comment added): PutStream, DeleteStream and PutConfig are each config.ErrStale and
 // the hand edit is byte-for-byte intact; config/status says stale; after Reload they work, and the comment is still there
@@ -1349,7 +1471,8 @@ func TestReloadAppliesDiff(t *testing.T)
 // the tap saw no Lost; the old password is refused and the new one accepted.
 func TestReloadInvalidKeepsState(t *testing.T)
 // one row per kind of bad file: not YAML; an unknown key; version 2; no editor; a plaintext password; a stream failing
-// Validate; two streams of one name; a stream whose Check fails; a claim on a Reserved port. Reload returns the error; every
+// Validate; two streams of one name; a stream whose Check fails; a claim on a Reserved port; a `- *cam` alias; height 0720;
+// `latency_ms: hunter2` (the error and the status do not contain "hunter2"); the file chmodded to 0644. Reload returns the error; every
 // stream keeps its generation; the old users still log in; config/status has last_reload_error (without any hash or
 // password) and stale stays true; openstreamer_config_reloads_total{result="error"} rose by 1. Restoring the old file and
 // reloading clears the error.
@@ -1377,11 +1500,19 @@ func TestHashPassword(t *testing.T)
 // stdin "correct horse battery\n" → exit 0 and stdout is one line that auth.ParseHash accepts and that verifies the
 // password without the newline; "\r\n" is stripped too; "short\n" → exit 2; an argument (`hash-password hunter2-secret`) →
 // exit 2 and neither stdout nor stderr contains "hunter2-secret"; empty stdin → exit 2.
-func TestSIGHUP(t *testing.T) // Unix (sighup_unix_test.go): with signal.Notify registered as main does, syscall.Kill(os.Getpid(), SIGHUP) after a hand edit makes the edited stream appear within 5 s
+func TestSIGHUP(t *testing.T)
+// Unix (sighup_unix_test.go), through main's own set-up (a helper shared with main that makes the buffered channel and
+// registers it): syscall.Kill(os.Getpid(), SIGHUP) after a hand edit makes the edited stream appear within 5 s. Coalescing:
+// with a reload made slow (a rebuild whose teardown the test holds), the test hand-edits the file again and sends 3 HUPs
+// while that reload is still running; the process survives, and after the release at least one further reload runs, the
+// final file is the config in force (ConfigText equals it) and config/status is not stale. A HUP sent before server.New has
+// returned (the helper registers first) does not kill the process. After ctx is cancelled a HUP starts no reload
+// (openstreamer_config_reloads_total does not move) and run returns 0.
 func TestHashPasswordTTY(t *testing.T)
 // Linux (tty_linux_test.go): a pty pair opened through /dev/ptmx with syscall; the slave is hash-password's stdin. While it
 // waits for the line the slave's termios has ECHO off; after two equal lines the hash is printed and ECHO is on again; two
-// different lines → exit 2 and ECHO is on again.
+// different lines → exit 2 and ECHO is on again. SIGINT while it waits for the first line (sent to the test process, which
+// the command's handler catches for the length of the read): ECHO is on again and the exit code is 130.
 ```
 
 - [ ] **Step 2: Run** `go test -race -count=1 ./internal/server/ ./cmd/openstreamer/` — compile failure.
@@ -1396,7 +1527,7 @@ func TestHashPasswordTTY(t *testing.T)
 
 **Interfaces:**
 - Consumes: `server.New`, `server.Options`, `Server.Addrs`, `Server.Manager` (in-process only for the tap and the packager identity: `Manager().CopyHub`, `Manager().Packager`), `Server.Reload`, `config.Parse`, `metricstest`, `conform.ReadHLS`/`ReadDASH`/`ReadTS`/`ReadRTMP`/`ReadRTSP`, `testpeer`, and the package's existing helpers, used as they are: `recordHub` (m4a), `assertMatchesHub` (m3b1), `assertRTSPMatchesHub` (m3b2), `assertTSMatchesHub`, `tsFrames`, `tsGaps`, `conformBytes`, `rawHTTP`, `rawSRT` (m3b3), `kindCounts` (m3a).
-- Produces, for later milestones' tests: `m5aServer(t, streams string) *m5a` (it writes a config file, mode 0600, into `t.TempDir()`: a commented template with every listener on `127.0.0.1:0`, the users `ops` (editor) and `eye` (viewer) hashed at 1000 iterations, and the given `streams:` YAML; starts `server.New(path, server.Options{MinIterations: 1000})` with a captured log buffer; stops it by `t.Cleanup`), `(*m5a).put(t, sp spec.Stream) (code int, applied string)` (the per-stream `PUT`), `(*m5a).del(t, name string)`, `(*m5a).get(t, path string) (int, []byte)`, `(*m5a).configText(t) (text, etag string)`, `(*m5a).putConfig(t, text, etag string) (code int, res api.ApplyResult)`, `(*m5a).handEdit(t, edit func(string) string)` (rewrites the file on disk, as an operator's editor would), `(*m5a).reload(t) api.ApplyResult` (`POST /api/v1/reload`), `(*m5a).as(user, password string) *m5a` (the same server with other credentials; the default is the editor), `(*m5a).metric(t, name string, labels ...string) float64` (a scrape through `metricstest.Find`), `(*m5a).url(out stream.Output, served string) string` (the play URL of an output: `http://…/live/<n>/hls/index.m3u8`, `…/cmaf/index.mpd`, `…/stream.ts`, `rtmp://…/live/<n>`, `rtsp://…/live/<n>`, `srt://…?streamid=live/<n>`), `(*m5a).tap(t, served string) *hubRecorder` (`recordHub` on `Manager().CopyHub(served)`, **polled every 5 ms for up to 5 s**: a `created` answer comes back before the supervisor has published its first View, so the hub may not be there yet), and `m5aSpec(name, input string) spec.Stream` (every output on, no push).
+- Produces, for later milestones' tests: `m5aServer(t, streams string) *m5a` (it writes a config file, mode 0600, into `t.TempDir()`: a commented template with every listener on `127.0.0.1:0`, the users `ops` (editor) and `eye` (viewer) hashed at 1000 iterations, and the given `streams:` YAML; starts `server.New(path, server.Options{MinIterations: 1000})` with a captured log buffer; stops it by `t.Cleanup`), `(*m5a).put(t, sp spec.Stream) (code int, applied string)` (the per-stream `PUT`), `(*m5a).del(t, name string)`, `(*m5a).get(t, path string) (int, []byte)`, `(*m5a).configText(t) (text, etag string)`, `(*m5a).putConfig(t, text, etag string) (code int, res api.ApplyResult)`, `(*m5a).handEdit(t, edit func(string) string)` (rewrites the file on disk, as an operator's editor would), `(*m5a).reload(t) api.ApplyResult` (`POST /api/v1/reload`), `(*m5a).as(user, password string) *m5a` (the same server with other credentials; the default is the editor; every helper sends `X-Requested-By: e2e` on writes), `(*m5a).metric(t, name string, labels ...string) float64` (a scrape through `metricstest.Find`), `(*m5a).url(out stream.Output, served string) string` (the play URL of an output: `http://…/live/<n>/hls/index.m3u8`, `…/cmaf/index.mpd`, `…/stream.ts`, `rtmp://…/live/<n>`, `rtsp://…/live/<n>`, `srt://…?streamid=live/<n>`), `(*m5a).tap(t, served string) *hubRecorder` (`recordHub` on `Manager().CopyHub(served)`, **polled every 5 ms for up to 5 s**: a `created` answer comes back before the supervisor has published its first View, so the hub may not be there yet), and `m5aSpec(name, input string) spec.Stream` (every output on, no push).
 
 The source is `file://<abs testdata/fixtures/h264_aac.ts>?loop=1`: a file input is paced in real time and each 6 s loop is one epoch change, which every reader below must also survive. The tests drive the server over HTTP with Basic credentials; the in-process access is the tap and the packager's identity, and a hand edit is a write to the file.
 
@@ -1514,7 +1645,8 @@ func TestM5aRoles(t *testing.T)
 // without credentials every /api/, /metrics and /debug/pprof/ URL is 401 with WWW-Authenticate `Basic realm="openstreamer"`
 // and /healthz is 200. The viewer reads streams, status, config/status and /metrics (as the soak's Prometheus will, with
 // basic_auth) and gets 403 for a stream PUT and DELETE, GET and PUT of the config, reload, ?secrets=1 and pprof; the editor
-// does all of them. Six wrong passwords from the test's address give 429 with Retry-After on the sixth. A PUT of the config
+// does all of them. A write without X-Requested-By is 400. Six wrong passwords for "eye" give 429 with Retry-After on the
+// sixth, while "ops", from the same address, is still served. A PUT of the config
 // that replaces the editor's hash makes the old password 401 and the new one 200 on the next request, and one that leaves
 // no editor is 422. The media listener serves /live/ without credentials and has no /api/ route (404).
 ```
@@ -1532,7 +1664,7 @@ func TestM5aRoles(t *testing.T)
 
 - [ ] **Step 1: CI.** Add `TestM5aLadder` to `E2E_TESTS` of the `transcode-e2e-arm64` job (its "Check the tests exist" step then guards the name). The amd64 peers job runs `./internal/e2e/` in full already; check that its run lists `TestM5aEveryOutput`, `TestM5aEditOutputs`, `TestM5aPeers` and `TestM5aLadder` as run, not skipped. Add a step to the untagged test job: `go build -o /dev/null ./cmd/openstreamer` on `GOOS=linux`, `windows` and `darwin`.
 - [ ] **Step 2: Coverage.** Run `make cover && make covercheck`. `cmd/openstreamer`'s `tty_*.go` terminal paths are covered on Linux by `TestHashPasswordTTY`; if `tty_darwin.go` and `tty_other.go` fall under the file threshold on CI's Linux, exclude exactly those two files with the comment "platform files: not compiled on the CI's Linux". Exclude `^internal/metrics/metricstest` with the comment "test-helper package: it is exercised by the internal/metrics, internal/stream, internal/api and internal/e2e tests, which go test does not count towards it without -coverpkg". No other exclusion: `cmd/openstreamer` is covered through `run`.
-- [ ] **Step 3: README and CLAUDE.md.** README: a section "Running the server" (`make openstreamer`; the example config and its three sections; `openstreamer hash-password` and the two roles; the file's mode 0600 and that the service must own its directory; one `curl -u` `PUT` creating a stream with every output, and the whole-config `GET`/`PUT` round trip with `If-Match`; a hand edit and `kill -HUP`, and the 409 that asks for it; the play URLs by output; `/metrics` scraped with `basic_auth` as a viewer; the log format; and that the API stays on loopback until HTTPS because Basic credentials are only base64). CLAUDE.md (the rebuild branch's): the binary, the config file's sections and keys, the package list of this plan, the one apply path (R-D4) and the two routes of an edit (R-D6).
+- [ ] **Step 3: README and CLAUDE.md.** README: a section "Running the server" (`make openstreamer`; the example config and its three sections; `openstreamer hash-password` and the two roles; the file's mode 0600 and that the service must own its directory, and in a container mount that directory, not the single file (a bind-mounted file cannot be renamed over); that anchors, aliases and merge keys are not supported and numbers are plain decimals; `X-Requested-By` on writes; one `curl -u` `PUT` creating a stream with every output, and the whole-config `GET`/`PUT` round trip with `If-Match`; a hand edit and `kill -HUP`, and the 409 that asks for it; the play URLs by output; `/metrics` scraped with `basic_auth` as a viewer; the log format; and that the API stays on loopback until HTTPS because Basic credentials are only base64). CLAUDE.md (the rebuild branch's): the binary, the config file's sections and keys, the package list of this plan, the one apply path (R-D4) and the two routes of an edit (R-D6).
 - [ ] **Step 4: `docs/REBUILD_PLAN.md`.**
   - §5's table: replace the M5 row with the three rows below, and change M6's "Depends on" to `M5a`.
 
@@ -1549,6 +1681,6 @@ func TestM5aRoles(t *testing.T)
   - §4: add `internal/spec/`, `internal/config/`, `internal/auth/`, `internal/server/`, `internal/metrics/` and `internal/logging/`; remove `internal/store/` (the config file took its place); change `internal/stream/` to "supervisor and manager" and `internal/api/` to "REST API and its OpenAPI document".
   - §3.5's presentation bullet and the two "Out of" rows that say "product naming is M5's" (R-B2): state R-D3's names and that osdev keeps `<name>_abr`.
   - The "Out of" rows that name M5: `Metrics for EncoderFallbacks` becomes done (M5a); the asset API, operator fonts, inputs in place and "several audio languages" name M5b; RTMPS, RTSPS and SRTP, SRT encryption and "credentials in the URL path or query" name M5c.
-  - Backlog: in "A fallback to libx264 can overload a host sized for NVENC", record that the count is exported (M5a) and refusing is M5b. Add: "A rebuild or a failure restart starts a new packager, so HLS `MEDIA-SEQUENCE` and the DASH timeline go backwards on the same URL and a player that stayed must reload (R-D5, R-D6); carry the sequence numbers and the availability start across generations"; "A switch that stops serving a ladder's renditions as their own streams (R-D3; saves N packagers)"; "HTTP-TS has no session counters, so `openstreamer_output_sessions` lacks it"; "A panic in one stream's goroutines takes the process down (R-D5): decide on per-stream recovery after the soak"; "A per-stream API edit drops the comments inside that stream's entry and may normalise the file's indentation (R-D4)"; "Behind a reverse proxy every API client shares one IP for the login limiter (R-D8): a trusted-proxy setting". Add an "M5a deferred minors" heading for the review's leftovers.
+  - Backlog: in "A fallback to libx264 can overload a host sized for NVENC", record that the count is exported (M5a) and refusing is M5b. Add: "A rebuild or a failure restart starts a new packager, so HLS `MEDIA-SEQUENCE` and the DASH timeline go backwards on the same URL and a player that stayed must reload (R-D5, R-D6); carry the sequence numbers and the availability start across generations"; "A switch that stops serving a ladder's renditions as their own streams (R-D3; saves N packagers)"; "HTTP-TS has no session counters, so `openstreamer_output_sessions` lacks it"; "A panic in one stream's goroutines takes the process down (R-D5): decide on per-stream recovery after the soak"; "A per-stream API edit goes through a YAML node round trip: it drops blank lines, re-indents sequences, normalises the spacing of line comments, and loses the comments inside the edited entry and a line comment on its `name:` (R-D4); a text-level splice of the one entry would keep the rest byte for byte"; "The login limiter's key includes the presented user name, so invented names can keep both verification slots busy and delay a real user's first login (R-D8)"; "Behind a reverse proxy every API client shares one IP for the login limiter (R-D8): a trusted-proxy setting". Add an "M5a deferred minors" heading for the review's leftovers.
 - [ ] **Step 5: Run** the gates: `go mod tidy` (no change since Task 6), `go vet ./...`, `golangci-lint run ./...`, `make test`, `GOOS=windows go vet ./...`, `GOOS=darwin go vet ./...`, `make test-transcode`, `make test-ci-peers` — all pass.
 - [ ] **Step 6: Commit** `ci: run the M5a ladder scenario on arm64 and build openstreamer for three systems` and `docs: M5a is done; M5 is split into M5a, M5b and M5c`
