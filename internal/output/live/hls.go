@@ -493,9 +493,13 @@ func tsVariants(s Snapshot) []int {
 	return out
 }
 
-// hasVariantTS reports whether a segment has a TS of the variant of track.
-func hasVariantTS(seg SegmentInfo, track int) bool {
-	return slices.ContainsFunc(seg.VariantTS, func(v VariantTS) bool { return v.Track == track })
+// findVariantTS returns a segment's TS of the variant of track, if it has one.
+func findVariantTS(seg SegmentInfo, track int) (VariantTS, bool) {
+	i := slices.IndexFunc(seg.VariantTS, func(v VariantTS) bool { return v.Track == track })
+	if i < 0 {
+		return VariantTS{}, false
+	}
+	return seg.VariantTS[i], true
 }
 
 // listedEpochs returns the epochs of the listed segments.
@@ -513,7 +517,7 @@ func listedEpochs(s Snapshot) map[uint32]bool {
 // no audio rendition: CODECS lists the variant's video codecs, then every
 // known audio track's. RESOLUTION is the largest over the window, as in
 // cmaf/master.m3u8, and BANDWIDTH the peak over listed segments of the
-// variant TS's bytes × 8 / segment duration. It returns nil when there is
+// variant TS's bytes × 8 / its Duration. It returns nil when there is
 // no variant.
 func buildTSMaster(s Snapshot) []byte {
 	tracks := tsVariants(s)
@@ -538,7 +542,7 @@ func buildTSMaster(s Snapshot) []byte {
 		video.bandwidth = map[uint64]float64{}
 		for _, seg := range s.Segments[:s.Listed] {
 			for _, v := range seg.VariantTS {
-				if d := media.ToDuration(seg.Duration).Seconds(); v.Track == track && d > 0 {
+				if d := media.ToDuration(v.Duration).Seconds(); v.Track == track && d > 0 {
 					video.bandwidth[seg.Seq] = float64(len(v.Data)) * 8 / d
 				}
 			}
@@ -560,8 +564,10 @@ func buildTSMaster(s Snapshot) []byte {
 // EvictedDiscontinuities), as RFC 8216 section 6.2.4 requires. A segment
 // with the variant's TS lists {track}-{Seq}.ts; one without (the track had
 // no frames in it, or its mux failed) lists a gap entry,
-// gap-{track}-{Seq}.ts, which is never served. EXTINF is the segment's
-// duration, EXT-X-PROGRAM-DATE-TIME is on the first entry and every
+// gap-{track}-{Seq}.ts, which is never served. A real entry's EXTINF is its
+// variant's Duration, which is the segment's duration unless the segment
+// closed without a cut and the variant's video ended elsewhere; a gap's is
+// the segment's duration. EXT-X-PROGRAM-DATE-TIME is on the first entry and every
 // discontinuity, and every variant shares one TARGETDURATION.
 func buildTSVariant(p *Packager, s Snapshot, track int) []byte {
 	if !s.ABR || !slices.Contains(tsVariants(s), track) {
@@ -581,7 +587,9 @@ func buildTSVariant(p *Packager, s Snapshot, track int) []byte {
 			Duration:      media.ToDuration(seg.Duration),
 			Discontinuity: seg.Discontinuity,
 		}
-		if !hasVariantTS(seg, track) {
+		if v, ok := findVariantTS(seg, track); ok {
+			e.Duration = media.ToDuration(v.Duration)
+		} else {
 			e.URI, e.Gap = "gap-"+e.URI, true
 		}
 		if i == 0 || seg.Discontinuity {

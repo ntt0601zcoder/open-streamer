@@ -1193,3 +1193,64 @@ func TestABRTSVariantGaps(t *testing.T) {
 	require.Len(t, m.Variants, 3)
 	assert.True(t, strings.HasSuffix(m.Variants[0].Codecs, ",mp4a.40.2"), m.Variants[0].Codecs)
 }
+
+// A respawn's shape: rung 0, the anchor, stops right after its keyframe at
+// 4 s while rungs 1 and 2 go on to 6 s, where epoch 2 starts. The segment
+// at 4 s closes without a cut: its Duration is rung 0's one frame, and
+// each TS variant's EXTINF and BANDWIDTH use its own video's span, so
+// conform finds every EXTINF matching its media.
+func TestABRTSVariantOwnDuration(t *testing.T) {
+	var ds []hub.Delivery
+	for _, d := range synthLadder(t, 1, 0, 150) {
+		if d.Frame.Track == 0 && d.Frame.PTS > 100*3600 {
+			continue
+		}
+		ds = append(ds, d)
+	}
+	ds = append(ds, synthLadder(t, 2, 150*3600, 100)...)
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+	h.SetAnchor(media.Anchor{Epoch: 2, Start: 150 * 3600, Wall: t0.Add(6 * time.Second)})
+	p := NewPackager(h, Options{Window: 100, Now: farFuture, ABR: true})
+	handleAll(p, ds)
+	p.End()
+	require.Zero(t, p.Errors())
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 5)
+	seg := snap.Segments[2]
+	require.EqualValues(t, 100*3600, seg.Start)
+	require.EqualValues(t, 3600, seg.Duration, "rung 0's one frame")
+	want := map[int]int64{0: 3600, 1: 50 * 3600, 2: 50 * 3600}
+	require.Len(t, seg.VariantTS, len(want))
+	for _, v := range seg.VariantTS {
+		assert.Equal(t, want[v.Track], v.Duration, "variant %d", v.Track)
+	}
+	srv := serve(p)
+	for track, d := range want {
+		pl := media3(t, srv, "/live/s/hls/v"+strconv.Itoa(track)+".m3u8")
+		require.Len(t, pl.Segments, 5)
+		assert.Equal(t, media.ToDuration(d), pl.Segments[2].Duration, "v%d EXTINF", track)
+		assert.Equal(t, 2*time.Second, pl.Segments[1].Duration, "v%d EXTINF of a cut segment", track)
+	}
+	m := tsMaster(t, srv)
+	require.Len(t, m.Variants, len(ladderSizes))
+	for i, v := range m.Variants {
+		peak := 1.0
+		for _, seg := range snap.Segments {
+			for _, vt := range seg.VariantTS {
+				if vt.Track == i {
+					peak = max(peak, float64(len(vt.Data))*8/media.ToDuration(vt.Duration).Seconds())
+				}
+			}
+		}
+		assert.Equal(t, int(math.Ceil(peak)), v.Bandwidth, "variant %d", i)
+	}
+
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := conform.ReadHLS(ctx, hs.URL+"/live/s/hls/index.m3u8", conform.ReadOptions{AlignedSequences: true, Once: true})
+	require.NoError(t, err)
+	assert.Empty(t, c.Violations)
+}

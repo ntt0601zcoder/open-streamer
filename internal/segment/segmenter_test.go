@@ -1214,3 +1214,34 @@ func TestAlignVideoAudioUntouched(t *testing.T) {
 	assert.Equal(t, off.Late(), on.Late())
 	assert.Zero(t, on.Dropped())
 }
+
+// A respawn under AlignVideo: rung 0, the anchor, stops right after its
+// keyframe at K = 180000 while rungs 1 and 2 go on for 10 frames, until an
+// epoch change closes the segment without a cut. Duration is the anchor's
+// one frame; VideoDurations gives rungs 1 and 2 their own spans. Segments
+// cut at a keyframe, and those whose rungs end together, have none.
+func TestAlignVideoUncutRungSpans(t *testing.T) {
+	const k = 180000
+	ds := ladderDeliveries([]int{0, 1, 2}, 0, 60, 25, func(tr, i int) int {
+		if tr == 0 && i > 50 {
+			return -1
+		}
+		return inDTS(tr, i)
+	})
+	ds = append(ds, hub.Delivery{Frame: media.Frame{Track: 0, Config: h264, PTS: 300000, DTS: 300000, Key: true, Epoch: 2}})
+	s := New(Options{AlignVideo: true})
+	segs := pushDeliveries(s, ds)
+	require.Len(t, segs, 3)
+	assertSeqs(t, segs)
+	assert.Nil(t, segs[0].VideoDurations, "cut at K")
+	g := segs[1]
+	assert.EqualValues(t, k, g.Start)
+	assert.EqualValues(t, 3600, g.Duration)
+	assert.Equal(t, map[int]int64{1: 36000, 2: 36000}, g.VideoDurations)
+	assert.Nil(t, segs[2].VideoDurations, "one rung")
+
+	off := pushDeliveries(New(Options{}), ds)
+	require.Len(t, off, 3)
+	assert.EqualValues(t, 3600, off[1].Duration)
+	assert.Nil(t, off[1].VideoDurations, "without AlignVideo")
+}

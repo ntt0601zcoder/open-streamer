@@ -108,10 +108,15 @@ type SegmentInfo struct {
 
 // VariantTS is one ABR variant's TS segment: video track Track at track
 // index 0 (PID 0x100) and every audio track at 1 + its rank among the known
-// audio tracks.
+// audio tracks. Duration is the variant's video span in the segment, in
+// ticks: the segment's Duration, unless the segment closed without a cut
+// and that video ended elsewhere (segment.Segment.VideoDurations), as the
+// anchor rung does when it stops before the others at a respawn. It is the
+// variant's EXTINF and the divisor of its BANDWIDTH.
 type VariantTS struct {
-	Track int
-	Data  []byte
+	Track    int
+	Data     []byte
+	Duration int64
 }
 
 // CMAFPart is one track's CMAF media segment, served as cmaf/{Track}-{N}.m4s.

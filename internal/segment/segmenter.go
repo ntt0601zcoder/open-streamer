@@ -91,10 +91,21 @@ type Segment struct {
 	Duration      int64         // ticks, anchor track
 	End           int64         // largest frame PTS + that track's last DTS delta, over all tracks
 	Frames        []media.Frame // arrival order, all tracks
+	// VideoDurations, under AlignVideo only, holds the span in ticks of
+	// each video track whose span in the segment is not Duration; a track
+	// it does not hold spans Duration, and it is nil when none differs. A
+	// segment cut at K (by the next anchor keyframe or the MaxDuration cut)
+	// ends every rung at K, so it is always nil there. A segment closed
+	// without a cut (an epoch change, Lost > 0 or Flush) ends each rung
+	// where its own frames end, at its largest PTS + last DTS delta, as
+	// Duration does for the anchor: after a respawn the anchor rung can
+	// stop well before the others.
+	VideoDurations map[int]int64
 }
 
 // trackAcc tracks one track's extent inside the open segment.
 type trackAcc struct {
+	video   bool
 	maxPTS  int64
 	lastDTS int64
 	delta   int64 // last DTS delta; 0 until the second frame
@@ -525,7 +536,7 @@ func (s *Segmenter) add(f media.Frame) { addTo(s.cur, f) }
 func addTo(c *open, f media.Frame) {
 	a := c.tracks[f.Track]
 	if a == nil {
-		a = &trackAcc{dflt: defaultDelta(f)}
+		a = &trackAcc{video: f.Kind() == media.KindVideo, dflt: defaultDelta(f)}
 		c.tracks[f.Track] = a
 	}
 	a.add(f)
@@ -555,12 +566,23 @@ func (s *Segmenter) closeOpen(duration int64) Segment {
 // finish builds the closed segment c; duration is as for closeOpen.
 func (s *Segmenter) finish(c *open, duration int64) Segment {
 	seg := c.seg
-	if duration < 0 {
+	cut := duration >= 0
+	if !cut {
 		duration = c.tracks[c.anchor].end() - seg.Start
 	}
 	seg.Duration = duration
 	for _, a := range c.tracks {
 		seg.End = max(seg.End, a.end())
+	}
+	if s.align && !cut {
+		for tr, a := range c.tracks {
+			if d := a.end() - seg.Start; a.video && d != duration {
+				if seg.VideoDurations == nil {
+					seg.VideoDurations = map[int]int64{}
+				}
+				seg.VideoDurations[tr] = d
+			}
+		}
 	}
 	return seg
 }

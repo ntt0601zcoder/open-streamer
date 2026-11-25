@@ -238,7 +238,7 @@ func (p *Packager) pack(s segment.Segment) {
 		End:           s.End,
 	}
 	if p.abr {
-		info.VariantTS = p.muxVariants(s.Frames)
+		info.VariantTS = p.muxVariants(s)
 	} else {
 		p.packTS(&info, s)
 	}
@@ -371,8 +371,11 @@ func (p *Packager) muxTS(frames []media.Frame) []byte {
 // for its continuity counters. A variant that fails to mux counts an error
 // and is left out. A frame no variant can place (a negative track, or a
 // track with no config in the segment or of neither kind) fails every
-// variant, as it fails the combined TS. Called with work held.
-func (p *Packager) muxVariants(frames []media.Frame) []VariantTS {
+// variant, as it fails the combined TS. Each variant's Duration is its
+// video's span: seg.VideoDurations', else seg.Duration. Called with work
+// held.
+func (p *Packager) muxVariants(seg segment.Segment) []VariantTS {
+	frames := seg.Frames
 	cfgs := map[int]*media.TrackConfig{} // per track: its first config in the segment
 	for _, f := range frames {
 		if _, ok := cfgs[f.Track]; !ok && f.Config != nil {
@@ -444,7 +447,11 @@ func (p *Packager) muxVariants(frames []media.Frame) []VariantTS {
 			p.errors.Add(1)
 			continue
 		}
-		out = append(out, VariantTS{Track: v, Data: buf.Bytes()})
+		d, ok := seg.VideoDurations[v]
+		if !ok {
+			d = seg.Duration
+		}
+		out = append(out, VariantTS{Track: v, Data: buf.Bytes(), Duration: d})
 	}
 	return slices.Clip(out)
 }
