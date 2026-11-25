@@ -681,6 +681,9 @@ func TestWatermarkSweepsStaleDirs(t *testing.T) {
 		mkdir(fmt.Sprintf("ostx-wm-0-%d", dead)),          // PID 0 names a group
 		mkdir(fmt.Sprintf("xostx-wm-%d-1", dead)),         // another prefix
 		mkdir("ostx-wm-abc"),                              // a v1-era name
+		mkdir("ostx-wm-2147483648-1"),                     // a 32-bit pid of -2^31: a group
+		mkdir("ostx-wm-4294967297-1"),                     // wraps to pid 1 as 32 bits
+		mkdir("ostx-wm-99999999-1"),                       // 8 digits: above pid_max
 		file, target, link, filepath.Join(target, "font.ttf"),
 	}
 

@@ -108,8 +108,11 @@ func (m *watermarker) set(w *picture.Watermark) error {
 // temp dir: ostx-wm-<pid>-<random>, pid being the child's.
 const wmDirPrefix = "ostx-wm-"
 
-// wmDirName matches a private directory's name, capturing the PID.
-var wmDirName = regexp.MustCompile(`^` + wmDirPrefix + `([1-9][0-9]{0,9})-[0-9]+$`)
+// wmDirName matches a private directory's name, capturing the PID: at
+// most 7 digits, since Linux's pid_max is at most 4194304. A longer one
+// is no child's, and kill takes a 32-bit pid, so 2147483648 would reach
+// the kernel as a process group and 4294967297 as pid 1.
+var wmDirName = regexp.MustCompile(`^` + wmDirPrefix + `([1-9][0-9]{0,6})-[0-9]+$`)
 
 // ensureDir creates the private directory and writes the font into it,
 // after sweeping the directories that dead children left behind
