@@ -1675,6 +1675,24 @@ func waitLog(t *testing.T, path string, want ...string) {
 	}
 }
 
+// waitLastLog waits until the last line of the log at path is want. A test
+// that sets a watermark waits for it before it ends the run: Run may take
+// the end of its source before the wake of a call made just before, and a
+// watermark set as Run ends is not sent.
+func waitLastLog(t *testing.T, path, want string) {
+	t.Helper()
+	last := func() string {
+		lines := logLines(t, path)
+		if len(lines) == 0 {
+			return ""
+		}
+		return lines[len(lines)-1]
+	}
+	if !assert.Eventually(t, func() bool { return last() == want }, 10*time.Second, time.Millisecond) {
+		require.Equal(t, want, last(), "%q", logLines(t, path))
+	}
+}
+
 // watermarkLog adds the fake child's watermark log to opt and returns its
 // path.
 func watermarkLog(t *testing.T, opt *Options) string {
@@ -1827,6 +1845,7 @@ func TestSetWatermarkLatestWins(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 		close(hold)
+		waitLastLog(t, log, "set text:third")
 		s.end(t)
 		lines := logLines(t, log)
 		require.GreaterOrEqual(t, len(lines), 2, "%v", lines)
@@ -1865,6 +1884,7 @@ func TestSetWatermarkBetweenConfigureAndHello(t *testing.T) {
 		<-reached
 		require.NoError(t, s.tr.SetWatermark(text("live")))
 		close(hold)
+		waitLastLog(t, log, "set text:live")
 		s.end(t)
 		assert.Equal(t, []string{"configure none", "set text:live"}, logLines(t, log))
 	})
@@ -1894,6 +1914,12 @@ func TestSetWatermarkBetweenConfigureAndHello(t *testing.T) {
 			<-reached
 			time.Sleep(caller)
 			require.NoError(t, tr.SetWatermark(text("live")))
+			// Either line names it; then the run ends, and with it the
+			// chance of a second set, which the whole log would show.
+			require.Eventually(t, func() bool {
+				lines := logLines(t, log)
+				return len(lines) > 0 && strings.HasSuffix(lines[len(lines)-1], "text:live")
+			}, 10*time.Second, 100*time.Microsecond, "run %d", i)
 			src.Close()
 			require.NoError(t, <-errc)
 			switch lines := logLines(t, log); {

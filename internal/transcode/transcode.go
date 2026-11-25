@@ -47,6 +47,29 @@
 // The bound holds for B-frames ≤ 3 at 8 fps or more (B-frames 2: 6 fps); a
 // slower source should use BFrames -1. New rejects BFrames above 3.
 //
+// # Encoder, watermark and thumbnails
+//
+// Each encoded rendition names its encoder, x264 or NVENC (Video.Encoder);
+// a child without the hardware falls back to x264 and counts it in
+// ChildStats.EncoderFallbacks.
+//
+// Options.Watermark is drawn on every encoded picture, so no rendition may
+// then copy its video (ruling R-C5). SetWatermark replaces it while Run
+// runs: the watermark has a version, a child's Configure carries the
+// version its writer snapshots, and Run brings a child that has a version
+// up to the current one with a wire.SetWatermark in order with its frames.
+// A call is therefore never lost between a child's Configure and its first
+// set, and calls that pile up collapse to the latest.
+//
+// With Options.Thumbnail the child sends a preview picture every interval
+// (Shot, Options.OnShot); its PTS is in rendition time. A child that
+// encodes video makes them of the pictures it decodes. A child that only
+// encodes audio is sent no video, so the router offers it the main video
+// track's keyframe whenever one is due (ruling R-C10a; see router), which
+// changes nothing else. A ladder that needs no child gets its thumbnails
+// from a Thumbnailer instead, a second supervisor in this package that
+// shares the respawn backoff, the Hello check and the stop with this one.
+//
 // # Respawn
 //
 // A child that exits for any reason other than the end of Run is respawned
