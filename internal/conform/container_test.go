@@ -1387,3 +1387,352 @@ func TestReadHLSRenditionLag(t *testing.T) {
 	assert.Equal(t, []string{RuleRenditionDiscontinuity}, rules(c.Violations), "a lag that persists")
 	require.Len(t, c.Violations, 1)
 }
+
+// ---- ABR variants ----
+
+// videoSegs cuts the video frames of h264_aac.ts at its keyframes.
+func videoSegs(t *testing.T) [][]media.Frame {
+	t.Helper()
+	var video []media.Frame
+	for _, f := range timedClip(t) {
+		if f.Kind() == media.KindVideo {
+			video = append(video, f)
+		}
+	}
+	keys := keyframes(t)
+	require.GreaterOrEqual(t, len(keys), 5)
+	var out [][]media.Frame
+	for i := 0; i+1 < len(keys); i++ {
+		out = append(out, slices.Clone(video[keys[i]:keys[i+1]]))
+	}
+	return out
+}
+
+// audioSegs cuts the audio frames of h264_aac.ts at the PTS of each video
+// segment's first frame.
+func audioSegs(t *testing.T, video [][]media.Frame) [][]media.Frame {
+	t.Helper()
+	out := make([][]media.Frame, len(video))
+	for _, f := range timedClip(t) {
+		if f.Kind() != media.KindAudio {
+			continue
+		}
+		for i := len(video) - 1; i >= 0; i-- {
+			if f.PTS >= video[i][0].PTS {
+				out[i] = append(out[i], f)
+				break
+			}
+		}
+	}
+	for i := range out {
+		require.NotEmpty(t, out[i])
+	}
+	return out
+}
+
+// shifted returns frames moved later by d ticks.
+func shifted(frames []media.Frame, d int64) []media.Frame {
+	out := slices.Clone(frames)
+	for i := range out {
+		out[i].PTS += d
+		out[i].DTS += d
+	}
+	return out
+}
+
+// segTicks returns the media duration of a segment in ticks: DTS span plus
+// one frame.
+func segTicks(frames []media.Frame) int64 {
+	return frames[len(frames)-1].DTS - frames[0].DTS + videoFrameTicks
+}
+
+// addHLS writes a media playlist named name+".m3u8" and its segments into m.
+// Entries in gaps are EXT-X-GAP placeholders.
+func addHLS(t *testing.T, m map[string][]byte, name string, segs [][]media.Frame, tsSegs bool, gaps map[int]bool) {
+	t.Helper()
+	pl := hls.MediaPlaylist{Version: 7, TargetDuration: 4, Ended: true}
+	cfg := segs[0][0].Config
+	if !tsSegs {
+		init, err := fmp4.Init(cfg)
+		require.NoError(t, err)
+		m["/init-"+name+".mp4"] = init
+	}
+	for i, fr := range segs {
+		s := hls.Segment{Duration: media.ToDuration(segTicks(segs[i]))}
+		switch {
+		case gaps[i]:
+			s.Gap, s.URI = true, "gap-"+name+"-"+strconv.Itoa(i)+".ts"
+		case tsSegs:
+			var buf bytes.Buffer
+			mx, err := ts.NewMuxer(&buf, []*media.TrackConfig{cfg})
+			require.NoError(t, err)
+			for _, f := range fr {
+				f.Track = 0
+				require.NoError(t, mx.WriteFrame(f))
+			}
+			s.URI = name + "-" + strconv.Itoa(i) + ".ts"
+			m["/"+s.URI] = buf.Bytes()
+		default:
+			data, _, err := fmp4.Segment(fr, cfg, uint32(i+1))
+			require.NoError(t, err)
+			s.URI, s.Map = name+"-"+strconv.Itoa(i)+".m4s", "init-"+name+".mp4"
+			m["/"+s.URI] = data
+		}
+		pl.Segments = append(pl.Segments, s)
+	}
+	m["/"+name+".m3u8"] = pl.Encode()
+}
+
+// readABR serves m and reads its master.m3u8 with aligned sequences.
+func readABR(t *testing.T, m map[string][]byte) Capture {
+	t.Helper()
+	c, err := ReadHLS(context.Background(), files(t, m)+"/master.m3u8", aligned())
+	require.NoError(t, err)
+	return c
+}
+
+func countRule(vs []Violation, rule string) int {
+	n := 0
+	for _, v := range vs {
+		if v.Rule == rule {
+			n++
+		}
+	}
+	return n
+}
+
+// abrMaster writes a master with the variants a and b.
+func abrMaster(m map[string][]byte) {
+	m["/master.m3u8"] = hls.MultivariantPlaylist{Version: 7, Variants: []hls.Variant{
+		{URI: "a.m3u8", Bandwidth: 1e9}, {URI: "b.m3u8", Bandwidth: 1e9},
+	}}.Encode()
+}
+
+func TestVariantAlignedHLS(t *testing.T) {
+	for _, tsSegs := range []bool{false, true} {
+		t.Run("ts="+strconv.FormatBool(tsSegs), func(t *testing.T) {
+			segs := videoSegs(t)
+			m := map[string][]byte{}
+			addHLS(t, m, "a", segs, tsSegs, nil)
+			addHLS(t, m, "b", segs, tsSegs, nil)
+			abrMaster(m)
+			c := readABR(t, m)
+			assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+		})
+	}
+}
+
+func TestVariantMisalignedHLS(t *testing.T) {
+	for _, tsSegs := range []bool{false, true} {
+		t.Run("ts="+strconv.FormatBool(tsSegs), func(t *testing.T) {
+			segs := videoSegs(t)
+			skewed := slices.Clone(segs)
+			skewed[2] = shifted(segs[2], 3600)
+			m := map[string][]byte{}
+			addHLS(t, m, "a", segs, tsSegs, nil)
+			addHLS(t, m, "b", skewed, tsSegs, nil)
+			abrMaster(m)
+			c := readABR(t, m)
+			assert.Equal(t, 1, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+			// Without aligned sequences the entries cannot be matched.
+			c, err := ReadHLS(context.Background(), files(t, m)+"/master.m3u8", once())
+			require.NoError(t, err)
+			assert.Zero(t, countRule(c.Violations, RuleVariantAlignment))
+		})
+	}
+}
+
+func TestVariantAlignedIgnoresGaps(t *testing.T) {
+	segs := videoSegs(t)
+	skewed := slices.Clone(segs)
+	skewed[2] = shifted(segs[2], 3600) // never fetched: the entry is a gap
+	m := map[string][]byte{}
+	addHLS(t, m, "a", segs, false, nil)
+	addHLS(t, m, "b", skewed, false, map[int]bool{2: true})
+	abrMaster(m)
+	c := readABR(t, m)
+	assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+	assert.Equal(t, 1, c.HLSGaps)
+}
+
+func TestVariantAlignedOpenGOP(t *testing.T) {
+	segs := videoSegs(t)
+	open := slices.Clone(segs)
+	open[1] = slices.Clone(segs[1])
+	// A leading picture: after the keyframe in decode order, before it in
+	// presentation order.
+	open[1][1].PTS = open[1][0].PTS - 3600
+	m := map[string][]byte{}
+	addHLS(t, m, "a", segs, false, nil)
+	addHLS(t, m, "b", open, false, nil)
+	abrMaster(m)
+	c := readABR(t, m)
+	assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+}
+
+func TestVariantAlignedSkipsForced(t *testing.T) {
+	segs := videoSegs(t)
+	forced := slices.Clone(segs)
+	forced[2] = segs[2][3:] // starts on a non-key frame, later than the others
+	require.False(t, forced[2][0].Key)
+	m := map[string][]byte{}
+	addHLS(t, m, "a", segs, false, nil)
+	addHLS(t, m, "b", forced, false, nil)
+	abrMaster(m)
+	c := readABR(t, m)
+	assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+	assert.NotZero(t, countRule(c.Violations, RuleSegmentKey), "the forced entry is still not a keyframe start")
+}
+
+// TestVariantAlignedSingle: one variant, or a master without video
+// variants alongside, never triggers the rule.
+func TestVariantAlignedSingle(t *testing.T) {
+	segs := videoSegs(t)
+	m := map[string][]byte{}
+	addHLS(t, m, "a", segs, false, nil)
+	m["/master.m3u8"] = hls.MultivariantPlaylist{Version: 7, Variants: []hls.Variant{{URI: "a.m3u8", Bandwidth: 1}}}.Encode()
+	c := readABR(t, m)
+	assert.Zero(t, countRule(c.Violations, RuleVariantAlignment))
+	assert.Zero(t, countRule(c.Violations, RuleVariantBandwidth))
+}
+
+// dashRepFiles writes the init and the segments of one representation into m
+// and returns it. Segments in skip are left out of the timeline; numbers
+// count the listed ones from start.
+func dashRepFiles(t *testing.T, m map[string][]byte, id string, segs [][]media.Frame, skip map[int]bool, start uint64) dash.Representation {
+	t.Helper()
+	cfg := segs[0][0].Config
+	init, err := fmp4.Init(cfg)
+	require.NoError(t, err)
+	m["/"+id+"-init.mp4"] = init
+	codec, err := media.CodecString(cfg)
+	require.NoError(t, err)
+	var tl []dash.S
+	n := start
+	for i, fr := range segs {
+		if skip[i] {
+			continue
+		}
+		data, tm, err := fmp4.Segment(fr, cfg, uint32(i+1))
+		require.NoError(t, err)
+		m["/"+id+"-"+strconv.FormatUint(n, 10)+".m4s"] = data
+		n++
+		tl = append(tl, dash.S{T: &tm.Earliest, D: tm.Duration})
+	}
+	return dash.Representation{
+		ID: id, Codecs: codec, Bandwidth: 1000,
+		SegmentTemplate: &dash.SegmentTemplate{
+			Timescale: 90000, Initialization: "$RepresentationID$-init.mp4", Media: "$RepresentationID$-$Number$.m4s",
+			StartNumber: &start, Timeline: &dash.SegmentTimeline{S: tl},
+		},
+	}
+}
+
+func readDASHSet(t *testing.T, m map[string][]byte, align bool, reps ...dash.Representation) Capture {
+	t.Helper()
+	m["/index.mpd"] = dash.MPD{Type: "static", Periods: []dash.Period{{AdaptationSets: []dash.AdaptationSet{{
+		SegmentAlignment: align, Representations: reps,
+	}}}}}.Encode()
+	c, err := ReadDASH(context.Background(), files(t, m)+"/index.mpd", once())
+	require.NoError(t, err)
+	return c
+}
+
+func TestVariantAlignedDASH(t *testing.T) {
+	segs := videoSegs(t)
+	run := func(align bool, b func(m map[string][]byte) dash.Representation) Capture {
+		m := map[string][]byte{}
+		a := dashRepFiles(t, m, "a", segs, nil, 1)
+		return readDASHSet(t, m, align, a, b(m))
+	}
+	t.Run("equal timelines, other start numbers", func(t *testing.T) {
+		c := run(false, func(m map[string][]byte) dash.Representation { return dashRepFiles(t, m, "b", segs, nil, 7) })
+		assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+		c = run(true, func(m map[string][]byte) dash.Representation { return dashRepFiles(t, m, "b", segs, nil, 7) })
+		assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+	})
+	t.Run("missing segment", func(t *testing.T) {
+		c := run(false, func(m map[string][]byte) dash.Representation {
+			return dashRepFiles(t, m, "b", segs, map[int]bool{2: true}, 1)
+		})
+		assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+	})
+	t.Run("shifted segment", func(t *testing.T) {
+		skewed := slices.Clone(segs)
+		skewed[2] = shifted(segs[2], 3600)
+		c := run(false, func(m map[string][]byte) dash.Representation { return dashRepFiles(t, m, "b", skewed, nil, 1) })
+		assert.Equal(t, 1, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+	})
+	t.Run("segmentAlignment with a missing segment", func(t *testing.T) {
+		c := run(true, func(m map[string][]byte) dash.Representation {
+			return dashRepFiles(t, m, "b", segs, map[int]bool{2: true}, 1)
+		})
+		assert.Equal(t, 1, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+	})
+	t.Run("one representation", func(t *testing.T) {
+		m := map[string][]byte{}
+		c := readDASHSet(t, m, true, dashRepFiles(t, m, "a", segs, nil, 1))
+		assert.Zero(t, countRule(c.Violations, RuleVariantAlignment))
+	})
+}
+
+func TestVariantBandwidth(t *testing.T) {
+	segs := videoSegs(t)
+	vsegs := segs
+	asegs := audioSegs(t, vsegs)
+
+	// peak measures a playlist's rate in bit/s as the rule defines it.
+	peak := func(m map[string][]byte, names ...string) int64 {
+		rates := map[uint64]int64{}
+		for _, name := range names {
+			pl, err := hls.ParseMedia(m["/"+name+".m3u8"])
+			require.NoError(t, err)
+			for i, s := range pl.Segments {
+				rates[uint64(i)] += int64(len(m["/"+s.URI])) * 8 * media.ClockRate / media.FromDuration(s.Duration)
+			}
+		}
+		var p int64
+		for _, r := range rates {
+			p = max(p, r)
+		}
+		return p
+	}
+	build := func(bwA, bwB int, audio bool) Capture {
+		m := map[string][]byte{}
+		addHLS(t, m, "a", vsegs, false, nil)
+		addHLS(t, m, "b", vsegs, false, nil)
+		mp := hls.MultivariantPlaylist{Version: 7, Variants: []hls.Variant{
+			{URI: "a.m3u8", Bandwidth: bwA}, {URI: "b.m3u8", Bandwidth: bwB},
+		}}
+		if audio {
+			addHLS(t, m, "au", asegs, false, nil)
+			mp.Variants[0].Audio, mp.Variants[1].Audio = "aud", "aud"
+			mp.Renditions = []hls.Rendition{{Type: "AUDIO", GroupID: "aud", Name: "a", URI: "au.m3u8", Default: true}}
+		}
+		m["/master.m3u8"] = mp.Encode()
+		return readABR(t, m)
+	}
+	m := map[string][]byte{}
+	addHLS(t, m, "a", vsegs, false, nil)
+	pv := peak(m, "a")
+	require.Greater(t, pv, int64(10000))
+
+	c := build(int(pv), int(pv), false)
+	assert.Zero(t, countRule(c.Violations, RuleVariantBandwidth), "at the peak: %v", c.Violations)
+	c = build(int(pv*91/100), int(pv), false)
+	assert.Zero(t, countRule(c.Violations, RuleVariantBandwidth), "within 1.1: %v", c.Violations)
+	c = build(int(pv*90/100), int(pv), false)
+	assert.Equal(t, 1, countRule(c.Violations, RuleVariantBandwidth), "%v", c.Violations)
+	assert.Contains(t, c.Violations[len(c.Violations)-1].Detail+fmt.Sprint(c.Violations), "a.m3u8")
+
+	// The default audio rendition counts.
+	ma := map[string][]byte{}
+	addHLS(t, ma, "a", vsegs, false, nil)
+	addHLS(t, ma, "au", asegs, false, nil)
+	pa := peak(ma, "a", "au")
+	require.Greater(t, pa, pv*11/10, "audio must add more than the slack")
+	c = build(int(pv), int(pv), true)
+	assert.Equal(t, 2, countRule(c.Violations, RuleVariantBandwidth), "video-only BANDWIDTH: %v", c.Violations)
+	c = build(int(pa), int(pa), true)
+	assert.Zero(t, countRule(c.Violations, RuleVariantBandwidth), "%v", c.Violations)
+}

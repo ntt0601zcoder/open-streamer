@@ -48,6 +48,17 @@ const (
 	// sequence number's EXTINF in the other renditions
 	// (ReadOptions.AlignedSequences only).
 	RuleGapDuration = "gap-duration"
+	// RuleVariantAlignment: the variants of an ABR presentation segment
+	// alike. HLS (ReadOptions.AlignedSequences only): the first video frame
+	// of one media sequence number has the same PTS in every playlist, where
+	// all of them start with a keyframe. DASH: no segment of a video
+	// representation contains the start of another's strictly inside it,
+	// and with segmentAlignment the timelines are equal.
+	RuleVariantAlignment = "variant-aligned"
+	// RuleVariantBandwidth: an HLS variant's measured peak bitrate, with its
+	// default audio rendition, does not exceed 1.1 times its BANDWIDTH
+	// (ReadOptions.AlignedSequences only).
+	RuleVariantBandwidth = "variant-bandwidth"
 )
 
 // frameRules are the rules CheckFrames knows.

@@ -208,6 +208,25 @@ type hlsEntry struct {
 	gap    bool
 	extinf int64 // ticks
 	tol    int64 // ticks: one frame of a real entry's track; 0 for a gap
+	bytes  int   // size of the segment; real entries only
+	start  segStart
+}
+
+// segStart is the first video frame of a segment in decode order.
+type segStart struct {
+	video bool  // the segment has a video frame
+	key   bool  // that frame is a keyframe
+	pts   int64 // its PTS
+}
+
+// firstVideo returns the first video frame of frames, in the order given.
+func firstVideo(frames []media.Frame) segStart {
+	for _, f := range frames {
+		if f.Kind() == media.KindVideo {
+			return segStart{video: true, key: f.Key, pts: f.PTS}
+		}
+	}
+	return segStart{}
 }
 
 // hlsRead is one media playlist read in a pass.
@@ -240,12 +259,24 @@ type hlsCapture struct {
 	master   bool
 	gaps     int
 	entries  map[uint64][]hlsEntry // by media sequence number; AlignedSequences only
+	// variants are the master's variants in order of first appearance, with
+	// the largest BANDWIDTH any master read gave each; defaults maps an
+	// audio group to the URL of its DEFAULT rendition, as of the latest read.
+	variants []*hlsVariant
+	defaults map[string]string
 	// misaligned: the renditions' media sequence numbers disagreed, so
 	// entries cannot be matched by number.
 	misaligned bool
 	// pending is the rule the previous pass's playlists disagreed on
 	// without AlignedSequences, not reported yet.
 	pending string
+}
+
+// hlsVariant is one variant URI of the masters read.
+type hlsVariant struct {
+	url       string
+	audio     string // audio group, as of the latest master
+	bandwidth int    // largest BANDWIDTH any master gave
 }
 
 // ReadHLS reads an HLS master or media playlist, with TS or fMP4 segments,
@@ -285,12 +316,21 @@ type hlsCapture struct {
 // in every other playlist, within one frame of a real entry's track (1 ms
 // against another gap): RuleGapDuration.
 //
+// With AlignedSequences and two or more playlists that carry video, the PTS
+// of the first video frame in decode order of each media sequence number must
+// be equal across them (RuleVariantAlignment), compared only when every one
+// of those entries starts with a keyframe; and for a master with two or more
+// variants, each variant's measured peak bitrate, over its own playlist and
+// its audio group's DEFAULT rendition playlist, must not exceed 1.1 times
+// the largest BANDWIDTH a master gave it (RuleVariantBandwidth).
+//
 // TS tracks are keyed by PID, so they keep their capture track across
 // segments.
 func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	c := &hlsCapture{
 		r: newReader(opt), opt: opt, b: newBuilder(), byURL: map[string]*hlsPlaylist{},
 		inits: map[string]fmp4Init{}, badInits: map[string]bool{}, entries: map[uint64][]hlsEntry{},
+		defaults: map[string]string{},
 	}
 	body, err := c.r.getOK(ctx, u)
 	if err != nil {
@@ -329,6 +369,8 @@ func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	}
 	c.checkTSExtinf()
 	c.checkGaps()
+	c.checkVariantAlignment()
+	c.checkVariantBandwidth()
 	if c.master {
 		if !opt.Once {
 			c.finalMaster(ctx, u)
@@ -530,6 +572,87 @@ func (c *hlsCapture) checkGaps() {
 	}
 }
 
+// checkVariantAlignment applies RuleVariantAlignment: with aligned
+// sequences, the entries of a media sequence number that carry video start
+// at the same PTS in every playlist, once all of them start with a keyframe.
+func (c *hlsCapture) checkVariantAlignment() {
+	if !c.opt.AlignedSequences || c.misaligned {
+		return
+	}
+	msns := make([]uint64, 0, len(c.entries))
+	for msn := range c.entries {
+		msns = append(msns, msn)
+	}
+	slices.Sort(msns)
+	for _, msn := range msns {
+		var vs []hlsEntry
+		for _, e := range c.entries[msn] {
+			if !e.gap && e.start.video {
+				vs = append(vs, e)
+			}
+		}
+		if len(vs) < 2 || slices.ContainsFunc(vs, func(e hlsEntry) bool { return !e.start.key }) {
+			continue
+		}
+		for i, a := range vs {
+			for _, b := range vs[i+1:] {
+				if a.start.pts != b.start.pts {
+					c.b.once("aligned:"+a.src+"|"+b.src, RuleVariantAlignment, -1,
+						"media sequence %d: first video PTS %d in %s, %d in %s", msn, a.start.pts, a.url, b.start.pts, b.url)
+				}
+			}
+		}
+	}
+}
+
+// bandwidthSlack is RuleVariantBandwidth's tolerance, the fraction 11/10.
+const bandwidthSlackNum, bandwidthSlackDen = 11, 10
+
+// checkVariantBandwidth applies RuleVariantBandwidth: a variant's measured
+// peak bitrate does not exceed 1.1 times its largest BANDWIDTH.
+func (c *hlsCapture) checkVariantBandwidth() {
+	if !c.opt.AlignedSequences || c.misaligned || len(c.variants) < 2 {
+		return
+	}
+	rate := func(e hlsEntry) int64 {
+		if e.gap || e.extinf <= 0 {
+			return 0
+		}
+		return int64(e.bytes) * 8 * media.ClockRate / e.extinf
+	}
+	for _, v := range c.variants {
+		pl := c.byURL[v.url]
+		if pl == nil || v.bandwidth <= 0 {
+			continue
+		}
+		audioSrc := ""
+		if ap := c.byURL[c.defaults[v.audio]]; ap != nil && v.audio != "" {
+			audioSrc = ap.src
+		}
+		var peak int64
+		var at uint64
+		for msn, es := range c.entries {
+			var own, aud int64
+			var haveOwn bool
+			for _, e := range es {
+				switch {
+				case e.src == pl.src && !e.gap:
+					own, haveOwn = rate(e), true
+				case audioSrc != "" && e.src == audioSrc:
+					aud = rate(e)
+				}
+			}
+			if r := own + aud; haveOwn && (r > peak || r == peak && msn < at) {
+				peak, at = r, msn
+			}
+		}
+		if peak*bandwidthSlackDen > int64(v.bandwidth)*bandwidthSlackNum {
+			c.b.once("bandwidth:"+v.url, RuleVariantBandwidth, -1,
+				"%s: measured peak %d bit/s (media sequence %d) above 1.1 times BANDWIDTH %d", v.url, peak, at, v.bandwidth)
+		}
+	}
+}
+
 // finalMaster reads the master once more after the last playlist poll: the
 // playlists were read after the previous master, so a later window may hold
 // a codec it did not list yet. A failed read (the master gone after the
@@ -550,8 +673,28 @@ func (c *hlsCapture) readMaster(u string, body []byte) error {
 		return fmt.Errorf("conform: read: %s: %w", u, err)
 	}
 	var uris []string
+	for _, rd := range m.Renditions {
+		if rd.Default && rd.URI != "" && rd.Type == "AUDIO" {
+			abs, err := resolve(u, rd.URI)
+			if err != nil {
+				return err
+			}
+			c.defaults[rd.GroupID] = abs
+		}
+	}
 	for _, v := range m.Variants {
 		uris = append(uris, v.URI)
+		abs, err := resolve(u, v.URI)
+		if err != nil {
+			return err
+		}
+		i := slices.IndexFunc(c.variants, func(x *hlsVariant) bool { return x.url == abs })
+		if i < 0 {
+			c.variants = append(c.variants, &hlsVariant{url: abs})
+			i = len(c.variants) - 1
+		}
+		c.variants[i].audio = v.Audio
+		c.variants[i].bandwidth = max(c.variants[i].bandwidth, v.Bandwidth)
 		for _, c1 := range strings.Split(v.Codecs, ",") {
 			if c1 = strings.TrimSpace(c1); c1 != "" && !slices.Contains(c.codecs, c1) {
 				c.codecs = append(c.codecs, c1)
@@ -672,10 +815,14 @@ func (c *hlsCapture) segment(ctx context.Context, pl *hlsPlaylist, s hls.Segment
 	pl.captured += s.Duration
 	extinf := media.FromDuration(s.Duration)
 	if s.Map == "" {
-		if err := c.tsSegment(pl, u, body, msn, epoch, s.Discontinuity, extinf); err != nil {
+		start, err := c.tsSegment(pl, u, body, msn, epoch, s.Discontinuity, extinf)
+		if err != nil {
 			return err
 		}
-		c.entry(msn, hlsEntry{src: pl.src, url: u, extinf: extinf, tol: pl.records[len(pl.records)-1].frame})
+		c.entry(msn, hlsEntry{
+			src: pl.src, url: u, extinf: extinf, tol: pl.records[len(pl.records)-1].frame,
+			bytes: len(body), start: start,
+		})
 		return nil
 	}
 	seg, err := parseSegment(body, in)
@@ -690,7 +837,7 @@ func (c *hlsCapture) segment(ctx context.Context, pl *hlsPlaylist, s hls.Segment
 	ts := int(in.timescale)
 	frame := media.SampleTime(int64(seg.duration)/int64(seg.samples), ts)
 	c.b.checkExtinf(u, track, extinf, media.SampleTime(int64(seg.duration), ts), frame)
-	c.entry(msn, hlsEntry{src: pl.src, url: u, extinf: extinf, tol: frame})
+	c.entry(msn, hlsEntry{src: pl.src, url: u, extinf: extinf, tol: frame, bytes: len(body), start: firstVideo(seg.frames)})
 	for _, f := range seg.frames {
 		c.b.add(f)
 	}
@@ -734,10 +881,10 @@ func fetchInit(ctx context.Context, r reader, b *builder, u string) (fmp4Init, b
 }
 
 // tsSegment demuxes one TS segment with the capture's shared time decoder.
-func (c *hlsCapture) tsSegment(pl *hlsPlaylist, u string, body []byte, msn uint64, epoch uint32, disc bool, extinf int64) error {
+func (c *hlsCapture) tsSegment(pl *hlsPlaylist, u string, body []byte, msn uint64, epoch uint32, disc bool, extinf int64) (segStart, error) {
 	d, err := ts.NewDemuxerWithOptions(bytes.NewReader(body), ts.DemuxOptions{Decoder: &c.dec})
 	if err != nil {
-		return fmt.Errorf("conform: read: %s: %w", u, err)
+		return segStart{}, fmt.Errorf("conform: read: %s: %w", u, err)
 	}
 	// Tracks are keyed by PID: a segment's demuxer numbers tracks from its
 	// own PMT, so a segment missing a lower track would renumber the rest.
@@ -749,7 +896,7 @@ func (c *hlsCapture) tsSegment(pl *hlsPlaylist, u string, body []byte, msn uint6
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("conform: read: %s: %w", u, err)
+			return segStart{}, fmt.Errorf("conform: read: %s: %w", u, err)
 		}
 		f.Track = c.b.track(pl.src, int(pids[f.Track]))
 		f.Epoch = epoch
@@ -760,7 +907,7 @@ func (c *hlsCapture) tsSegment(pl *hlsPlaylist, u string, body []byte, msn uint6
 	for _, f := range frames {
 		c.b.add(f)
 	}
-	return nil
+	return firstVideo(frames), nil
 }
 
 // tsAnchor fills a record from the segment's anchor track: its lowest video
@@ -840,24 +987,33 @@ type dashRep struct {
 
 // dashCapture is the state of one ReadDASH.
 type dashCapture struct {
-	r       reader
-	b       *builder
-	url     string
-	reps    map[string]*dashRep
-	inits   map[string]fmp4Init
-	bad     map[string]bool // inits that did not answer 200, reported once
-	epochs  map[string]uint32
-	ast     *time.Time
-	polled  bool
-	docSegs int64 // timeline segments of the MPD being read
-	total   int   // distinct segments, init URLs and representations in the capture
-	firstOK bool  // the first period's start was decided
+	r      reader
+	b      *builder
+	url    string
+	reps   map[string]*dashRep
+	inits  map[string]fmp4Init
+	bad    map[string]bool // inits that did not answer 200, reported once
+	epochs map[string]uint32
+	// startKey records, per fetched segment, whether its first sample is a
+	// keyframe.
+	startKey map[segID]bool
+	ast      *time.Time
+	polled   bool
+	docSegs  int64 // timeline segments of the MPD being read
+	total    int   // distinct segments, init URLs and representations in the capture
+	firstOK  bool  // the first period's start was decided
 }
 
 // ReadDASH reads a DASH MPD with SegmentTemplate timelines back into frames.
 // Epochs number periods from 1 in order of first appearance; tracks are
 // keyed by Representation@id. A timeline expanding to more than 100000
 // segments is an error.
+//
+// In each period, an adaptation set with two or more video representations
+// must be aligned in time (RuleVariantAlignment): over the span two of them
+// share, no segment of one contains the start of one of the other's strictly
+// inside it, compared only where both segments start on a keyframe; with
+// segmentAlignment="true" their resolved timelines must also be equal.
 //
 // The first period's start rules apply only when its anchor set's (first
 // video, else first audio) first captured segment has a tfdt equal to its
@@ -871,6 +1027,7 @@ func ReadDASH(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	c := &dashCapture{
 		r: newReader(opt), b: newBuilder(), url: u,
 		reps: map[string]*dashRep{}, inits: map[string]fmp4Init{}, bad: map[string]bool{}, epochs: map[string]uint32{},
+		startKey: map[segID]bool{},
 	}
 	for {
 		body, err := c.r.getOK(ctx, u)
@@ -912,12 +1069,20 @@ func (c *dashCapture) done(d time.Duration) bool {
 	return false
 }
 
+// segID names a segment of a representation by its timeline start.
+type segID struct {
+	rep string
+	t   uint64
+}
+
 // dashSet is one representation of a period, resolved.
 type dashSet struct {
-	rep  dash.Representation
-	tpl  dash.SegmentTemplate
-	segs []dash.Seg
-	in   fmp4Init
+	set   int  // index of its adaptation set in the period
+	align bool // the set's segmentAlignment
+	rep   dash.Representation
+	tpl   dash.SegmentTemplate
+	segs  []dash.Seg
+	in    fmp4Init
 }
 
 // poll handles one MPD refresh.
@@ -956,9 +1121,90 @@ func (c *dashCapture) poll(ctx context.Context, m dash.MPD) error {
 		if err := c.fetchPeriod(ctx, sets, epoch, !c.firstOK); err != nil {
 			return err
 		}
+		c.checkAlignment(key, sets)
 		c.firstOK = true
 	}
 	return nil
+}
+
+// span is a segment on the 90 kHz clock.
+type span struct{ start, end int64 }
+
+// checkAlignment applies RuleVariantAlignment to the adaptation sets of one
+// period that have two or more video representations: over the span two
+// representations share, no segment of one contains the start of the
+// other's strictly inside it, comparing only segments that start on a
+// keyframe. With segmentAlignment, the timelines must also be equal.
+func (c *dashCapture) checkAlignment(period string, sets []dashSet) {
+	bySet := map[int][]dashSet{}
+	for _, s := range sets {
+		if s.in.cfg.Codec.Kind() == media.KindVideo {
+			bySet[s.set] = append(bySet[s.set], s)
+		}
+	}
+	ids := make([]int, 0, len(bySet))
+	for id := range bySet {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	for _, id := range ids {
+		reps := bySet[id]
+		for i, a := range reps {
+			for _, b := range reps[i+1:] {
+				key := "aligned:" + period + "|" + a.rep.ID + "|" + b.rep.ID
+				if detail := c.misaligned(a, b); detail != "" {
+					c.b.once(key, RuleVariantAlignment, -1, "period %s: representations %s and %s: %s",
+						period, a.rep.ID, b.rep.ID, detail)
+				}
+			}
+		}
+	}
+}
+
+// timeline returns the segments of s on the 90 kHz clock.
+func (s dashSet) timeline(c *dashCapture) (all, keyed []span) {
+	scale := int(s.tpl.Timescale)
+	for _, sg := range s.segs {
+		sp := span{media.SampleTime(int64(sg.T), scale), media.SampleTime(int64(sg.T+sg.D), scale)}
+		all = append(all, sp)
+		if c.startKey[segID{s.rep.ID, sg.T}] {
+			keyed = append(keyed, sp)
+		}
+	}
+	return all, keyed
+}
+
+// misaligned describes how a and b are not aligned, or returns "".
+func (c *dashCapture) misaligned(a, b dashSet) string {
+	allA, keyA := a.timeline(c)
+	allB, keyB := b.timeline(c)
+	if len(allA) == 0 || len(allB) == 0 {
+		return ""
+	}
+	if a.align || b.align {
+		if !slices.Equal(allA, allB) {
+			return "segmentAlignment is true but the timelines differ"
+		}
+	}
+	lo := max(allA[0].start, allB[0].start)
+	hi := min(allA[len(allA)-1].end, allB[len(allB)-1].end)
+	straddles := func(x, y []span) (span, int64, bool) {
+		for _, sx := range x {
+			for _, sy := range y {
+				if sy.start >= lo && sy.start < hi && sx.start < sy.start && sy.start < sx.end {
+					return sx, sy.start, true
+				}
+			}
+		}
+		return span{}, 0, false
+	}
+	if sx, t, ok := straddles(keyA, keyB); ok {
+		return fmt.Sprintf("a segment of %s (%d to %d) contains a segment start of %s (%d)", a.rep.ID, sx.start, sx.end, b.rep.ID, t)
+	}
+	if sx, t, ok := straddles(keyB, keyA); ok {
+		return fmt.Sprintf("a segment of %s (%d to %d) contains a segment start of %s (%d)", b.rep.ID, sx.start, sx.end, a.rep.ID, t)
+	}
+	return ""
 }
 
 // mediaSpan returns the longest span from period start to media end over
@@ -983,7 +1229,7 @@ func mediaSpan(sets []dashSet) time.Duration {
 // period resolves a period's representations and reads their inits.
 func (c *dashCapture) period(ctx context.Context, per dash.Period) ([]dashSet, error) {
 	var out []dashSet
-	for _, as := range per.AdaptationSets {
+	for asi, as := range per.AdaptationSets {
 		for _, rep := range as.Representations {
 			tp := as.SegmentTemplate
 			if rep.SegmentTemplate != nil {
@@ -1037,7 +1283,7 @@ func (c *dashCapture) period(ctx context.Context, per dash.Period) ([]dashSet, e
 				c.b.once("codecs:"+per.ID+"/"+rep.ID, RuleCodecString, -1,
 					"period %s representation %s: @codecs %q, content %q (%v)", per.ID, rep.ID, rep.Codecs, got, err)
 			}
-			out = append(out, dashSet{rep: rep, tpl: tpl, segs: tpl.Timeline.Resolve(), in: in})
+			out = append(out, dashSet{set: asi, align: as.SegmentAlignment, rep: rep, tpl: tpl, segs: tpl.Timeline.Resolve(), in: in})
 		}
 	}
 	return out, nil
@@ -1125,6 +1371,7 @@ func (c *dashCapture) segment(ctx context.Context, u string, s dashSet, sg dash.
 		seg.frames[i].Track, seg.frames[i].Epoch = track, epoch
 	}
 	c.b.checkSegmentKey(u, seg.frames, 0)
+	c.startKey[segID{s.rep.ID, sg.T}] = firstVideo(seg.frames).key
 	for _, f := range seg.frames {
 		c.b.add(f)
 	}
