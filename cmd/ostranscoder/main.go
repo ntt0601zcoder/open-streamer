@@ -33,20 +33,25 @@ const statsInterval = time.Second
 // errorRung is Error.Rung for an error not tied to one rung.
 const errorRung = -1
 
-// main prints the version with -version, and otherwise serves the wire
-// protocol on fd 3: exit 0 after Stop or EOF from the host, 1 on an error,
-// 2 on bad usage.
+// exitProbeFailed is the exit status of a probe that failed.
+const exitProbeFailed = 3
+
+// main prints the version with -version, probes NVENC with -probe nvenc
+// (exit 0 or 3), and otherwise serves the wire protocol on fd 3: exit 0
+// after Stop or EOF from the host, 1 on an error, 2 on bad usage.
 func main() {
+	// libav's default log callback writes to stderr.
+	astiav.SetLogLevel(astiav.LogLevelWarning)
 	switch {
 	case len(os.Args) == 2 && os.Args[1] == "-version":
 		fmt.Printf("ostranscoder wire %d libavcodec %s\n", wire.Version, libavcodecVersion())
 		return
+	case len(os.Args) == 3 && os.Args[1] == "-probe" && os.Args[2] == "nvenc":
+		os.Exit(probeNVENC(os.Stdout))
 	case len(os.Args) != 1:
-		fmt.Fprintln(os.Stderr, "usage: ostranscoder [-version]")
+		fmt.Fprintln(os.Stderr, "usage: ostranscoder [-version | -probe nvenc]")
 		os.Exit(2)
 	}
-	// libav's default log callback writes to stderr.
-	astiav.SetLogLevel(astiav.LogLevelWarning)
 	conn, err := hostConn()
 	if err == nil {
 		err = run(conn)
@@ -55,6 +60,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// probeNVENC opens and closes an NVENC encoder, prints "nvenc: ok" or
+// "nvenc: <error>" to w, and returns the exit status: 0, or
+// exitProbeFailed.
+func probeNVENC(w io.Writer) int {
+	if err := native.ProbeNVENC(); err != nil {
+		_, _ = fmt.Fprintf(w, "nvenc: %v\n", err)
+		return exitProbeFailed
+	}
+	_, _ = fmt.Fprintln(w, "nvenc: ok")
+	return 0
 }
 
 // hostConn wraps fd 3 as a net.Conn, so that closing it unblocks a pending
@@ -177,14 +194,14 @@ func configure(r *wire.Reader, w *wire.Writer) (*child, error) {
 	for i, r := range cfg.Rungs {
 		rungs[i] = native.Rung{
 			Height: r.Height, BitrateKbps: r.BitrateKbps, MaxBitrateKbps: r.MaxBitrateKbps,
-			BFrames: r.BFrames, Preset: r.Preset,
+			BFrames: r.BFrames, Preset: r.Preset, Encoder: r.Encoder,
 		}
 	}
 	var audio *native.Audio
 	if a := cfg.Audio; a != nil {
 		audio = &native.Audio{BitrateKbps: a.BitrateKbps, SampleRate: a.SampleRate, Channels: a.Channels}
 	}
-	p, err := native.New(rungs, audio)
+	p, err := native.NewWith(native.Config{Rungs: rungs, Audio: audio})
 	if err != nil {
 		return nil, fatal(w, fmt.Errorf("ostranscoder: configure: %w", err))
 	}
@@ -284,5 +301,6 @@ func (c *child) stats() wire.Stats {
 		In: c.in, Out: c.out, EncodeNanos: c.nanos,
 		DroppedTracks: st.DroppedTracks, Reanchors: st.Reanchors, AudioDropped: st.AudioDropped,
 		AudioCorrupt: st.AudioCorrupt, VideoCorrupt: st.VideoCorrupt,
+		EncoderFallbacks: st.EncoderFallbacks,
 	}
 }

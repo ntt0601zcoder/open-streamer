@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -23,16 +24,21 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/clock"
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/native"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/wire"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 )
 
-// envChild makes the test binary run main, for TestMainOverFD3.
-const envChild = "OSTX_TEST_CHILD"
+// envChild makes the test binary run main, for TestMainOverFD3 and
+// TestProbeFlag; envArgs holds main's arguments, split on spaces.
+const (
+	envChild = "OSTX_TEST_CHILD"
+	envArgs  = "OSTX_TEST_ARGS"
+)
 
 func TestMain(m *testing.M) {
 	if os.Getenv(envChild) == "1" {
-		os.Args = os.Args[:1]
+		os.Args = append(os.Args[:1], strings.Fields(os.Getenv(envArgs))...)
 		main()
 		os.Exit(0)
 	}
@@ -583,4 +589,70 @@ func TestMainOverFD3(t *testing.T) {
 			}
 		})
 	}
+}
+
+// runMain runs main in a subprocess with args and returns its exit code,
+// stdout and stderr.
+func runMain(t *testing.T, args string) (code int, stdout, stderr string) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^$") //nolint:gosec // the test binary itself
+	cmd.Env = append(os.Environ(), envChild+"=1", envArgs+"="+args)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	var exit *exec.ExitError
+	switch {
+	case err == nil:
+	case errors.As(err, &exit):
+		code = exit.ExitCode()
+	default:
+		require.NoError(t, err)
+	}
+	return code, out.String(), errb.String()
+}
+
+// TestProbeFlag: -probe nvenc exits 0 with "nvenc: ok" when a device opens,
+// or 3 with the error; any other probe is bad usage.
+func TestProbeFlag(t *testing.T) {
+	code, stdout, stderr := runMain(t, "-probe nvenc")
+	t.Logf("-probe nvenc: exit %d, stdout %q", code, stdout)
+	switch code {
+	case 0:
+		assert.Equal(t, "nvenc: ok\n", stdout)
+	case 3:
+		require.True(t, strings.HasPrefix(stdout, "nvenc: "), "stdout %q", stdout)
+		assert.NotEqual(t, "nvenc: ok\n", stdout)
+		assert.Equal(t, 1, strings.Count(stdout, "\n"), "stdout %q", stdout)
+		require.NotEqual(t, "1", os.Getenv("OS_REQUIRE_NVENC"), "OS_REQUIRE_NVENC=1 but the probe failed: %s", stdout)
+	default:
+		t.Fatalf("-probe nvenc: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+
+	for _, args := range []string{"-probe x", "-probe", "-probe nvenc extra"} {
+		code, stdout, stderr = runMain(t, args)
+		assert.Equal(t, 2, code, "%q", args)
+		assert.Empty(t, stdout, "%q", args)
+		assert.Contains(t, stderr, "usage: ostranscoder", "%q", args)
+	}
+}
+
+// TestChildEncoderFallbacks: the rung's Encoder reaches the pipeline, and
+// its fallbacks reach the host in Stats: 0 when NVENC opens, 1 otherwise.
+func TestChildEncoderFallbacks(t *testing.T) {
+	want := uint64(0)
+	if err := native.ProbeNVENC(); err != nil {
+		want = 1
+	}
+	h, errc := startChild(t, run)
+	require.NoError(t, h.send(wire.Configure{Rungs: []wire.Rung{{Height: 120, BitrateKbps: 150, Encoder: "nvenc"}}}))
+	require.NoError(t, h.sendFrames(ofKind(source(t), media.KindVideo)))
+	require.NoError(t, h.send(wire.Stop{}))
+
+	e := h.wait(t, errc)
+	require.NoError(t, e.runErr)
+	c := collect(e.msgs)
+	require.Empty(t, c.errs)
+	require.NotEmpty(t, c.frames[0])
+	require.NotEmpty(t, c.stats)
+	assert.Equal(t, want, c.stats[len(c.stats)-1].EncoderFallbacks)
 }

@@ -37,11 +37,21 @@ const (
 // peak. BFrames is the number of consecutive B-frames: 0 means 2 and −1
 // means none. At most 3 are allowed: the rendition delay D (0.5 s) covers
 // the encoder's reorder delay only down to about 8 fps with 3 B-frames, or
-// about 6 fps with 2; slower sources should use −1. Preset is the libx264
-// preset, "veryfast" when empty.
+// about 6 fps with 2; slower sources should use −1. Encoder is EncoderX264
+// (libx264, the default when empty) or EncoderNVENC (h264_nvenc). Preset is
+// the libx264 preset, "veryfast" when empty, or for NVENC p1 to p7, "p4"
+// when empty. An NVENC rung whose encoder fails to open is encoded by
+// libx264 with preset veryfast, and counted in Stats.EncoderFallbacks.
 type Rung struct {
 	Height, BitrateKbps, MaxBitrateKbps, BFrames int
-	Preset                                       string
+	Preset, Encoder                              string
+}
+
+// Config is what a pipeline encodes: the video ladder and the audio. A nil
+// Audio ignores audio frames; at least one rung or Audio is required.
+type Config struct {
+	Rungs []Rung
+	Audio *Audio
 }
 
 // Audio is the AAC encoding of every audio track. Zero values mean 128 kbps,
@@ -64,15 +74,19 @@ type Output struct {
 // the input frames a decoder rejected and that were skipped: any decoder
 // error but ENOMEM. Damage a video decoder conceals is not counted. A
 // decoder that rejects 50 frames in a row fails the pipeline.
+// EncoderFallbacks counts the rung encoder opens that fell back from NVENC
+// to libx264: one per rung per build.
 type Stats struct {
 	DroppedTracks, Reanchors, AudioDropped uint64
 	AudioCorrupt, VideoCorrupt             uint64
+	EncoderFallbacks                       uint64
 }
 
-// Pipeline decodes the source video once, encodes it per rung with libx264,
-// and re-encodes every audio track to AAC. Its input is already in rendition
-// time: epoch-mapped and shifted by D. Output PTS are the input's; video
-// output DTS are the encoder's. It is not safe for concurrent use.
+// Pipeline decodes the source video once, encodes it per rung with libx264
+// or NVENC, and re-encodes every audio track to AAC. Its input is already
+// in rendition time: epoch-mapped and shifted by D. Output PTS are the
+// input's; video output DTS are the encoder's. It is not safe for
+// concurrent use.
 type Pipeline struct {
 	video  *videoPath // nil without rungs
 	audio  *Audio     // resolved; nil when audio is ignored
@@ -101,9 +115,14 @@ type Pipeline struct {
 	stats Stats
 }
 
-// New builds a pipeline for the given ladder. A nil audio ignores audio
-// frames; at least one rung or audio is required.
+// New builds a pipeline for the given ladder and audio, as NewWith.
 func New(rungs []Rung, audio *Audio) (*Pipeline, error) {
+	return NewWith(Config{Rungs: rungs, Audio: audio})
+}
+
+// NewWith builds a pipeline for c.
+func NewWith(c Config) (*Pipeline, error) {
+	rungs, audio := c.Rungs, c.Audio
 	if len(rungs) == 0 && audio == nil {
 		return nil, errors.New("transcode: new pipeline: no rungs and no audio")
 	}
@@ -149,8 +168,21 @@ func resolveRung(r Rung) (Rung, error) {
 	case -1:
 		r.BFrames = 0
 	}
-	if r.Preset == "" {
-		r.Preset = defaultPreset
+	switch r.Encoder {
+	case "", EncoderX264:
+		r.Encoder = EncoderX264
+		if r.Preset == "" {
+			r.Preset = defaultPreset
+		}
+	case EncoderNVENC:
+		if r.Preset == "" {
+			r.Preset = defaultNVENCPreset
+		}
+		if !validNVENCPreset(r.Preset) {
+			return r, fmt.Errorf("nvenc preset %q is not p1 to p7", r.Preset)
+		}
+	default:
+		return r, fmt.Errorf("encoder %q is not x264 or nvenc", r.Encoder)
 	}
 	return r, nil
 }

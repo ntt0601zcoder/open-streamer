@@ -1,6 +1,8 @@
 // Command ostranscoder is the per-stream transcoder child that
-// internal/transcode spawns: it decodes the source once and encodes a
-// software H.264 ladder through libavcodec (internal/transcode/native).
+// internal/transcode spawns: it decodes the source once and encodes an
+// H.264 ladder through libavcodec (internal/transcode/native), each rung
+// with libx264 or NVENC; an NVENC rung that fails to open falls back to
+// libx264.
 //
 // It needs cgo and FFmpeg 8.1 and builds only with the build tag libav
 // (make ostranscoder bundles it with its libraries); without the tag it is a
@@ -8,8 +10,11 @@
 //
 // Usage:
 //
-//	ostranscoder            serves the wire protocol on fd 3, a Unix socket
-//	ostranscoder -version   prints "ostranscoder wire <N> libavcodec <x.y.z>"
+//	ostranscoder               serves the wire protocol on fd 3, a Unix socket
+//	ostranscoder -version      prints "ostranscoder wire <N> libavcodec <x.y.z>"
+//	ostranscoder -probe nvenc  opens and closes an NVENC encoder: prints
+//	                           "nvenc: ok" and exits 0, or "nvenc: <error>"
+//	                           and exits 3
 //
 // On fd 3 it writes Hello, reads Configure, then turns every Frame into
 // encoded frames, drains on Discontinuity, and writes Stats every second. It

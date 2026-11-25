@@ -289,24 +289,6 @@ func (v *videoPath) encode(fr *astiav.Frame, epoch uint32) ([]Output, error) {
 	return out, nil
 }
 
-// openEncoders opens every rung or none: on a failure it closes the rungs
-// it opened.
-func (v *videoPath) openEncoders(fr *astiav.Frame) error {
-	encs := make([]*rungEncoder, 0, len(v.rungs))
-	for i, r := range v.rungs {
-		e, err := openRung(i, r, fr, v.fps, &v.caches[i])
-		if err != nil {
-			for _, o := range encs {
-				o.release()
-			}
-			return err
-		}
-		encs = append(encs, e)
-	}
-	v.encs = encs
-	return nil
-}
-
 // drain flushes the build's held input, decoder and encoders, then
 // releases it.
 func (v *videoPath) drain(epoch uint32) ([]Output, error) {
@@ -359,7 +341,7 @@ func (v *videoPath) release() {
 }
 
 // rungEncoder scales decoded pictures to one rung and encodes them with
-// libx264.
+// libx264 or NVENC.
 type rungEncoder struct {
 	idx   int
 	cache *media.ConfigCache
@@ -381,46 +363,6 @@ type rungEncoder struct {
 func evenWidth(srcW, srcH, h int) int {
 	w := (srcW*h + srcH) / (2 * srcH) * 2
 	return max(w, 2)
-}
-
-func openRung(idx int, r Rung, fr *astiav.Frame, fps astiav.Rational, cache *media.ConfigCache) (*rungEncoder, error) {
-	codec := astiav.FindEncoderByName("libx264")
-	if codec == nil {
-		return nil, errors.New("video encoder: libx264 not in libavcodec")
-	}
-	cc := astiav.AllocCodecContext(codec)
-	if cc == nil {
-		return nil, errors.New("video encoder: alloc libx264 context")
-	}
-	e := &rungEncoder{idx: idx, cache: cache, cc: cc, w: evenWidth(fr.Width(), fr.Height(), r.Height), h: r.Height}
-	cc.SetWidth(e.w)
-	cc.SetHeight(e.h)
-	cc.SetPixelFormat(astiav.PixelFormatYuv420P)
-	cc.SetTimeBase(timeBase)
-	cc.SetFramerate(fps)
-	if sar := fr.SampleAspectRatio(); sar.Num() > 0 && sar.Den() > 0 {
-		cc.SetSampleAspectRatio(sar)
-	}
-	cc.SetBitRate(int64(r.BitrateKbps) * 1000)
-	cc.SetRateControlMaxRate(int64(r.MaxBitrateKbps) * 1000)
-	cc.SetRateControlBufferSize(2 * r.MaxBitrateKbps * 1000)
-	cc.SetMaxBFrames(r.BFrames)
-	cc.SetThreadCount(0)
-
-	opts := astiav.NewDictionary()
-	defer opts.Free()
-	for _, kv := range [][2]string{{"preset", r.Preset}, {"x264-params", x264Params}, {"forced-idr", "1"}} {
-		if err := opts.Set(kv[0], kv[1], 0); err != nil {
-			cc.Free()
-			return nil, fmt.Errorf("video encoder: option %s: %w", kv[0], err)
-		}
-	}
-	if err := cc.Open(codec, opts); err != nil {
-		cc.Free()
-		return nil, fmt.Errorf("video encoder: rung %d: open libx264 %dx%d: %w", idx, e.w, e.h, err)
-	}
-	e.pkt = astiav.AllocPacket()
-	return e, nil
 }
 
 // encode scales one picture and sends it to the encoder, as an IDR when
