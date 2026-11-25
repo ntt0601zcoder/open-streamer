@@ -436,7 +436,7 @@ func (l *Limiter) Key(remoteAddr, user string) string
 func (l *Limiter) Blocked(key string) (retryAfter time.Duration, blocked bool) // in a backoff now
 // Reserve takes one in-flight attempt for key, unless its counted failures plus its attempts in flight are already 5.
 func (l *Limiter) Reserve(key string) (*Attempt, bool)
-func (l *Limiter) Succeed(key string) // a remembered login: zeroes the key's failures; its attempts in flight stay counted
+func (l *Limiter) Succeed(key string) // a remembered login: zeroes the key's failures; its attempts in flight stay counted. Does nothing for a key that is not tracked
 type Attempt struct{ /* unexported */ }
 func (a *Attempt) Succeed() // gives the place back and zeroes the key's failures
 func (a *Attempt) Fail()    // counts one failure and starts or lengthens the backoff
@@ -446,7 +446,7 @@ func ClientKey(remoteAddr string) string // the IP of a host:port, Unmap()ped fi
 
 **Remembered logins.** `tag = HMAC-SHA-256(processKey, name ‖ 0x00 ‖ password)`. `Remembered` is true when the user has a remembered tag and `hmac.Equal` says it is this one. `Verify` takes one of 2 slots (or waits, at most 16 deep), verifies against the user's hash, or against the dummy hash when the name is unknown, and on success remembers the tag for that user, replacing an older one. `processKey` (32 random bytes) and **the dummy hash are made once per process**, at first use (`sync.Once`), the dummy at `auth.Iterations`: they are not remade when a `Users` is built, so building one costs no PBKDF2. A `Users` is immutable apart from its remembered tags; the server keeps the same `*Users` across config edits that leave the users section equal (`Equal`, Task 10), so an editor's own writes do not forget its login.
 
-**The limiter.** A key is a client address **and the user name presented** (controller ruling): on the loopback default every local client has the same address, and one scraper with a stale password must not lock out the others. Per key: `failures` (counted), `inFlight` (reserved, not yet resolved), the time of the last failure. `Blocked` is true for `min(1 s × 2^(failures−5), 5 min)` after the last failure once `failures ≥ 5`. `Reserve` refuses when `failures + inFlight ≥ 5`: so of N simultaneous wrong logins for one key at most 5 are verified, however they are timed, because each takes its place before it is verified, not after. `Fail` gives the place back and adds a failure; `Succeed` (the limiter's and the attempt's) **sets `failures` to 0 and never deletes the key or touches the other attempts in flight**: deleting it would let those attempts give back places that are no longer counted, and `inFlight` would go negative; `Abandon` only gives the place back. A key idle for 15 min (and with nothing in flight) is deleted; with 4096 keys the one whose last failure is oldest and that has nothing in flight is deleted to make room.
+**The limiter.** A key is a client address **and the user name presented** (controller ruling): on the loopback default every local client has the same address, and one scraper with a stale password must not lock out the others. Per key: `failures` (counted), `inFlight` (reserved, not yet resolved), the time of the last failure. `Blocked` is true for `min(1 s × 2^(failures−5), 5 min)` after the last failure once `failures ≥ 5`. `Reserve` refuses when `failures + inFlight ≥ 5`: so of N simultaneous wrong logins for one key at most 5 are verified, however they are timed, because each takes its place before it is verified, not after. `Fail` gives the place back and adds a failure; `Succeed` (the limiter's and the attempt's) **sets `failures` to 0 and never deletes the key or touches the other attempts in flight**: deleting it would let those attempts give back places that are no longer counted, and `inFlight` would go negative; `Abandon` only gives the place back. `Limiter.Succeed` on a key the table does not hold **does nothing and adds nothing**: ordinary remembered traffic, which calls it on every request, must never fill the 4096 entries or push a failing key out. A key idle for 15 min (and with nothing in flight) is deleted; with 4096 keys the one whose last failure is oldest and that has nothing in flight is deleted to make room.
 
 **The order a caller follows** (Task 9 does; it is stated here because the pieces only make sense together): (1) `Blocked(key)` → refuse, **before anything is compared**: a blocked client must not learn whether its guess equals a remembered password; (2) `Remembered` → success, `Limiter.Succeed(key)`, no reservation (so many parallel requests of a logged-in client never meet the limit of 5); (3) `Reserve(key)` → refuse when false; (4) `Verify`, then `Succeed`, `Fail` (on `ErrBadCredentials`) or `Abandon` (on `ErrBusy` and on a ctx error).
 
@@ -472,7 +472,10 @@ func TestVerifyAndRemember(t *testing.T)
 // password only, and never true after a failed Verify. A counter on the PBKDF2 call (an unexported hook) shows one call per
 // Verify and none per Remembered.
 func TestVerifyBounded(t *testing.T)
-// the hook blocks. 30 goroutines call Verify with wrong passwords, half on one Users and half on another: at most 2 are inside PBKDF2, 16 wait, and the other 12
+// not parallel: it sets the package-level PBKDF2 hook and fills the process-wide slots. No test of this package calls
+// t.Parallel(), and the same holds for every test elsewhere that sets that hook (internal/api's TestLoginBurst, TestLoginBusy
+// and TestLoginBackoff, internal/server's TestEditKeepsRememberedLogin): each restores the hook in t.Cleanup.
+// The hook blocks. 30 goroutines call Verify with wrong passwords, half on one Users and half on another: at most 2 are inside PBKDF2, 16 wait, and the other 12
 // get ErrBusy at once. A waiter whose ctx is cancelled returns ctx.Err() and its place is taken by a new caller; when the
 // hook is released, every waiter finishes.
 func TestDummyOncePerProcess(t *testing.T)
@@ -485,7 +488,8 @@ func TestLimiter(t *testing.T)
 // blocked; a 6th → 2 s; … the 14th and later → 5 min, never more; Succeed → clear at once and the next failure counts from
 // 1; an idle key is gone after 15 min; Abandon changes nothing. With 3 attempts in flight, Limiter.Succeed and an
 // Attempt.Succeed leave the other attempts counted: only 2 more can be reserved, and after all of them resolve inFlight is
-// exactly 0 (never negative: a further 5 can then be reserved, not 6 or more).
+// exactly 0 (never negative: a further 5 can then be reserved, not 6 or more). Limiter.Succeed for 10000 keys that never
+// failed leaves the table empty, and a key with 4 failures recorded before them is still there with its 4.
 func TestLimiterReservesBeforeVerifying(t *testing.T)
 // 200 goroutines Reserve the same key at once and hold their attempt: exactly 5 get one. After those 5 Fail, the key is
 // Blocked and Reserve is false. With 3 counted failures, only 2 more can be in flight. An Abandon gives a place back.
@@ -554,8 +558,10 @@ type Parsed struct { Doc Document; Users *auth.Users; UserList []auth.User } // 
 
 // SyntaxError: the text is not one YAML document of the expected shape. Its Error() hides the values the library quotes:
 // yaml puts the offending scalar between backquotes ("cannot unmarshal !!str `hunter2` into int"), and it may be a secret
-// typed on the wrong line. On each line of the message, everything from the first backquote to the last is replaced by
-// `…` (not pair by pair: a value that itself contains a backquote would leak its tail).
+// typed on the wrong line. The cut is made **per error entry** (each element of a *yaml.TypeError's Errors; for any other
+// error, the whole message), **across newlines**: everything from the entry's first backquote to its last is replaced by
+// `…`. Not pair by pair (a value that contains a backquote would leak its tail) and not line by line (a value that contains
+// a newline would leak its second line).
 type SyntaxError struct{ Err error }
 type Errors []error                   // every validation error of a document; Error() joins them with "; "
 
@@ -588,9 +594,9 @@ func (f *File) Adopt(text []byte)       // remember text's hash: after a reload 
 
 **Checks** (`Parse`; each error names its place, as `server.srt.latency_ms: …` or `users[1].role: …`, and never quotes a password field): `version` is 1; each listen address is empty or `host:port` with a port of 0 to 65535, `http.listen` and `api.listen` not empty after defaults; apps not empty and without `/` at their ends; `rtsp.udp` needs `rtsp.listen`; `srt.latency_ms` 1…65535; `log.level` one of `debug`, `info`, `warn`, `error` and `log.format` one of `json`, `text`; each user's `password` passes `auth.ParseHash(…, MinIterations)` and the list passes `auth.NewUsers`; at most `spec.MaxStreams` streams, each passing `Validate`, with distinct names. `Parse` does no `stream.Check` and no claims: those need the running server and are `Manager.Replace`'s. **`Parse` never touches the file system**: whether `transcoder.binary` and `assets_dir` exist is `Server.CheckFiles`' question (on Unix, `exec_unix.go`, an execute bit; elsewhere, `exec_other.go`, a regular file is the whole check: Windows has no such bit), asked once at start. So a binary that disappears while the server runs does not make every later edit of the config fail; the stream that needs it reports it (Review Focus 5).
 
-**Two checks on the node tree**, made by walking the decoded `yaml.Node` before anything else, each an entry of `Errors` with its line. **In `ParseLenient` they follow the same split as every other check:** a violation inside `streams[i]` skips that entry and is reported as `streams[i] (name): line N: …` (the walk is run per entry node), so one stream written with an anchor or a `0720` does not stop the start; a violation in `version`, `server` or `users` is `err` and stops it. An alias in one entry to an anchor in another skips both entries (the one with the anchor and the one with the alias).
+**Two checks on the node tree**, made by walking the decoded `yaml.Node` before anything else, each an entry of `Errors` with its line. **In `ParseLenient` they follow the same split as every other check:** a violation inside `streams[i]` skips that entry and is reported as `streams[i] (name): line N: …` (the walk is run per entry node), so one stream written with an anchor or a `0720` does not stop the start; a violation in `version`, `server` or `users` is `err` and stops it. An alias in one entry to an anchor in another skips both entries (the one with the anchor and the one with the alias); an entry that is nothing but an alias (`- *cam`) has no `name` of its own to read and is reported as `streams[i]: line N: …`, without a name. An anchor on the `streams` sequence itself, or on the document root, is not inside any entry: it is `err` and stops the start.
 - **No anchors, aliases or merge keys** (`&a`, `*a`, `<<:`): a node with an `Anchor`, an `AliasNode`, or a mapping key tagged `!!merge` is refused with `line N: anchors, aliases and merge keys are not supported`. They would make a stream entry's text depend on another place in the file, which the per-entry lenient decoding and the node edits of `SetStream` and `DeleteStream` cannot keep whole (an edit could leave an alias dangling).
-- **Numbers are plain decimal integers.** The config has no fractional field, and YAML converts silently: `0720` is 464, `1.5` and `1.0` become 1, `1_000` is 1000. Every scalar the library resolved as `!!int` or `!!float` must match `^-?(0|[1-9][0-9]*)$`, or it is refused with `line N: write the number as a plain decimal integer, or quote it if it is text`. A quoted scalar is a string and is not affected. **The rule is on the scalar, not on the field**, so it also catches unquoted text that looks like a number: a stream `name: 007`, a rendition `label: 007`, a watermark `text: 24.7` or `text: 1e3` are refused with that message, where the library would otherwise hand the string field a value the operator did not write (`7`, or a reformatted float). Quoting them (`"007"`) is the fix the message names.
+- **Numbers are plain decimal integers.** The config has no fractional field, and YAML converts silently: `0720` is 464, `1.5` and `1.0` become 1, `1_000` is 1000. Every scalar the library resolved as `!!int` or `!!float` must match `^-?(0|[1-9][0-9]*)$`, or it is refused with `line N: write the number as a plain decimal integer, or quote it if it is text`. A quoted scalar is a string and is not affected. **The rule is on the scalar, not on the field**, so it also catches unquoted text that looks like a number: a stream `name: 007`, a rendition `label: 007`, a watermark `text: 24.7` or `text: 1e3` are refused with that message. The library itself would decode them correctly (`name: 007` into a string field is `"007"`); they are refused because the node walk does not know the type of the field a scalar is headed for, and one rule on the scalar is simpler and has no field table to keep in step with `internal/spec`. The cost is that operators must quote such text (`"007"`), which the message tells them.
 
 **Strict decoding.** `yaml.NewDecoder` with `KnownFields(true)`; a second document in the text is a `*SyntaxError`; duplicate keys are refused by the library and surface as `*SyntaxError`. `ParseLenient` decodes `streams` as `[]yaml.Node` first, and each entry by marshalling the node back to text and decoding that with a strict decoder (a `Node` cannot be decoded strictly by itself).
 
@@ -598,7 +604,7 @@ func (f *File) Adopt(text []byte)       // remember text's hash: after a reload 
 
 **What a node round trip keeps and loses** (measured in review; R-D4): the library re-emits the whole document, so head comments (the lines above a key or an entry) and the order of keys and entries survive, while **blank lines are dropped, sequences are re-indented, the spacing before a line comment is normalised, comments inside the replaced entry are lost, and so is a line comment on the replaced entry's `name:`**. Only a text that is already in the library's own formatting comes back byte-equal outside the edited entry. A whole-config `PUT` is not affected: it never goes through a node.
 
-**Repairing a skipped entry.** Because `SetStream` and `DeleteStream` find an entry by its `name` scalar alone, a per-stream `PUT` or `DELETE` of the name of an entry the start skipped replaces or removes that entry, and if it was the only fault the document then parses and the edit goes through. An entry whose `name` cannot be read is repaired with a whole-config `PUT` or by hand.
+**Repairing a skipped entry.** Because `SetStream` and `DeleteStream` find an entry by its `name` scalar alone, a per-stream `PUT` or `DELETE` of the name of an entry the start skipped replaces or removes that entry, and if it was the only fault the document then parses and the edit goes through. An entry whose `name` cannot be read is repaired with a whole-config `PUT` or by hand. **So is an anchor and alias pair:** a per-stream `PUT` or `DELETE` of the anchored entry's name would have the encoder emit the other entry's alias with nothing left to point at, and the result is refused like any text with an alias; the whole-config `PUT` is the way to rewrite both.
 
 **`File.Write`.** Steps, each followed by a call of an unexported `hook func(step string) error` that tests set (nil in production): create `.<base>.<8 random hex>.tmp` in the file's directory with `O_WRONLY|O_CREATE|O_EXCL`, 0600 (`created`); write (`written`); `fsync` (`synced`); rename over the file (`renamed`); `fsync` the directory (`dirsynced`). A real error before the rename removes the temp file; a hook error returns at once and removes nothing, which is what a crash leaves. **An error after the rename** (the directory `fsync` failing) is returned, and the hash is **not** remembered: the new text is on disk, the caller's edit was not applied (`commit` failed), so the file is stale and API writes answer 409 until a reload takes the file as it is. Calls are serialised by a mutex in `File`.
 
@@ -620,7 +626,8 @@ func TestParseStrict(t *testing.T)
 func TestSyntaxErrorHidesValues(t *testing.T)
 // `latency_ms: hunter2` and a password written under the wrong key as a bare scalar: the error names the line and the
 // types and contains neither "hunter2" nor the scalar; every backquoted piece of the library's message reads `…`. A value
-// with a backquote inside it, latency_ms: hun`ter2`tail, leaves neither "hun", "ter2" nor "tail" in the message.
+// with a backquote inside it, latency_ms: hun`ter2`tail, leaves neither "hun", "ter2" nor "tail" in the message; a value with a newline inside it,
+// latency_ms: "abc\nsecret", leaves neither "abc" nor "secret"; with two bad fields, both entries are cut and both lines named.
 func TestParseServer(t *testing.T)
 // one row per server check above. Parse does not look at the file system: a transcoder.binary and an assets_dir that do
 // not exist pass Parse. Server.CheckFiles refuses a binary that does not exist, is a directory, and on Unix a regular file
@@ -636,7 +643,8 @@ func TestParseLenientSkipsBadStreams(t *testing.T)
 // returns [cam, other] and three skipped errors naming index and name; a bad server section or user is err and nothing is
 // returned. Parse of the same text returns Errors with those three. The node-tree checks follow the same split: an entry
 // with `height: 0720`, an entry written `- &x {…}` and an entry `- *x` are each skipped as `streams[i] (name): line N: …`
-// and the good streams are returned; `latency_ms: 0120` in server, and an anchor on a user, are err.
+// and the good streams are returned, the plain alias entry reported as `streams[i]` without a name; `latency_ms: 0120` in
+// server, an anchor on a user, an anchor on the streams sequence and an anchor on the document root are err.
 func TestHash(t *testing.T) // quoted 64 hex digits; one changed byte (a comment) changes it
 func TestSetStreamKeepsComments(t *testing.T)
 // fixture 1, already in the library's formatting (made by encoding a node once: 2-space indent, no blank lines, one space
@@ -1195,8 +1203,8 @@ Routes, roles and answers (JSON unless said otherwise):
 | `GET /debug/pprof/…` | editor | `net/http/pprof`'s `Index`, `Cmdline`, `Profile`, `Symbol`, `Trace` | |
 
 **The order of one request** (the outer wrapper; this order is what the tests pin):
-1. **Route first, from the pattern only.** `_, pattern := mux.Handler(r)` is called for the pattern and nothing else (the handler it returns has no path values and is never called). The pattern is `"GET /api/v1/streams/{name}"`: the wrapper cuts the method off and looks `(method, path)` up in the table behind `Routes()`. Found: that path is the `route` of the access log and the counter, and its role is the one required. **A path the mux redirects resolves to its target**: for a path it cleans (a doubled slash, a `..`), `mux.Handler` returns the *target's* pattern with its method (`GET /api/v1//streams` gives `"GET /api/v1/streams"` and a 307 handler; measured on go1.26.11), so such a request is treated as a request for that route: authenticated, authorised and counted under it, and then answered by the mux's redirect in step 7. **The lookup requires the `METHOD ` prefix**: the mux's trailing-slash redirect returns a bare path as its pattern, which must not be mistaken for a route. Anything else is `unmatched`: no pattern (an unknown path), a bare-path pattern (the trailing-slash redirect), and **a known path with another method** (the mux then returns an empty pattern and its 405 handler).
-2. An `unmatched` request is handed to `mux.ServeHTTP` and gets the mux's own answer, **without authentication**: 404, 405 with `Allow`, or the trailing-slash redirect, as plain text. It is counted under `route="unmatched"` with that code. (It tells a stranger which paths exist, which the OpenAPI document does anyway; it never reaches a handler of ours.) An open route (`/healthz`) is dispatched the same way.
+1. **Route first, from the pattern only.** `_, pattern := mux.Handler(r)` is called for the pattern and nothing else (the handler it returns has no path values and is never called). The pattern is `"GET /api/v1/streams/{name}"`: the wrapper cuts the method off and looks `(method, path)` up in the table behind `Routes()`. Found: that path is the `route` of the access log and the counter, and its role is the one required. **A path the mux redirects resolves to its target**, whichever redirect it is: for a path it cleans (a doubled slash, a `..`) and for a trailing-slash redirect alike, `mux.Handler` returns the *target's* full pattern with its method (`GET /api/v1//streams` gives `"GET /api/v1/streams"`, and `GET /debug/pprof` gives `"GET /debug/pprof/"`, each with a 307 handler; measured), so such a request is treated as a request for that route: authenticated, authorised and counted under it, and then answered by the mux's redirect in step 7. **The lookup requires the `METHOD ` prefix**, as a guard: only the mux's `CONNECT` branch returns a bare path as its pattern, and a bare path must never be mistaken for a route. Anything else is `unmatched`: no pattern (an unknown path; `GET /api/v1/streams/x/` is one: no pattern has that shape, so it is a 404, not a redirect), a bare-path pattern (`CONNECT`), and **a known path with another method** (the mux then returns an empty pattern and its 405 handler).
+2. An `unmatched` request is handed to `mux.ServeHTTP` and gets the mux's own answer, **without authentication**: 404 or 405 with `Allow`, as plain text. It is counted under `route="unmatched"` with that code. (It tells a stranger which paths exist, which the OpenAPI document does anyway; it never reaches a handler of ours.) An open route (`/healthz`) is dispatched the same way.
 3. A `PUT`, `DELETE` or `POST` without an `X-Requested-By` header is 400 `bad_request` ("the X-Requested-By header is required"), before any credential is looked at (R-D8).
 4. Credentials: `r.BasicAuth()`. Missing or malformed is 401; it is not a failed login and counts against nobody.
 5. The limiter and the users, in the order Task 13 fixes, with `key := Limiter.Key(r.RemoteAddr, name)`: `Blocked(key)` → 429 with `Retry-After` (whole seconds, rounded up), nothing compared; `Users().Remembered` → authenticated, `Limiter.Succeed(key)`; else `Reserve(key)` false → 429 with `Retry-After: 1`; else `Users().Verify(r.Context(), …)`: a role → `Succeed`; `auth.ErrBadCredentials` → `Fail`, 401; `auth.ErrBusy` → `Abandon`, 503 `unavailable` with `Retry-After: 1`; a context error → `Abandon` (the client is gone).
@@ -1213,8 +1221,8 @@ Errors are `{"error":{"code":"…","message":"…","errors":["…"]}}` (`errors`
 | 401 | `unauthorized` | no, malformed or wrong credentials; with `WWW-Authenticate: Basic realm="openstreamer"` |
 | 403 | `forbidden` | a viewer on an editor's route, or with `?secrets=1` |
 | 404 | `not_found` | `ErrNotFound`, `config.ErrNoStream`, an unknown stream, an invalid name in the path, no thumbnail yet |
-| 404, 405, 3xx | (the mux's plain text) | an `unmatched` request: an unknown path (404), a known path with another method (405 with `Allow`), a trailing-slash redirect. Not authenticated, not JSON |
-| 307 | (the mux's redirect) | a path the mux cleans to a registered route (`//`, `..`): authenticated and authorised as that route first, so 401, 403 or 429 without the credentials for it; counted under that route |
+| 404, 405 | (the mux's plain text) | an `unmatched` request: an unknown path (404), a known path with another method (405 with `Allow`). Not authenticated, not JSON |
+| 307 | (the mux's redirect) | a path the mux redirects to a registered route (`//`, `..`, a missing trailing slash as in `/debug/pprof`): authenticated and authorised as that route first, so 401, 403 or 429 without the credentials for it; counted under that route |
 | 409 | `conflict` | `stream.ErrConflict` (a listen claim, a `copy://` cycle); `errors` lists each |
 | 409 | `config_changed` | `config.ErrStale`: the file was edited by hand; reload first |
 | 412 | `precondition_failed` | `ErrPrecondition` |
@@ -1299,7 +1307,9 @@ func TestRequestCounter(t *testing.T)
 // credentials to /api/v1/streams/x is counted under route="/api/v1/streams/{name}",code="401": the route is resolved
 // before authentication, and the label has no method in it. Unmatched, each without credentials and each counted under
 // route="unmatched": POST /api/v1/streams/x → 405 with an Allow header naming GET, PUT and DELETE; GET /api/v1/nope → 404;
-// GET /api/v1/streams/x/ (a trailing slash: the mux's bare-path pattern) → the mux's own answer, never a handler of ours.
+// GET /api/v1/streams/x/ (404: no such pattern) → the mux's own answer, never a handler of ours. GET /debug/pprof (a
+// trailing-slash redirect to a registered route) is 401 without credentials, 403 for the viewer and 307 for the editor,
+// counted under route="/debug/pprof/".
 // A cleaned path resolves to its target's route: GET /api/v1//streams is 401 without credentials and 307 with them, both
 // counted under route="/api/v1/streams", and never reaches a handler of ours; a pattern without a "METHOD " prefix is
 // never looked up as a route (a unit row on the lookup function: "/api/v1/streams" → unmatched, "GET /api/v1/streams" → found).
@@ -1437,10 +1447,12 @@ func TestServerReserved(t *testing.T)
 // API and the RTSP port, are each refused with 409; one with rtmp://<Addrs().RTMP>/in/key?mode=listen is accepted (it shares
 // the play listener) and one publishing at live/anything there is refused with 422.
 func TestStartIsLenient(t *testing.T)
-// a file with a good stream, a stream "bad" with an unknown key, a stream "oct" with `height: 0720`, a stream "ali" that is
-// an alias of an anchored one, and two streams on one UDP port: New succeeds; the good stream and the first of the pair
-// run; config/status has load_errors for bad, oct, ali and its anchored source (each `streams[i] (name): line N: …`) and
-// for the second of the pair, left stopped, and openstreamer_config_load_errors is 5. A file with `latency_ms: 0120` in
+// a file with a good stream, a stream "bad" with an unknown key, a stream "oct" with `height: 0720`, a stream written
+// `- {<<: *src, name: ali}` whose source "src" carries the anchor, and two streams on one UDP port: New succeeds; the good stream and the first of the pair
+// run; config/status has load_errors for bad, oct, ali and src (each `streams[i] (name): line N: …`) and for the second of
+// the pair, left stopped, and openstreamer_config_load_errors is 5. A per-stream PUT of "src" is refused with 422 (it would
+// leave ali's merge dangling) and a PUT /api/v1/config that rewrites both entries without the anchor succeeds. A file
+// with an anchor on the streams sequence itself does not start. A file with `latency_ms: 0120` in
 // server does not start. While "bad" is in the file, a per-stream PUT of another stream is
 // refused with 422 naming the bad entry. Three repairs, each on a fresh server: PUT /api/v1/streams/bad with a valid
 // document → 201 "created" and the file parses; DELETE /api/v1/streams/bad → 204; a PUT /api/v1/config with the entry
