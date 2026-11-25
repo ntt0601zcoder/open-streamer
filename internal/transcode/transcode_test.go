@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -1572,4 +1573,82 @@ func TestPresentationStats(t *testing.T) {
 		assert.Len(t, out[i], want)
 	}
 	assert.Zero(t, st.MergeDropped)
+}
+
+// captureConfigure makes tr hand every Configure it writes to the returned
+// channel, as well as to the child.
+func captureConfigure(tr *Transcoder) <-chan wire.Configure {
+	ch := make(chan wire.Configure, 16)
+	tr.writeMsg = func(c *child, m wire.Message) error {
+		if cfg, ok := m.(wire.Configure); ok {
+			ch <- cfg
+		}
+		return c.w.Write(m)
+	}
+	return ch
+}
+
+// sentConfigure runs a transcoder with opt and returns the Configure its
+// child is sent.
+func sentConfigure(t *testing.T, opt Options) wire.Configure {
+	t.Helper()
+	var ch <-chan wire.Configure
+	startWith(t, opt, func(tr *Transcoder) { ch = captureConfigure(tr) })
+	select {
+	case cfg := <-ch:
+		return cfg
+	case <-time.After(10 * time.Second):
+		t.Fatal("no Configure")
+		return wire.Configure{}
+	}
+}
+
+func TestNewEncoderValidation(t *testing.T) {
+	src := hub.New(hub.Options{})
+	rung := func(v Video) []Rendition {
+		v.Height, v.BitrateKbps = 240, 600
+		return []Rendition{{Name: "a", Video: v}}
+	}
+	_, err := New(src, Options{Binary: "x", Renditions: rung(Video{Encoder: "qsv"})})
+	require.EqualError(t, err, `transcode: new: rendition "a": encoder "qsv" is not x264 or nvenc`)
+	_, err = New(src, Options{Binary: "x", Renditions: rung(Video{Encoder: EncoderNVENC, Preset: "veryfast"})})
+	require.EqualError(t, err, `transcode: new: rendition "a": nvenc preset "veryfast" is not p1 to p7`)
+	for _, preset := range []string{"p0", "p8", "p", "p11", "P5"} {
+		_, err = New(src, Options{Binary: "x", Renditions: rung(Video{Encoder: EncoderNVENC, Preset: preset})})
+		require.ErrorContains(t, err, "is not p1 to p7", preset)
+	}
+	_, err = New(src, Options{Binary: "x", Renditions: rung(Video{Encoder: EncoderNVENC, BFrames: 4})})
+	require.EqualError(t, err, `transcode: new: rendition "a": bframes 4 outside [-1, 3]`)
+	// An x264 preset is not checked on the host.
+	_, err = New(src, Options{Binary: "x", Renditions: rung(Video{Encoder: EncoderX264, Preset: "veryfast"})})
+	require.NoError(t, err)
+
+	for _, b := range []int{2, 3} {
+		opt := fakeOptions(t)
+		opt.Renditions = rung(Video{Encoder: EncoderNVENC, BFrames: b})
+		cfg := sentConfigure(t, opt)
+		require.Len(t, cfg.Rungs, 1)
+		assert.Equal(t, wire.Rung{Height: 240, BitrateKbps: 600, BFrames: b, Encoder: "nvenc"}, cfg.Rungs[0])
+	}
+	opt := fakeOptions(t)
+	opt.Renditions = rung(Video{Encoder: EncoderNVENC, Preset: "p5"})
+	cfg := sentConfigure(t, opt)
+	require.Len(t, cfg.Rungs, 1)
+	assert.Equal(t, "nvenc", cfg.Rungs[0].Encoder)
+	assert.Equal(t, "p5", cfg.Rungs[0].Preset)
+
+	// An x264 ladder's Configure is M4b's, byte for byte, whether the
+	// encoder is named or not.
+	const m4b = "0000002a12280a0c08f00110d804180020002a000a1008b40110ac02180020012a04666173741206086010001800"
+	for _, enc := range []string{"", EncoderX264} {
+		opt := fakeOptions(t)
+		opt.Renditions = []Rendition{
+			{Name: "t240", Video: Video{Height: 240, BitrateKbps: 600, Encoder: enc}},
+			{Name: "t180", Video: Video{Height: 180, BitrateKbps: 300, BFrames: -1, Preset: "fast", Encoder: enc}},
+		}
+		opt.Audio = Audio{BitrateKbps: 96}
+		var buf bytes.Buffer
+		require.NoError(t, wire.NewWriter(&buf).Write(sentConfigure(t, opt)))
+		assert.Equal(t, m4b, hex.EncodeToString(buf.Bytes()), "encoder %q", enc)
+	}
 }

@@ -106,13 +106,21 @@ const (
 	maxBFrames = 3
 )
 
+// The encoders a rendition's video can ask for.
+const (
+	EncoderX264  = "x264"  // libx264, in software; the default
+	EncoderNVENC = "nvenc" // NVIDIA's hardware encoder; the child falls back to x264 without one
+)
+
 // Video describes a rendition's video: copied from the source, or encoded
 // at Height, which must be even (width keeps the aspect ratio). BFrames -1 means none, 0 means
-// the encoder default (2); at most 3.
+// the encoder default (2); at most 3. Encoder is "" (x264), EncoderX264 or
+// EncoderNVENC; with EncoderNVENC, Preset is "" or "p1" to "p7".
 type Video struct {
 	Copy                                         bool
 	Height, BitrateKbps, MaxBitrateKbps, BFrames int
 	Preset                                       string
+	Encoder                                      string
 }
 
 // Audio describes the audio of every rendition: copied from the source, or
@@ -303,10 +311,14 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 		case v.BFrames < -1 || v.BFrames > maxBFrames:
 			return nil, fmt.Errorf("transcode: new: rendition %q: bframes %d outside [-1, %d]", r.Name, v.BFrames, maxBFrames)
 		}
+		enc, err := wireEncoder(v)
+		if err != nil {
+			return nil, fmt.Errorf("transcode: new: rendition %q: %w", r.Name, err)
+		}
 		t.encodeIdx = append(t.encodeIdx, i)
 		t.configure.Rungs = append(t.configure.Rungs, wire.Rung{
 			Height: v.Height, BitrateKbps: v.BitrateKbps, MaxBitrateKbps: v.MaxBitrateKbps,
-			BFrames: v.BFrames, Preset: v.Preset,
+			BFrames: v.BFrames, Preset: v.Preset, Encoder: enc,
 		})
 	}
 	if a := opt.Audio; !a.Copy {
@@ -362,6 +374,23 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 		t.pres = newPresentationMerger(h, opt.MergeHold, opt.Now, t.anchors.get)
 	}
 	return t, nil
+}
+
+// wireEncoder checks v's encoder and its preset, and returns the encoder as
+// the child is sent it: x264 as "", so that an x264 rung's Configure is the
+// one of before there was a choice.
+func wireEncoder(v Video) (string, error) {
+	switch v.Encoder {
+	case "", EncoderX264:
+		return "", nil
+	case EncoderNVENC:
+		if p := v.Preset; p != "" && (len(p) != 2 || p[0] != 'p' || p[1] < '1' || p[1] > '7') {
+			return "", fmt.Errorf("nvenc preset %q is not p1 to p7", p)
+		}
+		return EncoderNVENC, nil
+	default:
+		return "", fmt.Errorf("encoder %q is not x264 or nvenc", v.Encoder)
+	}
 }
 
 // presentationCacheFrames is the presentation hub's GOP cache for n
@@ -1001,7 +1030,7 @@ func (t *Transcoder) writeChild(c *child) {
 	case <-c.exited:
 		return
 	}
-	if err := c.w.Write(t.configure); err != nil {
+	if err := t.write(c, t.configure); err != nil {
 		c.kill()
 		return
 	}
@@ -1048,12 +1077,7 @@ func (t *Transcoder) writeChild(c *child) {
 // other error, wire.ErrConfigTable included (a respawn starts a fresh
 // table), means the child must go. Called from the writer goroutine.
 func (t *Transcoder) send(c *child, m wire.Message) bool {
-	var err error
-	if t.writeMsg != nil {
-		err = t.writeMsg(c, m)
-	} else {
-		err = c.w.Write(m)
-	}
+	err := t.write(c, m)
 	if err == nil {
 		return true
 	}
@@ -1070,6 +1094,15 @@ func (t *Transcoder) send(c *child, m wire.Message) bool {
 		t.log.Warn("transcode: frame dropped: the wire protocol cannot carry it", "pid", c.p.pid, "err", err)
 	}
 	return true
+}
+
+// write writes m to the child, through the tests' hook when there is one.
+// Called from the writer goroutine.
+func (t *Transcoder) write(c *child, m wire.Message) error {
+	if t.writeMsg != nil {
+		return t.writeMsg(c, m)
+	}
+	return c.w.Write(m)
 }
 
 // wait reaps the process, then lets the reader drain what the child wrote.
