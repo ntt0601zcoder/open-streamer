@@ -1342,6 +1342,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			continue
 		}
 		twg.Go(func() {
+			// Run returns ctx.Err() when ctx ends (Ctrl-C), as the
+			// transcoder's does: a normal end, like the hub closing.
 			err := ts.nailer.Run(ctx)
 			if err != nil && ctx.Err() == nil {
 				transcodeFailed.Store(true)

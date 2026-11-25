@@ -451,7 +451,8 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   R-T5e). A dead child, and a child that cannot be started (a missing
   binary included, so that a binary installed later is picked up), is
   respawned with backoff (250 ms doubling to 5 s), each failure logged and
-  counted as an exit; a version mismatch ends `Run` with an error.
+  counted as an exit; a version mismatch ends `Run` with an error. `Run`
+  returns nil when the source hub closes and `ctx.Err()` when ctx ends.
 - **Decoder errors.** Corrupt input frames, audio and video, are skipped and
   counted (`AudioCorrupt`, `VideoCorrupt`); a decoder fails the pipeline only
   after 50 consecutive corrupt frames (ruling R-T4b). Encoder errors stay
@@ -558,7 +559,8 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   child that exits, or cannot be started (a missing binary included), is
   respawned with backoff (250 ms doubling to 5 s), as the Transcoder's is,
   and the schedule is reset; a wire-version mismatch ends `Run` with an
-  error.
+  error. Like `Transcoder.Run`, `Run` returns nil when the source hub closes
+  and `ctx.Err()` when ctx ends.
 - **Build.** FFmpeg 8.1.3 shared, GPL, comes from a pinned FFmpeg-Builds
   release instead of a compiled builder image (ruling R-M4b): release
   `autobuild-2026-10-31-12-59`, archives

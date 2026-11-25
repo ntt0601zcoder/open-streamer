@@ -270,8 +270,11 @@ func TestThumbnailHTTP(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, get("/live/w/thumbnail.jpg").code)
 	assert.Equal(t, http.StatusNotFound, get("/live/nope/thumbnail.jpg").code)
 	assert.Equal(t, http.StatusNotFound, get("/live/v_abr/thumbnail.jpg").code)
+	// Ctrl-C (the context ends): Thumbnailer.Run returns context.Canceled,
+	// which is a normal end, not a failure.
 	assert.Equal(t, 0, stop(), errw.String())
 	assert.Contains(t, errw.String(), "thumbnailer")
+	assert.NotContains(t, errw.String(), "thumbnailer stopped", "a canceled run is not a failure")
 }
 
 func TestThumbnailBeforeFirstShot(t *testing.T) {
@@ -308,6 +311,7 @@ func TestThumbnailFromChild(t *testing.T) {
 	}, 20*time.Second, 50*time.Millisecond, errw.String())
 	time.Sleep(300 * time.Millisecond) // a Stats with the count
 	assert.Equal(t, 0, stop(), errw.String())
+	assert.NotContains(t, errw.String(), "transcoder stopped", "a canceled run is not a failure")
 	assert.Regexp(t, `transcoder pid .*, thumbnails \d+`, errw.String())
 	assert.NotContains(t, errw.String(), "thumbnailer spawns")
 }

@@ -281,7 +281,7 @@ func TestThumbnailerSkipsWhenChildBusy(t *testing.T) {
 	s.cancel()
 	select {
 	case err := <-s.errc:
-		require.NoError(t, err)
+		require.ErrorIs(t, err, context.Canceled)
 		s.errc <- nil
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return")
@@ -374,8 +374,9 @@ func TestThumbnailerTalkingChildNotKilled(t *testing.T) {
 	assert.Equal(t, ThumbnailerStats{Spawns: 1}, s.th.Stats())
 }
 
-// When the hub closes, or the context ends, Run returns nil and has stopped
-// its child.
+// When the hub closes Run returns nil, and when the context ends
+// context.Canceled, as Transcoder.Run does; either way it has stopped its
+// child.
 func TestThumbnailerEndsWithHub(t *testing.T) {
 	base := runtime.NumGoroutine()
 	for _, how := range []string{"hub", "context"} {
@@ -389,7 +390,11 @@ func TestThumbnailerEndsWithHub(t *testing.T) {
 			}
 			select {
 			case err := <-s.errc:
-				require.NoError(t, err)
+				if how == "hub" {
+					require.NoError(t, err)
+				} else {
+					require.ErrorIs(t, err, context.Canceled)
+				}
 				s.errc <- nil
 			case <-time.After(10 * time.Second):
 				t.Fatal("Run did not return")
@@ -463,7 +468,7 @@ func TestThumbnailerMissingBinary(t *testing.T) {
 	cancel()
 	select {
 	case err := <-errc:
-		require.NoError(t, err)
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return")
 	}

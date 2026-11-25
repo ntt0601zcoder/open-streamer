@@ -172,8 +172,9 @@ type thumbRun struct {
 	backoff   backoff
 }
 
-// Run makes thumbnails until the source hub closes or ctx ends; it returns
-// nil for both, after it has stopped its child. A child that announces another wire version is fatal: Run
+// Run makes thumbnails until the source hub closes (it returns nil) or ctx
+// ends (it returns ctx.Err()), as Transcoder.Run does, after it has stopped
+// its child. A child that announces another wire version is fatal: Run
 // returns that error. A binary that does not exist is not: like any spawn
 // failure it is logged and retried after the backoff, so that a binary
 // installed later is picked up. Run may be called once.
@@ -203,7 +204,7 @@ func (s *thumbRun) loop(ctx context.Context, sub *hub.Sub) error {
 		}
 		select {
 		case <-ctx.Done():
-			return nil
+			return ctx.Err()
 		case d, ok := <-sub.C():
 			if !ok {
 				return nil
