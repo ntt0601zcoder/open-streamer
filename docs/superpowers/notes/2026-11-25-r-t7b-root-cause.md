@@ -21,9 +21,12 @@ observed: the runs used `--vout dummy` and no display capture was taken. It
 is under "Not determined", with why VLC resets.
 
 For the product: at 15 fps every VLC 3 play of a shipping rung resets once,
-at about 6 s, and logs the line. At 25 fps, HEAD with shipping settings
-showed no reset in 16 plays (the cell with 8 decoder threads); HEAD with the
-pyramid switched on resets about twice per play, without the line.
+at about 6 s, and logs the line; at that reset the dump instance also logs
+about 5 pictures as too late to be displayed, 544 to 833 ms late, in 16 of
+16 plays. At 25 fps, HEAD with shipping settings showed no reset and no late
+picture in 16 plays (the cell with 8 decoder threads); HEAD with the pyramid
+switched on resets about twice per play, without the line, and logs late
+pictures in 15 of 16 plays.
 
 1. **Where.** Never at the start of a play. It comes 4, 6 or 8 s in, each
    time VLC fetches a new segment at the live edge. VLC then logs
@@ -296,11 +299,31 @@ the reset lands one frame later, as in C.
   the copied source), not explained from VLC's source.
 - What a viewer sees at a reset. The decoders and their queued pictures are
   flushed and the re-buffer takes about 1 ms of wall time, but no display
-  was captured. The only display-side messages in the logs are
-  `picture is too late to be displayed` (16 to 135 ms) in HEAD with the
-  pyramid on: about 4 pictures in 15 of 16 display logs, at 8.07 s when the
-  next segment arrives and no reset is logged. There are none at 15 fps, in
-  the pre-fix cells A and B, or in HEAD with shipping settings at 25 fps.
+  was captured (`--vout dummy`). The only display-side signal in the logs is
+  `main video output warning: picture is too late to be displayed`, counted
+  here over 16 runs per cell in both instances (the dump instance also
+  decodes for display):
+
+  | Cell | Display logs | Dump logs |
+  |---|---|---|
+  | HEAD, shipping, 15 fps (`h15`) | 0 | 80 lines in 16 of 16, 5 per run, 544–833 ms late |
+  | HEAD, shipping, 25 fps, 8 threads (`hB-t8`) | 0 | 0 |
+  | HEAD A, pyramid (`A`) | 61 in 15 of 16, 10–166 ms | 125 in 15 of 16, 1–638 ms |
+  | HEAD A, 7 threads (`hA-t7`) | 81 in 16 of 16, 14–209 ms | 165 in 16 of 16, 0–678 ms |
+  | HEAD A, audio hold off (`hA-nohold`) | 0 | 192 in 16 of 16, 0–678 ms |
+  | pre-fix A (`oA`) | 0 | 190 in 16 of 16, 0–678 ms |
+  | pre-fix A again (`oA2`) | 4 in 1 of 16, 22–142 ms | 188 in 16 of 16, 0–678 ms |
+  | pre-fix B (`oB`) | 0 | 80 in 16 of 16, 554–721 ms |
+  | pre-fix C (`oC`) | 0 | 192 in 16 of 16, 0–640 ms |
+  | pre-fix copied source (`oSrc`) | 50 in 16 of 16, 48–169 ms | 128 in 16 of 16, 32–637 ms |
+
+  At 15 fps the dump instance logs about 5 late pictures per play, right at
+  the reset (reset at 6.0607 s, the five lines within 2 ms after it, 826 to
+  560 ms late in run 00). The cell with no reset, `hB-t8`, has none in
+  either log. Whether those pictures are dropped, and what that looks like,
+  was not observed. An earlier version of this bullet counted the display
+  logs only and was wrong to say there were none at 15 fps or in pre-fix A
+  and B.
 - The one line logged with a stray picture at a 1069 ms buffer.
 - Cell counts differ run to run with how often a stray picture is delivered
   (3 of 16 to 8 of 16 for cell A). Another agent's stress run shared the
