@@ -553,18 +553,38 @@ func transcoderVersion(t testing.TB, binary string) error {
 	return nil
 }
 
-// EnvRequireNVENC names the environment variable that, set to "1", turns a
-// missing NVENC device from a skip into a failure. Only make test-nvenc
-// sets it; CI has no GPU.
+// EnvNVENC names the environment variable that, set to "1", opts in to the
+// tests that open an NVENC device. They are opt-in because opening one
+// starts an encoder session on a GPU that other processes may be using:
+// make test-nvenc sets it after checking that the GPU is free, and an
+// ordinary go test never opens a session.
+const EnvNVENC = "OS_NVENC"
+
+// EnvRequireNVENC names the environment variable that, set to "1", opts in
+// as OS_NVENC does and turns a missing NVENC device from a skip into a
+// failure. Only make test-nvenc sets it; CI has no GPU.
 const EnvRequireNVENC = "OS_REQUIRE_NVENC"
 
-// NVENC runs transcoder -probe nvenc, which opens and closes an NVENC
-// encoder. When it exits 0 NVENC returns; otherwise the test is skipped
-// with the probe's reason (probeReason), or failed when
-// OS_REQUIRE_NVENC=1. OS_REQUIRE_PEERS does not apply: a missing GPU is
-// not a missing peer.
+// NVENCOptIn is the reason an NVENC device test skips when neither
+// OS_NVENC nor OS_REQUIRE_NVENC is "1".
+const NVENCOptIn = "NVENC tests are opt-in: set OS_NVENC=1 (make test-nvenc does)"
+
+// NVENCOptedIn reports whether OS_NVENC or OS_REQUIRE_NVENC is "1".
+func NVENCOptedIn() bool {
+	return os.Getenv(EnvNVENC) == "1" || os.Getenv(EnvRequireNVENC) == "1"
+}
+
+// NVENC skips the test (NVENCOptIn) unless NVENCOptedIn; it then runs
+// transcoder -probe nvenc, which opens and closes an NVENC encoder. When
+// the probe exits 0 NVENC returns; otherwise the test is skipped with the
+// probe's reason (probeReason), or failed when OS_REQUIRE_NVENC=1.
+// OS_REQUIRE_PEERS does not apply: a missing GPU is not a missing peer.
 func NVENC(t testing.TB, transcoder string) {
 	t.Helper()
+	if !NVENCOptedIn() {
+		t.Skipf("%s", NVENCOptIn)
+		return
+	}
 	out, err := exec.CommandContext(t.Context(), transcoder, "-probe", "nvenc").CombinedOutput() //nolint:gosec // test peers
 	if err == nil {
 		return

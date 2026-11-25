@@ -68,7 +68,8 @@ test-transcode:
 # The GPU proof (ruling R-C12), on this host only: refuses to start while
 # another process holds NVENC sessions or GPU compute (OS_NVENC_SHARED=1
 # warns instead), runs the NVENC scenarios on the host against the bundle
-# with OS_REQUIRE_NVENC=1, plays the recorded presentation in VLC in
+# with OS_NVENC=1 and OS_REQUIRE_NVENC=1 (the device tests are opt-in: a
+# plain make test opens no NVENC session), plays the recorded presentation in VLC in
 # osv2-ci-peers:m4a, and writes dist/nvenc-report/report.md. See
 # scripts/test-nvenc.sh.
 test-nvenc:

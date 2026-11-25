@@ -31,9 +31,13 @@ import (
 
 // The NVENC scenarios (ruling R-C12) run ladders with NVENC rungs on the
 // host's GPU, under make test-nvenc (scripts/test-nvenc.sh). Every one but
-// TestM4cNVENCRecordedVLC starts with testpeer.NVENC, so without a device
-// (CI, the peers container) it skips naming the probe's reason, or fails
-// with OS_REQUIRE_NVENC=1. Transcoder runs go one after another: no
+// TestM4cNVENCRecordedVLC starts with testpeer.NVENC, so they are opt-in:
+// without OS_NVENC=1 or OS_REQUIRE_NVENC=1, which make test-nvenc sets once
+// it has found the GPU free, they skip without opening an NVENC session
+// (a plain go test or make test on the GPU host must not disturb other
+// users of the GPU); opted in but without a device (CI, the peers
+// container) they skip naming the probe's reason, or fail with
+// OS_REQUIRE_NVENC=1. Transcoder runs go one after another: no
 // top-level test here is parallel and no t.Parallel surrounds a run
 // (serialRuns), so at most 3 NVENC sessions are open at once. The checks of
 // the recorded runs may run in parallel.
@@ -49,9 +53,12 @@ const envNVENCMedia = "OS_NVENC_MEDIA"
 const envNVENCShared = "OS_NVENC_SHARED"
 
 // nvencBinary returns the ostranscoder of the NVENC scenarios, after
-// testpeer.NVENC has found a device for it.
+// testpeer.NVENC has checked the opt-in and found a device for it.
 func nvencBinary(t *testing.T) string {
 	t.Helper()
+	if !testpeer.NVENCOptedIn() {
+		t.Skip(testpeer.NVENCOptIn) // before looking for the transcoder
+	}
 	bin := testpeer.OSTranscoder(t)
 	testpeer.NVENC(t, bin)
 	return bin

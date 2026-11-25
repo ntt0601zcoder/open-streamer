@@ -16,15 +16,21 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
 	"github.com/ntt0601zcoder/open-streamer/pkg/h26x"
 )
 
-// nvencOrSkip skips the test when no NVENC device can be opened, or fails
-// it when OS_REQUIRE_NVENC=1.
+// nvencOrSkip skips the test unless OS_NVENC=1 or OS_REQUIRE_NVENC=1
+// (testpeer.NVENCOptIn: the probe opens an NVENC session, which an
+// ordinary run on the GPU host must not do); opted in, it skips when no
+// NVENC device can be opened, or fails when OS_REQUIRE_NVENC=1.
 func nvencOrSkip(t *testing.T) {
 	t.Helper()
+	if !testpeer.NVENCOptedIn() {
+		t.Skip(testpeer.NVENCOptIn)
+	}
 	if err := ProbeNVENC(); err != nil {
-		if os.Getenv("OS_REQUIRE_NVENC") == "1" {
+		if os.Getenv(testpeer.EnvRequireNVENC) == "1" {
 			t.Fatalf("OS_REQUIRE_NVENC=1 but no NVENC device: %v", err)
 		}
 		t.Skipf("no NVENC device: %v", err)

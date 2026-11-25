@@ -16,7 +16,9 @@
 #     list h264_nvenc.
 #  3. make ostranscoder; the bundle's -probe nvenc must print "nvenc: ok".
 #  4. Checks the GPU again as in step 1 (steps 2 and 3 take minutes), then
-#     on the host, with OS_REQUIRE_NVENC=1 and OS_REQUIRE_PEERS=1: the
+#     on the host, with OS_NVENC=1 (the NVENC device tests are opt-in, so
+#     that a plain go test on this host never opens a session),
+#     OS_REQUIRE_NVENC=1 and OS_REQUIRE_PEERS=1: the
 #     TestM4cNVENC* scenarios of internal/e2e (TestM4cNVENCKeep records the
 #     B-frame presentation into dist/nvenc-report/media; TestM4cNVENCLongGOP
 #     makes its clip with the pinned FFmpeg, OS_NVENC_FFMPEG) and the native
@@ -189,11 +191,11 @@ $skips"
 # 4. The GPU again, then the NVENC scenarios and the native device tests,
 # on the host. The host has no VLC: TestM4cNVENCRecordedVLC runs in step 5.
 gpu_free "before the GPU tests"
-step "e2e scenarios on the host" env OS_TRANSCODER="$ostx" OS_REQUIRE_NVENC=1 OS_REQUIRE_PEERS=1 \
+step "e2e scenarios on the host" env OS_TRANSCODER="$ostx" OS_NVENC=1 OS_REQUIRE_NVENC=1 OS_REQUIRE_PEERS=1 \
 	OS_NVENC_MEDIA="$media" OS_NVENC_FFMPEG="$p/bin/ffmpeg" go test -race -count=1 -timeout=15m -v \
 	-run '^TestM4cNVENC' -skip '^TestM4cNVENCRecordedVLC$' ./internal/e2e/
 step "native device tests on the host" env PKG_CONFIG_PATH="$p/lib/pkgconfig" LD_LIBRARY_PATH="$p/lib" \
-	OS_REQUIRE_NVENC=1 go test -race -count=1 -v -tags libav -run 'NVENC' ./internal/transcode/native/
+	OS_NVENC=1 OS_REQUIRE_NVENC=1 go test -race -count=1 -v -tags libav -run 'NVENC' ./internal/transcode/native/
 
 # 5. VLC 3.0.20 on the recorded presentation, in the peers image.
 step "recorded presentation in VLC (osv2-ci-peers:m4a)" env OS_NVENC_MEDIA="$media" \

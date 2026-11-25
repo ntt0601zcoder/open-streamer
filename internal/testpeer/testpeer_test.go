@@ -4,9 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // recorder is a testing.TB whose Skipf and Fatalf record instead of ending
@@ -14,9 +17,13 @@ import (
 type recorder struct {
 	testing.TB
 	skipped, failed bool
+	skipMsg         string
 }
 
-func (r *recorder) Skipf(string, ...any)  { r.skipped = true }
+func (r *recorder) Skipf(format string, args ...any) {
+	r.skipped = true
+	r.skipMsg = fmt.Sprintf(format, args...)
+}
 func (r *recorder) Fatalf(string, ...any) { r.failed = true }
 func (r *recorder) Helper()               {}
 
@@ -275,9 +282,9 @@ func TestOSTranscoderPeer(t *testing.T) {
 	}
 }
 
-// TestNVENCProbeSkipsOrFails: a transcoder whose -probe nvenc exits 3 skips
-// the test, or fails it with OS_REQUIRE_NVENC=1; one that exits 0 does
-// neither.
+// TestNVENCProbeSkipsOrFails: opted in (OS_NVENC=1 or OS_REQUIRE_NVENC=1),
+// a transcoder whose -probe nvenc exits 3 skips the test, or fails it with
+// OS_REQUIRE_NVENC=1; one that exits 0 does neither.
 func TestNVENCProbeSkipsOrFails(t *testing.T) {
 	ok := fakeTranscoder(t, `[ "$1 $2" = "-probe nvenc" ] || exit 2; echo 'nvenc: ok'`)
 	none := fakeTranscoder(t, `[ "$1 $2" = "-probe nvenc" ] || exit 2; echo 'nvenc: no device'; exit 3`)
@@ -292,12 +299,51 @@ func TestNVENCProbeSkipsOrFails(t *testing.T) {
 		{"not runnable", "/nonexistent/ostranscoder", "", true, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(EnvNVENC, "1")
 			t.Setenv(EnvRequireNVENC, tt.require)
 			t.Setenv(EnvRequire, "1") // OS_REQUIRE_PEERS has no say
 			rec := &recorder{TB: t}
 			NVENC(rec, tt.bin)
 			assert.Equal(t, tt.wantSkip, rec.skipped, "skipped")
 			assert.Equal(t, tt.wantFail, rec.failed, "failed")
+			if tt.wantSkip {
+				assert.True(t, strings.HasPrefix(rec.skipMsg, "no NVENC device: "), "skip %q", rec.skipMsg)
+			}
+		})
+	}
+}
+
+// TestNVENCOptIn: without OS_NVENC=1 or OS_REQUIRE_NVENC=1 the test skips
+// naming the opt-in, and the probe, which would open an NVENC session, is
+// never run; OS_REQUIRE_NVENC=1 alone opts in.
+func TestNVENCOptIn(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "probed")
+	bin := fakeTranscoder(t, `touch '`+marker+`'; echo 'nvenc: ok'`)
+	for _, nvenc := range []string{"", "0", "true"} {
+		t.Run("OS_NVENC="+nvenc, func(t *testing.T) {
+			t.Setenv(EnvNVENC, nvenc)
+			t.Setenv(EnvRequireNVENC, "")
+			assert.False(t, NVENCOptedIn())
+			rec := &recorder{TB: t}
+			NVENC(rec, bin)
+			assert.True(t, rec.skipped, "skipped")
+			assert.False(t, rec.failed, "failed")
+			assert.Equal(t, "NVENC tests are opt-in: set OS_NVENC=1 (make test-nvenc does)", rec.skipMsg)
+			assert.NoFileExists(t, marker, "the probe ran")
+		})
+	}
+	for _, env := range []string{EnvNVENC, EnvRequireNVENC} {
+		t.Run(env+"=1", func(t *testing.T) {
+			t.Setenv(EnvNVENC, "")
+			t.Setenv(EnvRequireNVENC, "")
+			t.Setenv(env, "1")
+			assert.True(t, NVENCOptedIn())
+			rec := &recorder{TB: t}
+			NVENC(rec, bin)
+			assert.False(t, rec.skipped, "skipped: %s", rec.skipMsg)
+			assert.False(t, rec.failed, "failed")
+			assert.FileExists(t, marker, "the probe did not run")
+			require.NoError(t, os.Remove(marker))
 		})
 	}
 }
