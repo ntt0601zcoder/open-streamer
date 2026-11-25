@@ -1,4 +1,4 @@
-.PHONY: test lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers ostranscoder test-transcode
+.PHONY: test lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers ostranscoder test-transcode test-nvenc
 
 test:
 	go test -race -shuffle=on -count=1 -timeout=10m ./...
@@ -64,3 +64,12 @@ test-transcode:
 	@sh scripts/ffmpeg-dev.sh $(OSTX_ARCH) >/dev/null
 	@set -f; sh scripts/test-ci-peers.sh --name osv2-ostx-test-$$$$ --exec \
 		go test -race -tags libav $${TEST_TRANSCODE_ARGS:-$(TRANSCODE_PKGS)}
+
+# The GPU proof (ruling R-C12), on this host only: refuses to start while
+# another process holds NVENC sessions or GPU compute (OS_NVENC_SHARED=1
+# warns instead), runs the NVENC scenarios on the host against the bundle
+# with OS_REQUIRE_NVENC=1, plays the recorded presentation in VLC in
+# osv2-ci-peers:m4a, and writes dist/nvenc-report/report.md. See
+# scripts/test-nvenc.sh.
+test-nvenc:
+	@sh scripts/test-nvenc.sh

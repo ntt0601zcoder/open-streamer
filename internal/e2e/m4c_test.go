@@ -56,8 +56,6 @@ const m4cShotStep = 2 * media.ClockRate
 // m4cLadder is the ladder of the M4c watermark scenarios: m4aLadder's three
 // encoded rungs, each with Encoder set, and no copy rung, since a
 // watermarked ladder may not copy its video (ruling R-C5).
-//
-//nolint:unparam // encoder is part of the helper's contract: Task 11 runs the NVENC ladder
 func m4cLadder(binary, encoder string) transcode.Options {
 	return transcode.Options{
 		Binary: binary,
@@ -404,6 +402,8 @@ func decodeShot(t *testing.T, s picture.Shot) image.Image {
 // checkShots checks that every shot decodes to w × h and that, within an
 // epoch, consecutive shots are at least m4cShotStep apart and, when maxStep
 // is positive, at most maxStep.
+//
+//nolint:unparam // the shot size is part of the helper's contract; every row so far shoots 160×120
 func checkShots(t *testing.T, shots []picture.Shot, w, h int, maxStep int64) {
 	t.Helper()
 	pts := make([]int64, 0, len(shots))

@@ -108,7 +108,13 @@ type step struct {
 // pipeline does.
 func clockSteps(t *testing.T, name string, now func() time.Time) []step {
 	t.Helper()
-	d, err := ts.NewDemuxer(bytes.NewReader(fixtureBytes(t, name)))
+	return dataSteps(t, fixtureBytes(t, name), now)
+}
+
+// dataSteps is clockSteps over the MPEG-TS bytes data.
+func dataSteps(t *testing.T, data []byte, now func() time.Time) []step {
+	t.Helper()
+	d, err := ts.NewDemuxer(bytes.NewReader(data))
 	require.NoError(t, err)
 	c := clock.New(clock.Options{Kinds: d.TrackKinds(), Now: now})
 	var out []step
