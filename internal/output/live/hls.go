@@ -27,7 +27,21 @@ func init() {
 			dir:   dirHLS,
 			match: func(name string) bool { return name == "index.m3u8" },
 			build: func(p *Packager, s Snapshot, _ string) ([]byte, string, bool) {
+				if s.ABR {
+					return finish(buildTSMaster(s))
+				}
 				return finish(buildTSPlaylist(p, s))
+			},
+		},
+		playlistRoute{
+			dir: dirHLS,
+			match: func(name string) bool {
+				kind, _, ok := parseTrackPlaylist(name)
+				return ok && kind == media.KindVideo
+			},
+			build: func(p *Packager, s Snapshot, name string) ([]byte, string, bool) {
+				_, track, _ := parseTrackPlaylist(name)
+				return finish(buildTSVariant(p, s, track))
 			},
 		},
 		playlistRoute{
@@ -461,4 +475,123 @@ func videoTracks(s Snapshot) []int {
 		}
 	}
 	return out
+}
+
+// tsVariants returns the video tracks hls/index.m3u8 lists in ABR mode,
+// ascending: every known video track and every track with a variant TS in a
+// listed segment.
+func tsVariants(s Snapshot) []int {
+	out := videoTracks(s)
+	for _, seg := range s.Segments[:s.Listed] {
+		for _, v := range seg.VariantTS {
+			if !slices.Contains(out, v.Track) {
+				out = append(out, v.Track)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// hasVariantTS reports whether a segment has a TS of the variant of track.
+func hasVariantTS(seg SegmentInfo, track int) bool {
+	return slices.ContainsFunc(seg.VariantTS, func(v VariantTS) bool { return v.Track == track })
+}
+
+// listedEpochs returns the epochs of the listed segments.
+func listedEpochs(s Snapshot) map[uint32]bool {
+	epochs := map[uint32]bool{}
+	for _, seg := range s.Segments[:s.Listed] {
+		epochs[seg.Epoch] = true
+	}
+	return epochs
+}
+
+// buildTSMaster renders hls/index.m3u8 in ABR mode (rulings R-B4, R-B5): a
+// multivariant playlist with one variant per tsVariants track, in track
+// order, URI v{track}.m3u8. Audio is muxed into every variant, so there is
+// no audio rendition: CODECS lists the variant's video codecs, then every
+// known audio track's. RESOLUTION is the largest over the window, as in
+// cmaf/master.m3u8, and BANDWIDTH the peak over listed segments of the
+// variant TS's bytes × 8 / segment duration. It returns nil when there is
+// no variant.
+func buildTSMaster(s Snapshot) []byte {
+	tracks := tsVariants(s)
+	if len(tracks) == 0 {
+		return nil
+	}
+	discard := map[uint32]bool{}
+	var audio trackSummary // codecs only: the audio bytes are in the variant TS
+	for _, kt := range s.Tracks {
+		if kt.Config == nil || kt.Config.Codec.Kind() != media.KindAudio {
+			continue
+		}
+		for _, c := range summarize(s, kt.Track, media.KindAudio, discard).codecs {
+			if !slices.Contains(audio.codecs, c) {
+				audio.codecs = append(audio.codecs, c)
+			}
+		}
+	}
+	pl := hls.MultivariantPlaylist{Version: hlsVersionTS}
+	for _, track := range tracks {
+		video := summarize(s, track, media.KindVideo, discard)
+		video.bandwidth = map[uint64]float64{}
+		for _, seg := range s.Segments[:s.Listed] {
+			for _, v := range seg.VariantTS {
+				if d := media.ToDuration(seg.Duration).Seconds(); v.Track == track && d > 0 {
+					video.bandwidth[seg.Seq] = float64(len(v.Data)) * 8 / d
+				}
+			}
+		}
+		pl.Variants = append(pl.Variants, variant("v"+strconv.Itoa(track)+".m3u8", video, audio))
+	}
+	pl.Independent = independent(s, listedEpochs(s))
+	return pl.Encode()
+}
+
+// buildTSVariant renders hls/v{track}.m3u8 in ABR mode (ruling R-B4). It
+// returns nil when the snapshot is not ABR or track is not a tsVariants
+// track.
+//
+// Like the CMAF track playlists, it lists one entry per listed segment, so
+// every variant has the same media sequence numbers (MEDIA-SEQUENCE is the
+// first segment's Seq) and discontinuity sequence numbers (each entry
+// carries its segment's Discontinuity; DISCONTINUITY-SEQUENCE is
+// EvictedDiscontinuities), as RFC 8216 section 6.2.4 requires. A segment
+// with the variant's TS lists {track}-{Seq}.ts; one without (the track had
+// no frames in it, or its mux failed) lists a gap entry,
+// gap-{track}-{Seq}.ts, which is never served. EXTINF is the segment's
+// duration, EXT-X-PROGRAM-DATE-TIME is on the first entry and every
+// discontinuity, and every variant shares one TARGETDURATION.
+func buildTSVariant(p *Packager, s Snapshot, track int) []byte {
+	if !s.ABR || !slices.Contains(tsVariants(s), track) {
+		return nil
+	}
+	listed := s.Segments[:s.Listed]
+	pl := hls.MediaPlaylist{
+		Version:               hlsVersionTS,
+		MediaSequence:         listed[0].Seq,
+		DiscontinuitySequence: s.EvictedDiscontinuities,
+	}
+	extinfs := make([]time.Duration, 0, len(listed))
+	name := strconv.Itoa(track) + "-" // Seq follows
+	for i, seg := range listed {
+		e := hls.Segment{
+			URI:           name + strconv.FormatUint(seg.Seq, 10) + ".ts",
+			Duration:      media.ToDuration(seg.Duration),
+			Discontinuity: seg.Discontinuity,
+		}
+		if !hasVariantTS(seg, track) {
+			e.URI, e.Gap = "gap-"+e.URI, true
+		}
+		if i == 0 || seg.Discontinuity {
+			e.ProgramDateTime = pdt(s, seg.Epoch, seg.Start)
+		}
+		pl.Segments = append(pl.Segments, e)
+		extinfs = append(extinfs, e.Duration)
+	}
+	pl.TargetDuration = p.targetDuration("hls-abr", s, extinfs)
+	pl.Independent = independent(s, listedEpochs(s))
+	pl.Ended = ended(s)
+	return pl.Encode()
 }

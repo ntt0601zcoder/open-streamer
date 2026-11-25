@@ -1069,9 +1069,15 @@ func TestKnownTracks(t *testing.T) {
 // ladderSizes are synthLadder's video renditions, track i at ladderSizes[i].
 var ladderSizes = [][2]int{{640, 360}, {426, 240}, {320, 180}}
 
+// ladderPad is the filler synthLadder appends to each frame of video track
+// i: ladderPad * (len(ladderSizes) - i) bytes, so the renditions' bitrates
+// differ (rung 0 the largest) by more than a TS packet per frame.
+const ladderPad = 200
+
 // synthLadder returns an ABR presentation's hub writes: n 25 fps frames on
 // each of video tracks 0..2 (H.264 at ladderSizes, keyframes every 50
-// frames at the same PTS) and 48 kHz AAC on track 3 covering the same span.
+// frames at the same PTS, payloads padded per ladderPad) and 48 kHz AAC on
+// track 3 covering the same span.
 // PTS == DTS (no B-frames). The frames come in barrier order: for each
 // keyframe PTS K, every frame of every track presented before K, then the
 // IDRs at K in track order, then the rest by DTS.
@@ -1086,7 +1092,9 @@ func synthLadder(t *testing.T, epoch uint32, start int64, n int) []hub.Delivery 
 		cfg.Width, cfg.Height = size[0], size[1]
 		for _, d := range synth(&cfg, epoch, start, n) {
 			d.Frame.Track = track
-			d.Frame.Data = [][]byte{append(d.Frame.Data[0], byte(track))}
+			data := append(d.Frame.Data[0], byte(track))
+			data = append(data, bytes.Repeat([]byte{0xab}, ladderPad*(len(ladderSizes)-track))...)
+			d.Frame.Data = [][]byte{data}
 			out = append(out, d)
 		}
 	}
@@ -1134,4 +1142,37 @@ func packLadder(t *testing.T, opt Options, edit func([]hub.Delivery)) *Packager 
 	handleAll(p, ds)
 	p.Flush()
 	return p
+}
+
+// In ABR mode no combined TS is muxed: each segment carries one TS per
+// video track, ascending, and {seq}.ts answers 404. Without ABR there are
+// no variant TS files or playlists.
+func TestABRTSNoCombinedTS(t *testing.T) {
+	p := packLadder(t, Options{ABR: true}, nil)
+	srv := serve(p)
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 5)
+	for _, seg := range snap.Segments {
+		assert.Nil(t, seg.TS)
+		require.Len(t, seg.VariantTS, len(ladderSizes))
+		for i, v := range seg.VariantTS {
+			assert.Equal(t, i, v.Track)
+			assert.NotEmpty(t, v.Data)
+		}
+		code, _ := get(t, srv, fmt.Sprintf("/live/s/hls/%d.ts", seg.Seq))
+		assert.Equal(t, http.StatusNotFound, code)
+		code, _ = get(t, srv, fmt.Sprintf("/live/s/hls/3-%d.ts", seg.Seq))
+		assert.Equal(t, http.StatusNotFound, code, "audio has no variant")
+	}
+
+	off := packLadder(t, Options{}, nil)
+	srv = serve(off)
+	for _, seg := range off.Snapshot().Segments {
+		assert.NotNil(t, seg.TS)
+		assert.Nil(t, seg.VariantTS)
+		code, _ := get(t, srv, fmt.Sprintf("/live/s/hls/0-%d.ts", seg.Seq))
+		assert.Equal(t, http.StatusNotFound, code)
+	}
+	code, _ := get(t, srv, "/live/s/hls/v0.m3u8")
+	assert.Equal(t, http.StatusNotFound, code)
 }

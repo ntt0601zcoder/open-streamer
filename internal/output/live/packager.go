@@ -1,10 +1,10 @@
 // Package live packages one stream for HLS (TS and fMP4) and DASH.
 //
 // A Packager subscribes to the stream's hub, cuts segments with one
-// segment.Segmenter, muxes each closed segment once as TS and once per track
-// as CMAF, and keeps the last Window segments. Handler serves the segment
-// and init files; the playlists and the MPD are built from a Snapshot of the
-// window on request.
+// segment.Segmenter, muxes each closed segment once as TS (in ABR mode once
+// per video track, see Options.ABR) and once per track as CMAF, and keeps
+// the last Window segments. Handler serves the segment and init files; the
+// playlists and the MPD are built from a Snapshot of the window on request.
 //
 // # Epoch walls
 //
@@ -59,7 +59,9 @@ type Options struct {
 	// track is a rendition of the same content, keyed at the same PTS. The
 	// segmenter then aligns the video tracks (segment.Options.AlignVideo),
 	// cmaf/master.m3u8 lists every video track as a variant (R-B5) and the
-	// MPD puts video tracks of one codec in one AdaptationSet (R-B6).
+	// MPD puts video tracks of one codec in one AdaptationSet (R-B6). HLS-TS
+	// muxes one TS per video track instead of a combined one (R-B4):
+	// hls/index.m3u8 becomes a multivariant playlist over hls/v{track}.m3u8.
 	ABR bool
 }
 
@@ -96,6 +98,7 @@ type Packager struct {
 	work    sync.Mutex
 	seg     *segment.Segmenter
 	tsm     *ts.Muxer
+	vtsm    map[int]*ts.Muxer      // ABR: per video track, its variant's muxer
 	epochs  map[uint32]*epochState // epochs with a segment in the window, plus the newest
 	prev    *epochState            // the last epoch placed on the wallclock
 	ast     time.Time              // valid once prev is set
@@ -125,6 +128,7 @@ func NewPackager(h *hub.Hub, opt Options) *Packager {
 		epochs:  map[uint32]*epochState{},
 		nextN:   map[int]uint64{},
 		pending: map[int]bool{},
+		vtsm:    map[int]*ts.Muxer{},
 	}
 	if p.target <= 0 {
 		p.target = defaultTarget
@@ -140,7 +144,8 @@ func NewPackager(h *hub.Hub, opt Options) *Packager {
 }
 
 // Errors returns the number of mux errors so far. Each one dropped one
-// segment's output in one format.
+// segment's output in one format: its TS, one variant's TS in ABR mode, or
+// one track's CMAF part.
 func (p *Packager) Errors() uint64 { return p.errors.Load() }
 
 // FallbackAnchors returns the number of epochs placed without a hub anchor.
@@ -231,17 +236,11 @@ func (p *Packager) pack(s segment.Segment) {
 		Start:         s.Start,
 		Duration:      s.Duration,
 		End:           s.End,
-		TS:            p.muxTS(s.Frames),
 	}
-	if info.TS == nil {
-		p.tsGap = true
+	if p.abr {
+		info.VariantTS = p.muxVariants(s.Frames)
 	} else {
-		// The first segment with TS bytes has nothing before it to be
-		// discontinuous with, like the segmenter's first segment.
-		info.TSSeq = p.tsSeq
-		info.TSDiscontinuity = p.tsSeq > 0 && (s.Discontinuity || p.tsGap)
-		p.tsSeq++
-		p.tsGap = false
+		p.packTS(&info, s)
 	}
 	if s.Discontinuity {
 		for track := range p.nextN {
@@ -265,6 +264,22 @@ func (p *Packager) pack(s segment.Segment) {
 			delete(p.epochs, id)
 		}
 	}
+}
+
+// packTS muxes the segment's combined TS into info and numbers it for the
+// HLS-TS playlist. Called with work held.
+func (p *Packager) packTS(info *SegmentInfo, s segment.Segment) {
+	info.TS = p.muxTS(s.Frames)
+	if info.TS == nil {
+		p.tsGap = true
+		return
+	}
+	// The first segment with TS bytes has nothing before it to be
+	// discontinuous with, like the segmenter's first segment.
+	info.TSSeq = p.tsSeq
+	info.TSDiscontinuity = p.tsSeq > 0 && (s.Discontinuity || p.tsGap)
+	p.tsSeq++
+	p.tsGap = false
 }
 
 // inWindow reports whether the store holds a segment of epoch id. Called with
@@ -341,31 +356,119 @@ func (p *Packager) muxTS(frames []media.Frame) []byte {
 		}
 	}
 	var buf bytes.Buffer
-	if err := p.writeTS(&buf, tracks, frames); err != nil {
+	if err := writeTS(&p.tsm, &buf, tracks, frames); err != nil {
 		p.errors.Add(1)
 		return nil
 	}
 	return buf.Bytes()
 }
 
-func (p *Packager) writeTS(buf *bytes.Buffer, tracks []*media.TrackConfig, frames []media.Frame) error {
-	if p.tsm == nil {
-		m, err := ts.NewMuxer(buf, tracks)
+// muxVariants writes the segment's ABR variants (ruling R-B4): one TS per
+// video track with frames in the segment, ascending, holding that track's
+// frames at track index 0 and every audio frame at 1 + its track's rank
+// among the known audio tracks and the segment's, so a variant's PIDs stay
+// put across segments. Each variant has its own muxer, kept across segments
+// for its continuity counters. A variant that fails to mux counts an error
+// and is left out. A frame no variant can place (a negative track, or a
+// track with no config in the segment or of neither kind) fails every
+// variant, as it fails the combined TS. Called with work held.
+func (p *Packager) muxVariants(frames []media.Frame) []VariantTS {
+	cfgs := map[int]*media.TrackConfig{} // per track: its first config in the segment
+	for _, f := range frames {
+		if _, ok := cfgs[f.Track]; !ok && f.Config != nil {
+			cfgs[f.Track] = f.Config
+		}
+	}
+	kind := func(track int) media.Kind {
+		if c := cfgs[track]; c != nil {
+			return c.Codec.Kind()
+		}
+		return 0
+	}
+	var videos, audios []int
+	bad := false
+	for _, f := range frames {
+		k := kind(f.Track)
+		switch {
+		case f.Track < 0 || (k != media.KindVideo && k != media.KindAudio):
+			bad = true
+		case k == media.KindVideo && !slices.Contains(videos, f.Track):
+			videos = append(videos, f.Track)
+		case k == media.KindAudio && !slices.Contains(audios, f.Track):
+			audios = append(audios, f.Track)
+		}
+	}
+	slices.Sort(videos)
+	if bad {
+		p.errors.Add(uint64(len(videos)))
+		return nil
+	}
+	ranked := slices.Clone(audios)
+	for _, kt := range p.st.known {
+		if kt.Config != nil && kt.Config.Codec.Kind() == media.KindAudio && !slices.Contains(ranked, kt.Track) {
+			ranked = append(ranked, kt.Track)
+		}
+	}
+	slices.Sort(ranked)
+	slot := map[int]int{} // audio track -> its track index in every variant
+	for i, track := range ranked {
+		slot[track] = 1 + i
+	}
+
+	var out []VariantTS
+	for _, v := range videos {
+		tracks := make([]*media.TrackConfig, 1+len(ranked))
+		tracks[0] = cfgs[v]
+		for _, a := range audios {
+			tracks[slot[a]] = cfgs[a]
+		}
+		fs := make([]media.Frame, 0, len(frames))
+		for _, f := range frames {
+			switch {
+			case f.Track == v:
+				f.Track = 0
+			case kind(f.Track) == media.KindAudio:
+				f.Track = slot[f.Track]
+			default:
+				continue // another variant's video
+			}
+			fs = append(fs, f)
+		}
+		m := p.vtsm[v]
+		var buf bytes.Buffer
+		err := writeTS(&m, &buf, tracks, fs)
+		if m != nil {
+			p.vtsm[v] = m
+		}
+		if err != nil {
+			p.errors.Add(1)
+			continue
+		}
+		out = append(out, VariantTS{Track: v, Data: buf.Bytes()})
+	}
+	return slices.Clip(out)
+}
+
+// writeTS writes the frames to buf on *m, tables first, creating the muxer
+// if *m is nil.
+func writeTS(m **ts.Muxer, buf *bytes.Buffer, tracks []*media.TrackConfig, frames []media.Frame) error {
+	if *m == nil {
+		mx, err := ts.NewMuxer(buf, tracks)
 		if err != nil {
 			return err
 		}
-		p.tsm = m
+		*m = mx
 	} else {
-		p.tsm.SetOutput(buf)
-		if err := p.tsm.SetTracks(tracks); err != nil {
+		(*m).SetOutput(buf)
+		if err := (*m).SetTracks(tracks); err != nil {
 			return err
 		}
 	}
-	if err := p.tsm.WriteTables(); err != nil {
+	if err := (*m).WriteTables(); err != nil {
 		return err
 	}
 	for _, f := range frames {
-		if err := p.tsm.WriteFrame(f); err != nil {
+		if err := (*m).WriteFrame(f); err != nil {
 			return err
 		}
 	}

@@ -1,10 +1,14 @@
 package live
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,9 +17,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/hls"
+	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 )
 
 func media3(t *testing.T, srv http.Handler, path string) hls.MediaPlaylist {
@@ -828,12 +835,13 @@ func TestHLSTargetDurationLikeTS(t *testing.T) {
 }
 
 // abrMasterGolden is buildMaster's output for packLadder's hub with ABR off,
-// captured before ABR mode existed.
+// captured with the packager before ABR mode existed (be38a47), with
+// synthLadder's per-track padding.
 const abrMasterGolden = `#EXTM3U
 #EXT-X-VERSION:7
 #EXT-X-INDEPENDENT-SEGMENTS
 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="a3.m3u8"
-#EXT-X-STREAM-INF:BANDWIDTH=12482,RESOLUTION=640x360,CODECS="avc1.4D400D,mp4a.40.2",AUDIO="aud"
+#EXT-X-STREAM-INF:BANDWIDTH=132482,RESOLUTION=640x360,CODECS="avc1.4D400D,mp4a.40.2",AUDIO="aud"
 v0.m3u8
 `
 
@@ -910,4 +918,278 @@ func TestABRMasterNonABRUnchanged(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 	assert.Equal(t, abrMasterGolden, string(body))
 	assert.Equal(t, abrMasterGolden, string(buildMaster(p.Snapshot())))
+}
+
+// tsTimeOffset is the offset the TS muxer adds to every stream time.
+const tsTimeOffset = 126000
+
+// variantTS returns a segment's TS of a variant.
+func variantTS(seg SegmentInfo, track int) ([]byte, bool) {
+	for _, v := range seg.VariantTS {
+		if v.Track == track {
+			return v.Data, true
+		}
+	}
+	return nil, false
+}
+
+func tsMaster(t *testing.T, srv http.Handler) hls.MultivariantPlaylist {
+	t.Helper()
+	code, body := get(t, srv, "/live/s/hls/index.m3u8")
+	require.Equal(t, http.StatusOK, code)
+	pl, err := hls.ParseMultivariant(body)
+	require.NoError(t, err, string(body))
+	return pl
+}
+
+func TestABRTSMaster(t *testing.T) {
+	p := packLadder(t, Options{ABR: true}, nil)
+	assert.Zero(t, p.Errors())
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 5)
+	m := tsMaster(t, serve(p))
+	assert.Equal(t, 3, m.Version)
+	assert.True(t, m.Independent)
+	assert.Empty(t, m.Renditions, "audio is muxed into every variant")
+	aet, ok := snap.Track(3)
+	require.True(t, ok)
+	require.Len(t, m.Variants, len(ladderSizes))
+	for i, v := range m.Variants {
+		et, ok := snap.Track(i)
+		require.True(t, ok)
+		assert.Equal(t, "v"+strconv.Itoa(i)+".m3u8", v.URI)
+		assert.Equal(t, ladderSizes[i][0], v.Width)
+		assert.Equal(t, ladderSizes[i][1], v.Height)
+		assert.Equal(t, et.Codec+","+aet.Codec, v.Codecs)
+		assert.Empty(t, v.Audio)
+
+		// R-B5: the peak over segments of the variant TS's bitrate.
+		peak := 1.0
+		for _, seg := range snap.Segments {
+			data, ok := variantTS(seg, i)
+			require.True(t, ok)
+			peak = max(peak, float64(len(data))*8/media.ToDuration(seg.Duration).Seconds())
+		}
+		assert.Equal(t, int(math.Ceil(peak)), v.Bandwidth, "variant %d", i)
+		if i > 0 {
+			assert.Less(t, v.Bandwidth, m.Variants[i-1].Bandwidth, "rung %d is smaller than rung %d", i, i-1)
+		}
+	}
+}
+
+func TestABRTSVariants(t *testing.T) {
+	ds := synthLadder(t, 1, 0, 250)
+	ds = append(ds, synthLadder(t, 2, 900000, 150)...)
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+	h.SetAnchor(media.Anchor{Epoch: 2, Start: 900000, Wall: t0.Add(11 * time.Second)})
+	p := NewPackager(h, Options{Window: 6, Now: farFuture, ABR: true})
+	handleAll(p, ds)
+	p.Flush()
+	assert.Zero(t, p.Errors())
+	srv := serve(p)
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 6)
+	require.Equal(t, 6, snap.Listed)
+
+	ref := media3(t, srv, "/live/s/hls/v0.m3u8")
+	assert.Equal(t, 1, discontinuities(ref), "the epoch change")
+	assert.Equal(t, snap.Segments[0].Seq, ref.MediaSequence)
+	assert.Equal(t, snap.EvictedDiscontinuities, ref.DiscontinuitySequence)
+	for track := range ladderSizes {
+		path := "/live/s/hls/v" + strconv.Itoa(track) + ".m3u8"
+		pl := media3(t, srv, path)
+		assert.Equal(t, 3, pl.Version, path)
+		assert.True(t, pl.Independent, path)
+		assert.Equal(t, ref.MediaSequence, pl.MediaSequence, path)
+		assert.Equal(t, ref.DiscontinuitySequence, pl.DiscontinuitySequence, path)
+		assert.Equal(t, ref.TargetDuration, pl.TargetDuration, path)
+		require.Len(t, pl.Segments, len(snap.Segments), path)
+		for i, e := range pl.Segments {
+			seg := snap.Segments[i]
+			assert.Equal(t, seg.Discontinuity, e.Discontinuity, "%s entry %d", path, i)
+			assert.Equal(t, ref.Segments[i].Discontinuity, e.Discontinuity, "%s entry %d", path, i)
+			assert.False(t, e.Gap, "%s entry %d", path, i)
+			assert.Equal(t, strconv.Itoa(track)+"-"+itoa(seg.Seq)+".ts", e.URI)
+			assert.Equal(t, media.ToDuration(seg.Duration).Round(time.Millisecond), e.Duration)
+			if i == 0 || seg.Discontinuity {
+				ep, ok := snap.Epoch(seg.Epoch)
+				require.True(t, ok)
+				assert.True(t, e.ProgramDateTime.Equal(ep.WallAt(seg.Start).Truncate(time.Millisecond)), "%s entry %d", path, i)
+			} else {
+				assert.True(t, e.ProgramDateTime.IsZero(), "%s entry %d", path, i)
+			}
+
+			code, body := get(t, srv, "/live/s/hls/"+e.URI)
+			require.Equal(t, http.StatusOK, code, e.URI)
+			want, _ := variantTS(seg, track)
+			assert.Equal(t, want, body)
+			require.GreaterOrEqual(t, len(body), 2*188)
+			pid := func(pkt []byte) int { return int(pkt[1]&0x1f)<<8 | int(pkt[2]) }
+			assert.Equal(t, 0, pid(body[:188]), "%s starts with the PAT", e.URI)
+			assert.Equal(t, byte(0x02), body[188+5], "%s: the PMT follows", e.URI)
+
+			var dec mpegts.TimeDecoder
+			dec.AnchorRaw()
+			d, err := ts.NewDemuxerWithOptions(bytes.NewReader(body), ts.DemuxOptions{Decoder: &dec})
+			require.NoError(t, err)
+			var first *media.Frame
+			for {
+				f, err := d.Read()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				require.NoError(t, err)
+				if first == nil && f.Kind() == media.KindVideo {
+					first = &f
+				}
+			}
+			assert.Equal(t, []uint16{0x100, 0x101}, d.TrackPIDs(), e.URI)
+			require.NotNil(t, first, e.URI)
+			assert.True(t, first.Key, e.URI)
+			assert.Equal(t, seg.Start, first.PTS-tsTimeOffset, e.URI)
+			nal := first.Data[len(first.Data)-1]
+			assert.Len(t, nal, 4+ladderPad*(len(ladderSizes)-track), "%s carries track %d's frame", e.URI, track)
+		}
+	}
+}
+
+func TestABRTSMuxFailureLeavesGap(t *testing.T) {
+	p := packLadder(t, Options{ABR: true}, func(ds []hub.Delivery) {
+		for i, d := range ds {
+			if d.Frame.Track == 1 && d.Frame.PTS == 110*3600 {
+				ds[i].Frame.Data = nil // segment 2; a P-frame
+			}
+		}
+	})
+	assert.EqualValues(t, 1, p.Errors())
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 5)
+	srv := serve(p)
+	for track := range ladderSizes {
+		pl := media3(t, srv, "/live/s/hls/v"+strconv.Itoa(track)+".m3u8")
+		require.Len(t, pl.Segments, 5)
+		for i, e := range pl.Segments {
+			seq := itoa(snap.Segments[i].Seq)
+			if track == 1 && i == 2 {
+				assert.True(t, e.Gap)
+				assert.Equal(t, "gap-1-"+seq+".ts", e.URI)
+				assert.Equal(t, media.ToDuration(snap.Segments[i].Duration).Round(time.Millisecond), e.Duration)
+				code, _ := get(t, srv, "/live/s/hls/"+e.URI)
+				assert.Equal(t, http.StatusNotFound, code)
+				continue
+			}
+			assert.False(t, e.Gap, "v%d entry %d", track, i)
+			assert.Equal(t, strconv.Itoa(track)+"-"+seq+".ts", e.URI)
+		}
+	}
+	_, ok := variantTS(snap.Segments[2], 1)
+	assert.False(t, ok)
+	cmaf := media3(t, srv, "/live/s/cmaf/v1.m3u8")
+	require.Len(t, cmaf.Segments, 5)
+	assert.False(t, cmaf.Segments[2].Gap, "fMP4 takes the frame")
+	// The master still lists the variant, from the segments it has.
+	assert.Len(t, tsMaster(t, srv).Variants, len(ladderSizes))
+}
+
+func TestABRTSConform(t *testing.T) {
+	ds := synthLadder(t, 1, 0, 250)
+	ds = append(ds, synthLadder(t, 2, 900000, 150)...)
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+	h.SetAnchor(media.Anchor{Epoch: 2, Start: 900000, Wall: t0.Add(11 * time.Second)})
+	p := NewPackager(h, Options{Window: 100, Now: farFuture, ABR: true})
+	handleAll(p, ds)
+	p.End()
+	srv := httptest.NewServer(serve(p))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := conform.ReadHLS(ctx, srv.URL+"/live/s/hls/index.m3u8", conform.ReadOptions{AlignedSequences: true, Once: true})
+	require.NoError(t, err)
+	assert.Empty(t, c.Violations)
+	assert.Zero(t, c.HLSGaps)
+	kinds := map[media.Kind]map[int]bool{media.KindVideo: {}, media.KindAudio: {}}
+	for _, f := range c.Frames {
+		kinds[f.Kind()][f.Track] = true
+	}
+	assert.Len(t, kinds[media.KindVideo], 3, "one video track per variant")
+	assert.Len(t, kinds[media.KindAudio], 3, "one audio capture per variant")
+}
+
+// A rung with no frames in a segment lists a gap there without an error; a
+// second audio track joining later takes the next PID in every variant
+// while the first keeps its own; a frame no variant can place fails every
+// variant of its segment.
+func TestABRTSVariantGaps(t *testing.T) {
+	ds := synthLadder(t, 1, 0, 250)
+	var kept []hub.Delivery
+	for _, d := range ds {
+		f := d.Frame
+		if f.Track == 2 && f.PTS >= 50*3600 && f.PTS < 100*3600 {
+			continue // segment 1: rung 2 missing
+		}
+		kept = append(kept, d)
+		if f.Track == 3 && f.PTS >= 100*3600 {
+			f.Track = 4 // a second audio track from segment 2 on
+			kept = append(kept, hub.Delivery{Frame: f})
+		}
+	}
+	// Segment 3: a frame on a track without a config.
+	i := slices.IndexFunc(kept, func(d hub.Delivery) bool { return d.Frame.Track == 0 && d.Frame.PTS == 160*3600 })
+	require.GreaterOrEqual(t, i, 0)
+	kept = slices.Insert(kept, i+1, hub.Delivery{Frame: media.Frame{Track: 5, PTS: 160 * 3600, DTS: 160 * 3600, Key: true, Data: [][]byte{{1}}, Epoch: 1}})
+
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+	p := NewPackager(h, Options{Window: 100, Now: farFuture, ABR: true})
+	handleAll(p, kept)
+	p.Flush()
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 5)
+	assert.EqualValues(t, 3+1, p.Errors(), "segment 3: three variants and the CMAF part of track 5")
+	for i, seg := range snap.Segments {
+		var tracks []int
+		for _, v := range seg.VariantTS {
+			tracks = append(tracks, v.Track)
+		}
+		switch i {
+		case 1:
+			assert.Equal(t, []int{0, 1}, tracks)
+		case 3:
+			assert.Empty(t, tracks)
+		default:
+			assert.Equal(t, []int{0, 1, 2}, tracks, "segment %d", i)
+		}
+	}
+	srv := serve(p)
+	pl := media3(t, srv, "/live/s/hls/v2.m3u8")
+	require.Len(t, pl.Segments, 5)
+	assert.True(t, pl.Segments[1].Gap)
+	assert.Equal(t, "gap-2-1.ts", pl.Segments[1].URI)
+	assert.True(t, pl.Segments[3].Gap)
+	assert.False(t, pl.Segments[4].Gap)
+
+	pids := func(data []byte) []uint16 {
+		d, err := ts.NewDemuxer(bytes.NewReader(data))
+		require.NoError(t, err)
+		for {
+			if _, err := d.Read(); errors.Is(err, io.EOF) {
+				break
+			}
+		}
+		return d.TrackPIDs()
+	}
+	for track := range ladderSizes {
+		data, ok := variantTS(snap.Segments[0], track)
+		require.True(t, ok)
+		assert.Equal(t, []uint16{0x100, 0x101}, pids(data), "segment 0, variant %d", track)
+		data, ok = variantTS(snap.Segments[4], track)
+		require.True(t, ok)
+		assert.Equal(t, []uint16{0x100, 0x101, 0x102}, pids(data), "segment 4, variant %d", track)
+	}
+	m := tsMaster(t, srv)
+	require.Len(t, m.Variants, 3)
+	assert.True(t, strings.HasSuffix(m.Variants[0].Codecs, ",mp4a.40.2"), m.Variants[0].Codecs)
 }

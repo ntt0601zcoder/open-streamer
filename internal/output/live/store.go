@@ -40,11 +40,15 @@ import (
 //   - HLS-TS numbering: a segment with TS == nil has no TS entry. Segments
 //     with TS bytes carry TSSeq, which counts them from 0 with no holes, so
 //     the TS playlist's MEDIA-SEQUENCE is the TSSeq of its first entry.
+//   - ABR HLS-TS (ABR set): TS is nil and SegmentInfo.VariantTS holds the
+//     variants. Their playlists list one entry per listed segment, like the
+//     CMAF track playlists, so they follow SegmentInfo.Discontinuity and
+//     EvictedDiscontinuities, with MEDIA-SEQUENCE the first segment's Seq.
 //
-// Byte slices (SegmentInfo.TS, CMAFPart.Data, EpochTrack.Init), configs and
-// SegmentInfo.GapMap are shared with the packager and must never be
-// modified. Segments and
-// Epochs are the snapshot's own; Tracks, SegmentInfo.Parts and
+// Byte slices (SegmentInfo.TS, VariantTS.Data, CMAFPart.Data,
+// EpochTrack.Init), configs and SegmentInfo.GapMap are shared with the
+// packager and must never be modified. Segments and Epochs are the
+// snapshot's own; Tracks, SegmentInfo.Parts, SegmentInfo.VariantTS and
 // EpochInfo.Tracks share immutable backing arrays clipped to their length,
 // so appending to them never touches the packager's data.
 type Snapshot struct {
@@ -76,7 +80,8 @@ type SegmentInfo struct {
 	// claims EXT-X-INDEPENDENT-SEGMENTS. It is not a discontinuity.
 	Forced bool
 	// TS is the muxed TS segment, served as hls/{Seq}.ts; nil when muxing
-	// failed, and then the segment has no HLS-TS entry.
+	// failed, and then the segment has no HLS-TS entry. Always nil in ABR
+	// mode, which muxes VariantTS instead.
 	TS []byte
 	// TSSeq numbers the segments with TS bytes from 0, consecutively and
 	// never reused: the HLS-TS media sequence number. Valid only when TS is
@@ -87,6 +92,11 @@ type SegmentInfo struct {
 	// Discontinuity or follows dropped TS segments.
 	TSDiscontinuity bool
 	Parts           []CMAFPart // one per track that has frames and muxed cleanly, ascending Track
+	// VariantTS holds, in ABR mode (Snapshot.ABR), one TS per video track
+	// that has frames in the segment and muxed cleanly, ascending Track,
+	// served as hls/{Track}-{Seq}.ts (ruling R-B4). nil when not ABR; in
+	// ABR mode TS is nil and TSSeq and TSDiscontinuity are unused.
+	VariantTS []VariantTS
 	// GapMap maps each known track without a part in this segment to the
 	// epoch of its latest part before it: its gap entry's EXT-X-MAP is that
 	// epoch's init, served while the entry is in the window. A track that
@@ -94,6 +104,14 @@ type SegmentInfo struct {
 	// segment is added and never modified; nil when every known track has a
 	// part.
 	GapMap map[int]uint32
+}
+
+// VariantTS is one ABR variant's TS segment: video track Track at track
+// index 0 (PID 0x100) and every audio track at 1 + its rank among the known
+// audio tracks.
+type VariantTS struct {
+	Track int
+	Data  []byte
 }
 
 // CMAFPart is one track's CMAF media segment, served as cmaf/{Track}-{N}.m4s.
@@ -308,6 +326,22 @@ func (s *store) segmentTS(seq uint64) []byte {
 	for _, seg := range s.segs {
 		if seg.Seq == seq {
 			return seg.TS
+		}
+	}
+	return nil
+}
+
+// variantTS returns the TS bytes of a video track's ABR variant in a segment
+// in the window.
+func (s *store) variantTS(track int, seq uint64) []byte {
+	for _, seg := range s.segs {
+		if seg.Seq != seq {
+			continue
+		}
+		for _, v := range seg.VariantTS {
+			if v.Track == track {
+				return v.Data
+			}
 		}
 	}
 	return nil

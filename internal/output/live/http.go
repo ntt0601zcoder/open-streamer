@@ -112,7 +112,12 @@ func (p *Packager) file(dir, name string) ([]byte, string, bool) {
 	defer p.mu.Unlock()
 	switch {
 	case dir == dirHLS && strings.HasSuffix(name, ".ts"):
-		if seq, ok := parseUint(strings.TrimSuffix(name, ".ts"), 64); ok {
+		base := strings.TrimSuffix(name, ".ts")
+		if strings.Contains(base, "-") {
+			if track, seq, ok := parsePair(base, 64); ok {
+				body, ctype = p.st.variantTS(int(track), seq), typeTS
+			}
+		} else if seq, ok := parseUint(base, 64); ok {
 			body, ctype = p.st.segmentTS(seq), typeTS
 		}
 	case dir == dirCMAF && strings.HasPrefix(name, "init-") && strings.HasSuffix(name, ".mp4"):
