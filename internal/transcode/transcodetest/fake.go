@@ -6,6 +6,8 @@ package transcodetest
 import (
 	"bufio"
 	"errors"
+	"fmt"
+	"image"
 	"io"
 	"os"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/wire"
 )
 
@@ -68,6 +71,27 @@ const (
 	// does, while audio goes out at once. The held video goes out at the
 	// end of the input and on Stop.
 	EnvVideoLag = "OS_TRANSCODE_FAKE_VIDEO_LAG"
+	// EnvShots makes the child send a Shot, a 1×1 JPEG carrying the key's
+	// PTS and epoch, for every n-th video keyframe it receives, and report
+	// their count as Stats.Thumbnails.
+	EnvShots = "OS_TRANSCODE_FAKE_SHOTS"
+	// EnvShotFail makes the child send no Shot and count each received
+	// video keyframe in Stats.ThumbnailsFailed instead.
+	EnvShotFail = "OS_TRANSCODE_FAKE_SHOT_FAIL"
+	// EnvWatermarkLog names a file the child appends one line to per
+	// Configure and per SetWatermark: "configure text:<the text verbatim>",
+	// "configure image:<len>" or "configure none", and "set …" in the same
+	// forms.
+	EnvWatermarkLog = "OS_TRANSCODE_FAKE_WATERMARK_LOG"
+	// EnvFrameLog names a file the child appends one line to per received
+	// frame, "<video|audio> <track> <pts> <epoch> <key|->", written as the
+	// frame arrives. A frame that is not video is logged as audio.
+	EnvFrameLog = "OS_TRANSCODE_FAKE_FRAME_LOG"
+	// EnvExitAfterHello makes the child exit 2 right after its Hello,
+	// before it reads anything. A child that announces a wrong version is
+	// never sent Configure, so EnvCrashAfter and EnvCloseThenExit, which
+	// fire only after Configure, cannot make it exit.
+	EnvExitAfterHello = "OS_TRANSCODE_FAKE_EXIT_AFTER_HELLO"
 )
 
 // Counters are the media counters a child run with EnvCounters reports.
@@ -75,8 +99,9 @@ var Counters = wire.Stats{DroppedTracks: 1, Reanchors: 2, AudioDropped: 3, Audio
 
 // Main runs the fake child on fd 3 and exits. It sends Hello, reads
 // Configure, then echoes every input video frame unchanged to every rung
-// and every input audio frame as rung -1. It exits 0 on Stop or at the end
-// of its input.
+// and every input audio frame as rung -1. A Configure with no rungs and no
+// audio, as a thumbnail-only one is, is accepted: video then goes nowhere.
+// It exits 0 on Stop or at the end of its input.
 func Main() {
 	conn := os.NewFile(3, "transcode")
 	if conn == nil {
@@ -141,6 +166,9 @@ func Main() {
 	if err := w.Write(wire.Hello{Version: version, PID: os.Getpid()}); err != nil {
 		os.Exit(1)
 	}
+	if os.Getenv(EnvExitAfterHello) != "" {
+		os.Exit(2)
+	}
 	if misbehave && os.Getenv(EnvJunkAfterHello) != "" {
 		markOnce()
 		_, _ = conn.Write([]byte{0, 0, 0, 0, 0xff, 0xff})
@@ -152,11 +180,11 @@ func Main() {
 	if d, err := time.ParseDuration(os.Getenv(EnvStatsInterval)); err == nil && d > 0 {
 		statsEvery = d
 	}
-	var in atomic.Uint64
+	var in, thumbs, thumbsFailed atomic.Uint64
 	var stuck atomic.Bool
 	counters := os.Getenv(EnvCounters) != ""
 	stats := func() wire.Stats {
-		s := wire.Stats{In: in.Load()}
+		s := wire.Stats{In: in.Load(), Thumbnails: thumbs.Load(), ThumbnailsFailed: thumbsFailed.Load()}
 		if counters {
 			s.DroppedTracks, s.Reanchors, s.AudioDropped = Counters.DroppedTracks, Counters.Reanchors, Counters.AudioDropped
 			s.AudioCorrupt, s.VideoCorrupt = Counters.AudioCorrupt, Counters.VideoCorrupt
@@ -174,6 +202,32 @@ func Main() {
 			}
 		}
 	}()
+
+	shotEvery, _ := strconv.Atoi(os.Getenv(EnvShots))
+	shotFail := os.Getenv(EnvShotFail) != ""
+	var shotJPEG []byte
+	if shotEvery > 0 && !shotFail {
+		var err error
+		if shotJPEG, err = picture.EncodeJPEG(image.NewGray(image.Rect(0, 0, 1, 1)), 80); err != nil {
+			os.Exit(1)
+		}
+	}
+	keys := 0 // video keyframes received
+	shoot := func(f media.Frame) {
+		keys++
+		switch {
+		case shotFail:
+			thumbsFailed.Add(1)
+		case shotEvery > 0 && keys%shotEvery == 0:
+			s := picture.Shot{PTS: f.PTS, Epoch: f.Epoch, Width: 1, Height: 1, JPEG: shotJPEG}
+			if w.Write(wire.Shot{S: s}) != nil {
+				os.Exit(1)
+			}
+			thumbs.Add(1)
+		}
+	}
+	wmLog := openLog(os.Getenv(EnvWatermarkLog))
+	frameLog := openLog(os.Getenv(EnvFrameLog))
 
 	lag, _ := strconv.Atoi(os.Getenv(EnvVideoLag))
 	var lagged []media.Frame
@@ -204,6 +258,7 @@ func Main() {
 		switch v := m.(type) {
 		case wire.Configure:
 			cfg = v
+			wmLog.line("configure " + describeWatermark(v.Watermark))
 			if misbehave && os.Getenv(EnvCloseThenExit) != "" {
 				markOnce()
 				_ = conn.Close()
@@ -217,12 +272,19 @@ func Main() {
 			if crashAfter == 0 {
 				crash()
 			}
+		case wire.SetWatermark:
+			wmLog.line("set " + describeWatermark(v.W))
 		case wire.Frame:
 			in.Add(1)
+			isVideo := v.F.Kind() == media.KindVideo
+			frameLog.line(describeFrame(v.F, isVideo))
 			if delay > 0 {
 				time.Sleep(delay)
 			}
-			if v.F.Kind() == media.KindVideo {
+			if isVideo && v.F.Key {
+				shoot(v.F)
+			}
+			if isVideo {
 				lagged = append(lagged, v.F)
 				for len(lagged) > lag {
 					sendVideo(lagged[0], len(cfg.Rungs))
@@ -248,4 +310,53 @@ func Main() {
 		default:
 		}
 	}
+}
+
+// logFile appends lines to a file, one write per line. A nil logFile drops
+// them.
+type logFile struct{ f *os.File }
+
+// openLog opens path for appending, or returns nil for an empty path.
+func openLog(path string) *logFile {
+	if path == "" {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		os.Exit(1)
+	}
+	return &logFile{f: f}
+}
+
+func (l *logFile) line(s string) {
+	if l == nil {
+		return
+	}
+	if _, err := l.f.WriteString(s + "\n"); err != nil {
+		os.Exit(1)
+	}
+}
+
+// describeWatermark is "text:<text>", "image:<len>" or "none".
+func describeWatermark(w *picture.Watermark) string {
+	switch {
+	case w == nil:
+		return "none"
+	case len(w.Image) > 0:
+		return "image:" + strconv.Itoa(len(w.Image))
+	default:
+		return "text:" + w.Text
+	}
+}
+
+// describeFrame is "<video|audio> <track> <pts> <epoch> <key|->".
+func describeFrame(f media.Frame, video bool) string {
+	kind, key := "audio", "-"
+	if video {
+		kind = "video"
+	}
+	if f.Key {
+		key = "key"
+	}
+	return fmt.Sprintf("%s %d %d %d %s", kind, f.Track, f.PTS, f.Epoch, key)
 }

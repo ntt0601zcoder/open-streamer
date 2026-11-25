@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 )
 
 func FuzzRead(f *testing.F) {
@@ -22,6 +23,8 @@ func FuzzRead(f *testing.F) {
 		Stats{In: 3, Out: []uint64{1}, EncodeNanos: []int64{9}},
 		Error{Rung: 1, Message: "x", Fatal: true},
 		Stop{},
+		SetWatermark{W: &picture.Watermark{Text: "%H:%M", Position: picture.BottomLeft, OpacityPct: 50, TimeZone: "UTC"}},
+		Shot{S: picture.Shot{PTS: -1, Epoch: 7, Width: 240, Height: 180, JPEG: []byte{0xff, 0xd8, 0xff}}},
 	} {
 		if err := w.Write(m); err != nil {
 			f.Fatal(err)

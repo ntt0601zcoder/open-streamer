@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 )
 
 // Parameter sets from internal/media's fixtures.
@@ -204,8 +206,8 @@ func TestStatsCounterFieldNumbers(t *testing.T) {
 // decodes: the unknown fields are skipped.
 func TestStatsUnknownFieldSkipped(t *testing.T) {
 	body := appendUint(nil, 1, 7)
-	body = appendUint(body, 9, 42)
-	body = appendBytes(body, 10, []byte("future"))
+	body = appendUint(body, 12, 42)
+	body = appendBytes(body, 13, []byte("future"))
 	body = appendUint(body, 5, 3) // a known field after the unknown ones
 	env := appendEnvelope(nil, fStats, body)
 	msg := binary.BigEndian.AppendUint32(nil, uint32(len(env)))
@@ -335,7 +337,7 @@ func record(body []byte) []byte {
 func TestMalformed(t *testing.T) {
 	cases := map[string][]byte{
 		"empty envelope":     record(nil),
-		"unknown type":       record([]byte{0x42, 0x00}),
+		"unknown type":       record([]byte{0x7a, 0x00}),
 		"wrong wire type":    record([]byte{0x08, 0x01}),
 		"trailing bytes":     record([]byte{0x22, 0x00, 0x22, 0x00}),
 		"bad inner varint":   record([]byte{0x0a, 0x02, 0x08, 0x80}),
@@ -464,4 +466,150 @@ func TestWriterConfigTableFull(t *testing.T) {
 	assert.Equal(t, n, buf.Len(), "nothing written")
 	require.NoError(t, w.Write(Frame{F: media.Frame{Config: a}}))
 	assert.Equal(t, maxConfigs, NewWriter(io.Discard).configCap)
+}
+
+func TestVersionIsTwo(t *testing.T) {
+	got := roundTrip(t, Hello{Version: Version})
+	assert.Equal(t, Hello{Version: 2}, got[0])
+}
+
+func TestConfigureV2RoundTrip(t *testing.T) {
+	text := Configure{
+		Rungs: []Rung{
+			{Height: 720, BitrateKbps: 2500, BFrames: 2, Preset: "p4", Encoder: "nvenc"},
+			{Height: 360, BitrateKbps: 600, Preset: "veryfast", Encoder: ""},
+		},
+		Audio: &AudioEncode{BitrateKbps: 128, SampleRate: 48000, Channels: 2},
+		Watermark: &picture.Watermark{
+			Text: "LIVE %H:%M:%S ✓", Position: picture.BottomRight, OpacityPct: 60, SizePct: 7,
+			TimeZone: "Asia/Ho_Chi_Minh",
+		},
+		Thumbnail: &picture.Thumbnail{IntervalSec: 5, Height: 240, Quality: 70},
+	}
+	image := Configure{
+		Rungs: []Rung{{Height: 480, BitrateKbps: 1200}},
+		Watermark: &picture.Watermark{
+			Image: bytes.Repeat([]byte{0xa5}, picture.MaxImageBytes), Position: picture.Center, SizePct: 100,
+		},
+	}
+	plain := Configure{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}}
+	thumbOnly := Configure{Thumbnail: &picture.Thumbnail{}}
+	got := roundTrip(t, text, image, plain, thumbOnly)
+	assert.Equal(t, text, got[0])
+	assert.Equal(t, image, got[1])
+	assert.Equal(t, plain, got[2])
+	pc := got[2].(Configure)
+	assert.Nil(t, pc.Watermark)
+	assert.Nil(t, pc.Thumbnail)
+	assert.Equal(t, thumbOnly, got[3])
+}
+
+// A Configure without M4c features has exactly M4b's bytes: an empty
+// Encoder, a nil Watermark and a nil Thumbnail write no field at all.
+func TestConfigureBytesUnchanged(t *testing.T) {
+	var buf bytes.Buffer
+	require.NoError(t, NewWriter(&buf).Write(Configure{
+		Rungs: []Rung{
+			{Height: 240, BitrateKbps: 600},
+			{Height: 180, BitrateKbps: 300, BFrames: -1, Preset: "fast"},
+		},
+		Audio: &AudioEncode{BitrateKbps: 96},
+	}))
+	const m4b = "0000002a12280a0c08f00110d804180020002a000a1008b40110ac02180020012a04666173741206086010001800"
+	assert.Equal(t, m4b, hex.EncodeToString(buf.Bytes()))
+}
+
+func TestSetWatermarkRoundTrip(t *testing.T) {
+	set := SetWatermark{W: &picture.Watermark{Text: "%Y-%m-%d", Position: picture.TopRight, OpacityPct: 1, SizePct: 50}}
+	got := roundTrip(t, set, SetWatermark{})
+	assert.Equal(t, set, got[0])
+	assert.Equal(t, SetWatermark{}, got[1])
+	assert.Nil(t, got[1].(SetWatermark).W, "absent means remove")
+}
+
+func TestShotRoundTrip(t *testing.T) {
+	shot := Shot{S: picture.Shot{PTS: -1, Epoch: 7, Width: 240, Height: 180, JPEG: []byte{0xff, 0xd8, 0xff}}}
+	got := roundTrip(t, shot)
+	assert.Equal(t, shot, got[0])
+}
+
+func TestStatsV2RoundTrip(t *testing.T) {
+	s := Stats{In: 1, Out: []uint64{2}, EncodeNanos: []int64{3}, EncoderFallbacks: 2, Thumbnails: 9, ThumbnailsFailed: 4}
+	got := roundTrip(t, s)
+	assert.Equal(t, s, got[0])
+
+	// The new counters take the next free Stats fields, 9 to 11, written
+	// only when non-zero.
+	var buf bytes.Buffer
+	require.NoError(t, NewWriter(&buf).Write(Stats{EncoderFallbacks: 2, Thumbnails: 9, ThumbnailsFailed: 4}))
+	assert.Equal(t, record(appendEnvelope(nil, fStats, []byte{0x08, 0, 0x48, 2, 0x50, 9, 0x58, 4})), buf.Bytes())
+}
+
+func TestEnvelopeFieldNumbersV2(t *testing.T) {
+	for tag, m := range map[byte]Message{0x42: SetWatermark{}, 0x4a: Shot{}} {
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).Write(m))
+		assert.Equal(t, tag, buf.Bytes()[4], "%T", m)
+	}
+}
+
+// The new limits: the Writer refuses with ErrLimit and writes nothing, and
+// the Reader rejects the same bytes, hand-encoded, as ErrMalformed.
+func TestV2Limits(t *testing.T) {
+	text := strings.Repeat("a", picture.MaxTextBytes+1)
+	img := make([]byte, picture.MaxImageBytes+1)
+	jpg := make([]byte, picture.MaxShotBytes+1)
+	enc := strings.Repeat("e", maxEncoder+1)
+	over := map[string]Message{
+		"configure text":  Configure{Watermark: &picture.Watermark{Text: text}},
+		"configure image": Configure{Watermark: &picture.Watermark{Image: img}},
+		"set text":        SetWatermark{W: &picture.Watermark{Text: text}},
+		"set image":       SetWatermark{W: &picture.Watermark{Image: img}},
+		"jpeg":            Shot{S: picture.Shot{JPEG: jpg}},
+		"encoder":         Configure{Rungs: []Rung{{Encoder: enc}}},
+		"shot width":      Shot{S: picture.Shot{Width: -1}},
+		"opacity":         Configure{Watermark: &picture.Watermark{Text: "x", OpacityPct: math.MaxInt32 + 1}},
+		"thumbnail":       Configure{Thumbnail: &picture.Thumbnail{Height: math.MinInt32 - 1}},
+	}
+	for name, m := range over {
+		var buf bytes.Buffer
+		err := NewWriter(&buf).Write(m)
+		require.ErrorIs(t, err, ErrLimit, name)
+		assert.Zero(t, buf.Len(), name)
+	}
+
+	wm := func(field protowire.Number, b []byte) []byte { return appendBytes(nil, field, b) }
+	hand := map[string][]byte{
+		"configure text":  appendEnvelope(nil, fConfigure, appendBytes(nil, 3, wm(1, []byte(text)))),
+		"configure image": appendEnvelope(nil, fConfigure, appendBytes(nil, 3, wm(2, img))),
+		"set text":        appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, wm(1, []byte(text)))),
+		"set image":       appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, wm(2, img))),
+		"jpeg":            appendEnvelope(nil, fShot, appendBytes(nil, 5, jpg)),
+		"encoder":         appendEnvelope(nil, fConfigure, appendBytes(nil, 1, appendBytes(nil, 6, []byte(enc)))),
+		"position":        appendEnvelope(nil, fConfigure, appendBytes(nil, 3, appendUint(nil, 3, 256))),
+		"shot epoch":      appendEnvelope(nil, fShot, appendUint(nil, 2, math.MaxUint32+1)),
+		"shot width":      appendEnvelope(nil, fShot, appendUint(nil, 3, math.MaxInt32+1)),
+		"opacity":         appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, appendSint(nil, 4, math.MaxInt32+1))),
+		"thumbnail":       appendEnvelope(nil, fConfigure, appendBytes(nil, 4, appendSint(nil, 2, math.MinInt32-1))),
+		"set wire type":   appendEnvelope(nil, fSetWatermark, appendUint(nil, 1, 1)),
+	}
+	for name, b := range hand {
+		_, err := NewReader(bytes.NewReader(record(b))).Read()
+		require.ErrorIs(t, err, ErrMalformed, name)
+	}
+
+	// At the limits, everything is written and read back.
+	at := []Message{
+		Configure{
+			Rungs:     []Rung{{Encoder: strings.Repeat("e", maxEncoder)}},
+			Watermark: &picture.Watermark{Text: strings.Repeat("a", picture.MaxTextBytes), OpacityPct: -1, SizePct: math.MinInt32},
+			Thumbnail: &picture.Thumbnail{IntervalSec: math.MaxInt32, Height: -2, Quality: math.MinInt32},
+		},
+		SetWatermark{W: &picture.Watermark{Image: make([]byte, picture.MaxImageBytes), Position: math.MaxUint8}},
+		Shot{S: picture.Shot{PTS: math.MinInt64, Epoch: math.MaxUint32, Width: math.MaxInt32, JPEG: make([]byte, picture.MaxShotBytes)}},
+	}
+	got := roundTrip(t, at...)
+	for i := range at {
+		assert.Equal(t, at[i], got[i], "message %d", i)
+	}
 }

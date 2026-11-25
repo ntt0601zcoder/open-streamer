@@ -12,10 +12,11 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 )
 
 // Version is the protocol version a Hello announces.
-const Version = 1
+const Version = 2
 
 // MaxMessage is the largest envelope, in bytes after the 4-byte length.
 const MaxMessage = 32 << 20
@@ -31,9 +32,10 @@ var (
 	ErrMalformed = errors.New("wire: malformed message")
 	// ErrLimit means the Writer refused a message that the Reader would
 	// reject for one of its limits: too many NAL units, parameter sets,
-	// rungs or stats entries, an integer outside the field's range, or more
-	// than MaxMessage bytes (then also ErrTooLarge). Nothing was written;
-	// the stream is still usable.
+	// rungs or stats entries, an integer outside the field's range, a
+	// watermark text, watermark image, shot JPEG or encoder name over its
+	// size limit, or more than MaxMessage bytes (then also ErrTooLarge).
+	// Nothing was written; the stream is still usable.
 	ErrLimit = errors.New("wire: message exceeds a protocol limit")
 	// ErrConfigTable means the Writer has sent as many distinct configs as
 	// a Reader tracks, and refused a frame with a new one. Nothing was
@@ -49,6 +51,7 @@ const (
 	maxNALs      = 1 << 16
 	maxParamSets = 256
 	maxStatsLen  = 64
+	maxEncoder   = 16 // bytes of a rung's encoder name
 	maxInt       = math.MaxInt32
 	readChunk    = 1 << 20 // body buffer pre-allocation cap before data arrives
 )
@@ -62,10 +65,12 @@ const (
 	fStats         = 5
 	fError         = 6
 	fStop          = 7
+	fSetWatermark  = 8
+	fShot          = 9
 )
 
 // Message is one wire message: Hello, Configure, Frame, Discontinuity, Stats,
-// Error or Stop. Read returns them by value.
+// Error, Stop, SetWatermark or Shot. Read returns them by value.
 type Message interface{ isMessage() }
 
 // Hello is the first message, child to host.
@@ -75,17 +80,22 @@ type Hello struct {
 }
 
 // Configure is sent once, host to child. A nil Audio means the child has no
-// audio to encode.
+// audio to encode, a nil Watermark no overlay and a nil Thumbnail no shots.
+// A Configure with no rungs and no audio but a Thumbnail asks for shots
+// only. The wire checks only its size limits; the host and the child call
+// Validate on the watermark and thumbnail.
 type Configure struct {
-	Rungs []Rung
-	Audio *AudioEncode
+	Rungs     []Rung
+	Audio     *AudioEncode
+	Watermark *picture.Watermark // nil: none
+	Thumbnail *picture.Thumbnail // nil: none
 }
 
 // Rung is one video rendition to encode. BFrames -1 means none, 0 means the
-// encoder default.
+// encoder default. Encoder is "", "x264" or "nvenc"; "" means x264.
 type Rung struct {
 	Height, BitrateKbps, MaxBitrateKbps, BFrames int
-	Preset                                       string
+	Preset, Encoder                              string
 }
 
 // AudioEncode asks for AAC re-encoding.
@@ -102,6 +112,13 @@ type Frame struct {
 // host to child.
 type Discontinuity struct{}
 
+// SetWatermark replaces the overlay of a running child, host to child. A nil
+// W removes it.
+type SetWatermark struct{ W *picture.Watermark }
+
+// Shot carries one thumbnail, child to host.
+type Shot struct{ S picture.Shot }
+
 // Stats is sent by the child every second. Every counter is cumulative
 // over the child's life. Out has one entry per rung: the video frames
 // written. EncodeNanos has one entry per rung: the wall time spent in the
@@ -110,7 +127,9 @@ type Discontinuity struct{}
 // the native pipeline's: DroppedTracks (video tracks other than the first),
 // Reanchors (forward audio re-anchors), AudioDropped (input audio samples
 // dropped for backward drift), AudioCorrupt and VideoCorrupt (frames the
-// decoders rejected and skipped).
+// decoders rejected and skipped). EncoderFallbacks counts rungs that fell
+// back from the requested encoder to x264, Thumbnails the shots sent and
+// ThumbnailsFailed the shots that could not be made.
 type Stats struct {
 	In          uint64
 	Out         []uint64
@@ -118,6 +137,8 @@ type Stats struct {
 
 	DroppedTracks, Reanchors, AudioDropped uint64
 	AudioCorrupt, VideoCorrupt             uint64
+
+	EncoderFallbacks, Thumbnails, ThumbnailsFailed uint64
 }
 
 // Error reports a child failure.
@@ -137,6 +158,8 @@ func (Discontinuity) isMessage() {}
 func (Stats) isMessage()         {}
 func (Error) isMessage()         {}
 func (Stop) isMessage()          {}
+func (SetWatermark) isMessage()  {}
+func (Shot) isMessage()          {}
 
 // Writer encodes messages. It is safe for concurrent use; each Write is one
 // io.Writer call.
@@ -197,6 +220,22 @@ func (w *Writer) Write(m Message) error {
 		}
 	case Stop:
 		body = appendEnvelope(body, fStop, nil)
+	case SetWatermark:
+		var b []byte
+		if v.W != nil {
+			var wm []byte
+			if wm, err = appendWatermark(nil, *v.W); err == nil {
+				b = appendBytes(nil, 1, wm)
+			}
+		}
+		if err == nil {
+			body = appendEnvelope(body, fSetWatermark, b)
+		}
+	case Shot:
+		var b []byte
+		if b, err = appendShot(nil, v.S); err == nil {
+			body = appendEnvelope(body, fShot, b)
+		}
 	default:
 		err = fmt.Errorf("wire: write: unsupported message %T", m)
 	}
@@ -278,10 +317,14 @@ func int32s(name string, vs ...int) error {
 	return nil
 }
 
-// Configure: 1 rung (repeated bytes), 2 audio (bytes, absent = no audio).
+// Configure: 1 rung (repeated bytes), 2 audio (bytes, absent = no audio),
+// 3 watermark (bytes, absent = none), 4 thumbnail (bytes, absent = none).
 // Rung: 1 height, 2 bitrate_kbps, 3 max_bitrate_kbps (varint),
-// 4 bframes (sint64), 5 preset (string).
+// 4 bframes (sint64), 5 preset (string), 6 encoder (string, absent when
+// empty).
 // AudioEncode: 1 bitrate_kbps, 2 sample_rate, 3 channels (varint).
+// Absent means absent: a Configure without an encoder, watermark or
+// thumbnail has the bytes of wire version 1.
 func appendConfigure(dst []byte, c Configure) ([]byte, error) {
 	if len(c.Rungs) > MaxRungs {
 		return nil, limit("%d rungs, at most %d", len(c.Rungs), MaxRungs)
@@ -293,12 +336,16 @@ func appendConfigure(dst []byte, c Configure) ([]byte, error) {
 		if err := int32s("rung bframes", r.BFrames); err != nil {
 			return nil, err
 		}
+		if len(r.Encoder) > maxEncoder {
+			return nil, limit("rung encoder name of %d bytes, at most %d", len(r.Encoder), maxEncoder)
+		}
 		var b []byte
 		b = appendUint(b, 1, uint64(r.Height))
 		b = appendUint(b, 2, uint64(r.BitrateKbps))
 		b = appendUint(b, 3, uint64(r.MaxBitrateKbps))
 		b = appendSint(b, 4, int64(r.BFrames))
 		b = appendBytes(b, 5, []byte(r.Preset))
+		b = appendString(b, 6, r.Encoder)
 		dst = appendBytes(dst, 1, b)
 	}
 	if a := c.Audio; a != nil {
@@ -310,6 +357,88 @@ func appendConfigure(dst []byte, c Configure) ([]byte, error) {
 		b = appendUint(b, 2, uint64(a.SampleRate))
 		b = appendUint(b, 3, uint64(a.Channels))
 		dst = appendBytes(dst, 2, b)
+	}
+	if c.Watermark != nil {
+		b, err := appendWatermark(nil, *c.Watermark)
+		if err != nil {
+			return nil, err
+		}
+		dst = appendBytes(dst, 3, b)
+	}
+	if t := c.Thumbnail; t != nil {
+		if err := int32s("thumbnail", t.IntervalSec, t.Height, t.Quality); err != nil {
+			return nil, err
+		}
+		dst = appendBytes(dst, 4, appendThumbnail(nil, *t))
+	}
+	return dst, nil
+}
+
+// appendString writes a bytes field only when s is not empty.
+func appendString(dst []byte, field protowire.Number, s string) []byte {
+	if s == "" {
+		return dst
+	}
+	return appendBytes(dst, field, []byte(s))
+}
+
+// appendNonZero writes a sint64 field only when v is not zero.
+func appendNonZero(dst []byte, field protowire.Number, v int) []byte {
+	if v == 0 {
+		return dst
+	}
+	return appendSint(dst, field, int64(v))
+}
+
+// Watermark: 1 text (string), 2 image (bytes), 3 position (varint, at most
+// 255), 4 opacity_pct, 5 size_pct (sint64), 6 time_zone (string). Each field
+// is written only when it is not empty or zero. Integers are signed so that
+// an out-of-range value reaches Validate rather than the wire's limits.
+func appendWatermark(dst []byte, w picture.Watermark) ([]byte, error) {
+	if len(w.Text) > picture.MaxTextBytes {
+		return nil, limit("watermark text of %d bytes, at most %d", len(w.Text), picture.MaxTextBytes)
+	}
+	if len(w.Image) > picture.MaxImageBytes {
+		return nil, limit("watermark image of %d bytes, at most %d", len(w.Image), picture.MaxImageBytes)
+	}
+	if err := int32s("watermark", w.OpacityPct, w.SizePct); err != nil {
+		return nil, err
+	}
+	dst = appendString(dst, 1, w.Text)
+	if len(w.Image) > 0 {
+		dst = appendBytes(dst, 2, w.Image)
+	}
+	if w.Position != 0 {
+		dst = appendUint(dst, 3, uint64(w.Position))
+	}
+	dst = appendNonZero(dst, 4, w.OpacityPct)
+	dst = appendNonZero(dst, 5, w.SizePct)
+	return appendString(dst, 6, w.TimeZone), nil
+}
+
+// Thumbnail: 1 interval_sec, 2 height, 3 quality (sint64), each written only
+// when not zero.
+func appendThumbnail(dst []byte, t picture.Thumbnail) []byte {
+	dst = appendNonZero(dst, 1, t.IntervalSec)
+	dst = appendNonZero(dst, 2, t.Height)
+	return appendNonZero(dst, 3, t.Quality)
+}
+
+// Shot: 1 pts (sint64), 2 epoch, 3 width, 4 height (varint), 5 jpeg (bytes,
+// absent when empty).
+func appendShot(dst []byte, s picture.Shot) ([]byte, error) {
+	if len(s.JPEG) > picture.MaxShotBytes {
+		return nil, limit("shot of %d bytes, at most %d", len(s.JPEG), picture.MaxShotBytes)
+	}
+	if err := nonNeg("shot size", s.Width, s.Height); err != nil {
+		return nil, err
+	}
+	dst = appendSint(dst, 1, s.PTS)
+	dst = appendUint(dst, 2, uint64(s.Epoch))
+	dst = appendUint(dst, 3, uint64(s.Width))
+	dst = appendUint(dst, 4, uint64(s.Height))
+	if len(s.JPEG) > 0 {
+		dst = appendBytes(dst, 5, s.JPEG)
 	}
 	return dst, nil
 }
@@ -381,7 +510,8 @@ func appendConfig(dst []byte, c *media.TrackConfig) []byte {
 // Stats: 1 in (varint), 2 out (repeated varint, one per rung),
 // 3 encode_nanos (repeated sint64, one per rung), then the media counters,
 // each a varint written only when non-zero: 4 dropped_tracks, 5 reanchors,
-// 6 audio_dropped, 7 audio_corrupt, 8 video_corrupt.
+// 6 audio_dropped, 7 audio_corrupt, 8 video_corrupt, 9 encoder_fallbacks,
+// 10 thumbnails, 11 thumbnails_failed.
 func appendStats(dst []byte, s Stats) []byte {
 	dst = appendUint(dst, 1, s.In)
 	for _, o := range s.Out {
@@ -390,7 +520,10 @@ func appendStats(dst []byte, s Stats) []byte {
 	for _, n := range s.EncodeNanos {
 		dst = appendSint(dst, 3, n)
 	}
-	for i, v := range []uint64{s.DroppedTracks, s.Reanchors, s.AudioDropped, s.AudioCorrupt, s.VideoCorrupt} {
+	for i, v := range []uint64{
+		s.DroppedTracks, s.Reanchors, s.AudioDropped, s.AudioCorrupt, s.VideoCorrupt,
+		s.EncoderFallbacks, s.Thumbnails, s.ThumbnailsFailed,
+	} {
 		if v != 0 {
 			dst = appendUint(dst, protowire.Number(4+i), v)
 		}
@@ -405,9 +538,9 @@ func appendError(dst []byte, e Error) []byte {
 	return appendBool(dst, 3, e.Fatal)
 }
 
-// Reader decodes messages. It is not safe for concurrent use. A Frame's Data
-// shares one buffer per message and is never reused by the Reader, so the
-// caller may keep it.
+// Reader decodes messages. It is not safe for concurrent use. A Frame's
+// Data, a watermark's Image and a Shot's JPEG share one buffer per message
+// that the Reader never reuses, so the caller may keep them.
 type Reader struct {
 	r       io.Reader
 	configs map[uint32]*media.TrackConfig
@@ -485,6 +618,10 @@ func (r *Reader) decode(b []byte) (Message, error) {
 		return decodeError(body)
 	case fStop:
 		return Stop{}, nil
+	case fSetWatermark:
+		return decodeSetWatermark(body)
+	case fShot:
+		return decodeShot(body)
 	default:
 		return nil, bad("unknown message type %d", num)
 	}
@@ -620,10 +757,123 @@ func decodeConfigure(b []byte) (Message, error) {
 			a, err := decodeAudio(raw)
 			c.Audio = &a
 			return err
+		case 3:
+			raw, err := f.bytes()
+			if err != nil {
+				return err
+			}
+			w, err := decodeWatermark(raw)
+			c.Watermark = &w
+			return err
+		case 4:
+			raw, err := f.bytes()
+			if err != nil {
+				return err
+			}
+			t, err := decodeThumbnail(raw)
+			c.Thumbnail = &t
+			return err
 		}
 		return nil
 	})
 	return c, err
+}
+
+func decodeWatermark(b []byte) (picture.Watermark, error) {
+	var w picture.Watermark
+	err := fields(b, func(f field) error {
+		var err error
+		switch f.num {
+		case 1:
+			var p []byte
+			if p, err = f.bytes(); err == nil && len(p) > picture.MaxTextBytes {
+				err = bad("watermark text of %d bytes", len(p))
+			}
+			w.Text = string(p)
+		case 2:
+			if w.Image, err = f.bytes(); err == nil && len(w.Image) > picture.MaxImageBytes {
+				err = bad("watermark image of %d bytes", len(w.Image))
+			}
+		case 3:
+			var v uint64
+			if v, err = f.uint(); err == nil && v > math.MaxUint8 {
+				err = bad("watermark position %d", v)
+			}
+			w.Position = picture.Position(v)
+		case 4:
+			w.OpacityPct, err = f.smallSint()
+		case 5:
+			w.SizePct, err = f.smallSint()
+		case 6:
+			var p []byte
+			p, err = f.bytes()
+			w.TimeZone = string(p)
+		}
+		return err
+	})
+	return w, err
+}
+
+func decodeThumbnail(b []byte) (picture.Thumbnail, error) {
+	var t picture.Thumbnail
+	err := fields(b, func(f field) error {
+		var err error
+		switch f.num {
+		case 1:
+			t.IntervalSec, err = f.smallSint()
+		case 2:
+			t.Height, err = f.smallSint()
+		case 3:
+			t.Quality, err = f.smallSint()
+		}
+		return err
+	})
+	return t, err
+}
+
+// SetWatermark: 1 watermark (bytes, absent = remove).
+func decodeSetWatermark(b []byte) (Message, error) {
+	var s SetWatermark
+	err := fields(b, func(f field) error {
+		if f.num != 1 {
+			return nil
+		}
+		raw, err := f.bytes()
+		if err != nil {
+			return err
+		}
+		w, err := decodeWatermark(raw)
+		s.W = &w
+		return err
+	})
+	return s, err
+}
+
+func decodeShot(b []byte) (Message, error) {
+	var s Shot
+	err := fields(b, func(f field) error {
+		var err error
+		switch f.num {
+		case 1:
+			s.S.PTS, err = f.sint()
+		case 2:
+			var v uint64
+			if v, err = f.uint(); err == nil && v > math.MaxUint32 {
+				err = bad("shot epoch %d", v)
+			}
+			s.S.Epoch = uint32(v)
+		case 3:
+			s.S.Width, err = f.small()
+		case 4:
+			s.S.Height, err = f.small()
+		case 5:
+			if s.S.JPEG, err = f.bytes(); err == nil && len(s.S.JPEG) > picture.MaxShotBytes {
+				err = bad("shot of %d bytes", len(s.S.JPEG))
+			}
+		}
+		return err
+	})
+	return s, err
 }
 
 func decodeRung(b []byte) (Rung, error) {
@@ -643,6 +893,12 @@ func decodeRung(b []byte) (Rung, error) {
 			var p []byte
 			p, err = f.bytes()
 			r.Preset = string(p)
+		case 6:
+			var p []byte
+			if p, err = f.bytes(); err == nil && len(p) > maxEncoder {
+				err = bad("rung encoder name of %d bytes", len(p))
+			}
+			r.Encoder = string(p)
 		}
 		return err
 	})
@@ -823,6 +1079,12 @@ func decodeStats(b []byte) (Message, error) {
 			s.AudioCorrupt, err = f.uint()
 		case 8:
 			s.VideoCorrupt, err = f.uint()
+		case 9:
+			s.EncoderFallbacks, err = f.uint()
+		case 10:
+			s.Thumbnails, err = f.uint()
+		case 11:
+			s.ThumbnailsFailed, err = f.uint()
 		}
 		return err
 	})
