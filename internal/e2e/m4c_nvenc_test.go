@@ -592,12 +592,12 @@ func TestM4cNVENCSessions(t *testing.T) {
 	}
 	assert.Equal(t, base+rungs, peakBeforeEnd, "the count read base + %d before the feed ended", rungs)
 	assert.LessOrEqual(t, peak, base+rungs, "never more than base + %d", rungs)
-	after := -1
 	assert.Eventually(t, func() bool {
 		n, err := nvencSessions(t.Context(), smi)
-		after = n
 		return err == nil && n == base
 	}, 10*time.Second, 250*time.Millisecond, "the count back to base %d after the run", base)
+	after, err := nvencSessions(t.Context(), smi)
+	require.NoError(t, err)
 	t.Logf("nvenc-sessions base=%d peak=%d after=%d (%d polls, %d before the feed ended at %v)", base, peak, after,
 		len(polls), countBefore(polls, fedAt), fedAt.Format(time.TimeOnly))
 }
