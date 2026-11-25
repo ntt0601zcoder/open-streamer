@@ -90,6 +90,16 @@ func (f *File) Write(text []byte) error {
 	return nil
 }
 
+// SetHook is for tests only; no production code calls it. f is called after
+// each step of a write (created, written, synced, renamed, dirsynced), and
+// an error it returns ends the write there, as a crash or a failed fsync
+// would. nil removes it.
+func (f *File) SetHook(hook func(step string) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hook = hook
+}
+
 // Adopt remembers text's hash: after a reload took the file as it is.
 func (f *File) Adopt(text []byte) {
 	f.mu.Lock()
