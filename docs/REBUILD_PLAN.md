@@ -1416,10 +1416,12 @@ Items accepted for later, not yet placed in a milestone:
   `OS_NVENC_SHARED=1` (warn instead of refusing when other NVENC sessions
   exist; session assertions become "rose by 3") is untested. The opt-in
   gate is done (M4c final review): the NVENC device tests (e2e
-  `testpeer.NVENC`, native `nvencOrSkip`) skip without opening a session
-  unless `OS_NVENC=1` or `OS_REQUIRE_NVENC=1`, which only the script sets
-  after its refusal check, so a plain `go test` or `make test` on the GPU
-  host no longer bypasses the refusal.
+  `testpeer.NVENC`, native `nvencOrSkip`, and `cmd/ostranscoder`'s
+  `TestProbeFlag/device` and `TestChildEncoderFallbacks`, which skip only
+  where `/dev/nvidiactl` exists) skip without opening a session unless
+  `OS_NVENC=1` or `OS_REQUIRE_NVENC=1`, which only the script sets after
+  its refusal check, so a plain `go test` or `make test` on the GPU host no
+  longer bypasses the refusal.
 
 #### M3b3 deferred minors
 

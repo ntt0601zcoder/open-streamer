@@ -612,25 +612,63 @@ func runMain(t *testing.T, args string) (code int, stdout, stderr string) {
 	return code, out.String(), errb.String()
 }
 
-// TestProbeFlag: -probe nvenc exits 0 with "nvenc: ok" when a device opens,
-// or 3 with the error; any other probe is bad usage.
-func TestProbeFlag(t *testing.T) {
-	code, stdout, stderr := runMain(t, "-probe nvenc")
-	t.Logf("-probe nvenc: exit %d, stdout %q", code, stdout)
-	switch code {
-	case 0:
-		assert.Equal(t, "nvenc: ok\n", stdout)
-	case 3:
-		require.True(t, strings.HasPrefix(stdout, "nvenc: "), "stdout %q", stdout)
-		assert.NotEqual(t, "nvenc: ok\n", stdout)
-		assert.Equal(t, 1, strings.Count(stdout, "\n"), "stdout %q", stdout)
-		require.NotEqual(t, "1", os.Getenv("OS_REQUIRE_NVENC"), "OS_REQUIRE_NVENC=1 but the probe failed: %s", stdout)
-	default:
-		t.Fatalf("-probe nvenc: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+// nvencOptIn is the reason an NVENC test skips where a device exists and
+// neither OS_NVENC nor OS_REQUIRE_NVENC is "1".
+const nvencOptIn = "NVENC tests are opt-in: set OS_NVENC=1 (make test-nvenc does)"
+
+// nvencGate reports whether a test that opens an NVENC session may run:
+// always without a device, and with one only when opted in.
+func nvencGate(device, optedIn bool) bool { return !device || optedIn }
+
+// nvencProbeOrSkip skips a test that opens an NVENC session where a device
+// exists (/dev/nvidiactl) unless OS_NVENC or OS_REQUIRE_NVENC is "1".
+// Without a device the test runs and finds no NVENC. This is the third
+// copy of the opt-in gate, beside testpeer.NVENCOptedIn and native's
+// nvencOrSkip: carry a change to one to all three. Importing testpeer
+// would pull this package into the untagged peer run.
+func nvencProbeOrSkip(t *testing.T) {
+	t.Helper()
+	_, err := os.Stat("/dev/nvidiactl")
+	optedIn := os.Getenv("OS_NVENC") == "1" || os.Getenv("OS_REQUIRE_NVENC") == "1"
+	if !nvencGate(err == nil, optedIn) {
+		t.Skip(nvencOptIn)
 	}
+}
+
+func TestNVENCGate(t *testing.T) {
+	for _, c := range []struct{ device, optedIn, want bool }{
+		{false, false, true},
+		{false, true, true},
+		{true, false, false},
+		{true, true, true},
+	} {
+		assert.Equal(t, c.want, nvencGate(c.device, c.optedIn), "device %v, opted in %v", c.device, c.optedIn)
+	}
+}
+
+// TestProbeFlag: -probe nvenc exits 0 with "nvenc: ok" when a device opens,
+// or 3 with the error (the device subtest, which opens an NVENC session);
+// any other probe is bad usage.
+func TestProbeFlag(t *testing.T) {
+	t.Run("device", func(t *testing.T) {
+		nvencProbeOrSkip(t)
+		code, stdout, stderr := runMain(t, "-probe nvenc")
+		t.Logf("-probe nvenc: exit %d, stdout %q", code, stdout)
+		switch code {
+		case 0:
+			assert.Equal(t, "nvenc: ok\n", stdout)
+		case 3:
+			require.True(t, strings.HasPrefix(stdout, "nvenc: "), "stdout %q", stdout)
+			assert.NotEqual(t, "nvenc: ok\n", stdout)
+			assert.Equal(t, 1, strings.Count(stdout, "\n"), "stdout %q", stdout)
+			require.NotEqual(t, "1", os.Getenv("OS_REQUIRE_NVENC"), "OS_REQUIRE_NVENC=1 but the probe failed: %s", stdout)
+		default:
+			t.Fatalf("-probe nvenc: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+		}
+	})
 
 	for _, args := range []string{"-probe x", "-probe", "-probe nvenc extra"} {
-		code, stdout, stderr = runMain(t, args)
+		code, stdout, stderr := runMain(t, args)
 		assert.Equal(t, 2, code, "%q", args)
 		assert.Empty(t, stdout, "%q", args)
 		assert.Contains(t, stderr, "usage: ostranscoder", "%q", args)
@@ -640,6 +678,7 @@ func TestProbeFlag(t *testing.T) {
 // TestChildEncoderFallbacks: the rung's Encoder reaches the pipeline, and
 // its fallbacks reach the host in Stats: 0 when NVENC opens, 1 otherwise.
 func TestChildEncoderFallbacks(t *testing.T) {
+	nvencProbeOrSkip(t)
 	want := uint64(0)
 	if err := native.ProbeNVENC(); err != nil {
 		want = 1
