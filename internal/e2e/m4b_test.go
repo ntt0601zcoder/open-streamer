@@ -3,7 +3,9 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +25,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode"
+	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/dash"
 	"github.com/ntt0601zcoder/open-streamer/pkg/hls"
 )
@@ -227,6 +230,17 @@ func packABR(t *testing.T, steps []step, queue int, slow *handBursts) abrScenari
 	if queue == bigQueue {
 		require.Zero(t, r.lost)
 	}
+	r.base, r.caps = serveABR(t, p, clk, fd, fmt.Sprintf("written %d frames %s; packager lost %d frames in %d losses",
+		len(r.written), trackCounts(r.written), r.lost, r.losses))
+	return r
+}
+
+// serveABR lists every segment of the ended ABR packager p (advancing clk),
+// checks that every segment Start exceeds the one before (ruling R-B8),
+// serves p (fd feeds stream.ts, which ABR outputs do not use) and reads
+// every ABR output back with readABR. note heads the log line.
+func serveABR(t *testing.T, p *live.Packager, clk *fakeClock, fd feed, note string) (string, map[string]conform.Capture) {
+	t.Helper()
 	content := advance(t, p, clk)
 	snap := p.Snapshot()
 	gaps := 0
@@ -237,11 +251,10 @@ func packABR(t *testing.T, steps []step, queue int, slow *handBursts) abrScenari
 		}
 		gaps += len(snap.Tracks) - len(seg.Parts)
 	}
-	t.Logf("written %d frames %s, content %v, %d segments, %d epochs, %d missing parts; packager lost %d frames in %d losses",
-		len(r.written), trackCounts(r.written), content, len(snap.Segments), len(snap.Epochs), gaps, r.lost, r.losses)
-	r.base = serve(t, p, fd)
-	r.caps = readABR(t, r.base)
-	return r
+	t.Logf("%s; content %v, %d segments, %d epochs, %d missing parts", note, content, len(snap.Segments),
+		len(snap.Epochs), gaps)
+	base := serve(t, p, fd)
+	return base, readABR(t, base)
 }
 
 // feedABR packages steps with live.Options{ABR: true} through a packager
@@ -346,18 +359,25 @@ func shapes(frames []media.Frame) map[uint32]epochShape {
 // assertCompleteABR checks, per ABR format, that every written video frame
 // of every track is captured once (capture video tracks, in order, are the
 // presentation's video tracks, in order: per epoch the same count, DTS
-// steps and picture size), and the audio once per hls-ts variant, once in
-// hls-fmp4 and in dash.
+// steps and picture size), and the audio track (the presentations have
+// one) once per hls-ts variant, once in hls-fmp4 and in dash, with the
+// same count and DTS steps per epoch. Formats missing from caps are not
+// checked.
 func assertCompleteABR(t *testing.T, caps map[string]conform.Capture, written []media.Frame) {
 	t.Helper()
 	wv, wa := byTrack(written)
 	vtracks := sortedKeys(wv)
+	require.LessOrEqual(t, len(wa), 1, "one audio track at most")
 	var audio []media.Frame
 	for _, tr := range sortedKeys(wa) {
-		audio = append(audio, wa[tr]...)
+		audio = wa[tr]
 	}
 	for _, f := range abrFormats {
-		cv, ca := byTrack(caps[f.name].Frames)
+		c, ok := caps[f.name]
+		if !ok {
+			continue
+		}
+		cv, ca := byTrack(c.Frames)
 		ctracks := sortedKeys(cv)
 		if !assert.Len(t, ctracks, len(vtracks), "%s: video tracks", f.name) {
 			continue
@@ -377,9 +397,9 @@ func assertCompleteABR(t *testing.T, caps map[string]conform.Capture, written []
 		if !assert.Len(t, ca, n, "%s: audio captures", f.name) {
 			continue
 		}
-		want := kindCounts(audio)
+		want := shapes(audio)
 		for tr, fs := range ca {
-			assert.Equal(t, want, kindCounts(fs), "%s: audio capture track %d", f.name, tr)
+			assert.Equal(t, want, shapes(fs), "%s: audio capture track %d", f.name, tr)
 		}
 	}
 }
@@ -734,6 +754,26 @@ func TestM4bSwitchTS(t *testing.T) {
 		pts[0], pts[len(pts)-1])
 }
 
+// pacedSteps writes steps at their own pace, as m4aSource writes a
+// fixture: each frame at its DTS after the first.
+func pacedSteps(steps []step) feed {
+	return func(ctx context.Context, h *hub.Hub) error {
+		start := time.Now()
+		first := steps[0].f.DTS
+		for _, s := range steps {
+			if d := time.Until(start.Add(media.ToDuration(s.f.DTS - first))); d > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(d):
+				}
+			}
+			s.write(h)
+		}
+		return nil
+	}
+}
+
 // killAfterKeys kills tr's child once, after the n-th video keyframe has
 // reached h, watching from a subscriber taken now. The returned channel
 // yields the kill time and is closed once the watcher is done (also when h
@@ -774,17 +814,27 @@ func killAfterKeys(t *testing.T, tr *transcode.Transcoder, h *hub.Hub, n int) <-
 }
 
 // TestM4bRespawn kills the child with SIGKILL once, after its 3rd output
-// keyframe on t240, while h264_aac.ts is fed once at its pace. The
-// presentation gets exactly one new epoch, which starts with rung 0's IDR:
-// its epochs are [1 2]; read back, every frame is there once; in hls-ts
-// and hls-fmp4 every playlist has exactly one discontinuity, at the same
-// msn; the MPD has 2 periods, each with the 4 video Representations.
+// keyframe on t240, while h264_aac.ts is fed twice at its pace
+// (loopSteps, pacedSteps: one upstream epoch, the second pass shifted). The presentation gets
+// exactly one new epoch, which starts with rung 0's IDR: its epochs are
+// [1 2]; read back, every frame is there once; in hls-ts and hls-fmp4
+// every playlist has exactly one discontinuity, at the same msn; the MPD
+// has 2 periods, each with the 4 video Representations.
+//
+// Timing budget: the source keys every second from 1.48 s. t240's 3rd
+// output keyframe is source key 3.48 s, reached about 2 s after the feed
+// starts plus the encoder's latency; the 2× feed lasts about 10 s, so 7
+// source keyframes (and about 7.5 s of wall time) remain after the kill
+// for the backoff (RespawnMin 250 ms), the new child's start-up and Hello,
+// and its first IDR. A single pass would leave one keyframe, at 5.48 s,
+// which a loaded runner (arm64, -race, parallel children) can miss.
 func TestM4bRespawn(t *testing.T) {
 	t.Parallel()
 	bin := testpeer.OSTranscoder(t)
 	opt := m4bLadder(bin)
 	var killed <-chan time.Time
-	run := recordTranscode(t, m4aSource(t, "h264_aac.ts"), opt, func(tr *transcode.Transcoder) {
+	src := pacedSteps(loopSteps(clockSteps(t, "h264_aac.ts", newFakeClock(m3aT0).Now), 2))
+	run := recordTranscode(t, src, opt, func(tr *transcode.Transcoder) {
 		killed = killAfterKeys(t, tr, tr.Hubs()[0], 3)
 	})
 	at, ok := <-killed
@@ -817,4 +867,182 @@ func TestM4bRespawn(t *testing.T) {
 	disc := assertDiscontinuitiesAligned(t, base)
 	assertABRManifests(t, base, len(opt.Renditions), 2)
 	t.Logf("discontinuity at msn %v", disc)
+}
+
+// tsAudioFrames counts the audio frames of segment seg's TS variant of
+// video track tr.
+func tsAudioFrames(t *testing.T, seg live.SegmentInfo, tr int) int {
+	t.Helper()
+	i := slices.IndexFunc(seg.VariantTS, func(v live.VariantTS) bool { return v.Track == tr })
+	require.GreaterOrEqual(t, i, 0, "segment %d has variant %d", seg.Seq, tr)
+	d, err := ts.NewDemuxer(bytes.NewReader(seg.VariantTS[i].Data))
+	require.NoError(t, err)
+	n := 0
+	for {
+		f, err := d.Read()
+		if errors.Is(err, io.EOF) {
+			return n
+		}
+		require.NoError(t, err)
+		if f.Kind() == media.KindAudio {
+			n++
+		}
+	}
+}
+
+// gapRung is the rung TestM4bRungGap leaves out: t120.
+const gapRung = 2
+
+// TestM4bRungGap shows ruling R-B8's other half end to end (Review Focus
+// 2): a rung whose IDR a loss swallowed lists a gap rather than a part
+// that starts mid-GOP. The h264_aac.ts presentation is handed to an ABR
+// packager directly, with rung 2's frames dropped from its IDR at the
+// second segment's start K up to its next keyframe (1 s later), and the
+// delivery of rung 0's IDR at K, the first at that barrier, carrying Lost,
+// as a hub loss just before K signals it. The segment at K is
+// discontinuous and has no rung-2 part: hls/v2.m3u8 lists gap-2-{Seq}.ts
+// and cmaf/v2.m3u8 a gap entry there, every other variant a real entry;
+// every format reads back with no violation, rung 2's frames from its next
+// keyframe on and every other frame once; and ffmpeg decodes hls/v2.m3u8
+// with no error.
+func TestM4bRungGap(t *testing.T) {
+	t.Parallel()
+	bin := testpeer.OSTranscoder(t)
+	steps := m4bRuns(t, bin, "h264_aac.ts")["h264_aac.ts"].presentation
+	rung := transcode.PresentationTrack(gapRung)
+
+	// K: the second segment's start, as the barrier makes it, two
+	// keyframes after the first.
+	keys := keySet(presentationTrackFrames(stepFrames(steps), transcode.PresentationTrack(0)))
+	require.GreaterOrEqual(t, len(keys), 4)
+	k := keys[2]
+	var kept []hub.Delivery
+	dropping, lostAt := false, -1
+	for _, s := range steps {
+		f := s.f
+		if f.Track == rung && f.Kind() == media.KindVideo && f.Key {
+			dropping = f.PTS == k
+		}
+		if dropping && f.Track == rung {
+			continue
+		}
+		if lostAt < 0 && f.Track == transcode.PresentationTrack(0) && f.Key && f.PTS == k {
+			lostAt = len(kept)
+		}
+		kept = append(kept, hub.Delivery{Frame: f})
+	}
+	require.GreaterOrEqual(t, lostAt, 0)
+	dropped := len(steps) - len(kept)
+	require.Positive(t, dropped)
+	kept[lostAt].Lost = uint64(dropped)
+
+	clk := newFakeClock(m3aT0)
+	h := hub.New(hub.Options{})
+	for _, s := range steps {
+		for _, a := range s.anchors {
+			h.SetAnchor(a)
+		}
+	}
+	p := live.NewPackager(h, live.Options{Window: m3aWindow, Now: clk.Now, ABR: true})
+	for _, d := range kept {
+		p.Handle(d)
+	}
+	p.End()
+	require.Zero(t, p.Errors())
+	require.Zero(t, p.FallbackAnchors())
+	base, caps := serveABR(t, p, clk, stepsFeed(steps),
+		fmt.Sprintf("rung %d: %d frames dropped from K = %d", rung, dropped, k))
+
+	snap := p.Snapshot()
+	at := slices.IndexFunc(snap.Segments, func(seg live.SegmentInfo) bool { return seg.Start == k })
+	require.GreaterOrEqual(t, at, 0, "a segment starts at K")
+	seg := snap.Segments[at]
+	assert.True(t, seg.Discontinuity, "the segment at K follows the loss")
+	msn := seg.Seq
+	for track := range len(m4bLadder(bin).Renditions) {
+		for _, f := range []struct{ dir, ext string }{{"hls", "ts"}, {"cmaf", "m4s"}} {
+			pl := mediaPlaylist(t, fmt.Sprintf("%s%s/v%d.m3u8", base, f.dir, track))
+			i := int(msn - pl.MediaSequence)
+			require.Less(t, i, len(pl.Segments))
+			e := pl.Segments[i]
+			if track == gapRung {
+				assert.True(t, e.Gap, "%s v%d: a gap at msn %d", f.dir, track, msn)
+				assert.Equal(t, fmt.Sprintf("gap-%d-%d.%s", track, msn, f.ext), e.URI, "%s v%d", f.dir, track)
+			} else {
+				assert.False(t, e.Gap, "%s v%d: a real entry at msn %d", f.dir, track, msn)
+			}
+		}
+	}
+	// The other segments list rung 2 for real.
+	for _, other := range snap.Segments {
+		if other.Seq != msn {
+			assert.True(t, slices.ContainsFunc(other.VariantTS, func(v live.VariantTS) bool { return v.Track == rung }),
+				"segment %d has rung %d", other.Seq, rung)
+		}
+	}
+
+	// Read back: rung 2 without the GOP dropped and without the rest of
+	// the segment at K (its first keyframe in it was not at K), everything
+	// else once. HLS epochs count discontinuities, so the loss splits them
+	// at K; compared over the stream, as the one DASH period.
+	flat := func(frames []media.Frame) []media.Frame {
+		out := slices.Clone(frames)
+		for i := range out {
+			out[i].Epoch = 1
+		}
+		return out
+	}
+	var want []media.Frame
+	for _, d := range kept {
+		f := d.Frame
+		if f.Track == rung && f.PTS >= seg.Start && f.PTS < seg.Start+seg.Duration {
+			continue
+		}
+		want = append(want, f)
+	}
+	// hls-fmp4 and dash: everything once, the audio in its own rendition.
+	// hls-ts: the video likewise, and the audio in every variant but v2,
+	// whose TS the gap left out at K.
+	checked := map[string]conform.Capture{}
+	for name, c := range caps {
+		c.Frames = flat(c.Frames)
+		if name == "hls-ts" {
+			c.Frames = slices.DeleteFunc(c.Frames, func(f media.Frame) bool { return f.Kind() == media.KindAudio })
+		}
+		checked[name] = c
+	}
+	videoOnly := slices.DeleteFunc(flat(want), func(f media.Frame) bool {
+		return f.Kind() == media.KindAudio
+	})
+	for _, f := range abrFormats {
+		w := flat(want)
+		if f.name == "hls-ts" {
+			w = videoOnly
+		}
+		assertCompleteABR(t, map[string]conform.Capture{f.name: checked[f.name]}, w)
+	}
+	audio := len(want) - len(videoOnly)
+	inK := tsAudioFrames(t, seg, transcode.PresentationTrack(0))
+	require.Positive(t, inK)
+	_, ca := byTrack(caps["hls-ts"].Frames)
+	counts := make([]int, 0, len(ca))
+	for _, tr := range sortedKeys(ca) {
+		counts = append(counts, len(ca[tr]))
+	}
+	want4 := []int{audio, audio, audio - inK, audio} // per variant, in order
+	assert.Equal(t, want4, counts, "hls-ts audio per variant: v2 lacks the %d frames of the segment at K", inK)
+	es := map[uint32]bool{}
+	for _, f := range caps["hls-ts"].Frames {
+		es[f.Epoch] = true
+	}
+	assert.Equal(t, map[uint32]bool{1: true, 2: true}, es, "hls-ts: the loss is a discontinuity")
+
+	ffmpeg := testpeer.Require(t, "ffmpeg")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffmpeg, "-v", "error", "-i", fmt.Sprintf("%shls/v%d.m3u8", base, gapRung), "-f", "null", "-")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	require.NoError(t, cmd.Run(), stderr.String())
+	assert.Empty(t, stderr.String(), "ffmpeg stderr")
 }
