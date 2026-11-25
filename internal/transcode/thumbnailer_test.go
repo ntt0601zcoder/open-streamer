@@ -21,6 +21,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/transcodetest"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/wire"
 )
 
 // thumbOptions runs the test binary as the fake child of a Thumbnailer.
@@ -286,6 +287,35 @@ func TestThumbnailerSkipsWhenChildBusy(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return")
 	}
+}
+
+// A key the wire protocol cannot carry is dropped and the child lives; a
+// source whose every key is too large logs that once per child, not at
+// every interval.
+func TestThumbnailerOversizeKeyLoggedOnce(t *testing.T) {
+	opt := thumbOptions(t, 1)
+	var logs syncBuffer
+	opt.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	cfg := fixtureVideoConfig(t)
+	s := startThumb(t, opt)
+	s.hello(t)
+	s.src.SetAnchor(media.Anchor{Epoch: 1, Wall: time.Now()})
+	big := [][]byte{make([]byte, wire.MaxMessage+1)}
+	const n = 5
+	for i := range int64(n) {
+		s.src.Write(media.Frame{Track: 0, Config: cfg, PTS: i * media.ClockRate, DTS: i * media.ClockRate, Key: true, Epoch: 1, Data: big})
+		require.Eventually(t, func() bool {
+			st := s.th.Stats()
+			return st.KeysSent+st.KeysSkipped == uint64(i+1)
+		}, 5*time.Second, time.Millisecond)
+		time.Sleep(200 * time.Millisecond) // the writer takes the key from the slot
+	}
+	st := s.th.Stats()
+	assert.GreaterOrEqual(t, st.KeysSent, uint64(2), "%+v", st)
+	assert.Zero(t, st.Shots)
+	assert.EqualValues(t, 1, st.Spawns, "the child lives")
+	assert.Zero(t, st.Exits)
+	assert.Equal(t, 1, strings.Count(logs.String(), "key dropped: the wire protocol cannot carry it"), logs.String())
 }
 
 // stubTime is a clock and a timer source for the silence timeout: delays of

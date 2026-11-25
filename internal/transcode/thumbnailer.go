@@ -489,6 +489,7 @@ func (t *Thumbnailer) writeChild(c *thumbChild) {
 		c.kill()
 		return
 	}
+	oversizeLogged := false // once per child, as the Transcoder's send does
 	for {
 		select {
 		case f := <-c.keys:
@@ -497,8 +498,13 @@ func (t *Thumbnailer) writeChild(c *thumbChild) {
 			case err == nil:
 			case errors.Is(err, wire.ErrLimit):
 				// Nothing was written: the child lives, without this key.
-				t.log.Warn("transcode: thumbnailer: key dropped: the wire protocol cannot carry it",
-					"pid", c.p.pid, "err", err)
+				// A source whose every key is too large would otherwise
+				// log at every interval, forever.
+				if !oversizeLogged {
+					oversizeLogged = true
+					t.log.Warn("transcode: thumbnailer: key dropped: the wire protocol cannot carry it",
+						"pid", c.p.pid, "err", err)
+				}
 			default:
 				c.kill()
 				return
