@@ -517,7 +517,8 @@ func cloneWatermark(w *picture.Watermark) *picture.Watermark {
 // removes it. It validates w as New does, and an error changes nothing. The
 // running child is told in order with its frames, and a child spawned later
 // starts with it; calls that pile up collapse to the latest. It is safe
-// from any goroutine, also before Run and after Run has ended.
+// from any goroutine, also before Run and after Run has ended; a call made
+// as Run ends may not reach the child that Run is stopping.
 func (t *Transcoder) SetWatermark(w *picture.Watermark) error {
 	if err := t.checkWatermark(w); err != nil {
 		return fmt.Errorf("transcode: set watermark: %w", err)
