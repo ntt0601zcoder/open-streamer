@@ -19,7 +19,7 @@
 // On fd 3 it writes Hello, reads Configure, then turns every Frame into
 // encoded frames, drains on Discontinuity, swaps the watermark at the next
 // picture on SetWatermark (one it cannot take is fatal), and writes Stats
-// every second. It
-// exits 0 after flushing on Stop or EOF from the host, 1 after writing a
-// fatal Error, and 2 on bad usage. libav logs go to stderr at warning level.
+// every second. It exits 0 after flushing on Stop or EOF from the host, 1
+// after writing a fatal Error, and 2 on bad usage. libav logs go to stderr
+// at warning level.
 package main

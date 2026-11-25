@@ -12,7 +12,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -418,11 +417,13 @@ func TestWatermarkTextIsLiteral(t *testing.T) {
 		for _, s := range []string{"%{localtime}", "/etc/passwd", "[in]", "localtime", "字"} {
 			assert.NotContains(t, desc, s)
 		}
-		paths := regexp.MustCompile(`([a-z]+)=(/[^:,]*)`).FindAllStringSubmatch(desc, -1)
-		require.Len(t, paths, 2, "absolute paths in %q", desc)
-		assert.Equal(t, []string{"fontfile", dir + "/font.ttf"}, paths[0][1:])
-		assert.Equal(t, []string{"textfile", dir + "/text"}, paths[1][1:])
-		assert.Equal(t, 1, strings.Count(desc, "/"+filepath.Base(dir)+"/font.ttf"))
+		// The only paths are the child's own: once they are taken out, no
+		// '/' is left.
+		for _, kv := range []string{"fontfile=" + dir + "/font.ttf:", "textfile=" + dir + "/text:"} {
+			require.Equal(t, 1, strings.Count(desc, kv), "%q in %q", kv, desc)
+			desc = strings.Replace(desc, kv, "", 1)
+		}
+		assert.NotContains(t, desc, "/", "a path is left in %q", desc)
 		got, err := os.ReadFile(filepath.Join(dir, "text"))
 		require.NoError(t, err)
 		assert.Equal(t, picture.FormatText(text, time.Now()), string(got), "the text file holds the text verbatim")
@@ -638,14 +639,15 @@ func TestWatermarkTempDirChars(t *testing.T) {
 	assert.Empty(t, m, "the refused directory is removed")
 }
 
-// A watermark that cannot be built is fatal (R-C9): here the text file is
-// gone when the next text watermark's graph is built. (A missing font would
-// not do: drawtext falls back to fontconfig.)
+// A watermark that cannot be built is fatal (R-C9): here the text file has
+// been replaced by a directory when the next graph is built.
 func TestWatermarkBuildFailureIsFatal(t *testing.T) {
 	src := source(t, "h264_aac.ts")
 	p := newWMPipeline(t, Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}, Watermark: &picture.Watermark{Text: "a"}})
 	_, rest := pushVideoCount(t, p, src, 30)
-	require.NoError(t, os.Remove(filepath.Join(p.video.wm.dir, "text")))
+	text := filepath.Join(p.video.wm.dir, "text")
+	require.NoError(t, os.Remove(text))
+	require.NoError(t, os.Mkdir(text, 0o700))
 	require.NoError(t, p.SetWatermark(&picture.Watermark{Text: "a", Position: picture.Center}))
 	var err error
 	for _, f := range rest {
@@ -656,4 +658,67 @@ func TestWatermarkBuildFailureIsFatal(t *testing.T) {
 	require.ErrorContains(t, err, "watermark")
 	_, err2 := p.Push(rest[len(rest)-1])
 	assert.Equal(t, err, err2, "the error is permanent")
+}
+
+// A temp cleaner may remove the font, the text or the whole directory on a
+// long stream: the next graph build writes them again, the font from the
+// embedded copy, never falling back to fontconfig (R-C7).
+func TestWatermarkFilesRestored(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	plain := unmarked(t, src)
+	for _, tc := range []struct {
+		name   string
+		remove func(dir string) error
+	}{
+		{"files", func(dir string) error {
+			return errors.Join(os.Remove(filepath.Join(dir, "font.ttf")), os.Remove(filepath.Join(dir, "text")))
+		}},
+		{"directory", os.RemoveAll},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newWMPipeline(t, Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}, Watermark: &picture.Watermark{Text: "a"}})
+			outs, rest := pushVideoCount(t, p, src, 30)
+			dir := p.video.wm.dir
+			require.NoError(t, tc.remove(dir))
+			// The same text: the text cache has nothing new to write, so only
+			// the build can bring the file back.
+			require.NoError(t, p.SetWatermark(&picture.Watermark{Text: "a", Position: picture.BottomLeft}))
+			outs = append(outs, run(t, p, rest)...)
+			font, err := os.ReadFile(filepath.Join(dir, "font.ttf"))
+			require.NoError(t, err)
+			assert.Equal(t, dejaVuSans, font)
+			text, err := os.ReadFile(filepath.Join(dir, "text"))
+			require.NoError(t, err)
+			assert.Equal(t, "a", string(text))
+			imgs := decodeRung(t, outs, 0)
+			require.Len(t, imgs, len(plain))
+			last := len(imgs) - 1
+			assert.Greater(t, band(imgs[last], plain[last], textBand), 2.0, "the last picture has no text")
+		})
+	}
+}
+
+// The image is added at the first picture's PTS, so a picture before 0 is
+// marked too.
+func TestWatermarkNegativePTS(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	const shift = 1_000_000
+	for i := range src {
+		src[i].PTS -= shift
+		src[i].DTS -= shift
+	}
+	p := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Image: magenta64(t), SizePct: 25},
+	})
+	outs := run(t, p, src)
+	v := rungFrames(outs, 0)
+	require.NotEmpty(t, v)
+	require.Negative(t, v[len(v)-1].PTS)
+	imgs := decodeRung(t, outs, 0)
+	require.Len(t, imgs, 150)
+	for _, i := range []int{0, len(imgs) - 1} {
+		got := region(imgs[i], picture.TopLeft, 25, squareHPct(imgs[i], 25))
+		assert.True(t, near(got, magenta, 40), "picture %d: %v", i, got)
+	}
 }

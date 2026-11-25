@@ -92,10 +92,9 @@ type Stats struct {
 
 // Pipeline decodes the source video once, draws the watermark on it when
 // one is set, encodes it per rung with libx264 or NVENC, and re-encodes
-// every audio track to AAC. Its input is already
-// in rendition time: epoch-mapped and shifted by D. Output PTS are the
-// input's; video output DTS are the encoder's. It is not safe for
-// concurrent use.
+// every audio track to AAC. Its input is already in rendition time:
+// epoch-mapped and shifted by D. Output PTS are the input's; video output
+// DTS are the encoder's. It is not safe for concurrent use.
 type Pipeline struct {
 	video  *videoPath // nil without rungs
 	audio  *Audio     // resolved; nil when audio is ignored

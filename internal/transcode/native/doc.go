@@ -5,6 +5,7 @@
 // picture with libavfilter (text through drawtext and an embedded DejaVu
 // Sans, read from a file so that operator text never enters a graph
 // string), scales and encodes an H.264 ladder, and re-encodes or drops
-// audio, keeping every rung keyframe-aligned with the source. It uses cgo through go-astiav and builds only with the build
-// tag libav, against FFmpeg 8.1 (scripts/ffmpeg-dev.sh).
+// audio, keeping every rung keyframe-aligned with the source. It uses cgo
+// through go-astiav and builds only with the build tag libav, against FFmpeg
+// 8.1 (scripts/ffmpeg-dev.sh).
 package native

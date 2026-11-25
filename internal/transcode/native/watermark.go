@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -136,7 +137,7 @@ func (m *watermarker) apply(fr *astiav.Frame) (*astiav.Frame, error) {
 	}
 	if m.graph == nil || k != m.key {
 		m.freeGraph()
-		if err := m.build(k); err != nil {
+		if err := m.build(k, fr.Pts()); err != nil {
 			m.freeGraph()
 			return nil, err
 		}
@@ -165,6 +166,19 @@ func (m *watermarker) writeText() error {
 	if m.hasWritten && s == m.written {
 		return nil
 	}
+	if err := m.writeTextFile(s); err != nil {
+		return err
+	}
+	m.written, m.hasWritten = s, true
+	return nil
+}
+
+// writeTextFile replaces <dir>/text with s atomically, making the directory
+// again if it is gone.
+func (m *watermarker) writeTextFile(s string) error {
+	if err := os.MkdirAll(m.dir, 0o700); err != nil {
+		return fmt.Errorf("watermark: temp dir: %w", err)
+	}
 	tmp := filepath.Join(m.dir, "text.tmp")
 	if err := os.WriteFile(tmp, []byte(s), 0o600); err != nil {
 		return fmt.Errorf("watermark: write text: %w", err)
@@ -172,7 +186,32 @@ func (m *watermarker) writeText() error {
 	if err := os.Rename(tmp, filepath.Join(m.dir, "text")); err != nil {
 		return fmt.Errorf("watermark: write text: %w", err)
 	}
-	m.written, m.hasWritten = s, true
+	return nil
+}
+
+// restoreFiles writes the font and the text again if they are gone, as when
+// a temp cleaner ages the directory on a long stream: drawtext would
+// otherwise fall back to fontconfig for the font (against R-C7) and fail on
+// the text.
+func (m *watermarker) restoreFiles() error {
+	if err := os.MkdirAll(m.dir, 0o700); err != nil {
+		return fmt.Errorf("watermark: temp dir: %w", err)
+	}
+	font := filepath.Join(m.dir, "font.ttf")
+	switch _, err := os.Stat(font); {
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.WriteFile(font, dejaVuSans, 0o600); err != nil {
+			return fmt.Errorf("watermark: write font: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("watermark: font: %w", err)
+	}
+	switch _, err := os.Stat(filepath.Join(m.dir, "text")); {
+	case errors.Is(err, fs.ErrNotExist) && m.hasWritten:
+		return m.writeTextFile(m.written)
+	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("watermark: text: %w", err)
+	}
 	return nil
 }
 
@@ -206,9 +245,14 @@ func (m *watermarker) imageGraph(w, h int) string {
 		"[in][o]overlay=%s:%s:format=auto,format=yuv420p", mw, opacity(wm.OpacityPct), x, y)
 }
 
-// build makes the graph for pictures of k. On an error the caller frees
-// what was built.
-func (m *watermarker) build(k graphKey) error {
+// build makes the graph for pictures of k, the first of which is at pts.
+// On an error the caller frees what was built.
+func (m *watermarker) build(k graphKey, pts int64) error {
+	if m.img == nil {
+		if err := m.restoreFiles(); err != nil {
+			return err
+		}
+	}
 	g := astiav.AllocFilterGraph()
 	if g == nil {
 		return errors.New("watermark: alloc filter graph")
@@ -264,7 +308,7 @@ func (m *watermarker) build(k graphKey) error {
 		return fmt.Errorf("watermark: configure graph: %w", err)
 	}
 	if mark != nil {
-		if err := m.addImage(mark); err != nil {
+		if err := m.addImage(mark, pts); err != nil {
 			return err
 		}
 	}
@@ -298,9 +342,10 @@ func newSource(g *astiav.FilterGraph, name string, k graphKey) (*astiav.Buffersr
 	return src, nil
 }
 
-// addImage adds the image once, at PTS 0, and ends the mark's input, so
-// that overlay repeats it on every picture.
-func (m *watermarker) addImage(mark *astiav.BuffersrcFilterContext) error {
+// addImage adds the image once, at pts, the PTS of the graph's first
+// picture, and ends the mark's input, so that overlay repeats it on that
+// picture and every later one, whatever their sign.
+func (m *watermarker) addImage(mark *astiav.BuffersrcFilterContext, pts int64) error {
 	b := m.img.Bounds()
 	f := astiav.AllocFrame()
 	defer f.Free()
@@ -314,7 +359,7 @@ func (m *watermarker) addImage(mark *astiav.BuffersrcFilterContext) error {
 	if err := f.Data().FromImage(m.img); err != nil {
 		return fmt.Errorf("watermark: image frame: %w", err)
 	}
-	f.SetPts(0)
+	f.SetPts(pts)
 	if err := mark.AddFrame(f, astiav.NewBuffersrcFlags()); err != nil {
 		return fmt.Errorf("watermark: add image: %w", err)
 	}
