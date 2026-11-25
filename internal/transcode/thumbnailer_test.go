@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -513,4 +514,100 @@ func TestThumbnailerNoHello(t *testing.T) {
 	st := s.th.Stats()
 	assert.EqualValues(t, 2, st.Spawns)
 	assert.EqualValues(t, 1, st.Exits)
+}
+
+// OnEvent reports each child's start and end from the Run goroutine, as the
+// Transcoder's does: EventSpawned with the child's PID, and exactly one
+// EventExited per child, whether it cannot be started, is killed, or is
+// killed by Run for silence. Stats and the retries are as without OnEvent
+// (the tests above, which leave it nil).
+func TestThumbnailerEvents(t *testing.T) {
+	t.Run("missing binary", func(t *testing.T) {
+		// The first attempt (made before any wait) and one fired retry give
+		// two events; the second wait is pending and is not fired.
+		ra := &recordAfter{n: 1, full: make(chan struct{})}
+		opt := thumbOptions(t, 2)
+		opt.Binary = "/nonexistent"
+		opt.After = ra.After
+		ev := &events{}
+		opt.OnEvent = ev.add
+		th, err := NewThumbnailer(hub.New(hub.Options{}), opt)
+		require.NoError(t, err)
+		ctx, cancel := context.WithCancel(t.Context())
+		errc := make(chan error, 1)
+		go func() { errc <- th.Run(ctx) }()
+		select {
+		case <-ra.full:
+		case err := <-errc:
+			t.Fatalf("Run returned: %v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("no retry")
+		}
+		ra.mu.Lock()
+		assert.Len(t, ra.delays, 2, "After called twice")
+		ra.mu.Unlock()
+		exits := ev.of(EventExited)
+		require.Len(t, exits, 2)
+		for _, e := range exits {
+			assert.ErrorContains(t, e.Err, "/nonexistent")
+			assert.Zero(t, e.PID)
+		}
+		assert.Empty(t, ev.of(EventSpawned))
+		assert.Equal(t, ThumbnailerStats{Spawns: 2, Exits: 2}, th.Stats())
+		cancel()
+		select {
+		case err := <-errc:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(10 * time.Second):
+			t.Fatal("Run did not return")
+		}
+		ev.mu.Lock()
+		assert.Len(t, ev.evs, 2, "nothing more at the end of Run")
+		ev.mu.Unlock()
+	})
+
+	t.Run("killed", func(t *testing.T) {
+		opt := thumbOptions(t, 2)
+		ev := &events{}
+		opt.OnEvent = ev.add
+		s := startThumb(t, opt)
+		first := s.hello(t)
+		require.NoError(t, syscall.Kill(first, syscall.SIGKILL))
+		second := s.hello(t)
+		ev.mu.Lock()
+		evs := slices.Clone(ev.evs)
+		ev.mu.Unlock()
+		require.Len(t, evs, 3, "%+v", evs)
+		assert.Equal(t, Event{Kind: EventSpawned, PID: first}, evs[0])
+		assert.Equal(t, EventExited, evs[1].Kind)
+		assert.Equal(t, first, evs[1].PID)
+		assert.Error(t, evs[1].Err)
+		assert.Equal(t, Event{Kind: EventSpawned, PID: second}, evs[2])
+		assert.Equal(t, ThumbnailerStats{Spawns: 2, Exits: 1}, s.th.Stats())
+	})
+
+	t.Run("silent", func(t *testing.T) {
+		ft := &stubTime{now: time.Unix(1000, 0), timers: make(chan stubTimer, 16)}
+		opt := thumbOptions(t, 2, transcodetest.EnvStatsInterval+"=1h")
+		opt.SilenceTimeout = 7 * time.Second
+		opt.Now, opt.After = ft.Now, ft.After
+		ev := &events{}
+		opt.OnEvent = ev.add
+		s := startThumb(t, opt)
+		first := s.hello(t)
+		tm := ft.timer(t)
+		ft.advance(7 * time.Second)
+		tm.c <- ft.Now()
+		second := s.hello(t)
+		ev.mu.Lock()
+		evs := slices.Clone(ev.evs)
+		ev.mu.Unlock()
+		require.Len(t, evs, 3, "one EventExited for the silent child: %+v", evs)
+		assert.Equal(t, Event{Kind: EventSpawned, PID: first}, evs[0])
+		assert.Equal(t, EventExited, evs[1].Kind)
+		assert.Equal(t, first, evs[1].PID)
+		assert.ErrorContains(t, evs[1].Err, "silent for 7s")
+		assert.Equal(t, Event{Kind: EventSpawned, PID: second}, evs[2])
+		assert.Equal(t, ThumbnailerStats{Spawns: 2, Exits: 1}, s.th.Stats())
+	})
 }

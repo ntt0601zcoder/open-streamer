@@ -49,6 +49,10 @@ type ThumbnailerOptions struct {
 	// OnShot is called with every thumbnail, from the child's reader
 	// goroutine: it must not block. Optional.
 	OnShot func(picture.Shot)
+	// OnEvent is called from the Run goroutine with EventSpawned (PID set)
+	// when a child starts and EventExited (Err set) when one exits, is
+	// killed, or cannot be started, as the Transcoder's is. Optional.
+	OnEvent func(Event)
 }
 
 // ThumbnailerStats counts a Thumbnailer's work: the children started and
@@ -153,6 +157,12 @@ func (t *Thumbnailer) Stats() ThumbnailerStats {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.stats
+}
+
+func (t *Thumbnailer) emit(e Event) {
+	if t.opt.OnEvent != nil {
+		t.opt.OnEvent(e)
+	}
 }
 
 func (t *Thumbnailer) update(fn func(s *ThumbnailerStats)) {
@@ -290,10 +300,12 @@ func (s *thumbRun) spawn() {
 	if err != nil {
 		t.update(func(st *ThumbnailerStats) { st.Exits++ })
 		t.log.Warn("transcode: thumbnailer: spawn failed", "err", err)
+		t.emit(Event{Kind: EventExited, Err: err})
 		s.respawn = t.opt.After(s.backoff.next(0))
 		return
 	}
 	s.c = c
+	t.emit(Event{Kind: EventSpawned, PID: c.p.pid})
 }
 
 // exited handles the end of the current child: a fatal error ends Run, any
@@ -322,6 +334,7 @@ func (s *thumbRun) exited() error {
 	t.sched = picture.NewSchedule(t.every)
 	t.retry.childExited()
 	t.mu.Unlock()
+	t.emit(Event{Kind: EventExited, PID: c.p.pid, Err: fmt.Errorf("transcode: thumbnailer: child %d: %w", c.p.pid, err)})
 	s.respawn = t.opt.After(s.backoff.next(t.opt.Now().Sub(c.started)))
 	return nil
 }
