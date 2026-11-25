@@ -76,3 +76,46 @@ func RTMPKey(path string) string {
 	}
 	return path[:i+1] + string(name) + mask
 }
+
+// Masked reports whether rawURL carries the mask where URL writes it: as
+// the password, as a lone user, as the value of a secret query parameter,
+// or, for rtmp://, at the end of the stream name. Such a URL came back
+// from URL, so it no longer holds the secret and must not be stored.
+func Masked(rawURL string) bool {
+	if !strings.Contains(rawURL, "://") {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	if u.User != nil {
+		if pw, hasPW := u.User.Password(); hasPW {
+			if pw == mask {
+				return true
+			}
+		} else if u.User.Username() == mask {
+			return true
+		}
+	}
+	for pair := range strings.SplitSeq(u.RawQuery, "&") {
+		k, v, ok := strings.Cut(pair, "=")
+		if !ok || v != mask {
+			continue
+		}
+		if name, err := url.QueryUnescape(k); err == nil {
+			k = name
+		}
+		if slices.Contains(secretKeys, strings.ToLower(k)) {
+			return true
+		}
+	}
+	if strings.EqualFold(u.Scheme, "rtmp") {
+		p := strings.TrimRight(u.Path, "/")
+		if u.Opaque != "" {
+			p = u.Opaque
+		}
+		return p != "" && strings.HasSuffix(p[strings.LastIndexByte(p, '/')+1:], mask)
+	}
+	return false
+}

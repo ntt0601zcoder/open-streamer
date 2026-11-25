@@ -68,3 +68,48 @@ func TestRTMPKey(t *testing.T) {
 		assert.Equal(t, c.want, RTMPKey(c.in), c.in)
 	}
 }
+
+func TestMasked(t *testing.T) {
+	// Each form URL masks: Masked(URL(x)) is true and Masked(x) is false.
+	for _, x := range []string{
+		"rtsp://u:" + vPW + "@h/a",
+		"http://u@h/x",
+		"srt://h:1?" + kPass + "=" + vS + "&streamid=x",
+		"srt://h:1?PassPhrase=" + vS,
+		"http://h/x?token=abc",
+		"http://h/x?a=1&password=" + vPW,
+		"http://h/x?secret=" + vSecret,
+		"http://h/x?key=" + vS,
+		"rtmp://h/live/" + vStreamKey,
+		"rtmp://h/live/" + vStreamKey + "/",
+		"rtmp://h/live/ab",
+		"rtmp://h/live/abc",
+		"RTMP://h/live/" + vStreamKey,
+		"rtmp://:1935/live/" + vStreamKey + "?mode=listen",
+	} {
+		assert.True(t, Masked(URL(x)), "Masked(URL(%q)) = Masked(%q)", x, URL(x))
+		assert.False(t, Masked(x), x)
+	}
+	// A URL without secrets is false both ways.
+	for _, x := range []string{
+		"udp://@:5000",
+		"udp://:5000",
+		"http://h/x",
+		"http://h/x?streamid=x&mode=pull",
+		"http://h/live/" + vStreamKey,
+		"srt://h:1",
+		"/tmp/a.ts",
+		"file:///tmp/a.ts",
+		"",
+	} {
+		assert.False(t, Masked(x), x)
+		assert.False(t, Masked(URL(x)), "URL(%q) = %q", x, URL(x))
+	}
+	// The mask counts only where URL writes it.
+	assert.False(t, Masked("http://h/xxxxx"), "a path segment of another scheme")
+	assert.False(t, Masked("http://h/x?mode=xxxxx"), "a value of a key that is not secret")
+	assert.False(t, Masked("http://xxxxx.example/x"), "a host")
+	assert.True(t, Masked("rtsp://user:xxxxx@host/a"))
+	assert.True(t, Masked("rtmp://h/app/abxxxxx"))
+	assert.False(t, Masked("http://[::1"), "an invalid URL")
+}
