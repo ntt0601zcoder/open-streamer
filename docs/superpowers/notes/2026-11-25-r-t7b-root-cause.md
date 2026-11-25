@@ -12,11 +12,18 @@ The line is a limit of VLC 3, reached by a conformant stream. Keep
 `b-pyramid=none` on x264 rungs and `b_ref_mode=disabled` on NVENC rungs.
 
 **The upstream cause is VLC's clock reset, not the line.** Each reset
-flushes the decoders and buffers 1 s again, which a viewer notices. The
-line is only logged on top of some resets and does not itself stop
-playback: `input_DecoderWait` gives up waiting and the play goes on. Our
-encoder settings decide whether the line is logged, not whether VLC resets.
-Why VLC resets is under "Not determined".
+flushes the decoders and the pictures they had queued, and the re-buffer
+completes in about 1 ms of wall time (`Stream buffering done (1002 ms in
+1 ms)`: 1 s of PCR time, already downloaded). The line is only logged on top
+of some resets and adds no stall: `input_DecoderWait` gives up waiting and
+the play goes on. What a viewer sees at a reset, a skip or a freeze, was not
+observed: the runs used `--vout dummy` and no display capture was taken. It
+is under "Not determined", with why VLC resets.
+
+For the product: at 15 fps every VLC 3 play of a shipping rung resets once,
+at about 6 s, and logs the line. At 25 fps, HEAD with shipping settings
+showed no reset in 16 plays (the cell with 8 decoder threads); HEAD with the
+pyramid switched on resets about twice per play, without the line.
 
 1. **Where.** Never at the start of a play. It comes 4, 6 or 8 s in, each
    time VLC fetches a new segment at the live edge. VLC then logs
@@ -132,10 +139,16 @@ delivered after the reset and before the new IDR is parsed):
 | C again (16) | 46 | 1024, 1045, 1149 | 6 | 0 |
 | HEAD A (16) | 30 (two per run) | **1024**, 1045 | 13 | 0: at least 9 fed |
 
-In the failing resets the log shows the count directly: after the IDR, seven
+In the failing resets the log gives the count: after the IDR, six or seven
 more slices are parsed, `Received first picture`, then
-`buffer deadlock prevented` 4 µs later. The first picture needs 8 packets at
-depth 2 and the second 9, so exactly 8 were fed.
+`buffer deadlock prevented` 4 to about 600 µs later (cell A). The first
+picture needs 8 packets at depth 2 and the second 9, so exactly 8 were fed.
+
+**The slice log trails what was fed by one packet.** libavcodec's worker
+threads log a slice after the packet was submitted, so the newest packet may
+not be logged yet. In cell A's runs 10 and 12 only six slices follow the IDR
+before a first picture that needs 8 packets. Every slice count in these
+notes is therefore the packets fed, or one less.
 
 **The fed count is exact only where the line was logged.** `an.py` counts
 slices up to `Decoder wait done`, and a decoder that gets its second picture
@@ -204,7 +217,7 @@ only:
 |---|---|---|
 | Resets | not predicted | **one per run in 16 of 16**, at 6.05 s, when `6.ts` arrives; buffered 1002 ms |
 | Packets needed for the second picture | 8 | no picture at all was returned before the line, so fewer than 7 were fed |
-| Packets fed | 5 or 6 | 4 slices parsed before the line in 7 resets, 5 in 9 |
+| Packets fed | 5 or 6 | 4 slices parsed before the line in 7 resets, 5 in 9; with the one-packet logging lag (Step 3), 4 to 6 fed |
 | Stray picture | not predicted | none in 16 resets |
 | The line | in every reset without a stray picture | **16 of 16 runs** |
 
@@ -217,7 +230,8 @@ video copied, the audio re-encoded):
 8. Its SPS announces reorder 2 and DPB 4 (Main profile), the same depth as
 the pyramid, so it needs 9 packets. It has two resets per run, buffered
 1024 and 1045 ms, 11 of 32 without a stray picture, none with the line: at
-least 9 fed each time. 1024 and 1045 ms are cell C's and HEAD A's values. A
+least 9 fed each time (five of those resets log 8 slices, which is the
+one-packet logging lag of Step 3; the second picture needs 9). 1024 and 1045 ms are cell C's and HEAD A's values. A
 copy has no encoder lag, so its passes start without the audio lead, and
 the reset lands one frame later, as in C.
 
@@ -231,8 +245,9 @@ the reset lands one frame later, as in C.
   settings shows the line in 16 of 16 plays (Step 5). A fit on the two
   leads measured (700 ms: 8 fed; 780 ms: 5 or 6 parsed) puts the fed count
   near (1000 ms − PCR lead) / frame duration + 1, which gave 5 or 6 for
-  15 fps against 4 or 5 parsed. It is a fit, not a formula: the same lead
-  fed 8 at two buffered values and at least 9 at a third.
+  15 fps against 4 or 5 parsed. It holds only within the one-packet logging
+  lag of Step 3, and it is a fit, not a formula: the same lead fed 8 at two
+  buffered values and at least 9 at a third.
 - Whether VLC resets depends on the stream. At 25 fps HEAD with
   `b-pyramid=none` and `--avcodec-threads=8` showed no reset in 16 runs, so
   that cell says nothing about the margin; at 15 fps the same settings reset
@@ -279,6 +294,13 @@ the reset lands one frame later, as in C.
 - Why an audio lead in one segment moves the reset in the next by one AAC
   frame. It was shown by switching it (cell G, HEAD without the hold, and
   the copied source), not explained from VLC's source.
+- What a viewer sees at a reset. The decoders and their queued pictures are
+  flushed and the re-buffer takes about 1 ms of wall time, but no display
+  was captured. The only display-side messages in the logs are
+  `picture is too late to be displayed` (16 to 135 ms) in HEAD with the
+  pyramid on: about 4 pictures in 15 of 16 display logs, at 8.07 s when the
+  next segment arrives and no reset is logged. There are none at 15 fps, in
+  the pre-fix cells A and B, or in HEAD with shipping settings at 25 fps.
 - The one line logged with a stray picture at a 1069 ms buffer.
 - Cell counts differ run to run with how often a stray picture is delivered
   (3 of 16 to 8 of 16 for cell A). Another agent's stress run shared the
