@@ -84,6 +84,27 @@
 //
 //	osdev -stream cam=in.ts -loop -ostranscoder dist/ostranscoder-amd64/ostranscoder \
 //		-rung cam=720:720:3000 -rung cam=360:360:800 -rung cam=src:copy -audio cam=aac:96
+//
+// A rung may name its encoder as a fourth field, name=label:height:kbps:nvenc
+// (or x264, the default); an NVENC rung falls back to x264 where the host
+// has no NVIDIA encoder. -watermark name=KEY=VALUE[,KEY=VALUE...], once per
+// stream with a ladder, draws a watermark on every encoded picture, so the
+// ladder may not copy video. The keys are pos (tl, tr, bl, br, c), opacity
+// (1 to 100), size (percent), tz (an IANA time zone for the clock
+// directives %Y %m %d %H %M %S), image (an asset name from the -assets
+// directory) and text, which must be last and takes the rest of the value,
+// commas included:
+//
+//	osdev -stream cam=in.ts -loop -ostranscoder $OSTX -rung cam=360:360:800 \
+//		-watermark cam=pos=br,opacity=80,tz=UTC,text=%H:%M:%S, live
+//
+// -thumbnail name=SECONDS[:HEIGHT[:QUALITY]], once per stream, makes a JPEG
+// preview of the source every SECONDS seconds (height default 180, quality
+// 80), served at /live/<name>/thumbnail.jpg until the stream ends (404
+// until the first one). It needs -ostranscoder, also for a stream that
+// copies everything: osdev then runs a thumbnailer child for it. The
+// 30 s report lists the thumbnail counters of each transcoder and
+// thumbnailer.
 package main
 
 import (
@@ -121,6 +142,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
 )
@@ -145,7 +167,8 @@ const usageText = `usage: osdev -stream name=URL [-stream ...] [-listen addr] [-
              [-rtmp-play addr [-rtmp-play-app live]] [-rtmp-push name=rtmp://host/app/key ...]
              [-rtsp-play addr [-rtsp-play-app live] [-rtsp-udp]]
              [-srt-play addr [-srt-play-app live] [-srt-latency 120ms]]
-             [-ostranscoder path] [-rung name=label:height:kbps|name=label:copy ...] [-audio name=copy|aac[:kbps]]
+             [-ostranscoder path] [-rung name=label:height:kbps[:nvenc|x264]|name=label:copy ...] [-audio name=copy|aac[:kbps]]
+             [-assets dir] [-watermark name=KEY=VALUE[,KEY=VALUE...] ...] [-thumbnail name=SECONDS[:HEIGHT[:QUALITY]] ...]
 
 Accept an RTMP publisher (OBS or ffmpeg):
   osdev -stream cam=rtmp://:1935/live/<stream-key>?mode=listen
@@ -198,6 +221,26 @@ cmaf/master.m3u8, cmaf/index.mpd), not over RTMP, RTSP, SRT, HTTP-TS or
 copy://:
   osdev -stream cam=in.ts -loop -ostranscoder dist/ostranscoder-amd64/ostranscoder \
     -rung cam=360:360:800 -rung cam=src:copy -audio cam=aac:96
+
+A rung may end in :nvenc (NVIDIA's encoder, with a fallback to x264 where
+there is none) or :x264 (the default): -rung cam=360:360:800:nvenc.
+
+Draw a watermark on every encoded picture of a stream with a ladder, which
+then may not copy video: -watermark name=KEY=VALUE[,KEY=VALUE...] with the
+keys pos (tl, tr, bl, br, c), opacity (1-100), size (percent), tz (an IANA
+zone), image (an asset name in -assets dir) and text, which must be last
+and takes the rest of the value, commas included. In text, %Y %m %d %H %M %S
+show the clock, in tz (default UTC):
+  osdev -stream cam=in.ts -loop -ostranscoder $OSTX -rung cam=360:360:800 \
+    -watermark cam=pos=br,opacity=80,tz=Asia/Ho_Chi_Minh,text=%H:%M:%S, live
+  osdev ... -assets ./assets -watermark cam=pos=tr,image=logo.png
+
+Make a preview JPEG of a stream every SECONDS seconds with
+-thumbnail name=SECONDS[:HEIGHT[:QUALITY]] (height default 180, quality
+80), served at http://<host>/live/<name>/thumbnail.jpg (404 until the first
+one; the source stream only, not a rendition). It needs -ostranscoder, also
+for a stream that copies everything:
+  osdev -stream cam=in.ts -loop -ostranscoder $OSTX -thumbnail cam=10:240:70
 `
 
 // streamFlags collects repeated -stream name=path values.
@@ -356,13 +399,19 @@ type config struct {
 	// presentations are the ladders' ABR presentations, <name>_abr, in
 	// the order of transcoders. They are served by packLookup only.
 	presentations []*source
+	// assets is the -assets directory, "" without one. thumbs are the
+	// streams' thumbnail sources, in -thumbnail order.
+	assets string
+	thumbs []*thumbSrc
 }
 
 // transcoder is the transcoder of one stream's -rung ladder.
 type transcoder struct {
-	stream   string
-	tr       *transcode.Transcoder
-	lastLine string // the last report line
+	stream string
+	tr     *transcode.Transcoder
+	// thumbnail is the thumbnail setting of its child, nil without one.
+	thumbnail *picture.Thumbnail
+	lastLine  string // the last report line
 }
 
 // report writes the transcoder's counters when they differ from the last
@@ -374,6 +423,20 @@ func (x *transcoder) report(w io.Writer) {
 		"child dropped tracks %d, reanchors %d, audio samples dropped %d, corrupt audio %d, corrupt video %d",
 		x.stream, st.PID, st.Spawns, st.Exits, st.Losses, st.DroppedBeforeKey, st.MergeDropped,
 		c.DroppedTracks, c.Reanchors, c.AudioDropped, c.AudioCorrupt, c.VideoCorrupt)
+	// The picture counters appear once they are not zero.
+	for _, n := range []struct {
+		name string
+		v    uint64
+	}{
+		{"encoder fallbacks", c.EncoderFallbacks},
+		{"thumbnails", c.Thumbnails},
+		{"thumbnails failed", c.ThumbnailsFailed},
+		{"shot keys skipped", st.ShotKeysSkipped},
+	} {
+		if n.v > 0 {
+			line += fmt.Sprintf(", %s %d", n.name, n.v)
+		}
+	}
 	if line == x.lastLine {
 		return
 	}
@@ -381,11 +444,12 @@ func (x *transcoder) report(w io.Writer) {
 	_, _ = fmt.Fprintln(w, line)
 }
 
-// parseRung parses a -rung value, name=label:height:kbps or name=label:copy.
+// parseRung parses a -rung value, name=label:height:kbps[:nvenc|x264] or
+// name=label:copy.
 func parseRung(v string) (stream, label string, video transcode.Video, err error) {
 	stream, spec, ok := strings.Cut(v, "=")
 	if !ok || !validName(stream) {
-		return "", "", video, fmt.Errorf("malformed -rung %q, want name=label:height:kbps or name=label:copy", v)
+		return "", "", video, fmt.Errorf("malformed -rung %q, want name=label:height:kbps[:nvenc|x264] or name=label:copy", v)
 	}
 	f := strings.Split(spec, ":")
 	label = f[0]
@@ -400,15 +464,22 @@ func parseRung(v string) (stream, label string, video transcode.Video, err error
 		return stream, label, transcode.Video{Copy: true}, nil
 	case len(f) > 1 && f[1] == "copy":
 		return "", "", video, fmt.Errorf("-rung %q: label:copy takes nothing more", v)
-	case len(f) == 3:
+	case len(f) == 3 || len(f) == 4:
 		height, herr := strconv.Atoi(f[1])
 		kbps, kerr := strconv.Atoi(f[2])
 		if herr != nil || kerr != nil || height <= 0 || kbps <= 0 {
 			return "", "", video, fmt.Errorf("-rung %q: height and kbps must be positive integers", v)
 		}
-		return stream, label, transcode.Video{Height: height, BitrateKbps: kbps}, nil
+		video = transcode.Video{Height: height, BitrateKbps: kbps}
+		if len(f) == 4 {
+			if f[3] != transcode.EncoderX264 && f[3] != transcode.EncoderNVENC {
+				return "", "", video, fmt.Errorf("-rung %q: the encoder %q is not nvenc or x264", v, f[3])
+			}
+			video.Encoder = f[3]
+		}
+		return stream, label, video, nil
 	default:
-		return "", "", video, fmt.Errorf("malformed -rung %q, want name=label:height:kbps or name=label:copy", v)
+		return "", "", video, fmt.Errorf("malformed -rung %q, want name=label:height:kbps[:nvenc|x264] or name=label:copy", v)
 	}
 }
 
@@ -434,9 +505,17 @@ func parseAudio(v string) (stream string, audio transcode.Audio, err error) {
 	}
 }
 
+// pictureOpts are the -watermark and -thumbnail settings by stream.
+type pictureOpts struct {
+	watermarks map[string]picture.Watermark
+	thumbnails map[string]picture.Thumbnail
+}
+
 // parseLadders builds one transcoder per stream with -rung values, and
-// adds each rendition to byName as the stream <name>_<label>.
-func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, audios []string, log *slog.Logger) error {
+// adds each rendition to byName as the stream <name>_<label>. A stream's
+// watermark and, when its ladder needs a child, its thumbnail go to its
+// transcoder.
+func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, audios []string, pic pictureOpts, log *slog.Logger) error {
 	ladders := map[string][]transcode.Rendition{}
 	var order []string
 	for _, v := range rungs {
@@ -471,6 +550,11 @@ func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, 
 		}
 		audio[stream] = a
 	}
+	for stream := range pic.watermarks {
+		if _, ok := ladders[stream]; !ok {
+			return fmt.Errorf("-watermark: stream %s has no -rung", stream)
+		}
+	}
 	for _, stream := range order {
 		encodes := !audio[stream].Copy
 		for _, r := range ladders[stream] {
@@ -483,14 +567,24 @@ func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, 
 		if encodes && binary == "" {
 			return fmt.Errorf("stream %s: encoding needs -ostranscoder", stream)
 		}
-		tr, err := transcode.New(byName[stream].hub, transcode.Options{
+		opt := transcode.Options{
 			Binary: binary, Renditions: ladders[stream], Audio: audio[stream], Logger: log,
 			Presentation: true,
-		})
+		}
+		if w, ok := pic.watermarks[stream]; ok {
+			opt.Watermark = &w
+		}
+		var thumb *picture.Thumbnail
+		if th, ok := pic.thumbnails[stream]; ok && encodes {
+			thumb = &th
+			opt.Thumbnail = thumb
+		}
+		// The watermark is validated here, in full, and against the ladder.
+		tr, err := transcode.New(byName[stream].hub, opt)
 		if err != nil {
 			return fmt.Errorf("stream %s: %w", stream, err)
 		}
-		cfg.transcoders = append(cfg.transcoders, &transcoder{stream: stream, tr: tr})
+		cfg.transcoders = append(cfg.transcoders, &transcoder{stream: stream, tr: tr, thumbnail: thumb})
 		for i, h := range tr.Hubs() {
 			s := byName[ladders[stream][i].Name]
 			s.hub, s.pack = h, live.NewPackager(h, live.Options{})
@@ -501,6 +595,70 @@ func parseLadders(cfg *config, byName map[string]*source, binary string, rungs, 
 			name: stream + "_" + abrLabel, from: stream, hub: ph,
 			pack: live.NewPackager(ph, live.Options{ABR: true, Logger: log}),
 		})
+	}
+	return nil
+}
+
+// parsePictures parses the -watermark and -thumbnail values. Their streams
+// must be sources, not renditions: byName holds only sources here.
+func parsePictures(cfg *config, byName map[string]*source, watermarks, thumbnails []string) (pictureOpts, error) {
+	pic := pictureOpts{watermarks: map[string]picture.Watermark{}, thumbnails: map[string]picture.Thumbnail{}}
+	for _, v := range watermarks {
+		stream, w, err := parseWatermark(v, cfg.assets)
+		if err != nil {
+			return pic, err
+		}
+		if byName[stream] == nil {
+			return pic, fmt.Errorf("-watermark: unknown stream %s", stream)
+		}
+		if _, ok := pic.watermarks[stream]; ok {
+			return pic, fmt.Errorf("-watermark: stream %s given twice", stream)
+		}
+		pic.watermarks[stream] = w
+	}
+	for _, v := range thumbnails {
+		stream, th, err := parseThumbnail(v)
+		if err != nil {
+			return pic, err
+		}
+		if byName[stream] == nil {
+			return pic, fmt.Errorf("-thumbnail: unknown stream %s", stream)
+		}
+		if _, ok := pic.thumbnails[stream]; ok {
+			return pic, fmt.Errorf("-thumbnail: stream %s given twice", stream)
+		}
+		pic.thumbnails[stream] = th
+		cfg.thumbs = append(cfg.thumbs, &thumbSrc{stream: stream})
+	}
+	return pic, nil
+}
+
+// parseThumbnailers connects each -thumbnail stream to its shots: the
+// shots of its transcoder's child when the ladder has one, else a
+// Thumbnailer of its own on the stream's hub, which needs the transcoder
+// binary.
+func parseThumbnailers(cfg *config, byName map[string]*source, binary string, pic pictureOpts, log *slog.Logger) error {
+	for _, ts := range cfg.thumbs {
+		var inChild *transcoder
+		for _, x := range cfg.transcoders {
+			if x.stream == ts.stream && x.thumbnail != nil {
+				inChild = x
+			}
+		}
+		if inChild != nil {
+			ts.shot = inChild.tr.Shot
+			continue
+		}
+		if binary == "" {
+			return fmt.Errorf("stream %s: thumbnails need -ostranscoder", ts.stream)
+		}
+		n, err := transcode.NewThumbnailer(byName[ts.stream].hub, transcode.ThumbnailerOptions{
+			Binary: binary, Thumbnail: pic.thumbnails[ts.stream], Logger: log,
+		})
+		if err != nil {
+			return fmt.Errorf("stream %s: %w", ts.stream, err)
+		}
+		ts.nailer, ts.shot = n, n.Shot
 	}
 	return nil
 }
@@ -565,6 +723,10 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	var rungs, audios streamFlags
 	fs.Var(&rungs, "rung", "name=label:height:kbps (encode) or name=label:copy: a rendition of stream name, served as <name>_<label>; repeatable")
 	fs.Var(&audios, "audio", "name=copy or name=aac[:kbps]: the audio of stream name's renditions (default aac, 128 kbps)")
+	assets := fs.String("assets", "", "directory of the images that -watermark image=NAME reads")
+	var watermarks, thumbnails streamFlags
+	fs.Var(&watermarks, "watermark", "name=KEY=VALUE[,KEY=VALUE...]: draw a watermark on every encoded picture of stream name's ladder; keys pos, opacity, size, tz, image, text (last)")
+	fs.Var(&thumbnails, "thumbnail", "name=SECONDS[:HEIGHT[:QUALITY]]: a preview JPEG of stream name every SECONDS, at /live/<name>/thumbnail.jpg")
 	if err := fs.Parse(args); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return nil, 2
@@ -580,7 +742,7 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 	}
 	if len(streams) == 0 {
 		_, _ = fmt.Fprintln(stderr, "osdev: at least one -stream name=URL is required")
-		_, _ = fmt.Fprint(stderr, usageText)
+		_, _ = io.WriteString(stderr, usageText)
 		return nil, 2
 	}
 	app, _ := rtmp.NormalizePath(*rtmpPlayApp, "")
@@ -660,7 +822,17 @@ func parseArgs(args []string, stderr io.Writer) (*config, int) {
 		return nil, 2
 	}
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	if err := parseLadders(cfg, byName, *ostx, rungs, audios, log); err != nil {
+	cfg.assets = *assets
+	pic, err := parsePictures(cfg, byName, watermarks, thumbnails)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
+		return nil, 2
+	}
+	if err := parseLadders(cfg, byName, *ostx, rungs, audios, pic, log); err != nil {
+		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
+		return nil, 2
+	}
+	if err := parseThumbnailers(cfg, byName, *ostx, pic, log); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osdev: %v\n", err)
 		return nil, 2
 	}
@@ -1041,6 +1213,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stdout, "%s/live/%s/%s\n", base, s.name, p)
 		}
 	}
+	thumbs := map[string]*thumbSrc{}
+	for _, ts := range cfg.thumbs {
+		thumbs[ts.stream] = ts
+		_, _ = fmt.Fprintf(stdout, "%s/live/%s/thumbnail.jpg\n", base, ts.stream)
+	}
 	if cfg.rtmpPlay != "" {
 		host, port, _ := net.SplitHostPort(cfg.rtmpPlay)
 		if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
@@ -1160,6 +1337,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		})
 	}
 
+	for _, ts := range cfg.thumbs {
+		if ts.nailer == nil {
+			continue
+		}
+		twg.Go(func() {
+			err := ts.nailer.Run(ctx)
+			if err != nil && ctx.Err() == nil {
+				transcodeFailed.Store(true)
+				_, _ = fmt.Fprintf(stderr, "osdev: stream %s: thumbnailer stopped: %v\n", ts.stream, err)
+			}
+		})
+	}
+
 	for _, p := range cfg.pushes {
 		_, _ = fmt.Fprintf(stderr, "osdev: stream %s: pushing to %s\n", p.stream, p.pusher)
 		wg.Add(1)
@@ -1185,6 +1375,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 				for _, x := range cfg.transcoders {
 					x.report(stderr)
 				}
+				for _, ts := range cfg.thumbs {
+					ts.report(stderr)
+				}
 				for _, p := range cfg.pushes {
 					p.report(stderr)
 				}
@@ -1202,6 +1395,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /live/{stream}/stream.ts", httpts.Handler(hubLookup, 0))
+	mux.Handle("GET /live/{stream}/thumbnail.jpg", thumbHandler(thumbs))
 	mux.Handle("/live/", live.Handler(packLookup))
 	srv := newServer(mux)
 
@@ -1231,6 +1425,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	report(stderr, slices.Concat(all, cfg.presentations), true)
 	for _, x := range cfg.transcoders {
 		x.report(stderr)
+	}
+	for _, ts := range cfg.thumbs {
+		ts.report(stderr)
 	}
 	for _, p := range cfg.pushes {
 		p.report(stderr)
