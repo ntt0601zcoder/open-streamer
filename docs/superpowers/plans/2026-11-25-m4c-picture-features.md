@@ -52,7 +52,7 @@
 
 | Wave | Tasks | Why this order |
 |---|---|---|
-| 1 | 1 (carry items), 2 (`picture`), 9 (R-T7b' root cause) | Disjoint files: Task 1 has `merge.go`, `rtspplay` and its own spec edits (§3.4, §3.5's presentation bullet); Task 2 a new package; Task 9 experiments, a notes file, one code comment and one native test. Task 9 edits no spec text: Task 12 does that from its notes. **Waves 2 to 7 do not wait for Task 9**, nor for its possible escalation round (R-C11): only Task 12 depends on it. Its one-comment edit of `video.go` is rebased onto Task 4 if Task 4 lands first |
+| 1 | 1 (carry items), 2 (`picture`), 9 (R-T7b' root cause) | Disjoint files: Task 1 has `merge.go`, `rtspplay` and its own spec edits (§3.4, §3.5's presentation bullet); Task 2 a new package; Task 9 experiments, a notes file, one code comment and one native test. Task 9 edits no spec text: Task 12 does that from its notes. **Waves 2 to 7 do not wait for Task 9**, nor for its possible escalation round (R-C11): only Task 12 depends on it. Its one-comment edit of `video.go` is rebased onto whichever of Tasks 4 to 6 have landed; the controller merges Task 9 at any time before wave 8, and runs `go mod tidy` then |
 | 2 | 3 (wire v2) | Needs Task 2's types |
 | 3 | 4 (native NVENC), 7 (host: options, `SetWatermark`, `Thumbnailer`) | 4 touches native and `cmd/ostranscoder`; 7 touches `internal/transcode` with the fake child |
 | 4 | 5 (native watermark), 8 (osdev) | 5 needs 4's `native.Config` (same files); 8 needs 7 |
@@ -78,7 +78,7 @@ Each parallel task runs in its own worktree; the controller merges.
 These four items are the controller's carry ruling from M4b's final review (the merger's opener hold, the unpruned lag envelopes, the §3.4 sentence, and the load-sensitive RTSP test), assigned to M4c's first task. Items 1 and 2 change the presentation merger's timing; that is outside the frozen-behaviour constraint by that ruling, and the tests below are what covers it.
 
 **Files:**
-- Modify: `internal/transcode/merge.go` (`holds`, `noteLag`, the merger doc), `internal/output/rtspplay/rtspplay_test.go` (`TestPlayCodecChangeEndsSession`), `docs/REBUILD_PLAN.md` (§3.4)
+- Modify: `internal/transcode/merge.go` (`holds`, `noteLag`, the merger doc), `internal/output/rtspplay/rtspplay_test.go` (`TestPlayCodecChangeEndsSession`), `docs/REBUILD_PLAN.md` (§3.4, and §3.5's presentation bullet)
 - Test: `internal/transcode/merge_test.go`
 
 **Interfaces:** none produced. Only the presentation merger changes; rendition mergers keep the fixed `MergeHold`.
@@ -89,7 +89,7 @@ These four items are the controller's carry ruling from M4b's final review (the 
 
 So an entry of the previous epoch survives into the new epoch's start. `m.first` is pruned where `m.lead` is.
 
-**New-epoch opener.** `push` records the opener's own track in `m.lag` before `holds` runs, so "the map has an entry" would always be true. The rule is: in `holds`, `case newEpoch`, when an unpruned entry was recorded in an epoch **below the opener's** (`entry.epoch < f.Epoch`; `holds` takes the head frame's epoch), return the learned hold: 1.5 × the largest envelope among those entries, clamped to [`hold`, `maxHold`], wall time only as today. Otherwise, the first epoch of a run or every older entry pruned, `maxHold` as today. The existing `TestMergerPresHoldCap` and `TestMergerPresHoldFollowsLag` pass unchanged.
+**New-epoch opener.** `push` records the opener's own track in `m.lag` before `holds` runs, so "the map has an entry" would always be true. The rule is: in `holds`, `case newEpoch`, when an unpruned entry was recorded in an epoch **below the opener's** (`entry.epoch < f.Epoch`, where f is the head frame `candidate()` returns: `holds` keeps its signature `holds(newEpoch bool)` and reads the epoch there in its `newEpoch` branch, so the existing calls in `merge_test.go` and `TestMergerLagSurvivesEpochChange`'s `holds(false)` stay as they are), return the learned hold: 1.5 × the largest envelope among those entries, clamped to [`hold`, `maxHold`], wall time only as today. Otherwise, the first epoch of a run or every older entry pruned, `maxHold` as today. The existing `TestMergerPresHoldCap` and `TestMergerPresHoldFollowsLag` pass unchanged.
 
 - [ ] **Step 1: Write the failing tests** (fake clock, as `TestMergerBarrierHoldRunsOut`)
 
@@ -379,8 +379,8 @@ func TestWatermarkTextTicks(t *testing.T)
 func TestWatermarkTextIsLiteral(t *testing.T)
 // Text ":'\\%%{localtime},[in]textfile=/etc/passwd" and a 256-byte text of CJK: the pipeline runs to the end,
 // the band differs from an unmarked run. The graph string, exposed to tests, contains neither the whole text
-// nor any of "%{localtime}", "/etc/passwd" and "[in]", and the only paths in it (substrings starting with "/")
-// are <dir>/font.ttf and <dir>/text.
+// nor any of "%{localtime}", "/etc/passwd" and "[in]", and the only absolute paths in it, the values
+// after fontfile= and textfile=, are <dir>/font.ttf and <dir>/text.
 func TestWatermarkAcrossConfigChange(t *testing.T)
 // h264_aac_then_640.ts, image mark, SizePct 25, TopRight: the mark is in place on the last picture before and
 // the first after the change, at 25 % of each picture's width.
@@ -470,8 +470,8 @@ func TestServeShots(t *testing.T)
 
 **Files:**
 - Create: `internal/transcode/thumbnailer.go`, `internal/transcode/childutil.go` (what the two supervisors share)
-- Modify: `internal/transcode/transcode.go` (`Video.Encoder`, `Options.Watermark`, `Options.Thumbnail`, `Options.OnShot`, `New`'s validation, `Configure` and `writeChild`, `readChild`, `ChildStats` with its `max` and `add`, `SetWatermark`, `Shot`, `newRouter`, the package doc), `internal/transcode/epochs.go` (the router's thumbnail keys: its schedule and `shotRetry`, the hooks `childReady` and `childShots`, `send`, `childExited`), `internal/transcode/spawn_unix.go` and `spawn_other.go` (only if `startProc` or `killGroup` need a change to be shared with the `Thumbnailer`; they are used as they are otherwise)
-- Test: `internal/transcode/transcode_test.go`, `internal/transcode/epochs_test.go`, `internal/transcode/thumbnailer_test.go` (with the `transcodetest` fake child)
+- Modify: `internal/transcode/transcode.go` (`Video.Encoder`, `Options.Watermark`, `Options.Thumbnail`, `Options.OnShot`, `New`'s validation, `Configure` and `writeChild`, `readChild`, `ChildStats` with its `max` and `add`, `SetWatermark`, `Shot`, `newRouter`, the package doc; and the refactor onto `childutil.go`: `scheduleRespawn` (onto `backoff`), the Hello part of `readChild` (onto `readHello`), and the tail of `child.stop` (onto `waitOrKill`)), `internal/transcode/epochs.go` (the router's thumbnail keys: its schedule and `shotRetry`, the hooks `childReady` and `childShots`, `send`, `childExited`), `internal/transcode/spawn_unix.go` and `spawn_other.go` (only if `startProc` or `killGroup` need a change to be shared with the `Thumbnailer`; they are used as they are otherwise)
+- Test: `internal/transcode/transcode_test.go`, `internal/transcode/epochs_test.go`, `internal/transcode/thumbnailer_test.go` (with the `transcodetest` fake child), `internal/transcode/childutil_test.go` (new: the shared helpers alone)
 
 **Interfaces:**
 - Consumes: wire v2 and the fake child's new behaviours (Task 3); `picture` (Task 2).
@@ -526,27 +526,32 @@ func (t *Thumbnailer) Stats() ThumbnailerStats
 
 So a call that lands before the snapshot is in the `Configure` with no `set`, whichever of the writer and Run handles Hello first, and a call that lands after it becomes exactly one `set`.
 
-**Shared by the two supervisors** (`childutil.go`). `Transcoder` is refactored onto these with no change of behaviour (its existing tests pass unchanged), and `Thumbnailer` uses them instead of re-implementing them:
+**Shared by the two supervisors** (`childutil.go`). `Transcoder` moves onto `backoff`, `readHello`, `shotRetry` and `waitOrKill` only, with no change of behaviour (its existing tests pass unchanged), and `Thumbnailer` uses them instead of re-implementing them. **The Transcoder's Stop-sending path is not refactored** (controller ruling): its writer goroutine still sends `Stop` after draining `c.in`, a non-graceful stop still sends `Stop` through `case <-c.quit`, and the kill is still `c.kill()` with its reap guard.
 
 ```go
-// readHello reads a child's first message: a Hello with wire.Version, or an error. A Hello with another
-// version returns an error that wraps errVersion (fatal for Run); anything else is a plain error (an exit).
+// readHello reads the child's first message and checks it: its type, then its version. It only reads and
+// checks. A read error comes back wrapped with %w (so ErrMalformed and the socket's errors survive); a first
+// message that is not a Hello is an error; another version is
+// fmt.Errorf("%w: %d, want %d", errVersion, got, wire.Version), which is fatal for Run.
 func readHello(r *wire.Reader) (wire.Hello, error)
 var errVersion = errors.New("transcode: child speaks another wire version")
 // backoff is the respawn delay: min, doubling up to max, back to min after a child ran for healthy.
 type backoff struct{ min, max, healthy, cur time.Duration }
 func (b *backoff) next(uptime time.Duration) time.Duration
-// stopChild sends Stop when graceful, waits up to stopGrace for exited, then kills the process group.
-func stopChild(p *proc, w *wire.Writer, graceful bool, exited <-chan struct{}, after func(time.Duration) <-chan time.Time)
+// waitOrKill is the tail of a stop: it waits for done up to stopGrace on a real time.NewTimer (not
+// Options.After, which tests fake), then calls kill. kill must be safe once the process is reaped.
+func waitOrKill(done <-chan struct{}, kill func())
 // shotRetry is the retry rule for key-only thumbnails: one early retry per run of failures.
 type shotRetry struct{ thumbs, failed uint64; afterSuccess bool }
 func (r *shotRetry) look(thumbs, failed uint64) (reset bool)
 func (r *shotRetry) childExited()
 ```
 
+`readChild` keeps what surrounds the Hello read: the read deadline (`HelloTimeout`), the mapping of `socketEnded`/`isExited` to a nil error, and the text "transcode: hello: none within"; only the read, the type check and the version check move into `readHello`. `child.stop` closes `in`/`quit` as today and then calls `waitOrKill(c.done, c.kill)`, so it still waits on `c.done`, on a real timer, and kills through the reap-guarded `c.kill()`.
+
 `shotRetry` starts, and is put back by `childExited`, with last-seen (0, 0) and `afterSuccess` true. `look` compares the child's cumulative counters with the last seen: a rise of `thumbs` sets `afterSuccess`; a rise of `failed` returns true when `afterSuccess` is set, and clears it; when both rose since the last look the success is counted first, so that look returns true. So the first reported failure that follows a success (or a child's start) resets the caller's schedule, and the next keyframe after the failure is reported is offered; while failures stay consecutive `Took` stands, so a key that never decodes alone costs one attempt per interval, not one per keyframe.
 
-**`Thumbnailer`** (only for a stream with no transcoding child, R-C10a). `Run` subscribes with `src.SubscribeLive("thumbnailer", 64)` and ends with nil when the context ends or the hub closes. The main video track is the lowest-numbered video track seen so far. A `picture.Schedule` on the host picks its key frames: a due key is offered, unshifted, to the child through a one-slot channel: taken when the child has said Hello and the slot is free (`KeysSent`, then `Took`), otherwise skipped (`KeysSkipped`, no `Took`, so the next key is offered); nothing else is sent and `Lost` deliveries are ignored. The child gets `Configure{Thumbnail: &opt.Thumbnail}` and shoots every key it is sent: the host's schedule is the only one. The schedule is reset when the child exits or is killed, with `shotRetry.childExited()`; each `Stats` from the child (`Failed`) goes through `shotRetry.look`, which resets the schedule when it returns true. A child that exits is respawned with `backoff` (`RespawnMin` doubling to `RespawnMax`); no hub is touched. Hello is read with `readHello`. A child that has said Hello and then sends no message for `SilenceTimeout` is killed and counts as an exit (it sends `Stats` every second). A missing binary and a wire-version mismatch end `Run` with an error; on non-Unix systems `NewThumbnailer` returns `errors.ErrUnsupported`. Stopping is `stopChild`; the process is started with `startProc`.
+**`Thumbnailer`** (only for a stream with no transcoding child, R-C10a). `Run` subscribes with `src.SubscribeLive("thumbnailer", 64)` and ends with nil when the context ends or the hub closes. The main video track is the lowest-numbered video track seen so far. A `picture.Schedule` on the host picks its key frames: a due key is offered, unshifted, to the child through a one-slot channel: taken when the child has said Hello and the slot is free (`KeysSent`, then `Took`), otherwise skipped (`KeysSkipped`, no `Took`, so the next key is offered); nothing else is sent and `Lost` deliveries are ignored. The child gets `Configure{Thumbnail: &opt.Thumbnail}` and shoots every key it is sent: the host's schedule is the only one. The schedule is reset when the child exits or is killed, with `shotRetry.childExited()`; each `Stats` from the child (`Failed`) goes through `shotRetry.look`, which resets the schedule when it returns true. A child that exits is respawned with `backoff` (`RespawnMin` doubling to `RespawnMax`, healthy after `defaultHealthyAfter`, 30 s: `ThumbnailerOptions` has no `HealthyAfter`); no hub is touched. Hello is read with `readHello`. A child that has said Hello and then sends no message for `SilenceTimeout` is killed and counts as an exit (it sends `Stats` every second). A missing binary and a wire-version mismatch end `Run` with an error; on non-Unix systems `NewThumbnailer` returns `errors.ErrUnsupported`. Stopping: the `Thumbnailer` writes `Stop` itself (it has no frame queue to drain first), then calls `waitOrKill` with its own done channel and a kill of its own that is reap-guarded as `child.kill` is (a mutex and a reaped flag around `killGroup`, so a recycled pgid is never signalled). The process is started with `startProc`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -593,7 +598,14 @@ func TestRouterShotRetry(t *testing.T)
 // again (a failure after a success). thumbnails and failed both rising between two looks: the next key is
 // sent (the success counts first). childExited resets the schedule: the next key is sent; then, on the new
 // child (childShots back at 0, 0), failed 0 → 1 gives the early retry again.
+// childutil_test.go:
 func TestShotRetry(t *testing.T)                 // the rule alone, as a table over look() sequences, including both-rose and childExited
+func TestReadHello(t *testing.T)
+// a Hello with wire.Version → ok; version 1 → errors.Is(err, errVersion) and the text holds "1, want 2"; a Stats
+// first → error; malformed bytes → errors.Is(err, wire.ErrMalformed); an empty stream → errors.Is(err, io.EOF).
+func TestBackoff(t *testing.T)                   // 250 ms, 500 ms, 1 s … capped at max; back to min after an uptime ≥ healthy
+func TestWaitOrKill(t *testing.T)                // done already closed: kill not called; done never closed: kill called once after stopGrace
+// transcode_test.go:
 func TestShotsFromChild(t *testing.T)
 // EnvShots=1: Shot() returns the latest shot with `at` from the fake clock; OnShot saw every one;
 // Stats().Child.Thumbnails follows the child's Stats; FramesOut and the hubs equal a run without thumbnails.
