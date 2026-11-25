@@ -3,6 +3,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -281,8 +282,10 @@ func pacedFast(steps []step) feed {
 // m4cSettle is how long the thumbnail scenarios of a child that is offered
 // keyframes wait after subscribing before they feed: time for the child to
 // say Hello, so that the first key is normally taken and the bounds that
-// hold when no key is skipped are exercised. A slower child only skips
-// keys, which the bounds allow for.
+// hold when no key is skipped are exercised. Neither the Transcoder nor the
+// Thumbnailer exports a Hello signal (EventSpawned comes before it), so the
+// wait is fixed; a slower child only skips keys, which the bounds allow
+// for, and the scenarios log a COVERAGE line when it does.
 const m4cSettle = time.Second
 
 // settled runs fd after m4cSettle.
@@ -304,21 +307,56 @@ func loopedFixture(t *testing.T, name string, n int) []step {
 	return loopSteps(clockSteps(t, name, newFakeClock(m3aT0).Now), n)
 }
 
-// frameID is what the frozen comparisons compare of a frame.
+// frameID is what the frozen comparisons compare of a frame: its timing,
+// its config (configID) and its data.
 type frameID struct {
 	pts, dts int64
 	key      bool
 	epoch    uint32
+	config   string
 	data     string
+}
+
+// configID renders every field of c (codec, size, VPS, SPS, PPS, rate,
+// channels, ASC) for comparison; "" for nil.
+func configID(c *media.TrackConfig) string {
+	if c == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v %dx%d vps %x sps %x pps %x %d Hz %d ch asc %x",
+		c.Codec, c.Width, c.Height, c.VPS, c.SPS, c.PPS, c.SampleRate, c.Channels, c.ASC)
 }
 
 // trackIDs returns, per track, the frameIDs of frames in order.
 func trackIDs(frames []media.Frame) map[int][]frameID {
 	out := map[int][]frameID{}
 	for _, f := range frames {
-		out[f.Track] = append(out[f.Track], frameID{f.PTS, f.DTS, f.Key, f.Epoch, string(bytes.Join(f.Data, nil))})
+		out[f.Track] = append(out[f.Track],
+			frameID{f.PTS, f.DTS, f.Key, f.Epoch, configID(f.Config), string(bytes.Join(f.Data, nil))})
 	}
 	return out
+}
+
+// x264Options returns the options string x264 writes in its
+// user-data-unregistered SEI ("x264 - core ... - options: ..."), from the
+// SEI NAL units of f's data, up to the string's NUL; ok is false when f has
+// none.
+func x264Options(f media.Frame) (string, bool) {
+	for _, nal := range f.Data {
+		if len(nal) == 0 || nal[0]&0x1f != 6 { // H.264 SEI
+			continue
+		}
+		i := bytes.Index(nal, []byte("x264 - core"))
+		if i < 0 {
+			continue
+		}
+		opts := nal[i:]
+		if end := bytes.IndexByte(opts, 0); end >= 0 {
+			opts = opts[:end]
+		}
+		return string(opts), true
+	}
+	return "", false
 }
 
 // killAfterKeyframes kills tr's child once, after the n-th video keyframe
@@ -543,9 +581,10 @@ func TestM4cWatermarkRespawn(t *testing.T) {
 	}
 }
 
-// requireFirstDue checks that each shot after the first of its epoch is
-// the first picture due: no picture of frames (a rendition's) lies at or
-// above the previous shot + m4cShotStep and below it. Within a pass of the
+// requireFirstDue checks that each shot is the first picture due: an
+// epoch's first shot is the epoch's first picture of frames (a
+// rendition's), in PTS order, and for every later one no picture lies at
+// or above the previous shot + m4cShotStep and below it. Within a pass of the
 // fixture, whose pictures are 3600 apart, the shots are then at most
 // 180000 + 3600 apart; across a loopSteps seam the gap between the passes
 // adds to that (passDelta shifts a pass by the last PTS + one frame − the
@@ -560,12 +599,15 @@ func requireFirstDue(t *testing.T, shots []picture.Shot, frames []media.Frame) {
 		slices.Sort(p)
 	}
 	var steps []int64
-	for i := 1; i < len(shots); i++ {
-		a, b := shots[i-1], shots[i]
-		if a.Epoch != b.Epoch {
+	for i, b := range shots {
+		p := pics[b.Epoch]
+		require.NotEmpty(t, p, "shot %d: pictures of epoch %d", i, b.Epoch)
+		if i == 0 || shots[i-1].Epoch != b.Epoch {
+			// The epoch's first shot is due at once: its first picture.
+			assert.Equal(t, p[0], b.PTS, "shot %d: the first picture of epoch %d", i, b.Epoch)
 			continue
 		}
-		p := pics[b.Epoch]
+		a := shots[i-1]
 		j, found := slices.BinarySearch(p, b.PTS)
 		require.True(t, found, "shot %d at PTS %d is a picture of the rendition", i, b.PTS)
 		require.Positive(t, j, "shot %d", i)
@@ -665,6 +707,10 @@ func TestM4cThumbnailsPassthrough(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
 			shots, st := thumbnailerRun(t, bin, loopedFixture(t, row.name, row.passes))
+			if st.KeysSkipped > 0 {
+				t.Logf("COVERAGE: %d keys skipped (the child was not ready): the no-skip bounds are relaxed",
+					st.KeysSkipped)
+			}
 			assert.EqualValues(t, 1, st.Spawns, "one child")
 			assert.Zero(t, st.Failed, "no shot failed")
 			assert.Equal(t, st.KeysSent, st.Shots, "a shot for every key sent")
@@ -709,8 +755,8 @@ func copyLadder(binary string, th *picture.Thumbnail, onShot func(picture.Shot))
 //     OnShot saw and ThumbnailsFailed is 0; the rendition's frames are a
 //     run's without thumbnails, track by track.
 //   - h264_aac_then_640.ts with interval 3600: one child and one shot per
-//     epoch, at the epoch's first keyframe (or its next when ShotKeysSkipped
-//     > 0); the second, of 640×360, 214×120.
+//     epoch, at the epoch's first keyframe or one at most ShotKeysSkipped
+//     keyframes after it; the second, of 640×360, 214×120.
 func TestM4cThumbnailsCopyVideo(t *testing.T) {
 	t.Parallel()
 	bin := testpeer.OSTranscoder(t)
@@ -737,6 +783,10 @@ func TestM4cThumbnailsCopyVideo(t *testing.T) {
 			t.FailNow()
 		}
 		st := with.stats
+		if st.ShotKeysSkipped > 0 {
+			t.Logf("COVERAGE: %d shot keys skipped (the child was not ready): the shot count bound is relaxed",
+				st.ShotKeysSkipped)
+		}
 		shots := log.get()
 		assert.GreaterOrEqual(t, len(shots), 11-int(st.ShotKeysSkipped))
 		require.NotEmpty(t, shots)
@@ -757,6 +807,10 @@ func TestM4cThumbnailsCopyVideo(t *testing.T) {
 		requireCleanRun(t, run.stats)
 		st := run.stats
 		t.Logf("stats %+v", st)
+		if st.ShotKeysSkipped > 0 {
+			t.Logf("COVERAGE: %d shot keys skipped (the child was not ready): a later keyframe is accepted",
+				st.ShotKeysSkipped)
+		}
 		frames := stepFrames(run.renditions[0])
 		keys := map[uint32][]int64{} // per epoch, the video keyframe PTS in order
 		for _, f := range videoFrames(frames) {
@@ -773,11 +827,12 @@ func TestM4cThumbnailsCopyVideo(t *testing.T) {
 			require.Equal(t, eps[i], s.Epoch, "shot %d", i)
 			k := keys[s.Epoch]
 			require.NotEmpty(t, k, "epoch %d keys", s.Epoch)
-			if st.ShotKeysSkipped > 0 && len(k) > 1 && s.PTS == k[1] {
-				t.Logf("shot %d at epoch %d's second keyframe (%d keys skipped)", i, s.Epoch, st.ShotKeysSkipped)
-			} else {
-				assert.Equal(t, k[0], s.PTS, "shot %d: at epoch %d's first keyframe", i, s.Epoch)
-			}
+			// The epoch's first keyframe, or a later one for each key
+			// skipped.
+			j := slices.Index(k, s.PTS)
+			require.GreaterOrEqual(t, j, 0, "shot %d at PTS %d is a keyframe of epoch %d: %v", i, s.PTS, s.Epoch, k)
+			assert.LessOrEqual(t, uint64(j), st.ShotKeysSkipped,
+				"shot %d: keyframe %d of epoch %d, with %d keys skipped", i, j, s.Epoch, st.ShotKeysSkipped)
 			decodeShot(t, s)
 		}
 		assert.Equal(t, image.Pt(160, 120), image.Pt(shots[0].Width, shots[0].Height))
@@ -795,10 +850,12 @@ const m4cNoise = 4.0
 // TestM4cFrozen transcodes h264_aac.ts through m4aLadder twice, once as M4b
 // ran it and once with Watermark nil, Thumbnail nil and Encoder "x264"
 // spelled out on every encoded rung. Per rendition and track, the frames
-// have the same PTS, DTS, Key and Epoch; the audio and the copied video the
-// same Data. An encoded rung's Data cannot be compared byte for byte
-// (libx264's threads), so its pictures, all decoded, must match within
-// m4cNoise.
+// have the same PTS, DTS, Key, Epoch and Config (codec, size, VPS, SPS,
+// PPS, rate, channels, ASC); the audio and the copied video the same Data.
+// An encoded rung's Data cannot be compared byte for byte (libx264's
+// threads): its first IDR's x264 options SEI must be the same, which pins
+// the encoder's settings (preset, refs, profile, rate control), and its
+// pictures, all decoded, must match within m4cNoise.
 func TestM4cFrozen(t *testing.T) {
 	t.Parallel()
 	bin := testpeer.OSTranscoder(t)
@@ -839,9 +896,17 @@ func TestM4cFrozen(t *testing.T) {
 						same++
 					}
 					w.data, x.data = "", ""
-					require.Equal(t, w, x, "track %d frame %d: PTS, DTS, Key, Epoch", tr, j)
+					require.Equal(t, w, x, "track %d frame %d: PTS, DTS, Key, Epoch, config", tr, j)
 				}
-				t.Logf("track %d: %d of %d frames byte-identical", tr, same, len(ids))
+				t.Logf("track %d: %d of %d frames byte-identical; config %s", tr, same, len(ids), ids[0].config)
+				// x264's settings, the preset among them, as its first IDR
+				// states them.
+				wo, ok := x264Options(videoFrames(a)[0])
+				require.True(t, ok, "track %d: the first IDR has x264's options SEI", tr)
+				go2, ok := x264Options(videoFrames(b)[0])
+				require.True(t, ok, "track %d: the first IDR has x264's options SEI", tr)
+				assert.Equal(t, wo, go2, "track %d: x264's options", tr)
+				t.Logf("track %d: %s", tr, wo)
 			}
 			if !encoded {
 				return
@@ -851,6 +916,7 @@ func TestM4cFrozen(t *testing.T) {
 			require.Len(t, pa, len(videoFrames(a)), "every picture decoded")
 			worst := 0.0
 			for j := range pa {
+				require.Equal(t, pa[j].Bounds(), pb[j].Bounds(), "picture %d", j)
 				d := meanAbsDiff(pa[j], pb[j], pa[j].Bounds())
 				worst = max(worst, d)
 				assert.Less(t, d, m4cNoise, "picture %d", j)
