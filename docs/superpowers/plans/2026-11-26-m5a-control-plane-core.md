@@ -20,11 +20,11 @@
 
 - **Libraries:** **one module becomes a direct dependency, and nothing is downloaded:** `go.yaml.in/yaml/v3` v3.0.5 (MIT and Apache-2.0), which `go.mod` already lists as indirect (testify needs it); Task 6 moves it to the direct `require` block, at that version (controller ruling, user decision 4). Nothing else is added: only the approved independent libraries (mp4ff, pion/rtp, pion/sdp, datarhei/gosrt, testify, go-astiav v0.41.0, protobuf `protowire`); no bluenviron, no lal, no code copied from another product. v1's code on `main` (`internal/store`, `internal/api`, `internal/coordinator`, `internal/runtime`) may be read for ideas and is never copied. The router is `net/http`'s `ServeMux`, not chi (R-D7); metrics are a hand-written text exposition, not `prometheus/client_golang` (R-D9); password hashing is the standard library's `crypto/pbkdf2` (R-D8); the terminal handling of `hash-password` uses `syscall`, not `golang.org/x/term` (R-D8). A task that finds it needs another module stops and reports.
 - **cgo:** only `internal/transcode/native` and `cmd/ostranscoder` use cgo, behind the tag `libav`. Without the tag, `go build ./...`, `go vet ./...`, `golangci-lint run ./...` and `make test` pass, as do `GOOS=windows go vet ./...` and `GOOS=darwin go vet ./...`. Every new package is pure Go; anything Unix-only (directory fsync, `/proc`) sits behind `_unix.go`/`_linux.go` and `_other.go` files.
-- **Frozen behaviour:** every existing pipeline, output, transcoder and osdev behaviour is what M4c left, and every existing test passes unchanged except the three Task 1 names. The only edits to existing non-test code are additive: `hub.Refuse` and `transcode.ThumbnailerOptions.OnEvent` (Task 5), `redact.Masked` (Task 2) and the watermark sweep's regex (Task 1). `rtmpsrv` is not changed: `AddrKey` rejects port 0 and osdev and ingest depend on that. A hub on which `Refuse` was never called behaves exactly as before.
+- **Frozen behaviour:** every existing pipeline, output, transcoder and osdev behaviour is what M4c left, and every existing test passes unchanged except the four existing tests Task 1 edits (`TestWatermarkSweepsStaleDirs`, `TestProbeFlag`, `TestChildEncoderFallbacks`, `TestPlayManyPlayers`). The only edits to existing non-test code are additive: `hub.Refuse` and `transcode.ThumbnailerOptions.OnEvent` (Task 5), `redact.Masked` (Task 2) and the watermark sweep's regex (Task 1). `rtmpsrv` is not changed: `AddrKey` rejects port 0 and osdev and ingest depend on that. A hub on which `Refuse` was never called behaves exactly as before.
 - **Time:** 90 kHz everywhere. The control plane never touches a timestamp.
 - **Lint:** `exhaustive` with `default-signifies-exhaustive: false` (a `switch` on `spec.Change`, `stream.Output` or a state lists every value); `godot`; gofumpt.
 - **Errors:** wrap as `fmt.Errorf("pkg: op: %w", err)`; never both log and return.
-- **Goroutines:** every spawned goroutine has an explicit cancel path, and the function that spawns it waits for it before returning.
+- **Goroutines:** every spawned goroutine has an explicit cancel path, and its owner waits for it before returning: the function that spawned it, or the `Run` of the object that spawned it (a supervisor that `Manager.Replace` or `Load` starts is waited for by `Manager.Run`; `Replace` only cancels, by design).
 - **Security:** every `/api/`, `/metrics` and `/debug/pprof/` request is authenticated with HTTP Basic auth against the users of the config file and authorised by role (R-D8); passwords exist in the file only as PBKDF2 hashes and are never logged, echoed or taken from argv. Request bodies are bounded (1 MiB for a stream, 4 MiB for a config) and decoded strictly. The config file must be mode 0600 on Unix (it holds stream keys and password hashes). A stream name must pass `spec.ValidName` (`^[a-z0-9][a-z0-9-]{0,62}$`, and not a Windows device name). No secret (URL password, secret query value, RTMP stream key, a user's password or its hash) reaches a log line, a metric, a status document or an error message: URLs pass through `redact.URL` before they leave the process, and the log handler scrubs what slips through (R-D10). The two deliberate exceptions return stored secrets to an **editor** only: `GET /api/v1/config` and `?secrets=1`.
 - **Peers:** every test that runs ffmpeg/ffprobe passes on the host (ffmpeg 8) and in `make test-ci-peers` (image `osv2-ci-peers:m4a`: ffmpeg 6.1, VLC 3.0.20, GStreamer 1.24) before any push. The transcoder bundle is built with `make ostranscoder`; NVENC device tests stay opt-in (`OS_NVENC=1`).
 - **Soak safety (absolute):** never stop, restart or reconfigure open-streamer-soak-mediamtx, caddy, grafana, osdev-console-1, vector, alloy, pyroscope, prometheus, node-exporter, nvidia-gpu-exporter, or any other container not named `osv2-*`. Never bind ports 554, 1935 or 8554: every test uses ephemeral ports and reads them back from `server.Addrs` (`127.0.0.1:0` for every listener; `server.New` turns a port-0 RTMP address into a concrete free port itself, because `rtmpsrv` cannot bind port 0, R-D13), and no test or step runs the server with the example config. Own containers are `osv2-*`, `--rm`, stopped afterwards.
@@ -93,7 +93,7 @@ func nvencGate(device, optedIn bool) bool { return !device || optedIn }
 func TestNVENCGate(t *testing.T) // table: (false,false)→true, (false,true)→true, (true,false)→false, (true,true)→true
 ```
 
-and `nvencProbeOrSkip(t)`: `device` is `os.Stat("/dev/nvidiactl") == nil`, `optedIn` is `OS_NVENC` or `OS_REQUIRE_NVENC` equal to `"1"`; when the gate is false it skips with the text `NVENC tests are opt-in: set OS_NVENC=1 (make test-nvenc does)` (the package keeps its own copy, as `native` does: importing `internal/testpeer` would pull the package into the untagged peer run). In `TestProbeFlag`, move the `-probe nvenc` block into a subtest `device` that calls `nvencProbeOrSkip` first; the three usage rows stay outside it and always run. `TestChildEncoderFallbacks` calls it first. CI has no device, so both still run there in full.
+and `nvencProbeOrSkip(t)`: `device` is `os.Stat("/dev/nvidiactl") == nil`, `optedIn` is `OS_NVENC` or `OS_REQUIRE_NVENC` equal to `"1"`; when the gate is false it skips with the text `NVENC tests are opt-in: set OS_NVENC=1 (make test-nvenc does)` (the package keeps its own copy, as `native` does: importing `internal/testpeer` would pull the package into the untagged peer run). **This third copy of the opt-in gate is accepted by controller ruling**, beside `testpeer.NVENCOptedIn` and native's `nvencOrSkip`: three lines, with a comment that names the other two so that a change to one is carried to all; a shared package is what the untagged peer run rules out. In `TestProbeFlag`, move the `-probe nvenc` block into a subtest `device` that calls `nvencProbeOrSkip` first; the three usage rows stay outside it and always run. `TestChildEncoderFallbacks` calls it first. CI has no device, so both still run there in full.
 - [ ] **Step 4:** run `make test-transcode ARGS='-run ^(TestNVENCGate|TestProbeFlag|TestChildEncoderFallbacks)$ ./cmd/ostranscoder/'` (pass, nothing skipped: the container has no device). On this host, `go test -count=1 ./cmd/ostranscoder/` still passes untagged (the stub tests).
 - [ ] **Step 5: Backlog line.** In that Backlog item, replace "the NVENC device tests (e2e `testpeer.NVENC`, native `nvencOrSkip`) skip" with "the NVENC device tests (e2e `testpeer.NVENC`, native `nvencOrSkip`, and `cmd/ostranscoder`'s `TestProbeFlag/device` and `TestChildEncoderFallbacks`, which skip only where `/dev/nvidiactl` exists) skip".
 - [ ] **Step 6: `TestPlayManyPlayers`, the cause first.** Reproduce under load: run `go test -race -count=30 -run '^TestPlayManyPlayers$' ./internal/output/rtspplay/` while `go test -race -count=1 ./internal/e2e/ ./internal/transcode/` runs beside it. The expected cause is the late-subscription class of `TestPlayCodecChangeEndsSession`: a session subscribes after its PLAY response, so a player whose subscription lands after the feed has written the next keyframe starts from a later cached GOP (the failure seen was player 49 at ts 453600 for 543600, exactly 1 s, one GOP). Confirm it by logging, in the failing run, `len(e.h.Stats())` just before `feed`: fewer than 50 confirms it. **If all 50 are subscribed and a player still differs, stop and report: that is a defect, not a test race.**
@@ -245,7 +245,7 @@ func (w *Writer) Gauge(name, help string, v float64, labels ...Label)
 
 type Registry struct{ /* unexported; the zero value is ready */ }
 func (r *Registry) Register(collect func(*Writer)) // collectors run in registration order at every scrape
-func (r *Registry) Handler() http.Handler          // GET; Content-Type "text/plain; version=0.0.4; charset=utf-8"
+func (r *Registry) Handler() http.Handler          // GET and HEAD (the same headers, no body); any other method is 405; Content-Type "text/plain; version=0.0.4; charset=utf-8"
 
 // Process returns the collector of the go_* and process_* families.
 func Process(start time.Time) func(*Writer)
@@ -253,7 +253,10 @@ func Process(start time.Time) func(*Writer)
 package metricstest
 type Sample struct { Name string; Labels map[string]string; Value float64; Type, Help string }
 func Parse(r io.Reader) ([]Sample, error) // strict: every sample's family has HELP and TYPE before it, families are contiguous, names and label names are legal, no duplicate series
-func Find(s []Sample, name string, labels ...string) (float64, bool) // labels as name, value pairs
+// Find returns the value of the one series of family name whose labels include every given pair (labels as name, value
+// pairs: a subset match, so {name="cam"} finds a series that also carries stream="cam"). It is false when no series or
+// more than one matches.
+func Find(s []Sample, name string, labels ...string) (float64, bool)
 ```
 
 Format rules the Writer owns: samples are grouped by family in first-seen order, with `# HELP` and `# TYPE` once per family; labels are written in the order given; a label value escapes `\`, `"` and newline, a help text `\` and newline; a counter's name ends in `_total`; a value is written with `strconv.FormatFloat(v, 'g', -1, 64)`. A family used with two types or two help texts, an illegal metric or label name, or the same series written twice makes the scrape fail with status 500 and a body naming the family, and nothing else: a broken exposition must not look like a valid one.
@@ -269,8 +272,11 @@ func TestWriterGolden(t *testing.T)
 func TestWriterRejects(t *testing.T)
 // a family as counter then gauge; two help texts; a counter not ending _total; a name "bad-name"; a label "0x"; the
 // same series twice: each gives 500 and a body with the family name.
-func TestHandlerParses(t *testing.T) // a registry with three collectors: metricstest.Parse accepts the body; a HEAD or POST is 405
+func TestHandlerParses(t *testing.T) // a registry with three collectors: metricstest.Parse accepts the body; HEAD is 200 with the Content-Type and an empty body (the API routes HEAD to the GET pattern, Task 9); POST is 405
 func TestParseStrict(t *testing.T)   // metricstest.Parse refuses a sample without TYPE, a split family, a duplicate series
+func TestFind(t *testing.T)
+// series x{a="1",b="1"} 3 and x{a="1",b="2"} 4: Find(x, a, 1, b, 2) is (4, true); Find(x, b, 1) is (3, true) (a subset);
+// Find(x, a, 1) is false (two match); Find(x, a, 9) and Find(y) are false; Find(x) with no pairs is false while two series exist.
 func TestProcess(t *testing.T)
 // go_goroutines ≥ 1; process_start_time_seconds equals start; on Linux process_open_fds ≥ 3 and rises by 1 after os.Open.
 ```
@@ -361,7 +367,8 @@ func TestRefuseReplaces(t *testing.T) // Refuse("rtsp ") then Refuse(): "rtsp a"
 func TestRefuseNeverCalled(t *testing.T) // a control: a hub without Refuse delivers the cached GOP to a late subscriber exactly as before
 func TestRefuseRace(t *testing.T) // under -race: writes, subscribes and Refuse from three goroutines for 200 ms; no panic, no send on a closed channel
 func TestThumbnailerEvents(t *testing.T)
-// a binary that does not exist: EventExited with a non-nil Err at every attempt (the fake After fires twice: two events), Stats
+// a binary that does not exist: EventExited with a non-nil Err at every attempt: the first attempt (made before any wait) and one fired retry give two
+// events, After having been called twice (the second wait is pending and is not fired); Stats
 // as before; the fake child: EventSpawned with its PID, then exactly one EventExited when it is killed, and exactly one when it is killed
 // for silence (SilenceTimeout on the fake clock). With OnEvent nil, nothing changes.
 ```
@@ -442,7 +449,19 @@ func (a *Attempt) Succeed() // gives the place back and zeroes the key's failure
 func (a *Attempt) Fail()    // counts one failure and starts or lengthens the backoff
 func (a *Attempt) Abandon() // neither: the request went away, or the server was busy
 func ClientKey(remoteAddr string) string // the IP of a host:port, Unmap()ped first, the zone dropped; an IPv6 address masked to its /64; the input itself when it does not parse
+
+// SetHashHook is for tests only; no production code calls it. While set, every PBKDF2 computation of the package goes
+// through f, which gets the real computation as next and may count it, hold it, or both. It returns the function that
+// removes the hook; a test calls it in t.Cleanup. Tests that use it must not run in parallel with anything.
+func SetHashHook(f func(next func() []byte) []byte) (restore func())
+// WarmDummy is for tests only: it makes the per-process dummy hash now, if it does not exist yet.
+func WarmDummy()
 ```
+
+**The test seam and its rules** (pre-flight F1, F2). The hook is exported because tests of `internal/api` and `internal/server` count and hold PBKDF2 too, and Go has no cross-package access to an unexported one. Three rules keep the counts stable under `make test`'s `-shuffle=on`:
+- **No test that sets the hook runs in parallel**, and no test of `internal/auth`, `internal/api` or `internal/server` calls `t.Parallel()`. The tests that set it: in `internal/auth`, `TestVerifyAndRemember`, `TestVerifyBounded`, `TestDummyOncePerProcess`; in `internal/api`, `TestLoginBackoff`, `TestLoginBurst`, `TestLoginBusy`, `TestUsersReload`, `TestWritesNeedRequestedBy`; in `internal/server`, `TestEditKeepsRememberedLogin`. Each removes it in `t.Cleanup`.
+- **The dummy hash is made lazily and its PBKDF2 goes through the hook**, so whichever test first verified an unknown name would pay one extra call. Every test above therefore calls `auth.WarmDummy()` **before** it sets the hook and takes its baseline, so its counts never include the dummy's making, whatever ran before.
+- `TestDummyOncePerProcess` is the one test about the making itself: it calls `resetDummyForTest()`, an unexported function in a `_test.go` file of `internal/auth` that forgets the dummy (a fresh `sync.Once`), sets the hook, and counts from there; it restores a made dummy before it returns.
 
 **Remembered logins.** `tag = HMAC-SHA-256(processKey, name ‖ 0x00 ‖ password)`. `Remembered` is true when the user has a remembered tag and `hmac.Equal` says it is this one. `Verify` takes one of 2 slots (or waits, at most 16 deep), verifies against the user's hash, or against the dummy hash when the name is unknown, and on success remembers the tag for that user, replacing an older one. `processKey` (32 random bytes) and **the dummy hash are made once per process**, at first use (`sync.Once`), the dummy at `auth.Iterations`: they are not remade when a `Users` is built, so building one costs no PBKDF2. A `Users` is immutable apart from its remembered tags; the server keeps the same `*Users` across config edits that leave the users section equal (`Equal`, Task 10), so an editor's own writes do not forget its login.
 
@@ -469,18 +488,16 @@ func TestNewUsers(t *testing.T)
 func TestVerifyAndRemember(t *testing.T)
 // (hashes at 1000 iterations) Verify of the editor with its password → Editor; a wrong password, an unknown name and an
 // empty name → ErrBadCredentials; the viewer → Viewer. Remembered is false before the first Verify, true after it for that
-// password only, and never true after a failed Verify. A counter on the PBKDF2 call (an unexported hook) shows one call per
-// Verify and none per Remembered.
+// password only, and never true after a failed Verify. After WarmDummy, a counter on the PBKDF2 call (SetHashHook) shows one call per
+// Verify, the unknown name's included, and none per Remembered.
 func TestVerifyBounded(t *testing.T)
-// not parallel: it sets the package-level PBKDF2 hook and fills the process-wide slots. No test of this package calls
-// t.Parallel(), and the same holds for every test elsewhere that sets that hook (internal/api's TestLoginBurst, TestLoginBusy
-// and TestLoginBackoff, internal/server's TestEditKeepsRememberedLogin): each restores the hook in t.Cleanup.
-// The hook blocks. 30 goroutines call Verify with wrong passwords, half on one Users and half on another: at most 2 are inside PBKDF2, 16 wait, and the other 12
+// not parallel: it sets the hook and fills the process-wide slots (the rules above). After WarmDummy, so that both slot
+// holders are inside the hook and neither is waiting for the dummy to be made. The hook blocks. 30 goroutines call Verify with wrong passwords, half on one Users and half on another: at most 2 are inside PBKDF2, 16 wait, and the other 12
 // get ErrBusy at once. A waiter whose ctx is cancelled returns ctx.Err() and its place is taken by a new caller; when the
 // hook is released, every waiter finishes.
 func TestDummyOncePerProcess(t *testing.T)
-// NewUsers called 50 times runs no PBKDF2 (the hook); the first Verify of an unknown name anywhere in the process makes the
-// dummy (one extra call, at auth.Iterations), later ones do not. An unknown name and a known name with a wrong password
+// after resetDummyForTest(): NewUsers called 50 times runs no PBKDF2 (the hook); the first Verify of an unknown name makes
+// the dummy (one extra call, at auth.Iterations), later ones do not, and WarmDummy after it runs none. An unknown name and a known name with a wrong password
 // each cost exactly one verification.
 func TestUsersEqual(t *testing.T) // equal for the same list reordered; not equal when a hash string, a role or a name differs, or a user is added
 func TestLimiter(t *testing.T)
@@ -598,13 +615,13 @@ func (f *File) Adopt(text []byte)       // remember text's hash: after a reload 
 - **No anchors, aliases or merge keys** (`&a`, `*a`, `<<:`): a node with an `Anchor`, an `AliasNode`, or a mapping key tagged `!!merge` is refused with `line N: anchors, aliases and merge keys are not supported`. They would make a stream entry's text depend on another place in the file, which the per-entry lenient decoding and the node edits of `SetStream` and `DeleteStream` cannot keep whole (an edit could leave an alias dangling).
 - **Numbers are plain decimal integers.** The config has no fractional field, and YAML converts silently: `0720` is 464, `1.5` and `1.0` become 1, `1_000` is 1000. Every scalar the library resolved as `!!int` or `!!float` must match `^-?(0|[1-9][0-9]*)$`, or it is refused with `line N: write the number as a plain decimal integer, or quote it if it is text`. A quoted scalar is a string and is not affected. **The rule is on the scalar, not on the field**, so it also catches unquoted text that looks like a number: a stream `name: 007`, a rendition `label: 007`, a watermark `text: 24.7` or `text: 1e3` are refused with that message. The library itself would decode them correctly (`name: 007` into a string field is `"007"`); they are refused because the node walk does not know the type of the field a scalar is headed for, and one rule on the scalar is simpler and has no field table to keep in step with `internal/spec`. The cost is that operators must quote such text (`"007"`), which the message tells them.
 
-**Strict decoding.** `yaml.NewDecoder` with `KnownFields(true)`; a second document in the text is a `*SyntaxError`; duplicate keys are refused by the library and surface as `*SyntaxError`. `ParseLenient` decodes `streams` as `[]yaml.Node` first, and each entry by marshalling the node back to text and decoding that with a strict decoder (a `Node` cannot be decoded strictly by itself).
+**Strict decoding.** `yaml.NewDecoder` with `KnownFields(true)`; a second document in the text is a `*SyntaxError`; duplicate keys are refused by the library and surface as `*SyntaxError`. `ParseLenient` decodes `streams` as `[]yaml.Node` first, and each entry by marshalling the node back to text and decoding that with a strict decoder (a `Node` cannot be decoded strictly by itself). **Line numbers must point into the file:** an error of that per-entry decode counts lines from the top of the re-marshalled snippet, so before it is reported every `line N` in it is rewritten to `line N + (entry node's Line − 1)`; the node-walk errors already carry file lines. (The snippet is re-emitted by the library, so inside an entry whose layout the library changes the line can be off by the lines it dropped; it is exact for the entry's first line and for entries in the library's own formatting, which is what the test pins.)
 
 **`SetStream`.** Decode `text` into a `yaml.Node`; find the top-level `streams` sequence (append the key when it is missing); find the entry whose `name` scalar is `sp.Name`. Replace: encode `sp` to a node and put its `Content` in place of the entry's, keeping the entry node's own head and foot comments; when several entries have that name (a duplicate the start skipped), the first is replaced and the others removed. Append otherwise. `DeleteStream` removes every entry of the name. Encode with `SetIndent(2)`.
 
 **What a node round trip keeps and loses** (measured in review; R-D4): the library re-emits the whole document, so head comments (the lines above a key or an entry) and the order of keys and entries survive, while **blank lines are dropped, sequences are re-indented, the spacing before a line comment is normalised, comments inside the replaced entry are lost, and so is a line comment on the replaced entry's `name:`**. Only a text that is already in the library's own formatting comes back byte-equal outside the edited entry. A whole-config `PUT` is not affected: it never goes through a node.
 
-**Repairing a skipped entry.** Because `SetStream` and `DeleteStream` find an entry by its `name` scalar alone, a per-stream `PUT` or `DELETE` of the name of an entry the start skipped replaces or removes that entry, and if it was the only fault the document then parses and the edit goes through. An entry whose `name` cannot be read is repaired with a whole-config `PUT` or by hand. **So is an anchor and alias pair:** a per-stream `PUT` or `DELETE` of the anchored entry's name would have the encoder emit the other entry's alias with nothing left to point at, and the result is refused like any text with an alias; the whole-config `PUT` is the way to rewrite both.
+**Repairing a skipped entry.** Because `SetStream` and `DeleteStream` find an entry by its `name` scalar alone, a per-stream `PUT` or `DELETE` of the name of an entry the start skipped replaces or removes that entry, and if it was the only fault the document then parses and the edit goes through. An entry whose `name` cannot be read is repaired with a whole-config `PUT` or by hand. **So is an anchor and alias pair,** and the node edits refuse it themselves: **`SetStream` and `DeleteStream` first run the anchor walk on the text they are given and return `config.Errors`** (`line N: anchors, aliases and merge keys are not supported`, one per place; 422 at the API) when it holds any anchor, alias or merge key, anywhere. They never try the edit: swapping or removing the anchored entry would have the encoder emit the other entry's alias with nothing to point at, which is not even YAML (it would come back as a `*SyntaxError`, a 400, for a request that was well-formed). The whole-config `PUT` is the way to rewrite both.
 
 **`File.Write`.** Steps, each followed by a call of an unexported `hook func(step string) error` that tests set (nil in production): create `.<base>.<8 random hex>.tmp` in the file's directory with `O_WRONLY|O_CREATE|O_EXCL`, 0600 (`created`); write (`written`); `fsync` (`synced`); rename over the file (`renamed`); `fsync` the directory (`dirsynced`). A real error before the rename removes the temp file; a hook error returns at once and removes nothing, which is what a crash leaves. **An error after the rename** (the directory `fsync` failing) is returned, and the hash is **not** remembered: the new text is on disk, the caller's edit was not applied (`commit` failed), so the file is stale and API writes answer 409 until a reload takes the file as it is. Calls are serialised by a mutex in `File`.
 
@@ -640,7 +657,8 @@ func TestParseCollectsEveryError(t *testing.T) // a document with a bad listen a
 func TestParseStreams(t *testing.T) // a stream that fails Validate, two streams "cam", and 1001 streams are errors; the YAML of a full stream (ladder, watermark, thumbnail, pushes) equals the JSON form field for field
 func TestParseLenientSkipsBadStreams(t *testing.T)
 // streams: good cam; an entry with an unknown key; an entry failing Validate; a second "cam"; good other. ParseLenient
-// returns [cam, other] and three skipped errors naming index and name; a bad server section or user is err and nothing is
+// returns [cam, other] and three skipped errors naming index and name, the unknown-key one with the line that key has in
+// the file (the fixture puts that entry at line 40 or later: a snippet-relative number would be below 10); a bad server section or user is err and nothing is
 // returned. Parse of the same text returns Errors with those three. The node-tree checks follow the same split: an entry
 // with `height: 0720`, an entry written `- &x {…}` and an entry `- *x` are each skipped as `streams[i] (name): line N: …`
 // and the good streams are returned, the plain alias entry reported as `streams[i]` without a name; `latency_ms: 0120` in
@@ -658,6 +676,10 @@ func TestSetStreamKeepsComments(t *testing.T)
 func TestSetStreamRepairsSkippedEntry(t *testing.T)
 // a text whose entry "cam" has an unknown key (ParseLenient skips it): SetStream(cam, valid) gives a text that Parse
 // accepts; DeleteStream("cam") too. An entry without a name is not found by either.
+func TestNodeEditsRefuseAnchors(t *testing.T)
+// a text where "src" carries an anchor and "ali" is `- {<<: *src, name: ali}`, plus a good "other": SetStream and
+// DeleteStream of src, of ali and of other each return config.Errors naming the lines of the anchor and of the merge key,
+// and no text. The same for a text whose only anchor is on a user.
 func TestDeleteStream(t *testing.T) // removes b and its comments only (fixture 1: byte-equal otherwise); ErrNoStream for an unknown name; the last stream leaves "streams: []"
 func TestOpenMode(t *testing.T)    // Unix only: 0644 and 0640 are refused with the path and "0600"; 0600 and 0400 pass; a file chmodded to 0644 after Open makes the next Read fail the same way
 func TestOpenSymlink(t *testing.T) // Unix: Open of a symlink to the file; after Write the link is still a link, the real file has the new text, and the temp file was made next to the real file
@@ -708,8 +730,11 @@ type Env struct {
 	// Reserved are the server's own listeners as bound (HTTP, API, RTMP, RTSP, SRT); the Manager's claims start from them.
 	Reserved []Claim
 	Logger *slog.Logger                           // nil discards
-	Now    func() time.Time                       // nil means time.Now
-	After  func(time.Duration) <-chan time.Time   // nil means time.After; the restart backoff
+	// Now and After drive the supervisor's own timing and nothing else: the restart backoff (After) and the 60 s rule
+	// that resets it (Now). They are NOT passed to the pipeline, the transcoder or the thumbnailer, which keep real
+	// timers: a fake clock must not run their stall, respawn or pacing rules. nil means time.Now and time.After.
+	Now    func() time.Time
+	After  func(time.Duration) <-chan time.Time
 	Open   func(ctx context.Context, url string) (ingest.Reader, error) // tests; nil means ingest.Open
 	TranscoderArgs, TranscoderEnv []string        // tests: the fake child
 }
@@ -922,8 +947,9 @@ func TestSupervisorEOFIsNotAnError(t *testing.T)
 // openstreamer_stream_input_eof_total is 3, and Restarts is 0.
 func TestSupervisorSpawnFails(t *testing.T)
 // (a) a ladder with Env.Transcoder naming a file that does not exist (Check passes: the path is only configured): one
-// generation, Restarts 0, LastError starts "transcoder: " and names the spawn failure, the transcoder's Spawns rises with the
-// fake After; (b) the same for a thumbnail-only stream: LastError starts "thumbnailer: ".
+// generation, Restarts 0, LastError starts "transcoder: " and names the spawn failure, and the transcoder's Spawns reaches 2 or
+// more within 5 s of real time (its respawn runs on real timers, 250 ms at first; the supervisor's fake After is never
+// called, since nothing rebuilds); (b) the same for a thumbnail-only stream: LastError starts "thumbnailer: ".
 func TestGenerationRunnerFailure(t *testing.T)
 // every long-lived part of a generation (pipeline, transcoder, thumbnailer) is started through one unexported helper,
 // g.run(name string, f func(context.Context) error), which closes g.failed with "<name>: <err>" when f returns while g's
@@ -1093,8 +1119,9 @@ func TestManagerLoad(t *testing.T)
 // w created; Replace with z on another port → z started; Replace with x unchanged but y deleted → x and z stay as they are.
 // Cancelling ctx stops everything; a later Replace is ErrClosed.
 func TestManagerChainSurvivesCancelledWaiter(t *testing.T)
-// a stream with an RTMP listen input and a udp:// listen input on real loopback ports (Env.Open nil), whose first supervisor
-// has a slow teardown (the test holds its pipeline's Run through a blocking reader Close). Replace: create (S1) → delete →
+// a stream with an RTMP listen input and a udp:// listen input on real loopback ports. Env.Open wraps ingest.Open: the
+// sockets are real, and the reader it returns has a Close that, for the first supervisor only, blocks until the test
+// releases it, which holds that pipeline's Run and so its teardown. Replace: create (S1) → delete →
 // create (S2, waits for S1) → delete (S2 is cancelled while it waits) → create (S3). While S1's teardown is held, S3's Status
 // stays "starting" with no LastError and Open is not called for it; when it is released, S3 runs. At no time does a Status
 // or a log line hold "already registered", "address already in use" or "bind:". The tails map has one entry afterwards, and
@@ -1223,13 +1250,13 @@ Errors are `{"error":{"code":"…","message":"…","errors":["…"]}}` (`errors`
 | 404 | `not_found` | `ErrNotFound`, `config.ErrNoStream`, an unknown stream, an invalid name in the path, no thumbnail yet |
 | 404, 405 | (the mux's plain text) | an `unmatched` request: an unknown path (404), a known path with another method (405 with `Allow`). Not authenticated, not JSON |
 | 307 | (the mux's redirect) | a path the mux redirects to a registered route (`//`, `..`, a missing trailing slash as in `/debug/pprof`): authenticated and authorised as that route first, so 401, 403 or 429 without the credentials for it; counted under that route |
-| 409 | `conflict` | `stream.ErrConflict` (a listen claim, a `copy://` cycle); `errors` lists each |
+| 409 | `conflict` | `stream.ErrConflict` (a listen claim, a `copy://` cycle) and no `stream.ErrInvalid` beside it; `errors` lists each |
 | 409 | `config_changed` | `config.ErrStale`: the file was edited by hand; reload first |
 | 412 | `precondition_failed` | `ErrPrecondition` |
 | 413 | `too_large` | a stream body over `spec.MaxSpecBytes`, a config body over `config.MaxBytes` |
 | 415 | `unsupported_media_type` | a stream `PUT` that is not `application/json`, a config `PUT` that is not `application/yaml` |
 | 422 | `invalid_config` | `config.Errors` (the whole document is judged, also for a per-stream edit); `errors` lists every one |
-| 422 | `invalid_spec` | `stream.ErrInvalid` (`Check`); `errors` lists every one |
+| 422 | `invalid_spec` | `stream.ErrInvalid` (`Check`). **It takes precedence:** `Replace` returns one joined error, which may hold both kinds; when any `ErrInvalid` is in it the answer is 422, and `errors` lists every joined error, the conflicts included |
 | 428 | `precondition_required` | `ErrPreconditionRequired` |
 | 429 | `too_many_attempts` | the limiter: the pair of address and user is in a backoff, or already has 5 logins counted or in flight; with `Retry-After` |
 | 500 | `internal` | anything else (a failed file write); the cause is logged, the message is "internal error" |
@@ -1239,7 +1266,7 @@ Every response sets `Cache-Control: no-store` (except the thumbnail) and `X-Cont
 
 `internal/api/openapi.json` is OpenAPI 3.1: every route above with its parameters and bodies (the config as `application/yaml`, type string), the `If-Match` and `ETag` headers, the `secrets` query parameter, a `basicAuth` security scheme (`type: http`, `scheme: basic`) on all but `/healthz`, an `x-role` of `viewer` or `editor` on each operation, and `components.schemas` for `Stream`, `Input`, `Transcode`, `Rendition`, `Audio`, `Watermark`, `Thumbnail`, `Outputs`, `Push`, `Status` and its nested types, `Outcome`, `ApplyResult`, `ConfigStatus` and `Error`, each property with a one-line description and the limits of Task 2's `Validate`.
 
-- [ ] **Step 1: Write the failing tests** (a fake `Backend`; `httptest`; users `ops` (editor) and `eye` (viewer) with hashes at 1000 iterations; a `Limiter` on a fake clock)
+- [ ] **Step 1: Write the failing tests** (a fake `Backend`; `httptest`; users `ops` (editor) and `eye` (viewer) with hashes at 1000 iterations; a `Limiter` on a fake clock. **No test of `internal/api` calls `t.Parallel()`.** PBKDF2 is counted and held through `auth.SetHashHook`, set after `auth.WarmDummy()` and removed in `t.Cleanup`, by `TestLoginBackoff`, `TestLoginBurst`, `TestLoginBusy`, `TestUsersReload` and `TestWritesNeedRequestedBy`)
 
 ```go
 func TestAuth(t *testing.T)
@@ -1250,6 +1277,7 @@ func TestAuth(t *testing.T)
 func TestRoles(t *testing.T)
 // from Routes(): the viewer gets 200 on every viewer route and 403 on every editor route (PUT and DELETE of a stream,
 // GET and PUT of the config, POST reload, pprof), and 403 for GET streams?secrets=1; the editor gets no 403 anywhere.
+// The editor's requests to /debug/pprof/profile and /debug/pprof/trace carry ?seconds=1 (the default profile is 30 s).
 // Routes() has exactly the table's roles.
 func TestUsersReload(t *testing.T) // Options.Users returning a new set: the old password is 401 on the next request and the new one 200; returning the same set again: the next request of a remembered login runs no PBKDF2
 func TestLoginBackoff(t *testing.T)
@@ -1275,7 +1303,8 @@ func TestStreamCRUD(t *testing.T)
 // the If-Match value verbatim.
 func TestErrors(t *testing.T)
 // one row per line of the error table, by the Backend's fake returning that error or by the request itself: the status, the
-// code, and for the rows with `errors` the full list (a config.Errors of three gives three). A 500 says "internal error" and
+// code, and for the rows with `errors` the full list (a config.Errors of three gives three). A joined error of one
+// ErrInvalid and two ErrConflict → 422 invalid_spec with three errors; of two ErrConflict alone → 409 conflict with two. A 500 says "internal error" and
 // the cause is in the log. A 412 has no ETag header.
 func TestPathNames(t *testing.T)
 // PUT and GET of "%2e%2e", "a%2Fb", "A", "x_y", "con" and a 64-byte name → 404 not_found, and the Backend was not called. A
@@ -1286,7 +1315,8 @@ func TestResponsesRedact(t *testing.T)
 // "hunter2" nor "secretkey", for the viewer and the editor; the editor with ?secrets=1 gets both; ?secrets=0 and
 // ?secrets=1&x=1 redact.
 func TestPutRejectsMaskedSecrets(t *testing.T)
-// with a Backend whose PutStream runs spec.Validate as the real path does: PUT a spec with a password; GET it (redacted);
+// with a Backend whose PutStream runs spec.Validate and returns its error as config.Errors{err}, which is what the real
+// apply path returns (a bare Validate error would be a 500 by the table): PUT a spec with a password; GET it (redacted);
 // PUT that body back → 422; GET ?secrets=1 still returns the password.
 func TestConfigGet(t *testing.T)
 // the editor gets ConfigText's bytes exactly (a text with comments, a stream key and a password hash), Content-Type
@@ -1349,6 +1379,9 @@ type Options struct {
 	Version       string
 	LogOut        io.Writer // nil means os.Stderr
 	MinIterations int       // passed to config.Options; 0 means auth.MinIterations. Tests only.
+	// Open is passed to stream.Env.Open. Tests only (a reader whose Close the test holds is how a teardown is held);
+	// nil means ingest.Open. cmd/openstreamer never sets it.
+	Open func(ctx context.Context, url string) (ingest.Reader, error)
 }
 type Addrs struct{ HTTP, API, RTMP, RTSP, SRT string } // host:port as bound; "" when off
 
@@ -1419,7 +1452,7 @@ Wiring, following osdev's `run`: the media mux has `GET /live/{stream}/stream.ts
 Shutdown order when `ctx` ends: stop accepting API requests (`Shutdown`, 2 s, then `Close`); cancel the manager's context and wait for `Manager.Run` (every hub closes); unregister RTMP play, stop RTSP, stop SRT (each waits for its sessions, which ended with their hubs); shut the media server down (2 s, then `Close`). A listener that fails after start-up ends `Run` with that error, after the same stop.
 
 **`cmd/openstreamer`.** `func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, hup <-chan os.Signal) int`. `main` passes `os.Stdin`, `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)` and, on Unix, `hup := make(chan os.Signal, 1)` with `signal.Notify(hup, syscall.SIGHUP)` (`nil` elsewhere: use `POST /api/v1/reload`). **SIGHUP rules:** the channel has a buffer of exactly 1, so signals that arrive during a reload coalesce into one pending reload and none is lost (with no buffer the runtime would drop a signal that arrives while the loop is inside `Reload`; the default action of an unhandled SIGHUP would end the process); `signal.Notify` is called **before** `server.New`, so a HUP during start-up is kept, not fatal; `signal.Stop` is never called (between it and the exit a HUP would kill a process that is shutting down cleanly); and the loop that reads `hup` selects on `ctx.Done()` as well and stops reading once it is closed; **after a receive from `hup` it checks `ctx.Err()` before it calls `Reload`**, because `select` picks at random when both cases are ready, so a HUP that was pending at shutdown could otherwise still start a reload.
-- `openstreamer -config path` prints one line per bound listener to stdout (`http <addr>`, `api <addr>`, `rtmp <addr>`, `rtsp <addr>`, `srt <addr>`), then runs; each value from `hup` calls `Reload` (one at a time, in the loop's goroutine) and logs its outcome. Exit codes: 0 after a clean stop, 1 when `Run` returns an error, 2 for a usage, config or start-up error (printed to stderr, scrubbed).
+- `openstreamer -config path` prints one line per bound listener to stdout (`http <addr>`, `api <addr>`, `rtmp <addr>`, `rtsp <addr>`, `srt <addr>`), then runs; each value from `hup` calls `Reload` (one at a time, in the loop's goroutine) and logs its outcome. The loop is one small function shared by `main` and the tests, **which takes the reload function as a parameter**: `func hupLoop(ctx context.Context, hup <-chan os.Signal, reload func(context.Context))`; `run` passes the server's `Reload` wrapped with its logging, and a test can pass a slow fake. Exit codes: 0 after a clean stop, 1 when `Run` returns an error, 2 for a usage, config or start-up error (printed to stderr, scrubbed).
 - `openstreamer -version` prints the version.
 - `openstreamer hash-password` takes **no argument** (any is a usage error, exit 2, and is not echoed back: it may be a password). When stdin is a terminal it writes `Password: ` to stderr, reads a line with echo off, writes `Again: `, reads again, and fails on a mismatch; echo is restored on every path: a normal return, an error, and SIGINT or SIGTERM while it waits (it catches them for the length of the read, restores the terminal, and exits 130 or 143). When stdin is not a terminal it reads at most 1024 bytes and strips one trailing `\n` or `\r\n`. A password under `auth.MinPasswordBytes` is refused. It prints the hash and a newline to stdout, exit 0. `tty_linux.go` and `tty_darwin.go` implement `isTerminal(fd)` and `readNoEcho(fd)` with `syscall` termios ioctls (`TCGETS`/`TCSETS`; `TIOCGETA`/`TIOCSETA`); `tty_other.go` reports a terminal by `os.ModeCharDevice` and refuses it with `hash-password: echo cannot be turned off on this system; pipe the password on stdin`.
 
@@ -1450,13 +1483,16 @@ func TestStartIsLenient(t *testing.T)
 // a file with a good stream, a stream "bad" with an unknown key, a stream "oct" with `height: 0720`, a stream written
 // `- {<<: *src, name: ali}` whose source "src" carries the anchor, and two streams on one UDP port: New succeeds; the good stream and the first of the pair
 // run; config/status has load_errors for bad, oct, ali and src (each `streams[i] (name): line N: …`) and for the second of
-// the pair, left stopped, and openstreamer_config_load_errors is 5. A per-stream PUT of "src" is refused with 422 (it would
-// leave ali's merge dangling) and a PUT /api/v1/config that rewrites both entries without the anchor succeeds. A file
-// with an anchor on the streams sequence itself does not start. A file with `latency_ms: 0120` in
-// server does not start. While "bad" is in the file, a per-stream PUT of another stream is
-// refused with 422 naming the bad entry. Three repairs, each on a fresh server: PUT /api/v1/streams/bad with a valid
-// document → 201 "created" and the file parses; DELETE /api/v1/streams/bad → 204; a PUT /api/v1/config with the entry
-// fixed. After each, the other per-stream PUT succeeds. A file whose users have no editor, whose server section is bad, or
+// the pair, left stopped, and openstreamer_config_load_errors is 5. With that file, a per-stream PUT of another stream is
+// refused with 422 naming the bad entries. A file with an anchor on the streams sequence itself does not start. A file
+// with `latency_ms: 0120` in server does not start.
+// The repairs, **each on a fresh server started from a file whose only fault is the one it repairs** (a strict parse of
+// anything else would refuse the repair). File A, a good stream and "bad" with an unknown key: (1) PUT /api/v1/streams/bad
+// with a valid document → 201 "created" and the file parses; (2) DELETE /api/v1/streams/bad → 204; (3) a PUT /api/v1/config
+// with the entry fixed; after each, a per-stream PUT of the good stream succeeds. File B, a good stream, "src" with an
+// anchor and "ali" merging it: a per-stream PUT of src, of ali and of the good stream are each 422 (anchors are refused up
+// front), and a PUT /api/v1/config that writes both entries out in full, without the anchor, succeeds, after which the
+// per-stream PUT of the good stream does too. A file whose users have no editor, whose server section is bad, or
 // whose transcoder.binary does not exist, makes New fail, without printing a hash.
 func TestBinaryGoneLaterBlocksNoEdit(t *testing.T)
 // started with a transcoder.binary that exists; the test deletes it; a per-stream PUT of a passthrough stream, a
@@ -1476,11 +1512,12 @@ func TestPutConfigPreconditions(t *testing.T)
 // config.ErrStale (the stale check comes first), and with an old ETag as well → still config.ErrStale. In each case the
 // file and the running streams are untouched.
 func TestEditKeepsRememberedLogin(t *testing.T)
-// the editor logs in (one PBKDF2, by auth's hook), then does a per-stream PUT, a PUT /api/v1/config that changes a stream
+// after auth.WarmDummy(), with auth.SetHashHook counting: the editor logs in (one PBKDF2), then does a per-stream PUT, a PUT /api/v1/config that changes a stream
 // only, and a Reload of an unchanged users section: no further PBKDF2 for any of its requests, and the *auth.Users pointer
 // is the same. A PUT /api/v1/config that changes the viewer's hash replaces the set: the editor's next request costs one.
 func TestClientGoneDuringRebuild(t *testing.T)
-// a per-stream PUT that rebuilds a stream whose teardown the test holds; the test cancels the request's context after the
+// a per-stream PUT that rebuilds a stream whose teardown the test holds (server.Options.Open: a reader whose Close
+// blocks until released; TestStatusDoesNotWaitForApply holds its rebuild the same way); the test cancels the request's context after the
 // file was written. Then: ConfigText() and its ETag equal the file on disk; config.Parse(file) holds the new spec and so
 // does Manager.Get; a following PutStream of another stream keeps the first edit (nothing is reverted); when the teardown
 // is released the stream runs the new spec.
@@ -1525,18 +1562,22 @@ func TestRun(t *testing.T)
 // config return 2 with a message on stderr that holds no hash; with a good config the five address lines appear on stdout,
 // /healthz answers, a value sent on hup reloads (a hand-edited stream appears), and cancelling ctx returns 0.
 func TestRealIterations(t *testing.T)
-// the product path once, without MinIterations: a config whose editor's hash was made by HashPassword (600000 iterations)
-// loads through run, and that user gets 200; a 599999-iteration hash makes run return 2.
+// a config whose editor's hash was made by auth.HashPassword (600000 iterations) loads through run, and that user gets
+// 200; a 599999-iteration hash makes run return 2. run has no MinIterations input, so every test of cmd/openstreamer that
+// authenticates (this one, TestRun, TestSIGHUP) uses HashPassword hashes: about 0.2 s for each user's first login, more
+// under -race.
 func TestHashPassword(t *testing.T)
 // stdin "correct horse battery\n" → exit 0 and stdout is one line that auth.ParseHash accepts and that verifies the
 // password without the newline; "\r\n" is stripped too; "short\n" → exit 2; an argument (`hash-password hunter2-secret`) →
 // exit 2 and neither stdout nor stderr contains "hunter2-secret"; empty stdin → exit 2.
 func TestSIGHUP(t *testing.T)
 // Unix (sighup_unix_test.go), through main's own set-up (a helper shared with main that makes the buffered channel and
-// registers it): syscall.Kill(os.Getpid(), SIGHUP) after a hand edit makes the edited stream appear within 5 s. Coalescing:
-// with a reload made slow (a rebuild whose teardown the test holds), the test hand-edits the file again and sends 3 HUPs
-// while that reload is still running; the process survives, and after the release at least one further reload runs, the
-// final file is the config in force (ConfigText equals it) and config/status is not stale. A HUP sent before server.New has
+// registers it): end to end, through run and the real Reload, syscall.Kill(os.Getpid(), SIGHUP) after a hand edit makes the
+// edited stream appear within 5 s, ConfigText equals the file and config/status is not stale. Coalescing, on hupLoop alone
+// with a fake reload that blocks until the test releases it and counts its calls (run has no way to hold a teardown, and
+// needs none for this): one real HUP starts the fake; 3 more HUPs arrive while it is blocked; the process survives; after
+// the release the fake runs at least once more and at most once more per pending signal (2 or 3 calls in all, never 1),
+// and a marker the test set before the last HUP has been seen by the last call. A HUP sent before server.New has
 // returned (the helper registers first) does not kill the process. After ctx is cancelled a HUP starts no reload
 // (openstreamer_config_reloads_total does not move) and run returns 0.
 func TestHashPasswordTTY(t *testing.T)
@@ -1593,7 +1634,7 @@ A lost frame in a segmented output's first or last capture epoch is therefore ca
 
 `output_resyncs_total` is equal in every row: no reader of any output lost a frame.
 
-- [ ] **Step 1: Write the tests** (they fail until they are written right; the code they test exists)
+- [ ] **Step 1: Write the tests.** The code they test exists, so they are green-first; that is accepted by controller ruling for end-to-end tests over existing code, on the condition of the mutation check in Step 2a.
 
 ```go
 func TestM5aEveryOutput(t *testing.T)
@@ -1632,9 +1673,9 @@ func TestM5aConfigPut(t *testing.T)
 // comment included. A second PUT with the old ETag → 412; one without If-Match → 428; a text with an unknown key → 422
 // listing it, and the file and the streams are untouched.
 func TestM5aReload(t *testing.T)
-// a hand edit applied by reload. cam and other running, readers and taps as above. handEdit: cam's srt: true → false, a new
+// a hand edit applied by reload. cam (pushing to sink), sink and other running, readers and taps as above. handEdit: cam's srt: true → false, a new
 // stream extra added, a comment added. Before the reload nothing changed (cam still serves SRT; config/status says stale).
-// reload → streams [{cam outputs}, {extra created}, {other unchanged}]; cam's SRT reader ended and its others pass
+// reload → streams [{cam outputs}, {extra created}, {other unchanged}, {sink unchanged}]; cam's SRT reader ended and its others pass
 // assertUninterrupted; other is untouched; extra plays over HLS. Then handEdit to invalid YAML and reload → the error;
 // every stream keeps its generation; config/status has last_reload_error; restoring the file and reloading clears it.
 // Then handEdit of server.rtsp.listen and reload → restart_required ["server.rtsp.listen"], and RTSP still answers on the
@@ -1676,13 +1717,14 @@ func TestM5aRoles(t *testing.T)
 // without credentials every /api/, /metrics and /debug/pprof/ URL is 401 with WWW-Authenticate `Basic realm="openstreamer"`
 // and /healthz is 200. The viewer reads streams, status, config/status and /metrics (as the soak's Prometheus will, with
 // basic_auth) and gets 403 for a stream PUT and DELETE, GET and PUT of the config, reload, ?secrets=1 and pprof; the editor
-// does all of them. A write without X-Requested-By is 400. Six wrong passwords for "eye" give 429 with Retry-After on the
+// does all of them (pprof's profile and trace with ?seconds=1). A write without X-Requested-By is 400. Six wrong passwords for "eye" give 429 with Retry-After on the
 // sixth, while "ops", from the same address, is still served. A PUT of the config
 // that replaces the editor's hash makes the old password 401 and the new one 200 on the next request, and one that leaves
 // no editor is 422. The media listener serves /live/ without credentials and has no /api/ route (404).
 ```
 
 - [ ] **Step 2: Run** `go test -race -count=1 -timeout=10m -run '^TestM5a' ./internal/e2e/` on the host — pass (`TestM5aLadder` needs `OS_TRANSCODER`: run `make ostranscoder` first and set it to `dist/ostranscoder-amd64/ostranscoder`). If a table rule fails on a reader that the edit did not touch, the finding is a defect in `reattach` or in the output, not a reason to loosen the rule: stop and report it.
+- [ ] **Step 2a: One recorded mutation check.** In a scratch copy of the tree (never committed), delete step 5 of `reattach` in `internal/stream/generation.go` (the `Refuse(off(new)…)` that ends the sessions of a disabled output) and run `go test -race -count=1 -run '^TestM5aEditOutputs$' ./internal/e2e/`: the `rtsp`, `rtmp`, `srt` and `httpts` rows must fail on "the row's own reader ends within 2 s of the first edit". Record the failing rows and their messages in the commit message of Step 6, then discard the scratch copy and run Step 2 again on the real tree: pass. A check that does not fail means the scenarios do not see what they claim to; stop and report.
 - [ ] **Step 3: Time budget.** `make test` runs every package under one `-timeout=10m` per package. The M5a scenarios may add at most **240 s** to `./internal/e2e/` (`TestM5aEditOutputs`' eight rows run in parallel, about 35 s of wall time together, the segmented readers' 26 s of media setting the pace; the others run one after another: about 15 s for `EveryOutput`, 35 for `ConfigPut`, 30 for `Reload`, 5 for `HandEditThenWrite`, 12 for `RebuildIsTheOtherRoute`, 15 for `RestartRestores`, 35 for `Ladder`, 15 for `Peers`, 8 for `NoSecretsLeak` and 3 for `Roles`). Measure it: `go test -race -count=1 ./internal/e2e/` before and after, and record both wall times in the commit message. If the package then takes more than 8 min under `-race`, mark the top-level `TestM5a*` tests parallel as well (each has its own server and ports) and measure again.
 - [ ] **Step 4: Run** `go test -race -count=5 -timeout=20m -run '^TestM5a(EditOutputs|EveryOutput|ConfigPut|Reload)$' ./internal/e2e/` — 5 of 5 (about 10 min); then once more while `make test` runs beside it, to see the scenarios under load.
 - [ ] **Step 5: Run** `make test-ci-peers ARGS='-timeout=15m -run ^TestM5a ./internal/e2e/'` — pass in `osv2-ci-peers:m4a`.
