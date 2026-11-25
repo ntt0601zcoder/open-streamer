@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -151,5 +152,62 @@ func TestHandlerKeepsStructure(t *testing.T) {
 	g, ok := m["grp"].(map[string]any)
 	if !ok || g["k"] != float64(7) {
 		t.Errorf("group = %v", m["grp"])
+	}
+}
+
+type strg struct{ u string }
+
+func (s strg) String() string { return "dial " + s.u }
+
+type nilErr struct{ msg string }
+
+func (e *nilErr) Error() string { return e.msg }
+
+type holder struct {
+	Name string
+	URL  string
+}
+
+func TestHandlerScrubsAnyValues(t *testing.T) {
+	const pw = "rtsp://u:pwsecret@cam/1?token=qsecret"
+	pu, err := url.Parse(pw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"json", "text"} {
+		t.Run(format, func(t *testing.T) {
+			var buf bytes.Buffer
+			log, err := New(&buf, "info", format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log.Info("m", "u", pu, "s", strg{pw}, "l", []string{pw}, "h", holder{"n", pw},
+				"mp", map[string]string{"k": pw}, "k", "v", "api_key", "ak", "ok", []int{1, 2})
+			out := buf.String()
+			for _, s := range []string{"pwsecret", "qsecret", `"ak"`, "=ak"} {
+				if strings.Contains(out, s) {
+					t.Errorf("%q leaked: %s", s, out)
+				}
+			}
+			if strings.Count(out, "cam/1") != 5 {
+				t.Errorf("hosts lost: %s", out)
+			}
+			if !strings.Contains(out, "[1 2]") && !strings.Contains(out, "[1,2]") {
+				t.Errorf("plain slice changed: %s", out)
+			}
+		})
+	}
+}
+
+func TestHandlerTypedNil(t *testing.T) {
+	var buf bytes.Buffer
+	log, err := New(&buf, "info", "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Info("m", "u", (*url.URL)(nil), "e", error((*nilErr)(nil)))
+	out := buf.String()
+	if strings.Count(out, "<nil>") != 2 {
+		t.Errorf("output = %s", out)
 	}
 }

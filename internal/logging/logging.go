@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"regexp"
 	"strings"
 
@@ -22,6 +23,7 @@ var urlLike = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
 // secretKeys are the lower-cased attribute names whose values are always hidden.
 var secretKeys = map[string]bool{
 	"token": true, "password": true, "passphrase": true, "secret": true, "authorization": true,
+	"key": true, "api_key": true, "stream_key": true, "streamkey": true, "passwd": true,
 }
 
 // New returns a logger writing to w. level is "debug", "info", "warn" or
@@ -114,11 +116,34 @@ func scrubAttr(a slog.Attr) slog.Attr {
 		}
 		return slog.Attr{Key: a.Key, Value: slog.GroupValue(dst...)}
 	case slog.KindAny:
-		if err, ok := v.Any().(error); ok && err != nil {
-			return slog.String(a.Key, Scrub(err.Error()))
+		switch x := v.Any().(type) {
+		case error:
+			return slog.String(a.Key, Scrub(safeString(x, x.Error)))
+		case fmt.Stringer:
+			return slog.String(a.Key, Scrub(safeString(x, x.String)))
+		default:
+			if rendered := fmt.Sprintf("%+v", x); strings.Contains(rendered, "://") {
+				return slog.String(a.Key, Scrub(rendered))
+			}
 		}
 	case slog.KindBool, slog.KindDuration, slog.KindFloat64, slog.KindInt64,
 		slog.KindTime, slog.KindUint64, slog.KindLogValuer:
 	}
 	return slog.Attr{Key: a.Key, Value: v}
+}
+
+// safeString calls f, which is a method of recv. A panic in it yields "<nil>"
+// when recv is a nil pointer, as slog does, and "!PANIC" otherwise.
+func safeString(recv any, f func() string) (s string) {
+	defer func() {
+		if recover() == nil {
+			return
+		}
+		if rv := reflect.ValueOf(recv); rv.Kind() == reflect.Pointer && rv.IsNil() {
+			s = "<nil>"
+			return
+		}
+		s = "!PANIC"
+	}()
+	return f()
 }
