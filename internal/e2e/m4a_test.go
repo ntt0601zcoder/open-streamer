@@ -95,12 +95,21 @@ func recordHub(h *hub.Hub) *hubRecorder {
 	return r
 }
 
-// transcodeSteps runs one transcoder with opt over src, written into the
-// source hub, and returns every rendition hub's deliveries as steps, in
-// opt.Renditions order, with the transcoder's final stats. The run must be
-// clean: one child, no exit, no loss, nothing dropped, an anchor before
-// every epoch.
-func transcodeSteps(t *testing.T, src feed, opt transcode.Options) ([][]step, transcode.Stats) {
+// transcodeRun is the recording of one transcoder run.
+type transcodeRun struct {
+	renditions   [][]step // per rendition, in opt.Renditions order
+	presentation []step   // the presentation hub's; nil without opt.Presentation
+	stats        transcode.Stats
+}
+
+// recordTranscode runs one transcoder with opt over src, written into the
+// source hub, and records every rendition hub's deliveries as steps, and
+// the presentation hub's too with opt.Presentation. hook, when not nil, is
+// called with the transcoder before it runs, so it can subscribe to its
+// hubs. Every recording must be whole: no loss and an anchor before every
+// epoch; the presentation's must also hold every frame its merger wrote.
+// The final stats are returned unchecked.
+func recordTranscode(t *testing.T, src feed, opt transcode.Options, hook func(tr *transcode.Transcoder)) transcodeRun {
 	t.Helper()
 	h := hub.New(hub.Options{})
 	if opt.Logger == nil {
@@ -112,6 +121,13 @@ func transcodeSteps(t *testing.T, src feed, opt transcode.Options) ([][]step, tr
 	for _, rh := range tr.Hubs() {
 		recs = append(recs, recordHub(rh))
 	}
+	var pres *hubRecorder
+	if ph := tr.Presentation(); ph != nil {
+		pres = recordHub(ph)
+	}
+	if hook != nil {
+		hook(tr)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), runLimit)
 	defer cancel()
 	runErr := make(chan error, 1)
@@ -122,22 +138,54 @@ func transcodeSteps(t *testing.T, src feed, opt transcode.Options) ([][]step, tr
 	h.Close()
 	require.NoError(t, <-runErr)
 	require.NoError(t, ferr)
-	out := make([][]step, len(recs))
+	out := transcodeRun{renditions: make([][]step, len(recs))}
 	for i, r := range recs {
-		<-r.done
-		require.Zero(t, r.lost, "%s: lost frames", opt.Renditions[i].Name)
-		require.Empty(t, r.missing, "%s: epochs without an anchor", opt.Renditions[i].Name)
-		require.NotEmpty(t, r.steps, opt.Renditions[i].Name)
-		requireVideoFirst(t, stepFrames(r.steps), opt.Renditions[i].Name)
-		out[i] = r.steps
+		out.renditions[i] = r.wait(t, opt.Renditions[i].Name)
 	}
-	st := tr.Stats()
+	out.stats = tr.Stats()
+	if pres != nil {
+		out.presentation = pres.wait(t, "presentation")
+		require.EqualValues(t, out.stats.PresentationOut, len(out.presentation),
+			"the presentation's recording holds every frame its merger wrote")
+	}
+	return out
+}
+
+// wait waits for the recorded hub to close and returns its steps, which
+// must be whole: no loss and an anchor before every epoch.
+func (r *hubRecorder) wait(t *testing.T, name string) []step {
+	t.Helper()
+	<-r.done
+	require.Zero(t, r.lost, "%s: lost frames", name)
+	require.Empty(t, r.missing, "%s: epochs without an anchor", name)
+	require.NotEmpty(t, r.steps, name)
+	return r.steps
+}
+
+// requireCleanRun checks that a transcoder run was clean: one child, no
+// exit, no loss, nothing dropped.
+func requireCleanRun(t *testing.T, st transcode.Stats) {
+	t.Helper()
 	require.EqualValues(t, 1, st.Spawns, "%+v", st)
 	require.Zero(t, st.Exits, "%+v", st)
 	require.Zero(t, st.Losses, "%+v", st)
 	require.Zero(t, st.DroppedBeforeKey, "%+v", st)
 	require.Zero(t, st.MergeDropped, "%+v", st)
-	return out, st
+}
+
+// transcodeSteps runs one transcoder with opt over src, written into the
+// source hub, and returns every rendition hub's deliveries as steps, in
+// opt.Renditions order, with the transcoder's final stats. The run must be
+// clean: one child, no exit, no loss, nothing dropped, an anchor before
+// every epoch.
+func transcodeSteps(t *testing.T, src feed, opt transcode.Options) ([][]step, transcode.Stats) {
+	t.Helper()
+	run := recordTranscode(t, src, opt, nil)
+	for i, steps := range run.renditions {
+		requireVideoFirst(t, stepFrames(steps), opt.Renditions[i].Name)
+	}
+	requireCleanRun(t, run.stats)
+	return run.renditions, run.stats
 }
 
 // requireVideoFirst checks that each epoch of a rendition hub that has
