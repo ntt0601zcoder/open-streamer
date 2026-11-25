@@ -98,8 +98,9 @@ type builder struct {
 	fromStart  bool
 	firstEpoch uint32
 	// gapStart holds the sources (HLS playlists) whose first entry in an
-	// epoch is a gap: their tracks may start late in it.
-	gapStart map[srcEpoch]bool
+	// epoch is a gap, with the summed EXTINF, in ticks, of the gaps before
+	// their first real entry in it: their tracks may start that late.
+	gapStart map[srcEpoch]int64
 }
 
 // srcEpoch names one epoch of one source.
@@ -111,19 +112,23 @@ type srcEpoch struct {
 func newBuilder() *builder {
 	return &builder{
 		tracks: map[trackKey]int{}, last: map[int]cfgState{}, seen: map[string]bool{},
-		gapStart: map[srcEpoch]bool{},
+		gapStart: map[srcEpoch]int64{},
 	}
 }
 
 // lateStart reports whether capture track track comes from a source whose
-// first entry in epoch is a gap.
-func (b *builder) lateStart(track int, epoch uint32) bool {
+// first entry in epoch is a gap, and how late its leading gaps there
+// declare it.
+func (b *builder) lateStart(track int, epoch uint32) (int64, bool) {
 	for k, n := range b.tracks {
-		if n == track && b.gapStart[srcEpoch{k.src, epoch}] {
-			return true
+		if n != track {
+			continue
+		}
+		if by, ok := b.gapStart[srcEpoch{k.src, epoch}]; ok {
+			return by, true
 		}
 	}
-	return false
+	return 0, false
 }
 
 // track maps a source track to the capture's track number, in order of

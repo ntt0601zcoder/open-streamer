@@ -52,9 +52,11 @@ type FrameOptions struct {
 	MaxStartOffset int64    // 0 means 3600 (40 ms).
 	Skip           []string // Rule names not to check.
 	// LateStart, when set, reports a track whose late start in an epoch is
-	// declared (an HLS playlist whose first entry in the epoch is a gap):
-	// RuleStartOffset neither checks it nor measures the others from it.
-	LateStart func(track int, epoch uint32) bool
+	// declared (an HLS playlist whose first entry in the epoch is a gap),
+	// and by how many ticks (the summed EXTINF of its leading gaps):
+	// RuleStartOffset does not measure the others from it, and lets it
+	// start up to by + MaxStartOffset after the earliest of the others.
+	LateStart func(track int, epoch uint32) (by int64, late bool)
 }
 
 type trackState struct {
@@ -191,11 +193,16 @@ func CheckFrames(frames []media.Frame, opt FrameOptions) []Violation {
 	}
 
 	if on(RuleStartOffset) {
-		late := func(k trackEpoch) bool { return opt.LateStart != nil && opt.LateStart(k.track, k.epoch) }
+		late := func(k trackEpoch) (int64, bool) {
+			if opt.LateStart == nil {
+				return 0, false
+			}
+			return opt.LateStart(k.track, k.epoch)
+		}
 		earliest := map[uint32]int64{}
 		for _, k := range teOrder {
 			st := te[k]
-			if late(k) {
+			if _, ok := late(k); ok {
 				continue
 			}
 			if e, ok := earliest[k.epoch]; !ok || st.firstPTS < e {
@@ -204,14 +211,25 @@ func CheckFrames(frames []media.Frame, opt FrameOptions) []Violation {
 		}
 		for _, k := range teOrder {
 			st := te[k]
-			if late(k) {
-				continue
+			first, ok := earliest[k.epoch]
+			if !ok {
+				continue // every track of the epoch starts late
 			}
-			if d := st.firstPTS - earliest[k.epoch]; d > maxOffset {
+			by, isLate := late(k)
+			d := st.firstPTS - first
+			switch {
+			case d <= by+maxOffset:
+			case isLate:
+				out = append(out, Violation{
+					Rule: RuleStartOffset, Track: k.track, Index: st.index,
+					Detail: fmt.Sprintf("first PTS %d is %d ticks after earliest %d in epoch %d (leading gaps declare %d, max %d more)",
+						st.firstPTS, d, first, k.epoch, by, maxOffset),
+				})
+			default:
 				out = append(out, Violation{
 					Rule: RuleStartOffset, Track: k.track, Index: st.index,
 					Detail: fmt.Sprintf("first PTS %d is %d ticks after earliest %d in epoch %d (max %d)",
-						st.firstPTS, d, earliest[k.epoch], k.epoch, maxOffset),
+						st.firstPTS, d, first, k.epoch, maxOffset),
 				})
 			}
 		}

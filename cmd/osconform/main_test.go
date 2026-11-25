@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/clock"
+	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
@@ -130,6 +131,37 @@ func TestOsconformExitCodes(t *testing.T) {
 		code, _ = runConform(t, "-url", url+"/"+ext, "-once")
 		assert.Equal(t, 2, code, ext)
 	}
+}
+
+// -aligned turns on the rules that need the master's playlists to number
+// their segments alike: a media playlist whose MEDIA-SEQUENCE is off by one
+// passes without it and fails with it.
+func TestOsconformAligned(t *testing.T) {
+	base := serve(t, "", nil)
+	code, out := runConform(t, "-url", base+"cmaf/master.m3u8", "-once", "-aligned")
+	assert.Equal(t, 0, code, out)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+"cmaf/master.m3u8", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, resp.Body.Close())
+	require.NoError(t, err)
+	m, err := hls.ParseMultivariant(body)
+	require.NoError(t, err)
+	require.NotEmpty(t, m.Variants)
+	bad := serve(t, "cmaf/"+m.Variants[0].URI, func(b []byte) []byte {
+		pl, err := hls.ParseMedia(b)
+		require.NoError(t, err)
+		pl.MediaSequence++
+		return pl.Encode()
+	})
+	code, out = runConform(t, "-url", bad+"cmaf/master.m3u8", "-once")
+	assert.Equal(t, 0, code, out)
+	code, out = runConform(t, "-url", bad+"cmaf/master.m3u8", "-once", "-aligned")
+	assert.Equal(t, 1, code)
+	assert.Contains(t, out, conform.RuleRenditionSequence)
 }
 
 // A server that never answers is a read error after -timeout, not a hang.

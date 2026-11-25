@@ -1,6 +1,12 @@
 // Command osconform reads an HLS playlist, a DASH MPD or an MPEG-TS stream
 // over HTTP, an RTMP stream (rtmp:// URL, played), or an RTSP stream (rtsp:// URL, played; ?transport=udp selects UDP), or an SRT stream (srt://host:port?streamid=...&latency=ms, called), and prints the conformance violations it finds, one per line.
 //
+// With -aligned, the media playlists of an HLS master must number their
+// segments alike (equal MEDIA-SEQUENCE and discontinuity sequence numbers,
+// matching gap durations), which also turns on the ABR rules that need it:
+// variants aligned and BANDWIDTH honest. Our servers promise that; RFC 8216
+// does not require it, so it is off by default.
+//
 // Exit status: 0 clean, 1 violations found, 2 read error (an MPEG-TS stream
 // that ends before its first byte is one) or bad arguments.
 package main
@@ -33,6 +39,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	dur := fs.Duration("duration", 30*time.Second, "media time to capture")
 	once := fs.Bool("once", false, "read the playlist or MPD once instead of polling")
 	timeout := fs.Duration("timeout", 30*time.Second, "limit on each request, and on a stall of the .ts, RTMP, RTSP or SRT stream")
+	aligned := fs.Bool("aligned", false, "HLS: require the master's media playlists to number their segments alike, and check that variants are aligned and BANDWIDTH is honest")
 	mtu := fs.Int("mtu", 0, "largest RTP payload accepted from an RTSP stream (0: 1200)")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "osconform: %v\n", err)
@@ -47,7 +54,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 		fmt.Fprintln(os.Stderr, "osconform: -url is required and must be a valid URL")
 		return 2
 	}
-	opt := conform.ReadOptions{Duration: *dur, Once: *once, Timeout: *timeout, MTU: *mtu}
+	opt := conform.ReadOptions{Duration: *dur, Once: *once, Timeout: *timeout, MTU: *mtu, AlignedSequences: *aligned}
 	var read func(context.Context, string, conform.ReadOptions) (conform.Capture, error)
 	switch p := strings.ToLower(pu.Path); {
 	case strings.EqualFold(pu.Scheme, "rtmp"):

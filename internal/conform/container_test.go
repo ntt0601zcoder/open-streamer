@@ -1572,6 +1572,41 @@ func TestStartOffsetAfterGap(t *testing.T) {
 	}
 }
 
+// The exemption is bounded by what the leading gaps declare: a playlist
+// whose media starts later than its gaps' EXTINF say still breaks
+// track-start-offset, with one leading gap or two.
+func TestStartOffsetAfterGapBounded(t *testing.T) {
+	segs := videoSegs(t)
+	for _, gaps := range []int{1, 2} {
+		late := slices.Clone(segs)
+		late[gaps] = segs[gaps][5:] // 5 frames after the gaps end
+		skip := map[int]bool{}
+		for i := range gaps {
+			skip[i] = true
+		}
+		for _, tsSegs := range []bool{false, true} {
+			// On time after the gaps: clean.
+			m := map[string][]byte{}
+			addHLS(t, m, "a", segs, tsSegs, nil)
+			addHLS(t, m, "b", segs, tsSegs, skip)
+			abrMaster(m)
+			c := readABR(t, m)
+			assert.Zero(t, countRule(c.Violations, RuleStartOffset), "%d gaps, ts %v: %v", gaps, tsSegs, c.Violations)
+			if tsSegs {
+				continue // the test's TS muxer needs a keyframe first
+			}
+			m = map[string][]byte{}
+			addHLS(t, m, "a", segs, tsSegs, nil)
+			addHLS(t, m, "b", late, tsSegs, skip)
+			abrMaster(m)
+			c = readABR(t, m)
+			require.Equal(t, 1, countRule(c.Violations, RuleStartOffset), "%d gaps: %v", gaps, c.Violations)
+			i := slices.IndexFunc(c.Violations, func(v Violation) bool { return v.Rule == RuleStartOffset })
+			assert.Contains(t, c.Violations[i].Detail, "leading gaps declare")
+		}
+	}
+}
+
 func TestVariantAlignedOpenGOP(t *testing.T) {
 	segs := videoSegs(t)
 	open := slices.Clone(segs)
