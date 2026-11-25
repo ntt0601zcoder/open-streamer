@@ -370,11 +370,13 @@ func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	c.checkTSExtinf()
 	c.checkGaps()
 	c.checkVariantAlignment()
-	c.checkVariantBandwidth()
 	if c.master {
-		if !opt.Once {
+		// With Once, the master is read again only for RuleVariantBandwidth
+		// (a peak segment may have appeared after the last master read).
+		if !opt.Once || (opt.AlignedSequences && len(c.variants) >= 2) {
 			c.finalMaster(ctx, u)
 		}
+		c.checkVariantBandwidth()
 		c.b.checkMasterCodecs(c.codecs)
 	}
 	out := c.b.finish()
@@ -597,7 +599,8 @@ func (c *hlsCapture) checkVariantAlignment() {
 		for i, a := range vs {
 			for _, b := range vs[i+1:] {
 				if a.start.pts != b.start.pts {
-					c.b.once("aligned:"+a.src+"|"+b.src, RuleVariantAlignment, -1,
+					lo, hi := min(a.src, b.src), max(a.src, b.src)
+					c.b.once("aligned:"+lo+"|"+hi, RuleVariantAlignment, -1,
 						"media sequence %d: first video PTS %d in %s, %d in %s", msn, a.start.pts, a.url, b.start.pts, b.url)
 				}
 			}
@@ -1013,7 +1016,9 @@ type dashCapture struct {
 // must be aligned in time (RuleVariantAlignment): over the span two of them
 // share, no segment of one contains the start of one of the other's strictly
 // inside it, compared only where both segments start on a keyframe; with
-// segmentAlignment="true" their resolved timelines must also be equal.
+// segmentAlignment="true" their resolved timelines must also be equal. A
+// segment is compared only when its first video frame is a keyframe at its
+// S@t. Each pair is reported once per period.
 //
 // The first period's start rules apply only when its anchor set's (first
 // video, else first audio) first captured segment has a tfdt equal to its
@@ -1151,7 +1156,8 @@ func (c *dashCapture) checkAlignment(period string, sets []dashSet) {
 		reps := bySet[id]
 		for i, a := range reps {
 			for _, b := range reps[i+1:] {
-				key := "aligned:" + period + "|" + a.rep.ID + "|" + b.rep.ID
+				lo, hi := min(a.rep.ID, b.rep.ID), max(a.rep.ID, b.rep.ID)
+				key := "aligned:" + period + "|" + lo + "|" + hi
 				if detail := c.misaligned(a, b); detail != "" {
 					c.b.once(key, RuleVariantAlignment, -1, "period %s: representations %s and %s: %s",
 						period, a.rep.ID, b.rep.ID, detail)
@@ -1371,7 +1377,10 @@ func (c *dashCapture) segment(ctx context.Context, u string, s dashSet, sg dash.
 		seg.frames[i].Track, seg.frames[i].Epoch = track, epoch
 	}
 	c.b.checkSegmentKey(u, seg.frames, 0)
-	c.startKey[segID{s.rep.ID, sg.T}] = firstVideo(seg.frames).key
+	// Keyed: the first video frame is a keyframe at S@t. An open-GOP segment
+	// starts earlier (leading pictures), so it is not compared.
+	fv := firstVideo(seg.frames)
+	c.startKey[segID{s.rep.ID, sg.T}] = fv.video && fv.key && fv.pts == media.SampleTime(int64(sg.T), int(s.tpl.Timescale))
 	for _, f := range seg.frames {
 		c.b.add(f)
 	}

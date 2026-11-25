@@ -1669,6 +1669,15 @@ func TestVariantAlignedDASH(t *testing.T) {
 		})
 		assert.Equal(t, 1, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
 	})
+	t.Run("open GOP", func(t *testing.T) {
+		// B's second segment carries a leading picture: it starts at S@t
+		// below its keyframe's PTS, so it is not compared.
+		open := slices.Clone(segs)
+		open[1] = slices.Clone(segs[1])
+		open[1][1].PTS = open[1][0].PTS - 3600
+		c := run(false, func(m map[string][]byte) dash.Representation { return dashRepFiles(t, m, "b", open, nil, 1) })
+		assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+	})
 	t.Run("one representation", func(t *testing.T) {
 		m := map[string][]byte{}
 		c := readDASHSet(t, m, true, dashRepFiles(t, m, "a", segs, nil, 1))
@@ -1735,4 +1744,61 @@ func TestVariantBandwidth(t *testing.T) {
 	assert.Equal(t, 2, countRule(c.Violations, RuleVariantBandwidth), "video-only BANDWIDTH: %v", c.Violations)
 	c = build(int(pa), int(pa), true)
 	assert.Zero(t, countRule(c.Violations, RuleVariantBandwidth), "%v", c.Violations)
+}
+
+// TestVariantBandwidthLargestWins: the largest BANDWIDTH any master read gave
+// a variant is the one checked.
+func TestVariantBandwidthLargestWins(t *testing.T) {
+	segs := videoSegs(t)
+	m := map[string][]byte{}
+	addHLS(t, m, "a", segs, false, nil)
+	addHLS(t, m, "b", segs, false, nil)
+	pl, err := hls.ParseMedia(m["/a.m3u8"])
+	require.NoError(t, err)
+	var peak int64
+	for _, s := range pl.Segments {
+		peak = max(peak, int64(len(m["/"+s.URI]))*8*media.ClockRate/media.FromDuration(s.Duration))
+	}
+	master := func(bw int) []byte {
+		return hls.MultivariantPlaylist{Version: 7, Variants: []hls.Variant{
+			{URI: "a.m3u8", Bandwidth: bw}, {URI: "b.m3u8", Bandwidth: bw},
+		}}.Encode()
+	}
+	for _, tc := range []struct {
+		name        string
+		first, next int
+		want        int
+	}{
+		{"larger first", int(peak), int(peak / 4), 0},
+		{"larger later", int(peak / 4), int(peak), 0},
+		{"always small", int(peak / 4), int(peak / 4), 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			reads := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/master.m3u8" {
+					mu.Lock()
+					reads++
+					bw := tc.next
+					if reads == 1 {
+						bw = tc.first
+					}
+					mu.Unlock()
+					_, _ = w.Write(master(bw))
+					return
+				}
+				b, ok := m[r.URL.Path]
+				if !ok {
+					http.NotFound(w, r)
+					return
+				}
+				_, _ = w.Write(b)
+			}))
+			t.Cleanup(srv.Close)
+			c, err := ReadHLS(context.Background(), srv.URL+"/master.m3u8", aligned())
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, countRule(c.Violations, RuleVariantBandwidth), "%v", c.Violations)
+		})
+	}
 }
