@@ -28,8 +28,9 @@
 // makes a hold time out is not waited for again until it delivers. Audio
 // frames below K that arrive while the segment is held go into it; after
 // its release they go into the open segment and count as Late. Video tracks
-// other than the anchor are never moved or waited for: they stay in arrival
-// order, since their decode order differs from PTS order. Held segments
+// other than the anchor are never waited for, and never moved except under
+// AlignVideo: they stay in arrival order, since their decode order differs
+// from PTS order. Held segments
 // come out in Seq order, all of them before the open segment closes at an
 // epoch change, Lost > 0 or Flush; those closes neither move frames nor
 // hold, so a segment they close may hold audio past its end.
@@ -49,7 +50,14 @@
 // than the anchor enters only at a keyframe presented at the segment's
 // Start: its frames before its first keyframe in the segment are dropped,
 // and if that keyframe has another PTS, the track is left out of the
-// segment. Audio is not affected.
+// segment. Third, a rung that leads the anchor: at a cut at K within the
+// epoch, the frames of a video track other than the anchor from its
+// keyframe presented at K on, in arrival order, move to the next segment
+// with the audio, so the closing segment ends that rung at K and the next
+// one starts it on its keyframe. Frames after that keyframe presented
+// before K (an open GOP's leading pictures) are dropped. A leading rung
+// with no keyframe at K keeps its frames past K in the closing segment
+// (and is left out of the next). Audio is not affected.
 //
 // The Segmenter starts no goroutines and is not safe for concurrent use.
 package segment
@@ -173,6 +181,7 @@ type Segmenter struct {
 	held    []held // in Seq order
 	seq     uint64
 	dropped uint64
+	leftOut map[int]uint64 // per video track: frames AlignVideo's rules dropped
 	late    uint64
 
 	haveEpoch   bool
@@ -210,6 +219,32 @@ func New(opt Options) *Segmenter {
 // AlignVideo, the video frames its rules leave out.
 func (s *Segmenter) Dropped() uint64 { return s.dropped }
 
+// LeftOut returns, per video track, the frames that AlignVideo's rules
+// discarded (they are also in Dropped): a rung's frames that missed a
+// segment's start, a lower track's before it could take the anchor, and
+// those not kept when a segment is reopened or a leading rung moved. It is
+// nil without any. A rung absent from every segment shows here even though
+// no segment ever holds it.
+func (s *Segmenter) LeftOut() map[int]uint64 {
+	if len(s.leftOut) == 0 {
+		return nil
+	}
+	out := make(map[int]uint64, len(s.leftOut))
+	for tr, n := range s.leftOut {
+		out[tr] = n
+	}
+	return out
+}
+
+// leaveOut counts a video frame that AlignVideo's rules discard.
+func (s *Segmenter) leaveOut(f media.Frame) {
+	s.dropped++
+	if s.leftOut == nil {
+		s.leftOut = map[int]uint64{}
+	}
+	s.leftOut[f.Track]++
+}
+
 // Late returns the number of non-anchor audio frames put in a segment that
 // starts after their PTS: those that arrived after the segment cut at their
 // PTS was released, and those below the first segment of an epoch.
@@ -237,7 +272,7 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 		s.disc, s.lost = true, true
 	}
 	if s.belowAnchor(f) {
-		s.dropped++
+		s.leaveOut(f)
 		return s.release(out)
 	}
 	if r, ok := s.reached[f.Track]; !ok || f.PTS > r {
@@ -285,16 +320,34 @@ func (s *Segmenter) Push(d hub.Delivery) []Segment {
 // cut closes the open segment at K within the epoch: its audio frames of
 // tracks other than the epoch's anchor presented at or after K go to the
 // carry, from where the next segment takes them, and it is held. Video
-// frames never move. A K at or before the segment's start (an anchor change
-// to a track presented earlier) moves nothing. duration is as for closeOpen.
+// frames never move, except under AlignVideo those of a track other than
+// the anchor from its keyframe presented at K on (a rung that leads the
+// anchor): they go to the carry too. A K at or before the segment's start
+// (an anchor change to a track presented earlier) moves nothing. duration
+// is as for closeOpen.
 func (s *Segmenter) cut(k, duration int64) {
 	c := s.cur
 	s.cur = nil
 	s.closed, s.lastStart = true, c.seg.Start
 	moved := []media.Frame{}
 	kept := c.seg.Frames[:0]
+	var leading map[int]bool // video tracks past their keyframe at k
 	for _, f := range c.seg.Frames {
-		if f.Track != s.anchor && f.Kind() == media.KindAudio && f.PTS >= k && k > c.seg.Start {
+		move := false
+		switch {
+		case f.Track == s.anchor || k <= c.seg.Start:
+		case f.Kind() == media.KindAudio:
+			move = f.PTS >= k
+		case s.align && f.Kind() == media.KindVideo:
+			if f.Key && f.PTS == k && !leading[f.Track] {
+				if leading == nil {
+					leading = map[int]bool{}
+				}
+				leading[f.Track] = true
+			}
+			move = leading[f.Track]
+		}
+		if move {
 			moved = append(moved, f)
 		} else {
 			kept = append(kept, f)
@@ -338,7 +391,7 @@ func (s *Segmenter) place(c *open, f media.Frame) {
 		}
 	}
 	if !s.admits(c, f) {
-		s.dropped++
+		s.leaveOut(f)
 		return
 	}
 	addTo(c, f)
@@ -492,7 +545,11 @@ func (s *Segmenter) openAt(f media.Frame) {
 	s.carry = nil
 	for _, c := range carry {
 		if c.PTS < f.PTS || !s.admits(s.cur, c) {
-			s.dropped++
+			if s.align && c.Kind() == media.KindVideo {
+				s.leaveOut(c)
+			} else {
+				s.dropped++
+			}
 			continue
 		}
 		s.add(c)

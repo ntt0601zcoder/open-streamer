@@ -960,6 +960,8 @@ func TestAlignVideoLateTrackAtOneCut(t *testing.T) {
 	assertSeqs(t, segs)
 	assertRungsAligned(t, segs)
 	assert.EqualValues(t, 2, s.Dropped())
+	assert.Equal(t, map[int]uint64{2: 2}, s.LeftOut())
+	assert.Nil(t, New(Options{}).LeftOut())
 	for i := range segs {
 		if i == 2 {
 			continue
@@ -1244,4 +1246,138 @@ func TestAlignVideoUncutRungSpans(t *testing.T) {
 	require.Len(t, off, 3)
 	assert.EqualValues(t, 3600, off[1].Duration)
 	assert.Nil(t, off[1].VideoDurations, "without AlignVideo")
+}
+
+// Finding I1 (ruling R-B8, third rule): the anchor rung arrives 15 frames
+// after the others, so at every cut K rungs 1 and 2 have delivered their
+// IDR at K and 14 frames more. Those move to the next segment: every rung's
+// part is 50 frames from its keyframe at Start, and nothing is dropped.
+// Without AlignVideo, video does not move.
+func TestAlignVideoLeadingRungMovedAtCut(t *testing.T) {
+	tracks := []int{0, 1, 2, 3}
+	order := func(tr, i int) int {
+		if tr == 0 {
+			return (i + 15) * 3600
+		}
+		return inDTS(tr, i)
+	}
+	s := New(Options{AlignVideo: true})
+	segs := ladder(s, tracks, 250, 25, order)
+	require.Len(t, segs, 5)
+	assertSeqs(t, segs)
+	assertRungsAligned(t, segs)
+	assertStartsRise(t, segs)
+	assertAudioInside(t, segs[:4])
+	for _, g := range segs {
+		n := perTrack(g)
+		delete(n, 3)
+		assert.Equal(t, map[int]int{0: 50, 1: 50, 2: 50}, n, "segment %d", g.Seq)
+		assert.EqualValues(t, 180000, g.Duration, "segment %d", g.Seq)
+		assert.Nil(t, g.VideoDurations, "segment %d", g.Seq)
+		for _, f := range g.Frames {
+			if f.Kind() == media.KindVideo {
+				assert.True(t, f.PTS >= g.Start && f.PTS < g.Start+180000, "segment %d: track %d frame at %d", g.Seq, f.Track, f.PTS)
+			}
+		}
+	}
+	assert.Zero(t, s.Dropped())
+	assertDTSOrder(t, segs)
+
+	off := ladder(New(Options{}), tracks, 250, 25, order)
+	require.NotEmpty(t, off)
+	straddle := false
+	for _, g := range off[:len(off)-1] {
+		for _, f := range g.Frames {
+			if f.Track == 1 && f.PTS >= g.Start+g.Duration {
+				straddle = true
+			}
+		}
+	}
+	assert.True(t, straddle, "without AlignVideo the leading rung's frames stay where they arrived")
+}
+
+// A rung that leads the anchor by more than a segment: from frame 50 on,
+// rung 0 arrives 60 frames (2.4 s) late. Every cut moves the leading rungs'
+// frames from their IDR at K on, the IDR at the next K among them, and the
+// next cut moves that one again.
+func TestAlignVideoLeadingRungBeyondSegment(t *testing.T) {
+	tracks := []int{0, 1, 2}
+	order := func(tr, i int) int {
+		if tr == 0 && i >= 50 {
+			return (i + 60) * 3600
+		}
+		return inDTS(tr, i)
+	}
+	s := New(Options{AlignVideo: true})
+	segs := ladder(s, tracks, 300, 25, order)
+	require.Len(t, segs, 6)
+	assertSeqs(t, segs)
+	assertRungsAligned(t, segs)
+	for _, g := range segs {
+		assert.Equal(t, map[int]int{0: 50, 1: 50, 2: 50}, perTrack(g), "segment %d", g.Seq)
+	}
+	assert.Zero(t, s.Dropped())
+}
+
+// The third rule on a cut made by a lower track taking the anchor: rung 2
+// runs alone for 35 frames, past its keyframe at frame 25 (K = 90000, short
+// of the target, so no cut), then rung 0 arrives from its IDR at K and cuts
+// the segment there. Rung 2's frames from its IDR at K on move into the
+// segment rung 0 opens.
+func TestAlignVideoLeadingRungAtPromoteCut(t *testing.T) {
+	s := New(Options{AlignVideo: true})
+	var ds []hub.Delivery
+	for i := range 35 {
+		ds = append(ds, frame(2, h264, int64(i)*3600, int64(i)*3600, i%25 == 0))
+	}
+	for i := 25; i < 75; i++ {
+		ds = append(ds, frame(0, h264, int64(i)*3600, int64(i)*3600, i%25 == 0))
+		if i >= 35 {
+			ds = append(ds, frame(2, h264, int64(i)*3600, int64(i)*3600, i%25 == 0))
+		}
+	}
+	segs := pushDeliveries(s, ds)
+	require.Len(t, segs, 2)
+	assertRungsAligned(t, segs)
+	assert.Equal(t, map[int]int{2: 25}, perTrack(segs[0]))
+	assert.Equal(t, map[int]int{0: 50, 2: 50}, perTrack(segs[1]))
+	assert.EqualValues(t, 90000, segs[1].Start)
+	assert.Zero(t, s.Dropped())
+}
+
+// An open GOP on a leading rung: the pictures after its IDR at K that are
+// presented before K are dropped when the rung moves. A leading rung with
+// no keyframe at K is not moved.
+func TestAlignVideoLeadingRungEdges(t *testing.T) {
+	const k = 180000
+	feed := func(key1 bool) []hub.Delivery {
+		ds := make([]hub.Delivery, 0, 105)
+		for i := range 50 {
+			ds = append(ds, frame(0, h264, int64(i)*3600, int64(i)*3600, i == 0), frame(1, h264, int64(i)*3600, int64(i)*3600, i == 0))
+		}
+		// Rung 1 leads: its frame at K, a leading picture below K, one above.
+		ds = append(ds,
+			frame(1, h264, k, k, key1),
+			frame(1, h264, k-1800, k+1800, false),
+			frame(1, h264, k+3600, k+3600, false),
+			frame(0, h264, k, k, true),
+			frame(0, h264, k+3600, k+3600, false),
+		)
+		return ds
+	}
+	s := New(Options{AlignVideo: true})
+	segs := pushDeliveries(s, feed(true))
+	require.Len(t, segs, 2)
+	assert.Equal(t, map[int]int{0: 50, 1: 50}, perTrack(segs[0]))
+	assert.Equal(t, map[int]int{0: 2, 1: 2}, perTrack(segs[1]))
+	assertRungsAligned(t, segs)
+	assert.EqualValues(t, 1, s.Dropped())
+	assert.Equal(t, map[int]uint64{1: 1}, s.LeftOut())
+
+	s = New(Options{AlignVideo: true})
+	segs = pushDeliveries(s, feed(false))
+	require.Len(t, segs, 2)
+	assert.Equal(t, map[int]int{0: 50, 1: 53}, perTrack(segs[0]))
+	assert.Equal(t, map[int]int{0: 2}, perTrack(segs[1]))
+	assert.Zero(t, s.Dropped())
 }
