@@ -17,21 +17,28 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
-	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
 	"github.com/ntt0601zcoder/open-streamer/pkg/h26x"
 )
 
-// nvencOrSkip skips the test unless OS_NVENC=1 or OS_REQUIRE_NVENC=1
-// (testpeer.NVENCOptIn: the probe opens an NVENC session, which an
-// ordinary run on the GPU host must not do); opted in, it skips when no
-// NVENC device can be opened, or fails when OS_REQUIRE_NVENC=1.
+// nvencOptIn is the reason a device test skips when neither OS_NVENC nor
+// OS_REQUIRE_NVENC is "1": the same text as the e2e NVENC scenarios'
+// (NVENCOptIn). This file does not import that package:
+// scripts/test-ci-peers.sh picks its packages by the name in test files,
+// and this one builds only with -tags libav.
+const nvencOptIn = "NVENC tests are opt-in: set OS_NVENC=1 (make test-nvenc does)"
+
+// nvencOrSkip skips the test unless OS_NVENC=1 or OS_REQUIRE_NVENC=1 (the
+// probe opens an NVENC session, which an ordinary run on the GPU host must
+// not do); opted in, it skips when no NVENC device can be opened, or fails
+// when OS_REQUIRE_NVENC=1.
 func nvencOrSkip(t *testing.T) {
 	t.Helper()
-	if !testpeer.NVENCOptedIn() {
-		t.Skip(testpeer.NVENCOptIn)
+	requireNVENC := os.Getenv("OS_REQUIRE_NVENC") == "1"
+	if !requireNVENC && os.Getenv("OS_NVENC") != "1" {
+		t.Skip(nvencOptIn)
 	}
 	if err := ProbeNVENC(); err != nil {
-		if os.Getenv(testpeer.EnvRequireNVENC) == "1" {
+		if requireNVENC {
 			t.Fatalf("OS_REQUIRE_NVENC=1 but no NVENC device: %v", err)
 		}
 		t.Skipf("no NVENC device: %v", err)
