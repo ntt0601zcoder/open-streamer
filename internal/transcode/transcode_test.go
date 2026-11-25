@@ -1948,3 +1948,338 @@ func TestSetWatermarkBeforeAndAfterRun(t *testing.T) {
 	require.Error(t, tr.SetWatermark(&picture.Watermark{}))
 	assert.Equal(t, []string{"configure text:before"}, logLines(t, log))
 }
+
+// A child that announces another wire version and exits at once is still
+// fatal: the version is checked before the exit is. Whether the host reads
+// the Hello before or after the exit is up to the OS.
+func TestVersionMismatchThenExit(t *testing.T) {
+	opt := fakeOptions(t, transcodetest.EnvVersion+"=1", transcodetest.EnvExitAfterHello+"=1")
+	opt.Renditions = []Rendition{encode240}
+	tr, err := New(hub.New(hub.Options{}), opt)
+	require.NoError(t, err)
+	errc := make(chan error, 1)
+	go func() { errc <- tr.Run(t.Context()) }()
+	select {
+	case err := <-errc:
+		require.ErrorIs(t, err, errVersion)
+		assert.ErrorContains(t, err, "1, want 2")
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not fail")
+	}
+	assert.EqualValues(t, 1, tr.Stats().Spawns)
+}
+
+// Thumbnails of a stream that needs no child are the Thumbnailer's.
+func TestThumbnailNeedsChild(t *testing.T) {
+	src := hub.New(hub.Options{})
+	_, err := New(src, Options{Renditions: []Rendition{copySrc}, Audio: Audio{Copy: true}, Thumbnail: &picture.Thumbnail{}})
+	require.EqualError(t, err, "transcode: new: thumbnails of a passthrough stream need a Thumbnailer")
+	_, err = New(src, Options{Binary: "x", Renditions: []Rendition{encode240}, Thumbnail: &picture.Thumbnail{IntervalSec: -1}})
+	require.EqualError(t, err, "transcode: new: thumbnail: interval -1 out of range 0..3600")
+	// A child that only encodes audio will do, and so will one that encodes
+	// video.
+	_, err = New(src, Options{Binary: "x", Renditions: []Rendition{copySrc}, Thumbnail: &picture.Thumbnail{}})
+	require.NoError(t, err)
+	_, err = New(src, Options{Binary: "x", Renditions: []Rendition{encode240, copySrc}, Audio: Audio{Copy: true}, Thumbnail: &picture.Thumbnail{}})
+	require.NoError(t, err)
+}
+
+// shotLog collects the shots OnShot is called with.
+type shotLog struct {
+	mu    sync.Mutex
+	shots []picture.Shot
+}
+
+func (l *shotLog) add(s picture.Shot) {
+	l.mu.Lock()
+	l.shots = append(l.shots, s)
+	l.mu.Unlock()
+}
+
+func (l *shotLog) all() []picture.Shot {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.shots)
+}
+
+// videoKeys returns the PTS of the video keyframes in fs.
+func videoKeys(fs []media.Frame) []int64 {
+	var out []int64
+	for _, f := range fs {
+		if f.Kind() == media.KindVideo && f.Key {
+			out = append(out, f.PTS)
+		}
+	}
+	return out
+}
+
+// A child that encodes video makes the shots itself: the host passes them
+// on, keeps the latest and counts them, and nothing else changes.
+func TestShotsFromChild(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	ladder := []Rendition{encode240, copySrc}
+
+	plain := fakeOptions(t)
+	plain.Renditions = ladder
+	ps := start(t, plain)
+	want := ps.feed(t, steps, 0)
+	wantStats := ps.tr.Stats()
+
+	opt := fakeOptions(t, transcodetest.EnvShots+"=1", transcodetest.EnvStatsInterval+"=5ms")
+	opt.Renditions = ladder
+	opt.Thumbnail = &picture.Thumbnail{IntervalSec: 2, Height: 90, Quality: 70}
+	// A clock far from the real one: Shot's time is Options.Now's.
+	const ahead = 1000 * time.Hour
+	opt.Now = func() time.Time { return time.Now().Add(ahead) }
+	var shots shotLog
+	opt.OnShot = shots.add
+	var cfgs <-chan wire.Configure
+	s := startWith(t, opt, func(tr *Transcoder) { cfgs = captureConfigure(tr) })
+	_, _, ok := s.tr.Shot()
+	assert.False(t, ok, "no shot yet")
+	before := time.Now().Add(ahead)
+	<-play(t.Context(), s.src, steps, 0, false)
+	keys := videoKeys(shifted(frames(steps)))
+	require.Len(t, keys, 6)
+	require.Eventually(t, func() bool { return s.tr.Stats().Child.Thumbnails == uint64(len(keys)) },
+		10*time.Second, time.Millisecond, "Stats().Child.Thumbnails follows the child's Stats")
+	got := s.feed(t, nil, 0)
+	after := time.Now().Add(ahead)
+
+	assert.Equal(t, opt.Thumbnail, (<-cfgs).Thumbnail, "the child is asked for the shots")
+	all := shots.all()
+	require.Len(t, all, len(keys), "OnShot saw every shot")
+	for i, sh := range all {
+		assert.Equal(t, keys[i], sh.PTS, "shot %d is in rendition time", i)
+		assert.Equal(t, uint32(1), sh.Epoch)
+		assert.NotEmpty(t, sh.JPEG)
+	}
+	last, at, ok := s.tr.Shot()
+	require.True(t, ok)
+	assert.Equal(t, all[len(all)-1], last)
+	assert.False(t, at.Before(before) || at.After(after), "at %v outside [%v, %v]", at, before, after)
+
+	st := s.tr.Stats()
+	assert.EqualValues(t, len(keys), st.Child.Thumbnails)
+	assert.Zero(t, st.Child.ThumbnailsFailed)
+	assert.Zero(t, st.ShotKeysSkipped, "the child has the video: the host sends it no extra key")
+	assert.Equal(t, wantStats.FramesOut, st.FramesOut)
+	assert.Equal(t, wantStats.FramesIn, st.FramesIn)
+	for i := range want {
+		assertSameFrames(t, sortTD(want[i]), sortTD(got[i]), ladder[i].Name)
+		assert.Equal(t, epochs(want[i]), epochs(got[i]))
+	}
+}
+
+// childWrites records, per child, the frames the host wrote to it.
+type childWrites struct {
+	mu   sync.Mutex
+	pids []int
+	by   map[int][]media.Frame
+}
+
+func (w *childWrites) hook(tr *Transcoder) {
+	w.by = map[int][]media.Frame{}
+	tr.writeMsg = func(c *child, m wire.Message) error {
+		if f, ok := m.(wire.Frame); ok {
+			w.mu.Lock()
+			if _, seen := w.by[c.p.pid]; !seen {
+				w.pids = append(w.pids, c.p.pid)
+			}
+			w.by[c.p.pid] = append(w.by[c.p.pid], f.F)
+			w.mu.Unlock()
+		}
+		return c.w.Write(m)
+	}
+}
+
+// frameLogVideo returns the PTS and epoch of the video lines of a fake
+// child's frame log, which must all be keyframes, and the count of its
+// audio lines.
+func frameLogVideo(t *testing.T, path string) (video []media.Frame, audio int) {
+	t.Helper()
+	for _, l := range logLines(t, path) {
+		var kind, key string
+		var f media.Frame
+		_, err := fmt.Sscanf(l, "%s %d %d %d %s", &kind, &f.Track, &f.PTS, &f.Epoch, &key)
+		require.NoError(t, err, l)
+		if kind == "audio" {
+			audio++
+			continue
+		}
+		require.Equal(t, "key", key, "the child got a video frame that is no keyframe: %s", l)
+		video = append(video, f)
+	}
+	return video, audio
+}
+
+// A child that only encodes audio is sent the main video's keyframe
+// whenever a thumbnail is due, and nothing else of the video (R-C10a). The
+// renditions are those of a run without thumbnails.
+func TestShotsFromAudioOnlyChild(t *testing.T) {
+	steps := fixtureSteps(t, "h264_aac.ts")
+	src := frames(steps)
+	ladder := []Rendition{copySrc}
+	var srcVideo, srcAudio int
+	for _, f := range src {
+		if f.Kind() == media.KindVideo {
+			srcVideo++
+		} else {
+			srcAudio++
+		}
+	}
+	thumbnail := &picture.Thumbnail{IntervalSec: 2}
+
+	t.Run("due keys only", func(t *testing.T) {
+		plain := fakeOptions(t)
+		plain.Renditions = ladder
+		want := start(t, plain).feed(t, steps, 4)
+
+		log := filepath.Join(t.TempDir(), "frames.log")
+		opt := fakeOptions(t, transcodetest.EnvShots+"=1", transcodetest.EnvFrameLog+"="+log)
+		opt.Renditions = ladder
+		opt.Thumbnail = thumbnail
+		var shots shotLog
+		opt.OnShot = shots.add
+		var cfgs <-chan wire.Configure
+		s := startWith(t, opt, func(tr *Transcoder) { cfgs = captureConfigure(tr) })
+		got := s.feed(t, steps, 4)
+
+		cfg := <-cfgs
+		assert.Empty(t, cfg.Rungs)
+		assert.NotNil(t, cfg.Audio)
+		assert.Equal(t, thumbnail, cfg.Thumbnail)
+
+		video, audio := frameLogVideo(t, log)
+		assert.Equal(t, srcAudio, audio, "the child got every audio frame")
+		// At 4 times real time the child says Hello within the first second
+		// or two of the stream: of the six keys, one second apart, it gets
+		// every other one from then on.
+		require.GreaterOrEqual(t, len(video), 2, "%v", video)
+		require.LessOrEqual(t, len(video), 3, "%v", video)
+		keys := videoKeys(shifted(src))
+		for i, f := range video {
+			assert.Contains(t, keys, f.PTS, "a source keyframe, in rendition time")
+			assert.Equal(t, uint32(1), f.Epoch)
+			assert.Zero(t, f.Track)
+			if i > 0 {
+				assert.GreaterOrEqual(t, f.PTS-video[i-1].PTS, int64(180000), "the keys are an interval apart")
+			}
+		}
+		all := shots.all()
+		require.Len(t, all, len(video), "a shot for every key")
+		for i, sh := range all {
+			assert.Equal(t, video[i].PTS, sh.PTS)
+			assert.Equal(t, video[i].Epoch, sh.Epoch)
+		}
+		last, _, ok := s.tr.Shot()
+		require.True(t, ok)
+		assert.Equal(t, all[len(all)-1], last)
+
+		st := s.tr.Stats()
+		assert.Zero(t, st.DroppedBeforeKey)
+		assert.Zero(t, st.MergeDropped)
+		assert.EqualValues(t, len(src), st.FramesOut[0])
+		assertSameFrames(t, sortTD(want[0]), sortTD(got[0]), "src")
+		assert.Equal(t, epochs(want[0]), epochs(got[0]))
+		check(t, got[0], "src")
+	})
+
+	// The source hub's cache is replayed to the transcoder before its child
+	// can have said Hello: the cached keyframe is not put in the child's
+	// pre-Hello backlog, it is skipped.
+	t.Run("none before the Hello", func(t *testing.T) {
+		log := filepath.Join(t.TempDir(), "frames.log")
+		opt := fakeOptions(t, transcodetest.EnvFrameLog+"="+log)
+		opt.Renditions = ladder
+		opt.Thumbnail = thumbnail
+		s := &session{src: hub.New(hub.Options{GOPCacheFrames: 64}), errc: make(chan error, 1)}
+		// One GOP: a keyframe and what follows it.
+		var gop []step
+		for _, st := range steps {
+			if st.anchor == nil && st.f.Kind() == media.KindVideo && st.f.Key && st.f.PTS > src[0].PTS {
+				break
+			}
+			gop = append(gop, st)
+		}
+		<-play(t.Context(), s.src, gop, 0, false)
+		tr, err := New(s.src, opt)
+		require.NoError(t, err)
+		go func() { s.errc <- tr.Run(t.Context()) }()
+		require.Eventually(t, func() bool { return tr.Stats().ShotKeysSkipped == 1 }, 10*time.Second, time.Millisecond)
+		s.end(t)
+		video, audio := frameLogVideo(t, log)
+		assert.Empty(t, video, "the keyframe that came before the Hello is not sent after it")
+		assert.NotZero(t, audio)
+		assert.EqualValues(t, 1, tr.Stats().ShotKeysSkipped)
+	})
+
+	// A child that never says Hello takes no key: each due key is counted,
+	// and the copied video is written all the same.
+	t.Run("a child that reads nothing", func(t *testing.T) {
+		opt := fakeOptions(t, transcodetest.EnvNoHello+"=1")
+		opt.Renditions = ladder
+		opt.Thumbnail = thumbnail
+		s := start(t, opt)
+		got := s.feed(t, steps, 0)
+		st := s.tr.Stats()
+		assert.EqualValues(t, len(videoKeys(src)), st.ShotKeysSkipped, "every key was due, and none was taken")
+		var video []media.Frame
+		for _, f := range got[0] {
+			if f.Kind() == media.KindVideo {
+				video = append(video, f)
+			}
+		}
+		assert.Len(t, video, srcVideo, "the copy path kept writing")
+		_, _, ok := s.tr.Shot()
+		assert.False(t, ok)
+	})
+
+	// The child exits mid-run. The next child is sent nothing below K, no
+	// video in its pre-Hello backlog either, and the rendition's epochs and
+	// anchors are those of the same run without thumbnails.
+	t.Run("respawn", func(t *testing.T) {
+		run := func(th *picture.Thumbnail) (*session, []media.Frame, *childWrites) {
+			opt := fakeOptions(t, append(crashOnce(t, 110), transcodetest.EnvShots+"=1")...)
+			opt.Renditions = ladder
+			opt.Thumbnail = th
+			w := &childWrites{}
+			s := startWith(t, opt, w.hook)
+			return s, s.feed(t, steps, 2)[0], w
+		}
+		ps, want, _ := run(nil)
+		s, got, w := run(thumbnail)
+
+		require.EqualValues(t, 2, s.tr.Stats().Spawns)
+		eps := epochs(got)
+		require.Equal(t, []uint32{1, 2}, eps)
+		assert.Equal(t, epochs(want), eps)
+		ps.cols[0].mu.Lock()
+		s.cols[0].mu.Lock()
+		assert.Equal(t, ps.cols[0].anchors, s.cols[0].anchors, "the anchors of a run without thumbnails")
+		k := s.cols[0].anchors[2].Start // K + Delay
+		s.cols[0].mu.Unlock()
+		ps.cols[0].mu.Unlock()
+		assert.Equal(t, firstOfEpoch(want, 2).PTS, firstOfEpoch(got, 2).PTS)
+		assert.Equal(t, k, firstOfEpoch(got, 2).PTS)
+
+		require.Len(t, w.pids, 2)
+		first, second := w.by[w.pids[0]], w.by[w.pids[1]]
+		for _, f := range first {
+			assert.Equal(t, uint32(1), f.Epoch)
+			if f.Kind() == media.KindVideo {
+				assert.True(t, f.Key)
+			}
+		}
+		require.NotEmpty(t, second)
+		assert.Equal(t, media.KindVideo, second[0].Kind(), "the new child starts at K, which is due in the new epoch")
+		for _, f := range second {
+			assert.Equal(t, uint32(2), f.Epoch, "nothing of the old epoch reaches the new child")
+			if f.Kind() == media.KindVideo {
+				assert.True(t, f.Key)
+				assert.GreaterOrEqual(t, f.PTS, k, "no video below K")
+			}
+		}
+		assert.Equal(t, k, second[0].PTS)
+	})
+}

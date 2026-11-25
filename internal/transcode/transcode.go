@@ -150,6 +150,10 @@ type Options struct {
 	// Watermark is drawn on every encoded picture; nil means none. No
 	// rendition may then copy its video. SetWatermark replaces it.
 	Watermark *picture.Watermark
+	// Thumbnail asks the child for a preview picture every interval; nil
+	// means none. It needs a child: for a ladder that copies everything,
+	// use a Thumbnailer. See Shot and OnShot.
+	Thumbnail *picture.Thumbnail
 
 	Queue int // source subscription queue; 0 means 1024
 
@@ -173,6 +177,9 @@ type Options struct {
 
 	Logger  *slog.Logger // nil discards
 	OnEvent func(Event)  // optional, called from the Run goroutine
+	// OnShot is called with every thumbnail, from the child's reader
+	// goroutine: it must not block. Optional.
+	OnShot func(picture.Shot)
 }
 
 // EventKind is the kind of an Event.
@@ -206,10 +213,13 @@ type Event struct {
 // StderrSuppressed counts the children's stderr lines not logged because
 // they came faster than 10 a second. Oversize counts the frames dropped on
 // their way to a child because the wire protocol cannot carry them
-// (wire.ErrLimit). Child holds the media counters the children reported.
+// (wire.ErrLimit). ShotKeysSkipped counts the keyframes that were due for a
+// thumbnail but were not sent to a child that encodes no video: its queue
+// was full, or it had not said Hello yet. Child holds the media counters the
+// children reported.
 type Stats struct {
 	Spawns, Exits, Losses, DroppedBeforeKey, MergeDropped uint64
-	FramesIn, StderrSuppressed, Oversize                  uint64
+	FramesIn, StderrSuppressed, Oversize, ShotKeysSkipped uint64
 	PresentationOut, PresentationDropped                  uint64
 	FramesOut                                             []uint64
 	MaxQueued                                             int
@@ -222,10 +232,23 @@ type Stats struct {
 // zero). DroppedTracks counts video tracks other than the first that a
 // child dropped, Reanchors forward audio re-anchors, AudioDropped input
 // audio samples dropped for backward drift, and AudioCorrupt and
-// VideoCorrupt the frames the child's decoders rejected and skipped. A
-// child's counts after its last Stats are not included.
+// VideoCorrupt the frames the child's decoders rejected and skipped.
+// EncoderFallbacks counts the rungs that fell back from the encoder they
+// asked for to x264, Thumbnails the shots the children made and
+// ThumbnailsFailed those they could not make. A child's counts after its
+// last Stats are not included.
 type ChildStats struct {
 	DroppedTracks, Reanchors, AudioDropped, AudioCorrupt, VideoCorrupt uint64
+	EncoderFallbacks, Thumbnails, ThumbnailsFailed                     uint64
+}
+
+// childStats returns the media counters of a child's Stats message.
+func childStats(v wire.Stats) ChildStats {
+	return ChildStats{
+		DroppedTracks: v.DroppedTracks, Reanchors: v.Reanchors, AudioDropped: v.AudioDropped,
+		AudioCorrupt: v.AudioCorrupt, VideoCorrupt: v.VideoCorrupt,
+		EncoderFallbacks: v.EncoderFallbacks, Thumbnails: v.Thumbnails, ThumbnailsFailed: v.ThumbnailsFailed,
+	}
 }
 
 // max returns the per-counter maximum of s and o.
@@ -236,6 +259,10 @@ func (s ChildStats) max(o ChildStats) ChildStats {
 		AudioDropped:  max(s.AudioDropped, o.AudioDropped),
 		AudioCorrupt:  max(s.AudioCorrupt, o.AudioCorrupt),
 		VideoCorrupt:  max(s.VideoCorrupt, o.VideoCorrupt),
+
+		EncoderFallbacks: max(s.EncoderFallbacks, o.EncoderFallbacks),
+		Thumbnails:       max(s.Thumbnails, o.Thumbnails),
+		ThumbnailsFailed: max(s.ThumbnailsFailed, o.ThumbnailsFailed),
 	}
 }
 
@@ -255,6 +282,9 @@ func (s *ChildStats) add(prev, cur ChildStats) {
 	s.AudioDropped += rise(prev.AudioDropped, cur.AudioDropped)
 	s.AudioCorrupt += rise(prev.AudioCorrupt, cur.AudioCorrupt)
 	s.VideoCorrupt += rise(prev.VideoCorrupt, cur.VideoCorrupt)
+	s.EncoderFallbacks += rise(prev.EncoderFallbacks, cur.EncoderFallbacks)
+	s.Thumbnails += rise(prev.Thumbnails, cur.Thumbnails)
+	s.ThumbnailsFailed += rise(prev.ThumbnailsFailed, cur.ThumbnailsFailed)
 }
 
 // Transcoder turns one source hub into one hub per rendition.
@@ -296,6 +326,10 @@ type Transcoder struct {
 	// child that has a version up to the current one with wire.SetWatermark.
 	watermark        *picture.Watermark
 	watermarkVersion uint64
+	// The latest thumbnail, and when it arrived.
+	shot     picture.Shot
+	shotAt   time.Time
+	haveShot bool
 }
 
 // New validates opt and returns a Transcoder whose rendition hubs are open.
@@ -359,6 +393,17 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 		return nil, fmt.Errorf("transcode: new: %w", err)
 	}
 	t.watermark = cloneWatermark(opt.Watermark)
+	if th := opt.Thumbnail; th != nil {
+		if err := th.Validate(); err != nil {
+			return nil, fmt.Errorf("transcode: new: %w", err)
+		}
+		if !t.needChild {
+			// Nothing decodes the video of a ladder that copies everything.
+			return nil, errors.New("transcode: new: thumbnails of a passthrough stream need a Thumbnailer")
+		}
+		th := *th
+		t.configure.Thumbnail = &th
+	}
 	if t.needChild {
 		if !spawnSupported {
 			return nil, fmt.Errorf("transcode: new: %w", errors.ErrUnsupported)
@@ -461,6 +506,27 @@ func (t *Transcoder) SetWatermark(w *picture.Watermark) error {
 	t.mu.Unlock()
 	t.wakeRun()
 	return nil
+}
+
+// Shot returns the latest thumbnail and when it arrived, by Options.Now. ok
+// is false while there is none. A shot's PTS is in rendition time: source
+// time + Delay. The caller must not change its JPEG.
+func (t *Transcoder) Shot() (s picture.Shot, at time.Time, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.shot, t.shotAt, t.haveShot
+}
+
+// gotShot keeps a child's thumbnail as the latest and passes it on. Called
+// from the child's reader goroutine.
+func (t *Transcoder) gotShot(s picture.Shot) {
+	at := t.opt.Now()
+	t.mu.Lock()
+	t.shot, t.shotAt, t.haveShot = s, at, true
+	t.mu.Unlock()
+	if t.opt.OnShot != nil {
+		t.opt.OnShot(s)
+	}
 }
 
 // wakeRun asks the Run goroutine to look at the watermark versions. It
@@ -614,6 +680,7 @@ func (s *run) loop(sub *hub.Sub) error {
 			s.r.deliver(d)
 		case <-hello:
 			s.c.handOver()
+			s.c.ready = true
 			s.r.childHello()
 			s.syncWatermark()
 		case <-t.wake:
@@ -841,7 +908,7 @@ func (t *Transcoder) newRouter(s *run) *router {
 	if t.pres != nil {
 		barrier = t.pres.barrier
 	}
-	return &router{
+	r := &router{
 		childVideo: t.childVideo,
 		copyVideo:  len(t.copyVideo) > 0,
 		childAudio: !t.opt.Audio.Copy,
@@ -876,7 +943,24 @@ func (t *Transcoder) newRouter(s *run) *router {
 			t.update(func(st *Stats) { st.DroppedBeforeKey += n })
 		},
 		warn: t.log.Warn,
+		// For thumbnail keys.
+		childReady: func() bool { return s.c != nil && s.c.ready },
+		childShots: func() (thumbs, failed uint64) {
+			if s.c == nil {
+				return 0, 0
+			}
+			return s.c.thumbs.Load(), s.c.thumbsFailed.Load()
+		},
+		shotSkipped: func() {
+			t.update(func(st *Stats) { st.ShotKeysSkipped++ })
+		},
 	}
+	if th := t.configure.Thumbnail; th != nil && !t.childVideo {
+		// The child decodes no video: it makes its shots of the keyframes
+		// the router sends it (ruling R-C10a).
+		r.shotKeys(th.Resolved().IntervalSec)
+	}
+	return r
 }
 
 // toCopy hands a copied frame to its renditions: video to those that copy
@@ -966,6 +1050,9 @@ type child struct {
 	backlog   []wire.Message
 	handed    bool
 	backlogCh chan []wire.Message
+	// Owned by the Run goroutine: Run has handled the child's hello event.
+	// handed alone does not say so: stop hands over too.
+	ready bool
 
 	reapMu sync.Mutex
 	reaped bool // the waiter has reaped the process: its pgid may be reused
@@ -995,6 +1082,9 @@ type child struct {
 	// rising Stats.In, or an output Frame), in Unix nanoseconds; Run reads
 	// it to tell a slow child from one that stopped.
 	lastProgress atomic.Int64
+	// The shots the child has made and failed to make, as its Stats last
+	// reported them; Run reads them for the thumbnail keys' retry rule.
+	thumbs, thumbsFailed atomic.Uint64
 }
 
 // startChild spawns the child and starts its reader, writer and waiter.
@@ -1101,14 +1191,15 @@ func (t *Transcoder) readChild(c *child) error {
 				in = v.In
 				c.lastProgress.Store(time.Now().UnixNano())
 			}
-			cur := ChildStats{
-				DroppedTracks: v.DroppedTracks, Reanchors: v.Reanchors, AudioDropped: v.AudioDropped,
-				AudioCorrupt: v.AudioCorrupt, VideoCorrupt: v.VideoCorrupt,
-			}
+			c.thumbs.Store(v.Thumbnails)
+			c.thumbsFailed.Store(v.ThumbnailsFailed)
+			cur := childStats(v)
 			if cur != counted {
 				t.update(func(st *Stats) { st.Child.add(counted, cur) })
 				counted = counted.max(cur)
 			}
+		case wire.Shot:
+			t.gotShot(v.S)
 		case wire.Error:
 			t.log.Warn("transcode: child error", "pid", c.p.pid, "rung", v.Rung, "fatal", v.Fatal, "msg", v.Message)
 		default:

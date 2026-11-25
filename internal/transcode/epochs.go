@@ -6,6 +6,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/wire"
 )
 
@@ -125,6 +126,23 @@ const pendingAudioTicks = media.ClockRate
 //     it arrives, and the copy path drops RASL frames until the first
 //     trailing picture.
 //
+// # Thumbnail keys
+//
+// A child that encodes no video is sent none, so it has nothing to make
+// thumbnails of (ruling R-C10a). With shotKeys, the router keeps the
+// thumbnail schedule itself and offers such a child the main video track's
+// keyframe whenever one is due, in the keyframe's rendition epoch and time,
+// as the child's audio is. Only send does so, for the normal path and for K,
+// and only while the child is fed: nothing of an old epoch reaches a new
+// child before K. The key is sent without waiting, and only to a child
+// whose Hello Run has handled (childReady): before that it would go to the
+// pre-Hello backlog. A due key that is not sent is counted (shotSkipped)
+// and not recorded as taken, so the next key is offered. A shot the child
+// reports as failed is retried under shotRetry. The keys change nothing
+// else: they are not counted as sent, announce nothing and never touch the
+// copy path, so epochs, anchors and hub writes are those of a run without
+// thumbnails.
+//
 // It is used by the Run goroutine only.
 type router struct {
 	childVideo, copyVideo, childAudio, copyAudio bool
@@ -155,6 +173,11 @@ type router struct {
 	upAnchor media.Anchor
 	upOK     bool
 
+	// Thumbnail keys; shots is nil without them.
+	shots     *picture.Schedule
+	shotEvery int // the schedule's interval, in seconds
+	retry     shotRetry
+
 	// Hooks.
 	toChild  func(wire.Message) bool // false: not queued
 	tryChild func(wire.Message) bool // toChild without waiting; false: not queued
@@ -173,6 +196,41 @@ type router struct {
 	onLoss    func()
 	dropped   func(n uint64) // DroppedBeforeKey
 	warn      func(msg string, args ...any)
+	// With thumbnail keys. childReady reports whether Run has handled the
+	// current child's Hello; childShots returns the current child's
+	// cumulative shots made and failed, as its Stats last reported them, or
+	// zeros without a child; shotSkipped counts a due key that was not sent.
+	childReady  func() bool
+	childShots  func() (thumbs, failed uint64)
+	shotSkipped func()
+}
+
+// shotKeys makes the router offer the child the main video's keyframes for
+// thumbnails, one every intervalSec seconds.
+func (r *router) shotKeys(intervalSec int) {
+	r.shotEvery = intervalSec
+	r.shots = picture.NewSchedule(intervalSec)
+	r.retry = newShotRetry()
+}
+
+// offerShot offers the child f, a main-video frame in its rendition epoch
+// on its way through send, when it is a keyframe that the thumbnail schedule
+// is due.
+func (r *router) offerShot(f media.Frame) {
+	if r.shots == nil || !f.Key || !r.childFed {
+		return
+	}
+	if r.retry.look(r.childShots()) {
+		r.shots = picture.NewSchedule(r.shotEvery)
+	}
+	if !r.shots.Due(f.Epoch, f.PTS) {
+		return
+	}
+	if !r.childReady() || !r.tryChild(wire.Frame{Rung: -1, F: f}) {
+		r.shotSkipped()
+		return
+	}
+	r.shots.Took(f.Epoch, f.PTS)
 }
 
 // deliver handles one source delivery.
@@ -241,6 +299,11 @@ func (r *router) childExited() {
 	r.childFed = false
 	r.needHello = true
 	r.em.bump()
+	if r.shots != nil {
+		// The next child counts its shots from zero.
+		r.shots = picture.NewSchedule(r.shotEvery)
+		r.retry.childExited()
+	}
 }
 
 // overflowBeforeHello records a message dropped because the current child's
@@ -414,7 +477,9 @@ func (r *router) sendEvicted(a media.Frame) {
 // to expect that video track in the epoch (expectVideo): the copy video
 // never reaches an encoded rendition's merger, but it does reach the
 // presentation's, which must not take a new epoch's copy IDR for the
-// epoch's first video frame. A keyframe announces its barrier first.
+// epoch's first video frame. A keyframe announces its barrier first. With
+// thumbnail keys, a due keyframe is also offered to the child (offerShot),
+// which does not count as sent.
 func (r *router) send(f media.Frame) {
 	sent := false
 	switch f.Kind() {
@@ -429,6 +494,7 @@ func (r *router) send(f media.Frame) {
 		if r.childVideo {
 			sent = r.sendChild(f) || sent
 		}
+		r.offerShot(f)
 	case media.KindAudio:
 		if r.copyAudio {
 			r.toCopy(f)

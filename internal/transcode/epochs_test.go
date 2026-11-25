@@ -361,3 +361,167 @@ func TestRouterBarriers(t *testing.T) {
 		{"child", 2, 180000 + Delay},
 	}, calls)
 }
+
+// shotRouter is a router for a ladder that copies video and encodes audio,
+// with thumbnails every intervalSec seconds: the child is sent the due
+// keyframes. ready and the two counters are the test's.
+type shotRouter struct {
+	*router
+	rt             routed
+	ready          bool
+	room           bool // tryChild takes the message
+	thumbs, failed uint64
+	skipped        int
+}
+
+func newShotRouter(intervalSec int) *shotRouter {
+	s := &shotRouter{ready: true, room: true}
+	s.router = newTestRouter(&s.rt, false, true, true)
+	s.tryChild = func(m wire.Message) bool {
+		if s.room {
+			s.rt.child = append(s.rt.child, m)
+		}
+		return s.room
+	}
+	s.shotKeys(intervalSec)
+	s.childReady = func() bool { return s.ready }
+	s.childShots = func() (uint64, uint64) { return s.thumbs, s.failed }
+	s.shotSkipped = func() { s.skipped++ }
+	return s
+}
+
+// keys returns the PTS, less Delay, of the video frames the child was sent.
+func (s *shotRouter) keys() []int64 {
+	var out []int64
+	for _, m := range s.rt.child {
+		if f, ok := m.(wire.Frame); ok && f.F.Kind() == media.KindVideo {
+			out = append(out, f.F.PTS-Delay)
+		}
+	}
+	return out
+}
+
+// key delivers a main-video keyframe at pts seconds.
+func (s *shotRouter) key(sec int64) {
+	s.deliver(hub.Delivery{Frame: vframe(1, sec*media.ClockRate, true)})
+}
+
+// Only due keyframes of the main video go to a child that encodes no video,
+// in their rendition epoch and time; a key the child cannot take is counted
+// and the next one is offered; nothing else about the routing changes.
+func TestRouterShotKeys(t *testing.T) {
+	s := newShotRouter(2)
+	const sec = media.ClockRate
+	s.key(0)
+	s.deliver(hub.Delivery{Frame: vframe(1, 3600, false)})
+	s.deliver(hub.Delivery{Frame: aframe(1, 1000)})
+	s.key(1) // not due
+	s.key(2)
+	s.deliver(hub.Delivery{Frame: media.Frame{Track: 2, Config: testVideoCfg, PTS: 4 * sec, DTS: 4 * sec, Key: true, Epoch: 1}}) // a second video track
+	assert.Equal(t, []int64{0, 2 * sec}, s.keys())
+	f := s.rt.child[0].(wire.Frame)
+	assert.Equal(t, -1, f.Rung)
+	assert.Equal(t, uint32(1), f.F.Epoch)
+	assert.True(t, f.F.Key)
+	assert.Zero(t, s.skipped)
+
+	// Not ready (no Hello yet): skipped, and the next key is offered.
+	s.ready = false
+	s.key(4)
+	assert.Equal(t, 1, s.skipped)
+	s.ready = true
+	s.key(5)
+	assert.Equal(t, []int64{0, 2 * sec, 5 * sec}, s.keys())
+	// No room in the child's queue: the same.
+	s.room = false
+	s.key(7)
+	s.key(8)
+	assert.Equal(t, 3, s.skipped)
+	s.room = true
+	s.key(9)
+	assert.Equal(t, []int64{0, 2 * sec, 5 * sec, 9 * sec}, s.keys())
+
+	// The copy path got every main-video frame and the child every audio
+	// frame, and nothing was dropped: the keys are invisible.
+	assert.Len(t, s.rt.copied, 9)
+	assert.Zero(t, s.rt.dropped)
+	assert.Empty(t, s.rt.expected)
+	assert.Equal(t, int64(9*sec+Delay), s.sentMax)
+
+	// A child that is not fed is offered nothing (sendChild's rule).
+	s.childFed = false
+	s.key(12)
+	s.childFed = true
+	assert.Equal(t, []int64{0, 2 * sec, 5 * sec, 9 * sec}, s.keys())
+	assert.Equal(t, 3, s.skipped)
+
+	// After the child exits nothing of the old epoch is offered: not before
+	// the next child's Hello, and not before K.
+	s.childExited()
+	s.ready = false
+	s.key(20)
+	s.ready = true
+	s.childHello()
+	s.deliver(hub.Delivery{Frame: aframe(1, 21*sec+500)})
+	assert.Equal(t, []int64{0, 2 * sec, 5 * sec, 9 * sec}, s.keys())
+	assert.Equal(t, 3, s.skipped, "a key before K is not offered, so not skipped either")
+	s.key(21) // K, in epoch 2
+	assert.Equal(t, []int64{0, 2 * sec, 5 * sec, 9 * sec, 21 * sec}, s.keys())
+	last := s.rt.child[len(s.rt.child)-2].(wire.Frame)
+	assert.Equal(t, media.KindVideo, last.F.Kind(), "K goes to the child ahead of the audio buffered for it")
+	assert.Equal(t, uint32(2), last.F.Epoch)
+
+	// A router without thumbnails sends the child no video.
+	var rt routed
+	r := newTestRouter(&rt, false, true, true)
+	r.deliver(hub.Delivery{Frame: vframe(1, 0, true)})
+	assert.Empty(t, rt.child)
+}
+
+// A failed shot is retried once: at the next keyframe after the failure is
+// reported, and then only at the schedule's pace while failures stay
+// consecutive.
+func TestRouterShotRetry(t *testing.T) {
+	s := newShotRouter(3600)
+	const sec = media.ClockRate
+	s.key(0)
+	assert.Equal(t, []int64{0}, s.keys(), "key 1")
+	s.failed = 1
+	s.key(1)
+	assert.Equal(t, []int64{0, sec}, s.keys(), "key 2: the early retry")
+	s.failed = 2
+	s.key(2)
+	s.key(3)
+	s.key(4)
+	assert.Equal(t, []int64{0, sec}, s.keys(), "a second failure in a row: no key inside the interval")
+	s.thumbs = 1
+	s.key(5)
+	assert.Equal(t, []int64{0, sec}, s.keys(), "a success alone changes nothing")
+	s.failed = 3
+	s.key(6)
+	assert.Equal(t, []int64{0, sec, 6 * sec}, s.keys(), "a failure after a success")
+	s.failed = 4
+	s.key(7)
+	assert.Equal(t, []int64{0, sec, 6 * sec}, s.keys())
+	s.thumbs, s.failed = 2, 5
+	s.key(8)
+	assert.Equal(t, []int64{0, sec, 6 * sec, 8 * sec}, s.keys(), "both rose: the success counts first")
+	s.failed = 6
+	s.key(9)
+	assert.Equal(t, []int64{0, sec, 6 * sec, 8 * sec}, s.keys())
+	assert.Zero(t, s.skipped)
+
+	// The child exits: the schedule starts over, and so does the rule, for
+	// a child that counts from zero.
+	s.childExited()
+	s.childHello()
+	s.thumbs, s.failed = 0, 0
+	s.key(10) // K
+	assert.Equal(t, []int64{0, sec, 6 * sec, 8 * sec, 10 * sec}, s.keys())
+	s.failed = 1
+	s.key(11)
+	assert.Equal(t, []int64{0, sec, 6 * sec, 8 * sec, 10 * sec, 11 * sec}, s.keys(), "the early retry again")
+	s.failed = 2
+	s.key(12)
+	assert.Equal(t, []int64{0, sec, 6 * sec, 8 * sec, 10 * sec, 11 * sec}, s.keys())
+}
