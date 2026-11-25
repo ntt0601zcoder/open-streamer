@@ -90,6 +90,23 @@ jobs:
           echo "$out"
           echo "$out" | grep -Eqx 'ostranscoder wire [0-9]+ libavcodec 62\.[0-9]+\.[0-9]+'
           ls -l "$(dirname "$ostx")/lib" "$(dirname "$ostx")/LICENSE-ffmpeg"
+      # The runner has no NVIDIA device (and on arm64 the build may lack
+      # h264_nvenc): -probe nvenc must report that cleanly, as exit 3 and
+      # one line "nvenc: <error>", never crash. The NVENC device tests skip
+      # here with their reason; the GPU proof is make test-nvenc (R-C12).
+      - name: Probe NVENC (no device)
+        run: |
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-$OSTX_ARCH/ostranscoder"
+          set +e
+          out=$(cd / && env -u LD_LIBRARY_PATH "$ostx" -probe nvenc)
+          code=$?
+          set -e
+          echo "exit $code: $out"
+          if [ "$code" -ne 3 ]; then
+            echo "-probe nvenc exited $code, want 3" >&2
+            exit 1
+          fi
+          echo "$out" | grep -q '^nvenc: '
       - name: Tar the bundle
         run: tar -C dist -cf "ostranscoder-$OSTX_ARCH.tar" "ostranscoder-$OSTX_ARCH"
       - uses: actions/upload-artifact@v4
@@ -153,6 +170,23 @@ jobs:
           echo "$out"
           echo "$out" | grep -Eqx 'ostranscoder wire [0-9]+ libavcodec 62\.[0-9]+\.[0-9]+'
           ls -l "$(dirname "$ostx")/lib" "$(dirname "$ostx")/LICENSE-ffmpeg"
+      # The runner has no NVIDIA device (and on arm64 the build may lack
+      # h264_nvenc): -probe nvenc must report that cleanly, as exit 3 and
+      # one line "nvenc: <error>", never crash. The NVENC device tests skip
+      # here with their reason; the GPU proof is make test-nvenc (R-C12).
+      - name: Probe NVENC (no device)
+        run: |
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-$OSTX_ARCH/ostranscoder"
+          set +e
+          out=$(cd / && env -u LD_LIBRARY_PATH "$ostx" -probe nvenc)
+          code=$?
+          set -e
+          echo "exit $code: $out"
+          if [ "$code" -ne 3 ]; then
+            echo "-probe nvenc exited $code, want 3" >&2
+            exit 1
+          fi
+          echo "$out" | grep -q '^nvenc: '
       - name: Tar the bundle
         run: tar -C dist -cf "ostranscoder-$OSTX_ARCH.tar" "ostranscoder-$OSTX_ARCH"
       - uses: actions/upload-artifact@v4
@@ -167,7 +201,11 @@ jobs:
   # M4a scenarios (TestM4aMatrix, TestM4aKeyframesAligned, TestM4aRespawn)
   # and the M4b ABR scenarios (TestM4bMatrix, TestM4bRespawn,
   # TestM4bSwitchTS, TestM4bRungGap; about 40 s together on amd64, well
-  # inside the 10 min timeout). Their only peers are the bundle and apt's
+  # inside the 10 min timeout) and the M4c software-encoder scenarios
+  # (TestM4cWatermarkEveryRung, TestM4cThumbnailsTranscoded,
+  # TestM4cThumbnailsPassthrough, TestM4cThumbnailsCopyVideo, TestM4cFrozen;
+  # the live-update and respawn ones run in the test job, the NVENC ones
+  # skip without a device). Their only peers are the bundle and apt's
   # ffmpeg and ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a
   # failure. The VLC, GStreamer, SRT and RTSP rows stay amd64-only:
   # TestM4aVLC and TestM4bPlayers are not in the pattern (they run in the
@@ -180,7 +218,7 @@ jobs:
       OS_REQUIRE_PEERS: "1"
       OS_TRANSCODE_E2E_ARM: "1"
       E2E_PKGS: ./internal/e2e/ ./internal/transcode/
-      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild
+      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
