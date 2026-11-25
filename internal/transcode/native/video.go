@@ -16,12 +16,24 @@ import (
 const (
 	// x264Params keeps keyframes where the pipeline puts them: no scene
 	// cuts, a keyframe interval long enough that the source's keys force
-	// every IDR, and IDRs allowed at any distance. b-pyramid=none (ruling
-	// R-T7b'): with x264's default B-pyramid, VLC 3.0.20 logged "buffer
-	// deadlock prevented" at the start of 5 of 16 HLS-TS plays of an
-	// encoded rung (0 of 8 for the copied source); without it, 0 of 8.
-	// It also halves the reorder depth and DPB the SPS announces (2 → 1,
-	// 4 → 2).
+	// every IDR, and IDRs allowed at any distance.
+	//
+	// b-pyramid=none (rulings R-T7b' and R-C11) keeps the reorder depth the
+	// SPS announces at 1 (the B-pyramid's is 2, with a DPB of 4 against 2),
+	// because of a limit in VLC 3.0.20, not a defect in the stream. At the
+	// live edge of HLS TS, VLC resets its clock when a new segment arrives
+	// ("ES_OUT_SET_(GROUP_)PCR is called too late"), flushes its decoders
+	// and buffers 1000 ms of PCR time again. Our PCR runs 700 ms behind
+	// the DTS, so only the first 300 ms of the new segment reach the
+	// decoder: 8 or 9 pictures at 25 fps. es_out then waits for the
+	// decoder's second picture, which libavcodec's 6 frame threads give
+	// after 5 + reorder + 2 packets: 8 with depth 1, 9 with depth 2. When
+	// that is more than it was fed, VLC logs "buffer deadlock prevented".
+	// Measured on the tree before this setting: 17 of 46 plays with the
+	// pyramid, 0 of 16 without; 0 of 16 with the pyramid and 5 decoder
+	// threads, 4 of 16 without it and 7. A larger depth, a lower frame
+	// rate or a longer PCR lead brings the line back. The measurements are
+	// in docs/superpowers/notes/2026-11-25-r-t7b-root-cause.md.
 	x264Params = "scenecut=0:keyint=600:min-keyint=1:rc-lookahead=10:b-pyramid=none"
 	// fpsDeltas is how many DTS deltas of the source estimate its framerate.
 	fpsDeltas = 8
