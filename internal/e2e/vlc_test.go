@@ -374,19 +374,20 @@ func (r gstResult) check() error {
 // each pad-added runs every pending delayed link on its own thread.
 //
 // "Delayed linking failed" (GStreamer 1.24.2: 4 of 1440 runs of
-// rtspPipeline, 7 of 960 runs of the RTSP play row). A delayed link with a
-// caps filter is two links through a capsfilter of its own, and the second
-// is made even when the first failed. The thread of the video pad tries
-// the audio link before the audio pad is there: no pad for its filter, but
-// its filter takes the depayloader's sink. The thread of the audio pad
-// links that pad to its own filter, finds the depayloader's sink taken, and
+// rtspPipeline when it had caps filters failed so, and 7 of 960 runs of the
+// RTSP play row; no run of 3360 without them). A delayed link with a caps
+// filter is two links through a capsfilter of its own, and the second is
+// made even when the first failed. The thread of the video pad tries the
+// audio link before the audio pad is there: no pad for its filter, but its
+// filter takes the depayloader's sink. The thread of the audio pad links
+// that pad to its own filter, finds the depayloader's sink taken, and
 // undoes; the first undoes too. No pad-added follows, and no-more-pads
 // leaves the pad unlinked. Its sink never prerolls, which holds the other
 // sink in preroll: neither gets a buffer, and gst-launch -e waits for an
-// EOS that cannot come until it is killed. (A pad added after
-// no-more-pads still gets linked: that run has the line and plays.)
+// EOS that cannot come until it is killed. (A pad added after no-more-pads
+// still gets linked: that run has the line and plays.)
 //
-// "Caught SIGSEGV" (1 of 3360 runs of rtspPipeline without its caps
+// "Caught SIGSEGV" (1 of 3360 runs of rtspPipeline, without caps
 // filters): gst-launch crashes in a streaming thread and spins, and the
 // pad that thread was adding never comes.
 var gstVoidMarks = []string{"Delayed linking failed", "Caught SIGSEGV"}
@@ -464,13 +465,15 @@ const (
 var rtspElements = []string{"rtspsrc", "rtph264depay", "rtpmp4gdepay", "avdec_h264", "avdec_aac", "fakesink"}
 
 // rtspPipeline plays an H.264+AAC RTSP URL over TCP into the sinks v and a.
+// rtspsrc's pads are linked straight to the depayloaders, whose sink
+// templates pick them (encoding-name H264 for v, MPEG4-GENERIC for a): a
+// caps filter in between makes the delayed link the two links that
+// gst-launch loses to itself (gstVoidMarks).
 func rtspPipeline(u string) []string {
 	return []string{
 		"rtspsrc", "location=" + u, "protocols=tcp", "name=s",
-		"s.", "!", "application/x-rtp,media=video", "!", "rtph264depay", "!", "avdec_h264", "!",
-		"fakesink", "name=v", "silent=false",
-		"s.", "!", "application/x-rtp,media=audio", "!", "rtpmp4gdepay", "!", "avdec_aac", "!",
-		"fakesink", "name=a", "silent=false",
+		"s.", "!", "rtph264depay", "!", "avdec_h264", "!", "fakesink", "name=v", "silent=false",
+		"s.", "!", "rtpmp4gdepay", "!", "avdec_aac", "!", "fakesink", "name=a", "silent=false",
 	}
 }
 
