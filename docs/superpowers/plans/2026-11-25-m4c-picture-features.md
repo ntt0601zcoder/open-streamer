@@ -18,7 +18,7 @@
 
 - **Libraries:** no new Go module. Only the approved independent libraries (mp4ff, pion/rtp, pion/sdp, datarhei/gosrt, testify, go-astiav v0.41.0, protobuf `protowire`); no bluenviron, no lal, no code copied from another product. No new link dependency either: go-astiav already links `libavfilter`, and the bundle already ships `libavfilter.so.11`; this plan is the first to use it. New file in the repo: `internal/transcode/native/font/DejaVuSans.ttf`, copied from this host's `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` (fonts-dejavu-core 2.37, 759720 bytes, sha256 `b4c632e3cdf9acc7f28758fb5a323c8524d7fc6660d46904d9b6cbe2809c419c`), with its licence (`/usr/share/doc/fonts-dejavu-core/copyright`: Bitstream Vera and Arev licences, free to redistribute and embed) as `internal/transcode/native/font/LICENSE`. Nothing else is downloaded or installed; in particular the NVIDIA container toolkit is **not** installed (it would reconfigure and restart the Docker daemon).
 - **cgo:** only `internal/transcode/native` and `cmd/ostranscoder` use cgo, behind the tag `libav`. Without the tag, `go build ./...`, `go vet ./...`, `golangci-lint run ./...` and `make test` keep passing, as do `GOOS=windows go vet ./...` and `GOOS=darwin go vet ./...`. Native changes are verified with `make test-transcode` and `make ostranscoder` (image `osv2-ci-peers:m4a`).
-- **Frozen behaviour:** with `Options.Watermark` nil, `Options.Thumbnail` nil and every rung's `Encoder` empty or `x264`, every hub write, counter, playlist and segment byte is what M4b produced, and every existing test passes unchanged, except the one wire-version assertion and the one test Task 1 names. **Task 1 is outside this constraint by the controller's carry ruling** (M4b's final review, items 1 to 4, assigned to M4c's first task): it changes when the presentation merger releases a new epoch's opener and how long a stale lag is remembered, and its own tests cover that change.
+- **Frozen behaviour:** with `Options.Watermark` nil, `Options.Thumbnail` nil and every rung's `Encoder` empty or `x264`, every hub write, counter, playlist and segment byte is what M4b produced, and every existing test passes unchanged, except the one test Task 1 names (no existing test asserts the wire version; Task 3's `TestVersionIsTwo` pins the new one). **Task 1 is outside this constraint by the controller's carry ruling** (M4b's final review, items 1 to 4, assigned to M4c's first task): it changes when the presentation merger releases a new epoch's opener and how long a stale lag is remembered, and its own tests cover that change.
 - **GPU facts (this host):** GeForce GTX 1650 (TU117), driver 595.99.02, 4 GiB. Its NVENC encodes B-frames (measured in review round 1: `-bf 2 -b_ref_mode disabled` gave 32 B-frames and `has_b_frames=1`); B-frames as references (`b_ref_mode` other than disabled) are not used. Docker here has only the `runc` runtime, so no container sees the GPU: every NVENC test runs **on the host**, against the bundle that `make ostranscoder` builds in the container. The host has ffmpeg 8 and ffprobe, and no VLC.
 - **CI has no GPU.** NVENC code builds and its device-free logic is unit-tested in CI; a test that needs a device skips with the probe's reason (`no NVENC device: <error>`), or fails when `OS_REQUIRE_NVENC=1`, which only `make test-nvenc` sets.
 - **Peers:** every test that runs ffmpeg/ffprobe, VLC or GStreamer passes on the host (ffmpeg 8, GStreamer 1.28) and in `make test-ci-peers` (image `osv2-ci-peers:m4a`: ffmpeg 6.1, VLC 3.0.20, GStreamer 1.24) before any push.
@@ -36,7 +36,7 @@
 | R-C1 | **The encoder is chosen per rung:** `transcode.Video.Encoder` is `""`/`"x264"` (libx264, as today) or `"nvenc"` (`h264_nvenc`). Mixed ladders are allowed; each rung is its own encoder context and the presentation's barrier already orders rungs with different decode delays. Rejected: per ladder (a 4 GiB card with a session limit must be able to keep the cheap rungs on the CPU) | One more field through `Video`, wire and native; a mixed ladder's rungs differ in B-frames and rate-control character |
 | R-C2 | **CPU frames.** The child decodes in software, applies the watermark and scales with swscale as today, and gives `yuv420p` system-memory frames to `h264_nvenc`, which uploads them itself. No `hwupload`, no cuvid decode, no `scale_cuda` | The decode, the scalers and one upload per rung stay on the CPU and the bus, so NVENC saves only the encode. A full-GPU path (cuvid → `scale_cuda` → nvenc, with `overlay_cuda`) is a Backlog item; it needs a watermark that renders on the GPU |
 | R-C3 | **NVENC options:** `preset` = `Video.Preset`, which for an nvenc rung is `""` (→ `p4`) or `p1`…`p7` (`New` rejects x264 preset names: nothing is mapped silently); `tune=hq`; `rc=vbr` with bitrate, maxrate (0 → bitrate) and bufsize = 2 × maxrate, as x264; `profile=high`; GOP 600 (as x264's `keyint=600`); `forced-idr=1` with `pict_type` I and the key flag on the frame at each source keyframe PTS, exactly as the x264 rung; `no-scenecut=1`, `rc-lookahead=0`, `strict_gop=1`, `delay=0`, `aud=0`. **B-frames exactly as on x264 rungs** (controller ruling, review round 1): `BFrames` 0 means 2, −1 means none, at most 3, under the same rendition delay D. **`b_ref_mode=disabled` always**: it is NVENC's analogue of `b-pyramid=none` under R-T7b' (R-C11) | Flipping a rung to nvenc with an x264 preset is a config error. Without reference B-frames NVENC gives up some efficiency on cards that have them. A card whose NVENC has no B-frames fails the open for a rung that asks for them and ends in R-C4's fallback, on every build, until the rung is set to −1 |
-| R-C4 | **A failed NVENC open falls back to libx264 for that rung, for that build:** same height, rates and B-frames, preset `veryfast`. It is counted (`Stats.Child.EncoderFallbacks`) and logged by the child once per build; the next build (source config change, discontinuity, respawn) tries NVENC again. This is also the session-limit handling: the driver's concurrent-session limit, another process holding sessions, a resolution below NVENC's minimum, a card without B-frames, a missing driver and a build without the encoder all end here. Rejected: failing the rung (the presentation would wait for it at every barrier) and failing the stream (the child would crash-loop every 5 s while the limit lasts) | A host sized for NVENC silently pays CPU for the overflow, and may not have it. `EncoderFallbacks` and the log are the only signal until M5 exports metrics; `make test-nvenc` requires 0 |
+| R-C4 | **A failed NVENC open falls back to libx264 for that rung, for that build:** same height, rates and B-frames, preset `veryfast`. It is counted per rung (`Stats.Child.EncoderFallbacks` rises by 1 for each rung that fell back) and logged by the child with one warning per build that names those rungs; the next build (source config change, discontinuity, respawn) tries NVENC again. This is also the session-limit handling: the driver's concurrent-session limit, another process holding sessions, a resolution below NVENC's minimum, a card without B-frames, a missing driver and a build without the encoder all end here. Rejected: failing the rung (the presentation would wait for it at every barrier) and failing the stream (the child would crash-loop every 5 s while the limit lasts) | A host sized for NVENC silently pays CPU for the overflow, and may not have it. `EncoderFallbacks` and the log are the only signal until M5 exports metrics; `make test-nvenc` requires 0 |
 | R-C5 | **The watermark is drawn once, on the decoded picture before the ladder,** so every *encoded* rung carries it, scaled with the picture. **A copy rung cannot carry it, so `New` (and `SetWatermark`) reject a watermark on a ladder with a copy-video rendition.** Rejected: silently exempting the copy rung (the full-quality rendition would go out unbranded, which is what a watermark is there to prevent) and silently re-encoding it (it has no bitrate; it would stop being a copy) | An operator who wants the source resolution watermarked pays for one more encoded rung at the source height; one who wants an unbranded copy next to branded rungs needs a second stream |
 | R-C6 | **Watermark spec** (`picture.Watermark`): either `Text` or `Image`, never both. Text: at most 256 bytes of valid UTF-8, one line, with the directives `%Y %m %d %H %M %S` and `%%` (any other `%x` is rejected), formatted in `TimeZone` (an IANA name, `""` = UTC; both binaries embed `time/tzdata`) from the child's wall clock, re-rendered when the formatted string changes. Image: PNG (alpha kept) or JPEG file bytes, at most 1 MiB and 2048 px per side. `Position`: top-left (zero value), top-right, bottom-left, bottom-right, centre, with a margin of 2 % of the picture height. `OpacityPct` 1…100 (0 → 100). `SizePct`: text glyph height in % of the picture height (0 → 5, 1…50); image width in % of the picture width (0 → 15, 1…100), height by its aspect ratio. Text is white with a black border of max(1, size/16) px | No colour, font, rotation or tiling choice. The clock is the child's wall clock at encode time, up to the pipeline's latency away from the picture's capture time, and meaningless for unpaced input |
 | R-C7 | **Text is rendered by libavfilter `drawtext` with the embedded DejaVu Sans** (written to a private temp directory at start), `expansion=none`, and the text read from a `textfile` the child rewrites atomically (`reload=1` when the text has a time directive). Operator text never enters a filter-graph string: the graph string is built only from numbers and paths the child makes, and a temp path with a character outside `[A-Za-z0-9_./-]` is refused. Rejected: rendering text in Go (needs a font rasteriser, a new dependency) and fontconfig lookup (host-dependent; the peers image has no guaranteed font) | Glyphs outside DejaVu Sans (CJK, Arabic shaping) render as empty boxes; an operator font from the asset library is a Backlog item. One small file read per frame while the text has a directive |
@@ -52,7 +52,7 @@
 
 | Wave | Tasks | Why this order |
 |---|---|---|
-| 1 | 1 (carry items), 2 (`picture`), 9 (R-T7b' root cause) | Disjoint files: Task 1 has `merge.go`, `rtspplay` and its own spec edits (§3.4, §3.5's presentation bullet); Task 2 a new package; Task 9 experiments, a notes file, one code comment and one native test. Task 9 edits no spec text: Task 12 does that from its notes |
+| 1 | 1 (carry items), 2 (`picture`), 9 (R-T7b' root cause) | Disjoint files: Task 1 has `merge.go`, `rtspplay` and its own spec edits (§3.4, §3.5's presentation bullet); Task 2 a new package; Task 9 experiments, a notes file, one code comment and one native test. Task 9 edits no spec text: Task 12 does that from its notes. **Waves 2 to 7 do not wait for Task 9**, nor for its possible escalation round (R-C11): only Task 12 depends on it. Its one-comment edit of `video.go` is rebased onto Task 4 if Task 4 lands first |
 | 2 | 3 (wire v2) | Needs Task 2's types |
 | 3 | 4 (native NVENC), 7 (host: options, `SetWatermark`, `Thumbnailer`) | 4 touches native and `cmd/ostranscoder`; 7 touches `internal/transcode` with the fake child |
 | 4 | 5 (native watermark), 8 (osdev) | 5 needs 4's `native.Config` (same files); 8 needs 7 |
@@ -89,7 +89,7 @@ These four items are the controller's carry ruling from M4b's final review (the 
 
 So an entry of the previous epoch survives into the new epoch's start. `m.first` is pruned where `m.lead` is.
 
-**New-epoch opener.** In `holds`, `case newEpoch`: when `m.lag` has an entry after the prune, return the learned hold (1.5 × the largest envelope, clamped to [`hold`, `maxHold`]), wall time only as today; when it has none, `maxHold` as today.
+**New-epoch opener.** `push` records the opener's own track in `m.lag` before `holds` runs, so "the map has an entry" would always be true. The rule is: in `holds`, `case newEpoch`, when an unpruned entry was recorded in an epoch **below the opener's** (`entry.epoch < f.Epoch`; `holds` takes the head frame's epoch), return the learned hold: 1.5 × the largest envelope among those entries, clamped to [`hold`, `maxHold`], wall time only as today. Otherwise, the first epoch of a run or every older entry pruned, `maxHold` as today. The existing `TestMergerPresHoldCap` and `TestMergerPresHoldFollowsLag` pass unchanged.
 
 - [ ] **Step 1: Write the failing tests** (fake clock, as `TestMergerBarrierHoldRunsOut`)
 
@@ -99,7 +99,8 @@ func TestMergerNewEpochUsesLearnedHold(t *testing.T)
 // Epoch 2 is expected on tracks 0 and 1; only track 0's IDR arrives. It is not written at 3.7 s of wall
 // time and is written at 3.8 s (1.5 × 2.5 s = 3.75 s), not at 8 s.
 func TestMergerNewEpochBeforeAnyLag(t *testing.T)
-// a fresh merger: the first epoch's opener with track 1 missing is held until 8 s, as today.
+// a fresh merger: the first epoch's opener with track 1 missing is held until 8 s, as today, although the
+// opener's own push has put its track in the lag map (the entry is of the opener's epoch, so it does not count).
 func TestMergerStaleLagPruned(t *testing.T)
 // track 1 pushes one frame 450000 ticks (5 s) behind, then nothing; tracks 0 and 2 push 9 s of stream time
 // (more than the 8 s cap). Then a frame waiting on a missing track 2 is released after 2 s of wall time,
@@ -199,7 +200,8 @@ func TestSchedule(t *testing.T)
 // Due(2, 0) true (new epoch); after Took(2, 900000): Due(2, 450000) true (PTS went back).
 func TestShotSize(t *testing.T)
 // (320,240,1,1,180) → 240×180; (320,240,1,1,720) → 320×240; (720,576,16,15,180) → 240×180;
-// (1920,1080,0,0,180) → 320×180 (a SAR with a zero is 1:1); (320,241,1,1,720) → 320×240.
+// (1920,1080,0,0,180) → 320×180 (a SAR with a zero is 1:1); (320,241,1,1,720) → 318×240
+// (h 241 → 240; w = 320 × 240 / 241 = 318.7, nearest even 318, as native's evenWidth gives).
 func TestEncodeJPEG(t *testing.T)          // a 16×16 image round-trips through image/jpeg at the same size
 ```
 
@@ -236,9 +238,9 @@ type Shot struct{ S picture.Shot }               // child to host
 // Stats gains: EncoderFallbacks, Thumbnails, ThumbnailsFailed uint64
 ```
 
-Field numbers: Rung 6 `encoder` (bytes). Configure 3 `watermark`, 4 `thumbnail`. Watermark: 1 text, 2 image, 3 position, 4 opacity, 5 size, 6 time zone. Thumbnail: 1 interval, 2 height, 3 quality. Envelope 8 `SetWatermark` (1 watermark, absent = remove), 9 `Shot` (1 pts sint64, 2 epoch, 3 width, 4 height, 5 jpeg). `Stats`: the next three free field numbers. The Writer refuses (`ErrLimit`) a text above `MaxTextBytes`, an image above `MaxImageBytes`, a JPEG above `MaxShotBytes` and an encoder name above 16 bytes; the Reader rejects the same as `ErrMalformed`. The wire does not validate a watermark further: the host and the child call `Validate`.
+Field numbers: Rung 6 `encoder` (bytes). Configure 3 `watermark`, 4 `thumbnail`. Watermark: 1 text, 2 image, 3 position, 4 opacity, 5 size, 6 time zone. Thumbnail: 1 interval, 2 height, 3 quality. Envelope 8 `SetWatermark` (1 watermark, absent = remove), 9 `Shot` (1 pts sint64, 2 epoch, 3 width, 4 height, 5 jpeg). `Stats`: the next three free field numbers. The Writer refuses (`ErrLimit`) a text above `MaxTextBytes`, an image above `MaxImageBytes`, a JPEG above `MaxShotBytes` and an encoder name above 16 bytes; the Reader rejects the same as `ErrMalformed`. The wire does not validate a watermark further: the host and the child call `Validate`. **Absent means absent:** an empty `Encoder`, a nil `Watermark` and a nil `Thumbnail` write no field at all, so a `Configure` without M4c features has exactly M4b's bytes (the 4-byte length included).
 
-The fake child (`transcodetest`) announces version 2 and learns four behaviours, each behind an environment variable in the style of `EnvVersion`: `EnvShots` (`OS_TRANSCODE_FAKE_SHOTS=n`: send a `Shot` with a 1×1 JPEG for every n-th video keyframe it receives, and report their count as `Stats.Thumbnails`), `EnvShotFail` (`OS_TRANSCODE_FAKE_SHOT_FAIL=1`: send no `Shot`, and count each received video keyframe in `Stats.ThumbnailsFailed` instead), `EnvWatermarkLog` (a file path: append one line per `Configure` and per `SetWatermark`, `configure <text|image:<len>|none>` and `set <…>`), and a thumbnail-only `Configure` (no rungs, no audio) is accepted.
+The fake child (`transcodetest`) announces version 2 and learns five behaviours, each behind an environment variable in the style of `EnvVersion`: `EnvShots` (`OS_TRANSCODE_FAKE_SHOTS=n`: send a `Shot` with a 1×1 JPEG, carrying the key's PTS and epoch, for every n-th video keyframe it receives, and report their count as `Stats.Thumbnails`), `EnvShotFail` (`OS_TRANSCODE_FAKE_SHOT_FAIL=1`: send no `Shot`, and count each received video keyframe in `Stats.ThumbnailsFailed` instead), `EnvWatermarkLog` (a file path: append one line per `Configure` and per `SetWatermark`: `configure text:<the text verbatim>`, `configure image:<len>` or `configure none`, and `set …` in the same forms), `EnvFrameLog` (a file path: append one line per received frame, `<video|audio> <track> <pts> <epoch> <key|->`, flushed per line), and a thumbnail-only `Configure` (no rungs, no audio) is accepted. Task 7's tests read what a child was sent from these two logs and from the shots' PTS.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -247,6 +249,11 @@ func TestConfigureV2RoundTrip(t *testing.T)
 // a Configure with rungs {Encoder "nvenc", Preset "p4"} and {Encoder ""}, a text watermark and a thumbnail
 // spec round-trips; one with an image watermark of MaxImageBytes round-trips; nil Watermark and Thumbnail
 // stay nil.
+func TestConfigureBytesUnchanged(t *testing.T)
+// Configure{Rungs: {{Height: 240, BitrateKbps: 600}, {Height: 180, BitrateKbps: 300, BFrames: -1, Preset: "fast"}},
+// Audio: &AudioEncode{BitrateKbps: 96}} written by a Writer is, in hex, exactly (M4b's encoder, captured
+// before this task):
+// 0000002a12280a0c08f00110d804180020002a000a1008b40110ac02180020012a04666173741206086010001800
 func TestSetWatermarkRoundTrip(t *testing.T)  // a text watermark; nil
 func TestShotRoundTrip(t *testing.T)          // PTS −1, epoch 7, 240×180, 3 bytes
 func TestStatsV2RoundTrip(t *testing.T)       // EncoderFallbacks 2, Thumbnails 9, ThumbnailsFailed 4
@@ -259,7 +266,7 @@ func TestVersionIsTwo(t *testing.T)           // Hello{Version: Version} carries
 Extend `FuzzRead`'s seed corpus with one `SetWatermark` and one `Shot`.
 
 - [ ] **Step 2: Run** `go test -race -count=1 ./internal/transcode/wire/` — fail.
-- [ ] **Step 3: Implement**; update the one existing assertion of version 1.
+- [ ] **Step 3: Implement.** No existing test asserts version 1; `TestVersionIsTwo` pins the version from here on.
 - [ ] **Step 4: Run** `go test -race -count=1 ./internal/transcode/...` — pass (the host ignores the new messages until Task 7).
 - [ ] **Step 5: Commit** `feat(wire): version 2 with encoder, watermark and thumbnail messages`
 
@@ -288,11 +295,11 @@ var nvencGPU = -1                                          // the `gpu` option; 
 
 `ostranscoder -probe nvenc` prints `nvenc: ok` and exits 0, or prints `nvenc: <error>` and exits 3. The untagged stub is unchanged (exit 2).
 
-`resolveRung`: `Encoder` `""` → `x264`; any other name than the two → error. For nvenc: `Preset` `""` → `p4`, `p1`…`p7` ok, anything else → error naming the allowed values; `BFrames` resolves exactly as for x264 (0 → 2, −1 → 0, at most 3). For x264 nothing changes.
+`resolveRung`: `Encoder` `""` → `x264`; any other name than the two → `fmt.Errorf("encoder %q is not x264 or nvenc", r.Encoder)`. For nvenc: `Preset` `""` → `p4`, `p1`…`p7` ok, anything else → `fmt.Errorf("nvenc preset %q is not p1 to p7", r.Preset)`; `BFrames` resolves exactly as for x264 (0 → 2, −1 → 0, at most 3), with the existing B-frame message. For x264 nothing changes. Task 7 writes the same two messages on the host, in parallel with this task, so they are fixed here: each sits behind its package's existing prefix (`transcode: new pipeline: rung %d: ` here).
 
 `openNVENC`: `h264_nvenc`, `yuv420p`, time base 1/90000, the framerate, SAR, bitrate, maxrate, buffer size 2 × maxrate, `SetGopSize(600)`, `SetMaxBFrames(r.BFrames)`, then `nvencOptions` and `gpu` = `nvencGPU` when it is not −1. The frame path (`rungEncoder.encode`, `frame`) is shared with x264 unchanged: NVENC repeats SPS and PPS in band on every IDR.
 
-Fallback (R-C4): in `openRung`, when `openNVENC` fails, log one `slog.Warn` ("nvenc open failed, using libx264", rung, error), add 1 to `Stats.EncoderFallbacks`, and open libx264 with the rung's height, rates and B-frames and preset `veryfast`. A failure of that x264 open is the error returned. A build of libavcodec without the encoder (`FindEncoderByName("h264_nvenc")` nil, possible on arm64) takes the same fallback, and `ProbeNVENC` then returns an error saying so; nothing dereferences a nil codec.
+Fallback (R-C4): in `openRung`, when `openNVENC` fails, add 1 to `Stats.EncoderFallbacks` for that rung, remember the rung and its error, and open libx264 with the rung's height, rates and B-frames and preset `veryfast`. A failure of that x264 open is the error returned. `openEncoders` then logs one `slog.Warn` per build ("nvenc open failed, using libx264", the rung indexes, the first error) when any rung fell back. A build of libavcodec without the encoder (`FindEncoderByName("h264_nvenc")` nil, possible on arm64) takes the same fallback, and `ProbeNVENC` then returns an error saying so; nothing dereferences a nil codec.
 
 - [ ] **Step 1: Write the failing tests** (`-tags libav`; `nvencOrSkip(t)` calls `ProbeNVENC` and skips with `no NVENC device: <error>`, or fails when `OS_REQUIRE_NVENC=1`)
 
@@ -305,7 +312,7 @@ func TestNVENCOptions(t *testing.T)
 // rc-lookahead 0, strict_gop 1, delay 0, aud 0, b_ref_mode disabled}, in that order.
 func TestNVENCFallback(t *testing.T)
 // nvencGPU = 63 (restored by t.Cleanup). h264_aac.ts through rungs {240 nvenc, 180 x264}: both rungs produce
-// video; Stats.EncoderFallbacks == 1; rung 0's first keyframe carries x264's SEI (a NAL of type 6 containing
+// video; Stats.EncoderFallbacks == 1 (and 2, with one warning, when both rungs are nvenc); rung 0's first keyframe carries x264's SEI (a NAL of type 6 containing
 // "x264"); both rungs have a keyframe at exactly every source keyframe PTS. Runs with and without a device;
 // not parallel.
 func TestNVENCRung(t *testing.T)            // nvencOrSkip
@@ -371,8 +378,9 @@ func TestWatermarkTextTicks(t *testing.T)
 // the band differs from an unmarked run's on every picture.
 func TestWatermarkTextIsLiteral(t *testing.T)
 // Text ":'\\%%{localtime},[in]textfile=/etc/passwd" and a 256-byte text of CJK: the pipeline runs to the end,
-// the band differs from an unmarked run, and nothing but <dir>/font.ttf and <dir>/text is opened by the graph
-// (assert the graph string, exposed to tests, contains none of the text's bytes).
+// the band differs from an unmarked run. The graph string, exposed to tests, contains neither the whole text
+// nor any of "%{localtime}", "/etc/passwd" and "[in]", and the only paths in it (substrings starting with "/")
+// are <dir>/font.ttf and <dir>/text.
 func TestWatermarkAcrossConfigChange(t *testing.T)
 // h264_aac_then_640.ts, image mark, SizePct 25, TopRight: the mark is in place on the last picture before and
 // the first after the change, at 25 % of each picture's width.
@@ -461,8 +469,8 @@ func TestServeShots(t *testing.T)
 ### Task 7: Host — encoder, watermark, thumbnails and the `Thumbnailer`
 
 **Files:**
-- Create: `internal/transcode/thumbnailer.go`
-- Modify: `internal/transcode/transcode.go` (`Video.Encoder`, `Options.Watermark`, `Options.Thumbnail`, `Options.OnShot`, `New`'s validation, `Configure` and `writeChild`, `readChild`, `ChildStats` with its `max` and `add`, `SetWatermark`, `Shot`, `newRouter`, the package doc), `internal/transcode/epochs.go` (the router's thumbnail keys: its schedule, `childReady`, `send`, `childExited`), `internal/transcode/spawn_unix.go` and `spawn_other.go` (only if `startProc` or `killGroup` need a change to be shared with the `Thumbnailer`; they are used as they are otherwise)
+- Create: `internal/transcode/thumbnailer.go`, `internal/transcode/childutil.go` (what the two supervisors share)
+- Modify: `internal/transcode/transcode.go` (`Video.Encoder`, `Options.Watermark`, `Options.Thumbnail`, `Options.OnShot`, `New`'s validation, `Configure` and `writeChild`, `readChild`, `ChildStats` with its `max` and `add`, `SetWatermark`, `Shot`, `newRouter`, the package doc), `internal/transcode/epochs.go` (the router's thumbnail keys: its schedule and `shotRetry`, the hooks `childReady` and `childShots`, `send`, `childExited`), `internal/transcode/spawn_unix.go` and `spawn_other.go` (only if `startProc` or `killGroup` need a change to be shared with the `Thumbnailer`; they are used as they are otherwise)
 - Test: `internal/transcode/transcode_test.go`, `internal/transcode/epochs_test.go`, `internal/transcode/thumbnailer_test.go` (with the `transcodetest` fake child)
 
 **Interfaces:**
@@ -502,13 +510,13 @@ func (t *Thumbnailer) Shot() (picture.Shot, time.Time, bool)
 func (t *Thumbnailer) Stats() ThumbnailerStats
 ```
 
-**`New`.** `Video.Encoder`: `""`, `x264` or `nvenc`, else an error; for nvenc, R-C3's preset and B-frame rules (the same messages as native's `resolveRung`). `Watermark`: `Validate`, then an error when any rendition copies video ("rendition %q copies video and cannot carry the watermark", R-C5). `Thumbnail`: `Validate`, then an error when the ladder needs no child, that is every rendition copies video and the audio is copied ("thumbnails of a passthrough stream need a Thumbnailer"). A shot's PTS is in rendition time (source + `Delay`).
+**`New`.** `Video.Encoder`: `""`, `x264` or `nvenc`, else `fmt.Errorf("transcode: new: rendition %q: encoder %q is not x264 or nvenc", name, enc)`; for nvenc, `Preset` must be `""` or `p1`…`p7`, else `fmt.Errorf("transcode: new: rendition %q: nvenc preset %q is not p1 to p7", name, preset)` (the two messages Task 4 uses, behind this package's prefix), and B-frames follow the existing check and message. `"x264"` is sent to the child as `""`, so an x264 rung's `Configure` is M4b's. `Watermark`: `Validate`, then an error when any rendition copies video ("rendition %q copies video and cannot carry the watermark", R-C5). `Thumbnail`: `Validate`, then an error when the ladder needs no child, that is every rendition copies video and the audio is copied ("thumbnails of a passthrough stream need a Thumbnailer"). A shot's PTS is in rendition time (source + `Delay`).
 
 **Thumbnails from an audio-only child (R-C10a).** When `Thumbnail` is set and no rendition encodes video, the router keeps a `picture.Schedule` and offers the child the main video track's key frame whenever one is due:
 - Only from `router.send` (the normal path and K), never from `beforeK`, and only while `childFed` is true (`sendChild`'s rule), so nothing of an old epoch reaches a new child before K.
 - The frame is epoch-mapped and shifted like the child's audio, and `Due` is asked with that rendition epoch and PTS.
 - It is sent with `tryChild`, and only when the router's new hook `childReady func() bool` says so: true from the Run goroutine's handling of a child's hello event (after `handOver`) until that child exits. `tryChild` alone would not do: before Hello it appends to the backlog, and `needHello` is false for the first child. A due key that is not sent (child not ready, no room) counts in `Stats.ShotKeysSkipped` and `Took` is not called, so the next key is offered.
-- `childExited` resets the schedule. A failed shot is retried under one rule, the same as the `Thumbnailer`'s: one early retry per run of failures: the first reported failure that follows a success (or the child's start) resets the schedule, so the next keyframe after the failure is reported is offered; while failures stay consecutive `Took` stands, so a key that never decodes alone costs one attempt per interval, not one per keyframe. The router learns of failures without leaving the Run goroutine: the reader goroutine, which sees the child's `Stats`, stores the child's cumulative `ThumbnailsFailed` and `Thumbnails` in two atomics on the `child`, and the router compares them with the values it last saw each time it considers a key.
+- A failed shot is retried under the shared rule, `shotRetry` (below). The router holds only hooks and no child pointer, so it gets one more: `childShots func() (thumbs, failed uint64)`, which returns the current child's two atomics (the reader goroutine, which sees the child's `Stats`, stores its cumulative `Thumbnails` and `ThumbnailsFailed` there), or (0, 0) when there is no child. Each time the router considers a key it calls `shotRetry.look(childShots())` and resets its schedule when that returns true. `childExited` resets the schedule and calls `shotRetry.childExited()`.
 - It is invisible to everything else: no `noteSent`, no `DroppedBeforeKey`, no `expectVideo`, no barrier, and the copy path is untouched. Epoch numbers, anchors and every hub write equal those of a run without thumbnails.
 
 **`SetWatermark`** validates as `New` does (an error changes nothing). Safe from any goroutine, also before `Run` and after it ends. No call may be lost between a child's `Configure` and its first `set`, so the state is versioned:
@@ -518,16 +526,40 @@ func (t *Thumbnailer) Stats() ThumbnailerStats
 
 So a call that lands before the snapshot is in the `Configure` with no `set`, whichever of the writer and Run handles Hello first, and a call that lands after it becomes exactly one `set`.
 
-**`Thumbnailer`** (only for a stream with no transcoding child, R-C10a). `Run` subscribes with `src.SubscribeLive("thumbnailer", 64)` and ends with nil when the context ends or the hub closes. The main video track is the lowest-numbered video track seen so far. A `picture.Schedule` on the host picks its key frames: a due key is offered, unshifted, to the child through a one-slot channel: taken when the child has said Hello and the slot is free (`KeysSent`, then `Took`), otherwise skipped (`KeysSkipped`, no `Took`, so the next key is offered); nothing else is sent and `Lost` deliveries are ignored. The child gets `Configure{Thumbnail: &opt.Thumbnail}` and shoots every key it is sent: the host's schedule is the only one. The schedule is reset when the child exits or is killed. A failed shot, which the `Thumbnailer` learns from the child's `Stats` (`Failed`), is retried under one rule: one early retry per run of failures: the first reported failure that follows a success (or the child's start) resets the schedule, so the next keyframe after the failure is reported is offered; while failures stay consecutive `Took` stands, so a key that never decodes alone costs one attempt per interval, not one per keyframe. A child that exits is respawned with the backoff of `Transcoder` (`RespawnMin` doubling to `RespawnMax`); no hub is touched. A child that has said Hello and then sends no message for `SilenceTimeout` is killed and counts as an exit (it sends `Stats` every second). A missing binary and a wire-version mismatch end `Run` with an error; on non-Unix systems `NewThumbnailer` returns `errors.ErrUnsupported`. Stopping sends `Stop`, waits 2 s and kills the process group, as `Transcoder` does (reuse `startProc` and `killGroup`).
+**Shared by the two supervisors** (`childutil.go`). `Transcoder` is refactored onto these with no change of behaviour (its existing tests pass unchanged), and `Thumbnailer` uses them instead of re-implementing them:
+
+```go
+// readHello reads a child's first message: a Hello with wire.Version, or an error. A Hello with another
+// version returns an error that wraps errVersion (fatal for Run); anything else is a plain error (an exit).
+func readHello(r *wire.Reader) (wire.Hello, error)
+var errVersion = errors.New("transcode: child speaks another wire version")
+// backoff is the respawn delay: min, doubling up to max, back to min after a child ran for healthy.
+type backoff struct{ min, max, healthy, cur time.Duration }
+func (b *backoff) next(uptime time.Duration) time.Duration
+// stopChild sends Stop when graceful, waits up to stopGrace for exited, then kills the process group.
+func stopChild(p *proc, w *wire.Writer, graceful bool, exited <-chan struct{}, after func(time.Duration) <-chan time.Time)
+// shotRetry is the retry rule for key-only thumbnails: one early retry per run of failures.
+type shotRetry struct{ thumbs, failed uint64; afterSuccess bool }
+func (r *shotRetry) look(thumbs, failed uint64) (reset bool)
+func (r *shotRetry) childExited()
+```
+
+`shotRetry` starts, and is put back by `childExited`, with last-seen (0, 0) and `afterSuccess` true. `look` compares the child's cumulative counters with the last seen: a rise of `thumbs` sets `afterSuccess`; a rise of `failed` returns true when `afterSuccess` is set, and clears it; when both rose since the last look the success is counted first, so that look returns true. So the first reported failure that follows a success (or a child's start) resets the caller's schedule, and the next keyframe after the failure is reported is offered; while failures stay consecutive `Took` stands, so a key that never decodes alone costs one attempt per interval, not one per keyframe.
+
+**`Thumbnailer`** (only for a stream with no transcoding child, R-C10a). `Run` subscribes with `src.SubscribeLive("thumbnailer", 64)` and ends with nil when the context ends or the hub closes. The main video track is the lowest-numbered video track seen so far. A `picture.Schedule` on the host picks its key frames: a due key is offered, unshifted, to the child through a one-slot channel: taken when the child has said Hello and the slot is free (`KeysSent`, then `Took`), otherwise skipped (`KeysSkipped`, no `Took`, so the next key is offered); nothing else is sent and `Lost` deliveries are ignored. The child gets `Configure{Thumbnail: &opt.Thumbnail}` and shoots every key it is sent: the host's schedule is the only one. The schedule is reset when the child exits or is killed, with `shotRetry.childExited()`; each `Stats` from the child (`Failed`) goes through `shotRetry.look`, which resets the schedule when it returns true. A child that exits is respawned with `backoff` (`RespawnMin` doubling to `RespawnMax`); no hub is touched. Hello is read with `readHello`. A child that has said Hello and then sends no message for `SilenceTimeout` is killed and counts as an exit (it sends `Stats` every second). A missing binary and a wire-version mismatch end `Run` with an error; on non-Unix systems `NewThumbnailer` returns `errors.ErrUnsupported`. Stopping is `stopChild`; the process is started with `startProc`.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```go
 func TestNewEncoderValidation(t *testing.T)
 // Encoder "qsv" → error; nvenc + Preset "veryfast" → error; nvenc + BFrames 2 and 3 → accepted, the Configure
-// carries them; nvenc + BFrames 4 → error; nvenc + "p5" → the child's Configure carries Encoder "nvenc", Preset "p5"; x264 rungs' Configure is byte-identical to before.
+// carries them; nvenc + BFrames 4 → error; nvenc + "p5" → the child's Configure carries Encoder "nvenc", Preset "p5".
+// The error strings are exactly the two above. For renditions {240, 600 kbps} and {180, 300 kbps, BFrames −1,
+// Preset "fast"} with audio at 96 kbps, with Encoder "" and again with Encoder "x264", the Configure the child
+// is sent (taken at the writeMsg hook and written by a wire.Writer) is, in hex, exactly
+// 0000002a12280a0c08f00110d804180020002a000a1008b40110ac02180020012a04666173741206086010001800.
 func TestWatermarkRejectsCopyRung(t *testing.T)   // New and SetWatermark, ladder {enc, copy}: the R-C5 error
-func TestWatermarkInConfigure(t *testing.T)       // the fake's log: "configure text"
+func TestWatermarkInConfigure(t *testing.T)       // the fake's log: "configure text:<the text>" (below, "text" in a log line stands for that)
 func TestSetWatermarkReachesChild(t *testing.T)   // log: "configure none", then "set text", then "set none" after SetWatermark(nil)
 func TestSetWatermarkLatestWins(t *testing.T)
 // three calls before the child is spawned: the Configure carries the third and there is no "set" line. The
@@ -548,7 +580,7 @@ func TestSetWatermarkBeforeAndAfterRun(t *testing.T) // no panic, no block; the 
 func TestThumbnailNeedsChild(t *testing.T)        // Options.Thumbnail with a copy-only ladder and copied audio → error
 func TestShotsFromAudioOnlyChild(t *testing.T)
 // ladder {src copy}, audio AAC, Thumbnail{IntervalSec: 2}, EnvShots=1: the fake child receives the audio and
-// only due video key frames (at least 180000 apart within an epoch), none before its Hello and no other video;
+// only due video key frames (read from EnvFrameLog: at least 180000 apart within an epoch), none before its Hello and no other video;
 // shots arrive; the rendition hub's frames equal a run without thumbnails; with a fake that reads nothing,
 // ShotKeysSkipped rises and the copy path keeps writing. Respawn row: the fake exits mid-run: the new child
 // receives no video frame with PTS below K, the pre-Hello backlog holds no video, and the rendition epochs
@@ -558,19 +590,22 @@ func TestRouterShotRetry(t *testing.T)
 // a router with the thumbnail schedule at interval 3600, childReady true, and the two atomics driven by the
 // test: key 1 is sent; failed 0 → 1 before key 2: key 2 is sent (the early retry); failed 1 → 2 before key 3:
 // key 3 is not sent, nor any key inside the interval; thumbnails 0 → 1 then failed 2 → 3: the next key is sent
-// again (a failure after a success). childExited resets the schedule: the next key is sent.
+// again (a failure after a success). thumbnails and failed both rising between two looks: the next key is
+// sent (the success counts first). childExited resets the schedule: the next key is sent; then, on the new
+// child (childShots back at 0, 0), failed 0 → 1 gives the early retry again.
+func TestShotRetry(t *testing.T)                 // the rule alone, as a table over look() sequences, including both-rose and childExited
 func TestShotsFromChild(t *testing.T)
 // EnvShots=1: Shot() returns the latest shot with `at` from the fake clock; OnShot saw every one;
 // Stats().Child.Thumbnails follows the child's Stats; FramesOut and the hubs equal a run without thumbnails.
 func TestThumbnailerForwardsKeysOnly(t *testing.T)
 // a hub fed h264_aac.ts (unpaced, so the one-slot channel may skip), interval 2, EnvShots=1: 1 ≤ KeysSent ≤ 3;
-// the fake child received exactly KeysSent frames, all video keys, at least 180000 apart; Shots == KeysSent;
+// the fake child's EnvFrameLog has exactly KeysSent lines, all video keys, at least 180000 apart; Shots == KeysSent;
 // Shot() is the last.
 func TestThumbnailerRespawns(t *testing.T)
 // interval 3600; the fake exits after its first key: Spawns 2, Exits 1, and the new child is sent the next key
 // (the schedule was reset), so Shots reaches 2; Run still running.
 func TestThumbnailerRetriesFailedShot(t *testing.T)
-// interval 3600, EnvShotFail=1, EnvStatsInterval a few milliseconds, h264_aac.ts looped at its pace for 5 s:
+// interval 3600, EnvShotFail=1, EnvStatsInterval a few milliseconds, h264_aac.ts at its pace for 5 s:
 // Failed rises, and one more key is sent, the next keyframe after the failure is reported; then no more:
 // KeysSent == 2 at the end, however many keyframes passed (a persistent failure is bounded).
 func TestThumbnailerSkipsWhenChildBusy(t *testing.T) // a fake that never reads: KeysSkipped rises, Run does not block, the hub's writes do not block
@@ -588,7 +623,7 @@ func TestThumbnailerVersionMismatch(t *testing.T) // EnvVersion=1 → Run return
 
 **Files:**
 - Modify: `cmd/osdev/main.go`
-- Test: `cmd/osdev/main_test.go`
+- Test: `cmd/osdev/main_test.go` (gains a `TestMain` that runs `transcodetest.Main()` when `OS_TRANSCODE_FAKE=1`, as `internal/transcode`'s does, so the test binary can be the `-ostranscoder`)
 
 **Interfaces — Consumes:** Task 7's API; `picture.LoadAsset`.
 
@@ -609,7 +644,9 @@ func TestParseWatermark(t *testing.T)
 // "a,pos=br"; an unknown key, both text and image, a stream without -rung → error.
 func TestParseThumbnail(t *testing.T)     // cam=10 → {10,0,0}; cam=5:240:70; cam=0, cam=x, a repeat → error
 func TestThumbnailHTTP(t *testing.T)
-// a file stream with -thumbnail v=1 and the fake transcoder child (EnvShots=1) as -ostranscoder: GET
+// a file stream with -thumbnail v=1 and -ostranscoder set to the test binary (os.Executable()). osdev gives
+// the child no environment of its own, so the child inherits the test's: t.Setenv("OS_TRANSCODE_FAKE", "1")
+// and t.Setenv(transcodetest.EnvShots, "1") before run (the test is therefore not parallel). GET
 // /live/v/thumbnail.jpg is 404, then 200 image/jpeg with an ETag; the same ETag in If-None-Match → 304;
 // /live/w/thumbnail.jpg (no -thumbnail) and /live/nope/thumbnail.jpg → 404.
 func TestThumbnailChildChoice(t *testing.T)
@@ -685,7 +722,8 @@ func TestM4cWatermarkLiveUpdate(t *testing.T)
 // exactly one epoch, Stats.Spawns == 1, the first picture of the run has no mark and the first picture of the
 // last GOP has it.
 func TestM4cWatermarkRespawn(t *testing.T)
-// the image mark on; the child is killed after its 3rd output keyframe (TestM4aRespawn's helper): the first
+// the image mark on; the child is killed after its 3rd output keyframe by killAfterKeyframes(t, tr, hub, 3), a
+// helper this task writes in m4c_test.go (TestM4aRespawn kills inline and is left as it is): the first
 // picture of epoch 2 on every rendition carries the mark.
 func TestM4cThumbnailsTranscoded(t *testing.T)
 // h264_aac.ts fed four times as one timeline (24 s) through m4cLadder with Thumbnail{IntervalSec: 2,
@@ -733,7 +771,8 @@ func TestM4cNVENCMatrix(t *testing.T)
 // presentation, packaged in ABR mode and read as hls-ts, hls-fmp4 and dash with AlignedSequences, has no
 // violation and passes assertCompleteABR.
 //   no-B ladder, h264_aac.ts, h264_aac_then_640.ts, h264_aac_nob.ts, h264_pyramid.ts: per rendition,
-//     TestM4aMatrix's rows steady-state, epoch-change and no-bframes with their assertions. On the NVENC
+//     assertM4aRows(t, runs, i): TestM4aMatrix's rows steady-state, epoch-change and no-bframes with their
+//     assertions, re-typed once as that helper in m4c_nvenc_test.go (TestM4aMatrix is not touched). On the NVENC
 //     rungs, in every row and for h264_pyramid.ts too: reordered == 0 (every frame's DTS == PTS in the hub,
 //     and assertReorder over the HTTP outputs, with hubTimes of the rung's own frames as its reference list,
 //     returns 0), with the PTS-set check against the source and strictly increasing DTS kept. The copy rung
@@ -761,10 +800,12 @@ func TestM4cNVENCWatermarkThumbnails(t *testing.T)
 // m4cLadder(bin, "nvenc") with the image mark and Thumbnail{2, 120, 80} on h264_aac.ts fed four times: the
 // mark on every rung's first picture (TestM4cWatermarkEveryRung's rule), at least 11 shots 2 s apart.
 func TestM4cNVENCKeep(t *testing.T)
-// when OS_NVENC_MEDIA names a directory (relative to the repository root), writes the B ladder's presentation
-// of h264_aac.ts fed four times as one timeline (24 s: vlcPlays samples at 6 s, quits at 10 s and wants 4 s
-// of video and audio) as a static, ended HLS-TS tree (index.m3u8, v{track}.m3u8, segments) into it;
-// otherwise skips.
+// when OS_NVENC_MEDIA names a directory (relative to the repository root): records the B ladder on h264_aac.ts
+// fed four times as one timeline (24 s: vlcPlays samples at 6 s, quits at 10 s and wants 4 s of video and
+// audio) through serialRuns (a clean run, EncoderFallbacks == 0), and writes its presentation as a static,
+// ended HLS-TS tree (index.m3u8, v{track}.m3u8, segments) into the directory. Then it serves the directory
+// from an http.FileServer and reads it back with conform.ReadHLS(index.m3u8, AlignedSequences, Once): no
+// violation, 4 video tracks, and every URI the playlists list exists as a non-empty file. Otherwise skips.
 func TestM4cNVENCRecordedVLC(t *testing.T)
 // no device needed: when OS_NVENC_MEDIA names a directory with index.m3u8, serves it from an
 // http.FileServer and plays index.m3u8 and v0.m3u8 with VLC (vlcPlays with tolerate true, as every HLS-TS
