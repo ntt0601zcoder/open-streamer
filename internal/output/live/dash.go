@@ -26,8 +26,9 @@ func init() {
 // buildMPD renders cmaf/index.mpd from the listed prefix of the window: one
 // Period per epoch that has a listed part, one AdaptationSet per track that
 // has an init segment, a codec string and a listed part in it (a track
-// without a codec string was counted once in Packager.CodecErrors). It
-// returns nil when nothing is listed.
+// without a codec string was counted once in Packager.CodecErrors). With
+// Snapshot.ABR, video tracks of one codec share an AdaptationSet instead
+// (see buildPeriod). It returns nil when nothing is listed.
 func buildMPD(s Snapshot) []byte {
 	if s.Listed == 0 || s.AST.IsZero() {
 		return nil
@@ -59,24 +60,69 @@ func buildMPD(s Snapshot) []byte {
 	return m.Encode()
 }
 
+// buildPeriod returns an epoch's Period, if any track has a set in it. Sets
+// are in order of their lowest track.
+//
+// With Snapshot.ABR (ruling R-B6) the video tracks with the same codec share
+// one AdaptationSet, each Representation with its own SegmentTemplate, and
+// the set has no segmentAlignment attribute: part numbers stay per track, so
+// after a gap the Representations' numbers differ. Audio tracks keep one set
+// each.
 func buildPeriod(s Snapshot, e EpochInfo) (dash.Period, bool) {
 	per := dash.Period{ID: "e" + strconv.FormatUint(uint64(e.Epoch), 10), Start: dash.Duration(e.Start)}
+	videoSet := map[media.Codec]int{} // ABR: codec -> index of its set in per.AdaptationSets
 	for _, et := range e.Tracks {
 		if et.Init == nil || et.Config == nil || et.Codec == "" {
 			continue
 		}
-		if as, ok := buildSet(s, e, et); ok {
-			per.AdaptationSets = append(per.AdaptationSets, as)
+		if !s.ABR || et.Config.Codec.Kind() != media.KindVideo {
+			if as, ok := buildSet(s, e, et); ok {
+				per.AdaptationSets = append(per.AdaptationSets, as)
+			}
+			continue
 		}
+		rep, tpl, ok := buildRep(s, e, et)
+		if !ok {
+			continue
+		}
+		rep.SegmentTemplate = tpl
+		if i, found := videoSet[et.Config.Codec]; found {
+			per.AdaptationSets[i].Representations = append(per.AdaptationSets[i].Representations, rep)
+			continue
+		}
+		videoSet[et.Config.Codec] = len(per.AdaptationSets)
+		per.AdaptationSets = append(per.AdaptationSets, dash.AdaptationSet{
+			ContentType:     "video",
+			MimeType:        "video/mp4",
+			Representations: []dash.Representation{rep},
+		})
 	}
 	return per, len(per.AdaptationSets) > 0
 }
 
-// buildSet returns the track's set, if it has a listed part.
+// buildSet returns the track's set, with the SegmentTemplate at set level,
+// if it has a listed part.
 func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (dash.AdaptationSet, bool) {
+	rep, tpl, ok := buildRep(s, e, et)
+	if !ok {
+		return dash.AdaptationSet{}, false
+	}
+	as := dash.AdaptationSet{SegmentAlignment: true, SegmentTemplate: tpl}
+	if et.Config.Codec.Kind() == media.KindAudio {
+		as.ContentType, as.MimeType = "audio", "audio/mp4"
+	} else {
+		as.ContentType, as.MimeType = "video", "video/mp4"
+	}
+	as.Representations = []dash.Representation{rep}
+	return as, true
+}
+
+// buildRep returns the track's Representation, without a template, and its
+// SegmentTemplate, if it has a listed part in the epoch.
+func buildRep(s Snapshot, e EpochInfo, et EpochTrack) (dash.Representation, *dash.SegmentTemplate, bool) {
 	ts := fmp4.Timescale(et.Config)
 	if ts == 0 {
-		return dash.AdaptationSet{}, false
+		return dash.Representation{}, nil, false
 	}
 	var tl dash.SegmentTimeline
 	var first uint64
@@ -100,33 +146,27 @@ func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (dash.AdaptationSet, bool)
 		}
 	}
 	if len(tl.S) == 0 {
-		return dash.AdaptationSet{}, false
+		return dash.Representation{}, nil, false
 	}
 	pto := max(media.Rescale(e.Anchor.Start, int(ts)), 0)
 	track := strconv.Itoa(et.Track)
 	rep := dash.Representation{ID: track, Codecs: et.Codec, Bandwidth: int(math.Ceil(peak))}
-	as := dash.AdaptationSet{
-		SegmentAlignment: true,
-		SegmentTemplate: &dash.SegmentTemplate{
-			Timescale:              ts,
-			PresentationTimeOffset: uint64(pto),
-			Initialization:         "init-" + track + "-" + strconv.FormatUint(uint64(e.Epoch), 10) + ".mp4",
-			Media:                  track + "-$Number$.m4s",
-			StartNumber:            &first,
-			Timeline:               &tl,
-		},
+	tpl := &dash.SegmentTemplate{
+		Timescale:              ts,
+		PresentationTimeOffset: uint64(pto),
+		Initialization:         "init-" + track + "-" + strconv.FormatUint(uint64(e.Epoch), 10) + ".mp4",
+		Media:                  track + "-$Number$.m4s",
+		StartNumber:            &first,
+		Timeline:               &tl,
 	}
 	if et.Config.Codec.Kind() == media.KindAudio {
-		as.ContentType, as.MimeType = "audio", "audio/mp4"
 		rep.AudioSamplingRate = et.Config.SampleRate
 		rep.AudioChannelConfiguration = &dash.AudioChannelConfiguration{
 			SchemeIDURI: dash.AudioChannelScheme,
 			Value:       strconv.Itoa(et.Config.Channels),
 		}
 	} else {
-		as.ContentType, as.MimeType = "video", "video/mp4"
 		rep.Width, rep.Height = et.Config.Width, et.Config.Height
 	}
-	as.Representations = []dash.Representation{rep}
-	return as, true
+	return rep, tpl, true
 }

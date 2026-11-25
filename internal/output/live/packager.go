@@ -55,6 +55,12 @@ type Options struct {
 	Target int64            // segment target in 90 kHz ticks; 0 means 180000 (2 s)
 	Window int              // segments kept; 0 means 6
 	Now    func() time.Time // nil means time.Now
+	// ABR marks the stream as an ABR presentation (ruling R-B1): every video
+	// track is a rendition of the same content, keyed at the same PTS. The
+	// segmenter then aligns the video tracks (segment.Options.AlignVideo),
+	// cmaf/master.m3u8 lists every video track as a variant (R-B5) and the
+	// MPD puts video tracks of one codec in one AdaptationSet (R-B6).
+	ABR bool
 }
 
 // epochState is the writer's working copy of one epoch.
@@ -80,6 +86,7 @@ type Packager struct {
 	h        *hub.Hub
 	target   int64
 	window   int
+	abr      bool
 	now      func() time.Time
 	errors   atomic.Uint64
 	fallback atomic.Uint64
@@ -113,6 +120,7 @@ func NewPackager(h *hub.Hub, opt Options) *Packager {
 		h:       h,
 		target:  opt.Target,
 		window:  opt.Window,
+		abr:     opt.ABR,
 		now:     opt.Now,
 		epochs:  map[uint32]*epochState{},
 		nextN:   map[int]uint64{},
@@ -127,7 +135,7 @@ func NewPackager(h *hub.Hub, opt Options) *Packager {
 	if p.now == nil {
 		p.now = time.Now
 	}
-	p.seg = segment.New(segment.Options{Target: p.target})
+	p.seg = segment.New(segment.Options{Target: p.target, AlignVideo: p.abr})
 	return p
 }
 
@@ -200,7 +208,7 @@ func (p *Packager) Snapshot() Snapshot {
 	p.mu.Lock()
 	s := p.st.snapshot()
 	p.mu.Unlock()
-	s.Target, s.Window, s.Now = p.target, p.window, now
+	s.Target, s.Window, s.Now, s.ABR = p.target, p.window, now, p.abr
 	for s.Listed < len(s.Segments) && s.IsListed(s.Segments[s.Listed]) {
 		s.Listed++
 	}

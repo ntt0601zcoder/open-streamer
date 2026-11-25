@@ -826,3 +826,88 @@ func TestHLSTargetDurationLikeTS(t *testing.T) {
 	}
 	assert.True(t, strings.HasPrefix(media3(t, srv, "/live/s/cmaf/a1.m3u8").Segments[2].URI, "gap-1-"))
 }
+
+// abrMasterGolden is buildMaster's output for packLadder's hub with ABR off,
+// captured before ABR mode existed.
+const abrMasterGolden = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="a3.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=12482,RESOLUTION=640x360,CODECS="avc1.4D400D,mp4a.40.2",AUDIO="aud"
+v0.m3u8
+`
+
+func TestABRMaster(t *testing.T) {
+	p := packLadder(t, Options{ABR: true}, nil)
+	assert.Zero(t, p.Errors())
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 5)
+	m := master(t, serve(p))
+	assert.True(t, m.Independent)
+	require.Len(t, m.Renditions, 1)
+	assert.Equal(t, hls.Rendition{Type: "AUDIO", GroupID: "aud", Name: "audio", URI: "a3.m3u8", Default: true}, m.Renditions[0])
+
+	aet, ok := snap.Track(3)
+	require.True(t, ok)
+	require.Len(t, m.Variants, len(ladderSizes))
+	for i, v := range m.Variants {
+		et, ok := snap.Track(i)
+		require.True(t, ok)
+		assert.Equal(t, "v"+strconv.Itoa(i)+".m3u8", v.URI)
+		assert.Equal(t, ladderSizes[i][0], v.Width)
+		assert.Equal(t, ladderSizes[i][1], v.Height)
+		assert.Equal(t, et.Codec+","+aet.Codec, v.Codecs)
+		assert.True(t, strings.HasPrefix(v.Codecs, "avc1."))
+		assert.True(t, strings.HasSuffix(v.Codecs, ",mp4a.40.2"))
+		assert.Equal(t, "aud", v.Audio)
+
+		// R-B5: the peak over segments of the variant's video part rate plus
+		// the default audio part rate.
+		peak := 1.0
+		for _, seg := range snap.Segments {
+			bw := 0.0
+			for _, track := range []int{i, 3} {
+				e, ok := trackPart(snap, seg, track)
+				require.True(t, ok)
+				bw += float64(len(e.part.Data)) * 8 / partDuration(e).Seconds()
+			}
+			peak = max(peak, bw)
+		}
+		assert.Equal(t, int(math.Ceil(peak)), v.Bandwidth, "variant %d", i)
+		media3(t, serve(p), "/live/s/cmaf/"+v.URI)
+	}
+}
+
+func TestABRTrackPlaylistsAligned(t *testing.T) {
+	ds := synthLadder(t, 1, 0, 250)
+	ds = append(ds, synthLadder(t, 2, 900000, 150)...)
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+	h.SetAnchor(media.Anchor{Epoch: 2, Start: 900000, Wall: t0.Add(11 * time.Second)})
+	p := NewPackager(h, Options{Window: 100, Now: farFuture, ABR: true})
+	handleAll(p, ds)
+	p.Flush()
+	srv := serve(p)
+
+	ref := media3(t, srv, "/live/s/cmaf/v0.m3u8")
+	require.Len(t, ref.Segments, 8)
+	assert.Equal(t, 1, discontinuities(ref), "the epoch change")
+	for _, path := range []string{"v1.m3u8", "v2.m3u8", "a3.m3u8"} {
+		pl := media3(t, srv, "/live/s/cmaf/"+path)
+		assert.Equal(t, ref.MediaSequence, pl.MediaSequence, path)
+		assert.Equal(t, ref.DiscontinuitySequence, pl.DiscontinuitySequence, path)
+		require.Len(t, pl.Segments, len(ref.Segments), path)
+		for i, seg := range pl.Segments {
+			assert.Equal(t, ref.Segments[i].Discontinuity, seg.Discontinuity, "%s entry %d", path, i)
+			assert.False(t, seg.Gap, "%s entry %d", path, i)
+		}
+	}
+}
+
+func TestABRMasterNonABRUnchanged(t *testing.T) {
+	p := packLadder(t, Options{}, nil)
+	code, body := get(t, serve(p), "/live/s/cmaf/master.m3u8")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, abrMasterGolden, string(body))
+	assert.Equal(t, abrMasterGolden, string(buildMaster(p.Snapshot())))
+}

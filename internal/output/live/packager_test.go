@@ -2,6 +2,7 @@ package live
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -1063,4 +1064,74 @@ func TestKnownTracks(t *testing.T) {
 	assert.Equal(t, a, kt)
 	_, ok = snap.Track(2)
 	assert.False(t, ok)
+}
+
+// ladderSizes are synthLadder's video renditions, track i at ladderSizes[i].
+var ladderSizes = [][2]int{{640, 360}, {426, 240}, {320, 180}}
+
+// synthLadder returns an ABR presentation's hub writes: n 25 fps frames on
+// each of video tracks 0..2 (H.264 at ladderSizes, keyframes every 50
+// frames at the same PTS) and 48 kHz AAC on track 3 covering the same span.
+// PTS == DTS (no B-frames). The frames come in barrier order: for each
+// keyframe PTS K, every frame of every track presented before K, then the
+// IDRs at K in track order, then the rest by DTS.
+func synthLadder(t *testing.T, epoch uint32, start int64, n int) []hub.Delivery {
+	t.Helper()
+	base := h264Config(t)
+	aac, err := media.NewAACConfig([]byte{0x11, 0x90})
+	require.NoError(t, err)
+	var out []hub.Delivery
+	for track, size := range ladderSizes {
+		cfg := *base
+		cfg.Width, cfg.Height = size[0], size[1]
+		for _, d := range synth(&cfg, epoch, start, n) {
+			d.Frame.Track = track
+			d.Frame.Data = [][]byte{append(d.Frame.Data[0], byte(track))}
+			out = append(out, d)
+		}
+	}
+	for ts := start; ts < start+int64(n)*3600; ts += 1920 {
+		out = append(out, hub.Delivery{Frame: media.Frame{
+			Track: len(ladderSizes), Config: aac, PTS: ts, DTS: ts, Key: true, Data: [][]byte{{0x21, 0x00}}, Epoch: epoch,
+		}})
+	}
+	const gop = 50 * 3600
+	idr := func(f media.Frame) int {
+		if f.Kind() == media.KindVideo && f.Key {
+			return 0
+		}
+		return 1
+	}
+	slices.SortStableFunc(out, func(a, b hub.Delivery) int {
+		fa, fb := a.Frame, b.Frame
+		return cmp.Or(
+			cmp.Compare((fa.PTS-start)/gop, (fb.PTS-start)/gop),
+			cmp.Compare(idr(fa), idr(fb)),
+			cmp.Compare(fa.DTS, fb.DTS),
+			cmp.Compare(fa.Track, fb.Track),
+		)
+	})
+	return out
+}
+
+// packLadder packages synthLadder(t, 1, 0, 250) (five segments), after
+// edit if it is not nil, with the epoch anchored at t0.
+func packLadder(t *testing.T, opt Options, edit func([]hub.Delivery)) *Packager {
+	t.Helper()
+	ds := synthLadder(t, 1, 0, 250)
+	if edit != nil {
+		edit(ds)
+	}
+	h := hub.New(hub.Options{})
+	h.SetAnchor(media.Anchor{Epoch: 1, Start: 0, Wall: t0})
+	if opt.Window == 0 {
+		opt.Window = 100
+	}
+	if opt.Now == nil {
+		opt.Now = farFuture
+	}
+	p := NewPackager(h, opt)
+	handleAll(p, ds)
+	p.Flush()
+	return p
 }

@@ -1,21 +1,26 @@
 package live
 
 import (
+	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Eyevinn/mp4ff/mp4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/dash"
 )
 
@@ -352,4 +357,217 @@ func TestMPDFFprobe(t *testing.T) {
 	require.NoError(t, err, string(out))
 	assert.Contains(t, string(out), "h264")
 	assert.Contains(t, string(out), "aac")
+}
+
+// videoSets returns the video and the audio adaptation sets of the MPD's
+// only period.
+func videoSets(t *testing.T, m dash.MPD) (video, audio []dash.AdaptationSet) {
+	t.Helper()
+	require.Len(t, m.Periods, 1)
+	for _, as := range m.Periods[0].AdaptationSets {
+		switch as.ContentType {
+		case "video":
+			video = append(video, as)
+		case "audio":
+			audio = append(audio, as)
+		default:
+			t.Fatalf("content type %q", as.ContentType)
+		}
+	}
+	return video, audio
+}
+
+// noAlignment asserts that no video AdaptationSet element of body carries a
+// segmentAlignment attribute.
+func noAlignment(t *testing.T, body []byte) {
+	t.Helper()
+	n := 0
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.Contains(line, "<AdaptationSet") && strings.Contains(line, `contentType="video"`) {
+			n++
+			assert.NotContains(t, line, "segmentAlignment", line)
+		}
+	}
+	assert.Positive(t, n)
+}
+
+// checkRep checks an ABR video Representation's own SegmentTemplate.
+func checkRep(t *testing.T, snap Snapshot, rep dash.Representation) {
+	t.Helper()
+	track, err := strconv.Atoi(rep.ID)
+	require.NoError(t, err)
+	et, ok := snap.Epochs[0].Track(track)
+	require.True(t, ok)
+	assert.Equal(t, et.Codec, rep.Codecs)
+	assert.Equal(t, et.Config.Width, rep.Width)
+	assert.Equal(t, et.Config.Height, rep.Height)
+	assert.GreaterOrEqual(t, rep.Bandwidth, 1)
+	st := rep.SegmentTemplate
+	require.NotNil(t, st)
+	assert.EqualValues(t, 90000, st.Timescale)
+	assert.Equal(t, "init-"+rep.ID+"-1.mp4", st.Initialization)
+	assert.Equal(t, rep.ID+"-$Number$.m4s", st.Media)
+	assert.EqualValues(t, media.Rescale(snap.Epochs[0].Anchor.Start, 90000), st.PresentationTimeOffset)
+	require.NotNil(t, st.StartNumber)
+	require.NotNil(t, st.Timeline)
+}
+
+func TestABRMPD(t *testing.T) {
+	p := packLadder(t, Options{ABR: true}, nil)
+	snap := p.Snapshot()
+	srv := serve(p)
+	code, body := get(t, srv, "/live/s/cmaf/index.mpd")
+	require.Equal(t, http.StatusOK, code)
+	noAlignment(t, body)
+	video, audio := videoSets(t, mpdOf(t, srv))
+
+	require.Len(t, video, 1)
+	as := video[0]
+	assert.Equal(t, "video/mp4", as.MimeType)
+	assert.False(t, as.SegmentAlignment)
+	assert.Nil(t, as.SegmentTemplate, "the template is per Representation")
+	require.Len(t, as.Representations, len(ladderSizes))
+	for i, rep := range as.Representations {
+		assert.Equal(t, strconv.Itoa(i), rep.ID)
+		assert.Equal(t, ladderSizes[i][0], rep.Width)
+		assert.Equal(t, ladderSizes[i][1], rep.Height)
+		checkRep(t, snap, rep)
+		assert.EqualValues(t, 0, *rep.SegmentTemplate.StartNumber)
+		assert.Len(t, rep.SegmentTemplate.Timeline.S, 5)
+		assert.Equal(t, as.Representations[0].SegmentTemplate.Timeline.Resolve(), rep.SegmentTemplate.Timeline.Resolve(), "rep %d", i)
+	}
+
+	// The audio set as without ABR.
+	require.Len(t, audio, 1)
+	assert.True(t, audio[0].SegmentAlignment)
+	require.NotNil(t, audio[0].SegmentTemplate)
+	assert.Equal(t, "init-3-1.mp4", audio[0].SegmentTemplate.Initialization)
+	require.Len(t, audio[0].Representations, 1)
+	assert.Equal(t, "3", audio[0].Representations[0].ID)
+	assert.Nil(t, audio[0].Representations[0].SegmentTemplate)
+}
+
+func TestABRMPDGap(t *testing.T) {
+	// Track 1 has no IDR at segment 2's Start: R-B8 leaves it out of segment 2.
+	k := int64(2 * 180000)
+	p := packLadder(t, Options{ABR: true}, func(ds []hub.Delivery) {
+		for i := range ds {
+			if f := &ds[i].Frame; f.Track == 1 && f.PTS == k {
+				f.Key = false
+				f.Data = [][]byte{{0x41, 0x9a, 0, 1}}
+			}
+		}
+	})
+	snap := p.Snapshot()
+	require.Len(t, snap.Segments, 5)
+	_, ok := trackPart(snap, snap.Segments[2], 1)
+	require.False(t, ok, "track 1 left out of segment 2")
+	srv := serve(p)
+	video, _ := videoSets(t, mpdOf(t, srv))
+	require.Len(t, video, 1)
+	require.Len(t, video[0].Representations, 3)
+
+	for _, rep := range video[0].Representations {
+		checkRep(t, snap, rep)
+		st := rep.SegmentTemplate
+		segs := st.Timeline.Resolve()
+		if rep.ID == "1" {
+			require.Len(t, segs, 4)
+			for _, sg := range segs {
+				assert.NotEqual(t, uint64(k), sg.T, "no entry for the left-out segment")
+			}
+		} else {
+			require.Len(t, segs, 5)
+		}
+		_, init := get(t, srv, "/live/s/cmaf/"+st.Initialization)
+		require.NotEmpty(t, init)
+		for i, sg := range segs {
+			path := "/live/s/cmaf/" + strings.ReplaceAll(st.Media, "$Number$", strconv.FormatUint(*st.StartNumber+uint64(i), 10))
+			code, body := get(t, srv, path)
+			require.Equal(t, http.StatusOK, code, path)
+			f, err := mp4.DecodeFile(bytes.NewReader(append(slices.Clone(init), body...)))
+			require.NoError(t, err, path)
+			traf := f.Segments[0].Fragments[0].Moof.Traf
+			earliest := int64(traf.Tfdt.BaseMediaDecodeTime()) + int64(traf.Trun.Samples[0].CompositionTimeOffset)
+			assert.Equal(t, int64(sg.T), earliest, path)
+		}
+	}
+}
+
+// h265Config returns the video config of the h265_aac51.ts fixture.
+func h265Config(t *testing.T) *media.TrackConfig {
+	t.Helper()
+	d, err := ts.NewDemuxer(bytes.NewReader(fixture(t, "h265_aac51.ts")))
+	require.NoError(t, err)
+	for {
+		f, err := d.Read()
+		require.NoError(t, err)
+		if f.Kind() == media.KindVideo && f.Config != nil {
+			require.Equal(t, media.CodecH265, f.Config.Codec)
+			return f.Config
+		}
+	}
+}
+
+func TestABRMPDTwoCodecs(t *testing.T) {
+	hevc := h265Config(t)
+	p := packLadder(t, Options{ABR: true}, func(ds []hub.Delivery) {
+		for i := range ds {
+			if f := &ds[i].Frame; f.Track == 2 {
+				f.Config = hevc
+				if f.Key {
+					f.Data = [][]byte{{0x26, 0x01, 0xaf}} // IDR_W_RADL
+				} else {
+					f.Data = [][]byte{{0x02, 0x01, 0xd0}} // TRAIL_R
+				}
+			}
+		}
+	})
+	snap := p.Snapshot()
+	srv := serve(p)
+	code, body := get(t, srv, "/live/s/cmaf/index.mpd")
+	require.Equal(t, http.StatusOK, code)
+	noAlignment(t, body)
+	video, audio := videoSets(t, mpdOf(t, srv))
+	require.Len(t, audio, 1)
+	require.Len(t, video, 2)
+	ids := make([][]string, 0, len(video))
+	for _, as := range video {
+		assert.Nil(t, as.SegmentTemplate)
+		var set []string
+		for _, rep := range as.Representations {
+			set = append(set, rep.ID)
+			checkRep(t, snap, rep)
+		}
+		ids = append(ids, set)
+	}
+	assert.Equal(t, [][]string{{"0", "1"}, {"2"}}, ids)
+	assert.True(t, strings.HasPrefix(video[0].Representations[0].Codecs, "avc1."))
+	assert.True(t, strings.HasPrefix(video[1].Representations[0].Codecs, "hvc1.") || strings.HasPrefix(video[1].Representations[0].Codecs, "hev1."))
+}
+
+func TestABRMPDFFprobe(t *testing.T) {
+	bin, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe not installed")
+	}
+	p := packLadder(t, Options{ABR: true}, nil)
+	ts := httptest.NewServer(serve(p))
+	defer ts.Close()
+	out, err := exec.CommandContext(context.Background(), bin, "-v", "error", "-show_entries", "stream=codec_type,codec_name",
+		"-of", "json", ts.URL+"/live/s/cmaf/index.mpd").Output()
+	require.NoError(t, err, string(out))
+	// The top-level streams; ffprobe also lists them per program.
+	var probe struct {
+		Streams []struct {
+			CodecName string `json:"codec_name"`
+			CodecType string `json:"codec_type"`
+		} `json:"streams"`
+	}
+	require.NoError(t, json.Unmarshal(out, &probe), string(out))
+	count := map[string]int{}
+	for _, st := range probe.Streams {
+		count[st.CodecName+","+st.CodecType]++
+	}
+	assert.Equal(t, map[string]int{"h264,video": 3, "aac,audio": 1}, count, string(out))
 }

@@ -50,6 +50,7 @@ import (
 type Snapshot struct {
 	Target                   int64     // segment target, 90 kHz ticks
 	Window                   int       // window length in segments
+	ABR                      bool      // the packager's Options.ABR
 	Now                      time.Time // the packager's clock when the snapshot was taken
 	AST                      time.Time // wall of the first anchor ever packaged; zero before the first segment
 	Segments                 []SegmentInfo

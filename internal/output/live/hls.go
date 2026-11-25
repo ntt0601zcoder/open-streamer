@@ -1,6 +1,7 @@
 package live
 
 import (
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -347,56 +348,61 @@ func lowestTracks(s Snapshot) (video, audio int, haveV, haveA bool) {
 	return
 }
 
-// buildMaster renders cmaf/master.m3u8 from the lowest known video and audio
-// tracks. It returns nil when no track is known.
-func buildMaster(s Snapshot) []byte {
-	vTrack, aTrack, haveV, haveA := lowestTracks(s)
-	if !haveV && !haveA {
-		return nil
+// trackSummary is what the master playlist takes from one track's listed
+// parts, or from its known epoch track when the window holds only gaps.
+type trackSummary struct {
+	codecs        []string           // distinct codec strings, in window order
+	width, height int                // video: the largest resolution
+	bandwidth     map[uint64]float64 // segment Seq -> the part's bits per second
+}
+
+// summarize returns a track's trackSummary and adds the epochs of its
+// listed parts to epochs.
+func summarize(s Snapshot, track int, kind media.Kind, epochs map[uint32]bool) trackSummary {
+	ts := trackSummary{bandwidth: map[uint64]float64{}}
+	codec := func(et EpochTrack) {
+		if c := et.Codec; c != "" && !slices.Contains(ts.codecs, c) {
+			ts.codecs = append(ts.codecs, c)
+		}
+		if kind == media.KindVideo && et.Config.Width*et.Config.Height > ts.width*ts.height {
+			ts.width, ts.height = et.Config.Width, et.Config.Height
+		}
 	}
-	pl := hls.MultivariantPlaylist{Version: hlsVersionFMP4}
-	v := hls.Variant{}
-	epochs := map[uint32]bool{}
-	var codecs []string
-	bandwidth := map[uint64]float64{} // segment Seq -> bits per second summed over the chosen tracks
-	codec := func(et EpochTrack, kind media.Kind) {
-		if c := et.Codec; c != "" && !slices.Contains(codecs, c) {
+	entries := trackEntries(s, track, kind)
+	if len(entries) == 0 {
+		// Only gaps in the window: the retained codec and resolution.
+		if kt, ok := s.Track(track); ok {
+			codec(kt)
+		}
+		return ts
+	}
+	for _, e := range entries {
+		epochs[e.seg.Epoch] = true
+		codec(e.et)
+		if d := partDuration(e).Seconds(); d > 0 {
+			ts.bandwidth[e.seg.Seq] += float64(len(e.part.Data)) * 8 / d
+		}
+	}
+	return ts
+}
+
+// variant combines a video summary with the audio summary: CODECS lists
+// the video codecs, then the audio ones; BANDWIDTH is the peak over
+// segments of the summed part rates; RESOLUTION is the video's.
+func variant(uri string, video, audio trackSummary) hls.Variant {
+	v := hls.Variant{URI: uri, Width: video.width, Height: video.height}
+	codecs := slices.Clone(video.codecs)
+	for _, c := range audio.codecs {
+		if !slices.Contains(codecs, c) {
 			codecs = append(codecs, c)
 		}
-		if kind == media.KindVideo && et.Config.Width*et.Config.Height > v.Width*v.Height {
-			v.Width, v.Height = et.Config.Width, et.Config.Height
-		}
 	}
-	add := func(track int, kind media.Kind) {
-		entries := trackEntries(s, track, kind)
-		if len(entries) == 0 {
-			// Only gaps in the window: the retained codec and resolution.
-			if kt, ok := s.Track(track); ok {
-				codec(kt, kind)
-			}
-			return
-		}
-		for _, e := range entries {
-			epochs[e.seg.Epoch] = true
-			codec(e.et, kind)
-			if d := partDuration(e).Seconds(); d > 0 {
-				bandwidth[e.seg.Seq] += float64(len(e.part.Data)) * 8 / d
-			}
-		}
+	bandwidth := maps.Clone(video.bandwidth)
+	if bandwidth == nil {
+		bandwidth = map[uint64]float64{}
 	}
-	if haveV {
-		add(vTrack, media.KindVideo)
-		v.URI = "v" + strconv.Itoa(vTrack) + ".m3u8"
-	}
-	if haveA {
-		add(aTrack, media.KindAudio)
-		uri := "a" + strconv.Itoa(aTrack) + ".m3u8"
-		if haveV {
-			pl.Renditions = []hls.Rendition{{Type: "AUDIO", GroupID: audioGroup, Name: "audio", URI: uri, Default: true}}
-			v.Audio = audioGroup
-		} else {
-			v.URI = uri
-		}
+	for seq, b := range audio.bandwidth {
+		bandwidth[seq] += b
 	}
 	peak := 1.0
 	for _, b := range bandwidth {
@@ -404,7 +410,55 @@ func buildMaster(s Snapshot) []byte {
 	}
 	v.Bandwidth = int(math.Ceil(peak))
 	v.Codecs = strings.Join(codecs, ",")
-	pl.Variants = []hls.Variant{v}
+	return v
+}
+
+// buildMaster renders cmaf/master.m3u8 from the lowest known video and audio
+// tracks. It returns nil when no track is known.
+//
+// With Snapshot.ABR every known video track is a variant, ascending track
+// (rendition order), each with the lowest audio track (ruling R-B5).
+func buildMaster(s Snapshot) []byte {
+	vTrack, aTrack, haveV, haveA := lowestTracks(s)
+	if !haveV && !haveA {
+		return nil
+	}
+	pl := hls.MultivariantPlaylist{Version: hlsVersionFMP4}
+	epochs := map[uint32]bool{}
+	var audio trackSummary
+	if haveA {
+		audio = summarize(s, aTrack, media.KindAudio, epochs)
+		uri := "a" + strconv.Itoa(aTrack) + ".m3u8"
+		if !haveV {
+			pl.Variants = []hls.Variant{variant(uri, trackSummary{}, audio)}
+		} else {
+			pl.Renditions = []hls.Rendition{{Type: "AUDIO", GroupID: audioGroup, Name: "audio", URI: uri, Default: true}}
+		}
+	}
+	if haveV {
+		videos := []int{vTrack}
+		if s.ABR {
+			videos = videoTracks(s)
+		}
+		for _, track := range videos {
+			v := variant("v"+strconv.Itoa(track)+".m3u8", summarize(s, track, media.KindVideo, epochs), audio)
+			if haveA {
+				v.Audio = audioGroup
+			}
+			pl.Variants = append(pl.Variants, v)
+		}
+	}
 	pl.Independent = independent(s, epochs)
 	return pl.Encode()
+}
+
+// videoTracks returns the known video tracks, ascending.
+func videoTracks(s Snapshot) []int {
+	var out []int
+	for _, kt := range s.Tracks { // ascending Track
+		if kt.Config != nil && kt.Config.Codec.Kind() == media.KindVideo {
+			out = append(out, kt.Track)
+		}
+	}
+	return out
 }
