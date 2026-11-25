@@ -991,7 +991,7 @@ func TestABRServedOnlyOverHTTP(t *testing.T) {
 		"-rtsp-play", fmt.Sprintf("127.0.0.1:%d", rtspPort),
 	}, &errw)
 	waitBody(t, "http://"+addr+"/live/v_abr/cmaf/master.m3u8", "#EXT-X-STREAM-INF")
-	waitBody(t, "http://"+addr+"/live/v_abr/hls/index.m3u8", "#EXTM3U")
+	waitBody(t, "http://"+addr+"/live/v_abr/hls/index.m3u8", "#EXT-X-STREAM-INF")
 	waitBody(t, "http://"+addr+"/live/v_abr/cmaf/index.mpd", "<MPD")
 
 	resp, err := httpGet("http://" + addr + "/live/v_abr/stream.ts")
