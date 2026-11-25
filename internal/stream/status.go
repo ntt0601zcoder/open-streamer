@@ -132,6 +132,12 @@ func (n snapshot) pipeStats() pipeline.Stats {
 	return n.g.pipe.Stats()
 }
 
+// state returns the stream's state alone, for the manager's count.
+func (s *Supervisor) state() string {
+	n := s.snapshot()
+	return n.state(n.pipeStats().Active)
+}
+
 // Status returns the stream's state. It is safe from any goroutine.
 func (s *Supervisor) Status() Status {
 	n := s.snapshot()
