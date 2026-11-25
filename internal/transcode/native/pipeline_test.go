@@ -184,6 +184,26 @@ func TestPipelineNoBPyramid(t *testing.T) {
 	assert.Positive(t, reordered, "B-frames are still used")
 }
 
+// Every x264 rung announces the reorder depth its B-frames need and no more
+// (R-C11): 1 with B-frames, 0 without. VLC 3's decoder starves on the 2 that
+// x264's B-pyramid announces; see the x264Params comment.
+func TestRungReorderSignalled(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	for _, tc := range []struct{ bframes, want int }{{0, 1}, {3, 1}, {-1, 0}} {
+		t.Run(fmt.Sprintf("bframes=%d", tc.bframes), func(t *testing.T) {
+			p := newPipeline(t, []Rung{{Height: 120, BitrateKbps: 150, BFrames: tc.bframes}}, nil)
+			v := rungFrames(run(t, p, src), 0)
+			require.NotEmpty(t, v)
+			require.NotEmpty(t, v[0].Config.SPS)
+			sps, err := h26x.ParseSPS(h26x.H264, v[0].Config.SPS[0])
+			require.NoError(t, err)
+			got, assumed := h26x.ReorderOf(h26x.H264, sps)
+			assert.Equal(t, tc.want, got, "reorder depth")
+			assert.False(t, assumed, "the SPS carries max_num_reorder_frames")
+		})
+	}
+}
+
 func TestPipelineLadder(t *testing.T) {
 	src := source(t, "h264_aac.ts")
 	p := newPipeline(t, []Rung{{Height: 240, BitrateKbps: 600}, {Height: 180, BitrateKbps: 300}, {Height: 120, BitrateKbps: 150}},
