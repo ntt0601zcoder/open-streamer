@@ -643,7 +643,7 @@ func TestWatermarkTempDirChars(t *testing.T) {
 // deadPID returns the PID of a process that has exited and been reaped.
 func deadPID(t *testing.T) int {
 	t.Helper()
-	cmd := exec.Command("true")
+	cmd := exec.CommandContext(t.Context(), "true")
 	require.NoError(t, cmd.Run())
 	pid := cmd.Process.Pid
 	require.True(t, pidGone(pid), "PID %d was reused at once", pid)
@@ -668,6 +668,11 @@ func TestWatermarkSweepsStaleDirs(t *testing.T) {
 	}
 	stale := mkdir(fmt.Sprintf("ostx-wm-%d-123", dead))
 	stale2 := mkdir(fmt.Sprintf("ostx-wm-%d-9", dead))
+	file := filepath.Join(tmp, fmt.Sprintf("ostx-wm-%d-5", dead))
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+	target := mkdir("target")
+	link := filepath.Join(tmp, fmt.Sprintf("ostx-wm-%d-6", dead))
+	require.NoError(t, os.Symlink(target, link))
 	kept := []string{
 		mkdir(fmt.Sprintf("ostx-wm-%d-456", os.Getpid())), // alive: this process
 		mkdir("ostx-wm-1-77"),                             // alive: init
@@ -676,13 +681,8 @@ func TestWatermarkSweepsStaleDirs(t *testing.T) {
 		mkdir(fmt.Sprintf("ostx-wm-0-%d", dead)),          // PID 0 names a group
 		mkdir(fmt.Sprintf("xostx-wm-%d-1", dead)),         // another prefix
 		mkdir("ostx-wm-abc"),                              // a v1-era name
+		file, target, link, filepath.Join(target, "font.ttf"),
 	}
-	file := filepath.Join(tmp, fmt.Sprintf("ostx-wm-%d-5", dead))
-	require.NoError(t, os.WriteFile(file, nil, 0o600))
-	target := mkdir("target")
-	link := filepath.Join(tmp, fmt.Sprintf("ostx-wm-%d-6", dead))
-	require.NoError(t, os.Symlink(target, link))
-	kept = append(kept, file, target, link, filepath.Join(target, "font.ttf"))
 
 	p, err := NewWith(Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}, Watermark: &picture.Watermark{Text: "x"}})
 	require.NoError(t, err)
