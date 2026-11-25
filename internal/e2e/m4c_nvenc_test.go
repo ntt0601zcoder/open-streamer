@@ -599,7 +599,7 @@ func TestM4cNVENCSessions(t *testing.T) {
 	after, err := nvencSessions(t.Context(), smi)
 	require.NoError(t, err)
 	t.Logf("nvenc-sessions base=%d peak=%d after=%d (%d polls, %d before the feed ended at %v)", base, peak, after,
-		len(polls), countBefore(polls, fedAt), fedAt.Format(time.TimeOnly))
+		len(polls), countBefore(polls, fedAt), fedAt.UTC().Format(time.RFC3339))
 }
 
 // countBefore counts the polls taken before at.
@@ -629,18 +629,51 @@ func TestM4cNVENCMixed(t *testing.T) {
 	assertNVENCLadder(t, opt, run, "h264_pyramid.ts")
 }
 
-// longGOPClip writes, with ffmpeg and libx264, a 30 s clip of 320x240 at
+// envNVENCFFmpeg names the ffmpeg TestM4cNVENCLongGOP makes its clip with:
+// scripts/test-nvenc.sh sets it to the pinned GPL FFmpeg build
+// (<prefix>/bin/ffmpeg, whose shared libraries are in <prefix>/lib), so
+// that the clip does not depend on the host's ffmpeg. Unset, the ffmpeg on
+// PATH is used.
+const envNVENCFFmpeg = "OS_NVENC_FFMPEG"
+
+// clipFFmpeg returns the ffmpeg of the long-GOP clip and the environment to
+// run it in (nil: this process's), and skips the test when that ffmpeg has
+// no libx264.
+func clipFFmpeg(t *testing.T) (bin string, env []string) {
+	t.Helper()
+	if bin = os.Getenv(envNVENCFFmpeg); bin != "" {
+		env = append(os.Environ(), "LD_LIBRARY_PATH="+filepath.Join(filepath.Dir(filepath.Dir(bin)), "lib"))
+	} else {
+		bin = testpeer.Require(t, "ffmpeg")
+	}
+	cmd := exec.CommandContext(t.Context(), bin, "-hide_banner", "-encoders")
+	cmd.Env = env
+	out, err := cmd.Output()
+	require.NoError(t, err, "%s -encoders (%s=%q)", bin, envNVENCFFmpeg, os.Getenv(envNVENCFFmpeg))
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if f := strings.Fields(line); len(f) > 1 && f[1] == "libx264" {
+			return bin, env
+		}
+	}
+	t.Skipf("%s has no libx264 encoder: the long-GOP clip cannot be made (%s=%q)", bin, envNVENCFFmpeg,
+		os.Getenv(envNVENCFFmpeg))
+	return "", nil
+}
+
+// longGOPClip writes, with ffmpeg (run in env) and libx264, a 30 s clip of 320x240 at
 // 24 fps with a closed 48-frame GOP (720 pictures, 15 keyframes) and AAC
 // stereo, and returns its bytes. 48 does not divide 600, the encoders' GOP,
 // so a GOP counter that a forced IDR did not reset would put an IDR at
 // picture 600, inside a source GOP.
-func longGOPClip(t *testing.T, ffmpeg string) []byte {
+func longGOPClip(t *testing.T, ffmpeg string, env []string) []byte {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "longgop.ts")
-	b, err := exec.CommandContext(t.Context(), ffmpeg, "-nostdin", "-v", "error", "-y",
+	cmd := exec.CommandContext(t.Context(), ffmpeg, "-nostdin", "-v", "error", "-y",
 		"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
 		"-t", "30", "-c:v", "libx264", "-profile:v", "main", "-bf", "2", "-g", "48", "-keyint_min", "48",
-		"-sc_threshold", "0", "-c:a", "aac", "-ac", "2", "-b:a", "64k", "-f", "mpegts", out).CombinedOutput()
+		"-sc_threshold", "0", "-c:a", "aac", "-ac", "2", "-b:a", "64k", "-f", "mpegts", out)
+	cmd.Env = env
+	b, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(b))
 	data, err := os.ReadFile(out)
 	require.NoError(t, err)
@@ -648,7 +681,7 @@ func longGOPClip(t *testing.T, ffmpeg string) []byte {
 }
 
 // TestM4cNVENCLongGOP transcodes longGOPClip (720 pictures at 24 fps, a
-// keyframe every 48) at its pace through a mixed ladder, {t240 nvenc
+// keyframe every 48, made by clipFFmpeg's ffmpeg) at its pace through a mixed ladder, {t240 nvenc
 // (2 B-frames), t180 x264, t120 nvenc BFrames −1}, with the presentation:
 // a clean run with EncoderFallbacks 0, and on every rung one frame per
 // source picture and the keyframe PTS set exactly the source's + D. That
@@ -657,8 +690,9 @@ func longGOPClip(t *testing.T, ffmpeg string) []byte {
 // of the fixtures put a source keyframe.
 func TestM4cNVENCLongGOP(t *testing.T) {
 	bin := nvencBinary(t)
-	ffmpeg := testpeer.Require(t, "ffmpeg")
-	steps := dataSteps(t, longGOPClip(t, ffmpeg), newFakeClock(m3aT0).Now)
+	ffmpeg, env := clipFFmpeg(t)
+	t.Logf("clip made with %s", ffmpeg)
+	steps := dataSteps(t, longGOPClip(t, ffmpeg, env), newFakeClock(m3aT0).Now)
 	src := videoFrames(stepFrames(steps))
 	require.GreaterOrEqual(t, len(src), 700)
 	var want []int64
@@ -766,9 +800,12 @@ func mediaFiles(dir string) http.Handler {
 
 // writeHLSTree copies the ended ABR HLS-TS output at hlsBase (".../hls/")
 // into dir as a static tree: index.m3u8, each v{track}.m3u8 and each
-// segment, under the names the playlists use. Files of an earlier tree
-// (*.m3u8, *.ts) in dir are removed first. Every variant playlist must be
-// ended and list no gap.
+// segment, under the names the playlists use. Every variant playlist must
+// be ended and list no gap.
+//
+// Warning: it first deletes every *.m3u8 and *.ts file in dir (an earlier
+// tree), whatever wrote them. Point it only at a directory kept for this
+// tree, such as dist/nvenc-report/media.
 func writeHLSTree(t *testing.T, hlsBase, dir string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(dir, 0o755))
