@@ -5,6 +5,7 @@ package native
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"slices"
@@ -252,6 +253,37 @@ func TestNVENCMissingEncoder(t *testing.T) {
 	require.NotEmpty(t, v)
 	assert.Equal(t, uint64(1), p.Stats().EncoderFallbacks)
 	assert.True(t, hasX264SEI(v[0]))
+}
+
+// TestNVENCFallbackFails: when the libx264 fallback of an NVENC rung cannot
+// open either (both encoders missing from libavcodec), the build fails with
+// libx264's error, nothing counts in EncoderFallbacks and the "using
+// libx264" warning is not logged, for one rung and for two.
+func TestNVENCFallbackFails(t *testing.T) {
+	oldNV, oldX := nvencCodec, x264Codec
+	t.Cleanup(func() { nvencCodec, x264Codec = oldNV, oldX })
+	nvencCodec = "no_such_nvenc"
+	src := source(t, "h264_aac.ts")
+	for _, rungs := range [][]Rung{
+		{{Height: 120, BitrateKbps: 150, Encoder: EncoderNVENC}},
+		{{Height: 240, BitrateKbps: 600, Encoder: EncoderNVENC}, {Height: 120, BitrateKbps: 150, Encoder: EncoderNVENC}},
+	} {
+		t.Run(fmt.Sprintf("%d rungs", len(rungs)), func(t *testing.T) {
+			w := recordWarnings(t)
+			x264Codec = "no_such_x264"
+			t.Cleanup(func() { x264Codec = oldX })
+			p := newPipeline(t, rungs, nil)
+			var err error
+			for _, f := range src {
+				if _, err = p.Push(f); err != nil {
+					break
+				}
+			}
+			require.ErrorContains(t, err, "no_such_x264 not in libavcodec")
+			assert.Zero(t, p.Stats().EncoderFallbacks)
+			assert.Empty(t, w.matching("nvenc open failed, using libx264"))
+		})
+	}
 }
 
 func TestNVENCRung(t *testing.T) {

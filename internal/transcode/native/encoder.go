@@ -3,7 +3,6 @@
 package native
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -34,6 +33,10 @@ const (
 // nvencCodec is the libavcodec encoder of NVENC rungs. A variable so that
 // tests can name one that is missing.
 var nvencCodec = "h264_nvenc"
+
+// x264Codec is the libavcodec encoder of libx264 rungs and of the NVENC
+// fallback. A variable so that tests can name one that is missing.
+var x264Codec = "libx264"
 
 // nvencGPU is the NVENC gpu option; −1 leaves libavcodec's default (any
 // device). Tests set a GPU that does not exist to force a failed open. A
@@ -67,37 +70,37 @@ func validNVENCPreset(p string) bool {
 }
 
 // openEncoders opens every rung or none: on a failure it closes the rungs
-// it opened. When NVENC rungs fell back to libx264, it logs one warning for
-// the build.
+// it opened. When the build succeeds, each NVENC rung that fell back to
+// libx264 counts in EncoderFallbacks, and one warning is logged for the
+// build. A failed build, a fallback that failed too included, is the
+// build's error and counts nothing.
 func (v *videoPath) openEncoders(fr *astiav.Frame) error {
 	encs := make([]*rungEncoder, 0, len(v.rungs))
 	var (
 		fellBack []int
 		firstErr error
 	)
-	defer func() {
-		if len(fellBack) > 0 {
-			slog.Warn("transcode: nvenc open failed, using libx264", "rungs", fellBack, "err", firstErr)
-		}
-	}()
 	for i, r := range v.rungs {
 		e, nvErr, err := openRung(i, r, fr, v.fps, &v.caches[i])
-		if nvErr != nil {
-			v.stats.EncoderFallbacks++
-			fellBack = append(fellBack, i)
-			if firstErr == nil {
-				firstErr = nvErr
-			}
-		}
 		if err != nil {
 			for _, o := range encs {
 				o.release()
 			}
 			return err
 		}
+		if nvErr != nil {
+			fellBack = append(fellBack, i)
+			if firstErr == nil {
+				firstErr = nvErr
+			}
+		}
 		encs = append(encs, e)
 	}
 	v.encs = encs
+	if len(fellBack) > 0 {
+		v.stats.EncoderFallbacks += uint64(len(fellBack))
+		slog.Warn("transcode: nvenc open failed, using libx264", "rungs", fellBack, "err", firstErr)
+	}
 	return nil
 }
 
@@ -167,9 +170,9 @@ func openCodec(cc *astiav.CodecContext, codec *astiav.Codec, opts [][2]string, i
 
 // openX264 opens libx264 for the rung.
 func openX264(idx int, r Rung, w int, sar, fps astiav.Rational) (*astiav.CodecContext, error) {
-	codec := astiav.FindEncoderByName("libx264")
+	codec := astiav.FindEncoderByName(x264Codec)
 	if codec == nil {
-		return nil, errors.New("video encoder: libx264 not in libavcodec")
+		return nil, fmt.Errorf("video encoder: %s not in libavcodec", x264Codec)
 	}
 	cc, err := newVideoContext(codec, "libx264", r, w, sar, fps)
 	if err != nil {
