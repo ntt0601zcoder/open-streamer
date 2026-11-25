@@ -581,6 +581,68 @@ func TestM4cWatermarkRespawn(t *testing.T) {
 	}
 }
 
+// TestM4cWatermarkTextTempDir is TestM4cWatermarkRespawn with the text
+// watermark, the children's TMPDIR a test directory: the killed child
+// never removes its ostx-wm-<pid>-* directory (it holds the 760 KB font),
+// so the respawned child sweeps it when it builds its watermark. A sampler
+// sees both children's directories during the run, and none remains after
+// it (the second child removes its own when it stops).
+func TestM4cWatermarkTextTempDir(t *testing.T) {
+	t.Parallel()
+	bin := testpeer.OSTranscoder(t)
+	tmp := t.TempDir()
+	opt := m4cLadder(bin, "")
+	opt.Watermark = &picture.Watermark{Text: "%H:%M:%S", Position: picture.BottomRight}
+	opt.Env = []string{"TMPDIR=" + tmp}
+	dirs := func() []string {
+		m, err := filepath.Glob(filepath.Join(tmp, "ostx-wm-*"))
+		require.NoError(t, err)
+		return m
+	}
+
+	seen := map[string]bool{} // the directories the sampler saw
+	ctx, cancel := context.WithCancel(t.Context())
+	sampled := make(chan struct{})
+	go func() {
+		defer close(sampled)
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			m, _ := filepath.Glob(filepath.Join(tmp, "ostx-wm-*"))
+			for _, d := range m {
+				seen[filepath.Base(d)] = true
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
+	var killed func() time.Time
+	var pids []int
+	run := recordTranscode(t, pacedSteps(loopedFixture(t, "h264_aac.ts", 2)), opt, func(tr *transcode.Transcoder) {
+		killed = killAfterKeyframes(t, tr, tr.Hubs()[0], 3)
+	})
+	cancel()
+	<-sampled
+	at := killed()
+	st := run.stats
+	t.Logf("killed at %v; stats %+v; directories seen %v", at.Format(time.TimeOnly), st, seen)
+	assert.EqualValues(t, 2, st.Spawns)
+	assert.EqualValues(t, 1, st.Exits)
+	for d := range seen {
+		var pid, rnd int
+		_, err := fmt.Sscanf(d, "ostx-wm-%d-%d", &pid, &rnd)
+		require.NoError(t, err, "directory %s", d)
+		if !slices.Contains(pids, pid) {
+			pids = append(pids, pid)
+		}
+	}
+	assert.Len(t, pids, 2, "one directory per child, named with its PID: %v", seen)
+	assert.Empty(t, dirs(), "the killed child's directory was swept, the other removed at stop")
+}
+
 // requireFirstDue checks that each shot is the first picture due: an
 // epoch's first shot is the epoch's first picture of frames (a
 // rendition's), in PTS order, and for every later one no picture lies at

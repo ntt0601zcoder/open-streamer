@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"image"
 	"io/fs"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/asticode/go-astiav"
@@ -101,12 +104,22 @@ func (m *watermarker) set(w *picture.Watermark) error {
 	return nil
 }
 
-// ensureDir creates the private directory and writes the font into it.
+// wmDirPrefix starts the name of a watermarker's private directory in the
+// temp dir: ostx-wm-<pid>-<random>, pid being the child's.
+const wmDirPrefix = "ostx-wm-"
+
+// wmDirName matches a private directory's name, capturing the PID.
+var wmDirName = regexp.MustCompile(`^` + wmDirPrefix + `([1-9][0-9]{0,9})-[0-9]+$`)
+
+// ensureDir creates the private directory and writes the font into it,
+// after sweeping the directories that dead children left behind
+// (sweepStaleDirs): a child killed or crashed never runs close.
 func (m *watermarker) ensureDir() error {
 	if m.dir != "" {
 		return nil
 	}
-	dir, err := os.MkdirTemp("", "ostx-wm-")
+	sweepStaleDirs(os.TempDir())
+	dir, err := os.MkdirTemp("", fmt.Sprintf("%s%d-", wmDirPrefix, os.Getpid()))
 	if err != nil {
 		return fmt.Errorf("watermark: temp dir: %w", err)
 	}
@@ -120,6 +133,49 @@ func (m *watermarker) ensureDir() error {
 	}
 	m.dir = dir
 	return nil
+}
+
+// sweepStaleDirs removes the private directories in tmp whose child is
+// gone: a directory (not a symlink) owned by this user, named
+// ostx-wm-<pid>-<random>, whose PID no process has (pidGone). Nothing else
+// is touched, and a failure only leaves the directory for a later sweep.
+func sweepStaleDirs(tmp string) {
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		return
+	}
+	uid := os.Getuid()
+	for _, e := range entries {
+		sub := wmDirName.FindStringSubmatch(e.Name())
+		if sub == nil || !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(sub[1])
+		if err != nil || pid == os.Getpid() || !pidGone(pid) {
+			continue
+		}
+		path := filepath.Join(tmp, e.Name())
+		fi, err := os.Lstat(path)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != uid {
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil {
+			slog.Warn("watermark: removing a dead child's temp dir", "dir", path, "err", err)
+		}
+	}
+}
+
+// pidGone reports whether no process has pid: kill(pid, 0) fails with
+// ESRCH. Any other answer (success, or EPERM for another user's process)
+// means it is alive. pid must be positive: 0 and negatives name groups.
+func pidGone(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
 }
 
 // apply draws the watermark on fr and returns the result, valid until the

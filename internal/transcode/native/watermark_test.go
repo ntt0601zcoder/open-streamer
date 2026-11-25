@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -637,6 +638,76 @@ func TestWatermarkTempDirChars(t *testing.T) {
 	m, err := filepath.Glob(filepath.Join(tmp, "*"))
 	require.NoError(t, err)
 	assert.Empty(t, m, "the refused directory is removed")
+}
+
+// deadPID returns the PID of a process that has exited and been reaped.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	require.NoError(t, cmd.Run())
+	pid := cmd.Process.Pid
+	require.True(t, pidGone(pid), "PID %d was reused at once", pid)
+	return pid
+}
+
+// TestWatermarkSweepsStaleDirs: building a text watermark first removes
+// the private directories of dead children (a SIGKILL or a crash skips
+// close), and nothing else: not a directory whose PID is alive (this
+// process's, or PID 1's), not a name off the pattern, not a file or a
+// symlink with a dead PID's name. The new directory carries this
+// process's PID.
+func TestWatermarkSweepsStaleDirs(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	dead := deadPID(t)
+	mkdir := func(name string) string {
+		d := filepath.Join(tmp, name)
+		require.NoError(t, os.Mkdir(d, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(d, "font.ttf"), []byte("font"), 0o600))
+		return d
+	}
+	stale := mkdir(fmt.Sprintf("ostx-wm-%d-123", dead))
+	stale2 := mkdir(fmt.Sprintf("ostx-wm-%d-9", dead))
+	kept := []string{
+		mkdir(fmt.Sprintf("ostx-wm-%d-456", os.Getpid())), // alive: this process
+		mkdir("ostx-wm-1-77"),                             // alive: init
+		mkdir(fmt.Sprintf("ostx-wm-%d", dead)),            // no random part
+		mkdir(fmt.Sprintf("ostx-wm-%d-12x", dead)),        // not digits
+		mkdir(fmt.Sprintf("ostx-wm-0-%d", dead)),          // PID 0 names a group
+		mkdir(fmt.Sprintf("xostx-wm-%d-1", dead)),         // another prefix
+		mkdir("ostx-wm-abc"),                              // a v1-era name
+	}
+	file := filepath.Join(tmp, fmt.Sprintf("ostx-wm-%d-5", dead))
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+	target := mkdir("target")
+	link := filepath.Join(tmp, fmt.Sprintf("ostx-wm-%d-6", dead))
+	require.NoError(t, os.Symlink(target, link))
+	kept = append(kept, file, target, link, filepath.Join(target, "font.ttf"))
+
+	p, err := NewWith(Config{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}, Watermark: &picture.Watermark{Text: "x"}})
+	require.NoError(t, err)
+	for _, d := range []string{stale, stale2} {
+		_, err = os.Lstat(d)
+		require.ErrorIs(t, err, os.ErrNotExist, "%s was not swept", d)
+	}
+	for _, k := range kept {
+		_, err = os.Lstat(k)
+		require.NoError(t, err, "%s was removed", k)
+	}
+	own := p.video.wm.dir
+	assert.True(t, strings.HasPrefix(filepath.Base(own), fmt.Sprintf("ostx-wm-%d-", os.Getpid())), "own dir %s", own)
+	assert.Regexp(t, wmDirName, filepath.Base(own))
+	p.Close()
+	_, err = os.Stat(own)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestPIDGone(t *testing.T) {
+	assert.False(t, pidGone(os.Getpid()))
+	assert.False(t, pidGone(1), "init is alive (EPERM is alive)")
+	assert.False(t, pidGone(0))
+	assert.False(t, pidGone(-1))
+	assert.True(t, pidGone(deadPID(t)))
 }
 
 // A watermark that cannot be built is fatal (R-C9): here the text file has

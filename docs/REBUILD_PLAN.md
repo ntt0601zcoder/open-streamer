@@ -501,7 +501,10 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   of the picture height (0 → 5, 1…50) or the image's width in % of the
   picture width (0 → 15, 1…100), its height following the aspect ratio. Text
   is rendered by libavfilter `drawtext` with the embedded DejaVu Sans
-  (R-C7), written to a private temp directory, with `expansion=none` and the
+  (R-C7), written to a private temp directory (`ostx-wm-<pid>-<random>`,
+  removed when the watermark closes; a child killed or crashed cannot, so
+  building a text watermark first removes this user's `ostx-wm-<pid>-*`
+  directories whose PID no process has), with `expansion=none` and the
   text read from a `textfile` that the child rewrites atomically (`reload=1`
   when the text has a time directive). Operator text never enters a
   filter-graph string: the graph is built only from numbers and the paths
