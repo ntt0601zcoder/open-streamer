@@ -1678,6 +1678,36 @@ func TestVariantAlignedDASH(t *testing.T) {
 		c := run(false, func(m map[string][]byte) dash.Representation { return dashRepFiles(t, m, "b", open, nil, 1) })
 		assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
 	})
+	t.Run("timelines overlapping themselves", func(t *testing.T) {
+		// An encoder reordering across a source PTS gap: from segment 2 on
+		// PTS are 8640 later, but DTS only from segment 2's third frame. So
+		// segment 1's S@t + S@d (its media's decode duration) falls short
+		// of segment 2's S@t and segment 2's runs past segment 3's. With
+		// equal timelines in both Representations the segments still start
+		// together: a segment ends at the next one's S@t when that comes
+		// first.
+		gapped := slices.Clone(segs)
+		for i := 2; i < len(gapped); i++ {
+			gapped[i] = slices.Clone(segs[i])
+			for j := range gapped[i] {
+				gapped[i][j].PTS += 8640
+				if i > 2 || j >= 2 {
+					gapped[i][j].DTS += 8640
+				}
+			}
+		}
+		m := map[string][]byte{}
+		a := dashRepFiles(t, m, "a", gapped, nil, 1)
+		tl := a.SegmentTemplate.Timeline.S
+		require.Greater(t, *tl[2].T+tl[2].D, *tl[3].T, "segment 2 runs past segment 3's start")
+		c := readDASHSet(t, m, false, a, dashRepFiles(t, m, "b", gapped, nil, 1))
+		assert.Zero(t, countRule(c.Violations, RuleVariantAlignment), "%v", c.Violations)
+		skewed := slices.Clone(gapped)
+		skewed[3] = shifted(gapped[3], 7200)
+		m = map[string][]byte{}
+		c = readDASHSet(t, m, false, dashRepFiles(t, m, "a", gapped, nil, 1), dashRepFiles(t, m, "b", skewed, nil, 1))
+		assert.Equal(t, 1, countRule(c.Violations, RuleVariantAlignment), "a shifted start is still found: %v", c.Violations)
+	})
 	t.Run("one representation", func(t *testing.T) {
 		m := map[string][]byte{}
 		c := readDASHSet(t, m, true, dashRepFiles(t, m, "a", segs, nil, 1))

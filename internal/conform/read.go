@@ -1015,7 +1015,9 @@ type dashCapture struct {
 // In each period, an adaptation set with two or more video representations
 // must be aligned in time (RuleVariantAlignment): over the span two of them
 // share, no segment of one contains the start of one of the other's strictly
-// inside it, compared only where both segments start on a keyframe; with
+// inside it (a segment ends at its S@t + S@d or at its successor's S@t,
+// whichever comes first), compared only where both segments start on a
+// keyframe; with
 // segmentAlignment="true" their resolved timelines must also be equal. A
 // segment is compared only when its first video frame is a keyframe at its
 // S@t. Each pair is reported once per period.
@@ -1167,11 +1169,19 @@ func (c *dashCapture) checkAlignment(period string, sets []dashSet) {
 	}
 }
 
-// timeline returns the segments of s on the 90 kHz clock.
+// timeline returns the segments of s on the 90 kHz clock. A segment ends
+// at S@t + S@d, or at the next segment's S@t when that comes first: S@d is
+// the media's decode duration and S@t its earliest presentation time, so
+// where an encoder reorders across a source PTS gap a Representation's own
+// timeline overlaps itself, and that is not a misalignment with another.
 func (s dashSet) timeline(c *dashCapture) (all, keyed []span) {
 	scale := int(s.tpl.Timescale)
-	for _, sg := range s.segs {
-		sp := span{media.SampleTime(int64(sg.T), scale), media.SampleTime(int64(sg.T+sg.D), scale)}
+	for i, sg := range s.segs {
+		end := sg.T + sg.D
+		if i+1 < len(s.segs) {
+			end = min(end, s.segs[i+1].T)
+		}
+		sp := span{media.SampleTime(int64(sg.T), scale), media.SampleTime(int64(end), scale)}
 		all = append(all, sp)
 		if c.startKey[segID{s.rep.ID, sg.T}] {
 			keyed = append(keyed, sp)
