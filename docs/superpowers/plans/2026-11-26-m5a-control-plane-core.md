@@ -19,14 +19,14 @@
 
 - **Libraries:** **no new Go module.** Only the approved independent libraries (mp4ff, pion/rtp, pion/sdp, datarhei/gosrt, testify, go-astiav v0.41.0, protobuf `protowire`); no bluenviron, no lal, no code copied from another product. v1's code on `main` (`internal/store`, `internal/api`, `internal/coordinator`, `internal/runtime`) may be read for ideas and is never copied. The router is `net/http`'s `ServeMux`, not chi (R-D7); metrics are a hand-written text exposition, not `prometheus/client_golang` (R-D9); the config and the store are JSON, so no YAML library (R-D2, R-D4). `go.mod` and `go.sum` do not change in this plan; a task that finds it needs a module stops and reports.
 - **cgo:** only `internal/transcode/native` and `cmd/ostranscoder` use cgo, behind the tag `libav`. Without the tag, `go build ./...`, `go vet ./...`, `golangci-lint run ./...` and `make test` pass, as do `GOOS=windows go vet ./...` and `GOOS=darwin go vet ./...`. Every new package is pure Go; anything Unix-only (directory fsync, `/proc`) sits behind `_unix.go`/`_linux.go` and `_other.go` files.
-- **Frozen behaviour:** every existing pipeline, output, transcoder and osdev behaviour is what M4c left, and every existing test passes unchanged except the three Task 1 names. The only edits to existing non-test code are additive: `hub.Refuse` and `rtmpsrv.Registry.Addr` (Task 5), `redact.Masked` (Task 2) and the watermark sweep's regex (Task 1). A hub on which `Refuse` was never called behaves exactly as before.
+- **Frozen behaviour:** every existing pipeline, output, transcoder and osdev behaviour is what M4c left, and every existing test passes unchanged except the three Task 1 names. The only edits to existing non-test code are additive: `hub.Refuse` and `transcode.ThumbnailerOptions.OnEvent` (Task 5), `redact.Masked` (Task 2) and the watermark sweep's regex (Task 1). `rtmpsrv` is not changed: `AddrKey` rejects port 0 and osdev and ingest depend on that. A hub on which `Refuse` was never called behaves exactly as before.
 - **Time:** 90 kHz everywhere. The control plane never touches a timestamp.
 - **Lint:** `exhaustive` with `default-signifies-exhaustive: false` (a `switch` on `spec.Change`, `stream.Output` or a state lists every value); `godot`; gofumpt.
 - **Errors:** wrap as `fmt.Errorf("pkg: op: %w", err)`; never both log and return.
 - **Goroutines:** every spawned goroutine has an explicit cancel path, and the function that spawns it waits for it before returning.
-- **Security:** every `/api/`, `/metrics` and `/debug/pprof/` request needs the bearer token (R-D8). Request bodies are bounded (1 MiB) and decoded strictly. A stream name is the only caller-supplied path component of the store and must match `^[a-z0-9][a-z0-9-]{0,62}$`. No secret (URL password, secret query value, RTMP stream key, API token) reaches a log line, a metric, a status document or an error message: URLs pass through `redact.URL` before they leave the process, and the log handler scrubs what slips through (R-D10).
+- **Security:** every `/api/`, `/metrics` and `/debug/pprof/` request needs the bearer token (R-D8). Request bodies are bounded (1 MiB) and decoded strictly. A stream name is the only caller-supplied path component of the store and must pass `spec.ValidName` (`^[a-z0-9][a-z0-9-]{0,62}$`, and not a Windows device name). No secret (URL password, secret query value, RTMP stream key, API token) reaches a log line, a metric, a status document or an error message: URLs pass through `redact.URL` before they leave the process, and the log handler scrubs what slips through (R-D10).
 - **Peers:** every test that runs ffmpeg/ffprobe passes on the host (ffmpeg 8) and in `make test-ci-peers` (image `osv2-ci-peers:m4a`: ffmpeg 6.1, VLC 3.0.20, GStreamer 1.24) before any push. The transcoder bundle is built with `make ostranscoder`; NVENC device tests stay opt-in (`OS_NVENC=1`).
-- **Soak safety (absolute):** never stop, restart or reconfigure open-streamer-soak-mediamtx, caddy, grafana, osdev-console-1, vector, alloy, pyroscope, prometheus, node-exporter, nvidia-gpu-exporter, or any other container not named `osv2-*`. Never bind ports 554, 1935 or 8554: every test listens on `127.0.0.1:0` and reads the port back (`server.Addrs`), and no test or step runs the server with the example config. Own containers are `osv2-*`, `--rm`, stopped afterwards.
+- **Soak safety (absolute):** never stop, restart or reconfigure open-streamer-soak-mediamtx, caddy, grafana, osdev-console-1, vector, alloy, pyroscope, prometheus, node-exporter, nvidia-gpu-exporter, or any other container not named `osv2-*`. Never bind ports 554, 1935 or 8554: every test uses ephemeral ports and reads them back from `server.Addrs` (`127.0.0.1:0` for every listener; `server.New` turns a port-0 RTMP address into a concrete free port itself, because `rtmpsrv` cannot bind port 0, R-D13), and no test or step runs the server with the example config. Own containers are `osv2-*`, `--rm`, stopped afterwards.
 - **Commits:** end every message with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. After each wave merge, run `go mod tidy` and check that it changes nothing.
 
 ## Rulings
@@ -35,26 +35,27 @@
 |---|---|---|
 | R-D1 | **M5 is split in three.** **M5a (this plan)** is the control-plane core and delivers the M5 row's exit criterion: spec, store, supervisor, manager, API, metrics (with `EncoderFallbacks`), logs, `cmd/openstreamer`, and the product names of a ladder. Done when a spec created over the API serves every output, an output edit interrupts no other output, and a restart restores every stream (Task 11's tests). **M5b, live edits and assets:** a running pipeline's inputs changed in place (`Pipeline.SetInputs`, §3.6), the watermark edited in place over the API (`Transcoder.SetWatermark` exists), the asset API (R-C8) with operator fonts (R-C7), a rung that refuses the x264 fallback (wire version 3), and audio language in the spec, the HLS masters and the MPD. Done when replacing a running stream's inputs is exactly one epoch change and ends no output session, an uploaded image and font appear on every rung, a strict NVENC rung fails instead of falling back and is counted, and `osconform` reads the languages. **M5c, transport security:** HTTPS for the API and the HTTP outputs, RTMPS (listen, pull, push), RTSPS with SRTP by its own ruling, SRT encryption (input and output), redaction of credentials in URL paths and queries (the M2c note), and secrets as write-only spec fields. Done when ffmpeg publishes and plays over each secured protocol against our server, and no secret appears in a response, log or metric. M6 and the M7 soak need only M5a; M5b and M5c may run beside M6 | Three plans and three reviews instead of one. Until M5b an input edit rebuilds the stream (R-D6), and assets are files the operator copies into a directory. Until M5c the API token and every stream key cross the network in clear, so the API listens on loopback by default (R-D8) |
 | R-D2 | **The binary is `cmd/openstreamer`** (§4), configured by one JSON file, `-config path`, decoded strictly (an unknown key is an error). Keys and defaults are in Task 10. The file holds only what cannot be a stream spec: the data directory, the listen addresses and apps of the shared servers, the transcoder binary, the assets directory, logging. The API token may also come from `OPENSTREAMER_API_TOKEN`, which wins, so the file need not hold a secret. The config is read once: changing it needs a restart. `cmd/osdev` stays the development harness. Rejected: YAML (a new direct dependency for one small file) and flags for everything (the soak unit would carry twenty flags) | No comments in the config file; an operator used to v1's `config.yaml` rewrites it. A listen-address change costs a restart of every stream |
-| R-D3 | **Product names (closes R-B2).** A stream name and a rendition label each match `^[a-z0-9][a-z0-9-]{0,62}$`, so `_` separates them without ambiguity and names are safe file names on case-insensitive file systems. A stream **without** a ladder is served as `<name>` on every output. A stream **with** a ladder is served as `<name>`: over HLS and DASH that is the ABR presentation, over HTTP-TS, RTMP, RTSP, SRT and RTMP push it is rendition 0, the first in the spec; and each rendition is also its own stream `<name>_<label>` on every enabled output. **The source of a laddered stream is not served to players** (with a watermark it is the unbranded picture, R-C5); `copy://<name>` reads it, and `copy://<name>_<label>` reads a rendition. There is no `<name>_abr` in the product and `abr` is an ordinary label; osdev keeps its names. The thumbnail is an operator preview of the source, so it is served by the API, behind the token, not under `/live/` | An operator who wants the raw source out next to a ladder adds a `copy` rendition (not possible with a watermark, by R-C5). A ladder of N rungs runs N + 1 packagers when HLS or DASH is on, as osdev does; a switch that stops serving the renditions on their own is a Backlog item |
-| R-D4 | **The store is `<data_dir>/streams/<name>.json`**, one file per stream: `{"version":1,"stream":{…}}`. A write is: create `.<name>.json.<random>.tmp` in the same directory with mode 0600, write, `fsync`, rename over the target, `fsync` the directory (Unix). The directory is 0700: specs hold stream keys and passwords. `Load` reads every `*.json`, removes `*.tmp` leftovers, and **skips and reports** a file that does not decode, fails validation, has a `version` above 1, or whose name is not its spec's name; such a file is never changed or deleted, and a later `Put` of that name replaces it. Migrations: `version` is the only switch; a future version N adds a function that lifts N−1 documents in memory at load, and files are rewritten only by `Put`. Rejected: one file for all streams (an edit rewrites every spec, and one bad byte loses them all) and refusing to start on a bad file (one corrupt spec would keep every other stream offline) | A stream whose file is corrupt is silently absent until someone reads the log or the `openstreamer_store_load_errors` gauge. Two servers on one data directory are not prevented (they would also fight for the ports). No history: an overwritten spec is gone |
-| R-D5 | **Supervisor (§3.6).** One goroutine per enabled stream owns everything of that stream and takes edits from a mailbox (`Submit`), in order; readers (the output servers' lookups, the API's status, the metrics) see only an immutable `View` and a `Status` behind atomic pointers. There is no lock shared between streams, and **no periodic reconciler**: a supervisor exists for exactly the enabled specs in the manager's map, by construction, and its loop ends only with its context. **Restart policy:** inside a generation, a failed input is the pipeline's business (retry and failover, M2a) and a dead child the transcoder's (respawn, M4a). The supervisor rebuilds the whole generation only when one of its parts returns an error it cannot recover from (the pipeline's `Run` or the transcoder's `Run` returning before the context ends, for example a child of another wire version): it tears the generation down, waits 1 s, doubling up to 30 s, back to 1 s once a generation has lived 60 s, and builds again, forever. An edit during the wait is applied at once. A stream never ends: `EndOnEOF` is false, so a file input without `loop` restarts at its end as a new epoch. A panic is not recovered | A generation that fails at once is rebuilt every 30 s for as long as the spec stands; `state: backoff`, `last_error` and `openstreamer_stream_restarts_total{reason="failure"}` are the signals. A bug that panics in one stream takes the process, and every stream, down; the service manager restarts it and the store brings every stream back |
+| R-D3 | **Product names (closes R-B2).** A stream name and a rendition label each match `^[a-z0-9][a-z0-9-]{0,62}$` and are none of the Windows device names (`con`, `prn`, `aux`, `nul`, `com1`…`com9`, `lpt1`…`lpt9`), so `_` separates them without ambiguity and a name is a safe file name on every system the server builds for. A stream **without** a ladder is served as `<name>` on every output. A stream **with** a ladder is served as `<name>`: over HLS and DASH that is the ABR presentation, over HTTP-TS, RTMP, RTSP, SRT and RTMP push it is rendition 0, the first in the spec; and each rendition is also its own stream `<name>_<label>` on every enabled output. **The source of a laddered stream is not served to players** (with a watermark it is the unbranded picture, R-C5); `copy://<name>` reads it, and `copy://<name>_<label>` reads a rendition. There is no `<name>_abr` in the product and `abr` is an ordinary label; osdev keeps its names. The thumbnail is an operator preview of the source, so it is served by the API, behind the token, not under `/live/` | An operator who wants the raw source out next to a ladder adds a `copy` rendition (not possible with a watermark, by R-C5). A ladder of N rungs runs N + 1 packagers when HLS or DASH is on, as osdev does; a switch that stops serving the renditions on their own is a Backlog item |
+| R-D4 | **The store is `<data_dir>/streams/<name>.json`**, one file per stream: `{"version":1,"stream":{…}}`. A write is: create `.<name>.json.<random>.tmp` in the same directory with mode 0600, write, `fsync`, rename over the target, `fsync` the directory (Unix). The directory is 0700: specs hold stream keys and passwords. `Load` reads every regular file named `*.json` (a directory or any other name is ignored, silently), removes `*.tmp` leftovers, and **skips and reports** a file that does not decode, fails validation, has a `version` above 1, or whose name is not its spec's name; such a file is never changed or deleted, and a later `Put` of that name replaces it. Migrations: `version` is the only switch; a future version N adds a function that lifts N−1 documents in memory at load, and files are rewritten only by `Put`. Rejected: one file for all streams (an edit rewrites every spec, and one bad byte loses them all) and refusing to start on a bad file (one corrupt spec would keep every other stream offline) | A stream whose file is corrupt is silently absent until someone reads the log or the `openstreamer_store_load_errors` gauge. Two servers on one data directory are not prevented (they would also fight for the ports). No history: an overwritten spec is gone |
+| R-D5 | **Supervisor (§3.6).** One goroutine per enabled stream owns everything of that stream and takes edits from a mailbox (`Submit`), in order; readers (the output servers' lookups, the API's status, the metrics) see only an immutable `View` and a `Status` behind atomic pointers. There is no lock shared between streams, and **no periodic reconciler**: a supervisor exists for exactly the enabled specs in the manager's map, by construction, and its loop ends only with its context. **Restart policy:** inside a generation, a failed input is the pipeline's business (retry and failover, M2a) and a dead child the transcoder's (respawn, M4a). The supervisor rebuilds the whole generation only when one of its long-lived parts returns before the context ends (the pipeline's `Run`, the transcoder's `Run`, for example on a child of another wire version, or the thumbnailer's `Run`), or when building it fails (an asset that was there at validation and is gone now): it tears the generation down, waits 1 s, doubling up to 30 s, back to 1 s once a generation has lived 60 s, and builds again, forever. An edit during the wait is applied at once. **Two supervisors of one name never overlap:** a supervisor started for a name waits, before it builds, for the previous supervisor of that name to have stopped completely (its pipeline's `Run` returned, so its listen sockets and RTMP publish routes are released). A stream never ends: `EndOnEOF` is false, so a file input without `loop` restarts at its end as a new epoch. A panic is not recovered | A generation that fails at once is rebuilt every 30 s for as long as the spec stands; `state: backoff`, `last_error` and `openstreamer_stream_restarts_total{reason="failure"}` are the signals. A rebuild, for an edit or a failure, starts a new packager, so the HLS `MEDIA-SEQUENCE` and the DASH timeline of the same URL start again (Backlog). A bug that panics in one stream takes the process, and every stream, down; the service manager restarts it and the store brings every stream back |
 | R-D6 | **How an edit is applied.** `spec.Diff(old, new)` is `ChangeNone` when the documents are equal, `ChangeOutputs` when they differ only in `outputs`, and `ChangeRebuild` otherwise. **Outputs, in place** (Task 7's `reattach`): packagers are started when the first of HLS and DASH is enabled and stopped when the last is disabled, and left alone otherwise; each of HTTP-TS, RTMP, RTSP and SRT is a flag in the view, and disabling one makes each served hub refuse that output's subscribers, which ends its sessions and no others; pushes are keyed by URL, so an added target starts, a removed one stops, and an unchanged one keeps its connection. The source hub, the pipeline, the transcoder and its child are not touched. **Rebuild:** the generation is torn down and built from the new spec at once (no backoff); every session of the stream ends and HLS media sequence numbers start again. **In M5a an input edit is a rebuild**; §3.6's "changing inputs … is applied in place" is M5b's. `disabled` stops and removes the supervisor, or starts one. Rejected: v1's field-by-field diff routing (the source of most of v1's lifecycle findings); here there are two routes | Any edit outside `outputs` (a rung's bitrate, a thumbnail interval, one more failover input) interrupts every viewer of that stream for a few seconds. Disabling HLS while DASH stays on stops serving the HLS paths but keeps the packager's work |
 | R-D7 | **API.** Base path `/api/v1`, JSON. The resource is the whole stream document: `PUT /streams/{name}` creates or replaces it and is idempotent; there is no PATCH and no POST. `GET /streams`, `GET /streams/{name}`, `DELETE /streams/{name}`, `GET /streams/{name}/status`, `GET /streams/{name}/thumbnail.jpg`, `GET /version`; outside the base path `/healthz`, `/metrics` and `/debug/pprof/`. Every `GET` of a spec carries an `ETag`; `PUT` and `DELETE` honour `If-Match` (412 on a mismatch). A `PUT` answers with the stored document and `applied`: `created`, `unchanged`, `outputs`, `rebuild`, `started` or `stopped`. **URLs are redacted in every response** unless the request has `?secrets=1`, which returns the stored document as is, for an edit round trip; a `PUT` whose URL carries the redaction mask where a secret would be is refused, so a redacted document cannot be written back by mistake. The router is `net/http.ServeMux` (method and wildcard patterns; osdev, `live` and `httpts` use it already), not chi. The OpenAPI 3.1 document is hand-written **as JSON**, `api/openapi.json`, and a test keeps it equal to the registered routes and the spec's fields. Task 12 edits §3.6 and §3.7 to say so | Clients send the whole document for a one-field edit, and must use `If-Match` to avoid losing a concurrent edit. No middleware library: auth, the body limit and the request counter are three hand-written wrappers. JSON OpenAPI is less pleasant to hand-edit than YAML |
 | R-D8 | **Auth.** One bearer token, at least 16 bytes, compared in constant time (`subtle.ConstantTimeCompare` over SHA-256 sums). The server refuses to start without one. It guards `/api/`, `/metrics` and `/debug/pprof/`; `/healthz` is open. The API has its own listener, default `127.0.0.1:8081`, separate from the media listener (`/live/`, default `:8080`), which has no auth (playback tokens are M6). The token holder is a full operator: it can point a stream at any URL or local media file the server can read. A failed attempt is logged at most once every 10 s, without the presented value. Rejected: no auth on loopback (a reverse proxy on the same host makes every request loopback) | A Prometheus scrape needs `authorization: credentials`. One shared secret, no roles, no rotation without a restart. Over plain HTTP until M5c, so a non-loopback API listener exposes the token to the network |
-| R-D9 | **Metrics.** `internal/metrics` writes the Prometheus text format 0.0.4 itself: counters and gauges, collected at scrape time from the `Stats` the packages already keep. No histograms. Every name starts `openstreamer_`, except the conventional `go_*` and `process_*` (so stock dashboards and the soak's leak panels work). **Labels come only from configuration:** `stream` (a spec name), `name` (a served name), `rendition` (a label), `output`, `reason`, `state`, `kind`, `result`, `target` (a push's index, never its URL), and for the API `method`, `route` (the mux pattern, never the path) and `code`. Nothing a client sends becomes a label value. With S streams of at most 8 rungs and 8 pushes the stream series are bounded by about 60 × S. Counters that come from a generation's objects start again at 0 when the stream is rebuilt, which Prometheus treats as a counter reset. `EncoderFallbacks` is `openstreamer_transcoder_encoder_fallbacks_total{stream}` (closes the Backlog's export; refusing the fallback is M5b). The catalogue is in Task 7 and Task 10. Rejected: `prometheus/client_golang` (Apache-2.0): about ten transitive modules for a job that is two hundred lines when every value is already a snapshot | We own the exposition code and its escaping. No latency histograms; if they are wanted, switching to `client_golang` is a contained change behind `metrics.Writer`. Per-stream session counts are not exported (the output servers count per server, not per stream): M6's sessions |
+| R-D9 | **Metrics.** `internal/metrics` writes the Prometheus text format 0.0.4 itself: counters and gauges, collected at scrape time from the `Stats` the packages already keep. No histograms. Every name starts `openstreamer_`, except the conventional `go_*` and `process_*` (so stock dashboards and the soak's leak panels work). **Labels come only from configuration:** `stream` (a spec name), `name` (a served name), `rendition` (a label), `output`, `reason`, `state`, `kind`, `result`, `target` (the first 8 hex digits of the SHA-256 of a push's URL: stable when another push is removed, and never the URL), and for the API `method` (one of `GET`, `PUT`, `DELETE`, `HEAD`, `OPTIONS`, or `other` for anything else a client sends), `route` (the mux pattern, never the path; `unmatched` when none matches) and `code`. Nothing a client sends becomes a label value. With S streams of at most 8 rungs and 8 pushes the stream series are bounded by about 60 × S. Counters that come from a generation's objects start again at 0 when the stream is rebuilt, which Prometheus treats as a counter reset. `EncoderFallbacks` is `openstreamer_transcoder_encoder_fallbacks_total{stream}` (closes the Backlog's export; refusing the fallback is M5b). The catalogue is in Task 7 and Task 10. Rejected: `prometheus/client_golang` (Apache-2.0): about ten transitive modules for a job that is two hundred lines when every value is already a snapshot | We own the exposition code and its escaping. No latency histograms; if they are wanted, switching to `client_golang` is a contained change behind `metrics.Writer`. Per-stream session counts are not exported (the output servers count per server, not per stream): M6's sessions |
 | R-D10 | **Logs.** `log/slog`, JSON on stderr by default (`text` for a terminal), level `info` by default. Attributes: `stream`, `component`, `input`, `err`. The API logs one line per request at `info`: method, route pattern, status, duration, remote address; never a header, a query or a body. Media requests are not logged per request. **Redaction is two layers:** code that logs a URL passes it through `redact.URL`, and the handler from `logging.New` scrubs every message, string attribute and error text: each URL-shaped substring (`scheme://…`) goes through `redact.URL`, and an attribute named `token`, `password`, `passphrase`, `secret` or `authorization` (any case) is replaced by the mask | A regular expression runs over every logged string, which is fine at log rates and would not be on a per-frame path (nothing logs per frame). A secret that is not URL-shaped and not under one of those keys is not caught by the second layer |
-| R-D11 | **Validation happens before anything is stored or started,** in two steps: `spec.Stream.Validate` (structure, names, limits; no I/O) and `stream.Check` (what needs the v2 packages or the server's config: `ingest.Parse` on every input, a dry `transcode.New` and `rtmppush.New` on scratch hubs, the asset read, the transcoder binary being configured). The manager then checks across streams: `copy://` cycles, and two streams claiming one listen address (an RTMP publish path on one address, a UDP or SRT listen port). After that the store is written, and only then is the supervisor told; a supervisor is never given a spec that failed a check, so building a generation cannot fail on the spec. An unreachable source is **not** a validation error: the stream is created and waits | A check the dry run misses surfaces as a stream in `backoff` rather than a 422. `copy://` of a stream that does not exist yet is accepted, and the copying stream waits for it |
-| R-D12 | **Proof.** In-process end-to-end tests in `internal/e2e` start `server.New` on ephemeral ports and drive it only through HTTP, as a client would: `TestM5aEveryOutput`, `TestM5aEditOutputs`, `TestM5aRestartRestores`, `TestM5aLadder`, `TestM5aPeers`, `TestM5aNoSecretsLeak` (Task 11). "Not interrupted" is measured, not inferred: one long-lived reader per output runs across the edit and its capture must hold every frame a tap subscriber saw on the hub in that span, once, in one epoch; and the session counters (`PlayersStarted`, SRT connections, push `Connects`, the generation number, the transcoder's `Spawns`) must not move | The tests run a looped file input, so they prove the control plane and not ingest, which M2's and M3's matrices already cover. An interruption shorter than one frame is invisible to them |
+| R-D11 | **Validation happens before anything is stored or started,** in two steps: `spec.Stream.Validate` (structure, names, limits; no I/O) and `stream.Check` (what needs the v2 packages or the server's config: `ingest.Parse` on every input, a dry `transcode.New` and `rtmppush.New` on scratch hubs, the asset read, the transcoder binary being configured). The manager then checks the whole set: `copy://` cycles, and **listen claims** under one rule for TCP and UDP: two claims overlap when they have the same protocol family and port and the same host, or a wildcard host on either side. The rule is seeded with the server's own bound listeners (HTTP, API, RTMP, RTSP on TCP; SRT on UDP), runs between the inputs of one spec as well as between streams, and runs over the stored streams at load. Two exceptions: RTMP listen inputs on the *same* address share one listener (and the server's RTMP play listener) and collide only on an equal publish path; and a UDP input on a multicast group claims nothing (several streams may read one group). After that the store is written, and only then is the supervisor told; a supervisor is never given a spec that failed a check, so building a generation cannot fail on the spec. An unreachable source is **not** a validation error: the stream is created and waits | A check the dry run misses surfaces as a stream in `backoff` rather than a 422. The RTSP server's UDP port pair is chosen at start and is not in the claims. Two multicast inputs that differ only in a source filter are not told apart. `copy://` of a stream that does not exist yet is accepted, and the copying stream waits for it |
+| R-D12 | **Proof.** In-process end-to-end tests in `internal/e2e` start `server.New` on ephemeral ports and drive it only through HTTP, as a client would: `TestM5aEveryOutput`, `TestM5aEditOutputs`, `TestM5aRestartRestores`, `TestM5aLadder`, `TestM5aPeers`, `TestM5aNoSecretsLeak` (Task 11). "Not interrupted" is measured, not inferred, by the rules of Task 11: a session output's reader (RTMP, RTSP, HTTP-TS, SRT) runs across the edit until the stream is deleted, so its capture and a lossless tap on the same hub end on the same frame and M3's own hub-matching helpers apply unchanged, frame for frame; a segmented output (HLS, DASH) has no session, so its rule is weaker and stated: no conform violation, no timestamp step inside an epoch other than the tap's, whole epochs complete, the same packager and one unbroken run of segment sequence numbers. The counters taken after the readers connected (`PlayersStarted`, SRT connections, push `Connects`, the generation, the transcoder's `Spawns`) must not move | The tests run a looped file input, so they prove the control plane and not ingest, which M2's and M3's matrices already cover. For HLS and DASH a lost frame in the first or last epoch of the capture is caught only as a timestamp step, not by a count |
+| R-D13 | **RTMP on an ephemeral port** (controller ruling, review round 1). `rtmpsrv.AddrKey` rejects port 0 and listeners are keyed by the requested address, so `server.New` resolves an `rtmp.listen` with port 0 itself: it binds a TCP listener on that host with port 0, reads the port, closes it, and registers the play handler on the concrete address, retrying up to 5 times when the port was taken in between. `Addrs().RTMP` and `Env.RTMPPlay` carry that concrete address. The other listeners (HTTP, API, RTSP, SRT) are bound directly and report their real ports. Rejected: changing `AddrKey` (not additive: osdev and `ingest/rtmp_listen.go` use it) | A port-0 RTMP listener has the close-and-rebind race the e2e's `freeTCPPort` has; it matters only to tests, since a deployment names its port |
 
 ## Execution waves (parallel per user instruction)
 
 | Wave | Tasks | Why this order |
 |---|---|---|
-| 1 | 1 (carry items), 2 (`spec`, `redact.Masked`), 3 (`metrics`), 4 (`logging`), 5 (`hub.Refuse`, `rtmpsrv.Registry.Addr`) | Disjoint files: Task 1 has `native/watermark*`, `cmd/ostranscoder/main_test.go`, `rtspplay_test.go` and one Backlog line; Tasks 2, 3 and 4 are new packages (Task 2 also `internal/redact`); Task 5 has `internal/hub` and `internal/rtmpsrv` |
+| 1 | 1 (carry items), 2 (`spec`, `redact.Masked`), 3 (`metrics`), 4 (`logging`), 5 (`hub.Refuse`, the Thumbnailer's `OnEvent`) | Disjoint files: Task 1 has `native/watermark*`, `cmd/ostranscoder/main_test.go`, `rtspplay_test.go` and one Backlog line; Tasks 2, 3 and 4 are new packages (Task 2 also `internal/redact`); Task 5 has `internal/hub` and `internal/transcode/thumbnailer*.go` |
 | 2 | 6 (`store`), 7 (`stream.Supervisor`) | 6 needs Task 2's types; 7 needs Tasks 2, 3 and 5. New, separate packages |
 | 3 | 8 (`stream.Manager`) | Same package as 7; needs 6's `Store` |
-| 4 | 9 (`api`) | Needs 8's `Manager` and `PutResult` |
-| 5 | 10 (`server`, `cmd/openstreamer`) | Needs 4, 8 and 9 |
+| 4 | 9 (`api`) | Needs 8's `Manager` and `PutResult`, and 4's `logging.Scrub` |
+| 5 | 10 (`server`, `cmd/openstreamer`) | Needs 3, 4, 6, 8 and 9 |
 | 6 | 11 (M5a scenarios) | Needs 10 |
 | 7 | 12 (CI, docs, spec, done) | Needs 11 |
 
@@ -62,11 +63,11 @@ Each parallel task runs in its own worktree; the controller merges.
 
 ## Review Focus
 
-1. **Two streams claim one listen address** (the same RTMP publish path on one address, the same UDP or SRT listen port): the second `PUT` is refused with 409 and the first stream keeps running untouched; nothing is stored. Task 8, `TestManagerListenClaim`.
+1. **A listen address claimed twice** (the same RTMP publish path; RTMP on `:P` and on `127.0.0.1:P`; the same UDP or SRT port, or a UDP input on the SRT play port; a listen input on one of the server's own ports; two inputs of one stream on one address): the `PUT` is refused with 409, nothing is stored and the stream that holds the address keeps running untouched; at load the later stream stays stopped with the reason. Two streams on one multicast group are accepted. Task 8, `TestManagerListenClaim` and `TestManagerRunRestores`.
 2. **A damaged store directory** (a truncated file after a crash, a leftover temp file, a file renamed by hand, a file from a newer version): the server starts with every good stream, reports each bad file once, and never rewrites or deletes it. Task 6, `TestLoadSkipsBadFiles`; Task 11, `TestM5aRestartRestores`.
 3. **A redacted document written back, and secrets on their way out:** a `GET` without `?secrets=1` followed by a `PUT` of its body is refused and the stored secret survives; no password, stream key or token appears in a response, a status, a metric or a log line, including the error of an input that fails to connect. Task 9, `TestPutRejectsMaskedSecrets`; Task 11, `TestM5aNoSecretsLeak`.
 4. **Edits that race:** twenty concurrent `PUT`s of one stream mixing output edits and rebuilds, with a `DELETE` among them: no deadlock, the runtime ends equal to the stored spec (or gone), and no goroutine or subscriber is left. Task 8, `TestManagerConcurrentPuts`.
-5. **A stream that cannot start** (a source that is down, a wrong password, a transcoder binary that is missing or speaks another wire version): the `PUT` succeeds, the stream reports `starting` or `backoff` with a redacted `last_error`, other streams and the API are unaffected, it runs when the source appears, and deleting it during a backoff returns at once. Task 7, `TestSupervisorDeadInput` and `TestSupervisorStopDuringBackoff`.
+5. **A stream that cannot start, or stops working** (a source that is down or goes away, a wrong password, a transcoder binary that disappears after start-up or speaks another wire version, an asset deleted under a running stream): the `PUT` succeeds; the stream reports `starting`, `no_input` or `backoff` with a redacted `last_error` that names the failing part (the input, the transcoder's or the thumbnailer's spawn, the asset); other streams and the API are unaffected; it runs when the cause is gone; and deleting it during a backoff returns at once. A binary that is missing when the server starts is a config error (`LoadConfig`). Task 7, `TestSupervisorDeadInput`, `TestSupervisorInputLoss`, `TestSupervisorSpawnFails`, `TestSupervisorAssetGone` and `TestSupervisorStopDuringBackoff`; Task 10, `TestLoadConfig`.
 
 ---
 
@@ -79,7 +80,7 @@ A hygiene task: three items the controller carried out of M4c. Items 1 and 2 tou
 
 **Interfaces:** none produced.
 
-- [ ] **Step 1: The sweep's PID.** `syscall.Kill` takes a 32-bit pid, so `ostx-wm-2147483648-1` reaches the kernel as a negative number (a process group), which answers `ESRCH`, and the sweep removes a directory it has no reason to think is dead. In `TestWatermarkSweepsStaleDirs`, add to the kept directories `mkdir("ostx-wm-2147483648-1")`, `mkdir("ostx-wm-4294967297-1")` (it wraps to pid 1) and `mkdir("ostx-wm-99999999-1")` (8 digits). Run `make test-transcode ARGS='-run ^TestWatermarkSweepsStaleDirs$ ./internal/transcode/native/'`: it fails on the first two.
+- [ ] **Step 1: The sweep's PID.** `syscall.Kill` takes a 32-bit pid, so `ostx-wm-2147483648-1` reaches the kernel as a negative number (a process group), which answers `ESRCH`, and the sweep removes a directory it has no reason to think is dead. In `TestWatermarkSweepsStaleDirs`, add to the kept directories `mkdir("ostx-wm-2147483648-1")`, `mkdir("ostx-wm-4294967297-1")` (as a 32-bit pid it wraps to 1) and `mkdir("ostx-wm-99999999-1")` (8 digits). Run `make test-transcode ARGS='-run ^TestWatermarkSweepsStaleDirs$ ./internal/transcode/native/'`: it fails on the first and the third, which the sweep removes (`kill` answers `ESRCH` for the group −2147483648 and for a pid above `pid_max`). The second is already kept before the fix, because pid 1 exists; it stays as a row that pins the wrap.
 - [ ] **Step 2:** change the capture group of `wmDirName` to `([1-9][0-9]{0,6})` (7 digits: Linux's `pid_max` is at most 4194304) and say so in its comment. Run the same command: pass.
 - [ ] **Step 3: The ostranscoder probes.** Add to `cmd/ostranscoder/main_test.go`:
 
@@ -174,7 +175,7 @@ type Outputs struct {
 }
 type Push struct{ URL string `json:"url"` }
 
-func ValidName(s string) bool                 // ^[a-z0-9][a-z0-9-]{0,62}$
+func ValidName(s string) bool                 // ^[a-z0-9][a-z0-9-]{0,62}$ and not con, prn, aux, nul, com1…com9, lpt1…lpt9
 func Decode(r io.Reader) (Stream, error)      // one JSON document of at most MaxSpecBytes; unknown fields and trailing data are errors
 func (s Stream) Validate() error
 func (s Stream) Redacted() Stream             // a deep copy with every input and push URL through redact.URL
@@ -195,7 +196,8 @@ func Masked(rawURL string) bool // the mask stands where URL writes it: the pass
 
 ```go
 func TestValidName(t *testing.T)
-// ok: "cam", "a", "cam-1", 63 × "a". Not ok: "", "Cam", "cam_1", "-cam", "cam.1", "..", "a/b", "a%2f", "cam ", 64 × "a".
+// ok: "cam", "a", "cam-1", "con1", "null", 63 × "a". Not ok: "", "Cam", "cam_1", "-cam", "cam.1", "..", "a/b", "a%2f", "cam ", 64 × "a",
+// and the device names "con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9".
 func TestDecodeStrict(t *testing.T)
 // an unknown key, a second document after the first, and a body of MaxSpecBytes+1 are errors; the minimal
 // document {"name":"cam","inputs":[{"url":"udp://:5000"}],"outputs":{"hls":true}} decodes.
@@ -294,7 +296,7 @@ func New(w io.Writer, level, format string) (*slog.Logger, error)
 func Scrub(s string) string
 ```
 
-The handler wraps the JSON or text handler and rewrites every record before it: the message through `Scrub`; a string attribute through `Scrub`; an `error` attribute to the `Scrub` of its `Error()`; groups recursively; `slog.LogValuer`s resolved first; an attribute whose key, lower-cased, is `token`, `password`, `passphrase`, `secret` or `authorization` becomes `xxxxx`. `WithAttrs` scrubs the attributes it is given; `WithGroup` and `Enabled` delegate. A URL-shaped substring matches `[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>\\]+`.
+The handler wraps the JSON or text handler and rewrites every record before it: the message through `Scrub`; a string attribute through `Scrub`; an `error` attribute to the `Scrub` of its `Error()`; groups recursively; `slog.LogValuer`s resolved first; an attribute whose key, lower-cased, is `token`, `password`, `passphrase`, `secret` or `authorization` becomes `xxxxx`. `WithAttrs` scrubs the attributes it is given; `WithGroup` and `Enabled` delegate. A URL-shaped substring matches `[A-Za-z][A-Za-z0-9+.-]*://\S+`: it runs to the next white space, because Go's `net/url` accepts `'`, `"` and most punctuation in the userinfo, so stopping earlier would cut a password in two and leave its tail in the log. Text glued to a URL's end without a space is therefore handed to `redact.URL` with it, which can only hide more.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -302,7 +304,8 @@ The handler wraps the JSON or text handler and rewrites every record before it: 
 func TestNewLevelsAndFormats(t *testing.T) // "" → info JSON: Debug is dropped, Info is one JSON object per line with time, level, msg; "text" is not JSON; "loud" and "xml" are errors
 func TestScrub(t *testing.T)
 // `open rtsp://u:hunter2@cam/1 failed, then srt://h:9?passphrase=topsecret&x=1` loses "hunter2" and "topsecret" and keeps
-// "cam/1" and "x=1"; `rtmp://h/live/secretkey` loses "secretkey"; a string without "://" is returned as is.
+// "cam/1" and "x=1"; `rtmp://h/live/secretkey` loses "secretkey"; `rtsp://u:pa'ss"w<d@cam/1 down` loses "pa'ss", "w<d" and
+// every other piece of the password and keeps "down"; a string without "://" is returned as is.
 func TestHandlerScrubs(t *testing.T)
 // log.With("url", u1).Error(msgWith(u2), "err", fmt.Errorf("dial %s: refused", u3), slog.Group("g", "url", u4), "Token", "abc123", "password", "pw"):
 // the output line contains none of the four passwords, nor "abc123", nor `"pw"`; it contains the hosts.
@@ -314,13 +317,13 @@ func TestHandlerKeepsStructure(t *testing.T) // ints, bools, durations and times
 - [ ] **Step 4: Run** the same command — pass.
 - [ ] **Step 5: Commit** `feat(logging): slog set-up with a handler that scrubs URLs and secrets`
 
-### Task 5: `hub.Refuse` and `rtmpsrv.Registry.Addr`
+### Task 5: `hub.Refuse` and the Thumbnailer's `OnEvent`
 
-Two additive methods the supervisor and the server need. Nothing changes for a caller that does not use them.
+Two additive hooks the supervisor needs. Nothing changes for a caller that does not use them.
 
 **Files:**
-- Modify: `internal/hub/hub.go`, `internal/rtmpsrv/registry.go`
-- Test: `internal/hub/hub_test.go`, `internal/rtmpsrv/registry_test.go` (the package's existing test file for the registry)
+- Modify: `internal/hub/hub.go`, `internal/transcode/thumbnailer.go`
+- Test: `internal/hub/hub_test.go`, `internal/transcode/thumbnailer_test.go`
 
 **Interfaces — Produces:**
 
@@ -332,11 +335,13 @@ Two additive methods the supervisor and the server need. Nothing changes for a c
 // returns the number of subscribers it closed.
 func (h *Hub) Refuse(prefixes ...string) int
 
-// Addr returns the address of the listener that serves addr (as given to
-// RegisterPlay or RegisterPublish), or nil when nothing listens there. With
-// port 0 it is how a caller learns the port.
-func (r *Registry) Addr(addr string) net.Addr
+// In ThumbnailerOptions: OnEvent is called from the Run goroutine with
+// EventSpawned (PID set) when a child starts and EventExited (Err set) when
+// one exits, is killed, or cannot be started, as the Transcoder's is. Optional.
+OnEvent func(Event)
 ```
+
+The Thumbnailer emits where it logs today: `EventExited` next to "spawn failed", "child exited" and "child sends nothing" (with that reason as `Err`), `EventSpawned` after a successful start. Its logs, counters and retries are unchanged.
 
 The subscriber names in use, which Task 7 relies on: `"httpts "+remote`, `"rtmp "+name`, `"rtsp "+name`, `"srt "+remote`, `"rtmppush "+target`, `"copy:"+url`, `"transcode"`, `"thumbnailer"`, and a packager's (the caller's choice).
 
@@ -352,13 +357,15 @@ func TestRefuseBlocksLaterSubscribes(t *testing.T)
 func TestRefuseReplaces(t *testing.T) // Refuse("rtsp ") then Refuse(): "rtsp a" subscribes again; then Refuse("rtmp ", "srt ") refuses both
 func TestRefuseNeverCalled(t *testing.T) // a control: a hub without Refuse delivers the cached GOP to a late subscriber exactly as before
 func TestRefuseRace(t *testing.T) // under -race: writes, subscribes and Refuse from three goroutines for 200 ms; no panic, no send on a closed channel
-func TestRegistryAddr(t *testing.T) // RegisterPlay("127.0.0.1:0", …): Addr("127.0.0.1:0") has a port above 0 that a TCP dial reaches; after unregister it is nil; an unknown addr is nil
+func TestThumbnailerEvents(t *testing.T)
+// a binary that does not exist: EventExited with a non-nil Err at every attempt (the fake After fires twice: two events), Stats
+// as before; the fake child: EventSpawned with its PID, then EventExited when it is killed. With OnEvent nil, nothing changes.
 ```
 
-- [ ] **Step 2: Run** `go test -race -count=1 -run 'TestRefuse|TestRegistryAddr' ./internal/hub/ ./internal/rtmpsrv/` — compile failure.
+- [ ] **Step 2: Run** `go test -race -count=1 -run 'TestRefuse|TestThumbnailerEvents' ./internal/hub/ ./internal/transcode/` — compile failure.
 - [ ] **Step 3: Implement.** `Refuse` takes `h.mu`, stores the prefixes, and closes matching subscribers with the same steps as `Sub.Close`; `subscribe` returns a closed `Sub` for a refused name before it replays the cache.
-- [ ] **Step 4: Run** `go test -race -count=1 ./internal/hub/ ./internal/rtmpsrv/` — pass, every existing test unchanged.
-- [ ] **Step 5: Commit** `feat(hub): refuse subscribers by name prefix` and `feat(rtmpsrv): report a listener's address`
+- [ ] **Step 4: Run** `go test -race -count=1 ./internal/hub/ ./internal/transcode/` — pass, every existing test unchanged.
+- [ ] **Step 5: Commit** `feat(hub): refuse subscribers by name prefix` and `feat(transcode): report the thumbnailer's child events`
 
 ### Task 6: `internal/store` — the file store
 
@@ -399,8 +406,10 @@ func TestPutRejectsUnsafeNames(t *testing.T)
 // "../x", "a/b", "", "A", "x.json", "..": Put and Delete return an error and nothing exists outside dir/streams (walk the temp root).
 func TestLoadSkipsBadFiles(t *testing.T)
 // next to a good cam.json: a truncated bad.json, future.json with "version":2, renamed.json holding the spec "other",
-// invalid.json whose spec fails Validate, a directory x.json, notes.txt, and .cam.json.123.tmp. Load returns [cam] and four
-// errors, each naming its file; the tmp file is gone; the four bad files, the directory and notes.txt are byte-for-byte untouched.
+// invalid.json whose spec fails Validate, a directory x.json, notes.txt, and .cam.json.123.tmp. Load returns [cam] and exactly
+// four errors, one for each of bad, future, renamed and invalid, each naming its file. The directory x.json and notes.txt are
+// skipped silently (they are not stream files), the tmp file is removed, and the four bad files, the directory and notes.txt
+// are byte-for-byte untouched.
 func TestDelete(t *testing.T) // Delete removes the file; a second Delete is nil; Load is then empty
 func TestConcurrentPuts(t *testing.T) // 8 goroutines × 50 Puts over 4 names under -race: Load returns 4 valid streams, no tmp files
 ```
@@ -417,7 +426,7 @@ func TestConcurrentPuts(t *testing.T) // 8 goroutines × 50 Puts over 4 names un
 - Test: `internal/stream/check_test.go`, `supervisor_test.go`, `reattach_test.go`, `helpers_test.go`
 
 **Interfaces:**
-- Consumes: Task 2 (`spec`), Task 3 (`metrics.Writer`, `metrics.L`), Task 5 (`hub.Refuse`); `pipeline.New`, `transcode.New`, `transcode.NewThumbnailer`, `live.NewPackager`, `rtmppush.New`, `picture.LoadAsset`, `ingest.Parse`, `redact.URL`; in tests `transcodetest`'s fake child.
+- Consumes: Task 2 (`spec`), Task 3 (`metrics.Writer`, `metrics.L`), Task 4 (`logging.Scrub`), Task 5 (`hub.Refuse`, `ThumbnailerOptions.OnEvent`); `pipeline.New`, `transcode.New`, `transcode.NewThumbnailer`, `live.NewPackager`, `rtmppush.New`, `picture.LoadAsset`, `ingest.Parse`, `redact.URL`; in tests `transcodetest`'s fake child.
 - Produces:
 
 ```go
@@ -434,8 +443,10 @@ type Env struct {
 	Lookup     func(name string) (*hub.Hub, bool) // copy:// inputs; the Manager sets it
 	Transcoder string                             // path of ostranscoder; "" means none
 	AssetsDir  string                             // "" means no assets
-	// The shared servers' addresses and RTMP play app, for Check's collision rules; "" means off.
-	RTMPPlay, RTMPApp, SRTPlay string
+	// The server's RTMP play address, as bound, and its app, for Check's publish-path rule; "" means off.
+	RTMPPlay, RTMPApp string
+	// Reserved are the server's own listeners as bound (HTTP, API, RTMP, RTSP, SRT); the Manager's claims start from them.
+	Reserved []Claim
 	Logger *slog.Logger                           // nil discards
 	Now    func() time.Time                       // nil means time.Now
 	After  func(time.Duration) <-chan time.Time   // nil means time.After; the restart backoff
@@ -443,12 +454,25 @@ type Env struct {
 	TranscoderArgs, TranscoderEnv []string        // tests: the fake child
 }
 
+// Claim is one listen address: a server listener's, or a stream's listen input's (R-D11).
+type Claim struct {
+	UDP   bool   // the family: UDP (UDP and SRT listen inputs, the SRT server) or TCP
+	Host  string // "" is the wildcard (0.0.0.0, ::, or no host)
+	Port  int
+	RTMP  bool   // an RTMP listener: RTMP claims on the same Host and Port share it
+	Path  string // an RTMP publish path; "" for a play listener and for every other claim
+	Owner string // a stream name, or "server"
+}
+
 // Check reports why sp cannot run under env (R-D11). sp has passed Validate.
 func Check(sp spec.Stream, env Env) error
 
 type Supervisor struct{ /* unexported */ }
-func NewSupervisor(sp spec.Stream, env Env) *Supervisor // sp has passed Check and is not disabled
-func (s *Supervisor) Run(ctx context.Context)           // returns when ctx ends, with everything stopped and waited for
+// NewSupervisor: sp has passed Check and is not disabled. after, when not nil, is the Done of the previous supervisor of
+// the same name: Run waits for it (or for ctx) before it builds anything, so two generations of one name never overlap.
+func NewSupervisor(sp spec.Stream, env Env, after <-chan struct{}) *Supervisor
+func (s *Supervisor) Run(ctx context.Context) // returns when ctx ends, with everything stopped and waited for
+func (s *Supervisor) Done() <-chan struct{}   // closed when Run has returned
 // Submit queues an edit and never blocks. The channel gets the Change once it is applied (for a rebuild: once the
 // old generation is torn down and the new one's View is published), and is closed without a value if Run ends first.
 func (s *Supervisor) Submit(sp spec.Stream) <-chan spec.Change
@@ -468,12 +492,13 @@ type View struct {
 
 type Status struct {
 	Name        string       `json:"name"`
-	State       string       `json:"state"` // "stopped", "starting", "running", "backoff"
+	State       string       `json:"state"` // "stopped", "starting", "running", "no_input", "backoff"
 	Generation  uint64       `json:"generation"`
 	Since       time.Time    `json:"since"`          // when the generation started
 	Restarts    uint64       `json:"restarts"`       // rebuilds after a failure
 	Rebuilds    uint64       `json:"rebuilds"`       // rebuilds for an edit
-	LastError   string       `json:"last_error,omitempty"`
+	LastError   string       `json:"last_error,omitempty"`    // scrubbed; prefixed "input N: ", "transcoder: ", "thumbnailer: " or "build: "
+	LastErrorAt *time.Time   `json:"last_error_at,omitempty"`
 	Served      []string     `json:"served"`
 	Outputs     spec.Outputs `json:"outputs"`        // push URLs redacted
 	Inputs      []string     `json:"inputs"`         // redacted
@@ -489,26 +514,36 @@ type Transcoder struct {
 	EncoderFallbacks uint64 `json:"encoder_fallbacks"`; Thumbnails uint64 `json:"thumbnails"`
 }
 type Push struct {
+	ID     string `json:"id"`     // the first 8 hex digits of sha256(URL): the metrics' target label
 	Target string `json:"target"` // redacted
 	State  string `json:"state"`; Connects uint64 `json:"connects"`; Failures uint64 `json:"failures"`
 	LastError string `json:"last_error,omitempty"`
 }
 ```
 
-**`Check`** (each error is prefixed `stream: check:`): every input passes `ingest.Parse` (or `env.Open` is set); `layout` maps to `[]media.Kind` (empty: video, audio); with `transcode`, the options are built as osdev's `parseLadders` does (rendition `Name` = `<name>_<label>`, `Presentation: true`, `Binary: env.Transcoder`), an image watermark is read with `picture.LoadAsset(env.AssetsDir, image)` (an empty `AssetsDir` is an error), anything that encodes needs `env.Transcoder != ""`, and `transcode.New` on a scratch `hub.New(hub.Options{})` must succeed; a thumbnail needs `env.Transcoder != ""` and `picture.Thumbnail.Validate`; every push passes `rtmppush.New` on a scratch hub; an SRT listen input must not overlap `env.SRTPlay` (same port, and the same host or either a wildcard: osdev's `srtAddrsCollide` rule, rewritten here); an RTMP listen input on `env.RTMPPlay`'s address must not publish at `<RTMPApp>/<served name>` for any served name of the stream (a publish path is never playable). `Check` and the generation's build share the functions that turn a spec into options, so they cannot disagree.
+**`Check`** (each error is prefixed `stream: check:`): every input passes `ingest.Parse` (or `env.Open` is set); `layout` maps to `[]media.Kind` (empty: video, audio); with `transcode`, the options are built as osdev's `parseLadders` does (rendition `Name` = `<name>_<label>`, `Presentation: true`, `Binary: env.Transcoder`), an image watermark is read with `picture.LoadAsset(env.AssetsDir, image)` (an empty `AssetsDir` is an error), anything that encodes needs `env.Transcoder != ""`, and `transcode.New` on a scratch `hub.New(hub.Options{})` must succeed; a thumbnail needs `env.Transcoder != ""` and `picture.Thumbnail.Validate`; every push passes `rtmppush.New` on a scratch hub; an RTMP listen input on `env.RTMPPlay`'s address must not publish at `<RTMPApp>/<served name>` for any served name of the stream (a publish path is never playable). Listen-address overlaps are not `Check`'s: they are the Manager's claims (Task 8), which see every stream and the server's listeners. `Check` and the generation's build share the functions that turn a spec into options, so they cannot disagree on the spec; what can still differ is the world (an asset deleted since), which is why build has an error path.
 
-**A generation** (unexported `generation`): the source hub; the `pipeline.Pipeline` (`Inputs` from the spec, `Env: ingest.Env{Lookup: env.Lookup}`, `Layout`, `EndOnEOF: false`, `OnEvent` recording the last failure, redacted); with a ladder, the `transcode.Transcoder` and its rendition and presentation hubs; a `transcode.Thumbnailer` when the spec has a thumbnail and no child encodes (as osdev's `parseThumbnailers`); and the attached outputs. The served hubs follow R-D3: without a ladder `Single[name]` is the source hub and its packager is non-ABR; with one, `Single[name]` and `Single[name_label0]` are rendition 0's hub, `Single[name_labelI]` rendition I's, `Packs[name]` is an ABR packager (`live.Options{ABR: true, Logger: …}`) on the presentation hub with a queue of 1024 × (renditions + 1), and `Packs[name_label]` a non-ABR packager on each rendition hub with a queue of 1024. Packagers subscribe under `"packager "+servedName`.
+**A generation** (unexported `generation`): the source hub; the `pipeline.Pipeline` (`Inputs` from the spec, `Env: ingest.Env{Lookup: env.Lookup}`, `Layout`, `EndOnEOF: false`, and `OnEvent`, see **Last error** below); with a ladder, the `transcode.Transcoder` and its rendition and presentation hubs; a `transcode.Thumbnailer` when the spec has a thumbnail and no child encodes (as osdev's `parseThumbnailers`); and the attached outputs. The served hubs follow R-D3: without a ladder `Single[name]` is the source hub and its packager is non-ABR; with one, `Single[name]` and `Single[name_label0]` are rendition 0's hub, `Single[name_labelI]` rendition I's, `Packs[name]` is an ABR packager (`live.Options{ABR: true, Logger: …}`) on the presentation hub with a queue of 1024 × (renditions + 1), and `Packs[name_label]` a non-ABR packager on each rendition hub with a queue of 1024. Packagers subscribe under `"packager "+servedName`.
 
 **The loop** (this is the algorithm the tests pin):
 
 ```go
 func (s *Supervisor) Run(ctx context.Context) {
+	defer close(s.done)
+	if !waitFor(ctx, s.after) { return }       // the previous supervisor of this name has stopped (nil: no wait)
 	wait := time.Second
 	for ctx.Err() == nil {
-		g := s.build(ctx)                      // hubs, pipeline, transcoder, thumbnailer; starts their goroutines
-		s.reattach(g, spec.Outputs{}, s.spec.Outputs) // starts the outputs and publishes the View
-		reason := s.serve(ctx, g)              // returns on ctx, on a rebuild edit, or when a part of g ended
-		s.teardown(g)                          // publishes the empty View first, then stops and waits, source hub first
+		reason, lived := stopFailed, time.Duration(0)
+		g, err := s.build(ctx)                 // hubs, pipeline, transcoder, thumbnailer; on an error nothing is left running
+		if err != nil {
+			s.fail("build: ", err)             // LastError; state "backoff" below
+		} else {
+			s.reattach(g, spec.Outputs{}, s.spec.Outputs) // starts the outputs and publishes the View
+			s.answerRebuilds(g)                // edits that asked for this generation get their answer now
+			reason = s.serve(ctx, g)           // returns on ctx, on a rebuild edit, or when a part of g ended
+			lived = s.now().Sub(g.started)
+			s.teardown(g)                      // publishes the empty View first, then stops and waits (see teardown)
+		}
 		switch reason {
 		case stopCtx:
 			return
@@ -516,7 +551,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 			s.rebuilds++
 		case stopFailed:
 			s.restarts++
-			if s.now().Sub(g.started) >= 60*time.Second { wait = time.Second }
+			if lived >= 60*time.Second { wait = time.Second }
 			if !s.idle(ctx, wait) { return }   // state "backoff"; an edit arriving here replaces s.spec and ends the wait
 			wait = min(2*wait, 30*time.Second)
 		}
@@ -524,25 +559,35 @@ func (s *Supervisor) Run(ctx context.Context) {
 }
 ```
 
-`serve` selects on `ctx.Done()`, the mailbox signal and `g.failed` (closed when the pipeline's `Run` or the transcoder's `Run` returns while `g`'s context is live; its error, scrubbed, becomes `LastError`). For each queued edit, in order: `spec.Diff(s.spec, next)`; `ChangeNone` answers at once; `ChangeOutputs` calls `reattach(g, s.spec.Outputs, next.Outputs)`, sets `s.spec`, answers; `ChangeRebuild` sets `s.spec`, returns `stopEdit`, and the answer is sent after the next generation's `reattach`. Edits queued behind a rebuild are applied to the new generation the same way.
+`build` returns an error when something the spec names is no longer there: today that is the watermark's asset (`picture.LoadAsset` is read again for every generation), and any error of `transcode.New`, `transcode.NewThumbnailer` or `rtmppush.New` is handled the same way rather than assumed away. A failed build is `stopFailed`: `LastError` is `build: …`, the state is `backoff`, and the next attempt follows the backoff. An edit that asked for a rebuild whose build fails is answered `ChangeRebuild` when the failure is recorded, not held until a build succeeds.
 
-**`reattach(g, old, new spec.Outputs)`** makes the smallest set of calls (R-D6), in this order:
+`serve` selects on `ctx.Done()`, the mailbox signal and `g.failed`, which is closed when the pipeline's `Run`, the transcoder's `Run` **or the thumbnailer's `Run`** returns while `g`'s context is live (for any reason: each of them is meant to run for the generation's life); its error becomes `LastError`. For each queued edit, in order: `spec.Diff(s.spec, next)`; `ChangeNone` answers at once; `ChangeOutputs` calls `reattach(g, s.spec.Outputs, next.Outputs)`, sets `s.spec`, answers; `ChangeRebuild` sets `s.spec`, returns `stopEdit`, and the answer is sent after the next generation's `reattach` (or its failed build). Edits queued behind a rebuild are applied to the new generation the same way.
+
+**Last error.** `s.fail(prefix, err)` stores `prefix + logging.Scrub(err.Error())` and the time, behind the status pointer. It is fed by: the pipeline's `EventFailed` (`input N: …`), **except an error that is `io.EOF`** (`errors.Is`): with `EndOnEOF` false a file input without `loop` reaches its end through the pipeline's failure path and restarts, which is the stream working as ruled (R-D5), so it is counted in `openstreamer_stream_input_eof_total` and not shown as an error; the transcoder's `EventExited` (`transcoder: …`: a child that exited, was killed, or could not be started, which the transcoder retries by itself without ending the generation); the thumbnailer's `EventExited` (`thumbnailer: …`, Task 5); a failed build; and the error that closed `g.failed`. It is cleared by a rebuild for an edit, and kept otherwise, with its time, so an operator sees the last thing that went wrong even after recovery.
+
+**State** comes from the pipeline, not from the hub (`Hub.Live()` stays true once a keyframe was written, whatever happens to the input): `starting` while no input has been active in this generation, `running` while `pipeline.Stats().Active >= 0`, `no_input` when an input was active and none is now, `backoff` between generations after a failure, `stopped` without a supervisor. `openstreamer_stream_up` is 1 exactly in `running`.
+
+**`reattach(g, old, new spec.Outputs)`** makes the smallest set of calls (R-D6), in this order. Let `off(o)` be the prefixes of the session outputs disabled in `o`: `"httpts "` for `!o.HTTPTS`, `"rtmp "` for `!o.RTMP`, `"rtsp "` for `!o.RTSP`, `"srt "` for `!o.SRT` (`"rtmp "` does not match `"rtmppush …"`).
 1. Packagers: with `want := new.HLS || new.DASH` and `have := old.HLS || old.DASH`, start them all on `want && !have`, stop them all (cancel, close their subscriptions, wait) on `!want && have`, and touch none otherwise.
 2. Pushes, keyed by URL: stop and wait for each one in `old` and not in `new`; start one for each in `new` and not in `old`, on `Single[s.spec.Name]`; leave the rest.
-3. Publish the new `View` (new sessions of a disabled output now find nothing).
-4. On every distinct hub in `Single`, call `Refuse` with the prefixes of the disabled session outputs: `"httpts "` for `!new.HTTPTS`, `"rtmp "` for `!new.RTMP`, `"rtsp "` for `!new.RTSP`, `"srt "` for `!new.SRT`. (`"rtmp "` does not match `"rtmppush …"`.)
+3. On every distinct hub in `Single`, `Refuse(off(old) ∩ off(new)…)`: this only relaxes. An output being re-enabled must be subscribable **before** the view announces it, or a player that connects at once would be handed a closed subscription.
+4. Publish the new `View`: sessions of a re-enabled output are now found, and new sessions of a disabled output find nothing.
+5. On the same hubs, `Refuse(off(new)…)`: this ends the sessions of the outputs just disabled, and only those.
 
-`teardown` cancels `g`'s context, closes the source hub, waits for the transcoder and thumbnailer (which close the rendition and presentation hubs), then for the packagers and pushers, as osdev's shutdown does. `State` is `starting` until the source hub is `Live()`, then `running`.
+At the first attach `old` is the zero `Outputs`, whose `off` is all four prefixes, so step 3 refuses exactly `off(new)` before anything is announced.
+
+`teardown` publishes the empty `View`, cancels `g`'s context, closes the source hub, and **waits, in this order, for: the pipeline's `Run`** (its return is what closes the input readers, so the listen sockets and RTMP publish routes of this generation are free before the next one, or the next supervisor of this name, builds); the transcoder and the thumbnailer (which close the rendition and presentation hubs); the packagers and the pushers. This is osdev's shutdown order with the pipeline's wait made explicit.
 
 **`Collect`** writes, with `stream=<name>` on every series (help texts are the implementer's, one sentence each):
 
 | Family | Type | Extra labels | Source |
 |---|---|---|---|
-| `openstreamer_stream_up` | gauge | | 1 when the source hub is live |
+| `openstreamer_stream_up` | gauge | | 1 in state `running` (`pipeline.Stats().Active >= 0`) |
 | `openstreamer_stream_generation` | gauge | | `View.Gen` |
 | `openstreamer_stream_restarts_total` | counter | `reason` = `failure`, `edit` | `Restarts`, `Rebuilds` |
 | `openstreamer_stream_active_input` | gauge | | `pipeline.Stats.Active` |
 | `openstreamer_stream_input_switches_total` | counter | | `Switches` |
+| `openstreamer_stream_input_eof_total` | counter | | inputs that ended with `io.EOF` and were restarted |
 | `openstreamer_stream_unmapped_frames_total` | counter | | `Unmapped` |
 | `openstreamer_stream_drift_breaks_total` | counter | | `Clock.DriftBreaks` |
 | `openstreamer_hub_subscribers` | gauge | `name` | `len(hub.Stats())` per served name |
@@ -555,7 +600,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 | `openstreamer_transcoder_encoder_fallbacks_total` | counter | | `Child.EncoderFallbacks` |
 | `openstreamer_transcoder_media_errors_total` | counter | `kind` = `audio_corrupt`, `video_corrupt`, `audio_dropped`, `reanchors`, `dropped_tracks` | `Child.*` |
 | `openstreamer_transcoder_thumbnails_total` | counter | `result` = `ok`, `failed` | `Child.Thumbnails`, `Child.ThumbnailsFailed` (or the Thumbnailer's) |
-| `openstreamer_push_up` | gauge | `target` (index) | 1 when the pusher's state is `rtmppush.StatePublishing` |
+| `openstreamer_push_up` | gauge | `target` (8 hex digits of the URL's SHA-256) | 1 when the pusher's state is `rtmppush.StatePublishing` |
 | `openstreamer_push_connects_total`, `_failures_total`, `_republishes_total`, `_messages_total` | counter | `target` | the pusher's `Stats` |
 
 Transcoder families are written only for a stream with a ladder or a thumbnailer.
@@ -566,7 +611,7 @@ Transcoder families are written only for a stream with a ladder or a thumbnailer
 func TestCheck(t *testing.T)
 // one row per Check rule: a URL ingest.Parse refuses; an encoded rung with Transcoder ""; an image watermark with AssetsDir "";
 // an asset that does not exist; a watermark next to a copy rung; a thumbnail with Transcoder ""; a push that is not rtmp://;
-// an SRT listen input on SRTPlay's port; an RTMP listen input publishing at live/cam on RTMPPlay with RTMPApp "live".
+// an RTMP listen input publishing at live/cam on RTMPPlay with RTMPApp "live" (and at live/cam_720 for a rung 720).
 // Each error starts "stream: check:" and holds no password. A copy-only ladder with copy audio and no binary passes.
 func TestSupervisorServes(t *testing.T)
 // no ladder, every output on: View.Gen is 1, Single and Packs have exactly "cam"; state goes starting → running; the tap on
@@ -579,6 +624,8 @@ func TestSupervisorOutputEditInPlace(t *testing.T)
 // the test on Single["cam"]. Submit(rtsp off) answers ChangeOutputs: the "rtsp cam" channel is closed, the other three get the
 // next 50 frames with no Lost; View.Gen is still 1; the same *hub.Hub and *live.Packager pointers; both pushers' Connects still 1;
 // a new "rtsp cam" subscription comes back closed. Submit(rtsp on): it subscribes again. Repeated for httpts, rtmp and srt.
+// The re-enable order is pinned: a goroutine that subscribes "rtsp cam" the moment View().Outputs.RTSP turns true (polled in a
+// tight loop, 200 rounds of off and on) never gets a closed subscription.
 func TestSupervisorPackagerEdit(t *testing.T)
 // hls+dash → dash only: the Packager pointers are unchanged and still listing segments; → neither: Packs is empty and
 // the "packager cam" subscriber is gone from hub.Stats(); → hls: new packagers, and "rtmp cam" saw no Lost throughout.
@@ -593,24 +640,52 @@ func TestSupervisorRestartBackoff(t *testing.T)
 // After sees 1 s, 2 s, 4 s … 30 s, 30 s; a generation that lives 60 s (fake Now) resets it to 1 s. Restarts counts each.
 func TestSupervisorDeadInput(t *testing.T)
 // an input whose Open always fails with an error naming "rtsp://u:hunter2@h/x": the supervisor stays in one generation (the
-// pipeline retries), state "starting", LastError without "hunter2"; when Open starts succeeding the state becomes "running".
+// pipeline retries), state "starting", stream_up 0, LastError "input 0: …" without "hunter2" and LastErrorAt set; when Open
+// starts succeeding the state becomes "running" and stream_up 1, and LastError is still there.
+func TestSupervisorInputLoss(t *testing.T)
+// running, then the only input's reader fails and every reopen fails: within the stall limit the state is "no_input" and
+// openstreamer_stream_up is 0, although View().Source.Live() is still true; Gen is unchanged (no rebuild). The reader comes
+// back: "running" and 1 again.
+func TestSupervisorEOFIsNotAnError(t *testing.T)
+// an input whose reader returns io.EOF after 50 frames and reopens fine: after three rounds LastError is empty,
+// openstreamer_stream_input_eof_total is 3, and Restarts is 0.
+func TestSupervisorSpawnFails(t *testing.T)
+// (a) a ladder with Env.Transcoder naming a file that does not exist (Check passes: the path is only configured): one
+// generation, Restarts 0, LastError starts "transcoder: " and names the spawn failure, the transcoder's Spawns rises with the
+// fake After; (b) the same for a thumbnail-only stream: LastError starts "thumbnailer: ".
+func TestGenerationRunnerFailure(t *testing.T)
+// every long-lived part of a generation (pipeline, transcoder, thumbnailer) is started through one unexported helper,
+// g.run(name string, f func(context.Context) error), which closes g.failed with "<name>: <err>" when f returns while g's
+// context is live, whatever f returns, and does nothing when it returns after the cancel. Called with a function that
+// returns an error, for each of the three names: the supervisor goes to "backoff", Restarts is 1, LastError has the name.
+// (The Thumbnailer has no fatal return today; this pins the rule for when it gets one.)
+func TestSupervisorAssetGone(t *testing.T)
+// an image watermark from a temp AssetsDir; the stream runs (Gen 1). The asset file is deleted, then the generation is made
+// to fail (the fake child of another wire version on respawn): the next build fails, state "backoff", LastError starts
+// "build: " and names the asset, View() is empty, nothing is subscribed anywhere, and the fake After keeps doubling. The file
+// is put back: the next attempt runs (a new Gen). A Submit asking for a rebuild while the asset is gone is answered ChangeRebuild.
+func TestSupervisorWaitsForPredecessor(t *testing.T)
+// NewSupervisor(sp, env, after) with after open: Run builds nothing (Open is not called) until after is closed; cancelling ctx
+// first makes Run return. Two supervisors of one spec with an RTMP listen input, the second chained on the first's Done: the
+// first is cancelled and the second started at once; the second's LastError never holds "already registered" or
+// "address already in use", and it becomes "running" when a publisher connects.
 func TestSupervisorStopDuringBackoff(t *testing.T)
 // in "backoff" with a 30 s wait pending: cancelling ctx makes Run return within 1 s; and, separately, a Submit during the
 // wait is applied at once (Gen advances without the fake After firing).
 func TestSupervisorSubmitOrder(t *testing.T)
 // 50 Submits alternating two output sets, sent without waiting: every channel answers, in order, and the final View.Outputs
 // is the last spec's. A Submit after Run returned gets a closed channel.
-func TestSupervisorNoLeaks(t *testing.T) // start, 3 output edits, 1 rebuild, stop: runtime.NumGoroutine returns to its starting value within 2 s
+func TestSupervisorNoLeaks(t *testing.T) // not parallel, like every test of this package (none calls t.Parallel, so the count is this test's): start, 3 output edits, 1 rebuild, stop: runtime.NumGoroutine returns to its starting value within 2 s
 func TestCollect(t *testing.T)
-// a laddered stream with one push: metricstest.Parse accepts the output; the families of the table are present with
+// a laddered stream with two pushes; removing the first leaves the second's target label and counters as they were. Then: metricstest.Parse accepts the output; the families of the table are present with
 // stream="cam"; openstreamer_transcoder_encoder_fallbacks_total{stream="cam"} is the fake child's count; no label value contains "://".
-func TestStatusRedacts(t *testing.T) // inputs and push targets in Status hold no password or stream key; json.Marshal(Status) neither
+func TestStatusRedacts(t *testing.T) // inputs, push targets and every LastError in Status hold no password or stream key; json.Marshal(Status) neither; a push's ID is 8 hex digits
 ```
 
 - [ ] **Step 2: Run** `go test -race -count=1 ./internal/stream/` — compile failure.
 - [ ] **Step 3: Implement** `env.go` and `Check`; run `-run TestCheck` — pass.
 - [ ] **Step 4: Implement** the generation, the loop, `reattach` and `teardown`; run `-run 'TestSupervisor'` — pass.
-- [ ] **Step 5: Implement** `Status`, `Shot` and `Collect`; run `go test -race -count=1 ./internal/stream/` — pass; then `-count=20 -run 'TestSupervisor(OutputEditInPlace|SubmitOrder|NoLeaks)'` — pass.
+- [ ] **Step 5: Implement** `Status`, `Shot` and `Collect`; run `go test -race -count=1 ./internal/stream/` — pass; then `-count=20 -run 'TestSupervisor(OutputEditInPlace|SubmitOrder|NoLeaks|WaitsForPredecessor)'` — pass.
 - [ ] **Step 6: Commit** `feat(stream): the per-stream supervisor with in-place output edits`
 
 ### Task 8: `stream.Manager`
@@ -649,11 +724,11 @@ type PutResult struct {
 type Manager struct{ /* unexported */ }
 // NewManager takes the streams the store loaded. env.Lookup is replaced by the manager's CopyHub.
 func NewManager(env Env, st Store, initial []spec.Stream) *Manager
-// Run starts a supervisor for every enabled initial stream that passes Check (one that fails is kept, stopped, with the
+// Run starts a supervisor for every enabled initial stream that passes Check and the claims, in name order (one that fails is kept, stopped, with the
 // error as its LastError) and returns when ctx ends and every supervisor has stopped.
 func (m *Manager) Run(ctx context.Context)
 func (m *Manager) Put(ctx context.Context, sp spec.Stream, ifMatch string) (PutResult, error)
-func (m *Manager) Delete(ctx context.Context, name, ifMatch string) error
+func (m *Manager) Delete(ctx context.Context, name, ifMatch string) error // cancels the supervisor; does not wait for it
 func (m *Manager) Get(name string) (spec.Stream, bool)
 func (m *Manager) List() []spec.Stream                    // sorted by name
 func (m *Manager) Status(name string) (Status, bool)      // a stream without a supervisor reports state "stopped"
@@ -664,11 +739,29 @@ func (m *Manager) CopyHub(name string) (*hub.Hub, bool)   // <stream>: its sourc
 func (m *Manager) Collect(w *metrics.Writer)              // every supervisor's Collect, by name, and openstreamer_streams{state}
 ```
 
-`Put`, under the manager's mutex: `ErrClosed` after `Run` ended; `sp.Validate()` and `Check` (`ErrInvalid`); `ifMatch`, when not empty, must be `*` or the current spec's `ETag()`, and a missing stream fails it (`ErrPrecondition`); a new name with `MaxStreams` streams present is `ErrTooMany`; the claims of the resulting set (`ErrConflict`); an equal document returns `unchanged` without writing; then `st.Put` (its error is returned as is, and nothing changed); then the map; then one of: start a supervisor (`created` or `started`), stop one (`stopped`: cancel, and wait after unlocking), or `Submit`. **The mutex is released before waiting** for a `Submit`'s answer or a stopped supervisor; because `Submit` is queued under the mutex, two `Put`s of one stream reach the supervisor in the order they reached the store. The wait ends early when `ctx` ends, in which case the edit stays applied and `Applied` is what `spec.Diff` said. A `disabled` stream has no supervisor; `Put` of a disabled, never-started stream is `created`.
+**Locks.** Edits (`Put`, `Delete`) are serialised by one mutex, `edit`. Readers never take it: the streams live in an immutable `map[string]*entry` behind an `atomic.Pointer`, which an edit replaces with a changed copy (`entry` holds the spec, the supervisor or nil, the load-time error or ""). So a lookup from an output server, a status request and a scrape never wait for a store `fsync` or for another stream's edit.
 
-The lookups split a served name at its first `_` (stream names have none), find the supervisor, read its `View` and test the output's flag: `Hub(OutRTSP, "cam_720")` is `View.Single["cam_720"]` when `View.Outputs.RTSP`. They take a read lock only to find the supervisor.
+`Put`, holding `edit`: `ErrClosed` after `Run` ended; `sp.Validate()` and `Check` (`ErrInvalid`); `ifMatch`, when not empty, must be `*` or the current spec's `ETag()`, and a missing stream fails it (`ErrPrecondition`); a new name with `MaxStreams` streams present is `ErrTooMany`; the claims of the resulting set (`ErrConflict`); an equal document returns `unchanged` without writing; then `st.Put` (its error is returned as is, and nothing changed); then one of: create a supervisor chained on the name's predecessor (`created` or `started`), cancel one (`stopped`), or `Submit`; and **last** the map swap. `edit` is released before waiting for a `Submit`'s answer; because `Submit` is queued while `edit` is held, two `Put`s of one stream reach the supervisor in the order they reached the store. The wait ends early when `ctx` ends, in which case the edit stays applied and `Applied` is what `spec.Diff` said. A `disabled` stream has no supervisor; `Put` of a disabled, never-started stream is `created`.
 
-Claims (`claims.go`): `listenClaim(url string) (key string, ok bool)` gives `rtmp|<addr key>|<normalised path>` for an RTMP listen input (`rtmpsrv.AddrKey`, `rtmp.NormalizePath`, default port 1935) and `udp|<port>|<host or "">` for a UDP or SRT listen input (`ingest.Parse(url).Passive`); two UDP claims collide on equal ports when the hosts are equal or either is a wildcard. `copy://` cycles: a depth-first walk over "stream reads stream" edges (a `copy://x_label` edge goes to `x`), reporting the path as `a -> b -> a`.
+**One supervisor per name at a time (R-D5).** The manager keeps, per name, the `Done()` of the last supervisor it started, also after that stream was stopped or deleted. Stopping, deleting and disabling only cancel and do not wait; a supervisor created later for the same name gets that channel as `after` and waits for it itself before it builds. `Delete` returns when the store file is gone and the supervisor is cancelled; `Manager.Run` waits for every supervisor before it returns.
+
+The lookups split a served name at its first `_` (stream names have none), find the entry in the current map, read the supervisor's `View` and test the output's flag: `Hub(OutRTSP, "cam_720")` is `View.Single["cam_720"]` when `View.Outputs.RTSP`.
+
+**Claims** (`claims.go`). `claimsOf(sp spec.Stream) []Claim` gives one claim per listen input: an RTMP listen input (`mode=listen`, default port 1935) is `{RTMP: true, Host, Port, Path}` with the host normalised as `rtmpsrv.AddrKey` does and the path by `rtmp.NormalizePath`; a UDP or SRT listen input (`ingest.Parse(url).Passive`) is `{UDP: true, Host, Port}`; **a UDP input whose host is a multicast address gives no claim**. `conflict(a, b Claim) bool`:
+
+```go
+func conflict(a, b Claim) bool {
+	if a.UDP != b.UDP || a.Port != b.Port { return false }
+	if a.RTMP && b.RTMP && a.Host == b.Host {    // one shared RTMP listener
+		return a.Path != "" && a.Path == b.Path  // two publishers of one path; a play listener ("" path) shares with all
+	}
+	return a.Host == b.Host || a.Host == "" || b.Host == ""
+}
+```
+
+The set checked is `env.Reserved` (owner `server`) plus every stream's claims, the edited stream's replaced by the new spec's; every pair with different owners, **and every pair inside the new spec**, must not conflict. So RTMP on `:P` and on `127.0.0.1:P` conflict whatever their paths (two listeners cannot both bind), a UDP input on the SRT server's port conflicts, and a listen input on the HTTP, API or RTSP port conflicts. The error names both owners and the address, never a path's key. **At load** (`Run`) the streams are taken in name order through the same rule, starting from `env.Reserved`: a stream that conflicts with the server or with an earlier stream is kept, without a supervisor, state `stopped`, its `LastError` naming the claim; it starts when a later `Put` resolves the conflict.
+
+`copy://` cycles: a depth-first walk over "stream reads stream" edges (a `copy://x_label` edge goes to `x`), reporting the path as `a -> b -> a`.
 
 - [ ] **Step 1: Write the failing tests** (a fake `Store` that records calls and can fail; `scriptedOpen` from Task 7)
 
@@ -680,10 +773,23 @@ func TestManagerPutCreatesAndEdits(t *testing.T)
 func TestManagerPutOrderStoreFirst(t *testing.T) // the store's Put failing returns its error; Get still returns the old spec and the generation did not move
 func TestManagerInvalid(t *testing.T)            // Validate and Check failures are ErrInvalid, not stored; 1001st stream is ErrTooMany
 func TestManagerIfMatch(t *testing.T)            // a stale ETag → ErrPrecondition on Put and Delete; the current one and "*" pass; If-Match on a missing stream fails
+func TestConflict(t *testing.T)
+// the rule alone, as a table of claim pairs. Conflict: UDP :P / UDP :P; UDP 0.0.0.0:P / UDP 127.0.0.1:P; UDP 10.0.0.1:P twice;
+// RTMP 127.0.0.1:P path a twice; RTMP :P path a / RTMP 127.0.0.1:P path b; RTMP :P path a / TCP :P (the HTTP listener);
+// RTMP 127.0.0.1:P path a / RTMP play on :P. No conflict: different ports; TCP :P / UDP :P; UDP 10.0.0.1:P / UDP 10.0.0.2:P;
+// RTMP 127.0.0.1:P paths a and b; RTMP 127.0.0.1:P path a / RTMP play on 127.0.0.1:P.
+func TestClaimsOf(t *testing.T)
+// rtmp://:1935/live/k?mode=listen → RTMP, host "", port 1935, path live/k; rtmp://h/live/k (a pull) → none; udp://:5000 and
+// srt://0.0.0.0:5000?mode=listener → UDP, host "", 5000; udp://239.1.1.1:5000 and udp://[ff02::1]:5000 → none; an RTSP pull → none.
 func TestManagerListenClaim(t *testing.T)
-// stream a with rtmp://127.0.0.1:P/in/key?mode=listen; Put of b with the same URL → ErrConflict, nothing stored, a's generation
-// unchanged. The same for two udp://:P inputs, for udp://0.0.0.0:P against srt://127.0.0.1:P?mode=listener, and not for
-// different ports or different RTMP paths. Editing a itself, keeping its input, is not a conflict.
+// Reserved: HTTP 127.0.0.1:H, API 127.0.0.1:A, RTMP play 127.0.0.1:R, RTSP 127.0.0.1:S (TCP), SRT 127.0.0.1:U (UDP).
+// Stream a holds rtmp://127.0.0.1:R/in/key?mode=listen and udp://:P. Each of these Puts is ErrConflict, stores nothing and
+// leaves a's generation unchanged: b with a's RTMP URL; b with rtmp://:R/in/other?mode=listen; b with udp://127.0.0.1:P;
+// b with srt://127.0.0.1:P?mode=listener; b with udp://:U (the SRT server's port); b with rtmp://127.0.0.1:H/x/y?mode=listen,
+// and the same on A and on S; b with two inputs udp://:Q and srt://:Q?mode=listener (inside one spec). Each error names the
+// address and both owners ("a", "server" or "b") and holds no "key". Accepted: b with rtmp://127.0.0.1:R/in/other?mode=listen
+// (the shared listener, another path); b with udp://:Q; b and c both with udp://239.1.1.1:P2; a Put of a itself keeping its
+// inputs; and, after a is deleted, b with a's old URLs.
 func TestManagerCopyCycle(t *testing.T) // a copies b, Put b copying a → ErrConflict naming "b -> a -> b"; a copying a_720 → conflict; a copying an unknown stream is accepted
 func TestManagerLookups(t *testing.T)
 // laddered cam with rtsp off: Hub(OutRTMP,"cam_360") found, Hub(OutRTSP,"cam") not, Hub(OutRTMP,"cam_x"), "nope", "" and "_" not;
@@ -691,18 +797,25 @@ func TestManagerLookups(t *testing.T)
 // CopyHub("cam") is the source, CopyHub("cam_360") the rendition.
 func TestManagerDelete(t *testing.T)   // Delete stops the supervisor, removes the store file, lookups fail; a second Delete is ErrNotFound
 func TestManagerRunRestores(t *testing.T)
-// initial: two enabled, one disabled, one whose Check fails (an encoded rung, Transcoder ""): two run, the disabled is "stopped",
-// the failing one is "stopped" with LastError; List returns all four. Cancelling ctx stops everything; a later Put is ErrClosed.
+// initial: two enabled, one disabled, one whose Check fails (an encoded rung, Transcoder ""), and two more, "y" and "z", with
+// the same udp://:P input, plus "x" with a listen input on a Reserved port: two run, y runs, the disabled is "stopped", the
+// failing one, z and x are "stopped" with a LastError naming the reason (for z: the address and "y"); List returns all seven.
+// A Put of z with another port starts it. Cancelling ctx stops everything; a later Put is ErrClosed.
 func TestManagerConcurrentPuts(t *testing.T)
-// 20 goroutines Put one stream, alternating an output edit and a rebuild edit, and one goroutine Deletes it half-way; then
-// one more Put. No deadlock within 10 s; the final Get equals the store's last Put; View().Outputs equals it; no goroutine left
-// after Run ends.
+// not parallel. The stream has an RTMP listen input and a udp:// listen input on real loopback ports (Env.Open nil for this
+// test), so an overlap of two generations would show. 20 goroutines Put it, alternating an output edit and a rebuild edit,
+// while one goroutine Deletes and re-creates it three times; then one more Put. No deadlock within 20 s; the final Get equals
+// the store's last Put; View().Outputs equals it; no Status sampled every 5 ms during the test and no captured log line holds
+// "already registered", "address already in use" or "bind:"; no goroutine is left after Run ends.
+func TestManagerReadersDoNotWaitForEdits(t *testing.T)
+// the fake store blocks inside Put until released: meanwhile Hub, Packager, CopyHub, Get, List, Status and Collect for this
+// and another stream all return within 100 ms, and show the state before the edit; after the release they show the new one.
 func TestManagerCollect(t *testing.T)  // openstreamer_streams{state="running"} 2, {state="stopped"} 1; every per-stream family carries a stream label of a known name
 ```
 
-- [ ] **Step 2: Run** `go test -race -count=1 -run 'TestManager|TestListenClaim|TestCopyCycle' ./internal/stream/` — compile failure.
+- [ ] **Step 2: Run** `go test -race -count=1 -run 'TestManager|TestConflict|TestClaimsOf' ./internal/stream/` — compile failure.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** `go test -race -count=1 ./internal/stream/` and `-count=20 -run TestManagerConcurrentPuts` — pass.
+- [ ] **Step 4: Run** `go test -race -count=1 ./internal/stream/` and `-count=20 -run 'TestManager(ConcurrentPuts|ReadersDoNotWaitForEdits)'` — pass.
 - [ ] **Step 5: Commit** `feat(stream): the manager, cross-stream checks and output lookups`
 
 ### Task 9: `internal/api` — the REST API and its OpenAPI document
@@ -712,7 +825,7 @@ func TestManagerCollect(t *testing.T)  // openstreamer_streams{state="running"} 
 - Test: `internal/api/api_test.go`, `streams_test.go`, `openapi_test.go`
 
 **Interfaces:**
-- Consumes: Task 8's `PutResult` and errors, Task 7's `Status`, Task 2, Task 3.
+- Consumes: Task 8's `PutResult` and errors, Task 7's `Status`, Task 2 (`spec`), Task 3 (`metrics.Writer`), Task 4 (`logging.Scrub`, for error messages).
 - Produces:
 
 ```go
@@ -775,7 +888,7 @@ Errors are `{"error":{"code":"…","message":"…"}}` with `Content-Type: applic
 | 500 | `internal` | anything else (a store failure); the cause is logged, the message is "internal error" |
 | 503 | `unavailable` | `stream.ErrClosed` |
 
-Every response sets `Cache-Control: no-store` (except the thumbnail) and `X-Content-Type-Options: nosniff`. Responses redact (`spec.Stream.Redacted`) unless the query is exactly `secrets=1`. The access log line (R-D10) and the request counter use `r.Pattern`'s path as `route`; a request no pattern matches counts under `route="unmatched"`. A failed authentication is logged at `warn` at most once every 10 s (`Options.Now`), with the remote address and never the header.
+Every response sets `Cache-Control: no-store` (except the thumbnail) and `X-Content-Type-Options: nosniff`. Responses redact (`spec.Stream.Redacted`) unless the query is exactly `secrets=1`. The access log line (R-D10) and the request counter use `r.Pattern`'s path as `route`; a request no pattern matches counts under `route="unmatched"`. The counter's `method` is the request's when it is `GET`, `PUT`, `DELETE`, `HEAD` or `OPTIONS` and `other` for anything else, so a client cannot mint series with invented methods. The counter and the access log wrap the whole handler, **outside** the auth check: a 401 is counted and logged like any answer, under the same bounded labels (at most 6 methods × the routes above + `unmatched` × the status codes of the error table). A failed authentication is logged at `warn` at most once every 10 s (`Options.Now`), with the remote address and never the header.
 
 `api/openapi.json` is OpenAPI 3.1: every route above with its parameters, the `If-Match` and `ETag` headers, the `secrets` query parameter, a `bearerAuth` security scheme on all but `/healthz`, and `components.schemas` for `Stream`, `Input`, `Transcode`, `Rendition`, `Audio`, `Watermark`, `Thumbnail`, `Outputs`, `Push`, `Status`, `PutResult` and `Error`, each property with a one-line description and the limits of Task 2's `Validate`.
 
@@ -793,7 +906,10 @@ func TestPutErrors(t *testing.T)
 // each row of the error table reachable from PUT: malformed JSON 400, unknown field 400, text/plain 415, 1 MiB + 1 byte 413,
 // ErrInvalid 422, ErrConflict 409, ErrPrecondition 412, ErrTooMany 422, a store error 500 with message "internal error" and
 // the cause in the log, ErrClosed 503. Each body is the error object with the table's code.
-func TestPathNames(t *testing.T) // PUT and GET of "..", "a%2Fb", "A", "x_y" and a 64-byte name → 404, and Streams was not called
+func TestPathNames(t *testing.T)
+// PUT and GET of "%2e%2e", "a%2Fb", "A", "x_y", "con" and a 64-byte name → 404 not_found, and Streams was not called. A literal
+// "/api/v1/streams/../x" is cleaned by ServeMux into a redirect before any handler: assert only that the answer is not 2xx
+// and Streams was not called.
 func TestResponsesRedact(t *testing.T)
 // a stored spec with rtsp://u:hunter2@h/a and push rtmp://h/live/secretkey: GET, the list and the PUT response hold neither
 // "hunter2" nor "secretkey"; with ?secrets=1 they hold both; ?secrets=0 and ?secrets=1&x=1 redact.
@@ -807,7 +923,9 @@ func TestStatusAndThumbnail(t *testing.T)
 func TestMetricsAndPprof(t *testing.T) // /metrics is the given handler behind the token; /debug/pprof/ is 200 behind it and 401 without
 func TestRequestCounter(t *testing.T)
 // after 2 GETs of two different streams and one 404 path: Collect has openstreamer_api_requests_total{method="GET",
-// route="/api/v1/streams/{name}",code="200"} 2 and a route="unmatched" series; no series holds a stream name.
+// route="/api/v1/streams/{name}",code="200"} 2 and a route="unmatched" series; no series holds a stream name. Requests with
+// the methods "BREW", "get" and a 40-byte random token all land in method="other" (one series per route and code, however
+// many methods are tried); a request without a token is counted once under code="401" with its matched route.
 func TestAccessLog(t *testing.T) // one info line per request with method, route, status, duration; a request with Authorization and ?secrets=1 logs neither the token nor the query
 func TestOpenAPIMatchesRoutes(t *testing.T)
 // api/openapi.json parses; the set of "METHOD path" in its paths equals Routes() minus the pprof routes; every operation
@@ -830,7 +948,7 @@ func TestOpenAPIMatchesSpec(t *testing.T)
 - Test: `internal/server/config_test.go`, `server_test.go`, `media_test.go`, `cmd/openstreamer/main_test.go`
 
 **Interfaces:**
-- Consumes: Tasks 3, 4, 5 (`Registry.Addr`), 6, 8, 9; `rtmpplay.New`, `rtspplay.New`, `srtout.New`, `httpts.Handler`, `live.Handler`, `rtmpsrv.Default.RegisterPlay`.
+- Consumes: Tasks 3, 4, 6, 7 (`Claim`, `Env`), 8, 9; `rtmpplay.New`, `rtspplay.New`, `srtout.New`, `httpts.Handler`, `live.Handler`, `rtmpsrv.Default.RegisterPlay`.
 - Produces:
 
 ```go
@@ -846,12 +964,13 @@ type Config struct {
 	RTMP struct{ Listen, App string } `json:"rtmp"`                 // json "listen", "app"; "" listen: off; app default "live"
 	RTSP struct{ Listen, App string; UDP bool } `json:"rtsp"`       // json "listen", "app", "udp"
 	SRT  struct{ Listen, App string; LatencyMS int } `json:"srt"`   // json "listen", "app", "latency_ms" (default 120, 1…65535)
-	Transcoder struct{ Binary string `json:"binary"` } `json:"transcoder"` // "" : ostranscoder next to the executable when it exists, else none
+	Transcoder struct{ Binary string `json:"binary"` } `json:"transcoder"` // "": ostranscoder next to the executable when it exists, else none; a path given must be an executable regular file
 	AssetsDir  string `json:"assets_dir"`                           // default <data_dir>/assets when that directory exists, else none
 	Log struct{ Level, Format string } `json:"log"`                 // json "level", "format"
 }
 
-// LoadConfig reads and checks the file: strict JSON, defaults filled, addresses well-formed, the token present and long enough.
+// LoadConfig reads and checks the file: strict JSON, defaults filled, addresses well-formed, the token present and long
+// enough, and a configured transcoder binary present and executable (a server that cannot spawn it must not start).
 func LoadConfig(path string, getenv func(string) string) (Config, error)
 
 type Options struct {
@@ -861,7 +980,8 @@ type Options struct {
 type Addrs struct{ HTTP, API, RTMP, RTSP, SRT string } // host:port as bound; "" when off
 
 type Server struct{ /* unexported */ }
-// New opens the store, loads the streams, and binds every listener, so Addrs is final when it returns. It starts no stream.
+// New binds every listener (so Addrs is final when it returns), then opens the store and loads the streams into a Manager
+// whose Env carries the bound addresses. It starts no stream.
 func New(cfg Config, opt Options) (*Server, error)
 func (s *Server) Addrs() Addrs
 func (s *Server) Manager() *stream.Manager
@@ -873,7 +993,7 @@ func (s *Server) Run(ctx context.Context) error
 func LiveOutputs(dir, file string) []stream.Output
 ```
 
-Wiring, following osdev's `run`: the media mux has `GET /live/{stream}/stream.ts` → `httpts.Handler(func(n) { return m.Hub(OutHTTPTS, n) }, 0)` and `/live/` → a gate in front of `live.Handler`: for `/live/{stream}/{dir}/{file}`, 404 unless `m.Packager(out, stream)` finds a packager for one `out` of `LiveOutputs(dir, file)`; the `live.Handler` behind it looks the packager up with either output. RTMP play registers `rtmpplay.New(lookup(OutRTMP), …)` on `rtmpsrv.Default` (the registry ingest's listen inputs share) and reads the port from `Registry.Addr`. RTSP and SRT start as osdev's `startRTSP` and `startSRT`. The media server has osdev's `newServer` limits (no read or write timeout: HTTP-TS responses are long-lived); the API server has `ReadHeaderTimeout` 10 s, `ReadTimeout` 30 s, `WriteTimeout` 60 s, `IdleTimeout` 2 min, `MaxHeaderBytes` 64 KiB. The metrics registry gets `metrics.Process`, `Manager.Collect`, `API.Collect`, `openstreamer_build_info{version,goversion} 1`, `openstreamer_store_load_errors` (the number of files `Load` skipped; each is also logged at `error`), and from `collect.go`:
+Wiring, following osdev's `run`: the media mux has `GET /live/{stream}/stream.ts` → `httpts.Handler(func(n) { return m.Hub(OutHTTPTS, n) }, 0)` and `/live/` → a gate in front of `live.Handler`: for `/live/{stream}/{dir}/{file}`, 404 unless `m.Packager(out, stream)` finds a packager for one `out` of `LiveOutputs(dir, file)`; the `live.Handler` behind it looks the packager up with either output. RTMP play registers `rtmpplay.New(lookup(OutRTMP), …)` on `rtmpsrv.Default` (the registry ingest's listen inputs share), on a concrete address: `resolveRTMP(addr string) (string, error)` returns `addr` unchanged when its port is not 0 and otherwise does R-D13's bind, read, close, and `New` retries the pair resolve-and-register up to 5 times while registering fails with the address in use. RTSP and SRT start as osdev's `startRTSP` and `startSRT`, on listeners `New` binds itself. `New` then fills the manager's `Env` from what was bound: `RTMPPlay` (the concrete address) and `RTMPApp`, and `Reserved` with one `stream.Claim` per listener, owner `server`: HTTP, API and RTSP as TCP claims, RTMP as `{RTMP: true}` with an empty path, SRT as a UDP claim, each with the host normalised (a wildcard is `""`) and the real port. The media server has osdev's `newServer` limits (no read or write timeout: HTTP-TS responses are long-lived); the API server has `ReadHeaderTimeout` 10 s, `ReadTimeout` 30 s, `WriteTimeout` 60 s, `IdleTimeout` 2 min, `MaxHeaderBytes` 64 KiB. The metrics registry gets `metrics.Process`, `Manager.Collect`, `API.Collect`, `openstreamer_build_info{version,goversion} 1`, `openstreamer_store_load_errors` (the number of files `Load` skipped; each is also logged at `error`), and from `collect.go`:
 
 | Family | Type | Labels | Source |
 |---|---|---|---|
@@ -892,13 +1012,20 @@ Shutdown order when `ctx` ends: stop accepting API requests (`Shutdown`, 2 s, th
 ```go
 func TestLoadConfig(t *testing.T)
 // defaults filled from {"data_dir":"/x","api":{"token":"…16+…"}}; the env token wins over the file's; an unknown key, no data_dir,
-// no token, a 15-byte token, "listen":"nope", srt latency 0 with a listen address or 70000, log level "loud" are errors,
+// no token, a 15-byte token, "listen":"nope", srt latency 0 with a listen address or 70000, log level "loud", and a
+// transcoder.binary that does not exist, is a directory or is not executable are errors,
 // and no error text contains the token. openstreamer.example.json decodes strictly (with the token from getenv) and names no forbidden port.
 func TestLiveOutputs(t *testing.T) // hls/index.m3u8, hls/3.ts, hls/v1.m3u8 → [hls]; cmaf/master.m3u8, cmaf/a1.m3u8 → [hls]; cmaf/index.mpd → [dash]; cmaf/init-0-1.mp4, cmaf/0-7.m4s → [hls, dash]; x/y → nil
 func TestServerStartsAndStops(t *testing.T)
-// New binds five listeners with ports above 0; /healthz on the API address is 200; the media address answers 404 for an
-// unknown stream; cancelling ctx makes Run return nil within 5 s, after which all five ports refuse connections and
-// runtime.NumGoroutine is back within 2 s.
+// not parallel (it counts goroutines; no test of this package calls t.Parallel). Every listen address is 127.0.0.1:0,
+// rtmp.listen included: New binds five listeners with five different ports above 0, and a TCP dial to Addrs().RTMP connects;
+// /healthz on the API address is 200; the media address answers 404 for an unknown stream; cancelling ctx makes Run return
+// nil within 5 s, after which all five ports refuse connections and runtime.NumGoroutine is back within 2 s.
+func TestResolveRTMP(t *testing.T) // "127.0.0.1:0" → a 127.0.0.1 address with a port above 0 that can be bound; "127.0.0.1:19351" and ":19351" come back unchanged; "nope" is an error
+func TestServerReserved(t *testing.T)
+// through the API of a running server: a stream with a udp:// listen input on the SRT port, and ones with an RTMP listen input
+// on the HTTP, the API and the RTSP port, are each refused with 409; one with rtmp://<Addrs().RTMP>/in/key?mode=listen is
+// accepted (it shares the play listener) and one publishing at live/<its own name> there is refused with 422.
 func TestServerListenersOff(t *testing.T) // rtmp, rtsp and srt listen "" → Addrs has "" for them and a stream with those outputs is still accepted and served over HLS
 func TestServerLiveGate(t *testing.T)
 // a stream from a looped fixture with hls on and dash off: hls/index.m3u8 and cmaf/master.m3u8 are 200, cmaf/index.mpd is 404,
@@ -925,51 +1052,70 @@ func TestRun(t *testing.T)
 - Create: `internal/e2e/m5a_test.go`
 
 **Interfaces:**
-- Consumes: `server.New`, `server.Config`, `Server.Addrs`, `Server.Manager` (only for the tap: `Manager().CopyHub`), `metricstest`, `conform.ReadHLS`/`ReadDASH`/`ReadTS`/`ReadRTMP`/`ReadRTSP`, `testpeer`, and the package's existing helpers (`fixtureBytes`, `tsGaps`, `assertTSMatchesHub`, `rawHTTP`, `rawSRT`).
-- Produces, for later milestones' tests: `m5aServer(t, mutate func(*server.Config)) *m5a` (a running server on ephemeral ports with a captured log buffer, stopped by `t.Cleanup`), `(*m5a).put(t, sp spec.Stream) (code int, applied string)`, `(*m5a).get(t, path string) (int, []byte)`, `(*m5a).url(out stream.Output, served string) string` (the play URL of an output: `http://…/live/<n>/hls/index.m3u8`, `…/cmaf/index.mpd`, `…/stream.ts`, `rtmp://…/live/<n>`, `rtsp://…/live/<n>`, `srt://…?streamid=live/<n>`), and `m5aSpec(name, input string) spec.Stream` (every output on, no push).
+- Consumes: `server.New`, `server.Config`, `Server.Addrs`, `Server.Manager` (in-process only for the tap and the packager identity: `Manager().CopyHub`, `Manager().Packager`), `metricstest`, `conform.ReadHLS`/`ReadDASH`/`ReadTS`/`ReadRTMP`/`ReadRTSP`, `testpeer`, and the package's existing helpers, used as they are: `recordHub` (m4a), `assertMatchesHub` (m3b1), `assertRTSPMatchesHub` (m3b2), `assertTSMatchesHub`, `tsFrames`, `tsGaps`, `conformBytes`, `rawHTTP`, `rawSRT` (m3b3), `kindCounts` (m3a).
+- Produces, for later milestones' tests: `m5aServer(t, mutate func(*server.Config)) *m5a` (a running server with every listener on `127.0.0.1:0` and a captured log buffer, stopped by `t.Cleanup`), `(*m5a).put(t, sp spec.Stream) (code int, applied string)`, `(*m5a).del(t, name string)`, `(*m5a).get(t, path string) (int, []byte)`, `(*m5a).metric(t, name string, labels ...string) float64` (a scrape through `metricstest.Find`), `(*m5a).url(out stream.Output, served string) string` (the play URL of an output: `http://…/live/<n>/hls/index.m3u8`, `…/cmaf/index.mpd`, `…/stream.ts`, `rtmp://…/live/<n>`, `rtsp://…/live/<n>`, `srt://…?streamid=live/<n>`), `(*m5a).tap(t, served string) *hubRecorder` (`recordHub` on `Manager().CopyHub(served)`), and `m5aSpec(name, input string) spec.Stream` (every output on, no push).
 
-The source is `file://<abs testdata/fixtures/h264_aac.ts>?loop=1`: a file input is paced in real time and each loop is one epoch change, which every reader below must also survive. The tests talk to the server over HTTP with the token; the only in-process access is the tap.
+The source is `file://<abs testdata/fixtures/h264_aac.ts>?loop=1`: a file input is paced in real time and each 6 s loop is one epoch change, which every reader below must also survive. The tests drive the server over HTTP with the token; the in-process access is the tap and the packager's identity.
 
-**The reader set** (`m5aReaders`): one long-lived reader per output of a served name, started together and stopped together: HLS-TS and DASH by `conform.ReadHLS`/`ReadDASH` polling for the span, HTTP-TS and SRT as raw byte captures (`rawHTTP`, `rawSRT`), RTMP by `conform.ReadRTMP`, RTSP by `conform.ReadRTSP` (TCP). `assertUninterrupted(t, readers, tap, except)` requires, for each reader not in `except`: it ended only because the test stopped it; no conform violation; per track, its frames are exactly the tap's frames between its own first and last DTS, each once, with the tap's epochs (TS captures through `assertTSMatchesHub` and `tsGaps == 0`); and the HLS playlists show a discontinuity only where the tap has an epoch change.
+**Measuring "not interrupted" (R-D12).** A row creates the stream, opens the tap (before any reader, so every reader joins at or after the tap's first keyframe), starts one reader per output, waits until they are connected, takes the counter baseline, makes its edits, and then **ends the stream with `DELETE`**. That last step is what makes a frame-exact comparison possible: the hub closes, each session reader gets its end of stream after the queued frames, and the tap ends on the same frame, so the capture and the tap are aligned at their ends, which is the contract of M3's helpers (`joinKey`: "received n video frames up to the hub's end"). No reader has to be stopped from outside, so `rawHTTP` and `rawSRT` are used as they are. The tap must be whole: `hubRecorder.lost == 0`, and no epoch without an anchor.
+
+*Connected* means: `openstreamer_output_sessions` is 1 for `rtmp`, `rtsp` and `srt`, and `openstreamer_hub_subscribers{name="cam"}` equals the tap, the four session readers, the packager and the pusher, when present. **The baseline is read after that**, so the readers' own connections are in it: `openstreamer_output_sessions_started_total` for `rtmp` and `rtsp`, `openstreamer_output_sessions{output="srt"}`, the status's `generation`, `input_switches`, `restarts`, `rebuilds` and `pushes[0].connects`, and with a ladder `transcoder.pid` and `transcoder.spawns`.
+
+| Output | Reader | Capture → tap, and the tolerance | Rule |
+|---|---|---|---|
+| RTMP | `conform.ReadRTMP`, to the end of the stream | FLV timestamps restart at each epoch and are milliseconds: `assertMatchesHub`'s mapping, DTS and PTS `floor((t − b)/90)` ms from the join keyframe's DTS `b`, exact, with the capture's epochs numbered from the join keyframe's hub epoch | `assertMatchesHub(tap, got)`: every tap video frame from the join keyframe to the end, once, with its key flag, and every audio frame presented from there; no conform violation |
+| RTSP (TCP) | `conform.ReadRTSP`, until the BYE | RTP timestamps are re-anchored per epoch: `assertRTSPMatchesHub`'s mapping, video PTS `t − b` exact with the parameter sets, audio PTS within 1 tick | `assertRTSPMatchesHub(tap, got)`; `RTPLost == 0`; `ByeTracks == 2`; no conform violation |
+| HTTP-TS | `rawHTTP`, then `tsFrames` | TS carries the hub's timestamps: one constant offset over the whole capture, exact (`assertTSMatchesHub`) | `assertTSMatchesHub(tap, got)`; `tsGaps(bytes) == 0`; `conformBytes` without a violation |
+| SRT | `rawSRT`, then `tsFrames` | as HTTP-TS | as HTTP-TS |
+| HLS-TS, HLS fMP4, DASH | `conform.ReadHLS` or `ReadDASH`, polling for the row's 14 s (`Duration`) | **A weaker rule, on purpose.** A segmented output has no session to end with the stream; its poll starts on a window that holds segments from before the tap, stops in the middle of an epoch, and a `DELETE` removes the playlist instead of ending it. So the capture and the tap share neither a start nor an end, and its timeline is the packager's per epoch, not the hub's | (a) no conform violation over the poll, which spans both edits (segment continuity, durations, a discontinuity at every epoch change and nowhere else); (b) inside every capture epoch, every video and audio DTS step is the tap's step for that kind (constant in this fixture; read from the tap): no hole of a frame or more; (c) every capture epoch that is neither its first nor its last holds exactly the per-kind frame counts (`kindCounts`) of a whole tap epoch, and there is at least one such epoch (else the row was too short and fails); (d) in-process, sampled every 200 ms across the edits: `Manager().Packager(…, "cam")` is the same pointer, and the `Seq` of its newest segment never goes back and the set of `Seq` seen is one run increasing by one |
+
+A lost frame in a segmented output's first or last capture epoch is therefore caught by (a) and (b) as a step, not by a count; that is the stated cost in R-D12.
+
+`assertUninterrupted(t, row, except ...stream.Output)` applies the table to every reader not in `except`, then compares the counters read **just before the `DELETE`** with the baseline: all equal, except `openstreamer_output_sessions_started_total` for the row's own output, which rose by exactly 1 when that output is RTMP or RTSP (the fresh reader that proves it works again), and `pushes[0].connects` on the push row.
 
 - [ ] **Step 1: Write the tests** (they fail until they are written right; the code they test exists)
 
 ```go
 func TestM5aEveryOutput(t *testing.T)
-// PUT sink (input rtmp://127.0.0.1:<rtmp port>/in/k0123456789?mode=listen, outputs hls) and PUT cam (m5aSpec with a push to
-// that URL): both 201 "created". For cam, 8 s of each of hls/index.m3u8, cmaf/master.m3u8, cmaf/index.mpd, stream.ts, RTMP,
-// RTSP and SRT: no violation, video and audio frames present, and at least one epoch change survived (the file looped).
-// sink's HLS has frames too (the push arrived and the listen input took it). GET cam/status: state "running", active_input 0,
-// two tracks, pushes[0].state "publishing" with connects 1. GET /api/v1/streams lists both, redacted (no "k0123456789").
+// PUT sink (input rtmp://<Addrs().RTMP>/in/k0123456789?mode=listen, outputs hls) and PUT cam (m5aSpec with a push to that
+// URL): both 201 "created". For cam, 8 s of each of hls/index.m3u8, cmaf/master.m3u8, cmaf/index.mpd, stream.ts, RTMP, RTSP and
+// SRT: no violation, video and audio frames present, and at least one epoch change survived (the file looped). sink's HLS
+// has frames too (the push arrived and the listen input took it). GET cam/status: state "running", active_input 0, two
+// tracks, pushes[0].state "publishing" with connects 1. GET /api/v1/streams lists both, redacted (no "k0123456789").
 func TestM5aEditOutputs(t *testing.T)
-// cam with every output and a push to sink. For each row of {rtsp, rtmp, srt, httpts, hls, dash, push}: start the reader set
-// and the tap; after 3 s PUT cam with that output off (push: the list emptied) → 200 "outputs"; after 3 s more PUT it back on
-// → 200 "outputs"; after 3 s stop the readers. Then:
-//   - the row's own reader ended at the first edit (a 404 for hls and dash paths; for push, sink's source goes quiet), and a
-//     fresh reader of that output works after the second edit;
-//   - assertUninterrupted for every other reader over the whole 9 s;
-//   - status.generation is unchanged, input_switches unchanged, and /metrics shows openstreamer_stream_restarts_total{stream="cam"}
-//     unchanged for both reasons;
-//   - openstreamer_output_sessions_started_total{output="rtmp"} and {output="rtsp"} rose by exactly 1 on their own row (the fresh
-//     reader) and by 0 on every other row;
-//   - for every row but push, sink saw one connection for the whole test (push connects still 1).
-// The hls row keeps dash on and the dash row keeps hls on; a last row turns both off and on again and checks that the four
-// session outputs were not interrupted.
+// eight rows, each a parallel subtest with its own m5aServer, its own cam (every output on, a push to its own sink stream)
+// and the procedure above: tap; readers; connected; baseline; after 5 s PUT cam with the row's output off → 200 "outputs";
+// after 5 s PUT it back on → 200 "outputs" and a fresh 2 s reader of that output gets frames; after 4 s DELETE cam; then
+// assertUninterrupted(t, row, the row's outputs). Rows and what "off" is:
+//   rtsp, rtmp, srt, httpts: that flag false. The row's own reader ends within 2 s of the first edit, and a new session of it
+//     is refused until the second (RTSP DESCRIBE 404, RTMP play refused, SRT rejected, GET stream.ts 404).
+//   hls: hls false, dash stays on. hls/* and cmaf/*.m3u8 answer 404 at once; the DASH reader is held to the table, including
+//     (d): the packager is the same one. dash: the mirror image.
+//   hls+dash: both false, then both true. The four session readers are held to the table; the HLS and DASH readers are the
+//     row's own. A new packager serves afterwards.
+//   push: the push list emptied, then restored. sink's input goes quiet within 5 s and comes back; all seven readers of cam
+//     are held to the table; pushes[0].connects is 1 before and 1 after for the new pusher.
+// In every row but push, sink saw one publish for the whole row (status of sink: input_switches 0; cam's connects 1).
 func TestM5aRebuildIsTheOtherRoute(t *testing.T)
-// the contrast that keeps the test above honest: PUT cam with a second input → 200 "rebuild", status.generation 2, and the
-// RTMP reader that ran across it ended. Afterwards every output plays again.
+// the contrast that keeps the test above honest: with an RTMP reader and the tap running, PUT cam with a second input → 200
+// "rebuild"; status.generation is 2; the reader ended and the tap ended (the old hub closed), and assertMatchesHub(tap, got)
+// still holds for what it got up to the rebuild. Afterwards every output plays again from the new generation.
 func TestM5aRestartRestores(t *testing.T)
 // PUT cam, a disabled stream off, and a third stream; stop the server (ctx); write a truncated junk.json into
 // <data_dir>/streams; start a second server on the same data_dir: GET /api/v1/streams?secrets=1 equals the list before the
 // stop; cam plays over HLS; off is "stopped"; junk.json is untouched and counted in openstreamer_store_load_errors.
 func TestM5aLadder(t *testing.T)
 // needs testpeer.OSTranscoder. cam with rungs 360 (x264, 360 p, 800 kbps) and 180 (180 p, 300 kbps), AAC audio, a thumbnail
-// every 2 s, every output: /live/cam/hls/index.m3u8, cmaf/master.m3u8 and cmaf/index.mpd pass conform with
-// AlignedSequences and list 2 video variants; /live/cam_360/… and /live/cam_180/… are single-rendition streams on HLS and
-// RTSP; RTMP live/cam carries 360-line video (rendition 0); /live/cam_abr/… is 404; the API's thumbnail.jpg is a JPEG and
-// /live/cam/thumbnail.jpg is 404; /metrics has openstreamer_transcoder_encoder_fallbacks_total{stream="cam"} 0 and
-// openstreamer_transcoder_up{stream="cam"} 1. Then PUT with dash off → "outputs": status.transcoder.pid and spawns unchanged,
-// and the HLS reader running across it passes assertUninterrupted.
+// every 2 s, every output. Taps on the rendition hubs, not the source: tap360 = tap("cam_360"), tap180 = tap("cam_180").
+// Names: /live/cam/hls/index.m3u8, cmaf/master.m3u8 and cmaf/index.mpd pass conform with AlignedSequences and list 2 video
+// variants; /live/cam_360/… and /live/cam_180/… are single-rendition streams on HLS and RTSP; /live/cam_abr/… is 404; the
+// API's thumbnail.jpg is a JPEG and /live/cam/thumbnail.jpg is 404; /metrics has
+// openstreamer_transcoder_encoder_fallbacks_total{stream="cam"} 0 and openstreamer_transcoder_up{stream="cam"} 1.
+// Edit: with an RTMP reader on live/cam, an HLS-TS reader on /live/cam/hls/index.m3u8 and the baseline taken, PUT with dash
+// off → "outputs"; 8 s later DELETE. Then: assertMatchesHub(tap360, rtmp) (live/cam is rendition 0, frame for frame); the
+// ABR capture meets the segmented rule per variant, variant i against rendition i's tap (the steps and whole-epoch counts of
+// tap360 for the first video track, tap180 for the second, as assertPresentationIsRenditions pairs track i with rendition
+// i), and (d) for Packager(OutHLS, "cam"); transcoder.pid and transcoder.spawns equal the baseline: the child was not touched.
 func TestM5aPeers(t *testing.T)
 // needs ffprobe with the protocols (testpeer.Require): ffprobe -show_streams on each of cam's seven URLs reports one h264 and
 // one aac stream. Runs on the host and in make test-ci-peers.
@@ -982,10 +1128,11 @@ func TestM5aNoSecretsLeak(t *testing.T)
 func TestM5aAuth(t *testing.T) // without the token every /api/, /metrics and /debug/pprof/ URL is 401 and /healthz is 200; the media listener serves /live/ without a token and has no /api/ route (404)
 ```
 
-- [ ] **Step 2: Run** `go test -race -count=1 -timeout=10m -run '^TestM5a' ./internal/e2e/` on the host — pass (`TestM5aLadder` needs `OS_TRANSCODER`: run `make ostranscoder` first and set it to `dist/ostranscoder-amd64/ostranscoder`).
-- [ ] **Step 3: Run** `go test -race -count=5 -run '^TestM5a(EditOutputs|EveryOutput)$' ./internal/e2e/` — 5 of 5; then the whole suite, `make test`, beside it once, to see the scenarios under load.
-- [ ] **Step 4: Run** `make test-ci-peers ARGS='-run ^TestM5a ./internal/e2e/'` — pass in `osv2-ci-peers:m4a`.
-- [ ] **Step 5: Commit** `test(e2e): the M5a scenarios`
+- [ ] **Step 2: Run** `go test -race -count=1 -timeout=10m -run '^TestM5a' ./internal/e2e/` on the host — pass (`TestM5aLadder` needs `OS_TRANSCODER`: run `make ostranscoder` first and set it to `dist/ostranscoder-amd64/ostranscoder`). If a table rule fails on a reader that the edit did not touch, the finding is a defect in `reattach` or in the output, not a reason to loosen the rule: stop and report it.
+- [ ] **Step 3: Time budget.** `make test` runs every package under one `-timeout=10m` per package. The M5a scenarios may add at most **150 s** to `./internal/e2e/` (`TestM5aEditOutputs`' eight rows run in parallel, about 20 s of wall time together; the others run one after another: about 15, 12, 12, 30, 15, 8 and 1 s). Measure it: `go test -race -count=1 ./internal/e2e/` before and after, and record both wall times in the commit message. If the package then takes more than 8 min under `-race`, mark the top-level `TestM5a*` tests parallel as well (each has its own server and ports) and measure again.
+- [ ] **Step 4: Run** `go test -race -count=5 -timeout=20m -run '^TestM5a(EditOutputs|EveryOutput)$' ./internal/e2e/` — 5 of 5; then once more while `make test` runs beside it, to see the scenarios under load.
+- [ ] **Step 5: Run** `make test-ci-peers ARGS='-timeout=15m -run ^TestM5a ./internal/e2e/'` — pass in `osv2-ci-peers:m4a`.
+- [ ] **Step 6: Commit** `test(e2e): the M5a scenarios`
 
 ### Task 12: CI, docs, spec, done
 
@@ -1004,12 +1151,12 @@ func TestM5aAuth(t *testing.T) // without the token every /api/, /metrics and /d
     | M5b | Live edits and assets: a running pipeline's inputs changed in place, the watermark edited in place over the API, the asset API (upload, listing, replacement; R-C8) with operator fonts (R-C7), a rung that refuses the x264 fallback (wire version 3), audio language in the spec, the HLS masters and the MPD | M5a | Replacing a running stream's inputs is exactly one epoch change and ends no output session; an uploaded image and font appear on every rung; a strict NVENC rung fails instead of falling back and is counted; `osconform` reads the languages |
     | M5c | Transport security: HTTPS for the API and the HTTP outputs, RTMPS (listen, pull, push), RTSPS and SRTP, SRT encryption (input and output), credentials in URL paths and queries redacted, secrets as write-only spec fields | M5a | ffmpeg publishes and plays over each secured protocol against our server; no secret appears in a response, a log or a metric |
 
-  - After the M4 paragraphs of §5, add "M5 runs in three parts" with R-D1's text, the rulings R-D2 to R-D12 by reference to this plan, and an "Out of M5a" table: inputs in place, the live watermark edit, the asset API, operator fonts and refusing the fallback (M5b); audio language (M5b); every TLS and encryption item and URL path or query credentials (M5c); PATCH and per-field edits (R-D7); histograms and per-stream session counts (R-D9; M6's sessions); a config reload without a restart (R-D2); roles and token rotation (R-D8).
+  - After the M4 paragraphs of §5, add "M5 runs in three parts" with R-D1's text, the rulings R-D2 to R-D13 by reference to this plan, and an "Out of M5a" table: inputs in place, the live watermark edit, the asset API, operator fonts and refusing the fallback (M5b); audio language (M5b); every TLS and encryption item and URL path or query credentials (M5c); PATCH and per-field edits (R-D7); histograms and per-stream session counts (R-D9; M6's sessions); a config reload without a restart (R-D2); roles and token rotation (R-D8).
   - §3.6: rewrite the four bullets to what was built: the spec and the store's file layout (R-D4); the supervisor's mailbox, `View`, restart policy and the absence of a reconciler (R-D5); "Changing the output set is applied in place; changing inputs is applied in place from M5b; any other change rebuilds the stream's pipeline" (R-D6); the API on `net/http.ServeMux` with the OpenAPI document as JSON, checked by `TestOpenAPIMatchesRoutes` and `TestOpenAPIMatchesSpec` (R-D7).
   - §3.7: in the library table replace the row `HTTP | go-chi/chi/v5` with `HTTP | net/http (ServeMux patterns); no router library (R-D7)` and add `Metrics | our own text exposition, internal/metrics (R-D9)`.
   - §4: add `internal/spec/`, `internal/server/`, `internal/metrics/`, `internal/logging/` and `api/openapi.json`; change `internal/stream/` to "supervisor and manager".
   - §3.5's presentation bullet and the two "Out of" rows that say "product naming is M5's" (R-B2): state R-D3's names and that osdev keeps `<name>_abr`.
   - The "Out of" rows that name M5: `Metrics for EncoderFallbacks` becomes done (M5a); the asset API, operator fonts, inputs in place and "several audio languages" name M5b; RTMPS, RTSPS and SRTP, SRT encryption and "credentials in the URL path or query" name M5c.
-  - Backlog: in "A fallback to libx264 can overload a host sized for NVENC", record that the count is exported (M5a) and refusing is M5b. Add: "A switch that stops serving a ladder's renditions as their own streams (R-D3; saves N packagers)"; "HTTP-TS has no session counters, so `openstreamer_output_sessions` lacks it"; "A panic in one stream's goroutines takes the process down (R-D5): decide on per-stream recovery after the soak"; "`openstreamer.example.json` is JSON without comments (R-D2)". Add an "M5a deferred minors" heading for the review's leftovers.
+  - Backlog: in "A fallback to libx264 can overload a host sized for NVENC", record that the count is exported (M5a) and refusing is M5b. Add: "A rebuild or a failure restart starts a new packager, so HLS `MEDIA-SEQUENCE` and the DASH timeline go backwards on the same URL and a player that stayed must reload (R-D5, R-D6); carry the sequence numbers and the availability start across generations"; "A switch that stops serving a ladder's renditions as their own streams (R-D3; saves N packagers)"; "HTTP-TS has no session counters, so `openstreamer_output_sessions` lacks it"; "A panic in one stream's goroutines takes the process down (R-D5): decide on per-stream recovery after the soak"; "`openstreamer.example.json` is JSON without comments (R-D2)". Add an "M5a deferred minors" heading for the review's leftovers.
 - [ ] **Step 5: Run** the gates: `go mod tidy` (no change), `go vet ./...`, `golangci-lint run ./...`, `make test`, `GOOS=windows go vet ./...`, `GOOS=darwin go vet ./...`, `make test-transcode`, `make test-ci-peers` — all pass.
 - [ ] **Step 6: Commit** `ci: run the M5a ladder scenario on arm64 and build openstreamer for three systems` and `docs: M5a is done; M5 is split into M5a, M5b and M5c`
