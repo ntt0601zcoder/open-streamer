@@ -43,10 +43,13 @@ const (
 // (libx264, the default when empty) or EncoderNVENC (h264_nvenc). Preset is
 // the libx264 preset, "veryfast" when empty, or for NVENC p1 to p7, "p4"
 // when empty. An NVENC rung whose encoder fails to open is encoded by
-// libx264 with preset veryfast, and counted in Stats.EncoderFallbacks.
+// libx264 with preset veryfast, and counted in Stats.EncoderFallbacks,
+// unless NoFallback is set: the build then fails with a *RefusedError, and
+// no rung is opened. NoFallback does nothing on a libx264 rung.
 type Rung struct {
 	Height, BitrateKbps, MaxBitrateKbps, BFrames int
 	Preset, Encoder                              string
+	NoFallback                                   bool
 }
 
 // Config is what a pipeline encodes: the video ladder and the audio. A nil

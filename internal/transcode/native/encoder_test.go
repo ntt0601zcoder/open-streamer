@@ -5,6 +5,7 @@ package native
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -410,4 +411,100 @@ func TestProbeNVENC(t *testing.T) {
 	t.Logf("probe: %v", err)
 	setGPU(t, 63)
 	require.Error(t, ProbeNVENC())
+}
+
+// deviceOptInOrSkip skips a test where an NVENC device exists
+// (/dev/nvidiactl) unless OS_NVENC or OS_REQUIRE_NVENC is "1"; without a
+// device it runs. The same gate as cmd/ostranscoder's nvencProbeOrSkip and
+// testpeer.NVENCOptedIn: carry a change to one to all of them.
+func deviceOptInOrSkip(t *testing.T) {
+	t.Helper()
+	_, err := os.Stat("/dev/nvidiactl")
+	optedIn := os.Getenv("OS_NVENC") == "1" || os.Getenv("OS_REQUIRE_NVENC") == "1"
+	if err == nil && !optedIn {
+		t.Skip(nvencOptIn)
+	}
+}
+
+// pushUntilError feeds frames until Push fails, and returns the outputs and
+// that error.
+func pushUntilError(p *Pipeline, frames []media.Frame) ([]Output, error) {
+	var outs []Output
+	for _, f := range frames {
+		o, err := p.Push(f)
+		outs = append(outs, o...)
+		if err != nil {
+			return outs, err
+		}
+	}
+	return outs, nil
+}
+
+// TestNoFallbackRefuses: an NVENC rung with NoFallback whose encoder cannot
+// open (GPU 99 does not exist) fails the build with a *RefusedError naming
+// it; the rungs opened before it are released, nothing falls back and
+// nothing is counted. On a GPU host this is the proof of the refusal
+// (opt-in, as make test-nvenc runs it); GPU 99 never opens a session.
+func TestNoFallbackRefuses(t *testing.T) {
+	deviceOptInOrSkip(t)
+	setGPU(t, 99)
+	src := source(t, "h264_aac.ts")
+	for _, tc := range []struct {
+		name  string
+		rungs []Rung
+		rung  int
+	}{
+		{"first", []Rung{{Height: 240, BitrateKbps: 600, Encoder: EncoderNVENC, NoFallback: true}, {Height: 120, BitrateKbps: 150}}, 0},
+		{"second", []Rung{{Height: 240, BitrateKbps: 600}, {Height: 120, BitrateKbps: 150, Encoder: EncoderNVENC, NoFallback: true}}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := recordWarnings(t)
+			before := openRungs.Load()
+			p := newPipeline(t, tc.rungs, nil)
+			outs, err := pushUntilError(p, src)
+			var refused *RefusedError
+			require.ErrorAs(t, err, &refused)
+			assert.Equal(t, tc.rung, refused.Rung)
+			require.Error(t, refused.Err)
+			assert.ErrorContains(t, err, fmt.Sprintf("rung %d: nvenc could not be opened and no_fallback is set: ", tc.rung))
+			assert.Empty(t, p.video.encs, "no rung is left open")
+			assert.Equal(t, before, openRungs.Load(), "every rung opened for the build is released")
+			assert.Zero(t, p.Stats().EncoderFallbacks)
+			assert.Empty(t, w.matching("nvenc open failed, using libx264"))
+			for _, o := range outs {
+				assert.Negative(t, o.Rung, "a video frame came out of a refused build")
+			}
+		})
+	}
+}
+
+// TestFallbackUnchanged: the same ladders without NoFallback build on
+// libx264, and the fallback is counted as before.
+func TestFallbackUnchanged(t *testing.T) {
+	setGPU(t, 99)
+	src := source(t, "h264_aac.ts")
+	for _, rungs := range [][]Rung{
+		{{Height: 240, BitrateKbps: 600, Encoder: EncoderNVENC}, {Height: 120, BitrateKbps: 150}},
+		{{Height: 240, BitrateKbps: 600}, {Height: 120, BitrateKbps: 150, Encoder: EncoderNVENC}},
+	} {
+		before := openRungs.Load()
+		p := newPipeline(t, rungs, nil)
+		outs := push(t, p, src)
+		assert.Equal(t, before+2, openRungs.Load())
+		o, err := p.Flush()
+		require.NoError(t, err)
+		outs = append(outs, o...)
+		assert.Equal(t, uint64(1), p.Stats().EncoderFallbacks)
+		for i := range rungs {
+			assert.NotEmpty(t, rungFrames(outs, i), "rung %d", i)
+		}
+		assert.Equal(t, before, openRungs.Load(), "the flush releases the build")
+	}
+}
+
+func TestRefusedError(t *testing.T) {
+	inner := errors.New("no device")
+	e := &RefusedError{Rung: 2, Err: inner}
+	assert.Equal(t, "rung 2: nvenc could not be opened and no_fallback is set: no device", e.Error())
+	assert.ErrorIs(t, fmt.Errorf("wrapped: %w", e), inner)
 }

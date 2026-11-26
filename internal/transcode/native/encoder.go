@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/asticode/go-astiav"
 
@@ -44,6 +45,24 @@ var x264Codec = "libx264"
 // test that sets it restores it and is never parallel.
 var nvencGPU = -1
 
+// openRungs is the number of rung encoders open in the process: opened by
+// openRung, released by rungEncoder.release. Tests check that a failed
+// build leaves none behind.
+var openRungs atomic.Int64
+
+// RefusedError is the build error of a NoFallback rung whose encoder could
+// not be opened.
+type RefusedError struct {
+	Rung int
+	Err  error // the NVENC failure
+}
+
+func (e *RefusedError) Error() string {
+	return fmt.Sprintf("rung %d: nvenc could not be opened and no_fallback is set: %v", e.Rung, e.Err)
+}
+
+func (e *RefusedError) Unwrap() error { return e.Err }
+
 // nvencOptions are the h264_nvenc options of a rung, in a fixed order.
 // Keyframes stay where the pipeline puts them: forced IDRs, no scene cuts,
 // no lookahead and a strict GOP. delay 0 returns each packet as soon as it
@@ -73,8 +92,8 @@ func validNVENCPreset(p string) bool {
 // openEncoders opens every rung or none: on a failure it closes the rungs
 // it opened. When the build succeeds, each NVENC rung that fell back to
 // libx264 counts in EncoderFallbacks, and one warning is logged for the
-// build. A failed build, a fallback that failed too included, is the
-// build's error and counts nothing.
+// build. A failed build, a fallback that failed too or a NoFallback rung's
+// *RefusedError included, is the build's error and counts nothing.
 func (v *videoPath) openEncoders(fr *astiav.Frame) error {
 	encs := make([]*rungEncoder, 0, len(v.rungs))
 	var (
@@ -108,13 +127,17 @@ func (v *videoPath) openEncoders(fr *astiav.Frame) error {
 // openRung opens the rung's encoder. An NVENC rung that fails to open is
 // encoded by libx264 with the rung's height, rates and B-frames and preset
 // veryfast; nvErr is then the NVENC failure, and err the libx264 one, if
-// that failed too.
+// that failed too. With NoFallback, err is instead a *RefusedError and
+// libx264 is not tried.
 func openRung(idx int, r Rung, fr *astiav.Frame, fps astiav.Rational, cache *media.ConfigCache) (e *rungEncoder, nvErr, err error) {
 	w := evenWidth(fr.Width(), fr.Height(), r.Height)
 	sar := fr.SampleAspectRatio()
 	var cc *astiav.CodecContext
 	if r.Encoder == EncoderNVENC {
 		if cc, nvErr = openNVENC(idx, r, w, sar, fps); nvErr != nil {
+			if r.NoFallback {
+				return nil, nvErr, &RefusedError{Rung: idx, Err: nvErr}
+			}
 			r.Preset = defaultPreset
 		}
 	}
@@ -123,6 +146,7 @@ func openRung(idx int, r Rung, fr *astiav.Frame, fps astiav.Rational, cache *med
 			return nil, nvErr, err
 		}
 	}
+	openRungs.Add(1)
 	return &rungEncoder{idx: idx, cache: cache, cc: cc, pkt: astiav.AllocPacket(), w: w, h: r.Height}, nvErr, nil
 }
 

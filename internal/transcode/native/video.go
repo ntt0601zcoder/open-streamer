@@ -542,6 +542,7 @@ func (e *rungEncoder) release() {
 	}
 	if e.cc != nil {
 		e.cc.Free()
+		openRungs.Add(-1)
 	}
 	e.sws, e.pkt, e.cc = nil, nil, nil
 }
