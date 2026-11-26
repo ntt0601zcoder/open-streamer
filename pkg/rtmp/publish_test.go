@@ -3,6 +3,7 @@ package rtmp_test
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 type publishResult struct {
@@ -1031,5 +1033,61 @@ func compareReadBack(t *testing.T, tags []rtmp.FLVTag, got []rtmp.Media) {
 			t.Fatalf("audio frame %d: delta %d, want delta %d, or the frames differ",
 				i, g.pts-gotA[0].pts, w.pts-pubA[k].pts)
 		}
+	}
+}
+
+func TestPublishTLS(t *testing.T) {
+	tags := loadFLV(t, "h264_aac.flv")
+	// received publishes the tags to srv and returns what it got.
+	received := func(t *testing.T, srv *rtmptest.PublishServer, cfg rtmp.Config) []rtmp.Media {
+		t.Helper()
+		p := publish(t, srv.URL("live/s?key=1"), cfg)
+		for i, tag := range tags {
+			if err := p.WriteMedia(mediaOf(tag)); err != nil {
+				t.Fatalf("tag %d: WriteMedia: %v", i, err)
+			}
+		}
+		if err := p.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		eventually(t, 5*time.Second, "the server's stream ends", func() bool { return len(srv.Ends()) == 1 })
+		if end := srv.Ends()[0]; !errors.Is(end, io.EOF) {
+			t.Fatalf("the server's stream ended with %v, want io.EOF", end)
+		}
+		return srv.Media()
+	}
+	plain := received(t, rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{}), rtmp.Config{})
+	if len(plain) != len(tags) {
+		t.Fatalf("the plain run delivered %d messages of %d tags", len(plain), len(tags))
+	}
+	ca := tlstest.NewCA(t)
+	srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{TLS: ca.Server(t)})
+	if !strings.HasPrefix(srv.URL("live/s"), "rtmps://") {
+		t.Fatalf("URL %q, want rtmps://", srv.URL("live/s"))
+	}
+
+	// Untrusted first, so the server's record holds only the trusted run.
+	r := awaitPublish(t, startPublish(context.Background(), srv.URL("live/s3cretkey"), rtmp.Config{}), 5*time.Second)
+	var e x509.UnknownAuthorityError
+	if !errors.As(r.err, &e) || !strings.HasPrefix(r.err.Error(), "rtmp: client: tls: ") {
+		t.Fatalf("Publish with the system roots: %v, want an x509.UnknownAuthorityError", r.err)
+	}
+	if strings.Contains(r.err.Error(), "s3cretkey") {
+		t.Fatalf("Publish: %q holds the stream name", r.err)
+	}
+
+	got := received(t, srv, rtmp.Config{TLS: ca.Client()})
+	if len(got) != len(plain) {
+		t.Fatalf("the server got %d messages over TLS, the plain run %d", len(got), len(plain))
+	}
+	for i := range got {
+		if got[i].Type != plain[i].Type || got[i].Timestamp != plain[i].Timestamp || !bytes.Equal(got[i].Payload, plain[i].Payload) {
+			t.Fatalf("message %d over TLS differs from the plain run's", i)
+		}
+	}
+	reqs := srv.Requests()
+	want := rtmp.Request{App: "live", Stream: "s", Query: "key=1", TCURL: "rtmps://" + srv.Addr + "/live"}
+	if len(reqs) != 1 || reqs[0] != want {
+		t.Fatalf("requests %+v, want [%+v]", reqs, want)
 	}
 }

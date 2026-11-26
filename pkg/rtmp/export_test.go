@@ -6,6 +6,13 @@ func SplitPlayURL(rawURL string) (addr, app, stream, tcURL string, err error) {
 	return t.addr, t.app, t.stream, t.tcURL, err
 }
 
+// SplitURLSecure exposes what the URL split decides for TLS: the address to
+// dial, the tcUrl and whether the connection is wrapped in TLS.
+func SplitURLSecure(rawURL string) (addr, tcURL string, secure bool, err error) {
+	t, err := splitPlayURL(rawURL)
+	return t.addr, t.tcURL, t.secure, err
+}
+
 // OutStream is the last message type and message stream id a ServerConn
 // wrote on one chunk stream.
 type OutStream struct {

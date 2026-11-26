@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"io"
 	"net"
@@ -42,6 +43,9 @@ type PlayOptions struct {
 	// Hold sends nothing after the tags and never ends the stream, like a
 	// live source gone silent.
 	Hold bool
+	// TLS makes the server an RTMPS one: every connection is a TLS server
+	// with this config, and URL returns rtmps://.
+	TLS *tls.Config
 }
 
 // PlayRequest is what a client asked a PlayServer for. Stream is the play
@@ -88,9 +92,28 @@ func NewPlayServer(t testing.TB, tags []rtmp.FLVTag, opt PlayOptions) *PlayServe
 	return s
 }
 
-// URL returns rtmp://Addr/path.
+// URL returns rtmp://Addr/path, or rtmps://Addr/path with PlayOptions.TLS.
 func (s *PlayServer) URL(path string) string {
-	return "rtmp://" + s.Addr + "/" + path
+	return scheme(s.opt.TLS) + s.Addr + "/" + path
+}
+
+// scheme is the URL scheme of a server with the TLS option c.
+func scheme(c *tls.Config) string {
+	if c != nil {
+		return "rtmps://"
+	}
+	return "rtmp://"
+}
+
+// serverConn is the conn a server's goroutine serves c through: c itself,
+// or a TLS server on it. Its handshake runs with the first read, under that
+// read's deadline. The servers keep c, the raw conn, to close at the end of
+// the test: closing it never waits on the peer.
+func serverConn(c net.Conn, cfg *tls.Config) net.Conn {
+	if cfg != nil {
+		return tls.Server(c, cfg)
+	}
+	return c
 }
 
 // Requests returns the play requests received so far, in order.
@@ -142,7 +165,7 @@ func (s *PlayServer) acceptLoop() {
 				s.mu.Unlock()
 				_ = c.Close()
 			}()
-			s.serve(c)
+			s.serve(serverConn(c, s.opt.TLS))
 		}()
 	}
 }
@@ -349,6 +372,9 @@ type PublishServerOptions struct {
 	// Config is the server's session Config (rtmp.Accept's). AckOnly
 	// overrides its PingInterval.
 	Config rtmp.Config
+	// TLS makes the server an RTMPS one: every connection is a TLS server
+	// with this config, handed to rtmp.Accept, and URL returns rtmps://.
+	TLS *tls.Config
 }
 
 // PublishServer is an RTMP server on 127.0.0.1 that every client may publish
@@ -391,9 +417,10 @@ func NewPublishServer(t testing.TB, opt PublishServerOptions) *PublishServer {
 	return s
 }
 
-// URL returns rtmp://Addr/path.
+// URL returns rtmp://Addr/path, or rtmps://Addr/path with
+// PublishServerOptions.TLS.
 func (s *PublishServer) URL(path string) string {
-	return "rtmp://" + s.Addr + "/" + path
+	return scheme(s.opt.TLS) + s.Addr + "/" + path
 }
 
 // Requests returns the publish requests received so far, in order, rejected
@@ -456,7 +483,7 @@ func (s *PublishServer) acceptLoop() {
 				s.mu.Unlock()
 				_ = c.Close()
 			}()
-			s.serve(c)
+			s.serve(serverConn(c, s.opt.TLS))
 		}()
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -16,9 +17,13 @@ import (
 	"time"
 )
 
+// DefaultHandshakeTimeout is Config.HandshakeTimeout's default. It is
+// exported for a server that runs a TLS handshake before Accept and bounds it
+// by the same time.
+const DefaultHandshakeTimeout = 5 * time.Second
+
 // Session defaults applied to zero Config fields.
 const (
-	defaultHandshakeTimeout     = 5 * time.Second
 	defaultCommandTimeout       = 10 * time.Second
 	defaultIdleTimeout          = 30 * time.Second
 	defaultPingInterval         = 10 * time.Second
@@ -30,12 +35,17 @@ const (
 	// idleGrace is the shortest read deadline: a read issued after the idle
 	// limit has passed still collects the bytes already waiting.
 	idleGrace = 10 * time.Millisecond
+
+	// closeNotifyWait is how long closing a TLS connection may wait for its
+	// close_notify to be written (see closeConn).
+	closeNotifyWait = 100 * time.Millisecond
 )
 
 // Config bounds an RTMP session, server or client. A zero field takes its
 // default.
 type Config struct {
-	// HandshakeTimeout bounds the handshake. Default 5 s.
+	// HandshakeTimeout bounds the handshake, and before it, apart, a client's
+	// TLS handshake to an rtmps:// URL. Default 5 s.
 	HandshakeTimeout time.Duration
 	// CommandTimeout bounds the command exchange before media flows
 	// (connect to publish, or connect to play). Default 10 s.
@@ -80,6 +90,10 @@ type Config struct {
 	// mode, which only means something to our input URLs. PlayWith and
 	// servers ignore it.
 	KeepQuery bool
+	// TLS is the client config of an rtmps:// URL (Play, PlayWith, Publish);
+	// nil means the system roots. It is cloned, and its ServerName, when
+	// empty, is set to the URL's host. Ignored for rtmp:// and by servers.
+	TLS *tls.Config
 }
 
 // dial opens a client's connection to addr with Dial, or a net.Dialer.
@@ -93,7 +107,7 @@ func (c Config) dial(ctx context.Context, addr string) (net.Conn, error) {
 
 func (c Config) withDefaults() Config {
 	if c.HandshakeTimeout <= 0 {
-		c.HandshakeTimeout = defaultHandshakeTimeout
+		c.HandshakeTimeout = DefaultHandshakeTimeout
 	}
 	if c.CommandTimeout <= 0 {
 		c.CommandTimeout = defaultCommandTimeout
@@ -305,13 +319,44 @@ func (s *session) LastInbound() time.Time {
 }
 
 // Close closes the connection, which unblocks a pending read or write and
-// stops the reader goroutine. It never writes, so it is safe to call from any
-// goroutine, and only the first call closes. When nothing ended the session
-// before, Err reports net.ErrClosed.
+// stops the reader goroutine. It writes no RTMP message, so it is safe to
+// call from any goroutine, and only the first call closes. On a TLS
+// connection with no write in flight it sends close_notify and waits at most
+// 100 ms for that write (see closeConn); otherwise it does not wait on the
+// peer. When nothing ended the session before, Err reports net.ErrClosed.
 func (s *session) Close() error {
 	s.setErr(fmt.Errorf("rtmp: session: %w", net.ErrClosed))
-	s.closeOnce.Do(func() { s.closeErr = s.conn.Close() })
+	s.closeOnce.Do(func() { s.closeErr = closeConn(s.conn) })
 	return s.closeErr
+}
+
+// closeConn closes c, and is the only way this package closes a session's
+// connection. A conn that is not a *tls.Conn is closed directly.
+//
+// A tls.Conn's Close with a Write in flight closes at once, but with none it
+// sends close_notify under a 5 s write deadline of its own. That is the case
+// of a session ended by a media write that missed its deadline: the write has
+// returned, the peer's buffer is still full, and Close would take the 5 s. So
+// the raw connection is closed after 100 ms, which ends that write: a healthy
+// peer gets its close_notify, a stalled one costs 100 ms.
+//
+// A TLS close returns nil: what tls.Conn.Close reports is a close_notify that
+// was not delivered (the peer stalled, or closed first) or the raw connection
+// this function closed itself, and the connection is closed either way, as a
+// plain one is when its peer has gone.
+//
+// pkg/rtsp's closeConn is the twin of this function, kept apart because the
+// two packages do not import each other: change the two together.
+func closeConn(c net.Conn) error {
+	tc, ok := c.(*tls.Conn)
+	if !ok {
+		return c.Close()
+	}
+	raw := tc.NetConn()
+	t := time.AfterFunc(closeNotifyWait, func() { _ = raw.Close() })
+	_ = tc.Close()
+	t.Stop()
+	return nil
 }
 
 // fail ends the session with err as its cause, unless one was set before,

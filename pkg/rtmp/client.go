@@ -3,6 +3,7 @@ package rtmp
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -16,14 +17,15 @@ import (
 
 // The play exchange.
 const (
-	defaultPort   = "1935"
-	clientFlash   = "LNX 9,0,124,2"
-	playLive      = -2   // play start: live, falling back to recorded
-	playBufferMS  = 1000 // Set Buffer Length we announce
-	txnConnect    = 1
-	txnCreate     = 2
-	txnPlay       = 3
-	codePlayStart = "NetStream.Play.Start"
+	defaultPort    = "1935"
+	defaultTLSPort = "443" // of rtmps://
+	clientFlash    = "LNX 9,0,124,2"
+	playLive       = -2   // play start: live, falling back to recorded
+	playBufferMS   = 1000 // Set Buffer Length we announce
+	txnConnect     = 1
+	txnCreate      = 2
+	txnPlay        = 3
+	codePlayStart  = "NetStream.Play.Start"
 
 	// maxHeldMedia and maxHeldBytes bound the data messages kept for
 	// ReadMedia when a server sends them before NetStream.Play.Start.
@@ -71,6 +73,8 @@ func statusOf(args []any) (level string, st *StatusError) {
 // playTarget is a play URL split into what the exchange sends.
 type playTarget struct {
 	addr   string // host:port to dial
+	host   string // the URL's host alone: the TLS server name
+	secure bool   // rtmps://: TLS over the dialled connection
 	app    string
 	name   string // the stream name, without the query
 	stream string // the name with the query, minus our mode parameter
@@ -104,10 +108,12 @@ func (t playTarget) redactor() *strings.Replacer {
 	return strings.NewReplacer(pairs...)
 }
 
-// splitPlayURL splits rtmp://host[:port]/app[/…]/stream[?query]. The app is
-// every path segment but the last, so rtmp://h/live/inst/s plays s from
-// live/inst. The stream name keeps the query, without the mode parameter
-// that only means something to us. Errors never echo the URL.
+// splitPlayURL splits rtmp://host[:port]/app[/…]/stream[?query], or the same
+// with rtmps:// (the scheme is matched without case; the default port is then
+// 443 and the tcUrl says rtmps://). The app is every path segment but the
+// last, so rtmp://h/live/inst/s plays s from live/inst. The stream name keeps
+// the query, without the mode parameter that only means something to us.
+// Errors never echo the URL.
 func splitPlayURL(rawURL string) (playTarget, error) {
 	return splitURL(rawURL, false)
 }
@@ -119,8 +125,10 @@ func splitURL(rawURL string, keepQuery bool) (playTarget, error) {
 	if err != nil {
 		return playTarget{}, errors.New("rtmp: client: invalid URL")
 	}
-	if u.Scheme != "rtmp" {
-		return playTarget{}, errors.New("rtmp: client: not an rtmp:// URL")
+	// url.Parse lower-cases the scheme.
+	secure := u.Scheme == "rtmps"
+	if u.Scheme != "rtmp" && !secure {
+		return playTarget{}, errors.New("rtmp: client: not an rtmp:// or rtmps:// URL")
 	}
 	if u.Hostname() == "" {
 		return playTarget{}, errors.New("rtmp: client: the URL has no host")
@@ -128,6 +136,9 @@ func splitURL(rawURL string, keepQuery bool) (playTarget, error) {
 	port := u.Port()
 	if port == "" {
 		port = defaultPort
+		if secure {
+			port = defaultTLSPort
+		}
 	} else if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 		return playTarget{}, errors.New("rtmp: client: invalid port")
 	}
@@ -150,10 +161,12 @@ func splitURL(rawURL string, keepQuery bool) (playTarget, error) {
 	app := strings.Join(segs[:len(segs)-1], "/")
 	t := playTarget{
 		addr:   net.JoinHostPort(u.Hostname(), port),
+		host:   u.Hostname(),
+		secure: secure,
 		app:    app,
 		name:   segs[len(segs)-1],
 		stream: segs[len(segs)-1],
-		tcURL:  "rtmp://" + host + "/" + app,
+		tcURL:  u.Scheme + "://" + host + "/" + app,
 	}
 	q := u.RawQuery
 	if !keepQuery {
@@ -217,7 +230,12 @@ func Play(ctx context.Context, rawURL string) (*ClientConn, error) {
 }
 
 // PlayWith plays rtmp://host[:port]/app[/…]/stream[?query] (port 1935 by
-// default): it dials, runs the handshake within cfg.HandshakeTimeout, then
+// default), or the same with rtmps:// (port 443 by default), which is RTMP
+// over TLS: the server's certificate is verified with cfg.TLS, by default
+// against the system roots and the URL's host, and a failure is an error
+// "rtmp: client: tls: …" that unwraps to the crypto/x509 one. It dials, runs
+// the TLS handshake of rtmps:// and then the RTMP one, each within
+// cfg.HandshakeTimeout, then
 // connect, createStream and play within cfg.CommandTimeout, and returns once
 // the server sends NetStream.Play.Start (or, from a server that does not,
 // the first audio or video message). An _error reply or an onStatus of level
@@ -229,9 +247,9 @@ func PlayWith(ctx context.Context, rawURL string, cfg Config) (*ClientConn, erro
 	if err != nil {
 		return nil, err
 	}
-	conn, err := cfg.dial(ctx, t.addr)
+	conn, err := cfg.connect(ctx, t)
 	if err != nil {
-		return nil, fmt.Errorf("rtmp: client: dial: %w", err)
+		return nil, err
 	}
 	s := newSession(conn, cfg, roleClient)
 	c := &ClientConn{s: s, redact: t.redactor()}
@@ -245,6 +263,40 @@ func PlayWith(ctx context.Context, rawURL string, cfg Config) (*ClientConn, erro
 		return nil, err
 	}
 	return c, nil
+}
+
+// connect dials t.addr and, for rtmps://, runs the TLS handshake on the
+// connection, bounded by ctx and by HandshakeTimeout. The session and its own
+// handshake timeout start after it. Errors never contain the URL.
+func (c Config) connect(ctx context.Context, t playTarget) (net.Conn, error) {
+	conn, err := c.dial(ctx, t.addr)
+	if err != nil {
+		return nil, fmt.Errorf("rtmp: client: dial: %w", err)
+	}
+	if !t.secure {
+		return conn, nil
+	}
+	tc := c.TLS.Clone()
+	if tc == nil {
+		tc = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	if tc.ServerName == "" {
+		// An IPv6 zone is no part of a name a certificate can carry.
+		tc.ServerName, _, _ = strings.Cut(t.host, "%")
+	}
+	timeout := c.HandshakeTimeout
+	if timeout <= 0 {
+		timeout = DefaultHandshakeTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	tconn := tls.Client(conn, tc)
+	if err := tconn.HandshakeContext(ctx); err != nil {
+		// Nothing was agreed, so there is no close_notify to send.
+		_ = conn.Close()
+		return nil, fmt.Errorf("rtmp: client: tls: %w", err)
+	}
+	return tconn, nil
 }
 
 // command is a decoded AMF0 command.
@@ -500,8 +552,9 @@ func (c *ClientConn) BadCommands() uint64 {
 	return c.bad.Load()
 }
 
-// Close closes the connection, unblocking a pending ReadMedia. It never
-// writes.
+// Close closes the connection, unblocking a pending ReadMedia. It writes no
+// RTMP message; over TLS it sends close_notify, waiting at most 100 ms for
+// that write.
 func (c *ClientConn) Close() error {
 	return c.s.Close()
 }

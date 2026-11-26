@@ -52,8 +52,10 @@ type PublishConn struct {
 
 // Publish publishes to rtmp://host[:port]/app[/…]/stream[?query] (port 1935
 // by default; the app is every path segment but the last, and a "mode"
-// query parameter is dropped, as for PlayWith, unless cfg.KeepQuery). It
-// dials with cfg.Dial, runs the handshake within cfg.HandshakeTimeout, then
+// query parameter is dropped, as for PlayWith, unless cfg.KeepQuery), or to
+// the same with rtmps:// (port 443 by default): RTMP over TLS, verified with
+// cfg.TLS as PlayWith does. It dials with cfg.Dial, runs the TLS handshake
+// of rtmps:// and then the RTMP one, each within cfg.HandshakeTimeout, then
 // within cfg.CommandTimeout connect (announcing the Enhanced RTMP FourCCs
 // hvc1 and avc1), Set Chunk Size 4096, releaseStream, FCPublish,
 // createStream and publish "live", and returns once the server answers
@@ -66,9 +68,9 @@ func Publish(ctx context.Context, rawURL string, cfg Config) (*PublishConn, erro
 	if err != nil {
 		return nil, err
 	}
-	conn, err := cfg.dial(ctx, t.addr)
+	conn, err := cfg.connect(ctx, t)
 	if err != nil {
-		return nil, fmt.Errorf("rtmp: client: dial: %w", err)
+		return nil, err
 	}
 	s := newSession(conn, cfg, roleClient)
 	p := &PublishConn{s: s, stream: t.stream, redact: t.redactor()}

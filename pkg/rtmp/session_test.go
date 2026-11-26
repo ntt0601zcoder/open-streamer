@@ -3,14 +3,19 @@ package rtmp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 // sessionPeer is the far end of a net.Pipe: a goroutine reads every message
@@ -938,4 +943,277 @@ func TestSessionReaderStopsOnClose(t *testing.T) {
 			t.Fatal("Err is nil after the peer closed")
 		}
 	})
+}
+
+// tlsEnds is one TCP connection on 127.0.0.1 between an RTMPS client of this
+// package and Accept over a TLS server, for the close rule's tests.
+type tlsEnds struct {
+	ca *tlstest.CA
+	// accepted yields the ServerConn once Accept returned.
+	accepted chan *ServerConn
+	// cfg is the client's Config: the CA's roots, and a Dial that returns
+	// the connection's client end for rtmps://localhost.
+	cfg Config
+	// clientIn and serverIn record the TLS records each end received, when
+	// the ends are healthy: clientIn is set once the client dialled, serverIn
+	// once accepted yields.
+	clientIn, serverIn *recordingConn
+}
+
+// recordingConn keeps every byte read from the conn: the peer's TLS records.
+type recordingConn struct {
+	net.Conn
+	mu sync.Mutex
+	in []byte
+}
+
+func (c *recordingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.mu.Lock()
+	c.in = append(c.in, p[:n]...)
+	c.mu.Unlock()
+	return n, err
+}
+
+// lastRecord is the content type of the last whole TLS record received, or
+// 0 when there is none or the bytes do not end on a record boundary.
+func (c *recordingConn) lastRecord() byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var typ byte
+	for b := c.in; len(b) > 0; {
+		if len(b) < 5 || len(b) < 5+int(binary.BigEndian.Uint16(b[3:5])) {
+			return 0
+		}
+		typ = b[0]
+		b = b[5+int(binary.BigEndian.Uint16(b[3:5])):]
+	}
+	return typ
+}
+
+// recordAlert is the TLS record content type of an alert, close_notify
+// included. Up to TLS 1.2 it is visible in the record header.
+const recordAlert = 21
+
+// newTLSEnds connects the two ends. shrink makes the buffers between a
+// writer and a peer that stops reading small: the server's send buffer and
+// the client's receive buffer, and the reverse. Without it the ends are
+// healthy, and each records what it receives, over TLS 1.2 so that an alert
+// record can be told from data. server is Accept's Config.
+func newTLSEnds(t *testing.T, server Config, shrink bool) *tlsEnds {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	e := &tlsEnds{ca: tlstest.NewCA(t), accepted: make(chan *ServerConn, 1)}
+	// prepare shrinks c's buffers, or records what it reads.
+	prepare := func(c net.Conn) (net.Conn, *recordingConn) {
+		if shrink {
+			_ = c.(*net.TCPConn).SetReadBuffer(4096)
+			_ = c.(*net.TCPConn).SetWriteBuffer(4096)
+			return c, nil
+		}
+		rc := &recordingConn{Conn: c}
+		return rc, rc
+	}
+	srvTLS := e.ca.Server(t)
+	cliTLS := e.ca.Client()
+	if !shrink {
+		cliTLS.MaxVersion = tls.VersionTLS12
+	}
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// The raw conn: closing it never waits, whatever the session did.
+		t.Cleanup(func() { _ = c.Close() })
+		// serverIn is read only after accepted yields.
+		c, e.serverIn = prepare(c)
+		sc, err := Accept(context.Background(), tls.Server(c, srvTLS), server, nil)
+		if err != nil {
+			t.Errorf("Accept: %v", err)
+			close(e.accepted)
+			return
+		}
+		e.accepted <- sc
+	}()
+	e.cfg = Config{
+		TLS: cliTLS,
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if network != "tcp" || addr != "localhost:443" {
+				return nil, errors.New("Dial(" + network + ", " + addr + ")")
+			}
+			var d net.Dialer
+			c, err := d.DialContext(ctx, network, ln.Addr().String())
+			if err != nil {
+				return nil, err
+			}
+			t.Cleanup(func() { _ = c.Close() })
+			c, e.clientIn = prepare(c)
+			return c, nil
+		},
+	}
+	return e
+}
+
+// server returns the accepted ServerConn.
+func (e *tlsEnds) server(t *testing.T) *ServerConn {
+	t.Helper()
+	select {
+	case sc := <-e.accepted:
+		if sc == nil {
+			t.FailNow()
+		}
+		return sc
+	case <-time.After(5 * time.Second):
+		t.Fatal("Accept did not return")
+	}
+	return nil
+}
+
+// stallWrites calls write, a WriteMedia of 1 MiB to a peer that stopped
+// reading, until it fails, and returns how long the failing call took. The
+// error must be the write timeout's.
+func stallWrites(t *testing.T, write func(Media) error) time.Duration {
+	t.Helper()
+	big := Media{Type: MsgVideo, Payload: make([]byte, 1<<20)}
+	for range 64 {
+		start := time.Now()
+		err := write(big)
+		took := time.Since(start)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("WriteMedia to a stalled peer: %v, want a write timeout", err)
+		}
+		return took
+	}
+	t.Fatal("WriteMedia never stalled")
+	return 0
+}
+
+// readEnd reads c, the TLS conn of a session's peer, to its end and returns
+// the error: io.EOF after the other side's close_notify, and
+// io.ErrUnexpectedEOF when the connection was only cut.
+func readEnd(t *testing.T, c net.Conn) error {
+	t.Helper()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4096)
+	for {
+		if _, err := c.Read(buf); err != nil {
+			return err
+		}
+	}
+}
+
+// R-S8: a session that ended on a media write's deadline has no write in
+// flight when it closes, so tls.Conn.Close would send close_notify into the
+// peer's full buffer under its own 5 s deadline. closeConn bounds that by
+// 100 ms.
+func TestTLSCloseStalled(t *testing.T) {
+	const (
+		writeTimeout = 200 * time.Millisecond
+		slack        = 300 * time.Millisecond
+	)
+	// closes runs the explicit Close after the session failed. The
+	// close_notify that could not be sent is no error of Close: the
+	// connection is closed, as a plain one would be.
+	closes := func(t *testing.T, closeConn func() error) {
+		t.Helper()
+		start := time.Now()
+		err := closeConn()
+		if took := time.Since(start); took > slack {
+			t.Fatalf("Close took %v, want within %v", took, slack)
+		}
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+	t.Run("a player stops reading", func(t *testing.T) {
+		e := newTLSEnds(t, Config{WriteTimeout: writeTimeout}, true)
+		// The client never calls ReadMedia: it reads nothing after play.
+		if _, err := PlayWith(context.Background(), "rtmps://localhost/live/s", e.cfg); err != nil {
+			t.Fatalf("Play: %v", err)
+		}
+		sc := e.server(t)
+		if took := stallWrites(t, sc.WriteMedia); took > writeTimeout+slack {
+			t.Fatalf("the WriteMedia that timed out took %v, want within %v", took, writeTimeout+slack)
+		}
+		if !errors.Is(sc.Err(), os.ErrDeadlineExceeded) {
+			t.Fatalf("Err %v, want the write timeout", sc.Err())
+		}
+		closes(t, sc.Close)
+	})
+	t.Run("a server stops reading", func(t *testing.T) {
+		e := newTLSEnds(t, Config{}, true)
+		cfg := e.cfg
+		cfg.WriteTimeout = writeTimeout
+		p, err := Publish(context.Background(), "rtmps://localhost/live/s", cfg)
+		if err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		e.server(t) // the publish ServerConn, whose ReadMedia nobody calls
+		if took := stallWrites(t, p.WriteMedia); took > writeTimeout+slack {
+			t.Fatalf("the WriteMedia that timed out took %v, want within %v", took, writeTimeout+slack)
+		}
+		if !errors.Is(p.Err(), os.ErrDeadlineExceeded) {
+			t.Fatalf("Err %v, want the write timeout", p.Err())
+		}
+		closes(t, p.Close)
+	})
+	t.Run("a healthy player gets close_notify", func(t *testing.T) {
+		e := newTLSEnds(t, Config{}, false)
+		c, err := PlayWith(context.Background(), "rtmps://localhost/live/s", e.cfg)
+		if err != nil {
+			t.Fatalf("Play: %v", err)
+		}
+		if _, ok := c.s.conn.(*tls.Conn); !ok {
+			t.Fatalf("the client's conn is a %T, want a *tls.Conn", c.s.conn)
+		}
+		if err := e.server(t).Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := readEnd(t, c.s.conn); err != io.EOF {
+			t.Fatalf("the player's TLS read ended with %v, want io.EOF", err)
+		}
+		// crypto/tls reports io.EOF for a connection cut on a record
+		// boundary too, so the record itself is the proof.
+		if typ := e.clientIn.lastRecord(); typ != recordAlert {
+			t.Fatalf("the last TLS record the player got has type %d, want %d (close_notify)", typ, recordAlert)
+		}
+	})
+	t.Run("a healthy server gets close_notify", func(t *testing.T) {
+		e := newTLSEnds(t, Config{}, false)
+		p, err := Publish(context.Background(), "rtmps://localhost/live/s", e.cfg)
+		if err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		sc := e.server(t)
+		if err := p.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := readEnd(t, sc.s.conn); err != io.EOF {
+			t.Fatalf("the server's TLS read ended with %v, want io.EOF", err)
+		}
+		if typ := e.serverIn.lastRecord(); typ != recordAlert {
+			t.Fatalf("the last TLS record the server got has type %d, want %d (close_notify)", typ, recordAlert)
+		}
+	})
+}
+
+// closeConn closes a conn that is not TLS directly.
+func TestCloseConnPlain(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() { _ = b.Close() }()
+	if err := closeConn(a); err != nil {
+		t.Fatalf("closeConn: %v", err)
+	}
+	if _, err := a.Write([]byte{0}); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("Write after closeConn: %v, want a closed pipe", err)
+	}
 }

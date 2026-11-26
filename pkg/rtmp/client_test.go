@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 type playResult struct {
@@ -345,7 +348,7 @@ func TestClientURLSplit(t *testing.T) {
 	}
 	for _, bad := range []string{
 		"http://h/live/s",
-		"rtmps://h/live/s",
+		"rtmps+insecure://h/live/s",
 		"rtmp:///live/s",
 		"rtmp://h/live",
 		"rtmp://h/live/",
@@ -931,4 +934,213 @@ func TestPlayServerSequence(t *testing.T) {
 	if !reflect.DeepEqual(seq, want) {
 		t.Fatalf("play sequence\n got %v\nwant %v", seq, want)
 	}
+}
+
+func TestSplitURLTLS(t *testing.T) {
+	for _, tc := range []struct {
+		url, addr, tcURL string
+		secure           bool
+	}{
+		{"rtmps://h/live/s", "h:443", "rtmps://h/live", true},
+		{"rtmps://h:1936/live/s", "h:1936", "rtmps://h:1936/live", true},
+		{"RTMPS://h/a/b", "h:443", "rtmps://h/a", true},
+		{"rtmps://[::1]/live/s", "[::1]:443", "rtmps://[::1]/live", true},
+		{"rtmp://h/live/s", "h:1935", "rtmp://h/live", false},
+	} {
+		addr, tcURL, secure, err := rtmp.SplitURLSecure(tc.url)
+		if err != nil || addr != tc.addr || tcURL != tc.tcURL || secure != tc.secure {
+			t.Errorf("split %q = %q %q %v %v; want %q %q %v", tc.url, addr, tcURL, secure, err, tc.addr, tc.tcURL, tc.secure)
+		}
+	}
+	const want = "rtmp: client: not an rtmp:// or rtmps:// URL"
+	for _, bad := range []string{"rtmps+insecure://h/a/b", "https://h/a/b"} {
+		if _, _, _, err := rtmp.SplitURLSecure(bad); err == nil || err.Error() != want {
+			t.Errorf("split %q: %v, want %q", bad, err, want)
+		}
+	}
+}
+
+// leafConfig is a TLS server config whose leaf, issued by ca for hosts, is
+// valid for d from an hour ago (see tlstest's Issue).
+func leafConfig(t *testing.T, ca *tlstest.CA, d time.Duration, hosts ...string) *tls.Config {
+	t.Helper()
+	certPEM, keyPEM := ca.Issue(t, d, hosts...)
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
+}
+
+// readAll plays rawURL with cfg and returns every media message up to the
+// end of the stream.
+func readAll(t *testing.T, rawURL string, cfg rtmp.Config) []rtmp.Media {
+	t.Helper()
+	r := awaitPlay(t, startPlay(context.Background(), rawURL, cfg), 5*time.Second)
+	if r.err != nil {
+		t.Fatalf("Play: %v", r.err)
+	}
+	var got []rtmp.Media
+	for {
+		m, err := readMedia(t, r.c)
+		if errors.Is(err, io.EOF) {
+			return got
+		}
+		if err != nil {
+			t.Fatalf("ReadMedia: %v", err)
+		}
+		got = append(got, m)
+	}
+}
+
+func TestPlayTLSVerifies(t *testing.T) {
+	const name = "s3cretkey"
+	tags := loadFLV(t, "h264_aac.flv")
+	plain := readAll(t, rtmptest.NewPlayServer(t, tags, rtmptest.PlayOptions{}).URL("live/"+name), rtmp.Config{})
+	if len(plain) < len(tags) {
+		t.Fatalf("the plain run played %d messages of %d tags", len(plain), len(tags))
+	}
+	ca := tlstest.NewCA(t)
+	server := func(c *tls.Config) *rtmptest.PlayServer {
+		return rtmptest.NewPlayServer(t, tags, rtmptest.PlayOptions{TLS: c})
+	}
+	good := server(ca.Server(t))
+	otherName := server(leafConfig(t, ca, time.Hour+time.Minute, "other.example"))
+	expired := server(leafConfig(t, ca, -time.Hour, "127.0.0.1"))
+	plays := func(t *testing.T, srv *rtmptest.PlayServer, c *tls.Config) {
+		t.Helper()
+		if got := readAll(t, srv.URL("live/"+name), rtmp.Config{TLS: c}); !reflect.DeepEqual(got, plain) {
+			t.Fatalf("played %d messages over TLS, which differ from the plain run's %d", len(got), len(plain))
+		}
+	}
+	// refused plays srv with c and returns the error, which must be a TLS
+	// one that does not name the stream.
+	refused := func(t *testing.T, srv *rtmptest.PlayServer, c *tls.Config) error {
+		t.Helper()
+		r := awaitPlay(t, startPlay(context.Background(), srv.URL("live/"+name), rtmp.Config{TLS: c}), 5*time.Second)
+		if r.err == nil {
+			t.Fatal("Play succeeded")
+		}
+		if !strings.HasPrefix(r.err.Error(), "rtmp: client: tls: ") {
+			t.Fatalf("Play: %q, want an rtmp: client: tls: error", r.err)
+		}
+		if strings.Contains(r.err.Error(), name) {
+			t.Fatalf("Play: %q holds the stream name", r.err)
+		}
+		return r.err
+	}
+
+	t.Run("trusted", func(t *testing.T) {
+		c := ca.Client()
+		plays(t, good, c)
+		if c.ServerName != "" {
+			t.Fatalf("the caller's config was changed: ServerName %q", c.ServerName)
+		}
+		reqs := good.Requests()
+		want := rtmptest.PlayRequest{App: "live", Stream: name, TCURL: "rtmps://" + good.Addr + "/live"}
+		if len(reqs) != 1 || reqs[0] != want {
+			t.Fatalf("server saw %+v, want [%+v]", reqs, want)
+		}
+	})
+	t.Run("system roots", func(t *testing.T) {
+		var e x509.UnknownAuthorityError
+		if err := refused(t, good, nil); !errors.As(err, &e) {
+			t.Fatalf("Play: %v, want an x509.UnknownAuthorityError", err)
+		}
+	})
+	t.Run("another name", func(t *testing.T) {
+		var e x509.HostnameError
+		if err := refused(t, otherName, ca.Client()); !errors.As(err, &e) {
+			t.Fatalf("Play: %v, want an x509.HostnameError", err)
+		}
+	})
+	t.Run("expired", func(t *testing.T) {
+		var e x509.CertificateInvalidError
+		if err := refused(t, expired, ca.Client()); !errors.As(err, &e) || e.Reason != x509.Expired {
+			t.Fatalf("Play: %v, want an x509.CertificateInvalidError (expired)", err)
+		}
+	})
+	t.Run("a server name of its own", func(t *testing.T) {
+		c := ca.Client()
+		c.ServerName = "other.example"
+		plays(t, otherName, c)
+	})
+	t.Run("InsecureSkipVerify", func(t *testing.T) {
+		for _, srv := range []*rtmptest.PlayServer{good, otherName, expired} {
+			plays(t, srv, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}) //nolint:gosec // the opt-out under test
+		}
+	})
+}
+
+// silentListener accepts connections on 127.0.0.1 and never writes to them.
+func silentListener(t *testing.T) string {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestPlayTLSHandshakeBounded(t *testing.T) {
+	const timeout = 100 * time.Millisecond
+	cfg := rtmp.Config{HandshakeTimeout: timeout, TLS: tlstest.NewCA(t).Client()}
+	// fails plays rawURL, which must fail as a TLS handshake within bound.
+	fails := func(t *testing.T, ctx context.Context, rawURL string, cfg rtmp.Config, bound time.Duration) error {
+		t.Helper()
+		start := time.Now()
+		r := awaitPlay(t, startPlay(ctx, rawURL, cfg), 5*time.Second)
+		if r.err == nil || !strings.HasPrefix(r.err.Error(), "rtmp: client: tls: ") {
+			t.Fatalf("Play: %v, want an rtmp: client: tls: error", r.err)
+		}
+		if took := time.Since(start); took > bound {
+			t.Fatalf("Play failed after %v, want within %v", took, bound)
+		}
+		return r.err
+	}
+	t.Run("a silent server", func(t *testing.T) {
+		start := time.Now()
+		err := fails(t, context.Background(), "rtmps://"+silentListener(t)+"/live/s", cfg, timeout+time.Second)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Play: %v, want a deadline error", err)
+		}
+		if took := time.Since(start); took < timeout*3/4 {
+			t.Fatalf("Play failed after %v, before HandshakeTimeout %v", took, timeout)
+		}
+	})
+	t.Run("a plain RTMP server", func(t *testing.T) {
+		srv := rtmptest.NewPlayServer(t, nil, rtmptest.PlayOptions{})
+		fails(t, context.Background(), "rtmps://"+srv.Addr+"/live/s", cfg, timeout+time.Second)
+	})
+	t.Run("ctx cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(50*time.Millisecond, cancel)
+		// The default HandshakeTimeout, 5 s, is far away.
+		err := fails(t, ctx, "rtmps://"+silentListener(t)+"/live/s", rtmp.Config{TLS: cfg.TLS}, time.Second)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Play: %v, want context.Canceled", err)
+		}
+	})
 }

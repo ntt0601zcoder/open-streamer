@@ -435,7 +435,10 @@ func (sc *ServerConn) BadCommands() uint64 {
 }
 
 // Close closes the connection, unblocking a pending ReadMedia or WriteMedia
-// and stopping a play conn's reader. It never writes.
+// and stopping a play conn's reader. It writes no RTMP message. When Accept
+// was given a *tls.Conn and no write is in flight, it sends close_notify and
+// waits at most 100 ms for that write, so a player that stopped reading never
+// holds it longer.
 func (sc *ServerConn) Close() error {
 	return sc.s.Close()
 }
