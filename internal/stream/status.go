@@ -329,6 +329,7 @@ func (s *Supervisor) Collect(w *metrics.Writer) {
 		{"openstreamer_push_failures_total", "Push connections and attempts that failed.", func(p rtmppush.Stats) uint64 { return p.Failures }},
 		{"openstreamer_push_republishes_total", "Push connections published again for a codec change.", func(p rtmppush.Stats) uint64 { return p.Republishes }},
 		{"openstreamer_push_messages_total", "RTMP messages written to the push target.", func(p rtmppush.Stats) uint64 { return p.Messages }},
+		{"openstreamer_push_resyncs_total", "Deliveries to the push that reported lost frames.", func(p rtmppush.Stats) uint64 { return p.Resyncs }},
 	} {
 		for i, r := range n.pushes {
 			w.Counter(f.name, f.help, float64(f.get(pushes[i])), l("target", r.id)...)

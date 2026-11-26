@@ -978,6 +978,7 @@ func TestCollect(t *testing.T) {
 		"openstreamer_transcoder_thumbnails_total",
 		"openstreamer_push_up", "openstreamer_push_connects_total", "openstreamer_push_failures_total",
 		"openstreamer_push_republishes_total", "openstreamer_push_messages_total",
+		"openstreamer_push_resyncs_total",
 	}
 	has := func(samples []metricstest.Sample, family string) bool {
 		return slices.ContainsFunc(samples, func(m metricstest.Sample) bool {
