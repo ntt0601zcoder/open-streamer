@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,7 +73,7 @@ func m5b2ProbeIs(t *testing.T, ffprobe, u, lang string) {
 // its audio ("" expects nothing), and returns the capture.
 func m5b2Read(ctx context.Context, u, lang string) (conform.Capture, error) {
 	opt := conform.ReadOptions{Once: true, Timeout: m5aRead, AlignedSequences: true, AudioLanguage: lang}
-	if len(u) > 4 && u[len(u)-4:] == ".mpd" {
+	if strings.HasSuffix(u, ".mpd") {
 		return conform.ReadDASH(ctx, u, opt)
 	}
 	return conform.ReadHLS(ctx, u, opt)
@@ -86,6 +87,10 @@ func m5b2Reads(t *testing.T, u, lang string, want []string) {
 	defer cancel()
 	c, err := m5b2Read(ctx, u, lang)
 	m5aAV(t, u, c, err)
+	if len(want) == 0 {
+		assert.Empty(t, c.AudioLanguages, "%s: the audio languages read", u)
+		return
+	}
 	assert.Equal(t, want, c.AudioLanguages, "%s: the audio languages read", u)
 }
 
@@ -121,6 +126,20 @@ func TestM5b2AudioLanguage(t *testing.T) {
 	// HLS-TS without a ladder is a media playlist: no master, no language
 	// (R-L4), and conform says so when one is expected (R-L6 (d)).
 	assert.NotContains(t, string(m.mediaGet(t, m.url(stream.OutHLS, "cam")).body), "LANGUAGE", "hls/index.m3u8, a media playlist")
+	func() {
+		u := m.url(stream.OutHLS, "cam")
+		ctx, cancel := context.WithTimeout(context.Background(), runLimit)
+		defer cancel()
+		c, err := m5b2Read(ctx, u, "vi")
+		require.NoError(t, err, u)
+		var lang []conform.Violation
+		for _, v := range c.Violations {
+			if v.Rule == conform.RuleAudioLanguage {
+				lang = append(lang, v)
+			}
+		}
+		assert.Len(t, lang, 1, "%s: R-L6 (d), one audio-language violation for a media playlist", u)
+	}()
 
 	// No segmented reader, as in TestM5b1ReplaceInputs: the source is one
 	// pass of a clip, not a loop. The playlist poller and the two samplers
