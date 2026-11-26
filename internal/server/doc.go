@@ -38,7 +38,8 @@
 // over TLS), the RTMP play server is registered on both addresses and the
 // RTSP play server serves both listeners. A TLS handshake that fails is
 // counted per listener and logged once at debug, never after the stop
-// began; everything else net/http reports is logged at error. At the stop
+// began; everything else net/http reports is logged at error, under the
+// server's name ("media" or "api"). At the stop
 // the raw connections of the HTTPS listeners are closed after shutdownWait,
 // so a reader that takes nothing cannot hold it up with its close_notify.
 //
@@ -54,7 +55,10 @@
 //
 // New starts the RTSP and the SRT server's accept loops, the RTMP
 // registry's listener and, through Manager.Load, one supervisor per stream.
-// Run starts the two HTTP servers and the manager's Run, and stops and
-// waits for all of them, New's included, before it returns: a Server that
-// New returned must be Run, once.
+// With an RTSPS listener New also starts the RTSP server's ServeTLS loop,
+// stopped and waited for with its Serve loop. Run starts the two HTTP
+// servers, each one's Serve loop and, with a TLS listener, its ServeTLS
+// loop, and the manager's Run, and stops and waits for all of them, New's
+// included, before it returns: a Server that New returned must be Run,
+// once.
 package server

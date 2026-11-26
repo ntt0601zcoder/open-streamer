@@ -484,6 +484,9 @@ func (s *Server) listen(sec config.Server) ([]stream.Claim, error) {
 			}
 		}
 		if err := s.startRTSPBoth(ln, tlsLn, sec); err != nil {
+			if ln == nil {
+				return nil, fmt.Errorf("server: rtsp.tls_listen %s: %w", sec.RTSP.TLSListen, err)
+			}
 			return nil, fmt.Errorf("server: rtsp.listen %s: %w", sec.RTSP.Listen, err)
 		}
 		if ln != nil {
@@ -801,19 +804,25 @@ func (s *Server) Run(ctx context.Context) error {
 // tlsLn is srv's HTTPS listener, nil when off. net/http closes a TLS
 // connection with a close_notify, which a peer that reads nothing holds up
 // for seconds, in Close and in Shutdown's own close of an idle connection
-// alike. So at shutdownWait the raw connections still open are closed here,
+// alike, and so does a connection that closes itself. So the raw connections
+// still open are closed here, when Shutdown returns and at shutdownWait
 // whatever Shutdown is doing then, and the stop takes shutdownWait at most
 // (R-S8).
 func shutdown(ctx context.Context, srv *http.Server, tlsLn *trackListener) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownWait)
 	defer cancel()
 	if tlsLn != nil {
+		// For a Shutdown that is itself held up by a close_notify.
 		defer time.AfterFunc(shutdownWait, tlsLn.closeConns).Stop()
 	}
-	if err := srv.Shutdown(ctx); err != nil {
-		if tlsLn != nil {
-			tlsLn.closeConns()
-		}
+	err := srv.Shutdown(ctx)
+	// Whatever Shutdown returned: a connection that was closing itself as
+	// Shutdown began is no longer Shutdown's to wait for, so nil does not
+	// mean that every raw connection is closed.
+	if tlsLn != nil {
+		tlsLn.closeConns()
+	}
+	if err != nil {
 		_ = srv.Close()
 	}
 }

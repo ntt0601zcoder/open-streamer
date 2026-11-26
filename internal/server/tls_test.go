@@ -543,7 +543,8 @@ func TestHTTPErrorLog(t *testing.T) {
 		require.Error(t, err)
 		require.Eventually(t, func() bool { return e.logs.String() != "" }, waitFor, time.Millisecond)
 		assert.Equal(t, 1, strings.Count(e.logs.String(), "\n"))
-		lines := logLines(t, e.logs.String(), "server: https: http: panic serving")
+		// Under the server's name: it serves the plain listener too.
+		lines := logLines(t, e.logs.String(), "server: media: http: panic serving")
 		require.Len(t, lines, 1)
 		assert.Equal(t, "ERROR", lines[0]["level"])
 		assert.Contains(t, lines[0]["msg"], "boom in the handler")
@@ -783,10 +784,16 @@ func TestShutdownClosesRawConns(t *testing.T) {
 		under := &stallListener{Listener: listenTCP(t, "127.0.0.1:0"), conns: make(chan *stallConn, 1)}
 		ln := newTrackListener(under)
 		entered := make(chan struct{}, 1)
+		isIdle := make(chan struct{}, 1)
 		srv := &http.Server{
 			ReadHeaderTimeout: headerTimeout,
 			TLSConfig:         ca.Server(t),
-			ErrorLog:          (&Server{log: slog.New(slog.DiscardHandler)}).httpErrorLog("https", new(atomic.Uint64)),
+			ConnState: func(_ net.Conn, st http.ConnState) {
+				if st == http.StateIdle {
+					isIdle <- struct{}{}
+				}
+			},
+			ErrorLog: (&Server{log: slog.New(slog.DiscardHandler)}).httpErrorLog("https", new(atomic.Uint64)),
 			Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 				entered <- struct{}{}
 				if !idle {
@@ -812,6 +819,13 @@ func TestShutdownClosesRawConns(t *testing.T) {
 			res, err := http.ReadResponse(bufio.NewReader(tc), nil)
 			require.NoError(t, err)
 			require.NoError(t, res.Body.Close())
+			// And the server has it down as idle: only then is it
+			// Shutdown's to close, and not still its own goroutine's.
+			select {
+			case <-isIdle:
+			case <-time.After(waitFor):
+				require.Fail(t, "the connection never became idle")
+			}
 		}
 		require.Equal(t, 1, ln.open())
 		(<-under.conns).stall.Store(true)
@@ -841,9 +855,20 @@ func TestTLSRestartRequired(t *testing.T) {
 	moved := filepath.Join(t.TempDir(), "moved.pem")
 	require.NoError(t, os.WriteFile(moved, data, 0o600))
 
+	// Two ports that are free now, and still are after the reload.
+	// Both are held until both are taken, so that they differ.
+	free := make([]string, 2)
+	held := make([]net.Listener, len(free))
+	for i := range free {
+		held[i] = listenTCP(t, "127.0.0.1:0")
+		free[i] = held[i].Addr().String()
+	}
+	for _, ln := range held {
+		require.NoError(t, ln.Close())
+	}
 	edited := strings.Replace(text, cert, moved, 1)
-	edited = strings.Replace(edited, `http: {listen: "127.0.0.1:0", tls_listen: "127.0.0.1:0"}`, `http: {listen: "127.0.0.1:0", tls_listen: "127.0.0.1:19443"}`, 1)
-	edited = strings.Replace(edited, `rtmp: {listen: "127.0.0.1:0", tls_listen: "127.0.0.1:0"}`, `rtmp: {listen: "127.0.0.1:0", tls_listen: "127.0.0.1:19361"}`, 1)
+	edited = strings.Replace(edited, `http: {listen: "127.0.0.1:0", tls_listen: "127.0.0.1:0"}`, `http: {listen: "127.0.0.1:0", tls_listen: "`+free[0]+`"}`, 1)
+	edited = strings.Replace(edited, `rtmp: {listen: "127.0.0.1:0", tls_listen: "127.0.0.1:0"}`, `rtmp: {listen: "127.0.0.1:0", tls_listen: "`+free[1]+`"}`, 1)
 	require.NotEqual(t, text, edited)
 	s.handEdit(edited)
 	res, err := s.Reload(bg)
@@ -858,7 +883,7 @@ func TestTLSRestartRequired(t *testing.T) {
 		require.NoError(t, err, name)
 		require.NoError(t, conn.Close())
 	}
-	for _, addr := range []string{"127.0.0.1:19443", "127.0.0.1:19361"} {
+	for _, addr := range free {
 		require.NoError(t, listenTCP(t, addr).Close(), "%s was bound", addr)
 	}
 
@@ -899,28 +924,30 @@ func frameData(frames []media.Frame, kind media.Kind) []string {
 	return out
 }
 
-// overlap is the number of frames two captures of one live stream share,
-// one's start found in the other; -1 when a shared frame differs.
+// overlap is the number of frames two captures of one live stream share:
+// the longest run on which one, laid over the other from some frame on,
+// agrees with it frame for frame to the end of the shorter. Every
+// alignment is tried and the best kept, since a payload may repeat (the
+// fixture's audio does); 0 when none agrees.
 func overlap(a, b []string) int {
-	if len(a) == 0 || len(b) == 0 {
-		return 0
-	}
+	best := 0
 	for range 2 {
 		for i := range a {
-			if a[i] != b[0] {
-				continue
-			}
 			n := min(len(a)-i, len(b))
-			for j := range n {
-				if a[i+j] != b[j] {
-					return -1
-				}
+			if n <= best {
+				break // no later alignment is longer
 			}
-			return n
+			same := true
+			for j := 0; j < n && same; j++ {
+				same = a[i+j] == b[j]
+			}
+			if same {
+				best = n
+			}
 		}
 		a, b = b, a
 	}
-	return 0
+	return best
 }
 
 func TestTLSOutputs(t *testing.T) {
