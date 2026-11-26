@@ -26,10 +26,11 @@ func liveInput(set *timedSet, marker byte) *opener {
 	}}
 }
 
-// failingInput is an input whose first open reads marker's source until at,
-// when it fails; its later opens are live.
-func failingInput(set *timedSet, marker byte, at time.Duration) *opener {
-	src := source{marker: marker, gop: idxGOP}
+// failingInput is an input whose first open reads source 0 until 2 s, when
+// it fails; its later opens are live.
+func failingInput(set *timedSet) *opener {
+	const at = 2 * time.Second
+	src := source{marker: 0, gop: idxGOP}
 	return &opener{next: func(n int, _ context.Context) (ingest.Reader, error) {
 		if n == 0 {
 			return set.reader(append(src.frames(0, at), failAt(at, errors.New("dropped")))), nil
@@ -234,7 +235,7 @@ func TestSetInputsKeepsActive(t *testing.T) {
 
 func TestSetInputsReorderBelow(t *testing.T) {
 	r := newEditRig(t, func(set *timedSet) byURL {
-		return byURL{"fake://a": failingInput(set, 0, 2*time.Second), "fake://b": standbyLive(set, 1)}
+		return byURL{"fake://a": failingInput(set), "fake://b": standbyLive(set, 1)}
 	}, "fake://a", "fake://b")
 	waitActive(t, r.ev, 0)
 	// A fails at 2 s and B becomes active; A reopens at 2.5 s as a probe.
@@ -336,7 +337,7 @@ func TestSetInputsDuringSearch(t *testing.T) {
 		// A fails at 2 s (retry at 2.5 s); the search tries B, which hangs.
 		r := newEditRig(t, func(set *timedSet) byURL {
 			return byURL{
-				"fake://a": failingInput(set, 0, 2*time.Second),
+				"fake://a": failingInput(set),
 				"fake://b": hangInput(),
 				"fake://c": standby(videoOnly, noReopen(t)),
 				"fake://d": liveInput(set, 3),
@@ -383,7 +384,7 @@ func TestSetInputsDuringSearch(t *testing.T) {
 		// (index 50) so that its epoch has frames.
 		r := newEditRig(t, func(set *timedSet) byURL {
 			return byURL{
-				"fake://a": failingInput(set, 0, 2*time.Second),
+				"fake://a": failingInput(set),
 				"fake://b": standby(videoOnly, func(int) (ingest.Reader, error) {
 					return set.reader(source{marker: 1, gop: idxGOP, phase: 20}.frames(set.ft.elapsed(), time.Minute)), nil
 				}),
@@ -573,7 +574,7 @@ func sameListIdle(t *testing.T) {
 	// A fails at 2 s; the search tries B, which hangs; C waits its turn.
 	r := newEditRig(t, func(set *timedSet) byURL {
 		return byURL{
-			"fake://a": failingInput(set, 0, 2*time.Second),
+			"fake://a": failingInput(set),
 			"fake://b": hangInput(),
 			"fake://c": hangInput(),
 		}
