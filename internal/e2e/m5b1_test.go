@@ -138,7 +138,11 @@ func m5b1Epochs(r *hubRecorder) []uint32 {
 // within d, and still exactly n after m5b1Hold more.
 func m5b1EpochsStay(t *testing.T, r *hubRecorder, n int, d time.Duration, what string) {
 	t.Helper()
-	m5aUntil(t, d, func() bool { return len(m5b1Epochs(r)) >= n }, "%s: frames of %d epochs; the tap has %v", what, n, m5b1Epochs(r))
+	var got []uint32
+	m5aUntil(t, d, func() bool {
+		got = m5b1Epochs(r)
+		return len(got) >= n
+	}, "%s: frames of %d epochs; the tap has %v", what, n, &got)
 	require.Len(t, m5b1Epochs(r), n, "%s: epochs", what)
 	time.Sleep(m5b1Hold)
 	require.Len(t, m5b1Epochs(r), n, "%s: epochs, %v later", what, m5b1Hold)
@@ -340,7 +344,6 @@ func TestM5b1ReplaceInputs(t *testing.T) {
 	assert.Zero(t, st.Rebuilds+st.Restarts, "rebuilds and restarts")
 	assert.EqualValues(t, 1, st.Switches, "input_switches")
 	assert.Len(t, st.Inputs, 2)
-	assert.Equal(t, endedBefore, m5b1Ended(t, m), "no openstreamer_output_sessions_ended_total series moved")
 
 	// The media sequence goes on once the window is full.
 	m5aUntil(t, m5aWait, playlist.slid, "the HLS window slides")
@@ -349,6 +352,9 @@ func TestM5b1ReplaceInputs(t *testing.T) {
 	r.base["input_switches"] = 1
 	playlist.end()
 	dash.end()
+	// Read last, just before the row ends the stream: it covers the whole
+	// run.
+	assert.Equal(t, endedBefore, m5b1Ended(t, m), "no openstreamer_output_sessions_ended_total series moved")
 	r.end(t)
 	assertUninterrupted(t, r)
 	t.Run("dash packager", dash.check)
@@ -430,10 +436,20 @@ func TestM5b1ReplaceInputsLadder(t *testing.T) {
 	got := waitRawResult(t, reader)
 	c := conformBytes(t, got)
 	assert.Empty(t, c.Violations, "the capture of cam_180's HTTP-TS")
-	// The rendition's epoch change is not one of the TS: the output goes
-	// on in its own timeline, so the capture is one run, held to the hub's
-	// two epochs frame for frame below.
+	// TS never signals a hub epoch, for any stream: the hub's stream time
+	// is continuous across one, and the output goes on in it. So the
+	// capture is one run, whose largest video DTS step, the one at the
+	// epoch change included, is under 1 s; it is held to the hub's two
+	// epochs frame for frame below.
 	assert.Zero(t, tsGaps(t, got), "resumes after loss")
+	captured, _ := byKind(tsFrames(t, got), media.KindVideo)
+	require.NotEmpty(t, captured, "video in the capture")
+	var step int64
+	for i := 1; i < len(captured); i++ {
+		step = max(step, captured[i].DTS-captured[i-1].DTS)
+	}
+	t.Logf("the capture's largest video DTS step: %d ticks over %d frames", step, len(captured))
+	assert.Less(t, step, int64(media.ClockRate), "the capture's largest video DTS step: continuous across the epoch change")
 	select {
 	case <-tap.done:
 	case <-time.After(m5aWait):
@@ -889,5 +905,11 @@ func TestM5b1NoFallback(t *testing.T) {
 	m.fresh(t, stream.OutHTTPTS, "cam_hi")
 	m.fresh(t, stream.OutHTTPTS, "cam_lo")
 	assert.Len(t, m5b1Epochs(source), 1, "the second generation's source hub: epochs")
-	assert.Len(t, m5b1Epochs(taps["cam_hi"]), 1, "cam_hi: epochs, with a child that was not respawned")
+	// A respawned child builds its encoders again, which is an epoch of
+	// its own: the count is held only for a child that was not respawned.
+	if st.Transcoder.Spawns == 1 && st.Transcoder.Exits == 0 {
+		assert.Len(t, m5b1Epochs(taps["cam_hi"]), 1, "cam_hi: epochs, with a child that was not respawned")
+	} else {
+		t.Logf("cam_hi: epochs %v not held to 1: the child was respawned (%+v)", m5b1Epochs(taps["cam_hi"]), *st.Transcoder)
+	}
 }
