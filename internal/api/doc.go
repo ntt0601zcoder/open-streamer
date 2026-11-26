@@ -17,10 +17,13 @@
 //     credential is looked at: a cross-site form cannot set the header.
 //  4. The Basic credentials; none is a 401 that counts against nobody.
 //  5. The limiter and the users, in the order internal/auth documents:
-//     Blocked, Remembered, Reserve, Verify. Reserve also holds the client
-//     address to 4 verifications in flight, whatever names it presents; a
-//     fifth is a 429 with Retry-After 1, and a remembered login takes no
-//     place.
+//     Blocked, Recall, Reserve, Verify. A remembered login is let in with
+//     no verification. A password that differs from the one remembered for
+//     its name is wrong: it is counted as a failed login and answered 401
+//     with no verification, before Reserve. Reserve holds the pair to its
+//     attempts and the client address to 4 verifications in flight,
+//     whatever names it presents; a fifth is a 429 with Retry-After 1.
+//     Neither remembered case takes a place.
 //  6. The route's role, and an editor for ?secrets=1.
 //  7. The dispatch through the mux, which fills the path values. A handler
 //     of ours refuses a request the wrapper did not pass for its own route.

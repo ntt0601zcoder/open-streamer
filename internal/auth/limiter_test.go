@@ -806,3 +806,129 @@ func TestLimiterAddressCapEvictsNothing(t *testing.T) {
 	}
 	assert.Equal(t, 0, l.addrSize())
 }
+
+// TestLimiterCharge: a failure counted with no attempt blocks the key as a
+// failed attempt does, and a burst counts no more than a burst of attempts.
+func TestLimiterCharge(t *testing.T) {
+	clk := newFakeClock()
+	l := NewLimiter(clk.now)
+	const addr = "203.0.113.9:1"
+	key := l.Key(addr, "ops")
+
+	for i := 1; i < maxAttempts; i++ {
+		require.True(t, l.Charge(key))
+		_, blocked := l.Blocked(key)
+		assert.False(t, blocked, "after %d", i)
+		assert.Equal(t, maxAttempts-i, places(t, l, key))
+	}
+	require.True(t, l.Charge(key))
+	ra, blocked := l.Blocked(key)
+	assert.True(t, blocked)
+	assert.Equal(t, baseBackoff, ra)
+	// Blocked: nothing more is counted, and the backoff does not move.
+	clk.add(400 * time.Millisecond)
+	for range 100 {
+		require.False(t, l.Charge(key))
+	}
+	e, _ := l.entryFor(key)
+	assert.Equal(t, maxAttempts, e.failures)
+	ra, _ = l.Blocked(key)
+	assert.Equal(t, 600*time.Millisecond, ra)
+	// Past the backoff, one more is counted, and doubles it.
+	clk.add(600 * time.Millisecond)
+	require.True(t, l.Charge(key))
+	require.False(t, l.Charge(key))
+	ra, _ = l.Blocked(key)
+	assert.Equal(t, 2*baseBackoff, ra)
+	// It mixes with failed attempts, and a Succeed clears both.
+	clk.add(ra)
+	failOnce(t, l, key)
+	e, _ = l.entryFor(key)
+	assert.Equal(t, maxAttempts+2, e.failures)
+	clk.add(4 * baseBackoff)
+	a, ok := l.Reserve(key, anyAddr())
+	require.True(t, ok)
+	a.Succeed()
+	_, tracked := l.entryFor(key)
+	assert.False(t, tracked)
+
+	// It takes no place, of the key or of the address, and is not held back
+	// by a full address.
+	held := make([]*Attempt, 0, addrInFlight)
+	for i := range addrInFlight {
+		a, ok := l.Reserve(l.Key(addr, fmt.Sprintf("ghost%d", i)), addr)
+		require.True(t, ok)
+		held = append(held, a)
+	}
+	require.True(t, l.Charge(key))
+	e, _ = l.entryFor(key)
+	assert.Equal(t, entry{failures: 1, lastFail: clk.now()}, e)
+	n, _ := l.addrCount(addr)
+	assert.Equal(t, addrInFlight, n)
+	for _, h := range held {
+		h.Abandon()
+	}
+
+	// A burst counts maxAttempts and is refused past that.
+	l = NewLimiter(nil)
+	key = l.Key(addr, "ops")
+	var (
+		counted atomic.Int64
+		wg      sync.WaitGroup
+	)
+	for range 200 {
+		wg.Go(func() {
+			if l.Charge(key) {
+				counted.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	assert.EqualValues(t, maxAttempts, counted.Load())
+	e, _ = l.entryFor(key)
+	assert.Equal(t, maxAttempts, e.failures)
+}
+
+// TestLimiterChargeFullTable: a Charge evicts only to insert its key, and a
+// refused one leaves a full table as it was.
+func TestLimiterChargeFullTable(t *testing.T) {
+	clk := newFakeClock()
+	l := NewLimiter(clk.now)
+	keys := make([]string, maxKeys)
+	for i := range keys {
+		keys[i] = l.Key(fmt.Sprintf("10.%d.%d.1:1", i/256, i%256), "ops")
+		clk.add(time.Millisecond)
+		failOnce(t, l, keys[i])
+	}
+	last := keys[len(keys)-1]
+	for range maxAttempts - 1 {
+		failOnce(t, l, last)
+	}
+	before := l.keySet()
+	require.False(t, l.Charge(last), "blocked")
+	assert.Equal(t, before, l.keySet(), "a refused Charge changed the table")
+
+	// A tracked key is counted in place.
+	require.True(t, l.Charge(keys[1]))
+	assert.Equal(t, maxKeys, l.size())
+	_, ok := l.entryFor(keys[0])
+	assert.True(t, ok, "a Charge of a tracked key evicted")
+	// A new key evicts the oldest under 5 failures.
+	fresh := l.Key("192.168.0.1:1", "ops")
+	require.True(t, l.Charge(fresh))
+	assert.Equal(t, maxKeys, l.size())
+	_, ok = l.entryFor(keys[0])
+	assert.False(t, ok)
+	e, ok := l.entryFor(fresh)
+	require.True(t, ok)
+	assert.Equal(t, 1, e.failures)
+
+	// When every key has an attempt in flight, a new key cannot be counted.
+	l = NewLimiter(clk.now)
+	for i := range maxKeys {
+		_, ok := l.Reserve(l.Key(fmt.Sprintf("10.%d.%d.1:1", i/256, i%256), "ops"), anyAddr())
+		require.True(t, ok)
+	}
+	assert.False(t, l.Charge(fresh))
+	assert.Equal(t, maxKeys, l.size())
+}

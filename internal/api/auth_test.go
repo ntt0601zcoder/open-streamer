@@ -679,7 +679,9 @@ func TestAPIAddressCap(t *testing.T) {
 	}
 	waitFor(t, "200 requests", func() bool { return sent.Load() >= 200 })
 	stopFlood()
-	// The slack is for a loaded machine: the bound is 4 verifications, not 18.
+	// A sanity check only, with slack for a loaded machine: the 200 above is
+	// what pins that the login was admitted; the bound is 4 verifications,
+	// not 18.
 	assert.LessOrEqual(t, took, 4*time.Duration(slowest.Load())+2*time.Second,
 		"a login from another address waited behind more than 4 verifications")
 	assert.Zero(t, gotOther.Load(), "an answer that is neither 401 nor 429 with Retry-After 1")
@@ -703,6 +705,193 @@ func TestAPIAddressCap(t *testing.T) {
 	for _, a := range places {
 		a.Abandon()
 	}
+}
+
+// TestRememberedMismatchIsCharged: a password that differs from the one
+// remembered for its name is a failed login, counted with no PBKDF2 and
+// before the address's cap. So an address that fills its 4 places cannot
+// guess at a remembered user for free: the cap would refuse every wrong
+// guess uncounted, and let the right one in.
+func TestRememberedMismatchIsCharged(t *testing.T) {
+	e := newEnv(t)
+	auth.WarmDummy()
+	const capped, elsewhere = "203.0.113.9:1", "198.51.100.7:1"
+	get := func(addr, user, pass string) *httptest.ResponseRecorder {
+		return e.do(http.MethodGet, "/api/v1/version", basic(user, pass), from(addr))
+	}
+	// ops has a remembered login, from elsewhere.
+	require.Equal(t, http.StatusOK, get(elsewhere, "ops", edPass).Code)
+
+	// From here on every PBKDF2 is counted and held.
+	var hashes atomic.Int64
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(auth.SetHashHook(func(func() []byte) []byte {
+		hashes.Add(1)
+		<-gate
+		return nil
+	}))
+	var wg sync.WaitGroup
+	t.Cleanup(wg.Wait)
+	t.Cleanup(release)
+
+	// The address fills its 4 places with invented names.
+	ghosts := make(chan int, 4)
+	for i := range 4 {
+		wg.Go(func() { ghosts <- get(capped, fmt.Sprintf("ghost%d", i), "some password 1").Code })
+	}
+	waitFor(t, "the address is at its cap", func() bool {
+		a, ok := e.lim.Reserve(e.lim.Key(capped, "probe"), capped)
+		a.Abandon()
+		return !ok
+	})
+	require.Equal(t, http.StatusTooManyRequests, get(capped, "ghost9", "some password 1").Code, "the cap")
+	blockedBefore := e.counter("openstreamer_api_auth_blocked_total")
+	held := hashes.Load()
+
+	// Wrong guesses at ops are not refused by the cap: each is a 401 and a
+	// counted failure, until the pair is in its backoff.
+	key := e.lim.Key(capped, "ops")
+	for i := range 5 {
+		_, blocked := e.lim.Blocked(key)
+		require.False(t, blocked, "after %d guesses", i)
+		rec := get(capped, "ops", fmt.Sprintf("wrong password %d", i))
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "guess %d", i+1)
+		assert.Equal(t, []string{realm}, rec.Header().Values("WWW-Authenticate"))
+	}
+	_, blocked := e.lim.Blocked(key)
+	require.True(t, blocked, "5 wrong guesses did not block the pair")
+	assert.Equal(t, 0, e.free(capped, "ops"))
+	assert.InDelta(t, 5, e.counter("openstreamer_api_auth_failures_total"), 0)
+	assert.InDelta(t, blockedBefore, e.counter("openstreamer_api_auth_blocked_total"), 0)
+	assert.Contains(t, e.logs.String(), "failed login")
+
+	// Blocked: every further guess is a 429 from the backoff, the right
+	// password included, and nothing is compared.
+	u := e.usersCalls.Load()
+	for i := range 1000 {
+		pass := fmt.Sprintf("another wrong password %d", i)
+		if i%100 == 0 {
+			pass = edPass
+		}
+		rec := get(capped, "ops", pass)
+		require.Equal(t, http.StatusTooManyRequests, rec.Code)
+		require.Equal(t, "1", rec.Header().Get("Retry-After"))
+	}
+	assert.Equal(t, u, e.usersCalls.Load(), "a blocked request reached the users")
+	assert.InDelta(t, blockedBefore+1000, e.counter("openstreamer_api_auth_blocked_total"), 0)
+	assert.InDelta(t, 5, e.counter("openstreamer_api_auth_failures_total"), 0)
+
+	// The pair is the address and the name: ops gets in from elsewhere, and
+	// its wrong guesses there are counted there.
+	assert.Equal(t, http.StatusOK, get(elsewhere, "ops", edPass).Code)
+	assert.Equal(t, http.StatusUnauthorized, get(elsewhere, "ops", "wrong password 1").Code)
+	assert.Equal(t, 4, e.free(elsewhere, "ops"))
+
+	// Once the block has run out the right password gets in, also from the
+	// capped address: a remembered login takes no place. The next wrong
+	// guess blocks the pair again, for longer.
+	e.clock.Advance(time.Second)
+	assert.Equal(t, http.StatusOK, get(capped, "ops", edPass).Code)
+	assert.Equal(t, http.StatusOK, get(elsewhere, "ops", edPass).Code)
+	assert.Equal(t, http.StatusUnauthorized, get(capped, "ops", "wrong password 1").Code)
+	rec := get(capped, "ops", edPass)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	assert.Equal(t, "2", rec.Header().Get("Retry-After"))
+
+	// Not one PBKDF2 in all of it: only the 4 held logins computed (2 of
+	// them so far, the others wait their turn).
+	assert.Equal(t, held, hashes.Load(), "a guess at a remembered name ran PBKDF2")
+	assert.LessOrEqual(t, held, int64(2))
+
+	// A name nobody remembers is still the cap's: eye was never verified.
+	assert.Equal(t, http.StatusTooManyRequests, get(capped, "eye", "wrong password 1").Code)
+	assert.Equal(t, 5, e.free(capped, "eye"))
+
+	release()
+	for range 4 {
+		select {
+		case code := <-ghosts:
+			assert.Equal(t, http.StatusUnauthorized, code)
+		case <-time.After(10 * time.Second):
+			require.FailNow(t, "a held login did not return")
+		}
+	}
+}
+
+// TestMismatchBurst: a burst of wrong guesses at a remembered name counts
+// 5 failures, as a burst of verified ones does, and runs no PBKDF2.
+func TestMismatchBurst(t *testing.T) {
+	e := newEnv(t)
+	require.Equal(t, http.StatusOK, e.do(http.MethodGet, "/api/v1/version", basic("ops", edPass), from("10.6.0.2:1")).Code)
+	hashes := countHashes(t)
+	const addr = "10.6.0.1:1"
+	var (
+		wg    sync.WaitGroup
+		codes [600]atomic.Int64
+		start = make(chan struct{})
+	)
+	for i := range 200 {
+		wg.Go(func() {
+			<-start
+			rec := e.do(http.MethodGet, "/api/v1/version", basic("ops", fmt.Sprintf("wrong password %d", i)), from(addr))
+			codes[rec.Code].Add(1)
+		})
+	}
+	close(start)
+	wg.Wait()
+	assert.EqualValues(t, 5, codes[http.StatusUnauthorized].Load())
+	assert.EqualValues(t, 195, codes[http.StatusTooManyRequests].Load())
+	assert.InDelta(t, 5, e.counter("openstreamer_api_auth_failures_total"), 0)
+	assert.InDelta(t, 195, e.counter("openstreamer_api_auth_blocked_total"), 0)
+	ra, blocked := e.lim.Blocked(e.lim.Key(addr, "ops"))
+	assert.True(t, blocked)
+	assert.Equal(t, time.Second, ra, "the burst lengthened the backoff")
+	assert.Zero(t, hashes.Load())
+}
+
+// TestChangedPasswordIsNotAMismatch: a password changed in the config comes
+// with a new set of users, which remembers nothing, so the new password is
+// verified and let in, never charged against the old remembered one.
+func TestChangedPasswordIsNotAMismatch(t *testing.T) {
+	e := newEnv(t)
+	const addr = "10.7.0.1:1"
+	get := func(pass string) int {
+		return e.do(http.MethodGet, "/api/v1/version", basic("ops", pass), from(addr)).Code
+	}
+	require.Equal(t, http.StatusOK, get(edPass))
+	const newPass = "another password 2"
+	next := usersWith(t, newPass, viPass)
+	hashes := countHashes(t)
+
+	// Under the old set the new password is a mismatch: 401, no PBKDF2, one
+	// failure.
+	require.Equal(t, http.StatusUnauthorized, get(newPass))
+	assert.Zero(t, hashes.Load())
+	assert.Equal(t, 4, e.free(addr, "ops"))
+
+	// The config changes the password. The new one is verified: 200, one
+	// PBKDF2, and a real verification clears the pair.
+	e.users.Store(next)
+	require.Equal(t, http.StatusOK, get(newPass))
+	assert.EqualValues(t, 1, hashes.Load(), "the new password was not verified")
+	assert.Equal(t, 5, e.free(addr, "ops"))
+	assert.InDelta(t, 1, e.counter("openstreamer_api_auth_failures_total"), 0)
+	require.Equal(t, http.StatusOK, get(newPass))
+	assert.EqualValues(t, 1, hashes.Load(), "remembered")
+
+	// The old password is now the mismatch.
+	require.Equal(t, http.StatusUnauthorized, get(edPass))
+	assert.EqualValues(t, 1, hashes.Load())
+	assert.Equal(t, 4, e.free(addr, "ops"))
+
+	// Before the new set has verified anybody, the old password is not a
+	// mismatch either: it is verified, and fails.
+	again := usersWith(t, newPass, "another viewer password 2")
+	e.users.Store(again)
+	base := hashes.Load()
+	require.Equal(t, http.StatusUnauthorized, get(edPass))
+	assert.Equal(t, base+1, hashes.Load(), "nothing is remembered: a verification")
 }
 
 func TestRememberedTouchesNoLimiter(t *testing.T) {

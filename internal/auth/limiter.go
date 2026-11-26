@@ -171,14 +171,18 @@ func (l *Limiter) Blocked(key string) (retryAfter time.Duration, blocked bool) {
 // under 5 failures, or failing that the one with the oldest last failure
 // at 5 or more. So a client that wants its own block evicted must first
 // make every other key of the table a newer block: about 20 000 failed
-// verifications (4096 keys at 5 failures each), each a full PBKDF2, for
-// one block; other names with fewer failures only evict each other. When
+// failures (4096 keys at 5 failures each) for one block; other names with
+// fewer failures only evict each other. Each of those failures is a full
+// PBKDF2, except against a name with a remembered login (Charge), of
+// which one address has at most MaxUsers keys. When
 // every key has an attempt in flight, Reserve refuses. The
 // new key's attempt may still end in ErrBusy and be abandoned, which
 // deletes the new key; that leaves a vacancy the next new key fills
 // without evicting, so abandoned attempts cost at most one eviction per
 // vacancy they create, and only failures that are counted grow the table.
 func (l *Limiter) Reserve(key, remoteAddr string) (*Attempt, bool) {
+	// An address that does not parse is its own client, as in Key; net/http
+	// always gives a host:port that does.
 	addr := ClientKey(remoteAddr)
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -203,6 +207,35 @@ func (l *Limiter) Reserve(key, remoteAddr string) (*Attempt, bool) {
 	e.inFlight++
 	l.addrs[addr]++
 	return &Attempt{l: l, key: key, addr: addr}, true
+}
+
+// Charge counts one failure against key with no attempt: for a password
+// known to be wrong without a verification (Mismatch). It reports false,
+// and counts nothing, when the key is blocked now or when the table cannot
+// make room; the caller refuses the request as it does for a refused
+// Reserve. Like Reserve it evicts only to insert, never for a refusal. A
+// burst is bounded as with Reserve: the failure that reaches 5, and each
+// one after a backoff has run out, blocks the key, so the rest of the burst
+// is refused and not counted. It takes no place of the key or of an
+// address, and the failures in flight do not hold it back.
+func (l *Limiter) Charge(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	e := l.lookup(key, now)
+	if blockedFor(e, now) > 0 {
+		return false
+	}
+	if e == nil {
+		if len(l.entries) >= maxKeys && !l.evict() {
+			return false
+		}
+		e = &entry{}
+		l.entries[key] = e
+	}
+	e.failures = min(e.failures+1, maxFailures)
+	e.lastFail = now
+	return true
 }
 
 // evict drops, among the keys with nothing in flight, the one with the

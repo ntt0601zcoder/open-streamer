@@ -377,3 +377,85 @@ func TestUsersEqual(t *testing.T) {
 func TestErrorsAreDistinct(t *testing.T) {
 	assert.False(t, errors.Is(ErrBusy, ErrBadCredentials))
 }
+
+// TestRecall: a password other than the remembered one is a Mismatch only
+// while the set that verified the remembered one is in use.
+func TestRecall(t *testing.T) {
+	u := testUsers(t)
+	n := countHashes(t)
+	ctx := context.Background()
+
+	for _, c := range []struct{ name, pw string }{
+		{"ops", edPass}, {"ops", "wrong password 1"}, {"watch", edPass}, {"nobody", edPass}, {"", ""},
+	} {
+		role, m := u.Recall(c.name, c.pw)
+		assert.Equal(t, Unknown, m, "%q before any Verify", c.name)
+		assert.Empty(t, role)
+	}
+	// A failed Verify leaves nothing to mismatch.
+	_, err := u.Verify(ctx, "ops", "wrong password 1")
+	require.ErrorIs(t, err, ErrBadCredentials)
+	_, m := u.Recall("ops", "another wrong password")
+	assert.Equal(t, Unknown, m)
+
+	_, err = u.Verify(ctx, "ops", edPass)
+	require.NoError(t, err)
+	base := n.Load()
+	role, m := u.Recall("ops", edPass)
+	assert.Equal(t, Match, m)
+	assert.Equal(t, Editor, role)
+	for _, pw := range []string{"wrong password 1", edPass + "x", "", viPass} {
+		role, m = u.Recall("ops", pw)
+		assert.Equal(t, Mismatch, m, "%q", pw)
+		assert.Empty(t, role, "a mismatch has no role")
+	}
+	// Per name: the other user and an unknown name are still Unknown.
+	_, m = u.Recall("watch", "wrong password 1")
+	assert.Equal(t, Unknown, m)
+	_, m = u.Recall("nobody", edPass)
+	assert.Equal(t, Unknown, m)
+	assert.Equal(t, base, n.Load(), "Recall runs PBKDF2")
+	// A failed Verify does not forget the remembered login.
+	_, err = u.Verify(ctx, "ops", "wrong password 1")
+	require.ErrorIs(t, err, ErrBadCredentials)
+	_, m = u.Recall("ops", "wrong password 1")
+	assert.Equal(t, Mismatch, m)
+
+	// A changed password is a new set, which remembers nothing: the new
+	// password is Unknown there, never a Mismatch, and verifies.
+	const newPass = "another password 2"
+	u2, err := NewUsers([]User{
+		{Name: "ops", Role: Editor, Hash: testHash(newPass)},
+		{Name: "watch", Role: Viewer, Hash: testHash(viPass)},
+	})
+	require.NoError(t, err)
+	_, m = u2.Recall("ops", newPass)
+	assert.Equal(t, Unknown, m)
+	_, m = u2.Recall("ops", edPass)
+	assert.Equal(t, Unknown, m)
+	_, err = u2.Verify(ctx, "ops", newPass)
+	require.NoError(t, err)
+	_, m = u2.Recall("ops", edPass)
+	assert.Equal(t, Mismatch, m, "the old password, once the new one is remembered")
+}
+
+// TestRecallWhileRemembering: the right password is never a Mismatch while
+// another request's Verify remembers it.
+func TestRecallWhileRemembering(t *testing.T) {
+	ctx := context.Background()
+	for range 20 {
+		u := testUsers(t)
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, err := u.Verify(ctx, "ops", edPass)
+			assert.NoError(t, err)
+		})
+		for range 200 {
+			_, m := u.Recall("ops", edPass)
+			if !assert.NotEqual(t, Mismatch, m) {
+				break
+			}
+		}
+		wg.Wait()
+	}
+}

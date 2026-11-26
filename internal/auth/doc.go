@@ -10,9 +10,19 @@
 //  1. Limiter.Blocked(key): refuse before anything is compared, so a
 //     blocked client never learns whether a guess equals a remembered
 //     password.
-//  2. Users.Remembered: success with no PBKDF2 and no reservation. The
-//     remembered path touches no limiter state: only a real verification
-//     (Attempt.Succeed) zeroes a key's failures.
+//  2. Users.Recall, which answers one of three:
+//     Match: success with no PBKDF2 and no reservation. It touches no
+//     limiter state: only a real verification (Attempt.Succeed) zeroes a
+//     key's failures.
+//     Mismatch: the name has a remembered login and the password is
+//     another one, so it is wrong, with no PBKDF2. Limiter.Charge(key)
+//     counts it as a failure, and the request is refused here, before
+//     step 3. Otherwise a client that fills its address's places (step 3)
+//     would have every further guess refused there, uncounted and for
+//     free, while the right guess answered at once: an oracle. A client
+//     can tell this refusal from a verified one by its speed, so it learns
+//     that the name has logged in since the users were loaded.
+//     Unknown: go on to step 3.
 //  3. Limiter.Reserve(key, remoteAddr): refuse when it is false; otherwise
 //     defer attempt.Abandon() at once, so every exit resolves the attempt.
 //     Besides the key's place it takes one of the 4 places of the client

@@ -183,20 +183,50 @@ func tag(name, password string) [sha256.Size]byte {
 // Remembered reports a login this set has already verified: no PBKDF2,
 // constant time in the password. It is never true for a wrong password.
 func (u *Users) Remembered(name, password string) (Role, bool) {
+	role, m := u.Recall(name, password)
+	return role, m == Match
+}
+
+// Memory is what a set remembers of a name, for a presented password.
+type Memory int
+
+// The answers of Recall.
+const (
+	// Unknown: the set remembers no login of the name. The password may be
+	// right or wrong: only Verify tells.
+	Unknown Memory = iota
+	// Match: the password is the one the set verified for the name.
+	Match
+	// Mismatch: the set remembers a login of the name, and the password is
+	// another one. It is a wrong password: a set is immutable, so the hash
+	// that verified the remembered password is still the name's hash, and a
+	// user has one password.
+	Mismatch
+)
+
+// Recall is Remembered that also tells a wrong password apart: no PBKDF2,
+// constant time in the password, and one reading of the memory, so a login
+// that is being remembered meanwhile is either Unknown or Match, never
+// Mismatch for the right password.
+//
+// A changed password never meets the old memory: the users are immutable,
+// so a new hash comes with a new set, which remembers nothing.
+func (u *Users) Recall(name, password string) (Role, Memory) {
 	got := tag(name, password)
 	u.mu.Lock()
 	want, has := u.tags[name]
 	u.mu.Unlock()
 	// Compare even when there is no tag, so the work does not depend on it.
 	eq := hmac.Equal(got[:], want[:])
-	if !has || !eq {
-		return "", false
-	}
 	e, ok := u.byName[name]
-	if !ok {
-		return "", false
+	switch {
+	case !has || !ok:
+		return "", Unknown
+	case !eq:
+		return "", Mismatch
+	default:
+		return e.role, Match
 	}
-	return e.role, true
 }
 
 // Verify runs PBKDF2 (against the dummy hash for an unknown name) and
