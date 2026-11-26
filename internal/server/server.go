@@ -251,9 +251,9 @@ func warnAPI(log *slog.Logger, addr string) {
 
 // stoppedTexts returns the reasons of the streams that cannot run, scrubbed.
 func stoppedTexts(left []stream.Stopped) []string {
-	var out []string
-	for _, st := range left {
-		out = append(out, logging.Scrub(st.Err.Error()))
+	out := make([]string, len(left))
+	for i, st := range left {
+		out[i] = logging.Scrub(st.Err.Error())
 	}
 	return out
 }

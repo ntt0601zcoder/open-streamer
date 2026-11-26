@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"os/signal"
 	"syscall"
 	"testing"
 	"time"
@@ -116,4 +117,21 @@ func TestHashPasswordPipeInterrupt(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	require.NoError(t, cmd.Process.Signal(syscall.SIGINT))
 	killedBy(t, cmd, syscall.SIGINT, false)
+}
+
+// In this process: the first signal ends the context. The handler it then
+// removes is put back by the test's own, so nothing ends the test.
+func TestSignalsContext(t *testing.T) {
+	keep := make(chan os.Signal, 1)
+	signal.Notify(keep, syscall.SIGINT)
+	defer signal.Stop(keep)
+	ctx, stop := signals()
+	defer stop()
+	require.NoError(t, ctx.Err())
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGINT))
+	select {
+	case <-ctx.Done():
+	case <-time.After(waitFor):
+		require.Fail(t, "the signal did not end the context")
+	}
 }

@@ -2082,8 +2082,10 @@ func TestM5aNoSecretsLeak(t *testing.T) {
 	require.NoError(t, err)
 	eye := m.as(m5aViewer, m5aViewerPW)
 	for _, who := range []*m5a{eye, m} {
-		paths := []string{"/metrics", "/api/v1/streams", "/api/v1/config/status"}
-		for _, name := range []string{"cam2", "cam5", "cam6"} {
+		names := []string{"cam2", "cam5", "cam6"}
+		paths := make([]string, 0, 3+2*len(names))
+		paths = append(paths, "/metrics", "/api/v1/streams", "/api/v1/config/status")
+		for _, name := range names {
 			paths = append(paths, "/api/v1/streams/"+name, "/api/v1/streams/"+name+"/status")
 		}
 		for _, path := range paths {
