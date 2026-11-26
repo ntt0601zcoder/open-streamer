@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics/metricstest"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
 )
 
 // waitFor bounds every wait of these tests.
@@ -748,6 +750,66 @@ func TestServerRTSPOverUDP(t *testing.T) {
 	s.stop()
 	// The pair is free again.
 	require.NoError(t, listenUDP(t, fmt.Sprintf("127.0.0.1:%d", ports[0])).Close())
+}
+
+// The wait for the RTSP server's UDP pair ends: with the pair, with Serve's
+// error (a nil one too), or at the deadline.
+func TestWaitUDP(t *testing.T) {
+	bound := func() [2]int { return [2]int{5000, 5001} }
+	never := func() [2]int { return [2]int{} }
+	served := make(chan error, 1)
+
+	ended, err := waitUDP(bound, served, time.Second)
+	require.NoError(t, err)
+	assert.False(t, ended)
+
+	var calls atomic.Int64
+	late := func() [2]int {
+		if calls.Add(1) < 5 {
+			return [2]int{}
+		}
+		return bound()
+	}
+	_, err = waitUDP(late, served, waitFor)
+	require.NoError(t, err)
+
+	boom := errors.New("listen udp 127.0.0.1:5000: address already in use")
+	served <- boom
+	ended, err = waitUDP(never, served, waitFor)
+	require.ErrorIs(t, err, boom)
+	assert.True(t, ended)
+
+	served <- nil
+	ended, err = waitUDP(never, served, waitFor)
+	require.ErrorContains(t, err, "stopped before it bound its UDP ports")
+	assert.True(t, ended)
+
+	start := time.Now()
+	ended, err = waitUDP(never, served, 30*time.Millisecond)
+	require.ErrorContains(t, err, "the UDP ports were not bound within 30ms")
+	assert.False(t, ended)
+	assert.Less(t, time.Since(start), waitFor)
+
+	require.NoError(t, serveErr(rtsp.ErrServerClosed))
+	require.ErrorIs(t, serveErr(boom), boom)
+	require.ErrorContains(t, serveErr(nil), "stopped serving")
+}
+
+// A UDP pair that cannot be bound is a start-up error, and nothing is left
+// listening.
+func TestServerRTSPUDPBindFails(t *testing.T) {
+	// The RTSP server binds an even/odd pair of its own choosing, so the
+	// failure is made by a host that cannot be bound.
+	text := strings.Replace(baseText(), `rtsp: {listen: "127.0.0.1:0"}`, `rtsp: {listen: "127.0.0.1:0", udp: true}`, 1)
+	s := &Server{failed: make(chan error, 4), stopRTSP: func() {}}
+	ln := listenTCP(t, "127.0.0.1:0")
+	sec := testParse(t, text).Doc.Server.Resolved()
+	sec.RTSP.Listen = "192.0.2.123:0" // TEST-NET-1: not an address of this host
+	err := s.startRTSP(ln, sec)
+	require.Error(t, err)
+	assert.Nil(t, s.rtsp)
+	_, err = ln.Accept()
+	require.Error(t, err, "the listener is closed")
 }
 
 func TestListenerFailsAfterStart(t *testing.T) {

@@ -39,6 +39,9 @@ const (
 	rtmpTries = 5
 	// shutdownWait is how long an HTTP server gets to finish its requests.
 	shutdownWait = 2 * time.Second
+	// rtspUDPWait is how long New waits for the RTSP server to bind its
+	// UDP pair.
+	rtspUDPWait = 5 * time.Second
 	// transcoderName is the transcoder looked for next to the executable
 	// when the config names none.
 	transcoderName = "ostranscoder"
@@ -443,18 +446,19 @@ func (s *Server) startRTSP(ln net.Listener, sec config.Server) error {
 	if sec.RTSP.UDP {
 		// Serve binds the pair before it accepts; wait for it so that a
 		// bind failure is a start-up error.
-		for srv.UDPPorts()[0] == 0 {
-			select {
-			case err := <-served:
-				_ = ln.Close()
-				return err
-			case <-time.After(time.Millisecond):
+		if ended, err := waitUDP(srv.UDPPorts, served, rtspUDPWait); err != nil {
+			// Serve has returned, or returns for this Close.
+			_ = srv.Close()
+			_ = ln.Close()
+			if !ended {
+				<-served
 			}
+			return err
 		}
 	}
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		if err := <-served; err != nil && !errors.Is(err, rtsp.ErrServerClosed) {
+		if err := serveErr(<-served); err != nil {
 			s.fail(fmt.Errorf("server: rtsp: %w", err))
 		}
 	})
@@ -464,6 +468,42 @@ func (s *Server) startRTSP(ln net.Listener, sec config.Server) error {
 		wg.Wait()
 	}
 	return nil
+}
+
+// waitUDP waits until ports reports the RTSP server's UDP pair bound. It
+// fails when Serve returns first (ended is true; also when it returned nil,
+// which is a server that stopped without a reason), and when the pair is
+// not bound within wait.
+func waitUDP(ports func() [2]int, served <-chan error, wait time.Duration) (ended bool, err error) {
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for ports()[0] == 0 {
+		select {
+		case err := <-served:
+			if err == nil {
+				err = errors.New("the server stopped before it bound its UDP ports")
+			}
+			return true, err
+		case <-deadline.C:
+			return false, fmt.Errorf("the UDP ports were not bound within %s", wait)
+		case <-tick.C:
+		}
+	}
+	return false, nil
+}
+
+// serveErr is the error of an RTSP Serve that returned after start-up: nil
+// for the return Close makes, an error for any other, also a nil one.
+func serveErr(err error) error {
+	switch {
+	case errors.Is(err, rtsp.ErrServerClosed):
+		return nil
+	case err == nil:
+		return errors.New("the server stopped serving")
+	}
+	return err
 }
 
 // startSRT serves SRT receivers on sec's address. It returns once the
