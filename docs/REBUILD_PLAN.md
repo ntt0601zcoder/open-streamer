@@ -1890,7 +1890,8 @@ branches. That is a repository setting, which no commit can change.
   - seed `FuzzCheckFont` with the fixture, an `OTTO` and a 12-byte header;
   - `CheckFont` accepts overlapping or duplicate tables (directory only).
 - native and cmd/ostranscoder:
-  - the NVENC opt-in gate exists in four copies.
+  - the NVENC opt-in gate exists in four copies;
+  - the child's own `transcode: set watermark: watermark: …` doubles the word, and reaches `last_error` on a child temp-dir or font-write failure.
 - transcode host:
   - a test note on the wire carriage of `NoFallback`;
   - control characters in a child's fatal message are not stripped;
