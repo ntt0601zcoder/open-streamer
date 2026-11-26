@@ -571,3 +571,175 @@ func TestABRMPDFFprobe(t *testing.T) {
 	}
 	assert.Equal(t, map[string]int{"h264,video": 3, "aac,audio": 1}, count, string(out))
 }
+
+// synthAVTracks is synthAV with its audio copied onto each of the given
+// tracks instead of track 1.
+func synthAVTracks(t *testing.T, epoch uint32, start int64, audio ...int) []hub.Delivery {
+	t.Helper()
+	var out []hub.Delivery
+	for _, d := range synthAV(t, epoch, start) {
+		if d.Frame.Track == 0 {
+			out = append(out, d)
+			continue
+		}
+		for _, track := range audio {
+			d.Frame.Track = track
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// twoAudioFeed packages three epochs of 4 s each, back to back: video
+// track 0 in every one, audio tracks 1 and 2 in the first two, and only
+// track 2 in the third.
+func twoAudioFeed(t *testing.T, opt Options) *Packager {
+	t.Helper()
+	epochs := [][]int{{1, 2}, {1, 2}, {2}}
+	ds := make([]hub.Delivery, 0, len(epochs)*300)
+	anchors := make([]media.Anchor, 0, len(epochs))
+	for i, audio := range epochs {
+		epoch, start := uint32(i+1), int64(i)*360000
+		ds = append(ds, synthAVTracks(t, epoch, start, audio...)...)
+		anchors = append(anchors, media.Anchor{Epoch: epoch, Start: start, Wall: t0.Add(time.Duration(i) * 4 * time.Second)})
+	}
+	return packFeed(t, opt, ds, anchors...)
+}
+
+// twoAudioMPDGolden is cmaf/index.mpd for twoAudioFeed, the base code's
+// output (75eb774, before the audio language existed; ledger ruling F1).
+const twoAudioMPDGolden = `<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" profiles="urn:mpeg:dash:profile:isoff-live:2011" availabilityStartTime="2026-01-01T00:00:00Z" publishTime="2026-01-01T01:00:00Z" minimumUpdatePeriod="PT2S" timeShiftBufferDepth="PT3M20S" suggestedPresentationDelay="PT6S" minBufferTime="PT2S">
+  <Period id="e1" start="PT0S">
+    <AdaptationSet contentType="video" mimeType="video/mp4" segmentAlignment="true">
+      <SegmentTemplate timescale="90000" initialization="init-0-1.mp4" media="0-$Number$.m4s" startNumber="0">
+        <SegmentTimeline>
+          <S t="0" d="180000"></S>
+          <S t="180000" d="180000"></S>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="0" codecs="avc1.4D400D" bandwidth="5064" width="320" height="240"></Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4" segmentAlignment="true">
+      <SegmentTemplate timescale="48000" initialization="init-1-1.mp4" media="1-$Number$.m4s" startNumber="0">
+        <SegmentTimeline>
+          <S t="0" d="96256"></S>
+          <S t="96256" d="96256"></S>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="1" codecs="mp4a.40.2" bandwidth="7213" audioSamplingRate="48000">
+        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"></AudioChannelConfiguration>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4" segmentAlignment="true">
+      <SegmentTemplate timescale="48000" initialization="init-2-1.mp4" media="2-$Number$.m4s" startNumber="0">
+        <SegmentTimeline>
+          <S t="0" d="96256"></S>
+          <S t="96256" d="96256"></S>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="2" codecs="mp4a.40.2" bandwidth="7213" audioSamplingRate="48000">
+        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"></AudioChannelConfiguration>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+  <Period id="e2" start="PT4S">
+    <AdaptationSet contentType="video" mimeType="video/mp4" segmentAlignment="true">
+      <SegmentTemplate timescale="90000" presentationTimeOffset="360000" initialization="init-0-2.mp4" media="0-$Number$.m4s" startNumber="2">
+        <SegmentTimeline>
+          <S t="360000" d="180000"></S>
+          <S t="540000" d="180000"></S>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="0" codecs="avc1.4D400D" bandwidth="5064" width="320" height="240"></Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4" segmentAlignment="true">
+      <SegmentTemplate timescale="48000" presentationTimeOffset="192000" initialization="init-1-2.mp4" media="1-$Number$.m4s" startNumber="2">
+        <SegmentTimeline>
+          <S t="192000" d="96256"></S>
+          <S t="288256" d="96256"></S>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="1" codecs="mp4a.40.2" bandwidth="7213" audioSamplingRate="48000">
+        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"></AudioChannelConfiguration>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4" segmentAlignment="true">
+      <SegmentTemplate timescale="48000" presentationTimeOffset="192000" initialization="init-2-2.mp4" media="2-$Number$.m4s" startNumber="2">
+        <SegmentTimeline>
+          <S t="192000" d="96256"></S>
+          <S t="288256" d="96256"></S>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="2" codecs="mp4a.40.2" bandwidth="7213" audioSamplingRate="48000">
+        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"></AudioChannelConfiguration>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+  <Period id="e3" start="PT8S">
+    <AdaptationSet contentType="video" mimeType="video/mp4" segmentAlignment="true">
+      <SegmentTemplate timescale="90000" presentationTimeOffset="720000" initialization="init-0-3.mp4" media="0-$Number$.m4s" startNumber="4">
+        <SegmentTimeline>
+          <S t="720000" d="180000"></S>
+          <S t="900000" d="180000"></S>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="0" codecs="avc1.4D400D" bandwidth="5064" width="320" height="240"></Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4" segmentAlignment="true">
+      <SegmentTemplate timescale="48000" presentationTimeOffset="384000" initialization="init-2-3.mp4" media="2-$Number$.m4s" startNumber="4">
+        <SegmentTimeline>
+          <S t="384000" d="96256"></S>
+          <S t="480256" d="96256"></S>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="2" codecs="mp4a.40.2" bandwidth="7213" audioSamplingRate="48000">
+        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"></AudioChannelConfiguration>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+  <UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014" value="2026-01-01T01:00:00Z"></UTCTiming>
+</MPD>
+`
+
+func TestMPDAudioLanguage(t *testing.T) {
+	p := twoAudioFeed(t, Options{})
+	srv := serve(p)
+	_, body := get(t, srv, "/live/s/cmaf/index.mpd")
+	assert.Equal(t, twoAudioMPDGolden, string(body))
+	assert.NotContains(t, string(body), "lang=")
+
+	p.SetAudioLanguage("vi")
+	_, body = get(t, srv, "/live/s/cmaf/index.mpd")
+	assert.Equal(t, 2, strings.Count(string(body), ` lang="vi"`), "track 1's set in e1 and e2")
+	assert.Equal(t, twoAudioMPDGolden, strings.ReplaceAll(string(body), ` lang="vi"`, ""), "nothing else changes")
+	m, err := dash.Parse(body)
+	require.NoError(t, err)
+	require.Len(t, m.Periods, 3)
+	labelled := map[string]bool{}
+	for _, per := range m.Periods {
+		for _, as := range per.AdaptationSets {
+			require.Len(t, as.Representations, 1)
+			id := as.Representations[0].ID
+			if as.ContentType == "audio" && id == "1" {
+				assert.Equal(t, "vi", as.Lang, "%s track %s", per.ID, id)
+				labelled[per.ID] = true
+			} else {
+				assert.Empty(t, as.Lang, "%s %s track %s", per.ID, as.ContentType, id)
+			}
+		}
+	}
+	assert.Equal(t, map[string]bool{"e1": true, "e2": true}, labelled)
+
+	p.SetAudioLanguage("")
+	_, body = get(t, srv, "/live/s/cmaf/index.mpd")
+	assert.Equal(t, twoAudioMPDGolden, string(body), "removed")
+
+	t.Run("ABR", func(t *testing.T) {
+		video, audio := videoSets(t, mpdOf(t, serve(packLadder(t, Options{ABR: true, AudioLanguage: "vi"}, nil))))
+		require.Len(t, video, 1)
+		assert.Empty(t, video[0].Lang)
+		require.Len(t, audio, 1)
+		assert.Equal(t, "vi", audio[0].Lang)
+	})
+}

@@ -28,7 +28,9 @@ func init() {
 // has an init segment, a codec string and a listed part in it (a track
 // without a codec string was counted once in Packager.CodecErrors). With
 // Snapshot.ABR, video tracks of one codec share an AdaptationSet instead
-// (see buildPeriod). It returns nil when nothing is listed.
+// (see buildPeriod). With a declared audio language, the sets of the lowest
+// known audio track carry it as lang (R-L3, R-L4). It returns nil when
+// nothing is listed.
 func buildMPD(s Snapshot) []byte {
 	if s.Listed == 0 || s.AST.IsZero() {
 		return nil
@@ -101,7 +103,9 @@ func buildPeriod(s Snapshot, e EpochInfo) (dash.Period, bool) {
 }
 
 // buildSet returns the track's set, with the SegmentTemplate at set level,
-// if it has a listed part.
+// if it has a listed part. The set of the lowest known audio track (the one
+// cmaf/master.m3u8 lists, ruling R-B5) carries the declared audio language
+// as lang (R-L3); every other set carries none.
 func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (dash.AdaptationSet, bool) {
 	rep, tpl, ok := buildRep(s, e, et)
 	if !ok {
@@ -110,6 +114,9 @@ func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (dash.AdaptationSet, bool)
 	as := dash.AdaptationSet{SegmentAlignment: true, SegmentTemplate: tpl}
 	if et.Config.Codec.Kind() == media.KindAudio {
 		as.ContentType, as.MimeType = "audio", "audio/mp4"
+		if _, aTrack, _, haveA := lowestTracks(s); haveA && et.Track == aTrack {
+			as.Lang = s.audioLanguage()
+		}
 	} else {
 		as.ContentType, as.MimeType = "video", "video/mp4"
 	}

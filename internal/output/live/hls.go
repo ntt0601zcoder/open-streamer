@@ -427,26 +427,45 @@ func variant(uri string, video, audio trackSummary) hls.Variant {
 	return v
 }
 
+// inVariantAudio returns the audio entry of a master whose variants carry
+// the audio themselves (R-L4): no URI, so the rendition's media is in the
+// variant (RFC 8216 section 4.3.4.2.1), and every variant names its group.
+func inVariantAudio(lang string) hls.Rendition {
+	return hls.Rendition{Type: "AUDIO", GroupID: audioGroup, Name: "audio", Language: lang, Default: true}
+}
+
 // buildMaster renders cmaf/master.m3u8 from the lowest known video and audio
 // tracks. It returns nil when no track is known.
 //
 // With Snapshot.ABR every known video track is a variant, ascending track
 // (rendition order), each with the lowest audio track (ruling R-B5).
+//
+// With a declared audio language (R-L4) and video, the audio rendition gains
+// LANGUAGE. Audio only, the variant is the audio track's playlist, so the
+// master gains one URI-less audio entry carrying LANGUAGE and the variant
+// AUDIO="aud". Without a language the master is as before.
 func buildMaster(s Snapshot) []byte {
 	vTrack, aTrack, haveV, haveA := lowestTracks(s)
 	if !haveV && !haveA {
 		return nil
 	}
+	lang := s.audioLanguage()
 	pl := hls.MultivariantPlaylist{Version: hlsVersionFMP4}
 	epochs := map[uint32]bool{}
 	var audio trackSummary
 	if haveA {
 		audio = summarize(s, aTrack, media.KindAudio, epochs)
 		uri := "a" + strconv.Itoa(aTrack) + ".m3u8"
-		if !haveV {
+		switch {
+		case haveV:
+			pl.Renditions = []hls.Rendition{{Type: "AUDIO", GroupID: audioGroup, Name: "audio", Language: lang, URI: uri, Default: true}}
+		case lang != "":
+			v := variant(uri, trackSummary{}, audio)
+			v.Audio = audioGroup
+			pl.Renditions = []hls.Rendition{inVariantAudio(lang)}
+			pl.Variants = []hls.Variant{v}
+		default:
 			pl.Variants = []hls.Variant{variant(uri, trackSummary{}, audio)}
-		} else {
-			pl.Renditions = []hls.Rendition{{Type: "AUDIO", GroupID: audioGroup, Name: "audio", URI: uri, Default: true}}
 		}
 	}
 	if haveV {
@@ -513,17 +532,24 @@ func listedEpochs(s Snapshot) map[uint32]bool {
 
 // buildTSMaster renders hls/index.m3u8 in ABR mode (rulings R-B4, R-B5): a
 // multivariant playlist with one variant per tsVariants track, in track
-// order, URI v{track}.m3u8. Audio is muxed into every variant, so there is
-// no audio rendition: CODECS lists the variant's video codecs, then every
-// known audio track's. RESOLUTION is the largest over the window, as in
-// cmaf/master.m3u8, and BANDWIDTH the peak over listed segments of the
-// variant TS's bytes × 8 / its Duration. It returns nil when there is
-// no variant.
+// order, URI v{track}.m3u8. Audio is muxed into every variant: CODECS lists
+// the variant's video codecs, then every known audio track's. RESOLUTION is
+// the largest over the window, as in cmaf/master.m3u8, and BANDWIDTH the
+// peak over listed segments of the variant TS's bytes × 8 / its Duration.
+// It returns nil when there is no variant.
+//
+// Without a declared audio language there is no audio rendition. With one
+// and an audio track known (R-L4), the master gains one URI-less audio
+// entry carrying LANGUAGE, which describes the audio muxed into the
+// variants, and every variant gains AUDIO="aud"; the version stays 3.
 func buildTSMaster(s Snapshot) []byte {
 	tracks := tsVariants(s)
 	if len(tracks) == 0 {
 		return nil
 	}
+	_, _, _, haveA := lowestTracks(s)
+	lang := s.audioLanguage()
+	inVariant := haveA && lang != ""
 	discard := map[uint32]bool{}
 	var audio trackSummary // codecs only: the audio bytes are in the variant TS
 	for _, kt := range s.Tracks {
@@ -537,6 +563,9 @@ func buildTSMaster(s Snapshot) []byte {
 		}
 	}
 	pl := hls.MultivariantPlaylist{Version: hlsVersionTS}
+	if inVariant {
+		pl.Renditions = []hls.Rendition{inVariantAudio(lang)}
+	}
 	for _, track := range tracks {
 		video := summarize(s, track, media.KindVideo, discard)
 		video.bandwidth = map[uint64]float64{}
@@ -547,7 +576,11 @@ func buildTSMaster(s Snapshot) []byte {
 				}
 			}
 		}
-		pl.Variants = append(pl.Variants, variant("v"+strconv.Itoa(track)+".m3u8", video, audio))
+		v := variant("v"+strconv.Itoa(track)+".m3u8", video, audio)
+		if inVariant {
+			v.Audio = audioGroup
+		}
+		pl.Variants = append(pl.Variants, v)
 	}
 	pl.Independent = independent(s, listedEpochs(s))
 	return pl.Encode()

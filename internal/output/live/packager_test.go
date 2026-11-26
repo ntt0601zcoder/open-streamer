@@ -1273,3 +1273,102 @@ func TestABRRungStats(t *testing.T) {
 	assert.Empty(t, logs.String())
 	assert.Empty(t, packLadder(t, Options{}, nil).Rungs())
 }
+
+func TestSetAudioLanguage(t *testing.T) {
+	t.Run("values", func(t *testing.T) {
+		long := "abc-" + strings.Repeat("abcdefgh-", 3) + "abcde" // 36 bytes
+		require.Len(t, long, 36)
+		for _, tc := range []struct{ in, want string }{
+			{"vi", "vi"},
+			{"EN-us", "EN-us"},
+			{"zh-Hant-TW", "zh-Hant-TW"},
+			{`vi",URI="x`, ""},
+			{"vi\n", ""},
+			{"e", ""},
+			{"english", ""},
+			{"x-klingon", ""},
+			{long, ""},
+			{long[:35], long[:35]},
+			{"", ""},
+		} {
+			p := NewPackager(hub.New(hub.Options{}), Options{AudioLanguage: tc.in})
+			assert.Equal(t, tc.want, p.Snapshot().AudioLanguage, "Options %q", tc.in)
+			p.SetAudioLanguage("fr")
+			p.SetAudioLanguage(tc.in)
+			assert.Equal(t, tc.want, p.Snapshot().AudioLanguage, "SetAudioLanguage %q", tc.in)
+		}
+	})
+
+	t.Run("running", func(t *testing.T) {
+		h := hub.New(hub.Options{})
+		h.SetAnchor(media.Anchor{Epoch: 1, Wall: t0})
+		sub := h.Subscribe("pkg", 1<<12)
+		p := NewPackager(h, Options{Window: 100, Now: farFuture, AudioLanguage: "vi"})
+		assert.Equal(t, "vi", p.Snapshot().AudioLanguage, "Options seeds the first value")
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			p.Run(ctx, sub)
+		}()
+		defer func() {
+			cancel()
+			<-done
+		}()
+		for _, d := range synthAV(t, 1, 0) {
+			h.Write(d.Frame)
+		}
+		require.Eventually(t, func() bool { return p.Snapshot().Listed > 0 }, 5*time.Second, time.Millisecond)
+		srv := serve(p)
+		assert.Equal(t, "vi", master(t, srv).Renditions[0].Language)
+
+		p.SetAudioLanguage("en")
+		assert.Equal(t, "en", p.Snapshot().AudioLanguage)
+		assert.Equal(t, "en", master(t, srv).Renditions[0].Language)
+		_, audio := videoSets(t, mpdOf(t, srv))
+		require.Len(t, audio, 1)
+		assert.Equal(t, "en", audio[0].Lang)
+
+		p.SetAudioLanguage(`vi",URI="x`)
+		assert.Empty(t, p.Snapshot().AudioLanguage)
+		code, body := get(t, srv, "/live/s/cmaf/master.m3u8")
+		require.Equal(t, http.StatusOK, code)
+		assert.NotContains(t, string(body), "LANGUAGE")
+		assert.NotContains(t, string(body), `URI="x`)
+
+		// Concurrent edits and requests (run under -race): every body carries
+		// one of the values set, whole.
+		langs := []string{"vi", "en", ""}
+		var wg sync.WaitGroup
+		stop := make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				p.SetAudioLanguage(langs[i%len(langs)])
+			}
+		}()
+		for range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range 50 {
+					m := master(t, srv)
+					assert.Contains(t, langs, m.Renditions[0].Language)
+					_, audio := videoSets(t, mpdOf(t, srv))
+					if assert.Len(t, audio, 1) {
+						assert.Contains(t, langs, audio[0].Lang)
+					}
+				}
+			}()
+		}
+		time.Sleep(50 * time.Millisecond)
+		close(stop)
+		wg.Wait()
+	})
+}

@@ -64,6 +64,19 @@ type Snapshot struct {
 	Tracks                   []EpochTrack
 	EvictedDiscontinuities   uint64
 	EvictedTSDiscontinuities uint64
+	// AudioLanguage is the packager's declared audio language when the
+	// snapshot was taken (Packager.SetAudioLanguage); "" when none.
+	AudioLanguage string
+}
+
+// audioLanguage returns the snapshot's declared audio language, or "" when
+// it fails media.ValidLanguage: the playlist encoders write it unescaped, so
+// only a valid tag may reach them (R-L2).
+func (s Snapshot) audioLanguage() string {
+	if !media.ValidLanguage(s.AudioLanguage) {
+		return ""
+	}
+	return s.AudioLanguage
 }
 
 // SegmentInfo is one packaged segment. The timing fields are the segmenter's

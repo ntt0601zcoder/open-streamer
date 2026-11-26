@@ -78,6 +78,9 @@ type Options struct {
 	// keyframe arrives behind it. Join drops that audio, so the first
 	// segment does not start with audio only (segment.Options.Join).
 	Join bool
+	// AudioLanguage is the declared language of the audio (R-L2), the first
+	// value SetAudioLanguage would set; "" or an invalid tag writes none.
+	AudioLanguage string
 }
 
 // RungStats counts what an ABR presentation lost of one video track (a
@@ -120,6 +123,7 @@ type Packager struct {
 	errors   atomic.Uint64
 	fallback atomic.Uint64
 	codecErr atomic.Uint64
+	lang     atomic.Pointer[string] // the declared audio language (SetAudioLanguage); nil means ""
 
 	// Writer state, guarded by work.
 	work    sync.Mutex
@@ -179,7 +183,20 @@ func NewPackager(h *hub.Hub, opt Options) *Packager {
 		p.now = time.Now
 	}
 	p.seg = segment.New(segment.Options{Target: p.target, AlignVideo: p.abr, Join: opt.Join})
+	p.SetAudioLanguage(opt.AudioLanguage)
 	return p
+}
+
+// SetAudioLanguage replaces the declared language of the audio (R-L2). The
+// next Snapshot, and so every playlist and MPD built after the call returns,
+// carries it. A value failing media.ValidLanguage is stored as "", so
+// nothing is written for it. It is safe to call concurrently with every
+// other method.
+func (p *Packager) SetAudioLanguage(lang string) {
+	if !media.ValidLanguage(lang) {
+		lang = ""
+	}
+	p.lang.Store(&lang)
 }
 
 // Errors returns the number of mux errors so far. Each one dropped one
@@ -325,6 +342,9 @@ func (p *Packager) Snapshot() Snapshot {
 	s := p.st.snapshot()
 	p.mu.Unlock()
 	s.Target, s.Window, s.Now, s.ABR = p.target, p.window, now, p.abr
+	if lang := p.lang.Load(); lang != nil {
+		s.AudioLanguage = *lang
+	}
 	for s.Listed < len(s.Segments) && s.IsListed(s.Segments[s.Listed]) {
 		s.Listed++
 	}

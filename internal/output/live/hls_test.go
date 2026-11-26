@@ -1297,3 +1297,215 @@ func TestABRTSVariantsShareTargetDuration(t *testing.T) {
 		}
 	}
 }
+
+// packFeed packages ds with the given anchors set on the hub, Window 100
+// and Now farFuture unless opt sets them.
+func packFeed(t *testing.T, opt Options, ds []hub.Delivery, anchors ...media.Anchor) *Packager {
+	t.Helper()
+	h := hub.New(hub.Options{})
+	for _, a := range anchors {
+		h.SetAnchor(a)
+	}
+	if opt.Window == 0 {
+		opt.Window = 100
+	}
+	if opt.Now == nil {
+		opt.Now = farFuture
+	}
+	p := NewPackager(h, opt)
+	handleAll(p, ds)
+	p.Flush()
+	require.Zero(t, p.Errors())
+	return p
+}
+
+// keepTracks returns the deliveries of ds on the given tracks, in order.
+func keepTracks(ds []hub.Delivery, tracks ...int) []hub.Delivery {
+	var out []hub.Delivery
+	for _, d := range ds {
+		if slices.Contains(tracks, d.Frame.Track) {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// avFeed packages synthAV(t, 1, 0): video track 0 and audio track 1.
+func avFeed(t *testing.T, opt Options) *Packager {
+	t.Helper()
+	return packFeed(t, opt, synthAV(t, 1, 0), media.Anchor{Epoch: 1, Wall: t0})
+}
+
+// audioOnlyFeed packages synthAV(t, 1, 0)'s audio track 1 alone.
+func audioOnlyFeed(t *testing.T, opt Options) *Packager {
+	t.Helper()
+	return packFeed(t, opt, keepTracks(synthAV(t, 1, 0), 1), media.Anchor{Epoch: 1, Wall: t0})
+}
+
+// ladderFeed packages synthLadder(t, 1, 0, 250)'s given tracks in ABR mode.
+func ladderFeed(t *testing.T, opt Options, tracks ...int) *Packager {
+	t.Helper()
+	opt.ABR = true
+	return packFeed(t, opt, keepTracks(synthLadder(t, 1, 0, 250), tracks...), media.Anchor{Epoch: 1, Wall: t0})
+}
+
+// The goldens below are the base code's output (75eb774, before the audio
+// language existed) for the feeds they name; with no language declared the
+// playlists must stay byte for byte the same (ledger ruling F1).
+
+// avMasterGolden is cmaf/master.m3u8 for avFeed.
+const avMasterGolden = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="a1.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=12277,RESOLUTION=320x240,CODECS="avc1.4D400D,mp4a.40.2",AUDIO="aud"
+v0.m3u8
+`
+
+// audioOnlyMasterGolden is cmaf/master.m3u8 for audioOnlyFeed.
+const audioOnlyMasterGolden = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-STREAM-INF:BANDWIDTH=7213,CODECS="mp4a.40.2"
+a1.m3u8
+`
+
+// tsMasterGolden is hls/index.m3u8 for ladderFeed's tracks 0, 1 and 3.
+const tsMasterGolden = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-STREAM-INF:BANDWIDTH=222592,RESOLUTION=640x360,CODECS="avc1.4D400D,mp4a.40.2"
+v0.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=184992,RESOLUTION=426x240,CODECS="avc1.4D400D,mp4a.40.2"
+v1.m3u8
+`
+
+// tsMasterNoAudioGolden is hls/index.m3u8 for ladderFeed's tracks 0 and 1.
+const tsMasterNoAudioGolden = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-STREAM-INF:BANDWIDTH=151904,RESOLUTION=640x360,CODECS="avc1.4D400D"
+v0.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=114304,RESOLUTION=426x240,CODECS="avc1.4D400D"
+v1.m3u8
+`
+
+// inVariantLine is R-L4's audio entry for audio carried in the variant.
+func inVariantLine(lang string) string {
+	return `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio",LANGUAGE="` + lang + `",DEFAULT=YES,AUTOSELECT=YES` + "\n"
+}
+
+// withInVariantAudio returns golden with R-L4's URI-less audio entry before
+// the first variant and AUDIO="aud" on every variant, nothing else changed.
+func withInVariantAudio(golden, lang string) string {
+	var b strings.Builder
+	added := false
+	for _, line := range strings.SplitAfter(golden, "\n") {
+		if rest, ok := strings.CutPrefix(line, "#EXT-X-STREAM-INF:"); ok {
+			if !added {
+				b.WriteString(inVariantLine(lang))
+				added = true
+			}
+			line = "#EXT-X-STREAM-INF:" + strings.TrimSuffix(rest, "\n") + `,AUDIO="aud"` + "\n"
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// withLanguage returns golden with LANGUAGE written after its rendition's NAME.
+func withLanguage(golden, lang string) string {
+	return strings.Replace(golden, `NAME="audio",`, `NAME="audio",LANGUAGE="`+lang+`",`, 1)
+}
+
+func TestMasterAudioLanguage(t *testing.T) {
+	t.Run("video track 0, audio track 1", func(t *testing.T) {
+		p := avFeed(t, Options{})
+		srv := serve(p)
+		_, body := get(t, srv, "/live/s/cmaf/master.m3u8")
+		assert.Equal(t, avMasterGolden, string(body))
+
+		p.SetAudioLanguage("vi")
+		m := master(t, srv)
+		require.Len(t, m.Renditions, 1)
+		assert.Equal(t, hls.Rendition{Type: "AUDIO", GroupID: "aud", Name: "audio", Language: "vi", URI: "a1.m3u8", Default: true}, m.Renditions[0])
+		_, body = get(t, srv, "/live/s/cmaf/master.m3u8")
+		assert.Equal(t, withLanguage(avMasterGolden, "vi"), string(body))
+
+		p.SetAudioLanguage("")
+		_, body = get(t, srv, "/live/s/cmaf/master.m3u8")
+		assert.Equal(t, avMasterGolden, string(body), "removed")
+	})
+	t.Run("ladder", func(t *testing.T) {
+		_, body := get(t, serve(packLadder(t, Options{}, nil)), "/live/s/cmaf/master.m3u8")
+		assert.Equal(t, abrMasterGolden, string(body))
+		_, body = get(t, serve(packLadder(t, Options{AudioLanguage: "vi"}, nil)), "/live/s/cmaf/master.m3u8")
+		assert.Equal(t, withLanguage(abrMasterGolden, "vi"), string(body))
+
+		m := master(t, serve(packLadder(t, Options{ABR: true, AudioLanguage: "vi"}, nil)))
+		require.Len(t, m.Renditions, 1)
+		assert.Equal(t, "vi", m.Renditions[0].Language)
+		assert.Equal(t, "a3.m3u8", m.Renditions[0].URI)
+		require.Len(t, m.Variants, len(ladderSizes))
+	})
+	t.Run("an invalid snapshot value writes none", func(t *testing.T) {
+		snap := avFeed(t, Options{}).Snapshot()
+		snap.AudioLanguage = `vi",URI="x`
+		assert.Equal(t, avMasterGolden, string(buildMaster(snap)))
+	})
+}
+
+func TestMasterAudioOnlyLanguage(t *testing.T) {
+	p := audioOnlyFeed(t, Options{})
+	srv := serve(p)
+	_, body := get(t, srv, "/live/s/cmaf/master.m3u8")
+	assert.Equal(t, audioOnlyMasterGolden, string(body))
+	assert.NotContains(t, string(body), "#EXT-X-MEDIA")
+	assert.NotContains(t, string(body), "AUDIO=")
+
+	p.SetAudioLanguage("vi")
+	_, body = get(t, srv, "/live/s/cmaf/master.m3u8")
+	assert.Equal(t, withInVariantAudio(audioOnlyMasterGolden, "vi"), string(body))
+	assert.Contains(t, string(body), inVariantLine("vi"))
+	m := master(t, srv)
+	require.Len(t, m.Renditions, 1)
+	assert.Equal(t, hls.Rendition{Type: "AUDIO", GroupID: "aud", Name: "audio", Language: "vi", Default: true}, m.Renditions[0])
+	require.Len(t, m.Variants, 1)
+	assert.Equal(t, "aud", m.Variants[0].Audio)
+	assert.Equal(t, "a1.m3u8", m.Variants[0].URI)
+}
+
+func TestTSMasterAudioLanguage(t *testing.T) {
+	t.Run("with audio", func(t *testing.T) {
+		p := ladderFeed(t, Options{}, 0, 1, 3)
+		srv := serve(p)
+		_, body := get(t, srv, "/live/s/hls/index.m3u8")
+		assert.Equal(t, tsMasterGolden, string(body))
+
+		p.SetAudioLanguage("vi")
+		_, body = get(t, srv, "/live/s/hls/index.m3u8")
+		assert.Equal(t, withInVariantAudio(tsMasterGolden, "vi"), string(body))
+		assert.Contains(t, string(body), inVariantLine("vi"))
+		m := tsMaster(t, srv)
+		assert.Equal(t, 3, m.Version)
+		require.Len(t, m.Renditions, 1)
+		assert.Equal(t, hls.Rendition{Type: "AUDIO", GroupID: "aud", Name: "audio", Language: "vi", Default: true}, m.Renditions[0])
+		require.Len(t, m.Variants, 2)
+		for _, v := range m.Variants {
+			assert.Equal(t, "aud", v.Audio)
+			assert.Equal(t, "avc1.4D400D,mp4a.40.2", v.Codecs)
+		}
+	})
+	t.Run("without audio", func(t *testing.T) {
+		p := ladderFeed(t, Options{AudioLanguage: "vi"}, 0, 1)
+		_, body := get(t, serve(p), "/live/s/hls/index.m3u8")
+		assert.Equal(t, tsMasterNoAudioGolden, string(body))
+		assert.NotContains(t, string(body), "#EXT-X-MEDIA")
+		assert.NotContains(t, string(body), "AUDIO=")
+	})
+	t.Run("without ABR there is no master", func(t *testing.T) {
+		p := avFeed(t, Options{AudioLanguage: "vi"})
+		_, body := get(t, serve(p), "/live/s/hls/index.m3u8")
+		assert.NotContains(t, string(body), "LANGUAGE")
+		assert.Contains(t, string(body), "#EXTINF:")
+	})
+}
