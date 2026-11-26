@@ -568,6 +568,78 @@ func TestFailoverSearchSkipsRunningProbe(t *testing.T) {
 	stop := startRun(t, p)
 
 	waitActive(t, ev, 1)
+	// Each retry and each start limit runs from the time Run reads when it
+	// handles the one before, so the test stops the clock at each of them
+	// until Run has: stepping on would add Run's lag to every later time.
+	// The times are those of the comment above, on the 40 ms steps; when
+	// Run is not done 100 ms after one, the clock goes on a step at a time.
+	settle := func(at time.Duration, what string, done func() bool) {
+		t.Helper()
+		stepTo(t, set, at)
+		for {
+			for wait := time.Now().Add(100 * time.Millisecond); !done() && time.Now().Before(wait); {
+				time.Sleep(20 * time.Microsecond)
+			}
+			if done() {
+				return
+			}
+			require.Less(t, ft.elapsed(), at+time.Second, "%s", what)
+			stepTo(t, set, ft.elapsed()+frameDur)
+		}
+	}
+	// armed waits for Run to arm a timer longer than over. With no active
+	// input no frame re-arms the timer, so the clock must not move between
+	// Run's reading it and the timer's registration.
+	armed := func(over time.Duration) {
+		t.Helper()
+		for {
+			d, ok := ft.nextCall()
+			require.True(t, ok, "no After over %v", over)
+			if d > over {
+				return
+			}
+		}
+	}
+	failed := func(n int) func() bool {
+		return func() bool {
+			got := 0
+			for _, k := range ev.kinds() {
+				if k == EventFailed {
+					got++
+				}
+			}
+			return got >= n
+		}
+	}
+	opened := func(o *opener, n int) func() bool { return func() bool { return o.count() >= n } }
+	ms := time.Millisecond
+	// Input 0's probes: each fails at its start limit and reopens after its
+	// backoff.
+	for i, c := range []struct{ fail, reopen time.Duration }{
+		{10000 * ms, 10520 * ms},
+		{20520 * ms, 21520 * ms},
+		{31520 * ms, 33520 * ms},
+		{43520 * ms, 47520 * ms},
+		{57520 * ms, 65520 * ms},
+		{75520 * ms, 85520 * ms},
+	} {
+		settle(c.fail, "input 0's probe fails", failed(i+1))
+		settle(c.reopen, "input 0 reopens", opened(o0, i+2))
+	}
+	// The active input re-armed the timer at every frame, for its stall
+	// limit (4 s) at most; from its failure on, each timer is armed once.
+	drainCalls(ft)
+	settle(90*time.Second, "input 1 fails", failed(7))
+	armed(4 * time.Second) // the running probe's start limit
+	settle(95520*ms, "input 2 is tried", opened(m["fake://2"], 2))
+	armed(9 * time.Second) // its start limit
+	settle(105520*ms, "input 3 is tried", opened(m["fake://3"], 2))
+	armed(9 * time.Second)
+	settle(115520*ms, "input 4 is active", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return activeAt > 0
+	})
 	stepTo(t, set, 118*time.Second)
 	stop()
 
