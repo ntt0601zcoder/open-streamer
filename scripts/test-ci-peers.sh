@@ -38,7 +38,7 @@
 # ostranscoder use it.
 #
 # Flags given follow the defaults (-race -shuffle=on -count=1
-# -timeout=10m), so a later -count or -timeout wins; packages given replace
+# -timeout=20m), so a later -count or -timeout wins; packages given replace
 # the default list. Arguments are split on spaces and not globbed.
 set -euf
 
@@ -72,7 +72,7 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
 	docker build -t "$image" -f testdata/peers/Dockerfile.ci testdata/peers
 fi
 
-flags="-race -shuffle=on -count=1 -timeout=10m"
+flags="-race -shuffle=on -count=1 -timeout=20m"
 pkgs=""
 if [ "$execmode" = 0 ]; then
 	for a in "$@"; do

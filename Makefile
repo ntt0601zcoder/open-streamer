@@ -1,7 +1,7 @@
 .PHONY: test lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers ostranscoder test-transcode test-nvenc openstreamer
 
 test:
-	go test -race -shuffle=on -count=1 -timeout=10m ./...
+	go test -race -shuffle=on -count=1 -timeout=20m ./...
 
 lint:
 	golangci-lint run ./...
@@ -21,7 +21,7 @@ vet:
 check: tidy vet lint test
 
 cover:
-	go test -race -shuffle=on -count=1 -timeout=10m -coverprofile=coverage.out ./...
+	go test -race -shuffle=on -count=1 -timeout=20m -coverprofile=coverage.out ./...
 
 covercheck:
 	go run github.com/vladopajic/go-test-coverage/v2@v2.22.0 -c .testcoverage.yml

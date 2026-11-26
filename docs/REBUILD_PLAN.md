@@ -1142,7 +1142,9 @@ part of the answer is written aborts the connection instead of ending it as
 a whole answer. `server.New` binds every listener and starts the streams
 through `Manager.Load`, so a server it returns must be run. The e2e
 scenarios run in `make test` and the amd64 `test` job, inside a 240 s
-budget; `transcode-e2e-arm64` runs `TestM5aLadder` against the arm64
+budget on the package's time (`make test` and `make cover` allow 20 min per
+package: CI's 2-core runners are slower than a local machine and the
+transcode scenarios contend for CPU, which overran the earlier 10 min); `transcode-e2e-arm64` runs `TestM5aLadder` against the arm64
 bundle; the `test` job builds `cmd/openstreamer` for Linux, Windows and
 macOS.
 
@@ -1256,6 +1258,11 @@ Out of M2c:
 ### Backlog
 
 Items accepted for later, not yet placed in a milestone:
+
+- **Split `internal/e2e` by milestone, or run the transcode scenarios in their
+  own job.** The package alone took over 10 min on the 2-core runners (CI run
+  45755846031), so `make test` and `make cover` now allow 20 min; a split
+  would bring the per-package time back down.
 
 - **Per-input RTSP sync mode** (`?sync=sr|initial`): `sr` (the default) keeps
   M2c's confirmed sender-report rule; `initial` uses sender reports only for

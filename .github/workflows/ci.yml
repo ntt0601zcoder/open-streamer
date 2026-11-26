@@ -208,7 +208,7 @@ jobs:
   # M5a ladder served by the openstreamer server (TestM5aLadder; the other
   # M5a scenarios need no transcoder and run in the test job). The
   # whole set took about 55 s with -race on an amd64 workstation, well
-  # inside the 10 min timeout. Their only peers are the bundle and apt's
+  # inside the 10 min timeout of this job's step. Their only peers are the bundle and apt's
   # ffmpeg and ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a
   # failure. The VLC, GStreamer, SRT and RTSP rows stay amd64-only:
   # TestM4aVLC and TestM4bPlayers are not in the pattern (they run in the
