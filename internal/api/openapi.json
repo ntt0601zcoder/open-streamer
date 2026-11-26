@@ -1345,6 +1345,11 @@
             "uniqueItems": true,
             "maxItems": 2
           },
+          "audio_language": {
+            "type": "string",
+            "description": "BCP 47 tag of the stream's audio, written to the HLS masters and the MPD; empty: not declared.",
+            "maxLength": 35
+          },
           "transcode": {
             "description": "The ladder; absent for a passthrough stream.",
             "allOf": [
@@ -1840,7 +1845,7 @@
           },
           "applied": {
             "type": "string",
-            "description": "created: a new stream. started: it was disabled or stopped and now runs; also a stream that did not differ but had been left stopped because it could not run (a listen address in use, a missing asset), which every edit and reload tries again. stopped: the stream has no supervisor after the edit (it is disabled). unchanged: nothing differed; a stream left stopped that still cannot run stays so, with its last_error refreshed. outputs: only the outputs differed, applied in place. live: the inputs or the watermark of a running stream were changed in place; no session ended. rebuild: the stream was rebuilt. deleted: the stream is gone.",
+            "description": "created: a new stream. started: it was disabled or stopped and now runs; also a stream that did not differ but had been left stopped because it could not run (a listen address in use, a missing asset), which every edit and reload tries again. stopped: the stream has no supervisor after the edit (it is disabled). unchanged: nothing differed; a stream left stopped that still cannot run stays so, with its last_error refreshed. outputs: only the outputs differed, applied in place. live: the inputs, the watermark or the audio language of a running stream were changed in place; no session ended. rebuild: the stream was rebuilt. deleted: the stream is gone.",
             "enum": [
               "created",
               "started",

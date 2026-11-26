@@ -1,12 +1,14 @@
 package spec
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
 	"strconv"
 	"unicode/utf8"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
 
@@ -44,6 +46,14 @@ func (s Stream) validate() error {
 		}
 		if slices.Contains(s.Layout[:i], l) {
 			return fmt.Errorf("layout[%d]: %s is repeated", i, Quote(l))
+		}
+	}
+	if s.AudioLanguage != "" {
+		if !media.ValidLanguage(s.AudioLanguage) {
+			return fmt.Errorf("audio_language: %s is not a language tag (BCP 47), such as vi or en-US", Quote(s.AudioLanguage))
+		}
+		if len(s.Layout) > 0 && !slices.Contains(s.Layout, "audio") {
+			return errors.New("audio_language: the layout has no audio")
 		}
 	}
 	if s.Transcode != nil {

@@ -116,6 +116,38 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// The audio language is a BCP 47 tag by R-L2's syntax, kept as given, and
+// needs a layout with audio.
+func TestValidateAudioLanguage(t *testing.T) {
+	long := "en-abcdefgh-abcdefgh-abcdefgh-abcde" // 35 bytes
+	require.Len(t, long, 35)
+	for _, v := range []string{"", "vi", "EN-us", "zh-Hant-TW", long} {
+		s := full()
+		s.AudioLanguage = v
+		require.NoError(t, s.Validate(), v)
+		assert.Equal(t, v, s.AudioLanguage, "kept as given")
+	}
+	for _, v := range []string{`vi",URI="x`, "vi\n", "english", "x-klingon", long + "f", "e"} {
+		s := full()
+		s.AudioLanguage = v
+		err := s.Validate()
+		if assert.Error(t, err, v) {
+			assert.Equal(t, "spec: validate: audio_language: "+Quote(v)+" is not a language tag (BCP 47), such as vi or en-US", err.Error(), v)
+		}
+	}
+
+	s := full()
+	s.Layout = []string{"video"}
+	require.NoError(t, s.Validate(), "no audio, no language")
+	s.AudioLanguage = "vi"
+	err := s.Validate()
+	if assert.Error(t, err) {
+		assert.Equal(t, "spec: validate: audio_language: the layout has no audio", err.Error())
+	}
+	s.Layout = []string{"audio"}
+	require.NoError(t, s.Validate(), "audio only")
+}
+
 func TestValidateRejectsMaskedURL(t *testing.T) {
 	s := full()
 	s.Inputs[0].URL = "rtsp://user:xxxxx@host/a"

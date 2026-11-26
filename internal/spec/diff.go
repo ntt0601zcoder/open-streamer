@@ -10,16 +10,17 @@ type Change uint8
 const (
 	ChangeNone    Change = iota // the documents are equal
 	ChangeOutputs               // they differ only in outputs: applied in place
-	ChangeLive                  // they differ in inputs or transcode.watermark, maybe in outputs, and nowhere else: applied to the running pipeline
+	ChangeLive                  // they differ in inputs, transcode.watermark or audio_language, maybe in outputs, and nowhere else: applied to the running pipeline
 	ChangeRebuild               // they differ elsewhere: the stream is rebuilt
 )
 
 // Diff returns how the edit from old to new is applied: ChangeNone when
 // the documents are equal; ChangeOutputs when they differ only in outputs
 // (a reordering of pushes included); ChangeLive when they differ in the
-// inputs (their order included) or, when both have a ladder, in its
-// watermark (added and removed included), and maybe in outputs, but
-// nowhere else; and ChangeRebuild otherwise. Nil and empty slices are
+// inputs (their order included), in the audio language (set and cleared
+// included) or, when both have a ladder, in its watermark (added and
+// removed included), and maybe in outputs, but nowhere else; and
+// ChangeRebuild otherwise. Nil and empty slices are
 // equal, and so are an empty layout and video then audio.
 func Diff(old, new Stream) Change {
 	o, n := old.normal(), new.normal()
@@ -33,6 +34,7 @@ func Diff(old, new Stream) Change {
 	// o and n are deep copies: clearing their fields leaves old and new as
 	// they were.
 	o.Inputs, n.Inputs = nil, nil
+	o.AudioLanguage, n.AudioLanguage = "", ""
 	if o.Transcode != nil && n.Transcode != nil {
 		o.Transcode.Watermark, n.Transcode.Watermark = nil, nil
 	}

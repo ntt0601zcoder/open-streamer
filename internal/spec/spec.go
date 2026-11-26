@@ -25,13 +25,14 @@ const (
 
 // Stream is one stream's document.
 type Stream struct {
-	Name      string     `json:"name" yaml:"name"`
-	Disabled  bool       `json:"disabled,omitempty" yaml:"disabled,omitempty"`
-	Inputs    []Input    `json:"inputs" yaml:"inputs"`                     // by priority, first highest
-	Layout    []string   `json:"layout,omitempty" yaml:"layout,omitempty"` // "video", "audio"; empty means both
-	Transcode *Transcode `json:"transcode,omitempty" yaml:"transcode,omitempty"`
-	Thumbnail *Thumbnail `json:"thumbnail,omitempty" yaml:"thumbnail,omitempty"`
-	Outputs   Outputs    `json:"outputs" yaml:"outputs"`
+	Name          string     `json:"name" yaml:"name"`
+	Disabled      bool       `json:"disabled,omitempty" yaml:"disabled,omitempty"`
+	Inputs        []Input    `json:"inputs" yaml:"inputs"`                                     // by priority, first highest
+	Layout        []string   `json:"layout,omitempty" yaml:"layout,omitempty"`                 // "video", "audio"; empty means both
+	AudioLanguage string     `json:"audio_language,omitempty" yaml:"audio_language,omitempty"` // BCP 47 tag of the audio, as given; empty: not declared
+	Transcode     *Transcode `json:"transcode,omitempty" yaml:"transcode,omitempty"`
+	Thumbnail     *Thumbnail `json:"thumbnail,omitempty" yaml:"thumbnail,omitempty"`
+	Outputs       Outputs    `json:"outputs" yaml:"outputs"`
 }
 
 // Input is one source of a stream; the ingest URL forms apply.

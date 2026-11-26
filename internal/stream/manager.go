@@ -32,7 +32,7 @@ const (
 	appliedStopped   = "stopped"   // it changed and has no supervisor now: disabled
 	appliedUnchanged = "unchanged" // the spec is the same
 	appliedOutputs   = "outputs"   // a running stream's outputs were edited in place
-	appliedLive      = "live"      // a running stream's inputs or watermark were edited in place
+	appliedLive      = "live"      // a running stream's inputs, watermark or audio language were edited in place
 	appliedRebuild   = "rebuild"   // a running stream is rebuilt
 	appliedDeleted   = "deleted"   // the name is gone
 )

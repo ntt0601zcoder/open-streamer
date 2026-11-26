@@ -108,3 +108,53 @@ func TestDiffOrder(t *testing.T) {
 	assert.Less(t, ChangeOutputs, ChangeLive)
 	assert.Less(t, ChangeLive, ChangeRebuild)
 }
+
+// A change to the audio language is live, alone or with the inputs or the
+// outputs (R-L5); with a layout change the stream is rebuilt.
+func TestDiffAudioLanguage(t *testing.T) {
+	lang := func(v string) func(*Stream) {
+		return func(s *Stream) { s.AudioLanguage = v }
+	}
+	for _, c := range []struct {
+		name string
+		want Change
+		from func(*Stream)
+		edit func(*Stream)
+	}{
+		{"set", ChangeLive, nil, lang("vi")},
+		{"changed", ChangeLive, lang("vi"), lang("en")},
+		{"and an input", ChangeLive, nil, func(s *Stream) {
+			s.AudioLanguage = "vi"
+			s.Inputs[0].URL = "udp://:7000"
+		}},
+		{"and the watermark", ChangeLive, nil, func(s *Stream) {
+			s.AudioLanguage = "vi"
+			s.Transcode.Watermark.Text = "live"
+		}},
+		{"and outputs", ChangeLive, nil, func(s *Stream) {
+			s.AudioLanguage = "vi"
+			s.Outputs.DASH = false
+		}},
+		{"and the layout", ChangeRebuild, nil, func(s *Stream) {
+			s.AudioLanguage = "vi"
+			s.Layout = []string{"audio"}
+		}},
+		{"equal", ChangeNone, lang("vi"), lang("vi")},
+	} {
+		old := full()
+		if c.from != nil {
+			c.from(&old)
+		}
+		edited := old.clone()
+		c.edit(&edited)
+		assert.Equal(t, c.want, Diff(old, edited), c.name)
+		assert.Equal(t, c.want, Diff(edited, old), c.name+", reversed")
+	}
+
+	// Diff does not change its arguments.
+	a, b := full(), full()
+	a.AudioLanguage, b.AudioLanguage = "vi", "en"
+	Diff(a, b)
+	assert.Equal(t, "vi", a.AudioLanguage)
+	assert.Equal(t, "en", b.AudioLanguage)
+}
