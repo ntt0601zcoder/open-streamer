@@ -31,6 +31,24 @@ func camSpec() spec.Stream {
 	}
 }
 
+// served is env with the server's three session servers on, at addresses
+// nothing binds, as Check wants for a stream that turns their outputs on.
+// An RTMP play address the caller set is kept.
+func served(env Env) Env {
+	if env.RTMPPlay == "" {
+		env.RTMPPlay, env.RTMPApp = "192.0.2.1:19350", "play"
+	}
+	env.RTSPPlay, env.SRTPlay = "192.0.2.1:15554", "192.0.2.1:19999"
+	return env
+}
+
+// rtmpOff is a row edit: the server has no RTMP listener, and the stream
+// does not ask for the output.
+func rtmpOff(sp *spec.Stream, env *Env) {
+	env.RTMPPlay, env.RTMPApp = "", ""
+	sp.Outputs.RTMP = false
+}
+
 // writeAsset writes a 1×1 PNG named name into a new assets directory.
 func writeAsset(t testing.TB, name string) string {
 	t.Helper()
@@ -96,6 +114,19 @@ func TestCheck(t *testing.T) {
 			encoded, binary, watermark(spec.Watermark{Image: "logo.png", Position: "br"}),
 			func(_ *spec.Stream, env *Env) { env.AssetsDir = assets },
 		}, ""},
+		{"rtmp on, the RTMP listener off", []func(*spec.Stream, *Env){func(_ *spec.Stream, env *Env) {
+			env.RTMPPlay, env.RTMPApp = "", ""
+		}}, "outputs.rtmp: the server's rtmp listener is off: set server.rtmp.listen"},
+		{"rtsp on, the RTSP listener off", []func(*spec.Stream, *Env){func(_ *spec.Stream, env *Env) {
+			env.RTSPPlay = ""
+		}}, "outputs.rtsp: the server's rtsp listener is off: set server.rtsp.listen"},
+		{"srt on, the SRT listener off", []func(*spec.Stream, *Env){func(_ *spec.Stream, env *Env) {
+			env.SRTPlay = ""
+		}}, "outputs.srt: the server's srt listener is off: set server.srt.listen"},
+		{"every listener off, and no such output on", []func(*spec.Stream, *Env){func(sp *spec.Stream, env *Env) {
+			*env = Env{}
+			sp.Outputs = spec.Outputs{HLS: true, DASH: true, HTTPTS: true}
+		}}, ""},
 		{"a text watermark", []func(*spec.Stream, *Env){encoded, binary, watermark(spec.Watermark{Text: "live %H:%M"})}, ""},
 		{"a watermark next to a copy rung", []func(*spec.Stream, *Env){encoded, binary, func(sp *spec.Stream, _ *Env) {
 			sp.Transcode.Renditions = append(sp.Transcode.Renditions, spec.Rendition{Label: "src", Copy: true})
@@ -126,7 +157,7 @@ func TestCheck(t *testing.T) {
 		{"publishing at in/key on the play address", []func(*spec.Stream, *Env){rtmpPlay, in("rtmp://" + play + "/in/key?mode=listen")}, ""},
 		{"publishing at live/cam on another address", []func(*spec.Stream, *Env){rtmpPlay, in("rtmp://127.0.0.1:1936/live/cam?mode=listen")}, ""},
 		{"publishing at live/other on another address", []func(*spec.Stream, *Env){rtmpPlay, in("rtmp://127.0.0.1:1936/live/other?mode=listen")}, ""},
-		{"publishing at live/cam with RTMP play off", []func(*spec.Stream, *Env){in("rtmp://" + play + "/live/cam?mode=listen")}, ""},
+		{"publishing at live/cam with RTMP play off", []func(*spec.Stream, *Env){rtmpOff, in("rtmp://" + play + "/live/cam?mode=listen")}, ""},
 		{"pulling live/cam from the play address", []func(*spec.Stream, *Env){rtmpPlay, in("rtmp://" + play + "/live/cam")}, ""},
 		{"the play app with slashes", []func(*spec.Stream, *Env){
 			func(_ *spec.Stream, env *Env) { env.RTMPPlay, env.RTMPApp = ":1935", "/live/" },
@@ -135,7 +166,7 @@ func TestCheck(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
-			sp, env := camSpec(), Env{}
+			sp, env := camSpec(), served(Env{})
 			for _, e := range row.edit {
 				e(&sp, &env)
 			}
@@ -159,7 +190,7 @@ func TestCheck(t *testing.T) {
 func TestCheckSkipsParseWithOpen(t *testing.T) {
 	sp := camSpec()
 	sp.Inputs = []spec.Input{{URL: "scripted://anything"}}
-	require.Error(t, Check(sp, Env{}))
+	require.Error(t, Check(sp, served(Env{})))
 	open := func(context.Context, string) (ingest.Reader, error) { return nil, errors.New("not opened by Check") }
-	require.NoError(t, Check(sp, Env{Open: open}))
+	require.NoError(t, Check(sp, served(Env{Open: open})))
 }

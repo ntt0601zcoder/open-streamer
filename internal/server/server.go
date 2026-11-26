@@ -161,6 +161,7 @@ func New(path string, opt Options) (*Server, error) {
 	if s.addrs.RTMP != "" {
 		env.RTMPPlay, env.RTMPApp = s.addrs.RTMP, sec.RTMP.App
 	}
+	env.RTSPPlay, env.SRTPlay = s.addrs.RTSP, s.addrs.SRT
 	m := stream.NewManager(env)
 
 	reg := &metrics.Registry{}

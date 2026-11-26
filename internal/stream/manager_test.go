@@ -44,7 +44,7 @@ type mrig struct {
 func newMrig(t testing.TB, tune ...func(*Env)) *mrig {
 	t.Helper()
 	r := &mrig{t: t, sc: newScript(t)}
-	env := Env{Open: r.sc.Open}
+	env := served(Env{Open: r.sc.Open})
 	for _, f := range tune {
 		f(&env)
 	}
@@ -698,10 +698,10 @@ func TestManagerLookups(t *testing.T) {
 // later edits (R-D4).
 func TestManagerLoad(t *testing.T) {
 	r := &mrig{t: t, sc: newScript(t)}
-	r.m = NewManager(Env{
+	r.m = NewManager(served(Env{
 		Open:     r.sc.Open,
 		Reserved: []Claim{{UDP: true, Host: "127.0.0.1", Port: 19000}},
-	})
+	}))
 	r1, r2, y := named("r1"), named("r2"), withInputs(named("y"), "udp://:15000")
 	z, x := withInputs(named("z"), "http://source.test/z.ts", "udp://:15000"), withInputs(named("x"), "udp://:19000")
 	dis := named("dis")
@@ -814,7 +814,7 @@ func TestManagerLoad(t *testing.T) {
 // Load leaves the stream that closes a copy:// cycle stopped.
 func TestManagerLoadCopyCycle(t *testing.T) {
 	r := &mrig{t: t, sc: newScript(t)}
-	r.m = NewManager(Env{Open: r.sc.Open})
+	r.m = NewManager(served(Env{Open: r.sc.Open}))
 	left, err := r.m.Load([]spec.Stream{withInputs(named("b"), "copy://a"), withInputs(named("a"), "copy://b")})
 	r.run()
 	require.NoError(t, err)
@@ -831,7 +831,7 @@ func TestManagerLoadCopyCycle(t *testing.T) {
 // a reason that is true now, without failing the edit.
 func TestManagerRetriesStopped(t *testing.T) {
 	r := &mrig{t: t, sc: newScript(t)}
-	r.m = NewManager(Env{Open: r.sc.Open})
+	r.m = NewManager(served(Env{Open: r.sc.Open}))
 	a, b := withInputs(named("a"), "udp://:15000"), withInputs(named("b"), "udp://:15000")
 	c := withInputs(named("c"), "udp://:15000")
 	left, err := r.m.Load([]spec.Stream{a, b, c})
@@ -1060,7 +1060,7 @@ func TestManagerChainSurvivesCancelledWaiter(t *testing.T) {
 	defer release()
 	open.gate.Store(&gate)
 	r := &mrig{t: t}
-	r.m = NewManager(Env{Open: open.Open, Logger: logger})
+	r.m = NewManager(served(Env{Open: open.Open, Logger: logger}))
 	r.run()
 	stopSend := sendFixture(t, port)
 	defer stopSend()
@@ -1145,7 +1145,7 @@ func TestManagerConcurrentReplaces(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	open := &heldOpen{delay: 10 * time.Millisecond}
-	m := NewManager(Env{Open: open.Open, Logger: logger})
+	m := NewManager(served(Env{Open: open.Open, Logger: logger}))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stopSend := sendFixture(t, port)

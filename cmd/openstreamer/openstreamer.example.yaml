@@ -28,7 +28,8 @@ server:
     listen: "127.0.0.1:8081"
   # The shared RTMP listener: players of rtmp://host:19350/live/<stream>,
   # and the streams' RTMP listen inputs on the same address. Leave listen
-  # out to turn it off.
+  # out to turn it off; the same goes for rtsp and srt. A stream may turn
+  # on an output (rtmp, rtsp, srt) only while its listener is on.
   rtmp:
     listen: ":19350"
     app: live

@@ -76,7 +76,9 @@ curl -u ops -X PUT http://127.0.0.1:8081/api/v1/streams/cam1 \
 ```
 
 It answers 201 for a new stream and 200 for a replaced one, with the stream
-(URLs redacted) and how the edit was applied. `GET /api/v1/streams/cam1/status`
+(URLs redacted) and how the edit was applied. An output whose listener is off
+(`rtmp`, `rtsp` or `srt` while that `server.*.listen` is empty) is refused with
+422 `invalid_spec`: turn the output off, or set the listener and restart. `GET /api/v1/streams/cam1/status`
 shows its state; `DELETE /api/v1/streams/cam1` removes it.
 
 Edit the whole config in one round trip. `GET` returns the file as it is,

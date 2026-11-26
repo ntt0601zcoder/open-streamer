@@ -530,19 +530,37 @@ func TestServerListenersOff(t *testing.T) {
 	s := testConfig(t, func(su *setup) {
 		su.Opt.Open = nil
 		su.Text = "version: 1\nserver:\n  http: {listen: \"127.0.0.1:0\"}\n  api: {listen: \"127.0.0.1:0\"}\n" + usersYAML() +
-			"streams:\n" + fileStream(t, "cam", "{hls: true, rtmp: true, rtsp: true, srt: true}")
+			"streams:\n" + fileStream(t, "cam", "{hls: true, httpts: true}") + fileStream(t, "off", "{hls: true, srt: true}")
 	})
 	a := s.Addrs()
 	assert.Empty(t, a.RTMP)
 	assert.Empty(t, a.RTSP)
 	assert.Empty(t, a.SRT)
 	assert.NotEmpty(t, a.HTTP)
-	assert.Empty(t, s.ConfigStatus().LoadErrors)
 	require.Eventually(t, func() bool { return s.mediaGet("/live/cam/hls/index.m3u8") == http.StatusOK },
 		waitFor, 50*time.Millisecond)
-	// A stream with those outputs is accepted over the API as well.
-	res := s.do(http.MethodPut, "/api/v1/streams/two", "ops", streamJSON("two", loopURL(t), `{"rtmp":true,"rtsp":true,"srt":true}`))
+	// A stream that turns on an output whose listener is off is left
+	// stopped at the start: nobody could play that output.
+	errs := s.ConfigStatus().LoadErrors
+	require.Len(t, errs, 1)
+	assert.Contains(t, errs[0], `stream "off": check: outputs.srt: the server's srt listener is off`)
+	st, ok := s.Status("off")
+	require.True(t, ok)
+	assert.Equal(t, "stopped", st.State)
+	// And it is refused over the API, one output at a time.
+	for _, out := range []string{"rtmp", "rtsp", "srt"} {
+		res := s.do(http.MethodPut, "/api/v1/streams/two", "ops", streamJSON("two", loopURL(t), `{"hls":true,"`+out+`":true}`))
+		require.Equal(t, http.StatusUnprocessableEntity, res.code, res.body)
+		assert.Contains(t, res.body, `"code":"invalid_spec"`)
+		assert.Contains(t, res.body, "outputs."+out+": the server's "+out+" listener is off: set server."+out+".listen")
+	}
+	res := s.do(http.MethodPut, "/api/v1/streams/two", "ops", streamJSON("two", loopURL(t), `{"hls":true,"httpts":true}`))
 	require.Equal(t, http.StatusCreated, res.code, res.body)
+	// Turning the output off is the repair.
+	res = s.do(http.MethodPut, "/api/v1/streams/off", "ops", streamJSON("off", loopURL(t), `{"hls":true}`))
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	assert.Contains(t, res.body, `"applied":"started"`)
+	assert.Empty(t, s.ConfigStatus().LoadErrors)
 	// Without an output server its series are absent, and the scrape parses.
 	out := s.do(http.MethodGet, "/metrics", "eye", "")
 	require.Equal(t, http.StatusOK, out.code)

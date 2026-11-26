@@ -905,7 +905,7 @@
         }
       },
       "Unprocessable": {
-        "description": "invalid_config: the config that would result is invalid. invalid_spec: the stream cannot run on this server; it takes precedence over conflict. errors lists every one.",
+        "description": "invalid_config: the config that would result is invalid. invalid_spec: the stream cannot run on this server (for one, it turns on rtmp, rtsp or srt while that server.*.listen is empty); it takes precedence over conflict. errors lists every one.",
         "content": {
           "application/json": {
             "schema": {

@@ -323,7 +323,7 @@ type rig struct {
 func newRig(t testing.TB) *rig {
 	t.Helper()
 	r := &rig{t: t, sc: newScript(t), after: newFakeAfter()}
-	r.env = Env{Open: r.sc.Open, After: r.after.After}
+	r.env = served(Env{Open: r.sc.Open, After: r.after.After})
 	return r
 }
 

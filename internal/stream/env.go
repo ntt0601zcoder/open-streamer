@@ -43,6 +43,10 @@ type Env struct {
 	// RTMPPlay is the server's RTMP play address, as bound, and RTMPApp its
 	// app, for Check's publish-path rule; "" means off.
 	RTMPPlay, RTMPApp string
+	// RTSPPlay and SRTPlay are the addresses of the server's RTSP and SRT
+	// servers, as bound; "" means off. Check refuses a stream that turns on
+	// an output whose server is off (RTMPPlay too): nobody could play it.
+	RTSPPlay, SRTPlay string
 	// Reserved are the server's own listeners as bound (HTTP, API, RTMP,
 	// RTSP, SRT); the Manager's claims start from them.
 	Reserved []Claim
@@ -102,6 +106,18 @@ func Check(sp spec.Stream, env Env) error {
 	}
 	if _, err := layoutOf(sp); err != nil {
 		return checkErr("layout", err)
+	}
+	for _, o := range []struct {
+		on         bool
+		addr, name string
+	}{
+		{sp.Outputs.RTMP, env.RTMPPlay, "rtmp"},
+		{sp.Outputs.RTSP, env.RTSPPlay, "rtsp"},
+		{sp.Outputs.SRT, env.SRTPlay, "srt"},
+	} {
+		if o.on && o.addr == "" {
+			return checkErr("outputs."+o.name, fmt.Errorf("the server's %s listener is off: set server.%s.listen and restart, or turn the output off", o.name, o.name))
+		}
 	}
 	scratch := hub.New(hub.Options{})
 	defer scratch.Close()
