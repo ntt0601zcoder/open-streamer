@@ -21,6 +21,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp/rtsptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 const (
@@ -646,16 +647,19 @@ func TestOpenRTSP(t *testing.T) {
 		_, err := Parse(u)
 		assert.Error(t, err, u)
 	}
-	_, err := Parse("rtsps://u:" + rtspPass + "@cam/stream")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "rtsps is not supported")
-	assert.NotContains(t, err.Error(), rtspPass)
+	// rtsps is an input since M5c1 (TestParseTLSSchemes has its refusals).
+	spec, err := Parse("rtsps://u:" + rtspPass + "@cam/stream")
+	require.NoError(t, err)
+	assert.Equal(t, Spec{Live: true}, spec)
 
+	// Nothing listens there: the open fails as an rtsp one, the password
+	// hidden.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, err = Open(ctx, "rtsps://cam/stream", Env{})
+	_, err = Open(ctx, "rtsps://u:"+rtspPass+"@127.0.0.1:"+freeTCPPort(t)+"/stream", Env{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "rtsps is not supported")
+	assert.Contains(t, err.Error(), "ingest: rtsp: open rtsps://u:xxxxx@127.0.0.1:")
+	assert.NotContains(t, err.Error(), rtspPass)
 
 	t.Run("transport removed from the request URL", func(t *testing.T) {
 		s := newRTSPServer(t, rtsptest.ServerOptions{Seed: 12})
@@ -703,4 +707,49 @@ func TestRTSPPullClientStats(t *testing.T) {
 	assert.GreaterOrEqual(t, st["oversize_aus"], uint64(1))
 	assert.Positive(t, st["unknown_channels"])
 	assert.Equal(t, uint64(3), st["server_requests"])
+}
+
+// An rtsps:// pull verified with Env.TLS reads the frames a plain pull
+// reads, over the one TLS connection: transport=auto is passed on as it is,
+// and pkg/rtsp makes it TCP.
+func TestRTSPSPull(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	read := func(t *testing.T, opt rtsptest.ServerOptions, query string, env Env) ([]media.Frame, *rtsptest.Server) {
+		t.Helper()
+		opt.SendRTPInfo, opt.SRAfter, opt.Seed = true, 100*time.Millisecond, 31
+		s := newRTSPServer(t, opt)
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		r := openPull(t, ctx, s.URL("/stream"+query), env)
+		assert.Equal(t, Spec{Live: true}, r.Spec())
+		assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
+		got := readRTSP(t, r, 40)
+		require.NoError(t, got.err)
+		checkRTSPFrames(t, got.frames)
+		assert.Empty(t, got.breaks)
+		assert.Zero(t, r.Stats()["lost_packets"])
+		require.NoError(t, r.Close())
+		return mediaFrames(got.frames), s
+	}
+	plain, _ := read(t, rtsptest.ServerOptions{}, "", Env{})
+
+	for _, query := range []string{"", "?transport=tcp", "?transport=auto"} {
+		t.Run("transport"+query, func(t *testing.T) {
+			client := ca.Client()
+			got, s := read(t, rtsptest.ServerOptions{TLS: ca.Server(t)}, query, Env{TLS: client})
+			assert.Equal(t, plain, got, "the frames of the plain pull")
+			assert.Empty(t, client.ServerName, "Env.TLS is not modified")
+			setups := 0
+			for _, req := range s.Requests() {
+				assert.True(t, strings.HasPrefix(req.URL, "rtsps://"+s.Addr+"/stream"), "%s %s", req.Method, req.URL)
+				assert.NotContains(t, req.URL, "transport", req.Method)
+				if req.Method == "SETUP" {
+					setups++
+					assert.Contains(t, req.Header.Get("Transport"), "interleaved", "RTP inside the TLS connection")
+					assert.NotContains(t, req.Header.Get("Transport"), "client_port")
+				}
+			}
+			assert.Equal(t, 2, setups, "no UDP attempt came first")
+		})
+	}
 }

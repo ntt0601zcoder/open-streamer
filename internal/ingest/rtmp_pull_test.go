@@ -18,6 +18,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 // wait waits until the reading goroutine of l has ended.
@@ -295,4 +296,39 @@ func TestRTMPFFmpegServerPull(t *testing.T) {
 	assert.Zero(t, st["bad_tags"])
 	assert.Zero(t, st["dropped_no_config"])
 	clockCheck(t, r, log.frames)
+}
+
+// An rtmps:// pull verified with Env.TLS reads the frames a plain pull
+// reads; the server sees the scheme rtmps and nothing of ours.
+func TestRTMPSPull(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	tags := fixtureTags(t, "h264_aac.flv")
+	read := func(t *testing.T, srv *rtmptest.PlayServer, env Env) []media.Frame {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		r := openPull(t, ctx, srv.URL("live/"+vStreamKey+"?mode=pull&token=x"), env)
+		assert.Equal(t, Spec{Live: true}, r.Spec())
+		assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
+		log := readAll(r)
+		log.wait(t)
+		require.ErrorIs(t, log.err, io.ErrUnexpectedEOF)
+		assert.NotContains(t, log.err.Error(), vStreamKey)
+		return mediaFrames(log.frames)
+	}
+	plain := read(t, rtmptest.NewPlayServer(t, tags, rtmptest.PlayOptions{}), Env{})
+	require.Equal(t, sourceFrames(t, tags), plain)
+
+	srv := rtmptest.NewPlayServer(t, tags, rtmptest.PlayOptions{TLS: ca.Server(t)})
+	client := ca.Client()
+	assert.Equal(t, plain, read(t, srv, Env{TLS: client}), "the frames of the plain pull")
+	assert.Empty(t, client.ServerName, "Env.TLS is not modified")
+
+	reqs := srv.Requests()
+	require.Len(t, reqs, 1)
+	assert.Equal(t, "rtmps://"+srv.Addr+"/live", reqs[0].TCURL)
+	assert.Equal(t, vStreamKey+"?token=x", reqs[0].Stream, "our mode parameter is stripped")
+	for _, s := range []string{reqs[0].App, reqs[0].Stream, reqs[0].TCURL} {
+		assert.NotContains(t, s, "insecure")
+	}
 }

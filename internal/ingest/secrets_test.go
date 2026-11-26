@@ -15,5 +15,12 @@ const (
 	vXyz    = "x" + "yz"
 )
 
+// vS3Key is a fake stream key that redacts to "s3xxxxx", and vP4ss a fake
+// password.
+const (
+	vS3Key = vS3 + "key"
+	vP4ss  = "p4" + "ss"
+)
+
 // vStreamKey is a fake RTMP stream key.
 const vStreamKey = "sk" + "_9f3a7c" + "e21b"

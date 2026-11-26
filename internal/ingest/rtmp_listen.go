@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	// defaultRTMPPort is the RTMP port when the URL has none.
-	defaultRTMPPort = "1935"
+	// defaultRTMPPort and defaultRTMPSPort are the ports of rtmp:// and
+	// rtmps:// when the URL has none.
+	defaultRTMPPort  = "1935"
+	defaultRTMPSPort = "443"
 	// takeoverIdle is how long the current publisher must have sent nothing
 	// before a new publisher of the same path takes over.
 	takeoverIdle = 2 * time.Second
@@ -113,14 +115,47 @@ var rtmpListeners = rtmpsrv.Default
 var errRTMPClosed = errors.New("ingest: rtmp: closed")
 
 // rtmpListenTarget returns the listen address and the path of a listen URL;
-// the port defaults to 1935.
+// the port defaults to 1935, and to 443 for rtmps://.
 func rtmpListenTarget(p parsed) (addr, path string) {
 	port := p.u.Port()
-	if port == "" {
+	switch {
+	case port != "":
+	case p.scheme == schemeRTMPS:
+		port = defaultRTMPSPort
+	default:
 		port = defaultRTMPPort
 	}
 	return net.JoinHostPort(p.u.Hostname(), port), p.u.Path
 }
+
+// TLSListen reports whether rawURL is an rtmps:// listen input, and its
+// listener key (rtmpsrv.AddrKey) and publish path.
+func TLSListen(rawURL string) (addr, path string, ok bool) {
+	p, err := parse(rawURL)
+	if err != nil || p.scheme != schemeRTMPS || !p.spec.Passive {
+		return "", "", false
+	}
+	target, raw := rtmpListenTarget(p)
+	key, err := rtmpsrv.AddrKey(target)
+	if err != nil {
+		return "", "", false
+	}
+	path, _ = rtmp.NormalizePath(raw, "")
+	return key, path, true
+}
+
+// noTLSListenerError is rtmpsrv.ErrNoTLSListener for an rtmps:// listen
+// input: a stream cannot open an RTMPS listener of its own, because the
+// certificate is the server's.
+type noTLSListenerError struct {
+	addr string // the listener key
+}
+
+func (e noTLSListenerError) Error() string {
+	return "no RTMPS listener on " + e.addr + ": set server.rtmp.tls_listen to it"
+}
+
+func (noTLSListenerError) Unwrap() error { return rtmpsrv.ErrNoTLSListener }
 
 // rtmpSession is one accepted publisher.
 type rtmpSession struct {
@@ -133,7 +168,9 @@ type rtmpSession struct {
 }
 
 // rtmpListen is an RTMP listen input: the sink of one path on a shared TCP
-// listener (see rtmpsrv.Registry). It has at most one publisher. A new one is
+// listener (see rtmpsrv.Registry), which an rtmp:// input opens when it is
+// the first on its address; an rtmps:// input only joins the server's RTMPS
+// listener. It has at most one publisher. A new one is
 // accepted when there is none, or when the current one has received no byte
 // for 2 s (a half-open peer): it takes over and the old session is closed.
 // While the current one is sending, a new one is rejected with the same
@@ -191,8 +228,20 @@ func newRTMPListen(spec Spec, addr string, now func() time.Time) *rtmpListen {
 func openRTMPListen(ctx context.Context, rawURL string, p parsed, env Env) (Reader, error) {
 	addr, path := rtmpListenTarget(p)
 	l := newRTMPListen(p.spec, addr, env.now())
-	//nolint:contextcheck // the shared listener outlives the open ctx, which bounds only the open
-	unregister, err := rtmpListeners.RegisterPublish(addr, path, l, rtmp.Config{}, rtmpListenPolicy)
+	var unregister func()
+	var err error
+	if p.scheme == schemeRTMPS {
+		//nolint:contextcheck // as below; this one opens no listener
+		unregister, err = rtmpListeners.RegisterPublishTLS(addr, path, l)
+		if errors.Is(err, rtmpsrv.ErrNoTLSListener) {
+			if key, kerr := rtmpsrv.AddrKey(addr); kerr == nil {
+				err = noTLSListenerError{addr: key}
+			}
+		}
+	} else {
+		//nolint:contextcheck // the shared listener outlives the open ctx, which bounds only the open
+		unregister, err = rtmpListeners.RegisterPublish(addr, path, l, rtmp.Config{}, rtmpListenPolicy)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("ingest: rtmp: open %s: %w", Redact(rawURL), err)
 	}

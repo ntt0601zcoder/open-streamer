@@ -11,7 +11,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 )
 
-// rtmpPull is an RTMP pull input: it plays one stream from a server, one
+// rtmpPull is an RTMP or RTMPS pull input: it plays one stream from a server, one
 // session for the reader's life. A live pull never ends cleanly: when the
 // server ends the stream (Play.Stop, UnpublishNotify, StreamEOF or a
 // disconnect), Read returns the held video frames (flvFrames.flush), then
@@ -34,8 +34,10 @@ type rtmpPull struct {
 }
 
 func openRTMPPull(ctx context.Context, rawURL string, p parsed, env Env) (Reader, error) {
-	// The client strips our mode parameter from the query it sends.
-	conn, err := rtmp.Play(ctx, rawURL)
+	// The client strips our mode parameter from the query it sends. An
+	// rtmps:// server is verified with env.TLS, unless the URL says +insecure.
+	dialURL, tlsConfig := p.tlsDial(rawURL, env.TLS)
+	conn, err := rtmp.PlayWith(ctx, dialURL, rtmp.Config{TLS: tlsConfig})
 	if err != nil {
 		return nil, fmt.Errorf("ingest: rtmp: open %s: %w", Redact(rawURL), err)
 	}

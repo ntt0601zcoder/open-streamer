@@ -14,3 +14,12 @@ func setRTMPListenPolicy(t *testing.T, p rtmpsrv.Policy) {
 	rtmpListenPolicy = p
 	t.Cleanup(func() { rtmpListenPolicy = old })
 }
+
+// setRTMPListeners makes r the registry of the shared RTMP listeners until
+// the test ends. Tests that use it must not run in parallel.
+func setRTMPListeners(t *testing.T, r *rtmpsrv.Registry) {
+	t.Helper()
+	old := rtmpListeners
+	rtmpListeners = r
+	t.Cleanup(func() { rtmpListeners = old })
+}

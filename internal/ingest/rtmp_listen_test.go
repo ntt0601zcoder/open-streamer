@@ -23,6 +23,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/testpeer"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 type openResult struct {
@@ -1042,5 +1043,164 @@ func TestRTMPListenSecondCloseWaits(t *testing.T) {
 			require.NoError(t, ln.Close())
 		}
 		<-first
+	}
+}
+
+// noPlayer is a play handler with no live stream.
+type noPlayer struct{}
+
+func (noPlayer) Live(string) bool                                { return false }
+func (noPlayer) Serve(context.Context, *rtmp.ServerConn, string) {}
+
+// openRefused opens rawURL, which must be refused at once: an open that waits
+// for a publisher instead ends after 5 s.
+func openRefused(rawURL string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := Open(ctx, rawURL, Env{})
+	if err == nil {
+		_ = r.Close()
+	}
+	return err
+}
+
+// An rtmps:// listen input joins the server's RTMPS listener and reads what
+// a publisher sends over TLS. Without that listener the open is refused and
+// opens none; a plain listen input on the RTMPS address is refused.
+// Not parallel: it replaces the registry.
+func TestRTMPSListen(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	reg := &rtmpsrv.Registry{}
+	setRTMPListeners(t, reg)
+
+	t.Run("no RTMPS listener", func(t *testing.T) {
+		port := stableTCPPort(t)
+		addr := "127.0.0.1:" + port
+		err := openRefused("rtmps://" + addr + "/pub/" + vStreamKey + "?mode=listen")
+		require.Error(t, err)
+		assert.Equal(t, "ingest: rtmp: open rtmps://"+addr+"/pub/skxxxxx?mode=listen: no RTMPS listener on "+addr+
+			": set server.rtmp.tls_listen to it", err.Error())
+		require.ErrorIs(t, err, rtmpsrv.ErrNoTLSListener)
+		assert.Zero(t, reg.Stats(addr).ID, "no listener was opened")
+		ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", addr)
+		require.NoError(t, err, "the port was not bound")
+		require.NoError(t, ln.Close())
+
+		// The wildcard spellings name the listener by its key.
+		err = openRefused("rtmps://0.0.0.0:" + port + "/pub/" + vStreamKey + "?mode=listen")
+		require.ErrorIs(t, err, rtmpsrv.ErrNoTLSListener)
+		assert.Contains(t, err.Error(), ": no RTMPS listener on :"+port+": set server.rtmp.tls_listen to it")
+		assert.NotContains(t, err.Error(), vStreamKey)
+	})
+
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	unplay, err := reg.RegisterPlayTLS(addr, "live", noPlayer{}, rtmp.Config{}, rtmpsrv.Policy{}, rtmpsrv.TLSOptions{Config: ca.Server(t)})
+	require.NoError(t, err)
+	t.Cleanup(unplay)
+
+	t.Run("a plain listen input on the RTMPS address", func(t *testing.T) {
+		err := openRefused(rtmpListenURL(port, "pub/"+vStreamKey))
+		require.ErrorIs(t, err, rtmpsrv.ErrTLSListener)
+		assert.Contains(t, err.Error(), "ingest: rtmp: open rtmp://"+addr+"/pub/skxxxxx?mode=listen: ")
+		assert.NotContains(t, err.Error(), vStreamKey)
+	})
+
+	t.Run("an rtmps listen input on a plain address", func(t *testing.T) {
+		plainPort := freeTCPPort(t)
+		unplain, err := reg.RegisterPlay("127.0.0.1:"+plainPort, "live", noPlayer{}, rtmp.Config{}, rtmpsrv.Policy{})
+		require.NoError(t, err)
+		defer unplain()
+		err = openRefused("rtmps://127.0.0.1:" + plainPort + "/pub/" + vStreamKey + "?mode=listen")
+		require.ErrorIs(t, err, rtmpsrv.ErrPlainListener)
+		assert.NotContains(t, err.Error(), vStreamKey)
+	})
+
+	t.Run("publish over TLS", func(t *testing.T) {
+		tags := fixtureTags(t, "h264_aac.flv")
+		want := sourceFrames(t, tags)
+		ch := openAsync(t, context.Background(), "rtmps://"+addr+"/pub/"+vStreamKey+"?mode=listen", Env{})
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var p *rtmp.PublishConn
+		// The route appears when Open has registered it.
+		require.Eventually(t, func() bool {
+			var err error
+			p, err = rtmp.Publish(ctx, "rtmps://"+addr+"/pub/"+vStreamKey, rtmp.Config{TLS: ca.Client()})
+			return err == nil
+		}, 5*time.Second, 20*time.Millisecond, "no publish was accepted")
+		t.Cleanup(func() { _ = p.Close() })
+		for _, tg := range tags {
+			require.NoError(t, p.WriteMedia(rtmp.Media{Type: tg.Type, Timestamp: tg.Timestamp, Payload: tg.Data}))
+		}
+
+		r := awaitOpen(t, ch)
+		assert.Equal(t, Spec{Live: true, Passive: true}, r.Spec())
+		assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
+		log := readAll(r)
+		// The last held frames come out only when the publisher ends.
+		log.waitCount(t, len(want)-heldAtEnd(t, tags))
+		go func() { _ = p.Close() }()
+		log.waitCount(t, len(want))
+		time.Sleep(50 * time.Millisecond) // nothing more arrives
+		st := r.Stats()
+		log.stop(t, r)
+		assert.Equal(t, want, mediaFrames(log.frames))
+		assert.Empty(t, log.breaks)
+		assert.EqualValues(t, len(want), st["frames"])
+		assert.EqualValues(t, 1, st["publishers"])
+		assert.NotZero(t, reg.Stats(addr).ID, "the server's listener outlives the input")
+
+		// The route is gone with the input, and a new input takes it again.
+		ch = openAsync(t, context.Background(), "rtmps://"+addr+"/pub/"+vStreamKey+"?mode=listen", Env{})
+		p2, err := rtmp.Publish(ctx, "rtmps://"+addr+"/pub/"+vStreamKey, rtmp.Config{TLS: ca.Client()})
+		require.Eventually(t, func() bool {
+			if err != nil {
+				p2, err = rtmp.Publish(ctx, "rtmps://"+addr+"/pub/"+vStreamKey, rtmp.Config{TLS: ca.Client()})
+			}
+			return err == nil
+		}, 5*time.Second, 20*time.Millisecond)
+		t.Cleanup(func() { _ = p2.Close() })
+		for _, tg := range tags[:40] {
+			require.NoError(t, p2.WriteMedia(rtmp.Media{Type: tg.Type, Timestamp: tg.Timestamp, Payload: tg.Data}))
+		}
+		awaitOpen(t, ch)
+	})
+}
+
+// TLSListen names the listener and the path of an rtmps:// listen input, and
+// nothing else.
+func TestTLSListen(t *testing.T) {
+	for _, c := range []struct{ url, addr, path string }{
+		{"rtmps://0.0.0.0:1936/pub/k?mode=listen", ":1936", "pub/k"},
+		{"rtmps://:1936/pub/k?mode=listener", ":1936", "pub/k"},
+		{"rtmps://[::]:1936/pub/inst/k/?mode=listen&token=x", ":1936", "pub/inst/k"},
+		{"RTMPS://127.0.0.1:1936/pub/k?mode=listen", "127.0.0.1:1936", "pub/k"},
+		{"rtmps:///pub/k?mode=listen", ":443", "pub/k"},
+		{"rtmps://0.0.0.0/pub/k?mode=listen", ":443", "pub/k"},
+		{"rtmps://example.com/pub/k?mode=listen", "example.com:443", "pub/k"},
+	} {
+		addr, path, ok := TLSListen(c.url)
+		assert.True(t, ok, c.url)
+		assert.Equal(t, c.addr, addr, c.url)
+		assert.Equal(t, c.path, path, c.url)
+		key, err := rtmpsrv.AddrKey(addr)
+		require.NoError(t, err, c.url)
+		assert.Equal(t, key, addr, "%s: the address is the listener key", c.url)
+	}
+	for _, u := range []string{
+		"rtmp://0.0.0.0:1936/pub/k?mode=listen", // plain
+		"rtmp:///pub/k?mode=listen",
+		"rtmps://h/a/b",                            // a pull
+		"rtmps://h:1936/a/b?mode=pull",             // a pull
+		"rtmps+insecure://h/a/b",                   // a pull
+		"rtmps+insecure://:1936/pub/k?mode=listen", // refused
+		"rtmps://:1936/pub?mode=listen",            // no stream name
+		"rtsps://cam/s", "https://h/x.ts", "/tmp/a.ts", "",
+	} {
+		addr, path, ok := TLSListen(u)
+		assert.False(t, ok, u)
+		assert.Empty(t, addr, u)
+		assert.Empty(t, path, u)
 	}
 }

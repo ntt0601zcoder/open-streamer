@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -21,16 +23,24 @@ import (
 // default HTTP client.
 const httpTimeout = 10 * time.Second
 
-// defaultClient is shared by every Open that has no Env.HTTP. It has dial and
-// response header timeouts and no overall timeout: the body of a live pull
-// never ends. Keep-alives are off: a streaming pull gains nothing from
-// connection reuse, and an idle pool would hold a connection (and its
-// goroutines) for every failed attempt of a retry loop, e.g. a bare 503.
-var defaultClient = &http.Client{Transport: func() *http.Transport {
+// defaultClient is shared by every Open that has no Env.HTTP.
+var defaultClient = NewHTTPClient(nil)
+
+// NewHTTPClient returns the default client of HTTP inputs, trusting roots;
+// nil means the system's. It is what Env.HTTP is set to when the roots are
+// not the system's. It has 10 s dial, TLS handshake and response header
+// timeouts and no overall timeout: the body of a live pull never ends.
+// Keep-alives are off: a streaming pull gains nothing from connection reuse,
+// and an idle pool would hold a connection (and its goroutines) for every
+// failed attempt of a retry loop, e.g. a bare 503.
+func NewHTTPClient(roots *x509.CertPool) *http.Client {
 	t := newTransport()
 	t.DisableKeepAlives = true
-	return t
-}()}
+	if roots != nil {
+		t.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	}
+	return &http.Client{Transport: t}
+}
 
 // newTransport returns a transport with the default client's dial, TLS
 // handshake and response header timeouts.

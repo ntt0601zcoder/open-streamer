@@ -33,9 +33,10 @@ var rtspSyncWait = time.Second
 // errRTSPClosed is returned by Read after Close.
 var errRTSPClosed = errors.New("ingest: rtsp: closed")
 
-// parseRTSP checks an rtsp:// URL: a host, an optional port and an optional
-// transport parameter.
-func parseRTSP(u *url.URL, q url.Values) (Spec, error) {
+// parseRTSP checks an rtsp:// URL, or with secure an rtsps:// one: a host, an
+// optional port and an optional transport parameter, which rtsps refuses as
+// udp. What auto means for rtsps is pkg/rtsp's to decide.
+func parseRTSP(u *url.URL, q url.Values, secure bool) (Spec, error) {
 	if u.Hostname() == "" {
 		return Spec{}, errors.New("no host")
 	}
@@ -48,8 +49,12 @@ func parseRTSP(u *url.URL, q url.Values) (Spec, error) {
 		if len(v) > 1 {
 			return Spec{}, errors.New("transport given more than once")
 		}
-		if _, err := rtspTransport(v[0]); err != nil {
+		tr, err := rtspTransport(v[0])
+		if err != nil {
 			return Spec{}, err
+		}
+		if secure && tr == "udp" {
+			return Spec{}, errors.New("rtsps carries RTP inside TLS: the transport must be tcp")
 		}
 	}
 	return Spec{Live: true}, nil
@@ -122,7 +127,7 @@ type rtspCounters struct {
 	lost, dups, resets, skippedPackets, foreignSR, restartDropped atomic.Uint64
 }
 
-// rtspPull is an RTSP pull input: one session for the reader's life. It
+// rtspPull is an RTSP or RTSPS pull input: one session for the reader's life. It
 // ends as the other pull inputs do: when the server ends the session or
 // stops sending (the client's idle timeout), Read returns what the
 // depacketizers hold, then io.ErrUnexpectedEOF, and the pipeline retries or
@@ -158,8 +163,11 @@ type rtspPull struct {
 }
 
 func openRTSP(ctx context.Context, rawURL string, p parsed, env Env) (Reader, error) {
+	// An rtsps:// server is verified with env.TLS, unless the URL says
+	// +insecure.
 	dialURL, transport := rtspDialURL(rawURL)
-	cl, err := rtsp.Dial(ctx, dialURL, rtsp.Config{Transport: transport, Now: env.now()})
+	dialURL, tlsConfig := p.tlsDial(dialURL, env.TLS)
+	cl, err := rtsp.Dial(ctx, dialURL, rtsp.Config{Transport: transport, Now: env.now(), TLS: tlsConfig})
 	if err != nil {
 		return nil, fmt.Errorf("ingest: rtsp: open %s: %w", Redact(rawURL), err)
 	}

@@ -3,8 +3,10 @@ package ingest_test
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,6 +29,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/output/httpts"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 func httpFixturePath() string {
@@ -303,4 +306,54 @@ func TestHTTPTSFailedOpensLeakNothing(t *testing.T) {
 	}
 	assert.Eventually(t, func() bool { return runtime.NumGoroutine() <= before+2 },
 		2*time.Second, 20*time.Millisecond, "goroutines before=%d now=%d", before, runtime.NumGoroutine())
+}
+
+// NewHTTPClient trusts the roots it is given, and the system's when given
+// none: an HTTP-TS body is read from a server whose certificate a test CA
+// issued only with that CA as the roots.
+func TestNewHTTPClient(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	data := httpFixture(t)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "video/mp2t")
+		_, _ = w.Write(data)
+	}))
+	srv.TLS = ca.Server(t)
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0) // the refused handshakes
+	srv.StartTLS()
+	defer srv.Close()
+
+	client := ingest.NewHTTPClient(ca.Pool())
+	tr, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.True(t, tr.DisableKeepAlives)
+	assert.Equal(t, 10*time.Second, tr.TLSHandshakeTimeout)
+	assert.Equal(t, 10*time.Second, tr.ResponseHeaderTimeout)
+	assert.Zero(t, client.Timeout, "the body of a live pull never ends")
+	assert.NotSame(t, client, ingest.NewHTTPClient(ca.Pool()), "each call returns its own client")
+
+	r, err := ingest.Open(context.Background(), srv.URL+"/live.ts", ingest.Env{HTTP: client})
+	require.NoError(t, err)
+	frames, err := readUntilErr(r)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.NoError(t, r.Close())
+	got := map[int]int{}
+	for _, f := range frames {
+		got[f.Track]++
+	}
+	assert.Equal(t, fixtureTrackCounts(t, data), got)
+
+	// The system roots do not hold the test CA: with them, and with no
+	// Env.HTTP at all, the pull is refused with the x509 reason.
+	for name, env := range map[string]ingest.Env{
+		"NewHTTPClient(nil)": {HTTP: ingest.NewHTTPClient(nil)},
+		"no Env.HTTP":        {},
+		"another CA":         {HTTP: ingest.NewHTTPClient(tlstest.NewCA(t).Pool())},
+	} {
+		_, err := ingest.Open(context.Background(), srv.URL+"/live.ts?token="+vSecret, env)
+		require.Error(t, err, name)
+		var ua x509.UnknownAuthorityError
+		assert.True(t, errors.As(err, &ua), "%s: %v", name, err)
+		assert.NotContains(t, err.Error(), vSecret, name)
+	}
 }

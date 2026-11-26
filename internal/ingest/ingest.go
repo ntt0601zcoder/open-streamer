@@ -9,6 +9,7 @@ package ingest
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -67,9 +68,12 @@ type Reader interface {
 type Env struct {
 	// Lookup finds another stream's hub for copy://; nil disables it.
 	Lookup func(stream string) (*hub.Hub, bool)
-	// HTTP is the client for HTTP inputs; nil means a 10 s dial and
-	// ResponseHeaderTimeout.
+	// HTTP is the client for HTTP inputs; nil means NewHTTPClient(nil): a
+	// 10 s dial and ResponseHeaderTimeout, and the system roots.
 	HTTP *http.Client
+	// TLS is the base client config of rtmps://, rtsps:// and their +insecure
+	// forms; nil means the system roots.
+	TLS *tls.Config
 	// Now stamps arrivals and times HLS playlist reloads and retries (the
 	// waits themselves are real timers); nil means time.Now.
 	Now func() time.Time
@@ -91,15 +95,50 @@ const (
 	schemeHTTPS = "https"
 	schemeCopy  = "copy"
 	schemeRTMP  = "rtmp"
+	schemeRTMPS = "rtmps"
+
+	// insecureSuffix on rtmps or rtsps turns certificate verification off
+	// for that one URL: rtmps+insecure://, rtsps+insecure://.
+	insecureSuffix = "+insecure"
 )
+
+// splitScheme splits a lower-case scheme into its base and whether it
+// carries the +insecure suffix.
+func splitScheme(scheme string) (base string, insecure bool) {
+	return strings.CutSuffix(scheme, insecureSuffix)
+}
 
 // parsed is a URL checked and classified by parse.
 type parsed struct {
-	scheme string
-	u      *url.URL // nil for a bare path
-	path   string   // file inputs
-	spec   Spec
-	loop   bool // file inputs
+	scheme   string   // lower case, without +insecure
+	insecure bool     // rtmps+insecure or rtsps+insecure: the certificate is not verified
+	u        *url.URL // nil for a bare path
+	path     string   // file inputs
+	spec     Spec
+	loop     bool // file inputs
+}
+
+// tlsDial translates a pull URL for its library, pkg/rtmp or pkg/rtsp, which
+// know only rtmps:// and rtsps:// and a *tls.Config: the URL, and base as the
+// client config. For a +insecure URL it is the same URL without the suffix,
+// byte for byte after the scheme, and a clone of base (a new config when
+// nil) with InsecureSkipVerify set, for this URL only; base itself is not
+// modified. The suffix never reaches the peer.
+//
+// rtmppush's insecureTarget is the twin of this translation for
+// rtmps+insecure:// push targets; the two change together.
+func (p parsed) tlsDial(rawURL string, base *tls.Config) (string, *tls.Config) {
+	if !p.insecure {
+		return rawURL, base
+	}
+	// The scheme ends at the first ':' (RFC 3986), as url.Parse reads it.
+	dial := p.scheme + rawURL[strings.IndexByte(rawURL, ':'):]
+	c := base.Clone()
+	if c == nil {
+		c = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	c.InsecureSkipVerify = true
+	return dial, c
 }
 
 // Parse returns the Spec of an input URL without any I/O. A bare path is a
@@ -123,10 +162,14 @@ func parse(rawURL string) (parsed, error) {
 	if err != nil {
 		return parsed{}, fmt.Errorf("ingest: parse: invalid url %s", Redact(rawURL))
 	}
-	p := parsed{scheme: strings.ToLower(u.Scheme), u: u}
+	p := parsed{u: u}
+	p.scheme, p.insecure = splitScheme(strings.ToLower(u.Scheme))
 	q := u.Query()
 	fail := func(format string, args ...any) (parsed, error) {
 		return parsed{}, fmt.Errorf("ingest: parse %s: %s", Redact(rawURL), fmt.Sprintf(format, args...))
+	}
+	if p.insecure && p.scheme != schemeRTMPS && p.scheme != schemeRTSPS {
+		return fail("unsupported scheme %q", u.Scheme)
 	}
 	switch p.scheme {
 	case schemeFile:
@@ -184,27 +227,28 @@ func parse(rawURL string) (parsed, error) {
 			return fail("no stream name")
 		}
 		p.spec = Spec{Live: true}
-	case schemeRTMP:
+	case schemeRTMP, schemeRTMPS:
 		spec, err := parseRTMP(u, q)
 		if err != nil {
 			return fail("%v", err)
 		}
+		if p.insecure && spec.Passive {
+			return fail("+insecure is for a pull: a listener presents the server's certificate")
+		}
 		p.spec = spec
-	case schemeRTSP:
-		spec, err := parseRTSP(u, q)
+	case schemeRTSP, schemeRTSPS:
+		spec, err := parseRTSP(u, q, p.scheme == schemeRTSPS)
 		if err != nil {
 			return fail("%v", err)
 		}
 		p.spec = spec
-	case schemeRTSPS:
-		return fail("rtsps is not supported")
 	default:
 		return fail("unsupported scheme %q", u.Scheme)
 	}
 	return p, nil
 }
 
-// parseRTMP checks an rtmp:// URL: a pull (the default with a host) or a
+// parseRTMP checks an rtmp:// or rtmps:// URL: a pull (the default with a host) or a
 // listen (mode=listen or listener, any host) for app[/…]/stream.
 func parseRTMP(u *url.URL, q url.Values) (Spec, error) {
 	if u.Port() != "" {
@@ -276,12 +320,12 @@ func Open(ctx context.Context, rawURL string, env Env) (Reader, error) {
 		return openHTTP(ctx, rawURL, p, env)
 	case schemeCopy:
 		return openCopy(ctx, rawURL, p, env)
-	case schemeRTMP:
+	case schemeRTMP, schemeRTMPS:
 		if p.spec.Passive {
 			return openRTMPListen(ctx, rawURL, p, env)
 		}
 		return openRTMPPull(ctx, rawURL, p, env)
-	case schemeRTSP:
+	case schemeRTSP, schemeRTSPS:
 		return openRTSP(ctx, rawURL, p, env)
 	default:
 		return nil, fmt.Errorf("ingest: open %s: %s inputs are not available yet", Redact(rawURL), p.scheme)
@@ -289,8 +333,9 @@ func Open(ctx context.Context, rawURL string, env Env) (Reader, error) {
 }
 
 // Redact returns rawURL with its password and secret query values hidden,
-// and for rtmp:// its stream name (the last path segment, the stream key)
-// cut to its first 2 characters. It is redact.URL.
+// and for rtmp://, rtmps:// and their +insecure spellings its stream name
+// (the last path segment, the stream key) cut to its first 2 characters. The
+// scheme is kept as written. It is redact.URL.
 func Redact(rawURL string) string {
 	return redact.URL(rawURL)
 }
