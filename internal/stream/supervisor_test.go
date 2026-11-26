@@ -781,7 +781,9 @@ func flvFixture(t testing.TB) []rtmp.FLVTag {
 	return tags
 }
 
-// Stopping never waits for a backoff, and an edit ends one.
+// Stopping never waits for a backoff. An edit that changes the stream ends
+// one at once, with the edit applied to the generation it starts; the same
+// document again changes nothing and leaves the wait as it is.
 func TestSupervisorStopDuringBackoff(t *testing.T) {
 	t.Run("stop", func(t *testing.T) {
 		r := newRig(t)

@@ -150,7 +150,7 @@ func TestSupervisorPushEdit(t *testing.T) {
 	sp := camSpec()
 	sp.Outputs.Push = []spec.Push{{URL: urls["a"]}, {URL: urls["b"]}}
 	s := r.start(sp)
-	waitState(t, s, "running")
+	waitRunning(t, s)
 	require.Eventually(t, func() bool {
 		return len(sinks["a"].Requests()) == 1 && len(sinks["b"].Requests()) == 1
 	}, waitFor, time.Millisecond)

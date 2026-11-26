@@ -144,8 +144,11 @@ func (l *Limiter) Blocked(key string) (retryAfter time.Duration, blocked bool) {
 // to insert, never for a refusal. When the table is full it drops, among
 // the keys with nothing in flight, the one with the oldest last failure
 // under 5 failures, or failing that the one with the oldest last failure
-// at 5 or more, so a client cannot flush its own block out with other
-// names. When every key has an attempt in flight, Reserve refuses. The
+// at 5 or more. So a client that wants its own block evicted must first
+// make every other key of the table a newer block: about 20 000 failed
+// verifications (4096 keys at 5 failures each), each a full PBKDF2, for
+// one block; other names with fewer failures only evict each other. When
+// every key has an attempt in flight, Reserve refuses. The
 // new key's attempt may still end in ErrBusy and be abandoned, which
 // deletes the new key; that leaves a vacancy the next new key fills
 // without evicting, so abandoned attempts cost at most one eviction per
