@@ -20,7 +20,9 @@
 //     Blocked, Recall, Reserve, Verify. A remembered login is let in with
 //     no verification. A password that differs from the one remembered for
 //     its name is wrong: it is counted as a failed login and answered 401
-//     with no verification, before Reserve. Reserve holds the pair to its
+//     with no verification, before Reserve; when it cannot be counted,
+//     because the pair is blocked by then, it is a 429 with Retry-After 1
+//     instead. Reserve holds the pair to its
 //     attempts and the client address to 4 verifications in flight,
 //     whatever names it presents; a fifth is a 429 with Retry-After 1.
 //     Neither remembered case takes a place.

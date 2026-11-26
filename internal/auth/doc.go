@@ -19,9 +19,19 @@
 //     counts it as a failure, and the request is refused here, before
 //     step 3. Otherwise a client that fills its address's places (step 3)
 //     would have every further guess refused there, uncounted and for
-//     free, while the right guess answered at once: an oracle. A client
-//     can tell this refusal from a verified one by its speed, so it learns
-//     that the name has logged in since the users were loaded.
+//     free, while the right guess answered at once: an oracle.
+//     What this costs, and is accepted:
+//     a client can tell this refusal from a verified one by its speed, so
+//     it learns that the name has logged in since the users were loaded;
+//     five requests, with no PBKDF2, block the pair of address and name,
+//     and because Blocked (step 1) comes before Recall, the block also
+//     refuses the right, remembered password to everyone behind that
+//     address;
+//     guesses at a remembered name are bounded by the name's backoff
+//     alone, not by PBKDF2;
+//     when Charge reports false (the pair was blocked meanwhile, or the
+//     table has no room) the caller answers 429 as for a refused Reserve,
+//     not 401.
 //     Unknown: go on to step 3.
 //  3. Limiter.Reserve(key, remoteAddr): refuse when it is false; otherwise
 //     defer attempt.Abandon() at once, so every exit resolves the attempt.

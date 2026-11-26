@@ -371,6 +371,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// 5. The limiter and the users.
 	key := a.opt.Limiter.Key(r.RemoteAddr, name)
+	// Blocked and Charge below take the limiter's lock separately, so of a
+	// concurrent burst a few guesses per backoff are compared and not
+	// counted: a small constant factor, not an oracle.
 	if left, blocked := a.opt.Limiter.Blocked(key); blocked {
 		a.tooMany(rec, left)
 		return
@@ -384,7 +387,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if memory == auth.Mismatch {
 		// A wrong password, known without a verification: it is counted
 		// against the pair here, before the address's cap could refuse it
-		// uncounted.
+		// uncounted. A false Charge is a guess that passed Blocked above and
+		// found the pair blocked since: compared, not counted, answered 429.
 		if !a.opt.Limiter.Charge(key) {
 			a.tooMany(rec, time.Second)
 			return
