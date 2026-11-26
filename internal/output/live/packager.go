@@ -123,7 +123,10 @@ type Packager struct {
 	errors   atomic.Uint64
 	fallback atomic.Uint64
 	codecErr atomic.Uint64
-	lang     atomic.Pointer[string] // the declared audio language (SetAudioLanguage); nil means ""
+	// lang is the declared audio language (SetAudioLanguage). NewPackager
+	// always stores one, so it is never nil after it; the nil guard in
+	// Snapshot only matters for a zero-value Packager.
+	lang atomic.Pointer[string]
 
 	// Writer state, guarded by work.
 	work    sync.Mutex

@@ -51,8 +51,12 @@ func buildMPD(s Snapshot) []byte {
 			Value:       now.UTC().Format(time.RFC3339Nano),
 		},
 	}
+	var label audioLabel
+	if _, aTrack, _, haveA := lowestTracks(s); haveA {
+		label = audioLabel{track: aTrack, lang: s.audioLanguage()}
+	}
 	for _, e := range s.Epochs {
-		if per, ok := buildPeriod(s, e); ok {
+		if per, ok := buildPeriod(s, e, label); ok {
 			m.Periods = append(m.Periods, per)
 		}
 	}
@@ -62,15 +66,22 @@ func buildMPD(s Snapshot) []byte {
 	return m.Encode()
 }
 
+// audioLabel is the declared audio language and the track that carries it,
+// the lowest known audio track (R-L3). An empty lang labels no set.
+type audioLabel struct {
+	track int
+	lang  string
+}
+
 // buildPeriod returns an epoch's Period, if any track has a set in it. Sets
-// are in order of their lowest track.
+// are in order of their lowest track. label goes to buildSet.
 //
 // With Snapshot.ABR (ruling R-B6) the video tracks with the same codec share
 // one AdaptationSet, each Representation with its own SegmentTemplate, and
 // the set has no segmentAlignment attribute: part numbers stay per track, so
 // after a gap the Representations' numbers differ. Audio tracks keep one set
 // each.
-func buildPeriod(s Snapshot, e EpochInfo) (dash.Period, bool) {
+func buildPeriod(s Snapshot, e EpochInfo, label audioLabel) (dash.Period, bool) {
 	per := dash.Period{ID: "e" + strconv.FormatUint(uint64(e.Epoch), 10), Start: dash.Duration(e.Start)}
 	videoSet := map[media.Codec]int{} // ABR: codec -> index of its set in per.AdaptationSets
 	for _, et := range e.Tracks {
@@ -78,7 +89,7 @@ func buildPeriod(s Snapshot, e EpochInfo) (dash.Period, bool) {
 			continue
 		}
 		if !s.ABR || et.Config.Codec.Kind() != media.KindVideo {
-			if as, ok := buildSet(s, e, et); ok {
+			if as, ok := buildSet(s, e, et, label); ok {
 				per.AdaptationSets = append(per.AdaptationSets, as)
 			}
 			continue
@@ -103,10 +114,10 @@ func buildPeriod(s Snapshot, e EpochInfo) (dash.Period, bool) {
 }
 
 // buildSet returns the track's set, with the SegmentTemplate at set level,
-// if it has a listed part. The set of the lowest known audio track (the one
-// cmaf/master.m3u8 lists, ruling R-B5) carries the declared audio language
+// if it has a listed part. The set of label.track, the lowest known audio
+// track (the one cmaf/master.m3u8 lists, ruling R-B5), carries label.lang
 // as lang (R-L3); every other set carries none.
-func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (dash.AdaptationSet, bool) {
+func buildSet(s Snapshot, e EpochInfo, et EpochTrack, label audioLabel) (dash.AdaptationSet, bool) {
 	rep, tpl, ok := buildRep(s, e, et)
 	if !ok {
 		return dash.AdaptationSet{}, false
@@ -114,8 +125,8 @@ func buildSet(s Snapshot, e EpochInfo, et EpochTrack) (dash.AdaptationSet, bool)
 	as := dash.AdaptationSet{SegmentAlignment: true, SegmentTemplate: tpl}
 	if et.Config.Codec.Kind() == media.KindAudio {
 		as.ContentType, as.MimeType = "audio", "audio/mp4"
-		if _, aTrack, _, haveA := lowestTracks(s); haveA && et.Track == aTrack {
-			as.Lang = s.audioLanguage()
+		if et.Track == label.track {
+			as.Lang = label.lang
 		}
 	} else {
 		as.ContentType, as.MimeType = "video", "video/mp4"
