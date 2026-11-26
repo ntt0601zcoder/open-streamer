@@ -41,7 +41,7 @@ var (
 
 // Options configures a Pipeline. Zero durations select the defaults.
 type Options struct {
-	Inputs   []string // URLs by priority, first highest; at least one
+	Inputs   []string // URLs by priority, first highest; at least one; SetInputs replaces them
 	Env      ingest.Env
 	Open     func(ctx context.Context, url string) (ingest.Reader, error) // nil means ingest.Open with Env
 	Parse    func(url string) (ingest.Spec, error)                        // nil means ingest.Parse
@@ -79,7 +79,7 @@ const (
 // Event reports a change of an input's state.
 type Event struct {
 	Kind  EventKind
-	Input int // index in Options.Inputs
+	Input int // index in Inputs()
 	Err   error
 }
 
@@ -109,13 +109,16 @@ type Pipeline struct {
 	timerAt     time.Time // the deadline timer is armed for; zero when none
 	rearm       bool      // arm a new timer even for an unchanged deadline
 	reached     time.Time // the latest deadline whose timer fired
-	last        int       // input active last, -1 before the first
+	last        int       // input active last, -1 before the first, lastGone once SetInputs removed it
 	stall       time.Duration
 	activeSince time.Time      // when the active input delivered its first frame
 	lastFrame   time.Time      // when the active input last delivered a mapped frame
 	wg          sync.WaitGroup // input goroutines
 
-	mu        sync.Mutex // guards st, cur and probePeak
+	edits chan edit     // SetInputs' requests, taken by Run
+	done  chan struct{} // closed when Run returns
+
+	mu        sync.Mutex // guards st, cur, probePeak and, for Inputs, opt.Inputs
 	st        Stats      // Input unset
 	cur       ingest.Reader
 	probePeak int // the most frames a probe has held, for tests
@@ -160,6 +163,8 @@ func New(h *hub.Hub, opt Options) *Pipeline {
 		w:      writer{h: h, now: opt.Now, sleep: opt.Sleep, anchors: map[uint32]media.Anchor{}},
 		layout: append([]media.Kind(nil), opt.Layout...),
 		last:   -1,
+		edits:  make(chan edit),
+		done:   make(chan struct{}),
 		st:     Stats{Active: -1},
 	}
 }
@@ -216,6 +221,7 @@ func (p *Pipeline) Stats() Stats {
 // keeps only its frames from its latest key. The passive inputs below the
 // active one drop their frames.
 func (p *Pipeline) Run(ctx context.Context) error {
+	defer close(p.done)
 	if len(p.opt.Inputs) == 0 {
 		return errors.New("pipeline: run: no input")
 	}
@@ -251,6 +257,8 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			err = p.expire(ctx)
 		case it := <-p.items:
 			err = p.handle(ctx, it)
+		case e := <-p.edits:
+			e.ans <- p.setInputs(ctx, e.urls)
 		}
 		if errors.Is(err, errEnded) {
 			p.end(ctx, p.act)
@@ -673,7 +681,8 @@ func (p *Pipeline) restartStall(a *attempt) {
 // pull inputs below it are closed; those above it go on as probes; passive
 // inputs keep listening. Every activation after the first breaks the Clock
 // once for a new input, the same input reopened or resumed included; a
-// different input than the last one counts as a switch.
+// different input than the last one counts as a switch, as does any input
+// after SetInputs removed the last one (lastGone).
 func (p *Pipeline) activate(a *attempt) {
 	p.act = a
 	p.search = false
@@ -708,7 +717,7 @@ func (p *Pipeline) activate(a *attempt) {
 	p.w.pace = spec.Pace
 	p.activeSince = p.now()
 	p.mu.Lock()
-	if p.last >= 0 && p.last != a.in {
+	if p.last != -1 && p.last != a.in {
 		p.st.Switches++
 	}
 	p.st.Active = a.in
