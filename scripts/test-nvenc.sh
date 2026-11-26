@@ -22,7 +22,7 @@
 #     TestM4cNVENC* scenarios of internal/e2e (TestM4cNVENCKeep records the
 #     B-frame presentation into dist/nvenc-report/media; TestM4cNVENCLongGOP
 #     makes its clip with the pinned FFmpeg, OS_NVENC_FFMPEG) and the native
-#     NVENC device tests (Task 4).
+#     NVENC device tests (Task 4), with TestNoFallbackRefuses (M5b1).
 #  5. In osv2-ci-peers:m4a (VLC 3.0.20): TestM4cNVENCRecordedVLC plays that
 #     recording.
 #  6. The session count must be back to step 4's.
@@ -195,7 +195,7 @@ step "e2e scenarios on the host" env OS_TRANSCODER="$ostx" OS_NVENC=1 OS_REQUIRE
 	OS_NVENC_MEDIA="$media" OS_NVENC_FFMPEG="$p/bin/ffmpeg" go test -race -count=1 -timeout=15m -v \
 	-run '^TestM4cNVENC' -skip '^TestM4cNVENCRecordedVLC$' ./internal/e2e/
 step "native device tests on the host" env PKG_CONFIG_PATH="$p/lib/pkgconfig" LD_LIBRARY_PATH="$p/lib" \
-	OS_NVENC=1 OS_REQUIRE_NVENC=1 go test -race -count=1 -v -tags libav -run 'NVENC' ./internal/transcode/native/
+	OS_NVENC=1 OS_REQUIRE_NVENC=1 go test -race -count=1 -v -tags libav -run 'NVENC|NoFallback' ./internal/transcode/native/
 
 # 5. VLC 3.0.20 on the recorded presentation, in the peers image.
 step "recorded presentation in VLC (osv2-ci-peers:m4a)" env OS_NVENC_MEDIA="$media" \
