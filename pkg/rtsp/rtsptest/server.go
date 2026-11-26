@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5" //nolint:gosec // MD5 is the HTTP Digest hash defined by RFC 2617; no security claim rests on it.
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -122,6 +123,9 @@ type ServerOptions struct {
 	// Seed seeds the session's random sequence numbers, timestamps and SSRCs.
 	Seed  int64
 	Media []TrackSource
+	// TLS, when set, serves RTSPS: every connection is wrapped with it and
+	// URL says rtsps://.
+	TLS *tls.Config
 }
 
 // Frame is an interleaved frame received from a client.
@@ -206,6 +210,9 @@ func NewServer(t testing.TB, opt ServerOptions) *Server {
 	if err != nil {
 		t.Fatalf("rtsptest: listen: %v", err)
 	}
+	if opt.TLS != nil {
+		ln = tls.NewListener(ln, opt.TLS)
+	}
 	s := &Server{
 		Addr: ln.Addr().String(), t: t, opt: opt, ln: ln, done: make(chan struct{}),
 		conns: map[net.Conn]struct{}{}, nonces: map[string]time.Time{},
@@ -219,8 +226,14 @@ func NewServer(t testing.TB, opt ServerOptions) *Server {
 	return s
 }
 
-// URL returns rtsp://Addr followed by path.
-func (s *Server) URL(path string) string { return "rtsp://" + s.Addr + path }
+// URL returns rtsp://Addr followed by path, or rtsps://Addr with the TLS
+// option.
+func (s *Server) URL(path string) string {
+	if s.opt.TLS != nil {
+		return "rtsps://" + s.Addr + path
+	}
+	return "rtsp://" + s.Addr + path
+}
 
 // Close stops the server and waits for its goroutines. It is idempotent.
 func (s *Server) Close() {
@@ -565,7 +578,7 @@ func (ss *session) style() string {
 func (ss *session) controls() (sessionAttr string, trackAttrs, trackURLs []string, playURLs []string) {
 	switch ss.style() {
 	case "absolute":
-		root := "rtsp://" + ss.s.Addr + "/media"
+		root := ss.s.URL("/media")
 		for i := range ss.s.tracks {
 			u := root + "/track" + strconv.Itoa(i)
 			trackAttrs = append(trackAttrs, u)
@@ -593,7 +606,7 @@ func (ss *session) describe(req *rtsp.Request) bool {
 		ss.base = strings.TrimSuffix(req.URL, "/") + "/"
 		cb := ss.base
 		if ss.s.opt.ContentBaseUserinfo {
-			cb = strings.Replace(cb, "rtsp://", "rtsp://"+ss.s.opt.User+":"+ss.s.opt.Pass+"@", 1)
+			cb = strings.Replace(cb, "://", "://"+ss.s.opt.User+":"+ss.s.opt.Pass+"@", 1)
 		}
 		h.Set("Content-Base", cb)
 	}

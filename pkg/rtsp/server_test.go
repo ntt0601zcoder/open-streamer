@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp/rtsptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 const testPublic = "OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN"
@@ -997,17 +999,39 @@ func TestServerGoroutinesExit(t *testing.T) {
 	}
 }
 
-// requirePeer returns the path of a peer tool, skipping the test when it is
-// missing, or failing it when OS_REQUIRE_PEERS=1. pkg/ cannot import
+// requirePeer returns the path of a peer tool, which must support every
+// listed protocol (checked with "-hide_banner -protocols", so it applies to
+// ffmpeg and ffprobe). When the tool or a protocol is missing the test is
+// skipped, or failed when OS_REQUIRE_PEERS=1. pkg/ cannot import
 // internal/testpeer, so this mirrors testpeer.Require.
-func requirePeer(t *testing.T, name string) string {
+func requirePeer(t *testing.T, name string, protocols ...string) string {
 	t.Helper()
+	missing := func(format string, args ...any) {
+		t.Helper()
+		if os.Getenv("OS_REQUIRE_PEERS") == "1" {
+			t.Fatalf(format, args...)
+		}
+		t.Skipf(format, args...)
+	}
 	path, err := exec.LookPath(name)
 	if err != nil {
-		if os.Getenv("OS_REQUIRE_PEERS") == "1" {
-			t.Fatalf("peer %s not found: %v", name, err)
+		missing("peer %s not found: %v", name, err)
+	}
+	if len(protocols) == 0 {
+		return path
+	}
+	out, err := exec.CommandContext(t.Context(), path, "-hide_banner", "-protocols").CombinedOutput()
+	if err != nil {
+		missing("peer %s: listing protocols: %v", name, err)
+	}
+	have := map[string]bool{}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		have[strings.TrimSpace(line)] = true
+	}
+	for _, p := range protocols {
+		if !have[p] {
+			missing("peer %s lacks protocol %s", name, p)
 		}
-		t.Skipf("peer %s not found: %v", name, err)
 	}
 	return path
 }
@@ -1170,4 +1194,586 @@ func TestServerPlayingHeaderLimit(t *testing.T) {
 	assert.Zero(t, srv.Stats().ProtocolErrors)
 	r.send("OPTIONS", "*", "X-Pad", pad)
 	assert.True(t, r.eof(2*time.Second), "an 8 KiB header after PLAY ends the connection")
+}
+
+// tlsServer is a Server with a plain listener and a TLS listener.
+type tlsServer struct {
+	srv         *rtsp.Server
+	plain, addr string // the plain and the TLS listener's address
+	ca          *tlstest.CA
+}
+
+// startTLSServer serves h on a plain and on a TLS listener of one Server,
+// both on 127.0.0.1:0, and closes the server at cleanup.
+func startTLSServer(t *testing.T, h rtsp.Handler, cfg rtsp.ServerConfig) *tlsServer {
+	t.Helper()
+	ca := tlstest.NewCA(t)
+	var lc net.ListenConfig
+	pl, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	tl, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := rtsp.NewServer(h, cfg)
+	served := make(chan error, 2)
+	sc := ca.Server(t)
+	go func() { served <- srv.Serve(pl) }()
+	go func() { served <- srv.ServeTLS(tl, sc) }()
+	t.Cleanup(func() {
+		require.NoError(t, srv.Close())
+		for range 2 {
+			select {
+			case err := <-served:
+				assert.ErrorIs(t, err, rtsp.ErrServerClosed)
+			case <-time.After(3 * time.Second):
+				t.Error("Serve did not return after Close")
+			}
+		}
+	})
+	return &tlsServer{srv: srv, plain: pl.Addr().String(), addr: tl.Addr().String(), ca: ca}
+}
+
+// dialRawTLS is dialRaw over TLS, the handshake done; tcp is the connection
+// under it.
+func dialRawTLS(t *testing.T, addr string, cfg *tls.Config) (r *raw, tcp *net.TCPConn) {
+	t.Helper()
+	c, err := (&net.Dialer{Timeout: 2 * time.Second}).Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	cfg = cfg.Clone()
+	cfg.ServerName = "127.0.0.1"
+	tc := tls.Client(c, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, tc.HandshakeContext(ctx))
+	return &raw{t: t, c: tc, br: bufio.NewReaderSize(tc, 1<<16), base: "rtsps://" + addr + "/live/cam"}, c.(*net.TCPConn)
+}
+
+// played is what two sessions of one handler must agree on: the packets'
+// payloads, markers and timestamps from the track's first.
+type played struct {
+	TS      uint32
+	Marker  bool
+	Payload string
+}
+
+// firstPlayed reads until both tracks have n RTP packets and returns the
+// first n of each.
+func firstPlayed(t *testing.T, c *rtsp.Client, n int) [2][]played {
+	t.Helper()
+	var out [2][]played
+	var base [2]uint32
+	readUntil(t, c, 5*time.Second, func(p rtsp.Packet) bool {
+		if p.RTP != nil && len(out[p.Track]) < n {
+			if len(out[p.Track]) == 0 {
+				base[p.Track] = p.RTP.Timestamp
+			}
+			out[p.Track] = append(out[p.Track], played{
+				TS: p.RTP.Timestamp - base[p.Track], Marker: p.RTP.Marker, Payload: string(p.RTP.Payload),
+			})
+		}
+		return len(out[0]) >= n && len(out[1]) >= n
+	})
+	return out
+}
+
+func TestServeTLS(t *testing.T) {
+	h := newHandler()
+	h.play = producer(2 * time.Millisecond)
+	ts := startTLSServer(t, h, rtsp.ServerConfig{UDPHost: "127.0.0.1"})
+	cfg := testConfig()
+	cfg.TLS = ts.ca.Client()
+
+	t.Run("the packets of the plain listener", func(t *testing.T) {
+		want := firstPlayed(t, dial(t, "rtsp://"+ts.plain+"/live/cam", testConfig()), 60)
+		c := dial(t, "rtsps://"+ts.addr+"/live/cam", cfg)
+		got := firstPlayed(t, c, 60)
+		assert.Equal(t, want, got)
+		assert.Equal(t, rtsp.ClientStats{}, c.Stats())
+		require.NoError(t, c.Close())
+		assert.Zero(t, ts.srv.Stats().TLSHandshakeFailures)
+	})
+
+	t.Run("udp plays on the plain listener only", func(t *testing.T) {
+		udp := testConfig()
+		udp.Transport = "udp"
+		c := dial(t, "rtsp://"+ts.plain+"/live/cam", udp)
+		firstPlayed(t, c, 5)
+
+		// "auto" over rtsps:// never offers UDP, so the session is
+		// interleaved although the server owns a UDP pair.
+		auto := cfg
+		auto.Transport = "auto"
+		c = dial(t, "rtsps://"+ts.addr+"/live/cam", auto)
+		firstPlayed(t, c, 5)
+		assert.Zero(t, c.Stats().FallbackTCP)
+	})
+
+	t.Run("Content-Base echoes the scheme", func(t *testing.T) {
+		r, _ := dialRawTLS(t, ts.addr, ts.ca.Client())
+		resp := r.do("DESCRIBE", r.base, "Accept", "application/sdp")
+		require.Equal(t, 200, resp.StatusCode)
+		assert.Equal(t, "rtsps://"+ts.addr+"/live/cam/", resp.Header.Get("Content-Base"))
+	})
+
+	t.Run("a UDP-only SETUP is 461", func(t *testing.T) {
+		const udpOffer = "RTP/AVP;unicast;client_port=5000-5001"
+		r, _ := dialRawTLS(t, ts.addr, ts.ca.Client())
+		assert.Equal(t, 461, r.setup(0, udpOffer).StatusCode)
+		assert.Equal(t, 461, r.setup(0, udpOffer+",RTP/AVP/UDP;unicast;client_port=5002-5003").StatusCode)
+
+		p := dialRaw(t, ts.plain)
+		resp := p.setup(0, udpOffer)
+		require.Equal(t, 200, resp.StatusCode, "the same SETUP on the plain listener")
+		assert.Contains(t, resp.Header.Get("Transport"), "client_port=5000-5001")
+
+		// The refusal left no session behind: the next offer starts one.
+		resp = r.setup(0, udpOffer+","+tcpOffer(0, 1))
+		require.Equal(t, 200, resp.StatusCode)
+		tr, err := rtsp.ParseTransport(resp.Header.Get("Transport"))
+		require.NoError(t, err)
+		assert.Equal(t, "RTP/AVP/TCP", tr.Protocol)
+		assert.Equal(t, [2]int{0, 1}, tr.Interleaved)
+		assert.Zero(t, tr.ClientPort)
+		require.Equal(t, 200, r.play().StatusCode)
+		s := h.session(t)
+		assert.False(t, s.UDP())
+		f, err := r.frame()
+		require.NoError(t, err)
+		assert.EqualValues(t, 0, f.ch)
+	})
+
+	t.Run("ServeTLS needs a config", func(t *testing.T) {
+		var lc net.ListenConfig
+		l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer func() { _ = l.Close() }()
+		assert.EqualError(t, ts.srv.ServeTLS(l, nil), "rtsp: serve tls: no tls config")
+	})
+}
+
+// halfHello returns the first half of a TLS ClientHello record.
+func halfHello(t *testing.T) []byte {
+	t.Helper()
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	go func() {
+		_ = tls.Client(a, &tls.Config{ServerName: "localhost", MinVersion: tls.VersionTLS12}).HandshakeContext(context.Background())
+	}()
+	hdr := make([]byte, 5, 1024)
+	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, err := io.ReadFull(b, hdr)
+	require.NoError(t, err)
+	body := make([]byte, binary.BigEndian.Uint16(hdr[3:]))
+	_, err = io.ReadFull(b, body)
+	require.NoError(t, err)
+	return append(hdr, body[:len(body)/2]...)
+}
+
+// closedWithin reports whether the peer closes c within d, dropping what
+// arrives before.
+func closedWithin(c net.Conn, d time.Duration) bool {
+	_ = c.SetReadDeadline(time.Now().Add(d))
+	_, err := io.Copy(io.Discard, c)
+	var ne net.Error
+	return !errors.As(err, &ne) || !ne.Timeout()
+}
+
+// tlsErrors records the TLSError calls of a server.
+type tlsErrors struct {
+	mu    sync.Mutex
+	addrs []string
+	errs  []error
+}
+
+func (e *tlsErrors) report(remote net.Addr, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.addrs = append(e.addrs, remote.String())
+	e.errs = append(e.errs, err)
+}
+
+func (e *tlsErrors) seen() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.addrs...)
+}
+
+func TestServeTLSWrongProtocol(t *testing.T) {
+	const readTimeout = 200 * time.Millisecond
+	dialTCP := func(t *testing.T, addr string) net.Conn {
+		t.Helper()
+		c, err := (&net.Dialer{Timeout: 2 * time.Second}).Dial("tcp", addr)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+	write := func(t *testing.T, c net.Conn, b []byte) {
+		t.Helper()
+		_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, err := c.Write(b)
+		require.NoError(t, err)
+	}
+	waitFor := func(t *testing.T, what string, ok func() bool) {
+		t.Helper()
+		require.Eventually(t, ok, 3*time.Second, 5*time.Millisecond, what)
+	}
+
+	t.Run("on the TLS listener", func(t *testing.T) {
+		h := newHandler()
+		h.play = producer(5 * time.Millisecond)
+		var reported tlsErrors
+		ts := startTLSServer(t, h, rtsp.ServerConfig{ReadTimeout: readTimeout, MaxPendingPerIP: 8, TLSError: reported.report})
+		hello := halfHello(t)
+
+		start := time.Now()
+		silent := dialTCP(t, ts.addr)
+		half := dialTCP(t, ts.addr)
+		write(t, half, hello)
+		plain := dialTCP(t, ts.addr)
+		write(t, plain, []byte("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n"))
+		waitFor(t, "the three are pending", func() bool {
+			return ts.srv.Stats().Connections+int(ts.srv.Stats().TLSHandshakeFailures) >= 3
+		})
+
+		// A good client is served while the silent ones wait: no
+		// handshake runs in the accept loop.
+		cfg := testConfig()
+		cfg.TLS = ts.ca.Client()
+		c := dial(t, "rtsps://"+ts.addr+"/live/cam", cfg)
+		played := time.Since(start)
+		firstPlayed(t, c, 3)
+		if played < readTimeout {
+			assert.LessOrEqual(t, ts.srv.Stats().TLSHandshakeFailures, uint64(1), "only the plaintext client can have failed yet")
+		} else {
+			t.Logf("the good client played after %v: the machine is too slow to tell it did not wait", played)
+		}
+
+		var wg sync.WaitGroup
+		closed := make([]bool, 3)
+		for i, bad := range []net.Conn{silent, half, plain} {
+			wg.Go(func() { closed[i] = closedWithin(bad, time.Until(start.Add(readTimeout+time.Second))) })
+		}
+		wg.Wait()
+		assert.Equal(t, []bool{true, true, true}, closed, "silent, half a ClientHello, plaintext")
+
+		waitFor(t, "three failures", func() bool { return len(reported.seen()) >= 3 })
+		assert.ElementsMatch(t,
+			[]string{silent.LocalAddr().String(), half.LocalAddr().String(), plain.LocalAddr().String()}, reported.seen())
+		st := ts.srv.Stats()
+		assert.EqualValues(t, 3, st.TLSHandshakeFailures)
+		assert.Zero(t, st.Timeouts, "a handshake that timed out is a handshake failure only")
+		assert.Zero(t, st.ProtocolErrors)
+		assert.Equal(t, 1, st.Connections, "the good client")
+		reported.mu.Lock()
+		for _, err := range reported.errs {
+			assert.True(t, strings.HasPrefix(err.Error(), "rtsp: tls handshake: "), err.Error())
+		}
+		reported.mu.Unlock()
+		firstPlayed(t, c, 3)
+	})
+
+	t.Run("on the plain listener", func(t *testing.T) {
+		h := newHandler()
+		var reported tlsErrors
+		ts := startTLSServer(t, h, rtsp.ServerConfig{ReadTimeout: readTimeout, TLSError: reported.report})
+		c := dialTCP(t, ts.plain)
+		cc := ts.ca.Client()
+		cc.ServerName = "127.0.0.1"
+		tc := tls.Client(c, cc)
+		ctx, cancel := context.WithTimeout(context.Background(), readTimeout+time.Second)
+		defer cancel()
+		// The hello is garbage to RTSP: it is answered 400 or skipped,
+		// and the connection ends by the read timeout.
+		require.Error(t, tc.HandshakeContext(ctx))
+		assert.True(t, closedWithin(c, readTimeout+time.Second))
+		r := dialRaw(t, ts.plain)
+		assert.Equal(t, 200, r.do("OPTIONS", "*").StatusCode, "the server still serves")
+		assert.Zero(t, ts.srv.Stats().TLSHandshakeFailures)
+		assert.Empty(t, reported.seen())
+	})
+
+	t.Run("the pending cap counts silent TLS clients", func(t *testing.T) {
+		ts := startTLSServer(t, newHandler(), rtsp.ServerConfig{ReadTimeout: 2 * time.Second, MaxPendingPerIP: 2})
+		a, b := dialTCP(t, ts.addr), dialTCP(t, ts.addr)
+		waitFor(t, "two pending", func() bool { return ts.srv.Stats().Connections == 2 })
+		third := dialTCP(t, ts.addr)
+		assert.True(t, closedWithin(third, time.Second), "the third is refused at accept")
+		st := ts.srv.Stats()
+		assert.EqualValues(t, 1, st.Rejected)
+		assert.Zero(t, st.TLSHandshakeFailures, "a refused connection never starts a handshake")
+		// The plain listener counts the same address.
+		assert.True(t, closedWithin(dialTCP(t, ts.plain), time.Second))
+		_ = a.Close()
+		_ = b.Close()
+		waitFor(t, "both gone", func() bool { return ts.srv.Stats().Connections == 0 })
+		r, _ := dialRawTLS(t, ts.addr, ts.ca.Client())
+		assert.Equal(t, 200, r.do("OPTIONS", "*").StatusCode)
+	})
+
+	t.Run("Close mid-handshake is no failure", func(t *testing.T) {
+		var reported tlsErrors
+		ca := tlstest.NewCA(t)
+		var lc net.ListenConfig
+		l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		srv := rtsp.NewServer(newHandler(), rtsp.ServerConfig{ReadTimeout: 5 * time.Second, MaxPendingPerIP: 8, TLSError: reported.report})
+		served := make(chan error, 1)
+		sc := ca.Server(t)
+		go func() { served <- srv.ServeTLS(l, sc) }()
+		hello := halfHello(t)
+		conns := make([]net.Conn, 0, 5)
+		for range 5 {
+			c := dialTCP(t, l.Addr().String())
+			write(t, c, hello)
+			conns = append(conns, c)
+		}
+		waitFor(t, "five pending", func() bool { return srv.Stats().Connections == 5 })
+		time.Sleep(50 * time.Millisecond) // every handshake has read its half hello
+		start := time.Now()
+		require.NoError(t, srv.Close())
+		assert.Less(t, time.Since(start), time.Second)
+		assert.ErrorIs(t, <-served, rtsp.ErrServerClosed)
+		for _, c := range conns {
+			assert.True(t, closedWithin(c, time.Second))
+		}
+		assert.Zero(t, srv.Stats().TLSHandshakeFailures)
+		assert.Empty(t, reported.seen())
+	})
+}
+
+// stallWriter writes on s until a write blocks (no write returned for
+// 150 ms) or fails; blocked is closed then. The returned channel yields how
+// long the last WritePackets call took, once it returns.
+func stallWriter(s *rtsp.ServerSession) (blocked <-chan struct{}, last <-chan time.Duration) {
+	var writes atomic.Int64
+	bc, lc := make(chan struct{}), make(chan time.Duration, 1)
+	stop := make(chan struct{})
+	go func() {
+		payload := bytes.Repeat([]byte{0x41}, 1000)
+		for {
+			ps := make([]*rtp.Packet, 8)
+			for i := range ps {
+				ps[i] = &rtp.Packet{Payload: payload}
+			}
+			start := time.Now()
+			err := s.WritePackets(0, ps)
+			writes.Add(1)
+			if err != nil {
+				lc <- time.Since(start)
+				close(stop)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer close(bc)
+		for prev := int64(-1); ; {
+			select {
+			case <-stop:
+				return
+			case <-time.After(150 * time.Millisecond):
+			}
+			n := writes.Load()
+			if n == prev {
+				return
+			}
+			prev = n
+		}
+	}()
+	return bc, lc
+}
+
+// stalledTLSPlayer starts a TLS session whose client never reads again and
+// returns its session, the writer filling its connection.
+func stalledTLSPlayer(t *testing.T, ts *tlsServer, h *testHandler) *rtsp.ServerSession {
+	t.Helper()
+	r, tcp := dialRawTLS(t, ts.addr, ts.ca.Client())
+	_ = tcp.SetReadBuffer(4096)
+	require.Equal(t, 200, r.setup(0, tcpOffer(0, 1)).StatusCode)
+	require.Equal(t, 200, r.play().StatusCode)
+	return h.session(t)
+}
+
+// TestServeTLSCloseNotify checks the healthy side of the close rule: a
+// session or an idle connection closed while its client reads gets
+// close_notify, the last TLS record the client receives. io.EOF alone would
+// not show it: crypto/tls also reports io.EOF for a stream cut on a record
+// boundary.
+func TestServeTLSCloseNotify(t *testing.T) {
+	recorded := func(t *testing.T, ts *tlsServer) (*raw, *recordedConn) {
+		t.Helper()
+		c, err := (&net.Dialer{Timeout: 2 * time.Second}).Dial("tcp", ts.addr)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		rec := &recordedConn{Conn: c}
+		cfg := ts.ca.Client()
+		cfg.ServerName = "127.0.0.1"
+		cfg.MaxVersion = tls.VersionTLS12 // the record type is in clear
+		tc := tls.Client(rec, cfg)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, tc.HandshakeContext(ctx))
+		return &raw{t: t, c: tc, br: bufio.NewReaderSize(tc, 1<<16), base: "rtsps://" + ts.addr + "/live/cam"}, rec
+	}
+	notified := func(t *testing.T, r *raw, rec *recordedConn) {
+		t.Helper()
+		_ = r.c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, err := io.Copy(io.Discard, r.br)
+		require.NoError(t, err, "the stream ends with EOF")
+		typ, whole := rec.in.lastType()
+		assert.True(t, whole, "the stream ends on a record boundary")
+		assert.EqualValues(t, tlsAlertRecord, typ, "the last record received is the close_notify alert")
+	}
+
+	t.Run("ServerSession.Close", func(t *testing.T) {
+		h := newHandler()
+		h.play = producer(5 * time.Millisecond)
+		ts := startTLSServer(t, h, rtsp.ServerConfig{})
+		r, rec := recorded(t, ts)
+		require.Equal(t, 200, r.setup(0, tcpOffer(0, 1)).StatusCode)
+		require.Equal(t, 200, r.play().StatusCode)
+		s := h.session(t)
+		_, err := r.frame()
+		require.NoError(t, err)
+		start := time.Now()
+		s.Close()
+		assert.Less(t, time.Since(start), time.Second)
+		notified(t, r, rec)
+	})
+
+	t.Run("Server.Close on an idle connection", func(t *testing.T) {
+		ca := tlstest.NewCA(t)
+		var lc net.ListenConfig
+		l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		srv := rtsp.NewServer(newHandler(), rtsp.ServerConfig{})
+		served := make(chan error, 1)
+		sc := ca.Server(t)
+		go func() { served <- srv.ServeTLS(l, sc) }()
+		r, rec := recorded(t, &tlsServer{srv: srv, addr: l.Addr().String(), ca: ca})
+		require.Equal(t, 200, r.do("OPTIONS", "*").StatusCode)
+		require.NoError(t, srv.Close())
+		assert.ErrorIs(t, <-served, rtsp.ErrServerClosed)
+		notified(t, r, rec)
+	})
+
+	t.Run("the read timeout", func(t *testing.T) {
+		ts := startTLSServer(t, newHandler(), rtsp.ServerConfig{ReadTimeout: 200 * time.Millisecond})
+		r, rec := recorded(t, ts)
+		require.Equal(t, 200, r.do("OPTIONS", "*").StatusCode)
+		notified(t, r, rec)
+		assert.EqualValues(t, 1, ts.srv.Stats().Timeouts)
+		assert.Zero(t, ts.srv.Stats().TLSHandshakeFailures)
+	})
+}
+
+func TestServeTLSCloseStalled(t *testing.T) {
+	smallBuffer := func(c net.Conn) { _ = c.(*net.TCPConn).SetWriteBuffer(4096) }
+	await := func(t *testing.T, blocked <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-blocked:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the writer never blocked")
+		}
+	}
+
+	// The write is in flight when Close runs: Close cuts it, sends no BYE
+	// on the broken TLS stream, and the connection's close must not wait
+	// for the close_notify the peer will never read.
+	t.Run("ServerSession.Close", func(t *testing.T) {
+		h := newHandler()
+		ts := startTLSServer(t, h, rtsp.ServerConfig{ConnHook: smallBuffer})
+		s := stalledTLSPlayer(t, ts, h)
+		blocked, last := stallWriter(s)
+		await(t, blocked)
+		start := time.Now()
+		s.Close()
+		assert.Less(t, time.Since(start), time.Second)
+		assert.ErrorIs(t, s.Err(), rtsp.ErrSessionClosed)
+		<-last
+		assert.Zero(t, ts.srv.Stats().Timeouts, "a write cut by Close is not a timeout")
+	})
+
+	// No write is in flight when the connection closes: the write missed
+	// its deadline, returned, and ended the session itself. crypto/tls
+	// would hold that close for 5 s.
+	t.Run("a missed write deadline", func(t *testing.T) {
+		const writeTimeout = 300 * time.Millisecond
+		h := newHandler()
+		ts := startTLSServer(t, h, rtsp.ServerConfig{ConnHook: smallBuffer, WriteTimeout: writeTimeout})
+		s := stalledTLSPlayer(t, ts, h)
+		_, last := stallWriter(s)
+		select {
+		case d := <-last:
+			assert.GreaterOrEqual(t, d, writeTimeout)
+			assert.Less(t, d, writeTimeout+300*time.Millisecond, "the close after the missed deadline")
+		case <-time.After(10 * time.Second):
+			t.Fatal("the stalled write never failed")
+		}
+		require.True(t, ended(s, time.Second))
+		assert.NotErrorIs(t, s.Err(), rtsp.ErrSessionClosed)
+		assert.EqualValues(t, 1, ts.srv.Stats().Timeouts)
+	})
+
+	t.Run("Server.Close with 100", func(t *testing.T) {
+		const n = 100
+		h := newHandler()
+		h.sessions = make(chan *rtsp.ServerSession, n)
+		ca := tlstest.NewCA(t)
+		var lc net.ListenConfig
+		l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		srv := rtsp.NewServer(h, rtsp.ServerConfig{
+			ConnHook: smallBuffer, MaxPending: 2 * n, MaxPendingPerIP: 2 * n, MaxSessionsPerIP: 2 * n,
+		})
+		served := make(chan error, 1)
+		sc := ca.Server(t)
+		go func() { served <- srv.ServeTLS(l, sc) }()
+		ts := &tlsServer{srv: srv, addr: l.Addr().String(), ca: ca}
+		sessions := make([]*rtsp.ServerSession, 0, n)
+		blocked := make([]<-chan struct{}, 0, n)
+		lasts := make([]<-chan time.Duration, 0, n)
+		for range n {
+			s := stalledTLSPlayer(t, ts, h)
+			b, last := stallWriter(s)
+			sessions, blocked, lasts = append(sessions, s), append(blocked, b), append(lasts, last)
+		}
+		for _, b := range blocked {
+			await(t, b)
+		}
+		require.Equal(t, n, srv.Stats().Sessions)
+		start := time.Now()
+		require.NoError(t, srv.Close())
+		took := time.Since(start)
+		assert.Less(t, took, time.Second, "100 stalled TLS sessions are closed concurrently")
+		assert.ErrorIs(t, <-served, rtsp.ErrServerClosed)
+		for i, s := range sessions {
+			assert.ErrorIs(t, s.Err(), rtsp.ErrSessionClosed, "session %d", i)
+			<-lasts[i]
+		}
+		assert.Zero(t, srv.Stats().Connections)
+	})
+}
+
+func TestServeTLSFFprobe(t *testing.T) {
+	ffprobe := requirePeer(t, "ffprobe", "tls")
+	ts := startTLSServer(t, newFixtureHandler(t), rtsp.ServerConfig{UDPHost: "127.0.0.1"})
+	probe := func(t *testing.T, args ...string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		var stderr bytes.Buffer
+		args = append(append([]string{"-v", "error"}, args...),
+			"-show_entries", "stream=codec_name", "-of", "csv=p=0", "rtsps://"+ts.addr+"/live/cam")
+		cmd := exec.CommandContext(ctx, ffprobe, args...)
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		require.NoError(t, err, "ffprobe: %s", stderr.String())
+		assert.Equal(t, []string{"h264", "aac"}, strings.Fields(string(out)), "ffprobe: %s", stderr.String())
+	}
+	t.Run("tcp", func(t *testing.T) { probe(t, "-rtsp_transport", "tcp") })
+	// ffprobe offers UDP first; the 461 sends it to interleaved.
+	t.Run("default transport", func(t *testing.T) { probe(t) })
+	assert.Zero(t, ts.srv.Stats().TLSHandshakeFailures)
 }

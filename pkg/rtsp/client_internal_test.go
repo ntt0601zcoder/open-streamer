@@ -70,3 +70,29 @@ func TestNewTargetDefaultPort(t *testing.T) {
 		assert.Error(t, err, bad)
 	}
 }
+
+// TestNewTargetTLS checks the rtsps:// target: port 322 when the URL names
+// none, the TLS flag and server name, and that the product's +insecure
+// spelling is not this package's. No connection is made.
+func TestNewTargetTLS(t *testing.T) {
+	for _, tc := range []struct{ in, addr, url, host, user, pass string }{
+		{"rtsps://cam/s", "cam:322", "rtsps://cam/s", "cam", "", ""},
+		{"rtsps://u:p@cam:8322/s", "cam:8322", "rtsps://cam:8322/s", "cam", "u", "p"},
+		{"RTSPS://cam/s", "cam:322", "RTSPS://cam/s", "cam", "", ""},
+		{"rtsps://[::1]/s", "[::1]:322", "rtsps://[::1]/s", "::1", "", ""},
+	} {
+		tg, err := newTarget(tc.in)
+		require.NoError(t, err, tc.in)
+		assert.Equal(t, tc.addr, tg.addr, tc.in)
+		assert.Equal(t, tc.url, tg.url, tc.in)
+		assert.Equal(t, tc.host, tg.host, tc.in)
+		assert.True(t, tg.secure, tc.in)
+		assert.Equal(t, tc.user, tg.user, tc.in)
+		assert.Equal(t, tc.pass, tg.pass, tc.in)
+	}
+	tg, err := newTarget("rtsp://cam/s")
+	require.NoError(t, err)
+	assert.False(t, tg.secure)
+	_, err = newTarget("rtsps+insecure://cam/s")
+	assert.EqualError(t, err, "rtsp: dial: unsupported scheme")
+}

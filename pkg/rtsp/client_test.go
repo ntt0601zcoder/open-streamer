@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -22,6 +24,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp/rtsptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 const (
@@ -813,4 +816,294 @@ func TestClientGoroutinesExit(t *testing.T) {
 func stacks() string {
 	b := make([]byte, 1<<20)
 	return string(b[:runtime.Stack(b, true)])
+}
+
+// bigSource is an H.264 track and an AAC track whose video access units are
+// 40 KiB, larger than one TLS record (16 KiB).
+func bigSource() []rtsptest.TrackSource {
+	video := rtsptest.TrackSource{
+		Codec: rtsp.CodecH264, ClockRate: 90000,
+		ParamSets: [][]byte{{0x67, 0x42, 0x00, 0x1e}, {0x68, 0xce, 0x38, 0x80}},
+	}
+	audio := rtsptest.TrackSource{
+		Codec: rtsp.CodecAAC, ClockRate: 48000,
+		AAC: &rtsp.AACFormat{Config: []byte{0x11, 0x90}, SizeLength: 13, IndexLength: 3, IndexDeltaLength: 3},
+	}
+	for i := range 50 {
+		nal := make([]byte, 40<<10)
+		nal[0] = 0x41
+		for j := 1; j < len(nal); j++ {
+			nal[j] = byte(i*31 + j*7)
+		}
+		video.AUs = append(video.AUs, rtsptest.TestAU{TS: uint32(i) * 1800, NALUs: [][]byte{nal}})
+		frame := bytes.Repeat([]byte{byte(i + 1)}, 300)
+		audio.AUs = append(audio.AUs, rtsptest.TestAU{TS: uint32(i) * 1024, Frames: [][]byte{frame}})
+	}
+	return []rtsptest.TrackSource{video, audio}
+}
+
+// rtpOf is what two runs of one scripted session must agree on.
+type rtpOf struct {
+	Seq     uint16
+	TS      uint32
+	SSRC    uint32
+	Marker  bool
+	Payload string
+}
+
+// firstRTP reads until both tracks have n RTP packets and returns the first
+// n of each.
+func firstRTP(t *testing.T, c *rtsp.Client, n int) [2][]rtpOf {
+	t.Helper()
+	var out [2][]rtpOf
+	readUntil(t, c, 5*time.Second, func(p rtsp.Packet) bool {
+		if p.RTP != nil && len(out[p.Track]) < n {
+			out[p.Track] = append(out[p.Track], rtpOf{
+				Seq: p.RTP.SequenceNumber, TS: p.RTP.Timestamp, SSRC: p.RTP.SSRC, Marker: p.RTP.Marker,
+				Payload: string(p.RTP.Payload),
+			})
+		}
+		return len(out[0]) >= n && len(out[1]) >= n
+	})
+	return out
+}
+
+func TestDialTLS(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	media := bigSource()
+	opt := rtsptest.ServerOptions{Media: media, Seed: 7, SendRTPInfo: true}
+	plain := newServer(t, opt)
+	want := firstRTP(t, dial(t, plain.URL("/live/stream"), testConfig()), 80)
+
+	secure := func(t *testing.T, opt rtsptest.ServerOptions) *rtsptest.Server {
+		t.Helper()
+		opt.TLS = ca.Server(t)
+		s := newServer(t, opt)
+		require.True(t, strings.HasPrefix(s.URL("/x"), "rtsps://"), s.URL("/x"))
+		return s
+	}
+	withTLS := func(c *tls.Config) rtsp.Config {
+		cfg := testConfig()
+		cfg.TLS = c
+		return cfg
+	}
+	dialErr := func(t *testing.T, rawURL string, cfg rtsp.Config) error {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		c, err := rtsp.Dial(ctx, rawURL, cfg)
+		if c != nil {
+			_ = c.Close()
+		}
+		require.Error(t, err)
+		return err
+	}
+
+	t.Run("plays the plain run's packets", func(t *testing.T) {
+		s := secure(t, opt)
+		trust := ca.Client()
+		c := dial(t, s.URL("/live/stream"), withTLS(trust))
+		assert.Equal(t, want, firstRTP(t, c, 80))
+		assert.Equal(t, rtsp.ClientStats{}, c.Stats())
+		assert.Empty(t, trust.ServerName, "the caller's config is cloned, not changed")
+		for _, r := range s.Requests() {
+			assert.True(t, strings.HasPrefix(r.URL, "rtsps://"), "%s %s", r.Method, r.URL)
+		}
+		require.NoError(t, c.Close())
+	})
+
+	t.Run("the server name is the URL's host", func(t *testing.T) {
+		s := secure(t, opt)
+		_, port, err := net.SplitHostPort(s.Addr)
+		require.NoError(t, err)
+		// Every name is dialled at the server's address: only the name
+		// the certificate is checked against differs.
+		cfg := withTLS(ca.Client())
+		cfg.Dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, s.Addr)
+		}
+		c := dial(t, "rtsps://localhost:"+port+"/live/stream", cfg)
+		firstRTP(t, c, 5)
+
+		err = dialErr(t, "rtsps://cam.example:"+port+"/live/stream", cfg)
+		var he x509.HostnameError
+		require.ErrorAs(t, err, &he)
+		assert.True(t, strings.HasPrefix(err.Error(), "rtsp: dial: tls: "), err.Error())
+	})
+
+	t.Run("an unknown authority is refused", func(t *testing.T) {
+		s := secure(t, opt)
+		err := dialErr(t, s.URL("/live/stream"), testConfig())
+		var ua x509.UnknownAuthorityError
+		require.ErrorAs(t, err, &ua)
+		assert.True(t, strings.HasPrefix(err.Error(), "rtsp: dial: tls: "), err.Error())
+		assert.Empty(t, requestsOf(s, "OPTIONS"), "nothing is sent to an unverified server")
+	})
+
+	t.Run("InsecureSkipVerify plays", func(t *testing.T) {
+		s := secure(t, opt)
+		c := dial(t, s.URL("/live/stream"), withTLS(&tls.Config{InsecureSkipVerify: true})) //nolint:gosec // the opt-out under test
+		firstRTP(t, c, 5)
+	})
+
+	t.Run("digest auth", func(t *testing.T) {
+		o := opt
+		o.Auth, o.User, o.Pass = "digest", testUser, testPass
+		s := secure(t, o)
+		c := dial(t, "rtsps://"+testUser+":"+testPass+"@"+s.Addr+"/live/stream", withTLS(ca.Client()))
+		firstRTP(t, c, 5)
+		for _, r := range s.Requests() {
+			assert.NotContains(t, r.URL, testPass)
+		}
+		err := dialErr(t, "rtsps://"+testUser+":"+wrongPass+"@"+s.Addr+"/live/stream", withTLS(ca.Client()))
+		var se *rtsp.StatusError
+		require.ErrorAs(t, err, &se)
+		assert.Equal(t, 401, se.Code)
+	})
+
+	t.Run("udp is refused before any dial", func(t *testing.T) {
+		cfg := withTLS(ca.Client())
+		cfg.Transport = "udp"
+		dials := 0
+		cfg.Dial = func(context.Context, string, string) (net.Conn, error) {
+			dials++
+			return nil, errors.New("dialled")
+		}
+		err := dialErr(t, "rtsps://127.0.0.1:1/live/stream", cfg)
+		assert.EqualError(t, err, "rtsp: dial: rtsps needs the tcp transport")
+		assert.Zero(t, dials)
+	})
+
+	t.Run("auto plays over tcp", func(t *testing.T) {
+		s := secure(t, opt)
+		cfg := withTLS(ca.Client())
+		cfg.Transport = "auto"
+		c := dial(t, s.URL("/live/stream"), cfg)
+		firstRTP(t, c, 5)
+		assert.Zero(t, c.Stats().FallbackTCP)
+		setups := requestsOf(s, "SETUP")
+		require.Len(t, setups, 2, "one session, no UDP attempt")
+		for _, r := range setups {
+			assert.Contains(t, r.Header.Get("Transport"), "RTP/AVP/TCP")
+		}
+	})
+
+	t.Run("a stalled handshake is bounded by the timeout", func(t *testing.T) {
+		var lc net.ListenConfig
+		l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer func() { _ = l.Close() }()
+		go func() {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				defer func() { _ = c.Close() }()
+			}
+		}()
+		cfg := withTLS(ca.Client())
+		cfg.Timeout = 200 * time.Millisecond
+		start := time.Now()
+		err = dialErr(t, "rtsps://"+l.Addr().String()+"/live/stream", cfg)
+		assert.Less(t, time.Since(start), 2*time.Second)
+		assert.True(t, strings.HasPrefix(err.Error(), "rtsp: dial: tls: "), err.Error())
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+	})
+}
+
+// tlsRecords follows one direction of a TLS byte stream and remembers the
+// type of its last complete record. With TLS 1.2 the type is in clear: 21 is
+// an alert, which close_notify is.
+type tlsRecords struct {
+	mu   sync.Mutex
+	hdr  []byte
+	left int
+	last byte
+	n    int
+}
+
+const tlsAlertRecord = 21
+
+func (r *tlsRecords) feed(b []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for len(b) > 0 {
+		if r.left > 0 {
+			k := min(r.left, len(b))
+			r.left -= k
+			b = b[k:]
+			if r.left == 0 {
+				r.last = r.hdr[0]
+				r.n++
+				r.hdr = r.hdr[:0]
+			}
+			continue
+		}
+		k := min(5-len(r.hdr), len(b))
+		r.hdr = append(r.hdr, b[:k]...)
+		b = b[k:]
+		if len(r.hdr) == 5 {
+			if r.left = int(binary.BigEndian.Uint16(r.hdr[3:])); r.left == 0 {
+				r.last = r.hdr[0]
+				r.n++
+				r.hdr = r.hdr[:0]
+			}
+		}
+	}
+}
+
+// lastType returns the type of the last complete record and whether the
+// stream ended on a record boundary.
+func (r *tlsRecords) lastType() (typ byte, whole bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.last, r.n > 0 && r.left == 0 && len(r.hdr) == 0
+}
+
+// recordedConn feeds what is read from the connection to in and what is
+// written to it to out.
+type recordedConn struct {
+	net.Conn
+	in, out tlsRecords
+}
+
+func (c *recordedConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.in.feed(b[:n])
+	return n, err
+}
+
+func (c *recordedConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.out.feed(b[:n])
+	return n, err
+}
+
+// TestDialTLSCloseNotify checks the healthy side of the close rule: a client
+// closed while its server reads sends close_notify, the last record it writes.
+func TestDialTLSCloseNotify(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	s := newServer(t, rtsptest.ServerOptions{TLS: ca.Server(t)})
+	cfg := testConfig()
+	cfg.TLS = ca.Client()
+	cfg.TLS.MaxVersion = tls.VersionTLS12 // the record type is in clear
+	var rec *recordedConn
+	cfg.Dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		rec = &recordedConn{Conn: c}
+		return rec, nil
+	}
+	c := dial(t, s.URL("/live/stream"), cfg)
+	readFor(t, c, 100*time.Millisecond)
+	start := time.Now()
+	require.NoError(t, c.Close())
+	assert.Less(t, time.Since(start), time.Second)
+	typ, whole := rec.out.lastType()
+	assert.True(t, whole, "the stream ends on a record boundary")
+	assert.EqualValues(t, tlsAlertRecord, typ, "the last record written is the close_notify alert")
+	require.Len(t, requestsOf(s, "TEARDOWN"), 1)
 }

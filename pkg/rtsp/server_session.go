@@ -192,7 +192,8 @@ func (s *ServerSession) idleLeft() time.Duration {
 }
 
 // end ends the session with err: the first call wins, cancels Play's
-// context and closes the connection.
+// context and closes the connection (closeConn: a TLS connection whose peer
+// stopped reading costs 100 ms, not crypto/tls's 5 s).
 func (s *ServerSession) end(err error) {
 	s.endOnce.Do(func() {
 		s.errMu.Lock()
@@ -200,7 +201,7 @@ func (s *ServerSession) end(err error) {
 		s.errMu.Unlock()
 		close(s.done)
 		s.cancel()
-		_ = s.c.nc.Close()
+		_ = closeConn(s.c.nc)
 	})
 }
 
@@ -395,7 +396,8 @@ func (s *ServerSession) writeFailed(err error) error {
 //
 // A TCP BYE is bounded by the close budget, 500 ms (or the WriteTimeout when
 // shorter): a writer blocked on the connection's full send buffer is cut
-// short and Close returns within that budget. A UDP BYE uses the normal
+// short and Close returns within that budget, plus 100 ms for the close of a
+// TLS connection whose peer has stopped reading. A UDP BYE uses the normal
 // WriteTimeout, like every other UDP write: the pair's sockets are shared by
 // every UDP session, so a shorter deadline on them would fail other
 // sessions' writes, and UDP sends rarely block (an asynchronous BYE would
@@ -415,13 +417,18 @@ func (s *ServerSession) Close() {
 		budget := min(byeWait, c.srv.cfg.WriteTimeout)
 		now := time.Now()
 		deadline := now.Add(budget)
-		if c.lockWriteBy(now.Add(budget/2), deadline) {
-			if s.Err() == nil {
-				s.sendByeLocked(deadline)
-			}
-			c.wmu.Unlock()
+		// The connection is closed under the write mutex: a write that
+		// started between the BYE and the close would be in flight then,
+		// and a TLS connection closed with a write in flight sends no
+		// close_notify.
+		locked := c.lockWriteBy(now.Add(budget/2), deadline)
+		if locked && s.Err() == nil {
+			s.sendByeLocked(deadline)
 		}
 		s.end(ErrSessionClosed)
+		if locked {
+			c.wmu.Unlock()
+		}
 	})
 }
 

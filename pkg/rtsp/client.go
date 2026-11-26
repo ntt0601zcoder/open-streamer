@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ const (
 	defaultMaxAU          = 8 << 20
 	defaultUDPFallback    = 3 * time.Second
 	defaultPort           = "554"
+	defaultTLSPort        = "322"
 	packetQueue           = 1024
 	teardownWait          = 100 * time.Millisecond
 	userAgent             = "open-streamer"
@@ -42,14 +44,16 @@ var ErrIdle = errors.New("rtsp: read: no packet within the idle timeout")
 
 // Config tunes a Client. A zero field means its default.
 type Config struct {
-	// Timeout bounds the connect and every request/response (default 10 s).
+	// Timeout bounds the connect, the TLS handshake of an rtsps:// URL and
+	// every request/response (default 10 s).
 	Timeout time.Duration
 	// IdleTimeout ends the session when no RTP packet arrives on any track
 	// for that long (default 10 s).
 	IdleTimeout time.Duration
 	// Transport is "tcp" (the default, interleaved), "udp" or "auto" (UDP,
 	// falling back to a new session over TCP when the server refuses UDP or
-	// no RTP arrives within UDPFallback; Dial waits for that).
+	// no RTP arrives within UDPFallback; Dial waits for that). An rtsps://
+	// URL plays interleaved only: "udp" is refused and "auto" means "tcp".
 	Transport string
 	Limits    Limits
 	// MaxAU is the access-unit bound for the depacketizers the caller
@@ -66,6 +70,9 @@ type Config struct {
 	// Dial opens the control connection ("tcp", host:port) (default a
 	// net.Dialer). Its context carries the Timeout.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// TLS is the client config of an rtsps:// URL; nil means the system roots. It is cloned, and its ServerName, when empty, is
+	// set to the URL's host. Ignored for rtsp://.
+	TLS *tls.Config
 }
 
 func (c Config) withDefaults() Config {
@@ -231,13 +238,16 @@ type Client struct {
 	timer *time.Timer
 }
 
-// target is where Dial connects and what it requests.
+// target is where Dial connects and what it requests. secure is set for an
+// rtsps:// URL, whose host is the TLS server name.
 type target struct {
 	addr, url, user, pass string
+	host                  string
+	secure                bool
 }
 
 // newTarget returns the address and the credential-free URL of an rtsp://
-// URL; the port defaults to 554.
+// or rtsps:// URL; the port defaults to 554, or to 322 for rtsps://.
 func newTarget(rawURL string) (target, error) {
 	clean, user, pass, err := StripUserinfo(rawURL)
 	if err != nil {
@@ -247,20 +257,34 @@ func newTarget(rawURL string) (target, error) {
 	if err != nil || u.Host == "" {
 		return target{}, errors.New("rtsp: dial: invalid URL")
 	}
-	if !strings.EqualFold(u.Scheme, "rtsp") {
+	tg := target{url: clean, user: user, pass: pass, host: u.Hostname()}
+	port := u.Port()
+	switch {
+	case strings.EqualFold(u.Scheme, "rtsp"):
+		if port == "" {
+			port = defaultPort
+		}
+	case strings.EqualFold(u.Scheme, "rtsps"):
+		tg.secure = true
+		if port == "" {
+			port = defaultTLSPort
+		}
+	default:
 		return target{}, errors.New("rtsp: dial: unsupported scheme")
 	}
-	port := u.Port()
-	if port == "" {
-		port = defaultPort
-	}
-	return target{addr: net.JoinHostPort(u.Hostname(), port), url: clean, user: user, pass: pass}, nil
+	tg.addr = net.JoinHostPort(tg.host, port)
+	return tg, nil
 }
 
-// Dial connects to an rtsp:// URL and starts playing: OPTIONS, DESCRIBE,
-// SETUP for every supported media and PLAY. Userinfo in the URL is used for
-// authentication and removed from everything sent or stored. ctx bounds only
-// Dial.
+// Dial connects to an rtsp:// or rtsps:// URL and starts playing: OPTIONS,
+// DESCRIBE, SETUP for every supported media and PLAY. Userinfo in the URL is
+// used for authentication and removed from everything sent or stored. ctx
+// bounds only Dial.
+//
+// An rtsps:// URL is RTSP over TLS: the server is verified with Config.TLS
+// and its RTP is interleaved on the connection, so the transport "udp" is
+// refused before anything is dialled and "auto" plays over TCP with no UDP
+// attempt. This is the one place that rule is decided.
 func Dial(ctx context.Context, rawURL string, cfg Config) (*Client, error) {
 	cfg = cfg.withDefaults()
 	switch cfg.Transport {
@@ -271,6 +295,12 @@ func Dial(ctx context.Context, rawURL string, cfg Config) (*Client, error) {
 	tg, err := newTarget(rawURL)
 	if err != nil {
 		return nil, err
+	}
+	if tg.secure {
+		if cfg.Transport == "udp" {
+			return nil, errors.New("rtsp: dial: rtsps needs the tcp transport")
+		}
+		return dialSession(ctx, cfg, tg, false)
 	}
 	if cfg.Transport == "auto" {
 		return dialAuto(ctx, cfg, tg)
@@ -288,6 +318,11 @@ func dialSession(ctx context.Context, cfg Config, tg target, udp bool) (*Client,
 	}
 	if err != nil {
 		return nil, fmt.Errorf("rtsp: dial: %w", err)
+	}
+	if tg.secure {
+		if conn, err = secureConn(ctx, cfg, tg, conn); err != nil {
+			return nil, err
+		}
 	}
 	c := &Client{
 		cfg: cfg, udp: udp, conn: conn, br: bufio.NewReaderSize(conn, 64<<10), auth: NewAuth(tg.user, tg.pass),
@@ -314,6 +349,56 @@ func dialSession(ctx context.Context, cfg Config, tg target, udp bool) (*Client,
 	c.wg.Add(1)
 	go c.timerLoop()
 	return c, nil
+}
+
+// secureConn runs the TLS handshake of an rtsps:// dial on raw, bounded by
+// ctx and the Timeout, and returns the TLS connection; a failed handshake
+// closes raw.
+func secureConn(ctx context.Context, cfg Config, tg target, raw net.Conn) (net.Conn, error) {
+	tc := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.TLS != nil {
+		tc = cfg.TLS.Clone()
+	}
+	if tc.ServerName == "" {
+		tc.ServerName = tg.host
+	}
+	conn := tls.Client(raw, tc)
+	hctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
+	if err := conn.HandshakeContext(hctx); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("rtsp: dial: tls: %w", err)
+	}
+	return conn, nil
+}
+
+// closeGrace is how long closeConn lets a TLS connection send its
+// close_notify before the raw connection is closed under it.
+const closeGrace = 100 * time.Millisecond
+
+// closeConn closes a connection of the client or the server without waiting
+// on the peer. A *tls.Conn closed with no write in flight sends close_notify
+// under crypto/tls's own 5 s write deadline, which a peer that stopped
+// reading holds for all of it; so the raw connection is closed 100 ms later
+// whatever the peer does. A healthy peer still gets its close_notify. Any
+// other connection is closed directly.
+//
+// A TLS close returns nil: what tls.Conn.Close reports is a close_notify that
+// was not delivered (the peer stalled, or closed first) or the raw connection
+// this function closed itself, and the connection is closed either way.
+//
+// pkg/rtmp's closeConn is the twin of this function (the two packages do not
+// import each other): the two must change together.
+func closeConn(c net.Conn) error {
+	tc, ok := c.(*tls.Conn)
+	if !ok {
+		return c.Close()
+	}
+	raw := tc.NetConn()
+	t := time.AfterFunc(closeGrace, func() { _ = raw.Close() })
+	_ = tc.Close()
+	t.Stop()
+	return nil
 }
 
 func randomSSRC() uint32 {
@@ -662,7 +747,7 @@ func (c *Client) fail(err error) {
 	c.failOnce.Do(func() {
 		c.err = err
 		close(c.done)
-		_ = c.conn.Close()
+		_ = closeConn(c.conn)
 		c.closeSockets()
 	})
 }
@@ -760,7 +845,9 @@ func (c *Client) ReadPacket() (Packet, error) {
 }
 
 // Close sends TEARDOWN (waiting at most 100 ms), closes the connection and
-// waits for the client's goroutines. It is idempotent.
+// waits for the client's goroutines. Over TLS the close sends close_notify,
+// for at most 100 ms more when the server has stopped reading. It is
+// idempotent.
 func (c *Client) Close() error {
 	c.shutdown(context.Background())
 	return nil
@@ -780,7 +867,17 @@ func (c *Client) shutdown(ctx context.Context) {
 				c.teardown(ctx)
 			}
 		}
+		// A TLS connection is closed under the write mutex, taken within
+		// the close grace: closed while a receiver report or a keepalive
+		// is being written it would send no close_notify.
+		locked := false
+		if _, ok := c.conn.(*tls.Conn); ok {
+			locked = c.lockWriteBy(time.Now().Add(closeGrace))
+		}
 		c.fail(ErrClosed)
+		if locked {
+			c.wmu.Unlock()
+		}
 		c.wg.Wait()
 	})
 }

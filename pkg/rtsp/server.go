@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -61,7 +62,8 @@ var errStop = errors.New("rtsp: connection done")
 
 // ServerConfig tunes a Server. A zero field means its default.
 type ServerConfig struct {
-	// ReadTimeout bounds each request read until PLAY (default 10 s).
+	// ReadTimeout bounds each request read until PLAY, and the TLS
+	// handshake of a connection of ServeTLS (default 10 s).
 	ReadTimeout time.Duration
 	// WriteTimeout bounds every response and every WritePackets or
 	// WriteRTCP call; a session that misses it ends (default 10 s).
@@ -87,8 +89,11 @@ type ServerConfig struct {
 	// Serve, closed by Close. Without it UDP SETUP is answered 461.
 	UDPHost string
 	// ConnHook, when set, is called on every accepted connection before it
-	// is served.
+	// is served. For a connection of ServeTLS it is given the raw
+	// connection, before the handshake.
 	ConnHook func(net.Conn)
+	// TLSError, when set, is called for each connection of ServeTLS whose handshake failed, in that connection's goroutine.
+	TLSError func(remote net.Addr, err error)
 	// Now is the clock of session liveness (default time.Now).
 	Now func() time.Time
 }
@@ -156,6 +161,10 @@ type ServerStats struct {
 	// UDPStrangers counts datagrams on the RTCP socket of the UDP pair from
 	// an address that is no session's client RTCP port.
 	UDPStrangers uint64
+	// TLSHandshakeFailures counts connections of ServeTLS whose TLS
+	// handshake failed or did not finish within the ReadTimeout. A
+	// handshake cut short by Close is not counted.
+	TLSHandshakeFailures uint64
 }
 
 // listenerState counts one listener's connections; guarded by Server.mu.
@@ -178,7 +187,7 @@ type Server struct {
 	udpPeers  map[netip.AddrPort]*ServerSession // client RTCP address → session
 	wg        sync.WaitGroup
 
-	nRejected, nProtocol, nTimeouts, nStrangers atomic.Uint64
+	nRejected, nProtocol, nTimeouts, nStrangers, nTLSFailures atomic.Uint64
 }
 
 // NewServer returns a server for h; Serve starts it.
@@ -195,7 +204,25 @@ func NewServer(h Handler, cfg ServerConfig) *Server {
 // The first Serve binds the UDP pair when UDPHost is set and fails when it
 // cannot. Transient accept errors are retried with a backoff; a listener
 // closed by someone else ends Serve with its error.
-func (s *Server) Serve(l net.Listener) error {
+func (s *Server) Serve(l net.Listener) error { return s.serve(l, nil) }
+
+// ServeTLS is Serve for RTSPS: every connection of l is wrapped with c. Its sessions carry RTP interleaved only: a SETUP
+// whose offers are all UDP is answered 461, whatever UDPHost is. It may run beside Serve on the same Server.
+//
+// The handshake runs in the connection's own goroutine, never in the accept
+// loop, bounded by the ReadTimeout, and the connection counts against the
+// pending caps from the moment it is accepted. A failed handshake is counted
+// in ServerStats.TLSHandshakeFailures and reported to ServerConfig.TLSError,
+// unless Close is what cut it short.
+func (s *Server) ServeTLS(l net.Listener, c *tls.Config) error {
+	if c == nil {
+		return errors.New("rtsp: serve tls: no tls config")
+	}
+	return s.serve(l, c)
+}
+
+// serve is Serve, or ServeTLS when tc is set.
+func (s *Server) serve(l net.Listener, tc *tls.Config) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -215,7 +242,7 @@ func (s *Server) Serve(l net.Listener) error {
 		nc, err := l.Accept()
 		if err == nil {
 			backoff = 0
-			s.accept(nc, ls)
+			s.accept(nc, ls, tc)
 			continue
 		}
 		s.mu.Lock()
@@ -236,7 +263,9 @@ func (s *Server) Serve(l net.Listener) error {
 }
 
 // accept admits a connection as pending, or refuses it at a pending cap.
-func (s *Server) accept(nc net.Conn, ls *listenerState) {
+// With tc the connection is served over TLS; its handshake is left to the
+// connection's goroutine.
+func (s *Server) accept(nc net.Conn, ls *listenerState, tc *tls.Config) {
 	if s.cfg.ConnHook != nil {
 		s.cfg.ConnHook(nc)
 	}
@@ -252,10 +281,12 @@ func (s *Server) accept(nc net.Conn, ls *listenerState) {
 	}
 	ls.pending++
 	s.pendingIP[key]++
-	c := &serverConn{
-		srv: s, ls: ls, nc: nc, br: bufio.NewReaderSize(nc, 64<<10),
-		peer: peer, ipKey: key, since: time.Now(),
+	c := &serverConn{srv: s, ls: ls, nc: nc, peer: peer, ipKey: key, since: time.Now()}
+	if tc != nil {
+		c.tls = tls.Server(nc, tc)
+		c.nc = c.tls
 	}
+	c.br = bufio.NewReaderSize(c.nc, 64<<10)
 	s.conns[c] = struct{}{}
 	s.wg.Add(1)
 	s.mu.Unlock()
@@ -282,7 +313,9 @@ func peerKey(a net.Addr) (net.IP, string) {
 
 // Close stops every listener, closes every session (playing sessions with
 // BYE, best effort), waits for every connection's goroutines and then
-// closes the UDP pair and waits for its readers. It is idempotent.
+// closes the UDP pair and waits for its readers. The connections are closed
+// concurrently: a TLS connection whose peer stopped reading takes 100 ms to
+// close (closeConn), and many of them must not add up. It is idempotent.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -296,22 +329,22 @@ func (s *Server) Close() error {
 		ls = append(ls, l)
 	}
 	var playing []*ServerSession
-	var idle []net.Conn
+	var idle []*serverConn
 	for c := range s.conns {
 		if c.playing {
 			playing = append(playing, c.sess)
 		} else {
-			idle = append(idle, c.nc)
+			idle = append(idle, c)
 		}
 	}
 	s.mu.Unlock()
 	for _, l := range ls {
 		_ = l.Close()
 	}
-	for _, nc := range idle {
-		_ = nc.Close()
-	}
 	var wg sync.WaitGroup
+	for _, c := range idle {
+		wg.Go(c.closeIdle)
+	}
 	for _, ss := range playing {
 		wg.Go(ss.Close)
 	}
@@ -335,6 +368,7 @@ func (s *Server) Stats() ServerStats {
 	st.ProtocolErrors = s.nProtocol.Load()
 	st.Timeouts = s.nTimeouts.Load()
 	st.UDPStrangers = s.nStrangers.Load()
+	st.TLSHandshakeFailures = s.nTLSFailures.Load()
 	return st
 }
 
@@ -413,9 +447,13 @@ func dec(m map[string]int, k string) {
 // serverConn is one RTSP connection. sess and playing are written by the
 // connection's goroutine under Server.mu and read by it without the lock.
 type serverConn struct {
-	srv   *Server
-	ls    *listenerState
+	srv *Server
+	ls  *listenerState
+	// nc is what the connection reads and writes: the accepted connection,
+	// or tls (a connection of ServeTLS) around it. It is closed with
+	// closeConn only.
 	nc    net.Conn
+	tls   *tls.Conn
 	br    *bufio.Reader
 	peer  net.IP
 	ipKey string
@@ -441,6 +479,10 @@ type describedSDP struct {
 
 func (c *serverConn) serve() {
 	defer c.srv.wg.Done()
+	if c.tls != nil && !c.handshake() {
+		c.srv.release(c)
+		return
+	}
 	err := c.loop()
 	if c.sess != nil {
 		switch {
@@ -454,11 +496,54 @@ func (c *serverConn) serve() {
 			c.sess.end(fmt.Errorf("rtsp: session: connection ended: %w", err))
 		}
 	}
-	_ = c.nc.Close()
+	_ = closeConn(c.nc)
 	if c.playDone != nil {
 		<-c.playDone
 	}
 	c.srv.release(c)
+}
+
+// closeIdle closes a connection without a playing session for Server.Close.
+// A TLS connection is closed under the write mutex, taken within the close
+// grace: closed while a response write is still in flight it would send no
+// close_notify. A response writer stuck that long is cut by the close.
+func (c *serverConn) closeIdle() {
+	if c.tls == nil {
+		_ = closeConn(c.nc)
+		return
+	}
+	giveUp := time.Now().Add(closeGrace)
+	locked := c.lockWriteBy(giveUp, giveUp)
+	_ = closeConn(c.nc)
+	if locked {
+		c.wmu.Unlock()
+	}
+}
+
+// handshake runs the TLS handshake of a connection of ServeTLS, first thing
+// in its goroutine, within the deadline of a first request. A failure closes
+// the raw connection, is counted and is reported to TLSError, unless the
+// server is closing: a handshake Close cut short is no failure of the peer.
+func (c *serverConn) handshake() bool {
+	ctx, cancel := context.WithDeadline(context.Background(), c.readDeadline())
+	err := c.tls.HandshakeContext(ctx)
+	cancel()
+	if err == nil {
+		return true
+	}
+	raw := c.tls.NetConn()
+	_ = raw.Close()
+	c.srv.mu.Lock()
+	closing := c.srv.closed
+	c.srv.mu.Unlock()
+	if closing {
+		return false
+	}
+	c.srv.nTLSFailures.Add(1)
+	if report := c.srv.cfg.TLSError; report != nil {
+		report(raw.RemoteAddr(), fmt.Errorf("rtsp: tls handshake: %w", err))
+	}
+	return false
 }
 
 // loop reads requests and interleaved frames until the connection ends.
@@ -828,9 +913,11 @@ func (c *serverConn) setup(req *Request, resp *Response) {
 		setStatus(resp, 461)
 		return
 	}
-	// UDP is offered only when the server owns a pair that reaches the peer.
+	// UDP is offered only when the server owns a pair that reaches the peer,
+	// and never to a TLS session: its RTP would leave the TLS connection in
+	// clear.
 	pair := c.srv.udpFor(c.peer)
-	offer, kind, ok := selectTransport(offers, c.peer, pair != nil, current)
+	offer, kind, ok := selectTransport(offers, c.peer, pair != nil && c.tls == nil, current)
 	if !ok {
 		setStatus(resp, 461)
 		return
