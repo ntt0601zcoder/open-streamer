@@ -25,6 +25,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/auth"
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
+	"github.com/ntt0601zcoder/open-streamer/internal/logging"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics/metricstest"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
@@ -567,6 +568,33 @@ func TestServerListenersOff(t *testing.T) {
 	_, err := metricstest.Parse(strings.NewReader(out.body))
 	require.NoError(t, err)
 	assert.NotContains(t, out.body, "openstreamer_output_sessions{")
+}
+
+// An API beyond loopback is warned about once, at the start; one on
+// loopback is not.
+func TestWarnAPI(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1:8081": true, "127.8.9.1:1": true, "[::1]:8081": true, "[::ffff:127.0.0.1]:8081": true,
+		"0.0.0.0:8081": false, "[::]:8081": false, "192.0.2.7:8081": false, "[2001:db8::1]:8081": false,
+		"nonsense": false, "localhost:1": false, // a bound address is never a name
+	} {
+		assert.Equal(t, want, loopback(addr), addr)
+		var b bytes.Buffer
+		log, err := logging.New(&b, "info", "json")
+		require.NoError(t, err)
+		warnAPI(log, addr)
+		if want {
+			assert.Empty(t, b.String(), addr)
+			continue
+		}
+		assert.Equal(t, 1, strings.Count(b.String(), "\n"), addr)
+		assert.Contains(t, b.String(), `"level":"WARN"`)
+		assert.Contains(t, b.String(), "api.listen is not a loopback address")
+		assert.Contains(t, b.String(), "travel in clear")
+	}
+	s := testConfig(t, nil)
+	assert.True(t, loopback(s.Addrs().API))
+	assert.NotContains(t, s.logs.String(), "api.listen is not a loopback")
 }
 
 func TestServerReserved(t *testing.T) {

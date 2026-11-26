@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -217,9 +218,32 @@ func New(path string, opt Options) (*Server, error) {
 	for _, e := range s.loadErrs {
 		log.Error("server: config: " + e)
 	}
+	warnAPI(log, s.addrs.API)
 	s.manager.Store(m)
 	s.publish()
 	return s, nil
+}
+
+// loopback reports whether the bound address addr is on a loopback
+// interface.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Unmap().IsLoopback()
+}
+
+// warnAPI logs once, at the start, that the API listens beyond loopback:
+// it has no TLS until M5c, so Basic credentials, the config and the stream
+// keys in it cross the network in clear.
+func warnAPI(log *slog.Logger, addr string) {
+	if loopback(addr) {
+		return
+	}
+	log.Warn("server: api.listen is not a loopback address: the API has no TLS, so passwords and stream keys travel in clear; keep it on loopback or put a TLS reverse proxy in front",
+		"listen", addr)
 }
 
 // stoppedTexts returns the reasons of the streams that cannot run, scrubbed.
