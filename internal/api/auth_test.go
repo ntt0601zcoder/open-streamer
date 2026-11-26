@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/pbkdf2"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -62,12 +64,14 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 // free reports how many logins can be reserved for the pair now, and gives
-// them back. 5 means nothing is in flight and no failure is counted.
+// them back. 5 means nothing is in flight and no failure is counted. It is
+// about the pair's key only: each reservation holds its place of an address
+// of its own, so the cap per address never ends the count.
 func (e *env) free(addr, user string) int {
 	key := e.lim.Key(addr, user)
 	var held []*auth.Attempt
-	for {
-		a, ok := e.lim.Reserve(key)
+	for i := 0; ; i++ {
+		a, ok := e.lim.Reserve(key, fmt.Sprintf("198.18.0.%d:1", i+1))
 		if !ok {
 			break
 		}
@@ -331,6 +335,7 @@ func TestLoginBurst(t *testing.T) {
 		return got
 	}
 
+	// The pair's key admits 5 in all, and the address 4 of them at a time.
 	got := burst(200, "10.0.0.1:1", "wrong password 1")
 	n := int(hashes.Load())
 	assert.LessOrEqual(t, n, 5)
@@ -484,6 +489,220 @@ func TestAttemptAlwaysResolved(t *testing.T) {
 		assert.InDelta(t, 0, e.counter("openstreamer_api_auth_failures_total"), 0)
 		release()
 	})
+}
+
+// TestAPIAddressCap: one address inventing names has at most 4 logins being
+// verified, the rest are 429s, and nobody else is kept out: not another
+// address, not a remembered user of the same address, and not that address
+// itself once the flood is over.
+func TestAPIAddressCap(t *testing.T) {
+	e := newEnv(t)
+	auth.WarmDummy()
+	const flood, elsewhere = "203.0.113.9", "198.51.100.7"
+	port := new(atomic.Int64)
+	// Each request from a port of its own, as each new connection has.
+	fromFlood := func() reqOpt { return from(fmt.Sprintf("%s:%d", flood, 1024+port.Add(1)%60000)) }
+	names := new(atomic.Int64)
+	invented := func() reqOpt {
+		n := names.Add(1)
+		return basic(fmt.Sprintf("ghost%d", n), fmt.Sprintf("some password %d", n))
+	}
+	get := func(opts ...reqOpt) *httptest.ResponseRecorder {
+		return e.do(http.MethodGet, "/api/v1/version", opts...)
+	}
+
+	// Before the flood, ops logs in from the address that will flood.
+	require.Equal(t, http.StatusOK, get(basic("ops", edPass), fromFlood()).Code)
+
+	// The hook counts the PBKDF2 computations, how many are inside, and how
+	// long the slowest took; while gate is set it holds them. An invented
+	// name is verified against the dummy hash, at 600000 iterations: so that
+	// the flood stays fast, the hook computes a PBKDF2 at the test's
+	// iteration count instead and answers with no key, which matches
+	// nothing, unless a login of a real user is under way (realLogin): then
+	// every computation is the real one.
+	var (
+		hashes, inside, real atomic.Int64
+		slowest              atomic.Int64 // ns
+		gate                 atomic.Pointer[chan struct{}]
+	)
+	t.Cleanup(auth.SetHashHook(func(next func() []byte) []byte {
+		hashes.Add(1)
+		inside.Add(1)
+		defer inside.Add(-1)
+		if g := gate.Load(); g != nil {
+			<-*g
+		}
+		start := time.Now()
+		var k []byte
+		if real.Load() > 0 {
+			k = next()
+		} else {
+			_, _ = pbkdf2.Key(sha256.New, "some password", []byte("0123456789abcdef"), 1000, auth.KeyBytes)
+		}
+		if d := int64(time.Since(start)); d > slowest.Load() {
+			slowest.Store(d) // a lost update only lowers the bound below
+		}
+		return k
+	}))
+	// forget stores a new set of the same users, which remembers nobody.
+	forget := func() {
+		real.Add(1)
+		defer real.Add(-1)
+		n := hashes.Load()
+		u, err := auth.NewUsers([]auth.User{
+			{Name: "ops", Role: auth.Editor, Hash: testHash(edPass)},
+			{Name: "eye", Role: auth.Viewer, Hash: testHash(viPass)},
+		})
+		require.NoError(t, err)
+		e.users.Store(u)
+		hashes.Store(n) // hashing their passwords is no login
+	}
+	realLogin := func(opts ...reqOpt) *httptest.ResponseRecorder {
+		real.Add(1)
+		defer real.Add(-1)
+		return get(opts...)
+	}
+	held := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(held) }) }
+	gate.Store(&held)
+	var wg sync.WaitGroup
+	t.Cleanup(wg.Wait)
+	t.Cleanup(release)
+
+	// 1. With the verifications held, the count is exact: of 20 logins at
+	// once, 4 are inside Users.Verify (2 computing, 2 waiting for a turn)
+	// and 16 are refused.
+	answers := make(chan *httptest.ResponseRecorder, 20)
+	for range 20 {
+		cred, addr := invented(), fromFlood()
+		wg.Go(func() { answers <- get(cred, addr) })
+	}
+	for range 16 {
+		select {
+		case rec := <-answers:
+			require.Equal(t, http.StatusTooManyRequests, rec.Code)
+			assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+			assert.Equal(t, codeTooMany, errOf(t, rec).Code)
+		case <-time.After(10 * time.Second):
+			require.FailNow(t, "a refusal is missing")
+		}
+	}
+	waitFor(t, "2 computing", func() bool { return inside.Load() == 2 })
+	select {
+	case rec := <-answers:
+		require.FailNow(t, "a 17th answer", "%d", rec.Code)
+	case <-time.After(50 * time.Millisecond):
+	}
+	assert.EqualValues(t, 2, hashes.Load(), "the other 2 wait inside Verify")
+	assert.InDelta(t, 16, e.counter("openstreamer_api_auth_blocked_total"), 0)
+	// More of them are refused the same way, whatever the name and the port.
+	for range 20 {
+		rec := get(invented(), fromFlood())
+		require.Equal(t, http.StatusTooManyRequests, rec.Code)
+		assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+	}
+	// The remembered user of the address takes no place and is let in.
+	require.Equal(t, http.StatusOK, get(basic("ops", edPass), fromFlood()).Code)
+	// Another address has its own 4 places: its login is not refused, it
+	// waits its turn and is verified.
+	waiting := make(chan int, 1)
+	cred := invented()
+	wg.Go(func() { waiting <- get(cred, from(elsewhere+":1")).Code })
+	release()
+	gate.Store(nil)
+	for range 4 {
+		select {
+		case rec := <-answers:
+			assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		case <-time.After(30 * time.Second):
+			require.FailNow(t, "a held login did not return")
+		}
+	}
+	select {
+	case code := <-waiting:
+		assert.Equal(t, http.StatusUnauthorized, code, "a login from another address")
+	case <-time.After(30 * time.Second):
+		require.FailNow(t, "the login from another address did not return")
+	}
+	assert.InDelta(t, 36, e.counter("openstreamer_api_auth_blocked_total"), 0)
+	assert.InDelta(t, 5, e.counter("openstreamer_api_auth_failures_total"), 0)
+	assert.EqualValues(t, 5, hashes.Load())
+
+	// 2. The flood, with real PBKDF2: 20 clients of the address send
+	// invented names one after another, 200 requests at least, until the
+	// rows below are through.
+	forget()
+	require.Equal(t, http.StatusOK, realLogin(basic("ops", edPass), fromFlood()).Code)
+	hashes.Store(0)
+	slowest.Store(0)
+	var (
+		sent, got401, got429, gotOther atomic.Int64
+		stop                           = make(chan struct{})
+		flooders                       sync.WaitGroup
+	)
+	for range 20 {
+		flooders.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rec := get(invented(), fromFlood())
+				sent.Add(1)
+				switch {
+				case rec.Code == http.StatusUnauthorized:
+					got401.Add(1)
+				case rec.Code == http.StatusTooManyRequests && rec.Header().Get("Retry-After") == "1":
+					got429.Add(1)
+					time.Sleep(time.Millisecond) // a refusal costs nothing: do not spin
+				default:
+					gotOther.Add(1)
+				}
+			}
+		})
+	}
+	stopFlood := sync.OnceFunc(func() { close(stop); flooders.Wait() })
+	t.Cleanup(stopFlood)
+	waitFor(t, "the flood is verifying", func() bool { return got401.Load() >= 2 && got429.Load() > 0 })
+
+	// A real user from another address logs in, within the time of four
+	// verifications: at most 4 of the flood's are before it.
+	start := time.Now()
+	require.Equal(t, http.StatusOK, realLogin(basic("eye", viPass), from(elsewhere+":2")).Code)
+	took := time.Since(start)
+	// The remembered user of the flooding address keeps getting in.
+	for range 20 {
+		require.Equal(t, http.StatusOK, get(basic("ops", edPass), fromFlood()).Code)
+	}
+	waitFor(t, "200 requests", func() bool { return sent.Load() >= 200 })
+	stopFlood()
+	// The slack is for a loaded machine: the bound is 4 verifications, not 18.
+	assert.LessOrEqual(t, took, 4*time.Duration(slowest.Load())+2*time.Second,
+		"a login from another address waited behind more than 4 verifications")
+	assert.Zero(t, gotOther.Load(), "an answer that is neither 401 nor 429 with Retry-After 1")
+	assert.Positive(t, got429.Load())
+	// Every login that was not refused was verified once: the flood's and eye's.
+	assert.Equal(t, got401.Load()+1, hashes.Load())
+	assert.InDelta(t, float64(36+got429.Load()), e.counter("openstreamer_api_auth_blocked_total"), 0)
+
+	// 3. The flood is over: nothing is left behind. A user nobody remembers
+	// logs in from that address at once, and its 4 places are all free.
+	forget()
+	before := hashes.Load()
+	require.Equal(t, http.StatusOK, realLogin(basic("ops", edPass), fromFlood()).Code)
+	assert.Equal(t, before+1, hashes.Load(), "a real verification")
+	places := make([]*auth.Attempt, 0, 5)
+	for i := range 5 {
+		a, ok := e.lim.Reserve(e.lim.Key(flood+":1", fmt.Sprintf("after%d", i)), flood+":1")
+		assert.Equal(t, i < 4, ok, "place %d", i+1)
+		places = append(places, a)
+	}
+	for _, a := range places {
+		a.Abandon()
+	}
 }
 
 func TestRememberedTouchesNoLimiter(t *testing.T) {

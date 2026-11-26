@@ -2,8 +2,10 @@ package auth
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,13 +34,48 @@ func (c *fakeClock) add(d time.Duration) {
 	c.mu.Unlock()
 }
 
+var addrSeq atomic.Uint32
+
+// anyAddr is an address no other attempt of the test holds a place of, for
+// the rows that are about the name key: the cap of attempts in flight per
+// address never refuses them.
+func anyAddr() string {
+	n := addrSeq.Add(1)
+	return fmt.Sprintf("198.%d.%d.%d:1", 18+n>>16&1, n>>8&255, n&255)
+}
+
+// addrCount is the attempts in flight the limiter counts for the client of
+// remoteAddr, and whether it tracks the address at all.
+func (l *Limiter) addrCount(remoteAddr string) (int, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n, ok := l.addrs[ClientKey(remoteAddr)]
+	return n, ok
+}
+
+func (l *Limiter) addrSize() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.addrs)
+}
+
+func (l *Limiter) keySet() map[string]entry {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]entry, len(l.entries))
+	for k, e := range l.entries {
+		out[k] = *e
+	}
+	return out
+}
+
 // places counts how many attempts can be reserved for key now, and
 // abandons them all.
 func places(t *testing.T, l *Limiter, key string) int {
 	t.Helper()
 	var held []*Attempt
 	for range 100 {
-		a, ok := l.Reserve(key)
+		a, ok := l.Reserve(key, anyAddr())
 		if !ok {
 			break
 		}
@@ -52,7 +89,7 @@ func places(t *testing.T, l *Limiter, key string) int {
 
 func failOnce(t *testing.T, l *Limiter, key string) {
 	t.Helper()
-	a, ok := l.Reserve(key)
+	a, ok := l.Reserve(key, anyAddr())
 	require.True(t, ok, "reserve")
 	a.Fail()
 }
@@ -87,7 +124,7 @@ func TestLimiter(t *testing.T) {
 	ra, blocked := l.Blocked(key)
 	assert.True(t, blocked)
 	assert.Equal(t, time.Second, ra)
-	_, ok := l.Reserve(key)
+	_, ok := l.Reserve(key, anyAddr())
 	assert.False(t, ok, "reserved while blocked")
 	clk.add(500 * time.Millisecond)
 	ra, blocked = l.Blocked(key)
@@ -113,7 +150,7 @@ func TestLimiter(t *testing.T) {
 	assert.Equal(t, 16, e.failures)
 
 	// Abandon changes nothing.
-	a, ok := l.Reserve(key)
+	a, ok := l.Reserve(key, anyAddr())
 	require.True(t, ok)
 	a.Abandon()
 	e2, ok := l.entryFor(key)
@@ -129,7 +166,7 @@ func TestLimiter(t *testing.T) {
 	ra, blocked = l.Blocked(key)
 	require.True(t, blocked)
 	clk.add(ra)
-	a, ok = l.Reserve(key)
+	a, ok = l.Reserve(key, anyAddr())
 	require.True(t, ok)
 	a.Succeed()
 	_, blocked = l.Blocked(key)
@@ -143,7 +180,7 @@ func TestLimiter(t *testing.T) {
 
 	// Below the threshold too.
 	failOnce(t, l, key)
-	a, ok = l.Reserve(key)
+	a, ok = l.Reserve(key, anyAddr())
 	require.True(t, ok)
 	a.Succeed()
 	assert.Equal(t, 5, places(t, l, key))
@@ -172,7 +209,7 @@ func TestLimiterInFlightAndSucceed(t *testing.T) {
 
 	held := make([]*Attempt, 0, 6)
 	for range 3 {
-		a, ok := l.Reserve(key)
+		a, ok := l.Reserve(key, anyAddr())
 		require.True(t, ok)
 		held = append(held, a)
 	}
@@ -180,11 +217,11 @@ func TestLimiterInFlightAndSucceed(t *testing.T) {
 	held[0].Succeed()
 	assert.Equal(t, 3, places(t, l, key), "Attempt.Succeed dropped the other attempts in flight")
 	for range 3 {
-		a, ok := l.Reserve(key)
+		a, ok := l.Reserve(key, anyAddr())
 		require.True(t, ok)
 		held = append(held, a)
 	}
-	_, ok := l.Reserve(key)
+	_, ok := l.Reserve(key, anyAddr())
 	assert.False(t, ok, "5 in flight")
 	held[1].Fail()
 	held[2].Abandon()
@@ -216,7 +253,7 @@ func TestLimiterReservesBeforeVerifying(t *testing.T) {
 	for range 200 {
 		wg.Go(func() {
 			<-startGate
-			if a, ok := l.Reserve(key); ok {
+			if a, ok := l.Reserve(key, anyAddr()); ok {
 				mu.Lock()
 				held = append(held, a)
 				mu.Unlock()
@@ -231,7 +268,7 @@ func TestLimiterReservesBeforeVerifying(t *testing.T) {
 	}
 	_, blocked := l.Blocked(key)
 	assert.True(t, blocked)
-	_, ok := l.Reserve(key)
+	_, ok := l.Reserve(key, anyAddr())
 	assert.False(t, ok)
 
 	clk := newFakeClock()
@@ -239,16 +276,16 @@ func TestLimiterReservesBeforeVerifying(t *testing.T) {
 	for range 3 {
 		failOnce(t, l, key)
 	}
-	a1, ok := l.Reserve(key)
+	a1, ok := l.Reserve(key, anyAddr())
 	require.True(t, ok)
-	a2, ok := l.Reserve(key)
+	a2, ok := l.Reserve(key, anyAddr())
 	require.True(t, ok)
-	_, ok = l.Reserve(key)
+	_, ok = l.Reserve(key, anyAddr())
 	assert.False(t, ok, "3 failures and 2 in flight")
 	a1.Abandon()
-	a3, ok := l.Reserve(key)
+	a3, ok := l.Reserve(key, anyAddr())
 	assert.True(t, ok, "an Abandon gives a place back")
-	_, ok = l.Reserve(key)
+	_, ok = l.Reserve(key, anyAddr())
 	assert.False(t, ok)
 	a2.Abandon()
 	a3.Abandon()
@@ -288,7 +325,7 @@ func TestLimiterBounded(t *testing.T) {
 	l := NewLimiter(clk.now)
 	pinned := l.Key("192.168.0.1:1", "ops")
 	failOnce(t, l, pinned)
-	hold, ok := l.Reserve(pinned)
+	hold, ok := l.Reserve(pinned, anyAddr())
 	require.True(t, ok)
 
 	keys := make([]string, 5000)
@@ -320,18 +357,18 @@ func TestLimiterFullOfInFlight(t *testing.T) {
 	l := NewLimiter(newFakeClock().now)
 	held := make([]*Attempt, 0, maxKeys)
 	for i := range maxKeys {
-		a, ok := l.Reserve(l.Key(fmt.Sprintf("10.%d.%d.1:1", i/256, i%256), "ops"))
+		a, ok := l.Reserve(l.Key(fmt.Sprintf("10.%d.%d.1:1", i/256, i%256), "ops"), anyAddr())
 		require.True(t, ok)
 		held = append(held, a)
 	}
-	_, ok := l.Reserve(l.Key("192.168.0.1:1", "ops"))
+	_, ok := l.Reserve(l.Key("192.168.0.1:1", "ops"), anyAddr())
 	assert.False(t, ok)
 	assert.Equal(t, maxKeys, l.size())
 	for _, a := range held {
 		a.Abandon()
 	}
 	assert.Equal(t, 0, l.size())
-	_, ok = l.Reserve(l.Key("192.168.0.1:1", "ops"))
+	_, ok = l.Reserve(l.Key("192.168.0.1:1", "ops"), anyAddr())
 	assert.True(t, ok)
 }
 
@@ -343,7 +380,7 @@ func TestLimiterConcurrent(t *testing.T) {
 			for i := range 500 {
 				key := l.Key(fmt.Sprintf("10.0.%d.%d:1", g, i%7), "ops")
 				l.Blocked(key)
-				if a, ok := l.Reserve(key); ok {
+				if a, ok := l.Reserve(key, anyAddr()); ok {
 					switch i % 3 {
 					case 0:
 						a.Fail()
@@ -427,9 +464,9 @@ func TestLimiterEvictsBlockedLast(t *testing.T) {
 		clk.add(time.Millisecond) // each newer than the last, all inside 15 min
 	}
 	clk.add(time.Second) // keys[0]'s 1 s backoff has run out
-	hold, ok := l.Reserve(keys[0])
+	hold, ok := l.Reserve(keys[0], anyAddr())
 	require.True(t, ok)
-	_, ok = l.Reserve(l.Key("192.168.0.1:1", "ops"))
+	_, ok = l.Reserve(l.Key("192.168.0.1:1", "ops"), anyAddr())
 	require.True(t, ok)
 	assert.Equal(t, maxKeys, l.size())
 	_, ok = l.entryFor(keys[0])
@@ -453,9 +490,319 @@ func TestLimiterRefusedReserveEvictsNothing(t *testing.T) {
 	for range 4 {
 		failOnce(t, l, keys[len(keys)-1])
 	}
-	_, ok := l.Reserve(keys[len(keys)-1])
+	_, ok := l.Reserve(keys[len(keys)-1], anyAddr())
 	require.False(t, ok, "blocked")
 	_, ok = l.entryFor(keys[0])
 	assert.True(t, ok, "a refused Reserve evicted a key")
 	assert.Equal(t, maxKeys, l.size())
+}
+
+// TestLimiterAddressCap: one client address holds at most addrInFlight
+// unresolved attempts, whatever names it presents, and nothing else is kept
+// per address.
+func TestLimiterAddressCap(t *testing.T) {
+	const a1, a2 = "203.0.113.9:1000", "203.0.113.10:1000"
+	seq := 0
+	// fresh reserves for a name the address has not presented before.
+	fresh := func(l *Limiter, addr string) (*Attempt, bool) {
+		seq++
+		return l.Reserve(l.Key(addr, fmt.Sprintf("name%d", seq)), addr)
+	}
+	fill := func(t *testing.T, l *Limiter, addr string) []*Attempt {
+		t.Helper()
+		held := make([]*Attempt, 0, addrInFlight)
+		for i := range addrInFlight {
+			a, ok := fresh(l, addr)
+			require.True(t, ok, "attempt %d", i+1)
+			held = append(held, a)
+		}
+		return held
+	}
+
+	t.Run("the fifth is refused", func(t *testing.T) {
+		l := NewLimiter(newFakeClock().now)
+		held := fill(t, l, a1)
+		_, ok := fresh(l, a1)
+		assert.False(t, ok, "a 5th attempt in flight")
+		// Another port of the address is the same client.
+		_, ok = fresh(l, "203.0.113.9:2000")
+		assert.False(t, ok, "another port")
+		n, _ := l.addrCount(a1)
+		assert.Equal(t, addrInFlight, n)
+
+		// Another address is not concerned, before, during and after.
+		other := fill(t, l, a2)
+		_, ok = fresh(l, a2)
+		assert.False(t, ok)
+		for _, a := range other {
+			a.Abandon()
+		}
+		for _, a := range held {
+			a.Abandon()
+		}
+		a, ok := fresh(l, a2)
+		require.True(t, ok)
+		a.Abandon()
+	})
+
+	t.Run("each resolution gives a place back", func(t *testing.T) {
+		for name, resolve := range map[string]func(*Attempt){
+			"Succeed": (*Attempt).Succeed,
+			"Fail":    (*Attempt).Fail,
+			"Abandon": (*Attempt).Abandon,
+		} {
+			l := NewLimiter(newFakeClock().now)
+			held := fill(t, l, a1)
+			_, ok := fresh(l, a1)
+			require.False(t, ok, name)
+			resolve(held[0])
+			a, ok := fresh(l, a1)
+			require.True(t, ok, "after %s", name)
+			_, ok = fresh(l, a1)
+			assert.False(t, ok, "%s gave more than one place back", name)
+			// Resolving again gives nothing more back.
+			held[0].Abandon()
+			held[0].Fail()
+			held[0].Succeed()
+			_, ok = fresh(l, a1)
+			assert.False(t, ok, "%s twice gave a second place back", name)
+			a.Abandon()
+			for _, h := range held[1:] {
+				h.Abandon()
+			}
+			assert.Equal(t, 0, l.addrSize(), name)
+		}
+	})
+
+	t.Run("failures never block the address", func(t *testing.T) {
+		clk := newFakeClock()
+		l := NewLimiter(clk.now)
+		for i := range 100 {
+			a, ok := fresh(l, a1)
+			require.True(t, ok, "attempt %d", i+1)
+			a.Fail()
+		}
+		_, tracked := l.addrCount(a1)
+		assert.False(t, tracked, "nothing is kept for an address with nothing in flight")
+		a, ok := fresh(l, a1)
+		require.True(t, ok, "the 101st")
+		a.Abandon()
+		held := fill(t, l, a1)
+		for _, h := range held {
+			h.Fail()
+		}
+		// There is no per-address state to expire: 15 min later nothing has
+		// changed either.
+		clk.add(idleAfter)
+		held = fill(t, l, a1)
+		_, ok = fresh(l, a1)
+		assert.False(t, ok)
+		for _, h := range held {
+			h.Abandon()
+		}
+		assert.Equal(t, 0, l.addrSize())
+	})
+
+	t.Run("a refusal by the name key takes no place", func(t *testing.T) {
+		l := NewLimiter(newFakeClock().now)
+		blocked := l.Key(a1, "admin")
+		for range maxAttempts {
+			a, ok := l.Reserve(blocked, a1)
+			require.True(t, ok)
+			a.Fail()
+		}
+		_, isBlocked := l.Blocked(blocked)
+		require.True(t, isBlocked)
+		for range 10 {
+			_, ok := l.Reserve(blocked, a1)
+			require.False(t, ok, "the blocked key")
+		}
+		_, tracked := l.addrCount(a1)
+		assert.False(t, tracked, "a refused Reserve took a place")
+		held := fill(t, l, a1)
+		for _, h := range held {
+			h.Abandon()
+		}
+
+		// A key refused for its attempts in flight, too.
+		l = NewLimiter(newFakeClock().now)
+		busy := l.Key(a1, "ops")
+		for range maxAttempts - 2 {
+			a, ok := l.Reserve(busy, a1)
+			require.True(t, ok)
+			a.Fail()
+		}
+		h1, ok := l.Reserve(busy, a1)
+		require.True(t, ok)
+		h2, ok := l.Reserve(busy, a1)
+		require.True(t, ok)
+		for range 10 {
+			_, ok = l.Reserve(busy, a1)
+			require.False(t, ok, "3 failures and 2 in flight")
+		}
+		n, _ := l.addrCount(a1)
+		assert.Equal(t, 2, n)
+		h1.Abandon()
+		h2.Abandon()
+		assert.Equal(t, 0, l.addrSize())
+	})
+
+	t.Run("an IPv6 client is its /64", func(t *testing.T) {
+		l := NewLimiter(newFakeClock().now)
+		held := make([]*Attempt, 0, addrInFlight)
+		for i := range addrInFlight {
+			a, ok := fresh(l, fmt.Sprintf("[2001:db8:1:2::%x]:443", i+1))
+			require.True(t, ok)
+			held = append(held, a)
+		}
+		_, ok := fresh(l, "[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:443")
+		assert.False(t, ok, "a 5th address of the /64")
+		a, ok := fresh(l, "[2001:db8:1:3::1]:443")
+		assert.True(t, ok, "another /64")
+		a.Abandon()
+		// An IPv4-mapped address is the IPv4 client.
+		v4 := fill(t, l, "192.0.2.7:1")
+		_, ok = fresh(l, "[::ffff:192.0.2.7]:9")
+		assert.False(t, ok, "the IPv4-mapped form")
+		for _, h := range append(held, v4...) {
+			h.Abandon()
+		}
+		assert.Equal(t, 0, l.addrSize())
+	})
+
+	t.Run("the address map empties", func(t *testing.T) {
+		l := NewLimiter(newFakeClock().now)
+		held := make([]*Attempt, 0, 50*addrInFlight)
+		for i := range 50 {
+			held = append(held, fill(t, l, fmt.Sprintf("10.9.%d.1:1", i))...)
+		}
+		assert.Equal(t, 50, l.addrSize())
+		for i, h := range held {
+			switch i % 3 {
+			case 0:
+				h.Fail()
+			case 1:
+				h.Succeed()
+			default:
+				h.Abandon()
+			}
+		}
+		assert.Equal(t, 0, l.addrSize(), "an address with nothing in flight is still tracked")
+	})
+
+	t.Run("a place cannot leak with the name entry", func(t *testing.T) {
+		// Unreachable today: an entry with an attempt in flight is never
+		// deleted. Were it, the address's place would still come back.
+		l := NewLimiter(newFakeClock().now)
+		key := l.Key(a1, "ops")
+		a, ok := l.Reserve(key, a1)
+		require.True(t, ok)
+		l.mu.Lock()
+		delete(l.entries, key)
+		l.mu.Unlock()
+		a.Fail()
+		assert.Equal(t, 0, l.addrSize())
+	})
+
+	t.Run("concurrent", func(t *testing.T) {
+		l := NewLimiter(nil)
+		const addrs = 5
+		var (
+			inFlight [addrs]atomic.Int32
+			most     [addrs]atomic.Int32
+			refused  atomic.Int64
+			wg       sync.WaitGroup
+		)
+		for g := range 50 {
+			wg.Go(func() {
+				n := g % addrs
+				addr := fmt.Sprintf("10.8.0.%d:%d", n+1, 1000+g)
+				for i := range 400 {
+					a, ok := l.Reserve(l.Key(addr, fmt.Sprintf("g%d-%d", g, i)), addr)
+					if !ok {
+						refused.Add(1)
+						continue
+					}
+					now := inFlight[n].Add(1)
+					for {
+						m := most[n].Load()
+						if now <= m || most[n].CompareAndSwap(m, now) {
+							break
+						}
+					}
+					runtime.Gosched() // held for a moment, so that attempts overlap
+					// Counted down before the place goes back, so the count
+					// never runs ahead of the limiter's.
+					inFlight[n].Add(-1)
+					switch i % 3 {
+					case 0:
+						a.Fail()
+					case 1:
+						a.Succeed()
+					default:
+						a.Abandon()
+					}
+				}
+			})
+		}
+		wg.Wait()
+		for n := range addrs {
+			assert.LessOrEqual(t, int(most[n].Load()), addrInFlight, "address %d", n)
+		}
+		assert.Equal(t, 0, l.addrSize())
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		for _, e := range l.entries {
+			assert.Equal(t, 0, e.inFlight)
+		}
+	})
+}
+
+// TestLimiterAddressCapEvictsNothing: a Reserve the address's cap refuses
+// leaves a full name table as it was: nothing evicted, nothing inserted.
+func TestLimiterAddressCapEvictsNothing(t *testing.T) {
+	clk := newFakeClock()
+	l := NewLimiter(clk.now)
+	const addr = "203.0.113.9:1"
+	held := make([]*Attempt, 0, addrInFlight)
+	for i := range addrInFlight {
+		a, ok := l.Reserve(l.Key(addr, fmt.Sprintf("held%d", i)), addr)
+		require.True(t, ok)
+		held = append(held, a)
+	}
+	for i := 0; l.size() < maxKeys; i++ {
+		clk.add(time.Millisecond)
+		failOnce(t, l, l.Key(fmt.Sprintf("10.%d.%d.1:1", i/256, i%256), "ops"))
+	}
+	// Past sweepEvery, so a lookup would sweep, and past nothing's idleAfter.
+	clk.add(2 * sweepEvery)
+	before := l.keySet()
+	require.Len(t, before, maxKeys)
+	l.mu.Lock()
+	lastSweep := l.lastSweep
+	l.mu.Unlock()
+
+	newKey := l.Key(addr, "a new name")
+	_, ok := l.Reserve(newKey, addr)
+	require.False(t, ok, "a 5th attempt in flight")
+	assert.Equal(t, before, l.keySet(), "the refused Reserve changed the name table")
+	_, ok = l.entryFor(newKey)
+	assert.False(t, ok, "the refused Reserve inserted its key")
+	l.mu.Lock()
+	assert.Equal(t, lastSweep, l.lastSweep, "the refused Reserve looked the name table up")
+	l.mu.Unlock()
+	n, _ := l.addrCount(addr)
+	assert.Equal(t, addrInFlight, n)
+
+	// With a place back, the same Reserve is admitted.
+	held[0].Abandon()
+	a, ok := l.Reserve(newKey, addr)
+	require.True(t, ok)
+	_, ok = l.entryFor(newKey)
+	assert.True(t, ok)
+	a.Abandon()
+	for _, h := range held[1:] {
+		h.Abandon()
+	}
+	assert.Equal(t, 0, l.addrSize())
 }

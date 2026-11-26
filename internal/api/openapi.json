@@ -1262,7 +1262,7 @@
         }
       },
       "TooManyAttempts": {
-        "description": "too_many_attempts: this address and user name are in a backoff after failed logins, or have 5 logins counted or in flight. The address is the connection's: behind a reverse proxy every client shares the proxy's address and so one limit (a trusted-proxy setting comes with M5c).",
+        "description": "too_many_attempts: this address and user name are in a backoff after failed logins, or have 5 logins counted or in flight, or this address has 4 logins being verified, whatever their user names. No address is blocked for failed logins. The address is the connection's: behind a reverse proxy every client shares the proxy's address and so the per-name limits and the one cap of 4.",
         "headers": {
           "Retry-After": {
             "schema": {

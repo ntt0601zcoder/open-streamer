@@ -31,6 +31,9 @@ const (
 	maxFailures = 1 << 20
 )
 
+// addrInFlight is how many unresolved attempts one client address may hold.
+const addrInFlight = 4
+
 // entry is one key's state. An entry with no failures and nothing in
 // flight is the same as no entry, and is deleted.
 type entry struct {
@@ -40,8 +43,10 @@ type entry struct {
 }
 
 // Limiter counts failed logins per client address and presented user name
-// and refuses further attempts while a key is in a backoff. It is safe for
-// concurrent use and starts no goroutine: it prunes when it is called.
+// and refuses further attempts while a key is in a backoff. It also caps
+// the unresolved attempts of one client address, whatever names it
+// presents, at addrInFlight. It is safe for concurrent use and starts no
+// goroutine: it prunes when it is called.
 type Limiter struct {
 	now    func() time.Time
 	secret []byte // HMAC key of Key, per Limiter
@@ -49,6 +54,10 @@ type Limiter struct {
 	mu        sync.Mutex
 	entries   map[string]*entry
 	lastSweep time.Time
+	// addrs is the unresolved attempts per ClientKey. An address with none
+	// has no entry, so the attempts in flight bound the map: it has no
+	// eviction, no idle rule and no sweep, and it never counts failures.
+	addrs map[string]int
 }
 
 // NewLimiter returns an empty Limiter reading the time from now; nil
@@ -59,7 +68,12 @@ func NewLimiter(now func() time.Time) *Limiter {
 	}
 	secret := make([]byte, 32)
 	randomBytes(secret)
-	return &Limiter{now: now, secret: secret, entries: make(map[string]*entry)}
+	return &Limiter{
+		now:     now,
+		secret:  secret,
+		entries: make(map[string]*entry),
+		addrs:   make(map[string]int),
+	}
 }
 
 // Key is the limiter's key for a client and the user name it presents:
@@ -130,13 +144,24 @@ func (l *Limiter) Blocked(key string) (retryAfter time.Duration, blocked bool) {
 	return d, d > 0
 }
 
-// Reserve takes one in-flight attempt for key, unless the key is blocked
-// or its counted failures plus its attempts in flight are already 5. Past
-// 5 failures, once the backoff has run out, failures count as 4, so the
-// key gets one attempt at a time.
+// Reserve takes one in-flight attempt for key and one of the addrInFlight
+// places of the client of remoteAddr (ClientKey), or neither. The address
+// is judged first: a refusal by its cap looks up, inserts and evicts
+// nothing in the name table. Then key is judged exactly as before.
+//
+// The address: a client with addrInFlight unresolved attempts is refused,
+// whatever name it presents, until one of them is resolved. Nothing else
+// is kept per address: no failure is counted against it and it is never
+// blocked, because behind a shared address (a reverse proxy, a NAT) a
+// block would let one client lock every other out.
+//
+// The key: it is refused when it is blocked or when its counted failures
+// plus its attempts in flight are already 5. Past 5 failures, once the
+// backoff has run out, failures count as 4, so the key gets one attempt at
+// a time. A refusal by the key takes no place of the address.
 //
 // The caller defers attempt.Abandon() right after a successful Reserve:
-// an unresolved Attempt holds its place for ever, and Abandon after
+// an unresolved Attempt holds its two places for ever, and Abandon after
 // Succeed or Fail does nothing.
 //
 // Eviction: a key the table does not hold is always admitted (it has no
@@ -153,9 +178,13 @@ func (l *Limiter) Blocked(key string) (retryAfter time.Duration, blocked bool) {
 // deletes the new key; that leaves a vacancy the next new key fills
 // without evicting, so abandoned attempts cost at most one eviction per
 // vacancy they create, and only failures that are counted grow the table.
-func (l *Limiter) Reserve(key string) (*Attempt, bool) {
+func (l *Limiter) Reserve(key, remoteAddr string) (*Attempt, bool) {
+	addr := ClientKey(remoteAddr)
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.addrs[addr] >= addrInFlight {
+		return nil, false
+	}
 	now := l.now()
 	e := l.lookup(key, now)
 	if blockedFor(e, now) > 0 {
@@ -172,7 +201,8 @@ func (l *Limiter) Reserve(key string) (*Attempt, bool) {
 		return nil, false
 	}
 	e.inFlight++
-	return &Attempt{l: l, key: key}, true
+	l.addrs[addr]++
+	return &Attempt{l: l, key: key, addr: addr}, true
 }
 
 // evict drops, among the keys with nothing in flight, the one with the
@@ -225,7 +255,8 @@ func (l *Limiter) dropIfEmpty(key string, e *entry) {
 type Attempt struct {
 	l    *Limiter
 	key  string
-	done bool // guarded by l.mu
+	addr string // the ClientKey whose place it holds
+	done bool   // guarded by l.mu
 }
 
 type outcome int
@@ -247,6 +278,13 @@ func (a *Attempt) resolve(o outcome) {
 		return
 	}
 	a.done = true
+	// The address's place goes back first, so that it cannot leak whatever
+	// became of the name entry.
+	if n := l.addrs[a.addr] - 1; n > 0 {
+		l.addrs[a.addr] = n
+	} else {
+		delete(l.addrs, a.addr)
+	}
 	e := l.entries[a.key]
 	if e == nil {
 		return // unreachable: an entry with an attempt in flight is never deleted
@@ -263,15 +301,15 @@ func (a *Attempt) resolve(o outcome) {
 	l.dropIfEmpty(a.key, e)
 }
 
-// Succeed gives the place back and zeroes the key's failures. Only a real
+// Succeed gives both places back and zeroes the key's failures. Only a real
 // verification calls it; a remembered login touches no limiter state.
 func (a *Attempt) Succeed() { a.resolve(succeeded) }
 
-// Fail gives the place back, counts one failure and starts or lengthens
-// the backoff.
+// Fail gives both places back, counts one failure against the key and
+// starts or lengthens its backoff. Nothing is counted against the address.
 func (a *Attempt) Fail() { a.resolve(failed) }
 
-// Abandon gives the place back and counts nothing: the request went away,
+// Abandon gives both places back and counts nothing: the request went away,
 // or the server was busy.
 func (a *Attempt) Abandon() { a.resolve(abandoned) }
 

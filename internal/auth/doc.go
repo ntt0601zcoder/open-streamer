@@ -13,8 +13,12 @@
 //  2. Users.Remembered: success with no PBKDF2 and no reservation. The
 //     remembered path touches no limiter state: only a real verification
 //     (Attempt.Succeed) zeroes a key's failures.
-//  3. Limiter.Reserve(key): refuse when it is false; otherwise defer
-//     attempt.Abandon() at once, so every exit resolves the attempt.
+//  3. Limiter.Reserve(key, remoteAddr): refuse when it is false; otherwise
+//     defer attempt.Abandon() at once, so every exit resolves the attempt.
+//     Besides the key's place it takes one of the 4 places of the client
+//     address, held until the attempt is resolved, so across Users.Verify
+//     and its queue: one address inventing names has at most 4
+//     verifications in flight. An address is never blocked for failures.
 //  4. Users.Verify, then Attempt.Succeed, or Attempt.Fail on
 //     ErrBadCredentials; the deferred Abandon covers ErrBusy, a ctx error
 //     and a panic, and does nothing after Succeed or Fail.

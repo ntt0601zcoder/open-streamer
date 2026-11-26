@@ -382,7 +382,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	role, remembered := users.Remembered(name, password)
 	if !remembered {
-		attempt, ok := a.opt.Limiter.Reserve(key)
+		// Only here, where a verification would start, does the address's
+		// cap of verifications in flight count: a remembered login took no
+		// place. Every refusal is answered alike.
+		attempt, ok := a.opt.Limiter.Reserve(key, r.RemoteAddr)
 		if !ok {
 			a.tooMany(rec, time.Second)
 			return
