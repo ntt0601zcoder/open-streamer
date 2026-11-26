@@ -1938,3 +1938,29 @@ func TestManagerConcurrentLiveEdits(t *testing.T) {
 	}
 	assert.Empty(t, l.Overlaps(), "two readers of one input at once")
 }
+
+// The manager reports an audio language edit as "live", and one that also
+// changes the layout as "rebuild".
+func TestManagerAudioLanguageOutcome(t *testing.T) {
+	r := newMrig(t)
+	cam := named("cam")
+	assert.Equal(t, outcomes("cam", "created"), r.replace(cam))
+	r.waitRunning("cam")
+	sup, gen := r.sup("cam"), r.status("cam").Generation
+
+	cam.AudioLanguage = "vi"
+	assert.Equal(t, outcomes("cam", "live"), r.replace(cam))
+	assert.Same(t, sup, r.sup("cam"))
+	assert.Equal(t, gen, r.status("cam").Generation)
+	assert.Zero(t, r.status("cam").Rebuilds)
+	got, ok := r.m.Get("cam")
+	require.True(t, ok)
+	assert.Equal(t, "vi", got.AudioLanguage)
+
+	cam.AudioLanguage = "en"
+	cam.Layout = []string{"audio", "video"}
+	assert.Equal(t, outcomes("cam", "rebuild"), r.replace(cam))
+	assert.Same(t, sup, r.sup("cam"))
+	assert.Equal(t, gen+1, r.status("cam").Generation)
+	assert.Equal(t, uint64(1), r.status("cam").Rebuilds)
+}

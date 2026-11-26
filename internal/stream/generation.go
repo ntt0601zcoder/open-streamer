@@ -399,10 +399,12 @@ func (s *Supervisor) publish(g *generation, o spec.Outputs) {
 
 // startPackagers starts every packager of g, each subscribed under
 // "packager <served name>". One that starts on a hub that is already live,
-// which is HLS and DASH turned on in the middle of a stream, joins it.
+// which is HLS and DASH turned on in the middle of a stream, joins it. Each
+// starts with the audio language of the spec in force (R-L5): s.spec is
+// read unlocked, as build does, since the Run goroutine is its only writer.
 func (s *Supervisor) startPackagers(g *generation) {
 	for _, ps := range g.packSpecs {
-		opt := live.Options{Join: ps.hub.Live()}
+		opt := live.Options{Join: ps.hub.Live(), AudioLanguage: s.spec.AudioLanguage}
 		if ps.abr {
 			opt.ABR, opt.Logger = true, s.log
 		}

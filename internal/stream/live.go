@@ -91,7 +91,8 @@ func sameWatermark(a, b spec.Stream) bool {
 }
 
 // applyLive takes g from old to new, which differ in the inputs, the
-// watermark and maybe the outputs, without ending a session (R-E3, R-E4).
+// watermark, the audio language and maybe the outputs, without ending a
+// session (R-E3, R-E4, R-L5).
 // Run goroutine only. It never holds s.mu across a call into the pipeline or
 // the transcoder: SetInputs waits for the pipeline's loop, whose OnEvent
 // takes s.mu, and Status must not wait behind either.
@@ -128,6 +129,14 @@ func (s *Supervisor) applyLive(g *generation, old, new spec.Stream) {
 	// 4. The outputs, as for an output edit.
 	if spec.Diff(spec.Stream{Outputs: old.Outputs}, spec.Stream{Outputs: new.Outputs}) != spec.ChangeNone {
 		s.reattach(g, old.Outputs, new.Outputs)
+	}
+	// 5. The audio language, handed to every running packager; one that
+	// step 4 started already has it. SetAudioLanguage is an atomic store, so
+	// s.mu is not needed.
+	if old.AudioLanguage != new.AudioLanguage {
+		for _, r := range g.packs {
+			r.p.SetAudioLanguage(new.AudioLanguage)
+		}
 	}
 }
 

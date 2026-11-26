@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -796,4 +797,74 @@ func TestManagerLiveOutcome(t *testing.T) {
 	assert.Same(t, sup, r.sup("cam"), "a rebuild keeps the supervisor too")
 	assert.Equal(t, gen+1, r.status("cam").Generation)
 	assert.Equal(t, uint64(1), r.status("cam").Rebuilds)
+}
+
+// langs is the audio language each packager of v reports, by served name.
+func langs(v *View) map[string]string {
+	out := make(map[string]string, len(v.Packs))
+	for name, p := range v.Packs {
+		out[name] = p.Snapshot().AudioLanguage
+	}
+	return out
+}
+
+// An audio language edit reaches every running packager without replacing
+// one, and packagers started later start with the language in force.
+func TestSupervisorLiveAudioLanguage(t *testing.T) {
+	r := newRig(t)
+	fakeChild(t, &r.env)
+	sp := ladderSpec("720", "360")
+	sp.AudioLanguage = "vi"
+	s := r.start(sp)
+	waitRunning(t, s)
+	v := s.View()
+	names := []string{"cam", "cam_360", "cam_720"}
+	require.Equal(t, names, slices.Sorted(maps.Keys(v.Packs)))
+	all := func(lang string) map[string]string {
+		out := map[string]string{}
+		for _, name := range names {
+			out[name] = lang
+		}
+		return out
+	}
+	assert.Equal(t, all("vi"), langs(v))
+	packs := maps.Clone(v.Packs)
+	before := s.Status()
+
+	for _, lang := range []string{"en", ""} {
+		next := cloneSpec(sp)
+		next.AudioLanguage = lang
+		require.NoError(t, Check(next, r.env), lang)
+		require.Equal(t, spec.ChangeLive, answer(t, s.Submit(next)), lang)
+		now := s.View()
+		assert.Equal(t, all(lang), langs(now), lang)
+		require.Len(t, now.Packs, len(packs), lang)
+		for name, p := range packs {
+			assert.Same(t, p, now.Packs[name], "%s was replaced (%q)", name, lang)
+		}
+		st := s.Status()
+		assert.Equal(t, before.Generation, st.Generation, lang)
+		assert.Equal(t, before.Since, st.Since, lang)
+		assert.Zero(t, st.Rebuilds, lang)
+		sp = next
+	}
+
+	// With neither HLS nor DASH on there is no packager to tell; the ones
+	// started later read the language in force.
+	off := outputEdit(outputEdit(sp, OutHLS, false), OutDASH, false)
+	require.Equal(t, spec.ChangeOutputs, answer(t, s.Submit(off)))
+	require.Empty(t, s.View().Packs)
+	fr := cloneSpec(off)
+	fr.AudioLanguage = "fr"
+	require.Equal(t, spec.ChangeLive, answer(t, s.Submit(fr)))
+	assert.Empty(t, s.View().Packs)
+	on := outputEdit(fr, OutHLS, true)
+	require.Equal(t, spec.ChangeOutputs, answer(t, s.Submit(on)))
+	now := s.View()
+	require.Equal(t, names, slices.Sorted(maps.Keys(now.Packs)))
+	assert.Equal(t, all("fr"), langs(now))
+	for name, p := range packs {
+		assert.NotSame(t, p, now.Packs[name], "%s was not started again", name)
+	}
+	assert.Equal(t, before.Generation, s.Status().Generation)
 }
