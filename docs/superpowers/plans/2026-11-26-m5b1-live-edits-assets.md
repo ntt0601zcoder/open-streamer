@@ -18,7 +18,7 @@
 
 - **Libraries:** **no new module.** Only the approved independent libraries (mp4ff, pion/rtp, pion/sdp, datarhei/gosrt, testify, go-astiav v0.41.0, protobuf `protowire`, `go.yaml.in/yaml/v3`); never bluenviron or lal; no code copied from another product. The upload is a raw request body read with `net/http` (no multipart). Fonts are checked by our own sfnt table-directory check and by the transcoder child's FreeType (R-E8), not by `golang.org/x/image`. **One file is added that is not ours:** `testdata/fixtures/fonts/DejaVuSansMono.ttf` (DejaVu Sans Mono 2.37, from Ubuntu's `fonts-dejavu-core`, the package and licence of the embedded `internal/transcode/native/font/DejaVuSans.ttf`; its `LICENSE` is copied beside it), a test fixture only (R-E8). After each wave merge, `go mod tidy` changes nothing.
 - **cgo:** only `internal/transcode/native` and `cmd/ostranscoder`, behind the tag `libav`. Without the tag, `go build ./...`, `go vet ./...`, `golangci-lint run ./...` and `make test` pass, as do `GOOS=windows go vet ./...` and `GOOS=darwin go vet ./...`. `internal/asset` and `internal/transcode/picture` stay pure Go; Unix-only code (directory `fsync`) sits in `_unix.go`/`_other.go` files.
-- **Frozen behaviour:** everything M5a delivered keeps working, and every existing test passes unchanged, except: (1) an input-only or watermark-only edit of a running stream now answers `live` where it answered `rebuild` (the tests that used such an edit *as* a rebuild move to another field, named in Tasks 8 and 12); (2) the wire version is 3, so the tests that pin `2` change, and a version-2 child is refused as a version-1 child was; (3) an exit error of a child that sent a fatal `Error` ends with that message (Task 6); (4) `TestManagerConcurrentReplaces` is rewritten (Task 1). An outputs-only edit still answers `outputs`. A watermark without a font renders exactly as before (DejaVu Sans); a rung without `no_fallback` falls back exactly as before.
+- **Frozen behaviour:** everything M5a delivered keeps working, and every existing test passes unchanged, except: (1) an input-only or watermark-only edit of a running stream now answers `live` where it answered `rebuild` (the tests that used such an edit *as* a rebuild move to another field, named in Task 8, which moves them to `layout: ["audio","video"]`); (2) the wire version is 3, so the tests that pin `2` change, and a version-2 child is refused as a version-1 child was; (3) an exit error of a child that sent a fatal `Error` ends with that message (Task 6); (4) `TestManagerConcurrentReplaces` is rewritten (Task 1). An outputs-only edit still answers `outputs`. A watermark without a font renders exactly as before (DejaVu Sans); a rung without `no_fallback` falls back exactly as before.
 - **Time:** 90 kHz everywhere. Nothing here touches a timestamp except the one Clock break of R-E3.
 - **Lint:** `exhaustive` with `default-signifies-exhaustive: false` (every `switch` on `spec.Change` lists `ChangeLive`; on `asset.Kind` both kinds); `godot`; gofumpt.
 - **Errors:** wrap as `fmt.Errorf("pkg: op: %w", err)`; never both log and return.
@@ -28,22 +28,22 @@
 - **Peers:** every test that runs ffmpeg/ffprobe passes on the host (ffmpeg 8) **and** in `make test-ci-peers` (image `osv2-ci-peers:m4a`: ffmpeg 6.1, VLC 3.0.20, GStreamer 1.24) before any push. The transcoder bundle is rebuilt with `make ostranscoder` after each of the merges of waves 1 and 2, before any real-child test runs (a version-2 bundle is refused by a version-3 host). NVENC device tests stay opt-in (`OS_NVENC=1`).
 - **Test time:** `make test` and `make cover` use `-timeout=20m` and `internal/e2e` is near it on CI. The M5b1 scenarios are `t.Parallel()` and together take at most 90 s on this host (R-E10; measured in Task 12).
 - **Soak safety (absolute):** never stop, restart or reconfigure open-streamer-soak-mediamtx, caddy, grafana, osdev-console-1, vector, alloy, pyroscope, prometheus, node-exporter, nvidia-gpu-exporter, or any other container not named `osv2-*`. Never bind ports 554, 1935 or 8554: every test uses `127.0.0.1:0` and reads the port back. Own containers are `osv2-*`, `--rm`.
-- **Commits:** end every message with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- **Commits:** end every message with the trailer the executing session's attribution rule names.
 
 ## Rulings
 
 | ID | Ruling | Cost if wrong |
 |---|---|---|
-| R-E1 | **M5b is split in two.** **M5b1 (this plan):** inputs edited in place, the live watermark edit, the asset API, operator fonts, `no_fallback`, and M5a's three carry items. Done when the first three clauses of the M5b row hold: replacing a running stream's inputs is exactly one epoch change and ends no output session; an uploaded image and font appear on every rung; a `no_fallback` NVENC rung fails instead of falling back and is counted (Task 12). **M5b2, audio language:** the spec field, the HLS masters' `LANGUAGE`, the MPD's `lang`, `osconform` reading them (the row's fourth clause), and M4b's multi-audio minors. It is cut off because it shares no code with the rest (it is `pkg/hls`, `pkg/dash`, the packager, `internal/conform` and possibly the demuxers, none of which M5b1 touches), and because its design hangs on a question for the user: one declared language for the stream's one audio track, or several audio tracks chosen by language (see the plan's hand-over). Task 13 splits the §5 row | The M5b row closes in two steps; M5b2 can run beside M5c and M6, as M5b could |
+| R-E1 | **M5b is split in two.** **M5b1 (this plan):** inputs edited in place, the live watermark edit, the asset API, operator fonts, `no_fallback`, and M5a's three carry items. Done when the first three clauses of the M5b row hold: replacing a running stream's inputs is exactly one epoch change and ends no output session; an uploaded image and font appear on every rung; a `no_fallback` NVENC rung fails instead of falling back and is counted (Task 12). **M5b2, audio language:** the spec field, the HLS masters' `LANGUAGE`, the MPD's `lang`, `osconform` reading them (the row's fourth clause), and M4b's multi-audio minors. It is cut off because it shares no code with the rest (it is `pkg/hls`, `pkg/dash`, the packager, `internal/conform` and possibly the demuxers, none of which M5b1 touches), and it is ruled (controller, review round 1) as **one declared language** for the stream's one audio track; several audio tracks chosen by language are a milestone of their own (see the plan's hand-over). Task 13 splits the §5 row | The M5b row closes in two steps; M5b2 can run beside M5c and M6, as M5b could |
 | R-E2 | **`spec.ChangeLive`.** `Diff` returns `ChangeNone` (equal), `ChangeOutputs` (differ only in `outputs`, as before), `ChangeLive` (differ in `inputs` and/or `transcode.watermark`, and possibly `outputs`, and nowhere else; both documents have a ladder, or neither), `ChangeRebuild` (anything else: adding or removing the whole `transcode`, a rendition, `no_fallback`, `layout`, `thumbnail`, `disabled`). The enum stays ordered by weight. The API outcome of a running stream is `outputs`, `live` or `rebuild`. `Diff` also treats `layout: [video, audio]` as the empty layout (an M5a deferred minor: that edit rebuilt for nothing). Rejected: one class per field (`inputs`, `watermark`), which needs a set of classes for a mixed edit and brings back v1's per-field routing | A client that switches on the outcome string sees a value it does not know for an edit that used to say `rebuild`; the README and the OpenAPI enum say so |
-| R-E3 | **`Pipeline.SetInputs(ctx, urls)`.** Applied by the `Run` goroutine between two frames; it returns when it is applied. Old and new entries are matched by URL text, in order, each old entry at most once. **Kept** (same URL, any position): the entry moves with its attempt, its reader, its listen socket and its retry time; nothing is reopened. **Removed, not active:** its attempt is stopped and its reader closed before `SetInputs` returns; no event. **Added:** opened as `Run` would open an input in that position (a probe above the active input; at once when none is active). **The active input kept:** it stays active at its new index; no Clock break, no epoch change, no switch counted; if inputs now stand above it they are probed and fail-back takes over by the existing rules (that later fail-back is its own epoch change). **The active input removed:** the Clock is flushed and the reader closed as at a failure, without `EventFailed` and without a backoff for anyone; with no active input, every input opens at once and the first frame activates one, which breaks the Clock once: **exactly one epoch change**, counted as one switch. The layout is fixed for the pipeline's life. Errors change nothing: an empty list, a URL `Parse` refuses, `ErrNotRunning` once `Run` has returned, `ctx.Err()`. Invariant 3 (failover never restarts the transcoder) holds by construction: the transcoder is a hub subscriber and sees an epoch change, as at a failover | Between the removal of the active input and the first frame of its successor the hub is silent (a pull input's connect time; nothing when the successor was already probing); players see a discontinuity, HLS one `EXT-X-DISCONTINUITY`. An operator who wants no gap adds the new input first, waits for the fail-back hold, then removes the old one |
+| R-E3 | **`Pipeline.SetInputs(ctx, urls)`.** Applied by the `Run` goroutine between two frames; it returns when it is applied. Old and new entries are matched by URL text, in order, each old entry at most once. **Kept** (same URL, any position): the entry moves with its attempt, its reader, its listen socket and its retry time; nothing is reopened. **Removed, not active:** its attempt is stopped and its reader closed before `SetInputs` returns; no event. **Added:** opened as `Run` would open an input in that position (a probe above the active input; at once when none is active). **The active input kept:** it stays active at its new index; no Clock break, no epoch change, no switch counted; if inputs now stand above it they are probed and fail-back takes over by the existing rules (that later fail-back is its own epoch change). **The active input removed:** the Clock is flushed and the reader closed as at a failure, without `EventFailed`; with no active input, `Run`'s existing rule applies: an added input opens at once, a kept pull input when its retry time comes (a kept input in backoff is not reopened early), a passive one is listening already; the first frame activates one, which breaks the Clock once: **exactly one epoch change** (beside the breaks the sources make themselves), counted as one switch. The layout is fixed for the pipeline's life. Errors change nothing: an empty list, a URL `Parse` refuses, `ErrNotRunning` once `Run` has returned, `ctx.Err()`. Invariant 3 (failover never restarts the transcoder) holds by construction: the transcoder is a hub subscriber and sees an epoch change, as at a failover | Between the removal of the active input and the first frame of its successor the hub is silent: a new pull input's connect time, nothing when the successor was already probing, and up to `RetryInterval` (10 s) when the only inputs left are kept ones in backoff; players see a discontinuity, HLS one `EXT-X-DISCONTINUITY`. An operator who wants no gap adds the new input first, waits for the fail-back hold, then removes the old one |
 | R-E4 | **Live watermark edit.** The supervisor builds the new `picture.Watermark` with the function `Check` and `build` use (it reads the image and the font from the asset directory) and calls `Transcoder.SetWatermark`; adding and removing a watermark are live too. The child takes it in order with its frames, the encoders are not reopened, no epoch changes. If the watermark cannot be built now (the asset went between `Check` and the apply), the old one stays on the picture, the stream's `last_error` says `watermark: …`, and the spec in force is the new one. A live edit made while the stream is between generations only replaces the spec | The picture and the spec can disagree until the next successful refresh, edit or generation; `last_error` is the only sign |
 | R-E5 | **Asset model.** An asset is a regular file directly in `server.assets_dir`, named `^[a-z0-9][a-z0-9_-]{0,63}\.(png\|jpg\|jpeg)$` (an image, M4c's rule, unchanged) or `^[a-z0-9][a-z0-9_-]{0,63}\.(ttf\|otf)$` (a font). No subdirectories, no metadata file: the directory is the model, so files an operator copies in by hand are assets like any other, and the API works on a directory M5a already serves from. **Limits:** an image is at most 1 MiB and 2048 px per side (`picture.DecodeImage`, unchanged), a font at most 24 MiB (`picture.MaxFontBytes`; a wire message is at most 32 MiB), the directory at most 256 assets and 512 MiB in all. **Content:** an image must decode in full and be the format its extension names (`.png`: PNG; `.jpg`/`.jpeg`: JPEG); a font must pass `picture.CheckFont` and, when the transcoder is configured, the child's own loader (`ostranscoder -probe font`, R-E8). **Write:** a temp file `.<name>.<8 hex digits>.tmp` in the same directory, mode 0600, `fsync`, rename, directory `fsync`; a leftover temp file is removed when the store opens; a reader sees the whole old file or the whole new one. The entity tag is `"` + the first 16 hex digits of the SHA-256 of the bytes + `"` (assets are not secret, so it is not keyed) | The quota counts only what the store manages: a full disk is a 500 `asset_write_failed`, not a 507. No versions: a replaced asset is gone |
-| R-E6 | **Asset API.** `GET /api/v1/assets` (viewer): the list, by name, each `{name, kind, size, modified, etag, used_by}` (`used_by`: the streams whose spec names it, running or not). `GET /api/v1/assets/{name}` (viewer): the bytes through `http.ServeContent`, `Content-Type` by content (`image/png`, `image/jpeg`, `font/ttf`, `font/otf`), `ETag`, `Content-Disposition: attachment`. `PUT /api/v1/assets/{name}` (editor): a raw body, `Content-Type: application/octet-stream` (anything else is 415); creates (201) or replaces (200); optional `If-Match` (a tag or `*`) and `If-None-Match: *` (create only); answers the asset document plus `refreshed`, the running streams that took the new bytes. `DELETE /api/v1/assets/{name}` (editor): 204. **Errors:** a name outside the rule is 404 `not_found` on every method (it names nothing); content the name does not allow is 422 `invalid_asset`; a body over the kind's limit is 413 `too_large`; a full directory is 507 `assets_full`; no `server.assets_dir` is 409 `assets_off`; a delete of an asset a stream names is 409 `asset_in_use` with the stream names; a failed precondition is 412; a write failure is 500 `asset_write_failed`. At most 2 uploads are read at once; a third waits for its turn or its request's end. Rejected: multipart forms (a second parser and file names from the client), and `POST` with a server-chosen name (the spec refers to assets by name) | Raw `PUT` is not what an HTML form sends; a UI uploads with `fetch`. Viewers can download every image and font |
-| R-E7 | **Replacement and deletion under running streams.** A successful `PUT` of an asset calls `Manager.RefreshAsset(name)`: every running stream whose watermark names it loads its watermark again and calls `SetWatermark` (R-E4), so the new image or font is on the picture without a stream edit; a stream between generations takes it at its next build, as M5a already reads assets per generation. A `DELETE` is refused while any stream of the config names the asset, enabled or not. The reference check and the removal run under the server's apply mutex, which every stream edit holds, so a delete and an edit that starts using the asset cannot cross. The upload's read, checks and probe run **outside** that mutex | A file removed by hand under a running stream is still M5a's case (Review Focus 5 there): the next generation fails to build with the reason. `RefreshAsset` is not transactional across streams: one that fails to load reports it in its own `last_error` |
-| R-E8 | **Operator fonts.** `spec.Watermark.Font` names a font asset, text watermarks only; empty means the embedded DejaVu Sans, as before. The host reads the file, checks it (`picture.CheckFont`: at most 24 MiB; an sfnt header `00 01 00 00`, `OTTO` or `true`; 1 to 256 table records, each inside the file; `cmap`, `head`, `hhea`, `hmtx`, `maxp` and either `glyf` with `loca` or `CFF `/`CFF2` present; collections `ttcf` and WOFF are refused by name) and sends the **bytes** in the watermark (wire field 7). The child writes them to `<its dir>/font.ttf`, the path the graph string already names, so no operator text or path enters a filter graph (the invariant stands) and the child never opens an operator's path. **The real parser is the child's FreeType**, so an upload is also probed with `ostranscoder -probe font FILE` (10 s limit), which draws two glyphs with it on a 256×144 picture; without a configured transcoder there is no probe and no child to hurt. Shaping (Arabic) and glyph coverage are the font's and the FFmpeg build's business (drawtext shapes with HarfBuzz); the plan proves only that the operator's font is the one drawn. Rejected: `golang.org/x/image/font/sfnt` (a new module for a second opinion the child gives anyway); passing a path (the child would read operator-controlled paths, and a replaced file would change under it) | A font FreeType accepts in the probe and fails on later text is fatal in the child (M4c's R-C9: never a picture without its watermark), so the stream respawns until the watermark is edited. Each running stream with a font holds its bytes twice (host and child), up to 48 MiB |
-| R-E9 | **Refusing the fallback.** `spec.Rendition.NoFallback` (`no_fallback: true`), valid only with `encoder: nvenc`. In the child, a rung with it whose NVENC open fails is not opened with libx264: the build fails, and since a build opens every rung or none (M4c), **the whole ladder fails**: the child sends `Error{Rung, Code: ErrorEncoderRefused, Fatal: true}` and exits 1; the host counts `Stats.EncoderRefusals` (once per refused build), reports the message in the exit error, and respawns by its existing backoff (250 ms doubling to 5 s). No software frame is ever produced for any rung of that ladder; the stream's source keeps running, its ladder outputs carry nothing until NVENC opens. Metric `openstreamer_transcoder_encoder_refusals_total{stream}`; status `transcoder.encoder_refusals`. Rejected: failing only that rung (a presentation with a rung that never starts is M4b's degraded path, not a state to run in for hours), and stopping the stream (an NVENC session freed by another stream would not bring it back) | One strict rung takes the ladder's software rungs down with it, and a host whose GPU is gone retries every 5 s for ever: a spawn, a decode to the first picture, an exit. The counter and `last_error` are how an operator sees it |
-| R-E10 | **Proof, and where it lives.** `TestM5b1ReplaceInputs` (a passthrough stream on every output, M5a's session harness: every session reader holds every hub frame once across the edit; one more epoch on the hub; no generation change) and `TestM5b1ReplaceInputsLadder` (the same edit under a real child: one epoch per rendition, the same PID); `TestM5b1Assets` (upload, live watermark edit, replacement, font, delete in use, roles; every rung checked by picture); `TestM5b1NoFallback`. They stay in `internal/e2e`, because they reuse M5a's harness and M4c's picture helpers, which are test files of that package; they are `t.Parallel()` and bounded at 90 s together. Task 13 reads the package's time from the CI run: above 17 min, the Backlog item "Split `internal/e2e`" is done before the PR merges | The package crosses 20 min on a slow runner and `make test` fails for a reason that is not a defect |
+| R-E6 | **Asset API.** `GET /api/v1/assets` (viewer): the list, by name, each `{name, kind, size, modified, etag, used_by}` (`used_by`: the streams whose spec names it, running or not). `GET /api/v1/assets/{name}` (viewer): the bytes through `http.ServeContent`, `Content-Type` by content (`image/png`, `image/jpeg`, `font/ttf`, `font/otf`), `ETag`, `Content-Disposition: attachment`. `PUT /api/v1/assets/{name}` (editor): a raw body, `Content-Type: application/octet-stream` (anything else is 415); creates (201) or replaces (200); optional `If-Match` (a tag or `*`) and `If-None-Match: *` (create only); answers the asset document plus `refreshed`, one entry per stream with a supervisor that names the asset, saying whether its running picture took the new bytes. `DELETE /api/v1/assets/{name}` (editor): 204. **Errors:** a name outside the rule is 404 `not_found` on every method (it names nothing); content the name does not allow is 422 `invalid_asset`; a body over the kind's limit is 413 `too_large`; a full directory is 507 `assets_full`; no `server.assets_dir` is 409 `assets_off`; a delete of an asset a stream names is 409 `asset_in_use` with the stream names; a failed precondition is 412; a write failure is 500 `asset_write_failed`; a font probe that could not run is 503 `probe_failed` (R-E8). At most 2 uploads are read at once; a third waits for its turn or its request's end. **Deadlines:** the API listener's 30 s read and 60 s write timeouts do not fit a 24 MiB body, so the asset `PUT` and the single-asset `GET` set their own through `http.NewResponseController`: the read deadline starts when the upload slot is taken (a wait for a slot is bounded at 30 s, then 503) and is 30 s plus 1 s per 256 KiB of the kind's limit (34 s for an image, 126 s for a font: a floor of about 2 Mbit/s); the `GET`'s write deadline is the same figure for the asset's size. A body read that times out or is cut is 400 `bad_request`. A `GET` streams from an open file, never from memory. Viewers may download assets (controller ruling). Rejected: multipart forms (a second parser and file names from the client), and `POST` with a server-chosen name (the spec refers to assets by name) | Raw `PUT` is not what an HTML form sends; a UI uploads with `fetch`. Viewers can download every image and font |
+| R-E7 | **Replacement and deletion under running streams.** A successful `PUT` of an asset calls `Manager.RefreshAsset(name)`: every running stream whose watermark names it loads its watermark again and calls `SetWatermark` (R-E4), so the new image or font is on the picture without a stream edit; a stream between generations takes it at its next build, as M5a already reads assets per generation. The answer's `refreshed` lists, per stream, whether it took the new bytes (`{stream, ok, error}`). A `DELETE` is refused while any stream of the config names the asset, enabled or not, and, with 409 `config_invalid_entries`, while the config still holds an entry the start skipped (the manager cannot see what such an entry names; M5a refuses writes in that state too). The reference check and the removal run under the server's apply mutex, which every stream edit holds, so a delete and an edit that starts using the asset cannot cross. The upload's read, checks and probe run **outside** that mutex | A file removed by hand under a running stream is still M5a's case (Review Focus 5 there): the next generation fails to build with the reason. `RefreshAsset` is not transactional across streams: one that fails to load reports it in its own `last_error` |
+| R-E8 | **Operator fonts.** `spec.Watermark.Font` names a font asset, text watermarks only; empty means the embedded DejaVu Sans, as before. The host reads the file, checks it (`picture.CheckFont`: at most 24 MiB; an sfnt header `00 01 00 00`, `OTTO` or `true`; 1 to 256 table records, each inside the file; `cmap`, `head`, `hhea`, `hmtx`, `maxp` and either `glyf` with `loca` or `CFF `/`CFF2` present; collections `ttcf` and WOFF are refused by name) and sends the **bytes** in the watermark (wire field 7). The child writes them to `<its dir>/font.ttf`, the path the graph string already names, so no operator text or path enters a filter graph (the invariant stands) and the child never opens an operator's path. **The real parser is the child's FreeType**, so an upload is also probed with `ostranscoder -probe font FILE` (10 s limit), which draws two glyphs with it on a 256×144 picture; without a configured transcoder there is no probe and no child to hurt. **Only the probe's own verdict refuses a font:** exit status `exitProbeFailed` (3), or death by a signal (FreeType crashed on it), is 422 `invalid_asset` with the text of the probe's stdout line `font: …` (stderr is never quoted: it carries temp paths). Anything else (exit 2 from a stale bundle or the untagged stub, the 10 s limit, an exec error) says nothing about the font: 503 `probe_failed`, logged, nothing stored. Shaping (Arabic) and glyph coverage are the font's and the FFmpeg build's business (drawtext shapes with HarfBuzz); the plan proves only that the operator's font is the one drawn. Rejected: `golang.org/x/image/font/sfnt` (a new module for a second opinion the child gives anyway); passing a path (the child would read operator-controlled paths, and a replaced file would change under it) | A font FreeType accepts in the probe and fails on later text is fatal in the child (M4c's R-C9: never a picture without its watermark), so the stream respawns until the watermark is edited. A font's bytes are treated as immutable and shared, never copied by `cloneWatermark` or by the supervisor, so a running stream with a font costs: one copy in the host for its lifetime (up to 24 MiB), one in the child, the child's `font.ttf` on disk (or in memory where the temp dir is tmpfs), and FreeType's own load; plus, transiently per `Configure` or `SetWatermark`, the encoded message in the host and the decoded one in the child. Budget about 4× the font's size per stream at the peak, 3× at rest |
+| R-E9 | **Refusing the fallback.** `spec.Rendition.NoFallback` (`no_fallback: true`), valid only with `encoder: nvenc`. In the child, a rung with it whose NVENC open fails is not opened with libx264: the build fails, and since a build opens every rung or none (M4c), **the whole ladder fails**: the child sends `Error{Rung, Code: ErrorEncoderRefused, Fatal: true}` and exits 1; the host counts `Stats.EncoderRefusals` (once per refused build), reports the message in the exit error, and respawns by its existing backoff (250 ms doubling to 5 s). No software frame is ever produced for any rung of that ladder; the stream's source keeps running, its ladder outputs carry nothing until NVENC opens. Metric `openstreamer_transcoder_encoder_refusals_total{stream}`; status `transcoder.encoder_refusals`. Whole-ladder failure is confirmed by the controller (review round 1). Rejected: failing only that rung (a presentation with a rung that never starts is M4b's degraded path, not a state to run in for hours), and stopping the stream (an NVENC session freed by another stream would not bring it back) | One strict rung takes the ladder's software rungs down with it, and a host whose GPU is gone retries every 5 s for ever: a spawn, a decode to the first picture, an exit. The counter and `last_error` are how an operator sees it |
+| R-E10 | **Proof, and where it lives.** Every scenario reads a continuous clip written at test time, never the looped fixture, whose passes are epochs of their own (Task 12). `TestM5b1ReplaceInputs` (a passthrough stream on every output, M5a's session harness: every session reader holds every hub frame once across the edit; one more epoch on the hub; no generation change) and `TestM5b1ReplaceInputsLadder` (the same edit under a real child: one epoch per rendition, the same PID); `TestM5b1Assets` (upload, live watermark edit, replacement, font, delete in use, roles; every rung checked by picture); `TestM5b1NoFallback`. They stay in `internal/e2e`, because they reuse M5a's harness and M4c's picture helpers, which are test files of that package; they are `t.Parallel()` and bounded at 90 s together. Task 13 reads the package's time from the CI run: above 17 min, the Backlog item "Split `internal/e2e`" is done before the PR merges | The package crosses 20 min on a slow runner and `make test` fails for a reason that is not a defect |
 | R-E11 | **Listeners stay fixed at start** (carry item 3). M5b1 does not make `server` hot-reloadable, so the 422 for an output whose listener is off stays, and the README gains the two operator consequences (Task 1) | Adding a listener and its first output stays a two-step change with a restart between |
 | R-E12 | **One wire bump.** Fonts and `no_fallback` both change the protocol; `wire.Version` goes from 2 to 3 once, in Task 4, with every field of both. The host, the fake child and the real child share `internal/transcode/wire`, so every merged state builds a consistent set; only a bundle left in `dist/` from before the merge is stale | A bundle built before Task 5 is refused by the host with the version error; `make ostranscoder` fixes it |
 
@@ -51,10 +51,10 @@
 
 | Wave | Tasks | Why this order |
 |---|---|---|
-| 1 | 1 (carry items), 2 (`spec`), 3 (`pipeline.SetInputs`), 4 (`picture`, `wire` v3) | Disjoint files: Task 1 has `internal/stream/manager_test.go` and `helpers_test.go`, `internal/api/errors.go` with its test, and `README.md`; Task 2 `internal/spec`; Task 3 `internal/pipeline`; Task 4 `internal/transcode/picture`, `internal/transcode/wire` and the fixture font |
+| 1 | 1 (carry items), 2 (`spec`), 3 (`pipeline.SetInputs`), 4 (`picture`, `wire` v3) | Disjoint files: Task 1 has `internal/stream/manager_test.go` and `helpers_test.go`, `internal/api/errors.go` with its test, and `README.md`; Task 2 `internal/spec`, plus its placeholder arms in `internal/stream/supervisor.go` and `manager.go` and two fields in `internal/api/openapi.json` (no other wave-1 task touches those three files); Task 3 `internal/pipeline`; Task 4 `internal/transcode/picture`, `internal/transcode/wire` and the fixture font |
 | 2 | 5 (`native`, `cmd/ostranscoder`), 6 (`transcode` host, `transcodetest`), 7 (`internal/asset`) | 5 and 6 need Task 4's wire and picture; 7 needs Task 4's names and `CheckFont`. 5 has the cgo packages, 6 `internal/transcode/*.go` and `transcodetest`, 7 a new package |
-| 3 | 8 (`stream.Supervisor`) | Needs 2, 3, 4 and 6 |
-| 4 | 9 (`stream.Manager`) | Same package as 8 |
+| 3 | 8 (`stream.Supervisor`, and the `live` outcome in `Manager.plan`) | Needs 2, 3, 4 and 6. It changes what the supervisor does **and** what the manager answers in one task, and moves the tests of `internal/server` and `internal/e2e` that used an input edit as the rebuild, so the branch is green after it |
+| 4 | 9 (`stream.Manager`: asset use) | Same package as 8 |
 | 5 | 10 (`api`) | Needs 7's `asset.Info` and errors and 9's outcome |
 | 6 | 11 (`server`, the example config, README) | Needs 7, 9 and 10 |
 | 7 | 12 (M5b1 scenarios) | Needs 11 and Task 5's bundle |
@@ -65,7 +65,7 @@ Each parallel task runs in its own worktree; the controller merges.
 ## Review Focus
 
 1. **An asset name or body from a hostile client:** `../x.png`, `%2e%2e%2fx.png`, `a/b.png`, `.png`, `X.PNG`, a 65-character stem, a name with a NUL or a space; an HTML or SVG file named `.png`, a PNG named `.jpg`, a truncated PNG, a 2049 px image, a 20000×20000 PNG of a few kB, a WOFF or a `.ttc` named `.ttf`, a font whose table directory points past the file, a body one byte over the limit with and without `Content-Length`. Each is refused with its code, nothing is written, no temp file is left, and nothing outside the directory is read or written. Task 7, `TestKindOf`, `TestPutRefusesContent` and `TestPutLeavesNoTemp`; Task 4, `TestCheckFont`; Task 10, `TestAssetNames` and `TestAssetTooLarge`.
-2. **An input edit that meets the pipeline in an awkward state:** the active input removed while its successor is in a retry backoff, or during the search after a failure; a kept listen input (its socket must not be rebound); a reorder that puts an input above the active one; the same URL twice in a list; the same edit sent twice; an edit as `Run` ends. No reader leaks, a kept reader is never reopened, and the epoch count is 0 or 1 as R-E3 says. Task 3, `TestSetInputsReplaceActive`, `TestSetInputsKeepsListener`, `TestSetInputsDuringSearch`, `TestSetInputsDuplicates` and `TestSetInputsErrors`.
+2. **An input edit that meets the pipeline in an awkward state:** the active input removed while its successor is in a retry backoff, or during the search after a failure; a kept listen input (its socket must not be rebound); a reorder that puts an input above the active one; the same URL twice in a list; the same edit sent twice; an edit as `Run` ends. No reader leaks, a kept reader is never reopened, and the epoch count is 0 or 1 as R-E3 says. Task 3, `TestSetInputsReplaceActive`, `TestSetInputsKeepsListener`, `TestSetInputsDuringSearch`, `TestSetInputsDuplicates`, `TestSetInputsSwitchCount` and `TestSetInputsErrors`.
 3. **An asset replaced or gone under running streams:** a replacement while two streams use it and one of them is in backoff; a file removed by hand, then a live watermark edit or a refresh; a delete of an asset a disabled stream names. The running picture keeps a valid watermark, the failure is in `last_error`, the delete is refused. Task 8, `TestSupervisorRefresh` and `TestSupervisorWatermarkAssetGone`; Task 9, `TestManagerAssetUsers`; Task 11, `TestDeleteAssetInUse`.
 4. **A `no_fallback` rung on a host where NVENC never opens:** no software frame on any rung, a respawn at most every 5 s, the counter up by one per attempt, `last_error` naming the rung, other streams untouched, and an edit that clears `no_fallback` brings the ladder up on libx264. Task 5, `TestNoFallbackRefuses`; Task 6, `TestRefusalCounted`; Task 12, `TestM5b1NoFallback`.
 5. **Edits that mix and race:** one `PUT` that changes inputs, watermark and outputs (all three applied, one answer, `live`); inputs with a rebuild field (a rebuild); a live edit during a backoff; twenty concurrent writers mixing stream edits with asset replacements and deletes. No deadlock between the apply mutex and the store, the final state equals the last write, no goroutine is left. Task 2, `TestDiff`; Task 8, `TestSupervisorLiveEditAllParts` and `TestSupervisorLiveEditInBackoff`; Task 11, `TestConcurrentAssetAndStreamWrites`.
@@ -107,7 +107,7 @@ func (l *leases) Live() int64
 
 A read of a released lease returns `io.EOF` at once; a read deadline of 50 ms on the held socket lets a lease notice its release. `Open` on a URL that is still held records the overlap **and** returns an error whose text is `lease: overlap`, so a real overlap also shows in `last_error`.
 - [ ] **Step 3: Rewrite the test on it.** `listenSpec` stays for the tests that need real ports. `TestManagerConcurrentReplaces` builds `cam` with `inputs: [l.idle("rtmp://lease/in/"+vKey+"?mode=listen"), udpURL]`, `Env.Open: l.Open`, and feeds the fixture to the held port with `sendFixture`. Every assertion it has stays (no deadlock within 20 s, the final list, view, layout and `running` state, `stream_up == 1`, more than 2 opens, `Run` returns, no goroutine left, no `vKey` in the log), and it gains `assert.Empty(t, l.Overlaps(), "two generations of cam never hold an input at once")`. `assertNoSocketErrors` stays as it is: with held sockets no bind happens, so any socket error is now a defect.
-- [ ] **Step 4: A real rebind stays covered, with the two causes told apart.** Add `TestManagerRebindsAfterRebuild`: `listenSpec`'s real ports, one stream, 10 sequential rebuild edits (`Layout` toggled), each awaited. After each, `Status.LastError` must not contain `address already in use`; if it does, the test probes the port itself (`ListenPacket` on it): when the probe also fails **and** the stream has no generation (`View().Gen == 0`), a foreign process holds the port, and the test takes new ports and starts over, at most 3 times, logging each; any other bind error fails the test as an overlap.
+- [ ] **Step 4: A real rebind stays covered, with the two causes told apart.** Add `TestManagerRebindsAfterRebuild`: `listenSpec`'s real ports, one stream, 10 sequential rebuild edits (`Layout` toggled between nil and `["audio","video"]`), each awaited. A failed bind does not fail the build (the pipeline reports the input and retries it), so the sign is the text: after each edit, poll `Status.LastError` for 200 ms for `address already in use`. When it shows: `Replace` the set with no stream and wait for the supervisor's `Done()`, so that nothing of ours holds the port; then bind the port from the test (`ListenPacket` for the UDP input, `Listen` for the RTMP one). **Still taken:** the holder is foreign; close nothing of theirs, take new ports with `listenSpec`, start over, at most 3 times, logging each. **Free:** our own previous generation held it when the next one bound: fail the test as an overlap, with the status and the log.
 - [ ] **Step 5: Hunt for a real overlap.** Run `go test -race -count=300 -run '^TestManagerConcurrentReplaces$' ./internal/stream/` while `go test -race -count=1 ./internal/e2e/ ./internal/transcode/` runs beside it. Expected: 300 passes, `Overlaps()` empty. **If an overlap is reported, stop the task and follow superpowers:systematic-debugging on the supervisor chain (`NewSupervisor`'s `after`, `Manager.tails`, `teardown`'s wait for `pipeDone`): the fix goes into `internal/stream` with a test that fails without it, in this task, and the plan's later tasks build on it.**
 - [ ] **Step 6: Cap the error lists.** Write `TestErrorsFromManagerCapped` in `internal/api/streams_test.go`: a backend whose `PutStream` returns 150 joined reasons that wrap `stream.ErrInvalid` answers 422 with `len(errors) == 101`, `errors[100] == "and 50 more"`, and `errors[0..99]` the first hundred in order; the same with `stream.ErrConflict` answers 409 with the same shape; 100 reasons give 100 entries and no tail. Run it: it fails (150 entries).
 - [ ] **Step 7:** in `internal/api/errors.go` add `capped(list []string) []string` (at most `config.MaxErrors` entries, then `fmt.Sprintf("and %d more", n)`), and use it on both `texts(split(err))` results. Run `go test -race -count=1 ./internal/api/`: pass.
@@ -118,7 +118,7 @@ A read of a released lease returns `io.EOF` at once; a read deadline of 50 ms on
 ### Task 2: `internal/spec` — `ChangeLive`, `no_fallback`, `font`
 
 **Files:**
-- Modify: `internal/spec/spec.go`, `internal/spec/diff.go`, `internal/spec/validate.go`, `internal/spec/doc.go`
+- Modify: `internal/spec/spec.go`, `internal/spec/diff.go`, `internal/spec/validate.go`, `internal/spec/doc.go`; for Step 5 only: `internal/stream/supervisor.go`, `internal/stream/manager.go`, `internal/api/openapi.json`
 - Test: `internal/spec/diff_test.go`, `internal/spec/validate_test.go`, `internal/spec/spec_test.go`
 
 **Interfaces — Produces:**
@@ -165,7 +165,7 @@ func TestCloneCopiesNewFields(t *testing.T) // Redacted() and ETag() carry NoFal
 - [ ] **Step 2: Run** `go test -race -count=1 ./internal/spec/` — compile failure.
 - [ ] **Step 3: Implement.** `Diff`: compare the normal forms; then with `Outputs` cleared; then with `Inputs` set to nil and, when both have a ladder, `Transcode.Watermark` set to nil on copies. `normal` maps a layout equal to `["video","audio"]` to nil. `fontRE` is `^[a-z0-9][a-z0-9_-]{0,63}\.(ttf|otf)$`.
 - [ ] **Step 4: Run** `go test -race -count=1 ./internal/spec/` — pass.
-- [ ] **Step 5: Keep M5a's behaviour until Tasks 8 and 9.** A new enum value compiles everywhere, but a `switch` without it would leave a live edit unanswered. In `internal/stream/supervisor.go`, make the `ChangeRebuild` arm of both switches (`serve`, `idle`) `case spec.ChangeLive, spec.ChangeRebuild:` with the comment `// ChangeLive: applied in place from Task 8`; in `manager.go`'s `plan`, report `rebuild` for both. So an input or watermark edit still rebuilds and still answers `rebuild`, and every test of `internal/stream` passes unchanged. `make lint` and `go test -race -count=1 ./internal/stream/ ./internal/config/ ./internal/api/` pass, except `TestOpenAPIMatchesSpec`, which now names the two fields it does not find: add them to `internal/api/openapi.json` (`no_fallback`: boolean, "Fail the ladder when NVENC cannot be opened for this rendition, instead of encoding it with libx264; needs encoder nvenc."; `font`: string, "The name of a TTF or OTF file in the assets directory, for a text watermark; the built-in DejaVu Sans when empty.").
+- [ ] **Step 5: Keep M5a's behaviour until Task 8.** A new enum value compiles everywhere, but a `switch` without it would leave a live edit unanswered. In `internal/stream/supervisor.go`, make the `ChangeRebuild` arm of both switches (`serve`, `idle`) `case spec.ChangeLive, spec.ChangeRebuild:` with the comment `// ChangeLive: applied in place from Task 8`; in `manager.go`'s `plan`, report `rebuild` for both. So an input or watermark edit still rebuilds and still answers `rebuild`, and every test of `internal/stream` passes unchanged. `make lint` and `go test -race -count=1 ./internal/stream/ ./internal/config/ ./internal/api/` pass, except `TestOpenAPIMatchesSpec`, which now names the two fields it does not find: add them to `internal/api/openapi.json` (`no_fallback`: boolean, "Fail the ladder when NVENC cannot be opened for this rendition, instead of encoding it with libx264; needs encoder nvenc."; `font`: string, "The name of a TTF or OTF file in the assets directory, for a text watermark; the built-in DejaVu Sans when empty.").
 - [ ] **Step 6: Commit** `feat(spec): a live change class, no_fallback and the watermark font`
 
 ### Task 3: `Pipeline.SetInputs`
@@ -207,8 +207,9 @@ build the new entry list: a matched entry moves (its attempt's index is rewritte
     an unmatched new URL gets a fresh entry (passive from Parse, no backoff)
 if an input is still active at index k: stop the pull attempts now below k and reset the passive ones below k,
     exactly as activate does for the inputs below a newly active one; Stats.Active = k
-last (the input active last) follows its entry; if that entry is gone it becomes "none of these",
-    so that the next activation counts as a switch
+last (the input active last) follows its entry; if that entry is gone it becomes lastGone, a new
+    constant −2: activate counts a switch when last != −1 && last != a.in (today it tests last >= 0,
+    which would not count this one), and −1 stays "before the first"
 drop removed attempts from the layout wait list; rearm = true; answer nil
 ```
 
@@ -225,8 +226,9 @@ func TestSetInputsKeepsActive(t *testing.T)
 // [A, B] with A active. SetInputs([C, A]): A opened once in all and never closed; no new epoch; Stats.Active == 1; Switches == 0;
 // C is opened as a probe; after FailbackHold of C's frames and its next key, C is active: exactly one new epoch, Switches == 1.
 func TestSetInputsReorderBelow(t *testing.T)
-// [A, B], A failed and in backoff, B active, A probing. SetInputs([B, A]): Stats.Active == 0; A's pull attempt is closed (it is below
-// the active input now) and is not reopened while B is active; no new epoch.
+// [A, B], A failed once and B became active; A's retry time has passed and A is open again as a probe above B, inside its hold.
+// SetInputs([B, A]): Stats.Active == 0; A's pull attempt is closed (it is below the active input now) and is not reopened while B is
+// active; no new epoch.
 func TestSetInputsRemovesIdle(t *testing.T)
 // [A, L] with A active and L passive, listening. SetInputs([A]): L's reader is closed before SetInputs returns; no new epoch;
 // A opened once.
@@ -235,6 +237,9 @@ func TestSetInputsKeepsListener(t *testing.T)
 func TestSetInputsDuringSearch(t *testing.T)
 // [A, B, C]: A failed (retry in 500 ms), the search is trying B. SetInputs([A, D]): B's and C's attempts are closed; D opens at once;
 // A is not reopened before its retry time; the first of A and D to deliver is active; exactly one new epoch after the edit.
+// A second run with [A] alone kept ([A, B] → [A] while B is active and A in backoff): nothing is opened until A's retry time, then A.
+func TestSetInputsSwitchCount(t *testing.T) // [A] → [B] → [C], each activated: Switches == 2 (the removed-active sentinel counts); [A] alone from
+// the start: 0; [A, B] → [B, A] with A active throughout: 0
 func TestSetInputsDuplicates(t *testing.T) // [A, A] → [A]: the first A's reader stays, the second is closed; [A] → [A, A]: one more open
 func TestSetInputsSameList(t *testing.T) // the list in force again: nil, nothing opened, nothing closed, no event
 func TestSetInputsErrors(t *testing.T)
@@ -263,7 +268,8 @@ func TestSetInputsRace(t *testing.T) // -race: four goroutines call SetInputs wi
 // package picture
 const MaxFontBytes = 24 << 20
 
-// In Watermark: Font is a TrueType or OpenType file; text only; nil means the built-in DejaVu Sans.
+// In Watermark: Font is a TrueType or OpenType file; text only; nil means the built-in DejaVu Sans. Its bytes are
+// immutable once set: holders share the slice and nobody copies or changes it (R-E8).
 Font []byte
 
 // ImageName and FontName report whether name is an image or a font asset's name (R-E5).
@@ -273,8 +279,9 @@ func FontName(name string) bool
 // CheckFont reports why b is not a font the child may be given (R-E8). It reads the table directory only.
 func CheckFont(b []byte) error
 
-// LoadFont reads the font asset name from dir, as LoadAsset reads an image: the name must match the rule,
-// the file is at most MaxFontBytes, and it passes CheckFont.
+// LoadFont reads the font asset name from dir: the name must match the rule, the entry must be a regular file
+// (Lstat first: a symlink, a directory or a FIFO is refused without being opened, so it cannot hang), it is at
+// most MaxFontBytes, and it passes CheckFont. The returned slice is never written to again by anyone (see Font).
 func LoadFont(dir, name string) ([]byte, error)
 
 // package wire
@@ -304,7 +311,8 @@ func TestCheckFont(t *testing.T)
 // the fixture with its "cmap" tag renamed; with "glyf" renamed (no outlines); a directory cut in the middle of a record.
 // And accepted: the fixture with magic "true"; a synthetic OTTO directory with "CFF " and the five required tables.
 func TestFontNames(t *testing.T) // FontName: "a.ttf", "a_b-c.otf" true; "A.ttf", "a.ttc", "a.png", ".ttf", "a/b.ttf", "../a.ttf", 65-char stem false; ImageName as LoadAsset's rule
-func TestLoadFont(t *testing.T) // a temp dir: the fixture loads; a bad name is refused before any open; a missing file; a file that fails CheckFont
+func TestLoadFont(t *testing.T) // a temp dir: the fixture loads; a bad name is refused before any open; a missing file; a file that fails CheckFont;
+// a symlink to the fixture, a directory and (Unix) a FIFO under a font name are each refused within 1 s, the FIFO never opened
 func TestWatermarkValidateFont(t *testing.T) // text+font valid; image+font: "watermark: a font needs text"; text + a bad font: CheckFont's error
 func TestWatermarkFontRoundTrip(t *testing.T) // wire: a Configure and a SetWatermark with a 300 kB font round-trip byte for byte; a font of
 // MaxFontBytes+1 is refused by the writer and, hand-encoded, by the reader; a watermark without a font has the bytes it had in version 2
@@ -323,8 +331,8 @@ func TestVersionIs3(t *testing.T)
 Verified with `make test-transcode` (cgo, in `osv2-ci-peers:m4a`), then `make ostranscoder`.
 
 **Files:**
-- Modify: `internal/transcode/native/watermark.go`, `internal/transcode/native/encoder.go`, `internal/transcode/native/pipeline.go`, `cmd/ostranscoder/main.go`, `cmd/ostranscoder/doc.go`
-- Test: `internal/transcode/native/watermark_test.go`, `internal/transcode/native/encoder_test.go`, `cmd/ostranscoder/main_test.go`
+- Modify: `internal/transcode/native/watermark.go`, `internal/transcode/native/encoder.go`, `internal/transcode/native/pipeline.go`, `cmd/ostranscoder/main.go`, `cmd/ostranscoder/stub.go`, `cmd/ostranscoder/doc.go`
+- Test: `internal/transcode/native/watermark_test.go`, `internal/transcode/native/encoder_test.go`, `cmd/ostranscoder/main_test.go`, `cmd/ostranscoder/stub_test.go`
 
 **Interfaces — Produces:**
 
@@ -344,7 +352,7 @@ func (e *RefusedError) Unwrap() error
 func ProbeFont(font []byte) error
 ```
 
-`ostranscoder -probe font FILE` reads at most `picture.MaxFontBytes+1` bytes of FILE, runs `picture.CheckFont` then `native.ProbeFont`, prints `font: ok` and exits 0, or prints `font: <reason>` and exits `exitProbeFailed`; the usage line becomes `usage: ostranscoder [-version | -probe nvenc | -probe font FILE]`. A fatal build error that is a `*native.RefusedError` is written as `wire.Error{Rung: e.Rung, Code: wire.ErrorEncoderRefused, Fatal: true, Message: …}`; every other fatal keeps `ErrorOther`.
+`configure()` in `cmd/ostranscoder/main.go`, which copies each `wire.Rung` into a `native.Rung`, copies `NoFallback` too. `ostranscoder -probe font FILE` reads at most `picture.MaxFontBytes+1` bytes of FILE, runs `picture.CheckFont` then `native.ProbeFont`, prints `font: ok` on stdout and exits 0, or prints `font: <reason>` on stdout (one line, no path in it) and exits `exitProbeFailed` (3); the usage line becomes `usage: ostranscoder [-version | -probe nvenc | -probe font FILE]`. A fatal build error that is a `*native.RefusedError` is written as `wire.Error{Rung: e.Rung, Code: wire.ErrorEncoderRefused, Fatal: true, Message: …}`; every other fatal keeps `ErrorOther`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -364,13 +372,13 @@ func TestNoFallbackRefuses(t *testing.T)
 // and the x264 rung it had opened is released.
 func TestFallbackUnchanged(t *testing.T) // the same without NoFallback: the build succeeds on libx264 and EncoderFallbacks is 1, as before
 func TestProbeFontFlag(t *testing.T) // in cmd/ostranscoder: the fixture → "font: ok", exit 0; a text file → "font: …", exitProbeFailed;
-// a missing file → exitProbeFailed; `-probe font` without a file → usage, exit 2
+// a missing file → exitProbeFailed; `-probe font` without a file → usage, exit 2; no output line holds the file's path
 func TestChildRefusal(t *testing.T) // in cmd/ostranscoder, with the package's seam for a failing NVENC open: Configure with a NoFallback
 // rung, one GOP → the child writes Error{Rung: 0, Code: ErrorEncoderRefused, Fatal: true} and exits 1, and writes no Frame of any rung
 ```
 
 - [ ] **Step 2: Run** `make test-transcode ARGS='-run "TestWatermarkFont|TestWatermarkBadFont|TestProbeFont|TestNoFallback|TestFallbackUnchanged|TestChildRefusal" ./internal/transcode/native/ ./cmd/ostranscoder/'` — compile failure.
-- [ ] **Step 3: Implement.** The watermarker keeps the font bytes it last wrote; `set` writes `font.tmp` and renames it over `font.ttf` when the watermark's font (or the built-in one, for nil) differs from them, then frees the graph; `restoreFiles` writes the current font. `openRung` returns the `*RefusedError` instead of opening libx264 when `r.NoFallback` and NVENC failed. The untagged stub of `cmd/ostranscoder` answers `-probe font` as it answers `-probe nvenc`.
+- [ ] **Step 3: Implement.** The watermarker keeps the font bytes it last wrote; `set` writes `font.tmp` and renames it over `font.ttf` when the watermark's font (or the built-in one, for nil) differs from them, then frees the graph; `restoreFiles` writes the current font. `openRung` returns the `*RefusedError` instead of opening libx264 when `r.NoFallback` and NVENC failed. The untagged stub (`cmd/ostranscoder/stub.go`) answers `-probe font` as it answers `-probe nvenc` (usage, exit 2: the server reads that as "no verdict", R-E8); `stub_test.go` pins it.
 - [ ] **Step 4: Run** `make test-transcode` (all cgo packages) — pass. Then `make ostranscoder`, and on this host `dist/ostranscoder-amd64/ostranscoder -probe font testdata/fixtures/fonts/DejaVuSansMono.ttf` prints `font: ok`.
 - [ ] **Step 5: Decide how Task 12 forces a refusal on the GPU host.** Run `CUDA_VISIBLE_DEVICES= dist/ostranscoder-amd64/ostranscoder -probe nvenc; echo $?`. Record the result in the task report: exit `exitProbeFailed` means an empty `CUDA_VISIBLE_DEVICES` in a child's environment makes NVENC unavailable to it, and Task 12 uses it (through `server.Options.TranscoderEnv`, Task 11); exit 0 means it does not, and Task 12's test skips where `/dev/nvidiactl` exists (the refusal on a GPU host is then proved by `TestNoFallbackRefuses` alone, under `make test-nvenc`).
 - [ ] **Step 6: Commit** `feat(native): draw text with the watermark's font`, `feat(native): a no_fallback rung fails the build` and `feat(ostranscoder): -probe font, and the refusal's error code`
@@ -395,7 +403,7 @@ EncoderRefusals uint64
 const EnvRefuse = "OSTX_FAKE_REFUSE"
 ```
 
-Rules: `New` refuses `NoFallback` on a rendition whose encoder is not `nvenc` ("rendition %q: no_fallback needs encoder nvenc") and on a copy; the flag goes into the rung of every `Configure`. The reader goroutine counts `EncoderRefusals` when it reads an `Error` with `ErrorEncoderRefused`. **Every** fatal `Error`'s message is kept on the child (the last one, cut to 256 bytes), and `exited` appends it to the exit error as `: <message>`, so `Event.Err` and the supervisor's `last_error` name the cause. `cloneWatermark` copies `Font`. The describe line of the fake child's watermark log gains ` font=<n bytes>` when a font is set.
+Rules: `New` refuses `NoFallback` on a rendition whose encoder is not `nvenc` ("rendition %q: no_fallback needs encoder nvenc") and on a copy; the flag goes into the rung of every `Configure`. The reader goroutine counts `EncoderRefusals` when it reads an `Error` with `ErrorEncoderRefused`. **Every** fatal `Error`'s message is kept on the child (the last one, cut to 256 bytes), and `exited` appends it to the exit error as `: <message>`, so `Event.Err` and the supervisor's `last_error` name the cause. `cloneWatermark` copies the struct and the image as before and **shares** `Font` (immutable, R-E8). The describe line of the fake child's watermark log gains ` font=<n bytes>` when a font is set.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -409,8 +417,8 @@ func TestRefusalCounted(t *testing.T)
 // any rendition hub or to the presentation hub.
 func TestFatalMessageInExitError(t *testing.T) // a fake child that sends Error{Fatal: true, Message: 300 × "x"} and exits: Err's text ends with
 // ": " + 256 × "x"; a child that exits without one has the text it had before
-func TestSetWatermarkCarriesFont(t *testing.T) // SetWatermark with a font: the fake child's watermark log shows font=<n>; changing the caller's
-// slice afterwards does not change what a respawned child is configured with
+func TestSetWatermarkCarriesFont(t *testing.T) // SetWatermark with a font: the fake child's watermark log shows font=<n>; a respawned child is
+// configured with it; the transcoder holds the caller's slice itself (same backing array: no copy), while Image is still copied
 ```
 
 - [ ] **Step 2: Run** `go test -race -count=1 -run 'TestNoFallback|TestRefusalCounted|TestFatalMessage|TestSetWatermarkCarriesFont' ./internal/transcode/...` — compile failure.
@@ -449,6 +457,7 @@ var (
 	ErrFull     = errors.New("asset: the directory is full")
 	ErrOff      = errors.New("asset: no assets directory")
 	ErrWrite    = errors.New("asset: write") // wrapped with the cause
+	ErrProbe    = errors.New("asset: the font probe did not run") // wrapped with the cause; says nothing about the font
 )
 
 // Info describes one asset.
@@ -463,8 +472,9 @@ type Info struct {
 
 // Options configures a Store.
 type Options struct {
-	// ProbeFont, when set, is the last check of an uploaded font: it gets the path of the temp file.
-	ProbeFont func(ctx context.Context, path string) error
+	// ProbeFont, when set, is the last check of an uploaded font: it gets the path of the temp file. refused
+	// true means the probe judged the font bad (reason is for the client); a non-nil err means it could not judge.
+	ProbeFont func(ctx context.Context, path string) (refused bool, reason string, err error)
 }
 
 // KindOf returns the kind an asset name stands for; ok is false for any other name.
@@ -478,6 +488,9 @@ func Open(dir string, opt Options) (*Store, error)
 func (s *Store) List() ([]Info, error)                 // by name; only regular files with an asset name
 func (s *Store) Stat(name string) (Info, error)
 func (s *Store) Read(name string) ([]byte, Info, error)
+// Open returns the asset as an open regular file, for streaming, with its Info (the cached ETag). A later
+// replacement renames a new file over the name: this descriptor keeps the old bytes.
+func (s *Store) Open(name string) (*os.File, Info, error)
 // Put checks and stores r under name: created reports whether the name was new. match, when not "", is an
 // If-Match value (a tag, or "*": the asset exists); noneMatch true is If-None-Match: * (the asset must not exist);
 // a failed condition is ErrPrecondition.
@@ -489,7 +502,7 @@ func (s *Store) Totals() map[Kind][2]int64
 var ErrPrecondition = errors.New("asset: precondition failed")
 ```
 
-`Put`'s order, which the tests pin: name (`ErrName`); read at most `MaxBytes(kind)+1` bytes (`ErrTooLarge`); content (an image: `picture.DecodeImage`, and its format must be the extension's; a font: `picture.CheckFont`; else `ErrContent` with the reason); the temp file `.<name>.<8 hex digits>.tmp` with mode 0600 and `fsync`; `ProbeFont` on it for a font (`ErrContent` with the probe's text); then, **under the store's lock:** the conditions, the quota (a new name needs a free slot of `MaxFiles`; the total minus the old size plus the new must be at most `MaxTotalBytes`; else `ErrFull`), the rename and the directory `fsync`. Every failure after the temp file exists removes it. Nothing before the lock holds it, so a slow body or a 10 s probe blocks nobody. Hashes are cached by name, size and modification time. `sync_unix.go`/`sync_other.go` are `internal/config`'s directory `fsync` again (`EINVAL` and `ENOTSUP` ignored), with a comment that names the other copy.
+`Put`'s order, which the tests pin: name (`ErrName`); read at most `MaxBytes(kind)+1` bytes (`ErrTooLarge`); content (an image: `picture.DecodeImage`, and its format must be the extension's; a font: `picture.CheckFont`; else `ErrContent` with the reason); the temp file `.<name>.<8 hex digits>.tmp` with mode 0600 and `fsync`; `ProbeFont` on it for a font (refused: `ErrContent` with the reason; an error: `ErrProbe`); then, **under the store's lock:** the conditions, the quota (a new name needs a free slot of `MaxFiles`; the total minus the old size plus the new must be at most `MaxTotalBytes`; else `ErrFull`), the rename and the directory `fsync`. Every failure after the temp file exists removes it. Nothing before the lock holds it, so a slow body or a 10 s probe blocks nobody. Every file access goes through `Lstat` first and takes regular files only: a symlink, a directory or a FIFO under an asset name is not an asset (not listed, `ErrNotFound`, never opened). `Open(name)` opens with `O_NOFOLLOW` on Unix and checks the open descriptor with `Stat` again. Hashes are cached by name, size and modification time; `Put` writes the entry of what it stored itself and `Delete` drops it, so the cache can only go stale for files changed by hand within one timestamp tick at the same size. `sync_unix.go`/`sync_other.go` are `internal/config`'s directory `fsync` again (`EINVAL` and `ENOTSUP` ignored), with a comment that names the other copy.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -503,7 +516,7 @@ func TestPutAndRead(t *testing.T) // a PNG, a JPEG and the fixture font: created
 func TestPutRefusesContent(t *testing.T)
 // each ErrContent with a reason, the directory unchanged afterwards: a PNG as "a.jpg"; a JPEG as "a.png"; "<svg…" and "<html…" as
 // "a.png"; a PNG cut in half; a 2049×10 PNG; a 20000×20000 PNG header with little data; a GIF as "a.png"; a text file as "a.ttf";
-// the font with magic "ttcf"; a font whose ProbeFont fails (the probe's text is in the error). And ErrTooLarge: an image of
+// the font with magic "ttcf"; a font whose ProbeFont refuses (the reason is in the error); a ProbeFont that errs: ErrProbe. And ErrTooLarge: an image of
 // MaxImageBytes+1, a font of MaxFontBytes+1 (a reader that counts: at most limit+1 bytes were read).
 func TestPutLeavesNoTemp(t *testing.T) // after every refused Put above, and after a ProbeFont that fails, the directory has no dot-file
 func TestPutConditions(t *testing.T) // noneMatch on an existing name, match "*" on a missing one, a stale tag: ErrPrecondition, nothing written;
@@ -513,7 +526,11 @@ func TestQuota(t *testing.T) // with the limits lowered through an unexported se
 func TestDelete(t *testing.T) // removes; ErrNotFound on a second delete; ErrName on a bad name before any file access; a stale match
 func TestOpenSweepsTemp(t *testing.T) // ".a.png.0a1b2c3d.tmp" is removed at Open; "notes.txt", ".hidden" and a subdirectory are left and never listed
 func TestHandCopiedFiles(t *testing.T) // a PNG written straight into the directory is listed, read and deleted like an uploaded one;
-// a directory named "x.png" and a FIFO named "y.png" (Unix) are not listed, and Read of them is ErrNotFound without blocking
+// a directory named "x.png", a FIFO named "y.png" and a symlink "z.png" to a real PNG (Unix) are not listed, and Read and Open of
+// them are ErrNotFound without blocking; a Put over the symlink replaces the link, not its target
+func TestOpenKeepsOldBytes(t *testing.T) // Open, then Put new bytes under the name: the open file still reads the old bytes whole, its Info the old ETag
+func TestHashCache(t *testing.T) // after Put, Stat's ETag is the new bytes' without the file being read again (a counting seam); a hand-written
+// file of another size gets a fresh hash; Delete then a hand copy of other bytes under the name is not served the old ETag
 func TestOff(t *testing.T) // Open(""): every method returns ErrOff
 func TestConcurrentPuts(t *testing.T) // -race: 16 goroutines put two alternating valid images under one name while 4 read it: every Read is
 // one of the two, whole; no temp file is left
@@ -528,7 +545,7 @@ func TestPutWriteError(t *testing.T) // a read-only directory (Unix, not root): 
 ### Task 8: `stream.Supervisor` — live edits and refresh
 
 **Files:**
-- Modify: `internal/stream/supervisor.go`, `internal/stream/generation.go`, `internal/stream/env.go`, `internal/stream/status.go`
+- Modify: `internal/stream/supervisor.go`, `internal/stream/generation.go`, `internal/stream/env.go`, `internal/stream/status.go`, `internal/stream/manager.go` (`plan`'s outcome only); the tests Step 4 names (`internal/server/*_test.go`, `internal/e2e/m5a_test.go`)
 - Create: `internal/stream/live.go`
 - Test: `internal/stream/live_test.go`, `internal/stream/supervisor_test.go`, `internal/stream/check_test.go`
 
@@ -538,9 +555,16 @@ func TestPutWriteError(t *testing.T) // a read-only directory (Unix, not root): 
 
 ```go
 // Refresh makes the running generation build its watermark again from the asset directory and hand it to the
-// transcoder (R-E7). The channel is closed when that is done, or at once when there is nothing to refresh
-// (no generation, no watermark) or the supervisor has stopped. It never blocks.
-func (s *Supervisor) Refresh() <-chan struct{}
+// transcoder (R-E7). The channel gets one value and is closed: nil when the transcoder took the watermark,
+// ErrNoGeneration when the stream is between generations (its next build reads the asset), or why the
+// watermark could not be built (the old one stays). It is closed without a value when the supervisor has
+// stopped. Refresh never blocks.
+func (s *Supervisor) Refresh() <-chan error
+
+// ErrNoGeneration is Refresh's answer between generations.
+var ErrNoGeneration = errors.New("stream: no generation is running")
+
+// In Outcome.Applied, beside the others: "live" — a running stream's inputs or watermark were edited in place.
 
 // watermarkOf returns the transcoder's watermark for sp, read from env.AssetsDir; nil without one.
 // ladderOf, and so Check and build, use it; so does the live edit.
@@ -549,7 +573,7 @@ func watermarkOf(sp spec.Stream, env Env) (*picture.Watermark, error)
 // In the status document's Transcoder: EncoderRefusals uint64 `json:"encoder_refusals"`
 ```
 
-How a live edit is applied by the `Run` goroutine in `serve` (`live.go`, `applyLive(g, old, new)`), in this order: **(1) the watermark**, when `old` and `new` differ in it and the generation has a transcoder: `watermarkOf(new)` then `g.tr.SetWatermark`; an error is recorded with `s.fail("watermark: ", err)` and the old watermark stays. **(2) the inputs**, when they differ: `g.pipe.SetInputs(g.ctx, inputsOf(new))`; `ErrNotRunning` and a context error are ignored (the generation is ending and the next one is built from the new spec); if the recorded `last_error` starts with `input `, it is cleared (it may name an input that is gone: an M5a deferred minor). **(3) the spec is replaced** (`setSpec`). **(4) the outputs**, when they differ: `reattach`, as for `ChangeOutputs`. Then the edit is answered `spec.ChangeLive`. In `idle` (between generations) a live edit replaces the spec, is answered `ChangeLive`, and ends the wait, as an output edit does there. A refresh is a mailbox entry like an edit, taken in order with them; in `serve` it runs step (1) for the spec in force; in `idle` it is answered at once. `ladderOf` passes `NoFallback` on, and loads a font with `picture.LoadFont` ("watermark: a font needs the assets directory, which is not configured" without one). `Collect` adds `openstreamer_transcoder_encoder_refusals_total` ("Transcoder children that ended because a no_fallback rendition could not open its encoder."), with the labels of `…_encoder_fallbacks_total`. If `internal/api`'s OpenAPI tests compare the status schema with `stream.Status`, add `encoder_refusals` to `internal/api/openapi.json` here; otherwise Task 10 adds it.
+How a live edit is applied by the `Run` goroutine in `serve` (`live.go`, `applyLive(g, old, new)`), in this order, **never holding `s.mu` across a call into the pipeline or the transcoder** (`SetInputs` waits for the pipeline's loop; `Status` must not wait behind it): **(1) the spec is replaced** (`setSpec`), so the status never shows a new `active_input` against the old `inputs`; for the moment until step (3) returns it may show the old index against the new list, which is accepted. **(2) the watermark**, when `old` and `new` differ in it and the generation has a transcoder: `watermarkOf(new)` then `g.tr.SetWatermark`; an error is recorded with `s.fail("watermark: ", err)` and the old watermark stays. **(3) the inputs**, when they differ: `g.pipe.SetInputs(g.ctx, inputsOf(new))`. `ErrNotRunning` and a context error are ignored (the generation is ending and the next one is built from the new spec); any other error is recorded with `s.fail("inputs: ", err)` (`Check` parsed these URLs, so it does not happen; it is reported rather than assumed away). On success, a recorded `last_error` that starts with `input ` is cleared (it may name an input that is gone: an M5a deferred minor). **(4) the outputs**, when they differ: `reattach`, as for `ChangeOutputs`. Then the edit is answered `spec.ChangeLive`. In `idle` (between generations) a live edit replaces the spec **and clears `last_error`**, as `rebuildFor` does for a rebuild edit (the error belongs to a generation built from a spec that is gone), is answered `ChangeLive`, and ends the wait. A refresh is a mailbox entry like an edit, taken in order with them; in `serve` it runs step (2) for the spec in force (a spec without a watermark answers nil); in `idle` it answers `ErrNoGeneration`. The watermark calls go through one seam, `s.setWatermark func(*transcode.Transcoder, *picture.Watermark) error` (nil means the transcoder's own method), which tests replace to record the calls. `Manager.plan` reports `live` for `spec.ChangeLive` (the constant `appliedLive`); its judging of such an edit is unchanged, the one a rebuild gets. `ladderOf` passes `NoFallback` on, and loads a font with `picture.LoadFont` ("watermark: a font needs the assets directory, which is not configured" without one). `Collect` adds `openstreamer_transcoder_encoder_refusals_total` ("Transcoder children that ended because a no_fallback rendition could not open its encoder."), with the labels of `…_encoder_fallbacks_total`. If `internal/api`'s OpenAPI tests compare the status schema with `stream.Status`, add `encoder_refusals` to `internal/api/openapi.json` here; otherwise Task 10 adds it.
 
 - [ ] **Step 1: Write the failing tests** (the package's `rig`, `script` readers and `fakeChild`)
 
@@ -565,69 +589,84 @@ func TestSupervisorLiveWatermark(t *testing.T)
 // watermark added from the assets dir (a line with its byte count): all ChangeLive.
 func TestSupervisorLiveEditAllParts(t *testing.T) // one Submit that changes the inputs, the watermark and outputs.rtsp: one answer, ChangeLive;
 // each of the three took effect (reader swapped, watermark line, "rtsp " subscribers refused); generation unchanged
-func TestSupervisorLiveEditInBackoff(t *testing.T) // during a backoff: answered ChangeLive at once, the wait ends, the next generation is built
-// from the new inputs and watermark
+func TestSupervisorLiveEditInBackoff(t *testing.T) // during a backoff with last_error "build: …": answered ChangeLive at once, last_error is empty,
+// the wait ends, the next generation is built from the new inputs and watermark
+func TestSupervisorLiveInputsError(t *testing.T) // a pipeline seam whose SetInputs returns an error: answered ChangeLive, last_error starts "inputs: ",
+// the spec in force is the new one; ErrNotRunning records nothing
+func TestSupervisorStatusDuringSetInputs(t *testing.T) // SetInputs held by a reader whose Close blocks: Status() returns within 100 ms, with the new inputs
 func TestSupervisorWatermarkAssetGone(t *testing.T) // the new watermark's image is removed between Check and Submit: answered ChangeLive, the
 // child got no new watermark, Status.LastError starts "watermark: " and names the asset, the stream keeps running
-func TestSupervisorRefresh(t *testing.T) // an image watermark; the file is replaced by other valid bytes; Refresh's channel closes and the
-// child's log has a new line with the new byte count; a Refresh without a watermark, during a backoff, and after Run closes at once
-func TestSupervisorRefreshInOrder(t *testing.T) // Submit(watermark A), Refresh, Submit(watermark B) queued while the loop is held: the child sees A, A again, B
+func TestSupervisorRefresh(t *testing.T) // an image watermark; the file is replaced by other valid bytes; Refresh answers nil and the child's log
+// has a new line with the new byte count; without a watermark: nil; during a backoff: ErrNoGeneration; the file removed: an error that
+// names the asset, and the child got nothing; after Run: closed without a value
+func TestSupervisorRefreshInOrder(t *testing.T) // Submit(watermark A), Refresh, Submit(watermark B) queued while the loop is held: the setWatermark
+// seam records exactly A, A, B in that order. (The child may see fewer: SetWatermark collapses calls that pile up, so the child's
+// log is only required to end in B.)
 func TestSupervisorClearsStaleInputError(t *testing.T) // last_error "input 1: …"; a live edit that removes input 1 clears it; a "transcoder: …" error stays
 func TestSupervisorRefusalStatus(t *testing.T) // fakeChild with EnvRefuse=0: Status.Transcoder.EncoderRefusals rises, LastError starts
 // "transcoder: " and contains "no_fallback", the metric openstreamer_transcoder_encoder_refusals_total{stream} equals the status
+func TestManagerLiveOutcome(t *testing.T) // Replace with one stream's input changed: Outcome "live"; with its watermark changed: "live";
+// with outputs only: "outputs"; with layout ["audio","video"]: "rebuild"; the supervisor (pointer) is the same after the live edits
 func TestCheckWatermarkFont(t *testing.T) // Check: a spec with a font that is in the assets dir passes; a missing one, a non-font file under a font
 // name, and a font without an assets dir each fail with "stream: check: transcode: watermark: …"
 ```
 
-- [ ] **Step 2: Run** `go test -race -count=1 -run 'TestSupervisorLive|TestSupervisorWatermarkAssetGone|TestSupervisorRefresh|TestSupervisorClearsStale|TestSupervisorRefusalStatus|TestCheckWatermarkFont' ./internal/stream/` — failures (`ChangeLive` still rebuilds; `Refresh` does not exist).
-- [ ] **Step 3: Implement.** The mailbox's `edit` gains `refresh bool` and a `done chan struct{}`; `closeMailbox` closes those too. Split Task 2's two `case spec.ChangeLive, spec.ChangeRebuild:` arms: `ChangeLive` gets its own. (`Manager.plan` still reports `rebuild` for it until Task 9; this task's tests talk to the supervisor.)
-- [ ] **Step 4: The tests that used an input edit as a rebuild.** `grep -n "Inputs" internal/stream/*_test.go` for edits whose expected answer is `spec.ChangeRebuild` or whose expected outcome is `"rebuild"`: change each to toggle `Layout` between nil and `["video"]` instead, and list them in the task report. No other assertion of those tests changes.
-- [ ] **Step 5: Run** `go test -race -count=1 ./internal/stream/` and `go test -race -count=20 -run 'TestSupervisorLive|TestSupervisorRefresh' ./internal/stream/` — pass.
+- [ ] **Step 2: Run** `go test -race -count=1 -run 'TestSupervisorLive|TestSupervisorStatusDuringSetInputs|TestSupervisorWatermarkAssetGone|TestSupervisorRefresh|TestSupervisorClearsStale|TestSupervisorRefusalStatus|TestManagerLiveOutcome|TestCheckWatermarkFont' ./internal/stream/` — failures (`ChangeLive` still rebuilds; `Refresh` does not exist).
+- [ ] **Step 3: Implement.** The mailbox's `edit` gains `refresh bool` and its answer channel; `closeMailbox` closes those too. Split Task 2's two `case spec.ChangeLive, spec.ChangeRebuild:` arms: `ChangeLive` gets its own; `Manager.plan` reports `live`. The pipeline is reached through a one-method seam (`setInputs func(ctx, []string) error`, nil meaning `g.pipe.SetInputs`) for the two tests that need it.
+- [ ] **Step 4: Every test that used an input or watermark edit as the rebuild, in this task.** From here on such an edit is `live`. `grep -rn '"rebuild"\|ChangeRebuild' internal --include='*_test.go'`: each test outside `internal/spec` whose edit changes only `inputs` or the watermark and expects a rebuild (in `internal/stream`; in `internal/server`; `TestM5aRebuildIsTheOtherRoute` in `internal/e2e/m5a_test.go`) switches its edit to `layout: ["audio","video"]` (toggled with the empty layout). That layout keeps both kinds, so every media assertion of those tests (M5a's `fresh` wants audio and video on every output) still holds; `["video"]` would drop the audio, and `["video","audio"]` is equal to the empty layout since Task 2. For each moved test, read its assertions on tracks and frames before changing it, change nothing but the edit, and list it in the task report.
+- [ ] **Step 5: Run** `go test -race -count=1 ./internal/stream/ ./internal/server/ ./internal/api/`, `go test -race -count=20 -run 'TestSupervisorLive|TestSupervisorRefresh' ./internal/stream/` and `go test -race -count=1 -run '^TestM5a' ./internal/e2e/` — pass: the branch is green after this task alone.
 - [ ] **Step 6: Commit** `feat(stream): apply input and watermark edits in place, refresh a watermark's assets, report refusals`
 
-### Task 9: `stream.Manager` — the `live` outcome and asset use
+### Task 9: `stream.Manager` — which streams use an asset
 
 **Files:**
-- Modify: `internal/stream/manager.go`; the tests Step 4 names (`internal/e2e/m5a_test.go`, `internal/server/*_test.go`)
+- Modify: `internal/stream/manager.go`
 - Test: `internal/stream/manager_test.go`
 
-**Interfaces — Produces:**
+**Interfaces:**
+- Consumes: `(*Supervisor).Refresh`, `ErrNoGeneration`, the `live` outcome (Task 8); `spec.Stream.Assets` (Task 2).
+- Produces:
 
 ```go
-// In Outcome.Applied, beside the others: "live" — a running stream's inputs or watermark were edited in place.
+// Refreshed is what RefreshAsset did to one stream.
+type Refreshed struct {
+	Stream string `json:"stream"`
+	OK     bool   `json:"ok"`              // the running picture has the new bytes
+	Error  string `json:"error,omitempty"` // scrubbed; "between generations: taken at the next build" for ErrNoGeneration
+}
 
-// AssetUsers returns the names of the streams whose spec refers to the asset, sorted: running, disabled or left stopped.
+// AssetUsers returns the names of the streams whose spec refers to the asset, sorted: running, disabled or left
+// stopped. It cannot see a config entry the start skipped (such an entry never became a stream): the server
+// refuses asset deletes while one exists.
 func (m *Manager) AssetUsers(name string) []string
 
-// RefreshAsset tells every running stream that refers to the asset to load it again, waits for them (or for ctx),
-// and returns their names, sorted.
-func (m *Manager) RefreshAsset(ctx context.Context, name string) []string
+// RefreshAsset tells every stream that has a supervisor and refers to the asset to load it again, waits for
+// their answers (or for ctx: the rest are reported with Error "cancelled"), and returns one entry per such
+// stream, by name.
+func (m *Manager) RefreshAsset(ctx context.Context, name string) []Refreshed
 ```
-
-`plan` sets `applied` from `spec.Diff`: `outputs`, `live` or `rebuild`. A live input edit is judged exactly as a rebuild is: `Check`, its listen claims against the server's, the holders' and the other touched streams' (its own old claims are not held against it, so a kept listen input does not conflict with itself), and `copy://` cycles.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```go
-func TestManagerLiveOutcome(t *testing.T) // Replace with one stream's input changed: Outcome "live"; with its watermark changed: "live";
-// with outputs only: "outputs"; with a layout change: "rebuild"; the supervisor (pointer) is the same after the live edits
 func TestManagerLiveInputClaims(t *testing.T) // stream a edits its inputs to a listen address stream b holds: ErrConflict, nothing changed,
-// a's reader not touched; a adds a second listen input and keeps its first: accepted, the first reader was opened once in all;
+// a's reader not touched; a adds a second listen input and keeps its first: accepted ("live"), the first reader was opened once in all;
 // a live input edit that makes a copy:// cycle: ErrInvalid
-func TestManagerAssetUsers(t *testing.T) // three streams: one with image "logo.png", one disabled with font "f.ttf" and image none, one without
+func TestManagerAssetUsers(t *testing.T) // three streams: one with image "logo.png", one disabled with font "f.ttf", one without
 // a ladder: AssetUsers("logo.png") == [first]; ("f.ttf") == [the disabled one]; ("other.png") == nil
-func TestManagerRefreshAsset(t *testing.T) // two running streams use "logo.png", one is disabled and names it too: after the file is replaced,
-// RefreshAsset returns the two running names and both fake children have a new watermark line; a cancelled ctx returns without waiting
+func TestManagerRefreshAsset(t *testing.T) // two running streams use "logo.png", a third is in backoff and a fourth is disabled, both naming it:
+// after the file is replaced, RefreshAsset returns three entries by name: the two running with OK true (both fake children have a new
+// watermark line), the one in backoff with OK false and the between-generations text; the disabled one is not listed. With the file
+// removed: OK false and an error naming the asset. A cancelled ctx returns at once with Error "cancelled".
 func TestManagerConcurrentLiveEdits(t *testing.T) // Task 1's leases: 20 writers mixing input swaps between two leased inputs, watermark texts,
 // output toggles and RefreshAsset for 2 s, then one last Replace: no deadlock, the final spec and view are the last write's,
-// l.Overlaps() is empty, the generation number moved only for the rebuild edits among them (none here: it is 1)
+// l.Overlaps() is empty, the generation number is still 1 (no edit among them is a rebuild)
 ```
 
-- [ ] **Step 2: Run** `go test -race -count=1 -run 'TestManagerLive|TestManagerAsset|TestManagerRefreshAsset|TestManagerConcurrentLiveEdits' ./internal/stream/` — failures.
-- [ ] **Step 3: Implement.** Both new methods read the immutable set behind the atomic pointer and take no lock.
-- [ ] **Step 4: The tests elsewhere that used an input edit as the rebuild.** From this task on an input or watermark edit answers `live`. `grep -rn '"rebuild"\|ChangeRebuild' internal --include='*_test.go'`: every test outside `internal/spec` whose edit changes only `inputs` or the watermark and expects a rebuild (`TestM5aRebuildIsTheOtherRoute` in `internal/e2e/m5a_test.go` is one; `internal/server` has others) switches its edit to `layout: ["video"]` and keeps every assertion. (`["video","audio"]` is no use: Task 2 makes it equal to the empty layout.) List each in the task report.
-- [ ] **Step 5: Run** `go test -race -count=1 ./internal/stream/ ./internal/server/ ./internal/api/` and `go test -race -count=1 -run '^TestM5a' ./internal/e2e/` — pass.
-- [ ] **Step 6: Commit** `feat(stream): the live outcome, and which streams use an asset`
+- [ ] **Step 2: Run** `go test -race -count=1 -run 'TestManagerLiveInputClaims|TestManagerAsset|TestManagerRefreshAsset|TestManagerConcurrentLiveEdits' ./internal/stream/` — compile failure.
+- [ ] **Step 3: Implement.** Both methods read the immutable set behind the atomic pointer and take no lock.
+- [ ] **Step 4: Run** `go test -race -count=1 ./internal/stream/` — pass.
+- [ ] **Step 5: Commit** `feat(stream): which streams use an asset, and refreshing them`
 
 ### Task 10: `internal/api` — the asset routes
 
@@ -637,7 +676,7 @@ func TestManagerConcurrentLiveEdits(t *testing.T) // Task 1's leases: 20 writers
 - Test: `internal/api/assets_test.go`, `internal/api/openapi_test.go`, `internal/api/auth_test.go` (`TestRoles`, `TestWritesNeedRequestedBy`)
 
 **Interfaces:**
-- Consumes: `asset.Info`, `asset.KindOf`, `asset.MaxBytes` and the `asset` errors (Task 7); `stream.Outcome` with `live` (Task 9).
+- Consumes: `asset.Info`, `asset.KindOf`, `asset.MaxBytes` and the `asset` errors (Task 7); `stream.Outcome` with `live` (Task 8); `stream.Refreshed` (Task 9).
 - Produces:
 
 ```go
@@ -652,23 +691,27 @@ type Asset struct {
 	UsedBy   []string  `json:"used_by"` // [] when no stream names it
 }
 
-// AssetPut is the answer to an upload: the asset, and the running streams that took the new bytes.
+// AssetPut is the answer to an upload: the asset, and what each stream that names it did with the new bytes.
 type AssetPut struct {
 	Asset
-	Refreshed []string `json:"refreshed"`
+	Refreshed []stream.Refreshed `json:"refreshed"` // [] when no stream with a supervisor names it
 }
+
+// ErrSkippedEntries is DeleteAsset's error while the config holds an entry the start skipped.
+var ErrSkippedEntries = errors.New("api: the config holds entries that were skipped")
 
 // ErrAssetInUse is DeleteAsset's error while a stream names the asset; Streams are their names.
 type ErrAssetInUse struct{ Streams []string }
 
 // Added to Backend:
 Assets() ([]Asset, error)
-Asset(name string) (Asset, []byte, error)
+// Asset returns the asset as an open regular file (asset.Store.Open); the handler closes it.
+Asset(name string) (Asset, io.ReadSeekCloser, error)
 PutAsset(ctx context.Context, name string, body io.Reader, ifMatch string, ifNoneMatch bool) (res AssetPut, created bool, err error)
 DeleteAsset(ctx context.Context, name, ifMatch string) error
 ```
 
-Routes added to the table: `GET /api/v1/assets` (viewer), `GET /api/v1/assets/{name}` (viewer), `PUT /api/v1/assets/{name}` (editor), `DELETE /api/v1/assets/{name}` (editor). The handlers: a `{name}` that `asset.KindOf` refuses is 404 before the backend is asked. `PUT`: `Content-Type` must be `application/octet-stream` (415 `unsupported_media_type`); a `Content-Length` above `asset.MaxBytes(kind)` is 413 at once; the body is wrapped in `http.MaxBytesReader(w, r.Body, limit+1)`; one of 2 upload slots is taken before the body is read and given back after the backend returns (a request whose context ends while it waits is 503 `unavailable`); `If-None-Match` other than `*` is 400. `GET` of one asset: `http.ServeContent` over the bytes with the `ETag`, `Content-Type` from `Asset.Type`, `Content-Disposition: attachment; filename="<name>"`, `Cache-Control: no-cache`. Error rows added to `fail`: `asset.ErrNotFound`, `asset.ErrName` → 404 `not_found`; `asset.ErrContent` → 422 `invalid_asset`, the reason as the message; `asset.ErrTooLarge` → 413 `too_large`; `asset.ErrFull` → 507 `assets_full`; `asset.ErrOff` → 409 `assets_off`, "server.assets_dir is not set"; `*ErrAssetInUse` → 409 `asset_in_use`, `errors` the stream names (through Task 1's `capped`); `asset.ErrPrecondition` → 412 `precondition_failed`; `asset.ErrWrite` → 500 `asset_write_failed`, logged as `config.ErrWrite` is.
+Routes added to the table: `GET /api/v1/assets` (viewer), `GET /api/v1/assets/{name}` (viewer), `PUT /api/v1/assets/{name}` (editor), `DELETE /api/v1/assets/{name}` (editor). The handlers: a `{name}` that `asset.KindOf` refuses is 404 before the backend is asked. `PUT`: `Content-Type` must be `application/octet-stream` (415 `unsupported_media_type`); a `Content-Length` above `asset.MaxBytes(kind)` is 413 at once; the body is wrapped in `http.MaxBytesReader(w, r.Body, limit+1)`; one of 2 upload slots is taken before the body is read and given back after the backend returns (a request whose context ends while it waits is 503 `unavailable`); `If-None-Match` other than `*` is 400. **Deadlines (R-E6),** through `http.NewResponseController(w)`: `deadline(n) = 30 s + 1 s per 256 KiB of n`; a `PUT` waits at most 30 s for a slot (503 `unavailable`), then calls `SetReadDeadline(now + deadline(asset.MaxBytes(kind)))` and `SetWriteDeadline` 60 s beyond it, before it reads a byte; a body read that fails for any reason but the size limit (a timeout, a cut connection, a short body against `Content-Length`) is 400 `bad_request` "the body could not be read", and nothing reaches the store's directory. `GET` of one asset: `SetWriteDeadline(now + deadline(size))`, then `http.ServeContent` over the open file (closed by the handler) with the `ETag`, `Content-Type` from `Asset.Type`, `Content-Disposition: attachment; filename="<name>"`, `Cache-Control: no-cache`. Error rows added to `fail`: `asset.ErrNotFound`, `asset.ErrName` → 404 `not_found`; `asset.ErrContent` → 422 `invalid_asset`, the reason as the message; `asset.ErrTooLarge` → 413 `too_large`; `asset.ErrFull` → 507 `assets_full`; `asset.ErrOff` → 409 `assets_off`, "server.assets_dir is not set"; `*ErrAssetInUse` → 409 `asset_in_use`, `errors` the stream names (through Task 1's `capped`); `asset.ErrPrecondition` → 412 `precondition_failed`; `asset.ErrWrite` → 500 `asset_write_failed`, logged as `config.ErrWrite` is; `asset.ErrProbe` → 503 `probe_failed`, "the font could not be checked; try again", the cause logged and not sent; `ErrSkippedEntries` → 409 `config_invalid_entries`, "the config holds entries that were skipped at start; fix or remove them first".
 
 - [ ] **Step 1: Write the failing tests** (a fake backend over a real `asset.Store` in a temp dir)
 
@@ -686,9 +729,19 @@ func TestAssetContent(t *testing.T) // an HTML body as logo.png: 422 invalid_ass
 func TestAssetConditions(t *testing.T) // If-None-Match: * on an existing name → 412; If-Match stale → 412; If-Match current → 200;
 // If-None-Match: "x" → 400
 func TestAssetErrors(t *testing.T) // table over the backend's errors: ErrFull → 507 assets_full; ErrOff → 409 assets_off;
-// &ErrAssetInUse{[a b]} → 409 asset_in_use with errors [a b]; ErrWrite → 500 asset_write_failed and one error log line
+// &ErrAssetInUse{[a b]} → 409 asset_in_use with errors [a b]; ErrWrite → 500 asset_write_failed and one error log line;
+// ErrProbe → 503 probe_failed, the cause in the log and not in the body; ErrSkippedEntries → 409 config_invalid_entries
 func TestAssetUploadSlots(t *testing.T) // two uploads held in the backend: a third is not passed to the backend until one returns; a third
 // whose request is cancelled while it waits answers 503
+func TestAssetDeadlines(t *testing.T) // over a real listener with ReadTimeout 200 ms and WriteTimeout 200 ms on the http.Server, and the
+// package's deadline function scaled down through a seam (base 1 s): a PUT whose body arrives in pieces over 600 ms succeeds; a PUT
+// that stalls past its deadline is 400 bad_request (or the connection is closed) and no file or temp file exists; a third PUT that
+// waits 400 ms for a slot still has its whole deadline afterwards and succeeds; a GET read slowly over 600 ms gets every byte.
+// And the unscaled figures: deadline(1 MiB) == 34 s, deadline(24 MiB) == 126 s.
+func TestAssetGetStreams(t *testing.T) // GET of a 2 MiB font: the backend's reader is handed to http.ServeContent as it is (a wrapper that fails the test
+// on a Read of more than 1 MiB at once proves nothing buffers it whole) and is closed exactly once, also on a 304 and when the client hangs up
+func TestAssetBodyAborted(t *testing.T) // Content-Length 1000 with 10 bytes then EOF: 400 bad_request, the backend's Put saw an error from its
+// reader and stored nothing
 func TestAssetRoles(t *testing.T) // viewer: GET list and GET one 200, PUT and DELETE 403; no credentials 401; a PUT without X-Requested-By 400
 ```
 
@@ -710,17 +763,25 @@ Extend `TestRoles` and `TestWritesNeedRequestedBy` with the four routes. `TestOp
 - Consumes: `asset.Open`, `asset.Options.ProbeFont` (Task 7); `Manager.AssetUsers`, `Manager.RefreshAsset` (Task 9); the four `api.Backend` methods (Task 10).
 - Produces: the server implements them.
 
-Rules. `server.Options` gains `TranscoderEnv []string` ("added to the environment of every transcoder child and of the font probe; tests only, `cmd/openstreamer` never sets it"), passed to `stream.Env.TranscoderEnv`: it is how this package's tests run the fake child (its `TestMain` runs `transcodetest.Main` when `OS_TRANSCODE_FAKE=1`, as `internal/stream`'s does, with `transcoder.binary` set to the test executable) and how Task 12 hides the GPU from one server's children. `server.New` opens the store on `server.assets_dir` (after `config`'s check that it is a directory); with a configured transcoder binary, `ProbeFont` runs `<binary> -probe font <path>` under a 10 s context with stdout and stderr captured to at most 4 KiB, and a non-zero exit is an error with that text. `Assets` and `Asset` fill `UsedBy` from `Manager.AssetUsers`. `PutAsset` calls `store.Put` **without** the apply mutex, then takes it (`s.cfg`) for `Manager.RefreshAsset`, so a refresh and a stream edit are in one order. `DeleteAsset` takes the apply mutex, asks `AssetUsers`, returns `&api.ErrAssetInUse{…}` when any, and deletes otherwise. `collect` adds `openstreamer_assets{kind}` ("Assets in the assets directory, by kind.") and `openstreamer_assets_bytes{kind}` from `Store.Totals`; no series without an assets directory.
+Rules. `server.Options` gains `TranscoderEnv []string` ("added to the environment of every transcoder child and of the font probe; tests only, `cmd/openstreamer` never sets it"), passed to `stream.Env.TranscoderEnv`: it is how this package's tests run the fake child (its `TestMain` runs `transcodetest.Main` when `OS_TRANSCODE_FAKE=1`, as `internal/stream`'s does, with `transcoder.binary` set to the test executable) and how Task 12 hides the GPU from one server's children. `server.New` opens the store on `server.assets_dir` (after `config`'s check that it is a directory); with a configured transcoder binary, `ProbeFont` runs `<binary> -probe font <path>` under a 10 s context, stdout captured to at most 4 KiB and stderr discarded, and maps the result as R-E8 rules: exit 0 → accepted; exit status 3 (`exitProbeFailed`) → refused, the reason being the stdout line that starts `font: ` with that prefix cut, at most 256 bytes (`"the transcoder could not load the font"` when there is none); killed by a signal that is not the context's kill → refused, `"the transcoder crashed on the font"`; everything else (exit 2 or any other status, the 10 s limit, an exec error) → an error, which the store returns as `asset.ErrProbe` and the server logs with the status and the binary's path. `Assets` and `Asset` fill `UsedBy` from `Manager.AssetUsers`. `Asset` returns `store.Open`'s file. `PutAsset` calls `store.Put` **without** the apply mutex, then takes it (`s.cfg`) for `Manager.RefreshAsset`, so a refresh and a stream edit are in one order. `DeleteAsset` takes the apply mutex; while `s.skipped` is set it returns `api.ErrSkippedEntries` (a skipped entry may name the asset and the manager cannot see it); it asks `AssetUsers`, returns `&api.ErrAssetInUse{…}` when any, and deletes otherwise. `collect` adds `openstreamer_assets{kind}` ("Assets in the assets directory, by kind.") and `openstreamer_assets_bytes{kind}` from `Store.Totals`; no series without an assets directory.
 
 - [ ] **Step 1: Write the failing tests** (the package's server rig on ephemeral ports, a temp assets dir, the fake child)
 
 ```go
 func TestAssetReachesRunningStream(t *testing.T) // a running ladder stream with watermark image "logo.png": PutAsset("logo.png", other bytes)
-// returns refreshed [cam]; the fake child's watermark log has a line with the new byte count; the stream's generation is unchanged
+// returns refreshed [{cam, ok}]; the fake child's watermark log has a line with the new byte count; the stream's generation is unchanged
 func TestDeleteAssetInUse(t *testing.T) // refused with ErrAssetInUse{[cam]} while cam names it, also when cam is disabled; after a stream edit
 // that drops the watermark the delete succeeds; a stream PUT that names a deleted asset is refused with 422 (Check)
-func TestFontProbe(t *testing.T) // a transcoder stand-in script that exits 1 printing "font: bad" for one file name: PutAsset of that font is
-// asset.ErrContent with "font: bad" in its text and no file is left; exit 0: stored. Without a transcoder: stored without a probe
+func TestFontProbe(t *testing.T) // a transcoder stand-in (the test binary under a switch) scripted per row; PutAsset of the fixture font gives:
+// exit 0 → stored; exit 3 with stdout "font: bad tables" and stderr "/tmp/secret/path" → asset.ErrContent whose text has "bad tables" and
+// not "/tmp"; exit 3 with empty stdout → ErrContent with the default reason; killed by SIGSEGV (Unix) → ErrContent "crashed";
+// exit 2 with a usage line (a stale bundle, the stub) → asset.ErrProbe; exit 1 → ErrProbe; a stand-in that sleeps past the limit (the
+// limit lowered through a seam) → ErrProbe and the process is gone; a binary that does not exist → ErrProbe. After every row but the
+// first, no file and no temp file is left, and each ErrProbe row logged once. Without a transcoder: stored without a probe.
+func TestDeleteAssetWhileSkipped(t *testing.T) // a server started on a config with one bad stream entry: DeleteAsset is api.ErrSkippedEntries;
+// after the entry is fixed over the API it works
+func TestAssetOpenIsAFile(t *testing.T) // Asset() of a 2 MiB font returns a reader whose bytes are the file's; replacing the asset while it is
+// open leaves it reading the old bytes; a symlink under an asset name is asset.ErrNotFound
 func TestAssetsOff(t *testing.T) // no assets_dir: Assets and PutAsset return asset.ErrOff; no assets series in the scrape
 func TestAssetMetrics(t *testing.T) // one image and one font: openstreamer_assets{kind="image"} 1, {kind="font"} 1, the byte gauges their sizes
 func TestConcurrentAssetAndStreamWrites(t *testing.T)
@@ -734,13 +795,15 @@ func TestLiveEditOverTheApplyPath(t *testing.T) // PutStream with new inputs: Ou
 
 - [ ] **Step 2: Run** `go test -race -count=1 ./internal/server/` — compile failure.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Docs.** `openstreamer.example.yaml`: a commented `font: brand.ttf` under the watermark example and a commented `no_fallback: true` on the NVENC rendition, each with one line of explanation. `README.md`: (a) in the edits section, replace "any other change to a stream restarts that stream" by the three outcomes: `outputs`, `live` (inputs and the watermark: no session ends; replacing the active input is one discontinuity; to switch without a gap, add the new input first and remove the old one after the fail-back hold of 10 s) and `rebuild`; (b) a section "Assets" with the four routes, the names, the limits, a `curl --data-binary @logo.png -H 'Content-Type: application/octet-stream'` upload, what `refreshed` and 409 `asset_in_use` mean, and that files copied into the directory by hand are assets too but reach a running stream only at its next build or edit; (c) fonts: `watermark.font`, TTF or OTF, one face per file, checked by the transcoder at upload; (d) `no_fallback`: what happens when NVENC cannot be opened, the metric and the status field, and that it takes the ladder's other renditions down with it.
+- [ ] **Step 4: Docs.** `openstreamer.example.yaml`: a commented `font: brand.ttf` under the watermark example and a commented `no_fallback: true` on the NVENC rendition, each with one line of explanation. `README.md`: (a) in the edits section, replace "any other change to a stream restarts that stream" by the three outcomes: `outputs`, `live` (inputs and the watermark: no session ends; replacing the active input is one discontinuity; to switch without a gap, add the new input first and remove the old one after the fail-back hold of 10 s) and `rebuild`; (b) a section "Assets" with the four routes, the names, the limits, a `curl --data-binary @logo.png -H 'Content-Type: application/octet-stream'` upload, what `refreshed` (one entry per stream that names the asset, with `ok`) and 409 `asset_in_use` mean, that a slow upload has about 2 Mbit/s as its floor, and that files copied into the directory by hand are assets too but reach a running stream only at its next build or edit; (c) fonts: `watermark.font`, TTF or OTF, one face per file, checked by the transcoder at upload; (d) `no_fallback`: what happens when NVENC cannot be opened, the metric and the status field, and that it takes the ladder's other renditions down with it.
 - [ ] **Step 5: Run** `go test -race -count=1 ./internal/server/ ./cmd/openstreamer/` and `make lint` — pass.
 - [ ] **Step 6: Commit** `feat(server): serve the asset API, probe fonts with the transcoder, refresh running streams` and `docs: live edits, assets, fonts and no_fallback`
 
 ### Task 12: The M5b1 scenarios
 
 Needs the bundle of Task 5 (`make ostranscoder`). The tests are in `internal/e2e/m5b1_test.go`, package `e2e`, on M5a's harness (`m5aServer`, `m5aOpen`, `assertUninterrupted`, `tap`, `running`, `metric`) and M4c's picture helpers (`firstPicture`, `marked`, `topLeftBand`, `meanAbsDiff`, `magentaPNG`). Every test is `t.Parallel()` and binds only `127.0.0.1:0`.
+
+**The sources make no epochs of their own.** M5a's `m5aSource` is `file://…/h264_aac.ts?loop=1`, and each 6 s pass of a looped file ends in a discontinuity, which is a new epoch on the hub (and a rebuild of the child's encoders). These tests count epochs, discontinuities and encoder opens, so they must not use it. `m5b1Clip(t, ffmpeg)` writes the fixture concatenated 20 times (120 s, longer than any test here) into the test's temp dir with ffmpeg's concat demuxer and stream copy, exactly as M2a's `liveClip` does (continuous timestamps, every keyframe kept), and returns `file://<path>` with no `loop`: one paced pass, one epoch. Each call writes its own file, so **source A and source B are two calls**: the same media under two different paths, hence two different URL texts, which is what `SetInputs` matches on. Every stream of every test below reads such a clip; a test fails with a clear message if it runs past 100 s of a clip. As a guard against a source break slipping in, each test asserts at its end that the hub's epoch count is what its own edits account for.
 
 **Files:**
 - Create: `internal/e2e/m5b1_test.go`
@@ -752,30 +815,32 @@ Needs the bundle of Task 5 (`make ostranscoder`). The tests are in `internal/e2e
 
 ```go
 // TestM5b1ReplaceInputs: clause 1 of the row, on a passthrough stream.
-// A server with every output on; stream cam with inputs [A] (the looped fixture, as m5aSource); an m5aOpen row with a session reader
-// on HTTP-TS, RTMP, RTSP and SRT, the HLS and DASH watchers, and a tap on the hub. After 3 s: PUT cam with inputs [B] (a second
-// source of the same fixture). Asserts: the PUT answers 200 and "live"; the status' generation and since are unchanged and
-// rebuilds is 0; within 10 s the tap has frames of exactly one more epoch than before the edit, and no further epoch in the
-// next 3 s; assertUninterrupted(row) with no exception: every session reader holds every hub frame once, across the epoch change,
-// and no openstreamer_output_sessions_ended_total series moved; the HLS media sequence went on (never back) with exactly one
-// EXT-X-DISCONTINUITY more; the config file holds [B]; input_switches is 1.
-// Then PUT inputs [B, A] (an input added below the active one): "live", no new epoch within 3 s, sessions still uninterrupted.
+// A := m5b1Clip, B := m5b1Clip (two files, two URLs). A server with every output on; stream cam with inputs [A]; an m5aOpen row
+// with a session reader on HTTP-TS, RTMP, RTSP and SRT, the HLS and DASH watchers, and a tap on the hub. After 3 s the tap has
+// exactly 1 epoch (the guard: the source made none). PUT cam with inputs [B]. Asserts: the PUT answers 200 and "live"; the
+// status' generation and since are unchanged and rebuilds is 0; within 10 s the tap has frames of exactly 2 epochs, and still
+// exactly 2 after 3 more seconds; assertUninterrupted(row) with no exception: every session reader holds every hub frame once,
+// across the epoch change, and no openstreamer_output_sessions_ended_total series moved; the HLS media sequence went on (never
+// back) and the playlists read over the test list exactly one EXT-X-DISCONTINUITY; the config file holds [B]; input_switches is 1.
+// Then PUT inputs [B, A] (an input added below the active one): "live", still exactly 2 epochs after 3 s, sessions uninterrupted.
 func TestM5b1ReplaceInputs(t *testing.T)
 
-// TestM5b1ReplaceInputsLadder: invariant 3 under a real child. A ladder of one x264 rung (height 180) and audio copy, HTTP-TS on.
-// PUT with a new input: "live"; the status' transcoder.pid and spawns are unchanged; a tap on cam_<label> sees exactly one more
-// epoch; an HTTP-TS reader of cam_<label> opened before the edit is still reading 3 s after it and its capture has no violation
-// (conform.CheckFrames with the epoch change allowed).
+// TestM5b1ReplaceInputsLadder: invariant 3 under a real child. A and B as above. A ladder of one x264 rung (height 180) and audio
+// copy, HTTP-TS on. A tap on cam_<label> has exactly 1 epoch before the edit. PUT with inputs [B]: "live"; the status'
+// transcoder.pid and spawns are unchanged; the tap has exactly 2 epochs within 15 s and still 2 after 3 more; an HTTP-TS reader of
+// cam_<label> opened before the edit is still reading 3 s after it and its capture has no violation (conform.CheckFrames with
+// the one epoch change allowed).
 func TestM5b1ReplaceInputsLadder(t *testing.T)
 
-// TestM5b1Assets: clause 2, and the live watermark edit. One server with an assets dir and the real child; cam with a ladder of two
+// TestM5b1Assets: clause 2, and the live watermark edit. One server with an assets dir and the real child; cam reads an m5b1Clip, with a ladder of two
 // x264 rungs (heights 180 and 120) and a text watermark "M5B1"; taps on both rendition hubs. picture(i) decodes the first picture
 // of rung i's latest GOP. Steps, each asserting on BOTH rungs, with the transcoder's pid, spawns and the generation unchanged
-// throughout, and no new epoch on either tap:
+// throughout, and exactly 1 epoch on either tap from start to end (no edit here changes epoch, and the source makes none):
 //  1. plain text: the top-left band is recorded as the DejaVu band.
 //  2. viewer PUT /assets/logo.png → 403. editor PUT (magentaPNG) → 201, used_by [], refreshed [].
+//     GET /assets/logo.png as the viewer → 200 and the bytes.
 //  3. PUT cam with watermark {image: logo.png, size_pct: 25} → "live"; within 10 s marked(picture(i), TopLeft) is true.
-//  4. PUT /assets/logo.png with a green PNG of the same size → 200, refreshed [cam]; within 10 s the mark region is within 40 of
+//  4. PUT /assets/logo.png with a green PNG of the same size → 200, refreshed [{stream: cam, ok: true}]; within 10 s the mark region is within 40 of
 //     (0,255,0) on both rungs. No stream PUT was made.
 //  5. DELETE /assets/logo.png → 409 asset_in_use, errors [cam]. GET /assets lists it with used_by [cam].
 //  6. PUT /assets/mono.ttf (the fixture font) → 201 (the probe ran: the bundle is configured). PUT cam with watermark
@@ -789,18 +854,19 @@ func TestM5b1Assets(t *testing.T)
 // TestM5b1NoFallback: clause 3. Needs NVENC to be unavailable to the child: where /dev/nvidiactl does not exist (CI, the peers
 // image) that is so; on a GPU host the test follows Task 5 Step 5's finding (server.Options.TranscoderEnv = ["CUDA_VISIBLE_DEVICES="]
 // for the server it starts, never os.Setenv; or it skips with that reason). cam: renditions [{label: hi, height: 180, bitrate_kbps: 400, encoder: nvenc, no_fallback: true},
-// {label: lo, height: 120, bitrate_kbps: 200}], HTTP-TS on. Asserts, within 20 s: openstreamer_transcoder_encoder_refusals_total
+// {label: lo, height: 120, bitrate_kbps: 200}], reading an m5b1Clip, HTTP-TS on. Asserts, within 20 s: openstreamer_transcoder_encoder_refusals_total
 // {stream="cam"} ≥ 2 and equal to the status' transcoder.encoder_refusals; encoder_fallbacks_total is 0; the status' last_error
 // starts "transcoder: " and contains "no_fallback"; taps on cam_hi and cam_lo have no video frame; the source is running (state
 // "running", copy://cam delivers); a second, passthrough stream on the same server plays over HTTP-TS without a violation.
-// Then PUT cam without no_fallback → "rebuild"; within 20 s both rungs deliver frames and encoder_fallbacks_total is 1.
+// Then PUT cam without no_fallback → "rebuild"; within 20 s both rungs deliver frames and encoder_fallbacks_total is ≥ 1
+// (one per build of the encoders: 1 with a source that never breaks, more if the child was respawned).
 func TestM5b1NoFallback(t *testing.T)
 ```
 
-- [ ] **Step 2: Run** `go test -race -count=1 -run '^TestM5b1' ./internal/e2e/` on the host — they pass (every task before this one is merged; a failure here is a defect of an earlier task: fix it there, with a test in its package).
-- [ ] **Step 3: The budget.** `time go test -race -count=1 -run '^TestM5b1' ./internal/e2e/`: at most 90 s. Over it: shorten the waits that are sleeps (the "no further epoch in the next 3 s" windows may go to 2 s), never an assertion.
+- [ ] **Step 2: Run** `go test -race -count=1 -run '^TestM5b1' ./internal/e2e/` on the host — they pass. For a failure, follow superpowers:systematic-debugging: decide from evidence whether the scenario or the code is wrong before changing either; a code fix gets a test in the package that owns the code.
+- [ ] **Step 3: The budget.** `time go test -race -count=1 -run '^TestM5b1' ./internal/e2e/`: at most 90 s. Over it: shorten the waits that are sleeps (the "still exactly 2 epochs after 3 more seconds" windows may go to 2 s), never an assertion.
 - [ ] **Step 4:** `go test -race -count=10 -run '^TestM5b1' ./internal/e2e/` — 10 of 10. Then `make test-ci-peers ARGS='-run ^TestM5b1 ./internal/e2e/'` — pass with ffmpeg 6.1.
-- [ ] **Step 5: M5a still holds.** `go test -race -count=1 -run '^TestM5a' ./internal/e2e/` — pass (Task 9 moved the tests that used an input edit as the rebuild to a layout edit; `TestM5aRebuildIsTheOtherRoute` still proves that a rebuild ends every session).
+- [ ] **Step 5: M5a still holds.** `go test -race -count=1 -run '^TestM5a' ./internal/e2e/` — pass (Task 8 moved the tests that used an input edit as the rebuild to the `["audio","video"]` layout edit; `TestM5aRebuildIsTheOtherRoute` still proves that a rebuild ends every session).
 - [ ] **Step 6: CI.** Add `TestM5b1ReplaceInputsLadder TestM5b1Assets TestM5b1NoFallback` to `E2E_TESTS` of the `transcode-e2e-arm64` job (its listed-tests guard then checks the names).
 - [ ] **Step 7:** `make test` (whole repository), `make test-ci-peers`, `make lint`, `make covercheck` — pass.
 - [ ] **Step 8: Commit** `test(e2e): the M5b1 scenarios`
@@ -818,6 +884,6 @@ func TestM5b1NoFallback(t *testing.T)
 
 ---
 
-## Hand-over: what M5b2 needs decided
+## Hand-over: M5b2
 
-M5b2 is not planned here. Its design needs one answer from the user first: **is the audio language one declared value for the stream's single audio track** (a spec field such as `audio_language: vi`, written as `LANGUAGE` on an `EXT-X-MEDIA` audio entry of the HLS masters and as `lang` on the MPD's audio AdaptationSet, with `osconform` reading both), **or several audio tracks chosen and labelled by language** (the layout takes more than one audio, the demuxers report each track's language from the PMT, the HLS rendition list or the SDP, the masters list one `EXT-X-MEDIA` per language and TS variants stop muxing every audio track)? The recommended default is the first: it closes the row's clause with `pkg/hls`, `pkg/dash`, the packager and `internal/conform` alone, and leaves multi-audio as a milestone of its own with M4b's deferred minors.
+M5b2 is not planned here. Ruled by the controller in review round 1: **the audio language is one declared value for the stream's single audio track** (a spec field such as `audio_language: vi`), written as `LANGUAGE` on an `EXT-X-MEDIA` audio entry of the HLS masters and as `lang` on the MPD's audio AdaptationSet, with `osconform` reading both. That closes the row's fourth clause with `pkg/hls`, `pkg/dash`, the packager and `internal/conform` alone. Several audio tracks chosen and labelled by language (a layout with more than one audio, track languages from the PMT, the HLS rendition list or the SDP, TS variants that stop muxing every audio track) are a milestone of their own, with M4b's multi-audio deferred minors.
