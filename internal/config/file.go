@@ -17,6 +17,17 @@ import (
 // was last loaded, written or adopted.
 var ErrStale = errors.New("config: the file changed on disk")
 
+// ErrUnreadable is what errors.Is finds in every error of reading the file:
+// it cannot be opened or read, is not a regular file, is too large, or, on
+// Unix, is not private to its owner.
+var ErrUnreadable = errors.New("config: the file cannot be read")
+
+// kinded is err, in which errors.Is also finds kind. Its text is err's.
+type kinded struct{ kind, err error }
+
+func (e *kinded) Error() string   { return e.err.Error() }
+func (e *kinded) Unwrap() []error { return []error{e.kind, e.err} }
+
 // File is the config file on disk. Its methods may be called from several
 // goroutines; Write calls are serialised.
 type File struct {
@@ -54,7 +65,7 @@ func Open(path string) (*File, []byte, error) {
 }
 
 // Read returns the text on disk now, with the same mode check as Open,
-// every time: a reload reads through it.
+// every time: a reload reads through it. Its errors are ErrUnreadable.
 func (f *File) Read() ([]byte, error) { return f.read(true) }
 
 // Stale reports whether the text on disk has another hash than the
@@ -116,8 +127,17 @@ func (f *File) staleLocked() (bool, error) {
 }
 
 // read returns the file's text, refusing anything but a regular file of
-// at most MaxBytes and, with mode, a file not private to its owner.
+// at most MaxBytes and, with mode, a file not private to its owner. Every
+// error is ErrUnreadable.
 func (f *File) read(mode bool) ([]byte, error) {
+	text, err := f.readFile(mode)
+	if err != nil {
+		return nil, &kinded{kind: ErrUnreadable, err: err}
+	}
+	return text, nil
+}
+
+func (f *File) readFile(mode bool) ([]byte, error) {
 	fh, err := os.Open(f.path)
 	if err != nil {
 		return nil, fmt.Errorf("config: read: %w", err)

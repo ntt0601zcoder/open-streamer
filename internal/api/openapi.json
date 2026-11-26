@@ -865,7 +865,7 @@
         }
       },
       "Conflict": {
-        "description": "conflict: a listen address or a copy:// cycle conflicts with another stream or the server (errors lists each). config_changed: the config file was edited by hand; reload first.",
+        "description": "conflict: a listen address or a copy:// cycle conflicts with another stream or the server (errors lists each). config_changed: the config file was edited by hand; reload first. config_unreadable (a reload only): the config file cannot be read, or on Unix is not mode 0600; message says why, and nothing changed.",
         "content": {
           "application/json": {
             "schema": {
@@ -1646,6 +1646,7 @@
               "not_found",
               "conflict",
               "config_changed",
+              "config_unreadable",
               "precondition_failed",
               "too_large",
               "unsupported_media_type",

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -140,6 +141,19 @@ func TestReloadAndStatus(t *testing.T) {
 	rec = e.do(http.MethodPost, "/api/v1/reload", editor...)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, errOf(t, rec).Message, "did not find expected key")
+
+	// A file that cannot be read is its own code, with the reason scrubbed,
+	// and the API logs nothing: the reload did.
+	cause := errors.New("config: /srv/os/config.yaml must be mode 0600, rtsp://u:hunter2@h/a")
+	e.be.reloadErr = fmt.Errorf("server: %w", errors.Join(config.ErrUnreadable, cause))
+	rec = e.do(http.MethodPost, "/api/v1/reload", editor...)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	doc := errOf(t, rec)
+	assert.Equal(t, codeUnreadable, doc.Code)
+	assert.Contains(t, doc.Message, "the config file cannot be read: ")
+	assert.Contains(t, doc.Message, "/srv/os/config.yaml must be mode 0600")
+	assert.NotContains(t, rec.Body.String(), "hunter2")
+	assert.NotContains(t, e.logs.String(), `"level":"ERROR"`, "the API logged the reload's error again")
 
 	at := time.Date(2026, 11, 26, 10, 0, 0, 0, time.UTC)
 	e.be.cstatus = ConfigStatus{

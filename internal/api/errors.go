@@ -19,6 +19,7 @@ const (
 	codeNotFound     = "not_found"
 	codeConflict     = "conflict"
 	codeChanged      = "config_changed"
+	codeUnreadable   = "config_unreadable"
 	codePrecondition = "precondition_failed"
 	codeTooLarge     = "too_large"
 	codeMediaType    = "unsupported_media_type"
@@ -79,6 +80,11 @@ func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusPreconditionRequired, codePrecondReq, "the If-Match header is required", nil)
 	case errors.Is(err, config.ErrStale):
 		writeError(w, http.StatusConflict, codeChanged, "the config file changed on disk; reload first", nil)
+	case errors.Is(err, config.ErrUnreadable):
+		// A reload of a file that cannot be read, or whose mode is not
+		// private: nothing changed, and the operator must be told why. Not
+		// logged here: the reload logged it.
+		writeError(w, http.StatusConflict, codeUnreadable, "the config file cannot be read: "+err.Error(), nil)
 	case errors.As(err, &syntax):
 		// Its Error hides the values the YAML library quoted.
 		writeError(w, http.StatusBadRequest, codeBadRequest, syntax.Error(), nil)

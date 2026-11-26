@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -914,6 +915,73 @@ func TestReloadInvalidKeepsState(t *testing.T) {
 			assert.False(t, status.Stale)
 		})
 	}
+}
+
+// A reload of a file that cannot be read, or that is not private, is a 409
+// with its own code and the reason, logged once.
+func TestReloadUnreadable(t *testing.T) {
+	text := baseText(streamYAML("cam", "{hls: true}"))
+	s := testConfig(t, func(su *setup) { su.Text = text })
+	gen := s.generation("cam")
+	refused := func(t *testing.T, reason string) {
+		t.Helper()
+		before := strings.Count(s.logs.String(), "reload failed")
+		res := s.do(http.MethodPost, "/api/v1/reload", "ops", "")
+		require.Equal(t, http.StatusConflict, res.code, res.body)
+		assert.Contains(t, res.body, `"code":"config_unreadable"`)
+		assert.Contains(t, res.body, "the config file cannot be read: ")
+		assert.Contains(t, res.body, reason)
+		assert.Contains(t, s.status().LastReloadError, reason)
+		assert.Equal(t, before+1, strings.Count(s.logs.String(), "reload failed"), "logged once")
+		assert.NotContains(t, s.logs.String(), "internal error")
+		assert.Equal(t, gen, s.generation("cam"))
+		applied, _ := s.ConfigText()
+		assert.Equal(t, text, string(applied))
+	}
+	restored := func(t *testing.T) {
+		t.Helper()
+		res := s.do(http.MethodPost, "/api/v1/reload", "ops", "")
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		assert.Empty(t, s.status().LastReloadError)
+	}
+	t.Run("mode 0644", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("no file modes")
+		}
+		require.NoError(t, os.Chmod(s.path, 0o644))
+		refused(t, "must be mode 0600")
+		require.NoError(t, os.Chmod(s.path, 0o600))
+		restored(t)
+	})
+	t.Run("mode 0000", func(t *testing.T) {
+		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+			t.Skip("the owner can always read")
+		}
+		require.NoError(t, os.Chmod(s.path, 0))
+		refused(t, "permission denied")
+		require.NoError(t, os.Chmod(s.path, 0o600))
+		restored(t)
+	})
+	t.Run("gone", func(t *testing.T) {
+		require.NoError(t, os.Remove(s.path))
+		refused(t, "config: read: ")
+		s.handEdit(text)
+		restored(t)
+	})
+	t.Run("a directory", func(t *testing.T) {
+		require.NoError(t, os.Remove(s.path))
+		require.NoError(t, os.Mkdir(s.path, 0o700))
+		refused(t, "is not a regular file")
+		require.NoError(t, os.Remove(s.path))
+		s.handEdit(text)
+		restored(t)
+	})
+	// A write is still told that the file changed, not that it is
+	// unreadable: the stale check comes first.
+	require.NoError(t, os.Remove(s.path))
+	res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", streamJSON("cam", "rtmp://src.example/live/cam", `{"hls":true,"dash":true}`))
+	require.Equal(t, http.StatusConflict, res.code, res.body)
+	assert.Contains(t, res.body, `"code":"config_changed"`)
 }
 
 func TestRestartRequired(t *testing.T) {

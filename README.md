@@ -118,7 +118,8 @@ curl -u ops -X POST -H 'X-Requested-By: curl' http://127.0.0.1:8081/api/v1/reloa
 Until the reload, every API write is refused with 409 `config_changed` ("the
 config file changed on disk; reload first"), so neither side overwrites the
 other. An invalid file at reload keeps the running config; the error is in the
-log and in `GET /api/v1/config/status`.
+log and in `GET /api/v1/config/status`. A file that cannot be read at reload,
+or whose mode is no longer 0600, is 409 `config_unreadable` with the reason.
 
 ### Playing a stream
 
