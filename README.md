@@ -94,6 +94,17 @@ is empty) is refused with 422 `invalid_spec`: turn the output off, or set the
 listener and restart. `GET /api/v1/streams/cam1/status` shows its state;
 `DELETE /api/v1/streams/cam1` removes it.
 
+Listeners are fixed at start:
+
+- Removing a server listener (`server.rtmp.listen`, `rtsp` or `srt`) and
+  restarting leaves every stream that has that output `stopped`, with a load
+  error that names the output, until the output is turned off or the listener
+  is back.
+- Adding a listener and turning on its output takes two steps: set the
+  listener and restart, then turn the output on. One whole-config `PUT` that
+  does both is refused with 422, because the output is judged against the
+  listeners the server started with.
+
 `If-Match` makes a write conditional. It takes one tag exactly as an `ETag`
 header gave it (or `*`, for "the stream exists"): a list of tags and weak
 tags (`W/"…"`) do not match. It is optional on a stream's `PUT` and `DELETE`
