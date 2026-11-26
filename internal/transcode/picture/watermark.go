@@ -8,11 +8,7 @@ import (
 	"image/draw"
 	"image/jpeg"
 	"image/png"
-	"io"
 	"math"
-	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -47,10 +43,14 @@ type Watermark struct {
 	OpacityPct int      // 1..100; 0 means 100.
 	SizePct    int      // Text: 1..50, 0 means 5; image: 1..100, 0 means 15.
 	TimeZone   string   // IANA name; "" means UTC.
+
+	// Font is a TrueType or OpenType file; text only; nil means the built-in DejaVu Sans. Its bytes are
+	// immutable once set: holders share the slice and nobody copies or changes it (R-E8).
+	Font []byte
 }
 
 // Validate reports whether w can be built. An image is decoded in full, so
-// what the host accepts the child can build.
+// what the host accepts the child can build; a font passes CheckFont.
 func (w Watermark) Validate() error {
 	hasText, hasImage := w.Text != "", len(w.Image) > 0
 	switch {
@@ -58,6 +58,8 @@ func (w Watermark) Validate() error {
 		return errors.New("watermark: neither text nor image")
 	case hasText && hasImage:
 		return errors.New("watermark: text and image are exclusive")
+	case len(w.Font) > 0 && !hasText:
+		return errors.New("watermark: a font needs text")
 	}
 	if w.Position > Center {
 		return fmt.Errorf("watermark: position %d out of range", w.Position)
@@ -71,6 +73,11 @@ func (w Watermark) Validate() error {
 	if hasText {
 		if w.SizePct < 0 || w.SizePct > 50 {
 			return fmt.Errorf("watermark: text size %d out of range 0..50", w.SizePct)
+		}
+		if len(w.Font) > 0 {
+			if err := CheckFont(w.Font); err != nil {
+				return fmt.Errorf("watermark: %w", err)
+			}
 		}
 		return validateText(w.Text)
 	}
@@ -261,25 +268,13 @@ func Margin(picH int) int {
 	return max(1, int(math.Round(0.02*float64(picH))))
 }
 
-var assetName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}\.(png|jpg|jpeg)$`)
-
-// LoadAsset reads the asset name from dir. The name must match the asset
-// rule, so it cannot leave dir; the file is at most MaxImageBytes.
+// LoadAsset reads the image asset name from dir. The name must match the
+// image rule (ImageName), so it cannot leave dir; the entry must be a regular
+// file (OpenRegular: a symlink, a directory or a FIFO is refused, which M4c
+// did not do for a symlink); the file is at most MaxImageBytes.
 func LoadAsset(dir, name string) ([]byte, error) {
-	if !assetName.MatchString(name) {
+	if !ImageName(name) {
 		return nil, fmt.Errorf("picture: asset name %q is not allowed", name)
 	}
-	f, err := os.Open(filepath.Join(dir, name))
-	if err != nil {
-		return nil, fmt.Errorf("picture: open asset: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-	b, err := io.ReadAll(io.LimitReader(f, MaxImageBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("picture: read asset %q: %w", name, err)
-	}
-	if len(b) > MaxImageBytes {
-		return nil, fmt.Errorf("picture: asset %q is over %d bytes", name, MaxImageBytes)
-	}
-	return b, nil
+	return readAsset(dir, name, MaxImageBytes)
 }
