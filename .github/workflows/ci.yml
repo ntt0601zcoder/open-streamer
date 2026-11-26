@@ -204,7 +204,9 @@ jobs:
   # (TestM4cWatermarkEveryRung, TestM4cWatermarkABR,
   # TestM4cThumbnailsTranscoded, TestM4cThumbnailsPassthrough,
   # TestM4cThumbnailsCopyVideo, TestM4cFrozen; the live-update and respawn
-  # ones run in the test job, the NVENC ones skip without a device). The
+  # ones run in the test job, the NVENC ones skip without a device) and the
+  # M5a ladder served by the openstreamer server (TestM5aLadder; the other
+  # M5a scenarios need no transcoder and run in the test job). The
   # whole set took about 55 s with -race on an amd64 workstation, well
   # inside the 10 min timeout. Their only peers are the bundle and apt's
   # ffmpeg and ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a
@@ -219,7 +221,7 @@ jobs:
       OS_REQUIRE_PEERS: "1"
       OS_TRANSCODE_E2E_ARM: "1"
       E2E_PKGS: ./internal/e2e/ ./internal/transcode/
-      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cWatermarkABR TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen
+      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cWatermarkABR TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen TestM5aLadder
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -277,6 +279,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # The server is pure Go and builds for any system (§2 Platforms).
+      - name: Build openstreamer for Linux, Windows and macOS
+        run: |
+          for goos in linux windows darwin; do
+            GOOS=$goos go build -o /dev/null ./cmd/openstreamer
+          done
       # The transcoder bundle of transcoder-amd64, for the tests that spawn
       # the real child (testpeer.OSTranscoder).
       - uses: actions/download-artifact@v4
