@@ -3,7 +3,7 @@
   "info": {
     "title": "Open Streamer API",
     "version": "1",
-    "description": "The REST API of Open Streamer: the streams, the config editor, the reload and the status documents. Every route but /healthz needs HTTP Basic credentials of a user in the config file; a viewer reads, an editor reads and writes (x-role on each operation). A viewer's ?secrets=1 is 403 on every authenticated route, not only on the stream routes. Every response has Cache-Control: no-store (the thumbnail: no-cache) and X-Content-Type-Options: nosniff. A request no route answers gets a plain-text 404 or 405, without authentication. The editor also has net/http/pprof under /debug/pprof/."
+    "description": "The REST API of Open Streamer: the streams, the config editor, the reload and the status documents. Every route but /healthz needs HTTP Basic credentials of a user in the config file; a viewer reads, an editor reads and writes (x-role on each operation). A viewer's ?secrets=1 is 403 on every authenticated route, not only on the stream routes. Every response has Cache-Control: no-store (the thumbnail: no-cache) and X-Content-Type-Options: nosniff. A request no route answers gets a plain-text 404 or 405, without authentication. The editor also has net/http/pprof under /debug/pprof/. The API has no TLS before M5c: keep it on loopback or behind a TLS reverse proxy. Run the server under a service manager that restarts it: there is no per-stream panic recovery, so a panic ends the process and the restart restores every stream from the config file."
   },
   "security": [
     {
@@ -781,7 +781,7 @@
         "name": "If-Match",
         "in": "header",
         "required": false,
-        "description": "The stream's ETag; the write is refused with 412 when the stream has another.",
+        "description": "One tag, exactly as an ETag header gave it, or *: the write is refused with 412 when the stream has another tag, and also when the stream does not exist (a DELETE of a missing name with If-Match is 412, not 404). A list of tags and a weak tag (W/) never match.",
         "schema": {
           "type": "string"
         }
@@ -790,7 +790,7 @@
         "name": "If-Match",
         "in": "header",
         "required": true,
-        "description": "The config's ETag, as GET /api/v1/config returned it; 428 without it, 412 when the config has another.",
+        "description": "The config's ETag, one tag exactly as GET /api/v1/config returned it; 428 without it, 412 when the config has another. A list of tags, a weak tag (W/) and * never match.",
         "schema": {
           "type": "string"
         }
@@ -925,7 +925,7 @@
         }
       },
       "TooManyAttempts": {
-        "description": "too_many_attempts: this address and user name are in a backoff after failed logins, or have 5 logins counted or in flight.",
+        "description": "too_many_attempts: this address and user name are in a backoff after failed logins, or have 5 logins counted or in flight. The address is the connection's: behind a reverse proxy every client shares the proxy's address and so one limit (a trusted-proxy setting comes with M5c).",
         "headers": {
           "Retry-After": {
             "schema": {

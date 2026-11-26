@@ -68,6 +68,15 @@ auth (`curl -u ops` asks for the password), and every `PUT`, `DELETE` and
 `POST` must carry an `X-Requested-By` header (any value). The OpenAPI
 document is at `/api/v1/openapi.json`.
 
+Failed logins are limited per client address and user name: after 5 failures
+that pair waits (1 s, doubling to 5 min) and gets 429 with `Retry-After`.
+Behind a reverse proxy every client has the proxy's address, so the limit is
+shared by all of them and one client's failures can lock a user name out for
+everyone; a trusted-proxy setting that reads the forwarded address comes with
+M5c. Until then keep the API on loopback or on a network you trust. The
+server logs a warning at start when `server.api.listen` is not a loopback
+address.
+
 Create or replace a stream, served on every output:
 
 ```sh
@@ -78,10 +87,17 @@ curl -u ops -X PUT http://127.0.0.1:8081/api/v1/streams/cam1 \
 ```
 
 It answers 201 for a new stream and 200 for a replaced one, with the stream
-(URLs redacted) and how the edit was applied. An output whose listener is off
+(URLs redacted) and how the edit was applied. A `PUT` of the document the
+stream already has is `unchanged` and does not rewrite the file. An output whose listener is off
 (`rtmp`, `rtsp` or `srt` while that `server.*.listen` is empty) is refused with
 422 `invalid_spec`: turn the output off, or set the listener and restart. `GET /api/v1/streams/cam1/status`
 shows its state; `DELETE /api/v1/streams/cam1` removes it.
+
+`If-Match` makes a write conditional. It takes one tag exactly as an `ETag`
+header gave it (or `*`, for "the stream exists"): a list of tags and weak
+tags (`W/"…"`) do not match. It is optional on a stream's `PUT` and `DELETE`
+and required on the config's `PUT`. A `DELETE` with `If-Match` on a name
+that does not exist is 412, not 404: the condition is checked first.
 
 Edit the whole config in one round trip. `GET` returns the file as it is,
 comments included, with an `ETag`; `PUT` takes the whole file back with that
@@ -124,6 +140,15 @@ config file changed on disk; reload first"), so neither side overwrites the
 other. An invalid file at reload keeps the running config; the error is in the
 log and in `GET /api/v1/config/status`. A file that cannot be read at reload,
 or whose mode is no longer 0600, is 409 `config_unreadable` with the reason.
+
+### Running it as a service
+
+Run `openstreamer` under a service manager that restarts it (systemd with
+`Restart=always`, a container with a restart policy). There is no per-stream
+panic recovery: a panic in one stream's code ends the whole process, and the
+restart brings every stream back from the config file. SIGTERM stops it in
+order; a second SIGTERM, or the manager's kill after its timeout, ends it at
+once.
 
 ### Playing a stream
 
