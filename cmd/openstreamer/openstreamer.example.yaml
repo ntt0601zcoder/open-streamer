@@ -19,24 +19,41 @@ version: 1
 # A change in this section is not applied while the server runs: it is
 # reported as restart_required until the process is restarted.
 server:
+  # The certificate of every TLS listener: one pair of PEM files (the
+  # certificate file may hold its chain). A new pair on disk is taken
+  # without a restart, within 30 s or at once on SIGHUP or POST
+  # /api/v1/reload. Each tls_listen below needs it.
+  # tls:
+  #   cert_file: /etc/openstreamer/tls/fullchain.pem
+  #   key_file: /etc/openstreamer/tls/privkey.pem
   # HLS, DASH and HTTP-TS, under /live/<stream>/. Default ":8080".
   http:
     listen: ":8080"
-  # The API, the metrics and pprof. Default "127.0.0.1:8081"; it has no TLS,
-  # so put a reverse proxy in front before it leaves the machine.
+    # The same over HTTPS, beside the plain listener. No default: off.
+    # tls_listen: ":8443"
+  # The API, the metrics and pprof. Default "127.0.0.1:8081": this listener
+  # has no TLS, so keep it on loopback.
   api:
     listen: "127.0.0.1:8081"
+    # The API over HTTPS: the listener to reach it from the network.
+    # tls_listen: ":8444"
   # The shared RTMP listener: players of rtmp://host:19350/live/<stream>,
   # and the streams' RTMP listen inputs on the same address. Leave listen
   # out to turn it off; the same goes for rtsp and srt. A stream may turn
   # on an output (rtmp, rtsp, srt) only while its listener is on.
   rtmp:
     listen: ":19350"
+    # RTMPS, with the same app: players of rtmps://host:19351/live/<stream>,
+    # and the streams' rtmps:// listen inputs, which must name this address.
+    # tls_listen: ":19351"
     app: live
   # RTSP players: rtsp://host:5554/live/<stream>. udp also offers RTP over
   # UDP; without it RTP is interleaved on the TCP connection.
   rtsp:
     listen: ":5554"
+    # RTSPS players: rtsps://host:5555/live/<stream>, RTP interleaved on the
+    # TLS connection only (udp does not apply to it).
+    # tls_listen: ":5555"
     app: live
     udp: false
   # SRT receivers: srt://host:9999?streamid=live/<stream>.

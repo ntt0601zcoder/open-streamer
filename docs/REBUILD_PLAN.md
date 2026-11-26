@@ -641,10 +641,14 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   Unknown names are verified against a dummy hash, successes are remembered
   under a per-process HMAC key, at most 2 verifications run at once, and a
   per-address-and-name limiter blocks after 5 failures for 1 s, doubling up
-  to 5 min; a remembered login touches no limiter state. Writes need an
-  `X-Requested-By` header. The API listens on `127.0.0.1:8081` by default,
-  apart from the media listener, because Basic credentials are only base64
-  until M5c's HTTPS.
+  to 5 min, and at most 4 verifications in flight per client address
+  (M5c1's R-S10); a remembered login touches no limiter state. Writes need
+  an `X-Requested-By` header. The API's default listener,
+  `server.api.listen`, stays plain and on `127.0.0.1:8081`, apart from the
+  media listener, because Basic credentials are only base64 there;
+  `server.api.tls_listen` is the network-facing API, opt-in and without a
+  default (M5c1's R-S5), so a certificate alone never exposes the control
+  plane.
 - **Supervisor** (R-D5, `internal/stream`): one goroutine per enabled
   stream owns all of that stream's state (its hubs, pipeline, transcoder or
   thumbnailer, packagers and pushers) and takes edits from a mailbox, in
@@ -739,6 +743,7 @@ never as dependencies.
 | Metrics | our own text exposition, `internal/metrics` (R-D9) |
 | Config file | `go.yaml.in/yaml/v3` (R-D2) |
 | Password hashing | `crypto/pbkdf2`, standard library (R-D8) |
+| TLS | `crypto/tls`, standard library (R-S2) |
 
 Our own libraries:
 
@@ -817,7 +822,8 @@ before the code they check.
 | M5b1 ([plan](superpowers/plans/2026-11-26-m5b1-live-edits-assets.md), done) | Live edits and assets: a running pipeline's inputs edited in place, the live watermark edit, the asset API (upload, listing, replacement; R-C8) with operator fonts (R-C7), `no_fallback` on an NVENC rung (wire version 3), and M5a's three carry items (`TestManagerConcurrentReplaces` on held sockets, error lists capped, the listener notes in the README) | M5a | Replacing a running stream's inputs is exactly one epoch change and ends no output session; an uploaded image and font appear on every rung; a strict NVENC rung fails instead of falling back and is counted. Proved by `TestM5b1ReplaceInputs`, `TestM5b1ReplaceInputsLadder`, `TestM5b1Assets` and `TestM5b1NoFallback`, with the pipeline, spec, asset, transcode, native, stream, api and server suites |
 | M5b2 ([plan](superpowers/plans/2026-11-26-m5b2-audio-language.md), done) | Audio language: the spec field, the HLS masters' `LANGUAGE`, the MPD's `lang` | M5a | `osconform` reads the languages. Proved by `TestM5b2AudioLanguage`, `TestM5b2AudioLanguageLadder` and `TestM5b2Players`, with the media, hls, dash, ingest, spec, live, stream and conform suites |
 | Multi-audio | Several audio tracks chosen and labelled by language, languages from the source, the TS language descriptor, M4b's multi-audio minors | M5b2 | Not yet planned |
-| M5c | Transport security: HTTPS for the API and the HTTP outputs, RTMPS (listen, pull, push), RTSPS and SRTP, SRT encryption (input and output), credentials in URL paths and queries redacted, secrets as write-only spec fields | M5a | ffmpeg publishes and plays over each secured protocol against our server; no secret appears in a response, a log or a metric |
+| M5c1 ([plan](superpowers/plans/2026-11-26-m5c1-tls.md), done) | TLS: one certificate in the config file, reloaded without a restart; HTTPS for the API and the media listener; RTMPS listen, pull and push; RTSPS listen (interleaved) and pull | M5a | ffmpeg publishes over RTMPS and plays over RTMPS, RTSPS and HTTPS (HLS, DASH, HTTP-TS) against our server; our server pulls from and pushes to a peer over RTMPS and pulls RTSPS (R-S1). Proved by `TestM5c1FFmpeg`, `TestM5c1PullPush`, `TestM5c1Rotate`, `TestM5c1API`, `TestM5c1Players` and `TestM5c1NoSecretsLeak`, with the certs, config, redact, rtmp, rtsp, rtmpsrv, rtmppush, ingest, stream, server and auth suites |
+| M5c2 | SRTP for RTSP over UDP; SRT output encryption; credentials in URL paths redacted; secrets as write-only spec fields | M5c1 | Not yet planned |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5a | Feature tests; DVR playback passes `osconform` |
 | M7 | Cutover | M1–M6 | The [soak plan](SOAK_TEST_PLAN.md) runs for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
 
@@ -857,7 +863,7 @@ Out of M3b1:
 
 | Item | Reason |
 |---|---|
-| RTMPS (TLS) | Needs certificates and their configuration: M5c |
+| RTMPS (TLS) | Done in M5c1: `server.rtmp.tls_listen` (R-S6) |
 | Play authentication and tokens | M6 sessions and tokens |
 | Seek, pause, `receiveAudio` and `receiveVideo` | Live only: acknowledged and ignored |
 | AMF3 | Clients that ask for `objectEncoding` 3 are refused, as in M2b |
@@ -887,7 +893,7 @@ Out of M3b2:
 
 | Item | Reason |
 |---|---|
-| RTSPS and SRTP | Need TLS and its configuration: M5c |
+| RTSPS and SRTP | RTSPS is done in M5c1 (`server.rtsp.tls_listen`, interleaved only; R-S6); SRTP is M5c2 |
 | Play authentication and tokens | M6 sessions and tokens, as for RTMP play |
 | Multicast; RTSP over HTTP tunnelling | Rare for players; added on demand |
 | PAUSE, seek, `Scale` and `Speed` | Live only: PAUSE is answered 455 |
@@ -924,7 +930,7 @@ Out of M3b3:
 | Item | Reason |
 |---|---|
 | SRT caller push-out | Add on demand; the RTMP push-out covers pushing today |
-| SRT encryption | Needs credentials: M5c; encrypted requests are refused |
+| SRT encryption | Needs credentials: M5c2; encrypted requests are refused |
 | Publishing into the SRT output listener | The SRT inputs own publishing |
 | DASH placeholders | Periods carry their adaptation sets; there is nothing to align |
 | Silent AAC placeholder parts instead of gaps | Backlog: silent AAC placeholder parts |
@@ -1176,14 +1182,18 @@ place (`Pipeline.SetInputs`, §3.6), the watermark edited in place over the
 API (`Transcoder.SetWatermark`), the asset API (R-C8) with operator fonts
 (R-C7), and a rung that refuses the x264 fallback (wire version 3). M5b2,
 one declared audio language in the spec, the HLS masters and the MPD (done).
-M5c, transport security: HTTPS for the API and the HTTP outputs, RTMPS
-(listen, pull, push), RTSPS with SRTP by its own ruling, SRT encryption
-(input and output), redaction of credentials in URL paths and queries (the
-M2c note), and secrets as write-only spec fields. M6 and the M7 soak need
-only M5a; M5b2 and M5c may run beside M6. Until M5b1 an input edit rebuilt
-the stream (R-D6), and assets were files the operator copied into a
-directory; until M5c the Basic credentials and every stream key cross the
-network in clear, so the API listens on loopback by default (R-D8).
+M5c, transport security, is two plans (ruling R-S1 of the M5c1 plan). M5c1,
+TLS (done): the certificate in the config file, HTTPS for the API and the
+media listener, an RTMPS listener (publish and play), RTMPS pull and push,
+an RTSPS listener (play only, TCP only) and RTSPS pull. M5c2 (not yet
+planned): SRTP for RTSP over UDP, SRT output encryption, redaction of
+credentials in URL paths (the M2c note), and secrets as write-only spec
+fields. M6 and the M7 soak need only M5a; M5b2 and M5c may run beside M6.
+Until M5b1 an input edit rebuilt the stream (R-D6), and assets were files
+the operator copied into a directory; until M5c1 the Basic credentials and
+every stream key crossed the network in clear. The API's plain listener
+still listens on loopback by default (R-D8); since M5c1 the network-facing
+API is `server.api.tls_listen` (R-S5).
 
 M5a's rulings are in its plan: R-D2 (one binary, one config file), R-D3
 (product names), R-D4 (how the file is loaded, written and reloaded), R-D5
@@ -1218,7 +1228,7 @@ Out of M5a:
 |---|---|
 | Inputs edited in place, the live watermark edit, the asset API, operator fonts, refusing the x264 fallback | Done in M5b1; until then an input edit rebuilt the stream (R-D6) and assets were files in `server.assets_dir` |
 | Audio language | Done in M5b2 (`audio_language`) |
-| HTTPS, RTMPS, RTSPS and SRTP, SRT encryption, credentials in URL paths or queries, write-only secrets | M5c; until then the API listens on loopback by default (R-D8) |
+| HTTPS, RTMPS, RTSPS and SRTP, SRT encryption, credentials in URL paths or queries, write-only secrets | HTTPS, RTMPS and RTSPS are done in M5c1; SRTP, SRT output encryption, credentials in URL paths and write-only secrets are M5c2. The plain API still listens on loopback by default (R-D8, R-S5) |
 | `PATCH` and per-field edits | R-D7: a stream is replaced whole by `PUT`, or the whole config |
 | Histograms and per-stream session counts | R-D9; per-stream sessions are M6's |
 | Applying a `server` change without a restart | R-D4: reported as `restart_required` |
@@ -1277,6 +1287,97 @@ Out of M5b2 (R-L1), and its known limits:
 | Known limit: when the lowest known audio track has left the window while a higher one continues, the MPD drops `lang`, while the CMAF master still labels the gap-only track | R-L3 as written: both label the lowest known audio track, which has no set in the MPD; the Multi-audio milestone |
 | Known limit: no player or e2e row covers the audio-only CMAF master's URI-less entry | Conform covers it (`TestAudioLanguageConforms`); players are proved on the ABR TS master's entry (`TestM5b2Players`) |
 
+M5c1's rulings are in its plan: R-S1 (the split of M5c and M5c1's exit
+criterion), R-S2 (one certificate), R-S3 (the certificate reloads without a
+restart), R-S4 (HTTPS is a second listener; plain HTTP stays), R-S5 (the
+API's default does not move), R-S6 (the RTMPS and RTSPS listeners), R-S7
+(TLS clients verify; the opt-out is in the scheme), R-S8 (closing a TLS
+connection never waits on the peer), R-S9 (secrets) and R-S10 (the login
+limiter's per-address cap).
+
+R-S1, in full: M5c is two plans. M5c1 is TLS: the certificate in the config
+file; HTTPS for the API and the media listener; an RTMPS listener (publish
+and play); RTMPS pull and push; an RTSPS listener (play only, TCP only) and
+RTSPS pull. M5c2 is SRTP for RTSP over UDP, SRT output encryption,
+credentials in URL paths, and secrets as write-only spec fields. M5c1's
+exit criterion: ffmpeg publishes over RTMPS and plays over RTMPS, RTSPS and
+HTTPS (HLS, DASH, HTTP-TS) against our server; our server pulls from and
+pushes to a peer over RTMPS and pulls RTSPS.
+
+Facts the code settled while it ran, beyond the rulings:
+
+- **R-S10 was revised twice.** The cap is one rule, at most 4 verifications
+  in flight per client address; the per-address failure block was dropped,
+  because behind a shared address it is a remote lockout. And R-S10's
+  sentence "guessing one name's password stays bounded … by PBKDF2" no
+  longer holds for a remembered name: a guess that does not match the
+  remembered login is charged as a failure at once and answered 401 without
+  a verification, before the cap. So guessing at a remembered name is
+  bounded by the name backoff alone, and a fast 401 reveals that a name is
+  remembered. A mismatch while the pair is blocked answers 429.
+- **Closing.** A TLS close waits at most 100 ms for `close_notify` when no
+  write is in flight (`closeConn` in `pkg/rtmp` and `pkg/rtsp`, which
+  returns nil for a TLS connection). A close that races a write may skip
+  `close_notify`, which is accepted: each protocol has its own end of
+  stream. `pkg/rtsp` closes under its write mutex; whether `pkg/rtmp`
+  needs the same is left to the final review.
+- **The handshake-failure counter** counts every connection that did not
+  complete a handshake: TCP probes, plain HTTP to the HTTPS port and silent
+  clients, as well as TLS errors. `https`, `api`, `rtmps` and `rtsps` are
+  the handshake line's and the counter's labels; what else `net/http`
+  reports is logged under the server's name, `server: media:` or `server:
+  api:`.
+- **The key file's mode.** The server warns on a key file with any of the
+  `0o077` bits set and never refuses it.
+- **A plain and a TLS listen on one address** are refused with "listen
+  address tcp :1936 conflicts with the RTMPS listener tcp :1936 of the
+  server".
+- **`SSL_CERT_FILE`** names extra roots on Linux and the BSDs only.
+- **The certificate store** also sees a replaced inode (`os.SameFile`), so
+  on Windows the `unchanged` counter may run high.
+- **The cmd usage text** did not change (exception 7 permitted it, and did
+  not require it).
+- **`pkg/tlstest`** is the test CA (the pre-flight moved it out of
+  `internal/`, so that `pkg/rtmp` and `pkg/rtsp` can use it), and
+  `conform.ReadOptions.TLS` is the client config of an `rtmps://` or
+  `rtsps://` read.
+- `TestM5c1FFmpeg` runs in the `transcode-e2e-arm64` job too; the other
+  M5c1 scenarios run in the amd64 `test` job.
+
+Known limits of the peers, found by the M5c1 scenarios:
+
+| Peer | Limit | Evidence |
+|---|---|---|
+| ffmpeg 6.1 and 8 | Cannot listen on `rtmps://`, so peer tests put ffmpeg's plain `-listen 1` behind a TLS terminator (`testpeer.TLSFront`) | "rtmp_listen not available for rtmps" |
+| ffmpeg 6.1 | Cannot verify an `rtsps://` server: its RTSP demuxer has no `tls_verify` and no `ca_file` (ffmpeg 8 has both, and its rows verify) | `ffprobe -h demuxer=rtsp` |
+| GStreamer 1.24 with libsoup 3 | Cannot verify an HTTPS read against a CA file from `gst-launch-1.0`: `souphttpsrc`'s `ssl-ca-file` is not applied, and the element verifies against the system's store alone. The row "GStreamer reads `stream.ts` verified" was dropped; the read runs with `ssl-strict=false` | With `ssl-ca-file=<the CA> ssl-strict=true`: "Unacceptable TLS certificate", for our chain and for one made by openssl, both of which `openssl s_client -CAfile` verifies; with the CA installed in the container's system store (as root) the same read plays |
+| GStreamer | `rtspsrc` and `rtmp2src` take a CA only as a `GTlsDatabase` object, which `gst-launch-1.0` cannot make, and its HLS client fetches by itself: those rows run with `tls-validation-flags=0`, and there is no HLS row | The elements' properties |
+| VLC 3.0.20 | No RTSP at all (no live555): its rows are HTTPS only, verified with `--gnutls-dir-trust` | Its module list |
+
+Out of M5c1:
+
+| Item | Where |
+|---|---|
+| SRTP for RTSP over UDP (`RTP/SAVP`, SDES keys, inside RTSPS only) | M5c2 |
+| SRT output encryption (the input passphrase exists since M2a) | M5c2 |
+| Credentials embedded in URL paths redacted | M5c2 |
+| Secrets as write-only spec fields | M5c2 |
+| A certificate per listener or per SNI name; client certificates; an encrypted key file; built-in ACME | Backlog (R-S2) |
+| HTTP/2 on the TLS listeners | Backlog (R-S4) |
+| `https+insecure://` inputs; a config key for extra roots | Backlog (R-S7: the system store or `SSL_CERT_FILE`) |
+| An RTMPS listen input on an address other than the server's | Backlog (R-S6) |
+| Redirecting HTTP to HTTPS; HSTS | Backlog (R-S4) |
+| A trusted-proxy setting for the login limiter | Backlog (R-S10) |
+| TLS flags for `cmd/osdev` | Not planned: `osdev` stays plain |
+
+M5c2 starts from these facts: an RTSPS session refuses UDP with 461
+(`pkg/rtsp` `ServeTLS`), which is the branch SRTP's `RTP/SAVP` offers go
+into; SRT output encryption is a passphrase, as the input's is, not the
+certificate; `redact` treats the three RTMP schemes alike
+(`redact.RTMPScheme`) and has no rule yet for credentials in other URL
+paths; and the config status and every stream document still return stored
+secrets to an editor (`?secrets=1`, `GET /api/v1/config`).
+
 M2 is split in three parts:
 
 | Part | Contents |
@@ -1324,7 +1425,7 @@ Out of M2b:
 
 | Item | Reason |
 |---|---|
-| RTMPS (RTMP over TLS) | Needs certificates and their configuration: M5c |
+| RTMPS (RTMP over TLS) | Done in M5c1: `rtmps://` listen, pull and push (R-S6, R-S7) |
 | RTMPT and RTMPE | Obsolete |
 | Enhanced RTMP v2 multitrack, and codecs other than H.264, H.265 and AAC (AV1, VP9, Opus, MP3) | Outside §2's codec scope |
 | AMF3 command encoding | Clients that ask for `objectEncoding` 3 are refused |
@@ -1363,11 +1464,11 @@ Out of M2c:
 
 | Item | Reason |
 |---|---|
-| RTSP 2.0; RTSPS and SRTP | TLS is M5c, like RTMPS; `rtsps://` is rejected with a clear error |
+| RTSP 2.0; RTSPS and SRTP | RTSPS pull is done in M5c1 (`rtsps://`, TCP only; R-S7); SRTP is M5c2; RTSP 2.0 is not planned |
 | UDP multicast transport; RTSP over HTTP tunnelling | Rare for pull |
 | MP4A-LATM, G.711, Opus, PCM | Outside §2's codec scope; such tracks are skipped with a reason |
 | H.264 packetization-mode 2; H.265 with `sprop-max-don-diff` above 0 | Interleaved, DON reordering; skipped with a reason |
-| Credentials in the URL path or query (`?user=&password=`) | M5c's redaction work |
+| Credentials in the URL path or query (`?user=&password=`) | M5c2's redaction work |
 | The RTSP server | M3b |
 | ONVIF | Outside M2c |
 
@@ -1526,11 +1627,14 @@ Items accepted for later, not yet placed in a milestone:
   comment on its `name:`. A text-level splice of the one entry would keep
   the rest byte for byte. (A `PUT` of the document the stream already has
   writes nothing, since the M5a final fix wave.)
-- **The login limiter's key includes the presented user name** (R-D8), so
-  invented names can keep both verification slots busy and delay a real
-  user's first (not yet remembered) login. A per-address secondary cap
-  would bound it. **Raised priority: before the API is exposed** beyond
-  loopback (M5c's HTTPS), not after.
+- **The login limiter and one address that invents names** (R-D8; M5c1's
+  R-S10). Done in M5c1, before `server.api.tls_listen` exposed the API: at
+  most 4 verifications are in flight per client address, so invented names
+  can no longer hold the verification slots. Left, as R-S10's cost says: a
+  spray of many names from one address is slowed only by each name's
+  backoff and by PBKDF2's cost; there is no per-address failure block,
+  because behind a shared address it would be a remote lockout; and behind
+  a proxy all clients share the one cap.
 - **Writers queue behind a slow apply and cannot be cancelled** (M5a final
   review). `server.apply` runs under one mutex, and a writer waiting for it
   does not watch its request's context. A teardown that hangs during a
@@ -1542,7 +1646,24 @@ Items accepted for later, not yet placed in a milestone:
   and publishes the View after, so for some milliseconds a request still
   finds the stopped packager and gets its last playlist. Publish first.
 - **Behind a reverse proxy every API client shares one IP for the login
-  limiter** (R-D8): a trusted-proxy setting.
+  limiter** (R-D8, R-S10): a trusted-proxy setting that reads the forwarded
+  client address for the login limiter. Until it exists the clients share
+  the per-name limits and the one in-flight cap of 4.
+- **A certificate per listener or per SNI name; client certificates; an
+  encrypted key file; built-in ACME** (R-S2). Until then a TLS proxy in
+  front; the key names leave room (`server.http.tls` beside
+  `server.http.tls_listen`).
+- **HTTP/2 on the TLS listeners** (R-S4). Off (`TLSNextProto` is empty), so
+  a browser uses up to six HTTP/1.1 connections. Its proof is the HTTP-TS
+  per-write deadline under HTTP/2's flow control.
+- **`https+insecure://` inputs, and a config key for extra roots** (R-S7).
+  Until then the system's store, or `SSL_CERT_FILE` on Linux and the BSDs.
+- **An RTMPS listen input on an address other than the server's** (R-S6):
+  needs a certificate per listener.
+- **Redirecting HTTP to HTTPS, and HSTS** (R-S4).
+- **ffmpeg cannot listen on rtmps**: peer tests put it behind a TLS
+  terminator (`testpeer.TLSFront`). A peer that is an RTMPS server by
+  itself would remove the front.
 - **A listen address handed from one stream to another in one edit** (R-D11):
   delete `a` and give `b` its URLs, or rebuild `a` off a port that `b`
   takes; the new owner may bind before the old one has let go, and gets one
@@ -1975,6 +2096,60 @@ branches. That is a repository setting, which no commit can change.
   - pin that the syntax error comes before "the layout has no audio", with
     a bad tag under a layout of `[video]`;
   - a config round-trip test for `audio_language`.
+
+#### M5c1 deferred minors
+
+- certs and pkg/tlstest:
+  - `Reload` holds the reload mutex across its file I/O;
+  - `tlstest` is an ordinary package that imports `testing` (the
+    convention of `rtmptest`).
+- pkg/rtmp:
+  - no row for a TLS read deadline that expires;
+  - the stalled-close rows have 200 ms of timing headroom;
+  - a ragged line in `PlayWith`'s doc;
+  - a close that runs beside a write may send no `close_notify` (accepted
+    by ruling; `pkg/rtsp` closes under its write mutex): judge whether
+    `pkg/rtmp` needs the same.
+- pkg/rtsp:
+  - no client-side stalled-close row.
+- rtmpsrv:
+  - doc sentences for `TLSOptions.OnError` (it must not block or
+    unregister its own listener) and `Config` (not modified after
+    registering; not cloned; nil is refused);
+  - the "unless closing" wording;
+  - a row comment at `registry_test.go:1830`;
+  - `RegisterPublishTLS`'s kind marker;
+  - the nil-`Config` error quotes the raw address.
+- rtmppush:
+  - a comment on the colon index;
+  - a `MinVersion` note for ingest's twin of the `+insecure` rule.
+- ingest:
+  - pin that `NewHTTPClient(nil)` has keep-alives off;
+  - reword `Open`'s unreachable default;
+  - align the twins' config on a nil base (`MinVersion` TLS 1.2 in both);
+  - a 2 s wall-clock bound in a test.
+- stream:
+  - the `rtmps+insecure` listen row should name ingest's text fragment;
+  - the raw-address fallback of the listen key could be simpler.
+- server:
+  - `net/http`'s semicolon warning is now one error line per request;
+  - fixed ports in tests that predate M5c1: 19359 (`apply_test.go:1115`)
+    and 19351 (`server_test.go:495`);
+  - the `certReload` comment overstates;
+  - `certLoaded` should skip when `info.Changed == certShown` (a `SIGHUP`
+    before `Run` logs the line twice);
+  - minors 2, 5 and 6 of Task 9b's review.
+- e2e and conform (Task 11):
+  - `TestM5c1Rotate`'s ffprobe row comes after the row's end, not between
+    the rotations, since a player that comes and goes moves the counters
+    the row compares;
+  - ffprobe's HLS and DASH rows pass `-tls_verify 1 -ca_file`, but which
+    of their requests ffmpeg verifies with them was not measured (the
+    HTTP-TS and RTMPS rows are proved to verify by a row with another CA);
+  - the "rtsps without `-rtsp_transport`" row does not assert that ffmpeg
+    offered UDP first: the 461 branch is pinned by `pkg/rtsp`'s tests;
+  - a push's failure is in its status and is not logged at info, so
+    `TestM5c1NoSecretsLeak` finds its x509 reason in the status only.
 
 ### Carried from M1
 

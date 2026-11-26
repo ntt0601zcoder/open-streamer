@@ -24,9 +24,10 @@ All configuration is one YAML file. Start from
 [cmd/openstreamer/openstreamer.example.yaml](cmd/openstreamer/openstreamer.example.yaml),
 which documents every key. Besides `version: 1` it has three sections:
 
-- `server`: the listeners (`http`, `api`, `rtmp`, `rtsp`, `srt`), their apps,
-  the transcoder binary, the assets directory and logging. A change here
-  needs a restart: until then it is reported as `restart_required`.
+- `server`: the listeners (`http`, `api`, `rtmp`, `rtsp`, `srt`), their TLS
+  siblings and the certificate ([TLS](#tls)), their apps, the transcoder
+  binary, the assets directory and logging. A change here needs a restart:
+  until then it is reported as `restart_required`.
 - `users`: the API's users, each a `name`, a `role` and a password hash.
 - `streams`: one document per stream (inputs by priority, an optional
   transcode ladder and thumbnail, the outputs and the push targets).
@@ -61,21 +62,36 @@ errors, and every error is reported with its place.
 
 ### The API
 
-The API listens on `127.0.0.1:8081` by default and keeps to loopback until
-M5c brings HTTPS: Basic credentials are only base64-encoded, so anyone who can
-see the traffic can read them. Every request but `/healthz` uses HTTP Basic
-auth (`curl -u ops` asks for the password), and every `PUT`, `DELETE` and
-`POST` must carry an `X-Requested-By` header (any value). The OpenAPI
-document is at `/api/v1/openapi.json`.
+The API has two listeners. `server.api.listen` is plain HTTP and is
+`127.0.0.1:8081` by default: Basic credentials are only base64-encoded, so
+anyone who can see the traffic can read them, and configuring a certificate
+does not move this listener. `server.api.tls_listen` is the same API over
+HTTPS (see [TLS](#tls)): it has no default, and it is the listener to reach
+the API from the network. A plain `server.api.listen` beyond loopback is
+allowed, for a reverse proxy or a container network, and the server logs a
+warning at start that names `server.api.tls_listen` as the fix. Every request
+but `/healthz` uses HTTP Basic auth (`curl -u ops` asks for the password), and
+every `PUT`, `DELETE` and `POST` must carry an `X-Requested-By` header (any
+value). The OpenAPI document is at `/api/v1/openapi.json`.
 
-Failed logins are limited per client address and user name: after 5 failures
-that pair waits (1 s, doubling to 5 min) and gets 429 with `Retry-After`.
-Behind a reverse proxy every client has the proxy's address, so the limit is
-shared by all of them and one client's failures can lock a user name out for
-everyone; a trusted-proxy setting that reads the forwarded address comes with
-M5c. Until then keep the API on loopback or on a network you trust. The
-server logs a warning at start when `server.api.listen` is not a loopback
-address.
+Logins are limited in two ways:
+
+- **Per client address and user name.** After 5 failures that pair waits (1 s,
+  doubling to 5 min) and gets 429 with `Retry-After`. A wrong password for a
+  name whose login the server remembers is refused at once, without being
+  verified, and counts as a failure; so guessing at such a name is bounded by
+  this backoff alone, and a fast 401 reveals that the name is remembered.
+- **Per client address.** At most 4 logins are being verified at a time for
+  one address (an IPv6 address counts by its /64); a fifth gets 429 with
+  `Retry-After: 1`. No address is ever blocked for its failures, so nobody
+  can lock other users out by failing on purpose. Requests of a user who is
+  already logged in are not verified again and take no place.
+
+Behind a reverse proxy every client has the proxy's address: they share the
+per-name limits, so one client's failures can make a user name wait for
+everyone, and they share the one cap of 4, so a burst of first logins sees
+429s with `Retry-After: 1`. There is no setting yet that reads the forwarded
+client address (it is in the backlog).
 
 Create or replace a stream, served on every output:
 
@@ -164,6 +180,90 @@ config file changed on disk; reload first"), so neither side overwrites the
 other. An invalid file at reload keeps the running config; the error is in the
 log and in `GET /api/v1/config/status`. A file that cannot be read at reload,
 or whose mode is no longer 0600, is 409 `config_unreadable` with the reason.
+
+### TLS
+
+One certificate secures every TLS listener. Name its PEM files in
+`server.tls` and give each listener that should have TLS a `tls_listen`
+beside its `listen`:
+
+```yaml
+server:
+  tls:
+    cert_file: /etc/openstreamer/tls/fullchain.pem   # the certificate, then its chain
+    key_file: /etc/openstreamer/tls/privkey.pem
+  http: {listen: ":8080", tls_listen: ":8443"}             # HLS, DASH and HTTP-TS over HTTPS
+  api: {listen: "127.0.0.1:8081", tls_listen: ":8444"}     # the API over HTTPS
+  rtmp: {listen: ":19350", tls_listen: ":19351", app: live}   # RTMPS, publish and play
+  rtsp: {listen: ":5554", tls_listen: ":5555", app: live}     # RTSPS, play
+```
+
+- **The plain listeners stay.** A `tls_listen` opens a second listener that
+  serves exactly what its plain sibling serves; plain HTTP is not redirected
+  and gets no HSTS header. `rtmp` and `rtsp` may have either listener, or
+  both: an `rtmp` or `rtsp` output needs at least one of the two. No
+  `tls_listen` has a default. A `tls_listen` without `server.tls`, or one of
+  the two files without the other, is a config error.
+- **One certificate.** Every TLS listener presents the same pair; a
+  certificate for several names carries them as SANs. The minimum version is
+  TLS 1.2, HTTPS is HTTP/1.1, and no client certificate is asked for.
+- **The key file's mode.** A key file that its group or others can read gets
+  one warning at start (`server: tls: key_file can be read by its group or
+  by others`), and the server still starts: a Kubernetes secret mount is
+  0444.
+- **RTSPS is TCP only.** RTP is interleaved on the TLS connection; a player
+  that offers only UDP gets 461, whatever `server.rtsp.udp` says.
+
+**Rotation.** Replace the two files (certbot's `live/` symlinks work) and the
+server takes the new pair without a restart: it looks at the files every
+30 s, and `SIGHUP` and `POST /api/v1/reload` read them at once, before
+anything else they do. New handshakes get the new certificate; sessions in
+progress are not touched. A pair that does not load (a rotation half done, an
+unreadable file) keeps the certificate in force, is logged once (`server:
+tls: reload failed`) and is tried again at every look. `GET
+/api/v1/config/status` shows the certificate in force as `certificate`:
+`not_after`, `names`, `loaded_at`, and `last_error` while the latest read
+failed. `/metrics` has `openstreamer_tls_certificate_not_after_seconds` and
+`openstreamer_tls_certificate_reloads_total{result="ok"|"unchanged"|"error"}`.
+Only the files' content is live: changing `cert_file`, `key_file` or a
+`tls_listen` needs a restart, like every `server` key.
+
+**Streams over TLS.** The URL's scheme says it:
+
+| Use | URL |
+|---|---|
+| Publish to the server over RTMPS | an input `rtmps://<the server's RTMPS address>/<app>/<key>?mode=listen` |
+| Pull over RTMPS or RTSPS | an input `rtmps://host/app/name` (default port 443) or `rtsps://host/path` (default port 322, TCP only) |
+| Push over RTMPS | a push `rtmps://host/app/key` |
+| Play | `rtmps://host:19351/live/cam1`, `rtsps://host:5555/live/cam1`, `https://host:8443/live/cam1/hls/index.m3u8` |
+
+An RTMPS listen input must name the server's own RTMPS listener, since the
+certificate is the server's; an `rtmp://` listen input on that address is
+refused ("listen address tcp :19351 conflicts with the RTMPS listener tcp
+:19351 of the server"). A pull or a push verifies the peer's certificate
+against the system's roots, with the URL's host as its name, and a failure
+is an ordinary input or push failure whose error gives the x509 reason. For
+a peer with a private CA, add the CA to the system's store; on Linux and the
+BSDs `SSL_CERT_FILE=/path/ca.pem` in the server's environment also works (Go
+ignores it on macOS and Windows, where it uses the platform's store).
+
+`rtmps+insecure://` and `rtsps+insecure://` turn the verification off for
+that one URL, for a camera with a self-signed certificate. **`+insecure`
+gives up the peer's identity:** the stream is still encrypted, but anyone
+who can get between the server and the peer can read and replace it. There
+is no global switch, and `+insecure` on any other scheme or on a listen
+input is refused.
+
+**Failed handshakes.** A TLS handshake that fails is one line at debug level
+(`server: tls: handshake failed`, with `listener`: `https`, `api`, `rtmps`
+or `rtsps`, the remote address and the reason) and one count in
+`openstreamer_tls_handshake_failures_total{listener}`. The counter counts
+every connection that did not complete a handshake: a TCP probe that
+connects and sends nothing, such as a load balancer's health check, plain
+HTTP sent to the HTTPS port, and a client that goes silent, as well as real
+TLS errors. So do not alert on its raw rate. Anything else `net/http`
+reports (a handler's panic, an accept error) is logged at error level as
+`server: media: …` or `server: api: …`.
 
 ### Assets
 
@@ -274,7 +374,9 @@ With the example config's listeners, stream `cam1` plays at:
 A stream with a ladder is served as `cam1` (the ABR presentation over HLS and
 DASH, the first rendition elsewhere), and each rendition also as
 `cam1_<label>`. The thumbnail is an operator preview behind the API:
-`/api/v1/streams/cam1/thumbnail.jpg`. Playback needs no credentials.
+`/api/v1/streams/cam1/thumbnail.jpg`. Playback needs no credentials. With TLS
+listeners the same paths play over `https://`, `rtmps://` and `rtsps://`
+([TLS](#tls)); SRT has no TLS.
 
 `audio_language` declares the language of a stream's audio. It is a BCP 47
 tag such as `vi` or `en-US` (a primary subtag of 2 or 3 letters, then
