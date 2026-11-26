@@ -1,6 +1,7 @@
 // Package config is the server's one configuration file: a YAML document
-// with a version and three sections, server (listen addresses, apps, the
-// transcoder binary, the assets directory, logging), users (names, roles
+// with a version and three sections, server (listen addresses and TLS
+// listen addresses, apps, the TLS certificate pair, the transcoder binary,
+// the assets directory, logging), users (names, roles
 // and PBKDF2 password hashes) and streams (stream documents, as in
 // internal/spec).
 //
@@ -32,8 +33,9 @@
 //     as well and must be quoted.
 //
 // Parse never touches the file system. Server.CheckFiles asks whether the
-// transcoder binary and the assets directory exist; the server asks it
-// once, at start, so a file that disappears later fails no edit.
+// transcoder binary, the assets directory and the TLS certificate and key
+// files exist; the server asks it once, at start, so a file that
+// disappears later fails no edit.
 //
 // # Editing
 //

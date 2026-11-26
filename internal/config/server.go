@@ -12,29 +12,47 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 )
 
-// Server is the server section: the shared servers, the transcoder, the
-// assets directory and logging. A change here needs a restart (R-D4).
+// Server is the server section: the shared servers, the certificate, the
+// transcoder, the assets directory and logging. A change here needs a
+// restart (R-D4); only the content of the certificate files is taken up
+// without one.
+//
+// Each tls_listen is a TLS listener beside its plain sibling, serving the
+// same thing with the server.tls certificate. None has a default: ""
+// turns it off.
 type Server struct {
-	// HTTP is the media listener, /live/; default ":8080".
+	// TLS is the one certificate every TLS listener presents: cert_file
+	// (PEM, may carry the chain) and key_file (PEM), used as given. Both
+	// or neither; a tls_listen needs both.
+	TLS struct {
+		CertFile string `yaml:"cert_file"`
+		KeyFile  string `yaml:"key_file"`
+	} `yaml:"tls"`
+	// HTTP is the media listener, /live/; listen defaults to ":8080".
 	HTTP struct {
-		Listen string `yaml:"listen"`
+		Listen    string `yaml:"listen"`
+		TLSListen string `yaml:"tls_listen"`
 	} `yaml:"http"`
-	// API is the API listener; default "127.0.0.1:8081".
+	// API is the API listener; listen defaults to "127.0.0.1:8081".
 	API struct {
-		Listen string `yaml:"listen"`
+		Listen    string `yaml:"listen"`
+		TLSListen string `yaml:"tls_listen"`
 	} `yaml:"api"`
-	// RTMP is the shared RTMP server: an empty listen turns it off; app
-	// defaults to "live".
+	// RTMP is the shared RTMP server: an empty listen turns the plain
+	// listener off; app defaults to "live" and is shared by both.
 	RTMP struct {
-		Listen string `yaml:"listen"`
-		App    string `yaml:"app"`
+		Listen    string `yaml:"listen"`
+		TLSListen string `yaml:"tls_listen"`
+		App       string `yaml:"app"`
 	} `yaml:"rtmp"`
-	// RTSP is the shared RTSP server: an empty listen turns it off; app
-	// defaults to "live"; udp needs a listen.
+	// RTSP is the shared RTSP server: an empty listen turns the plain
+	// listener off; app defaults to "live" and is shared by both; udp
+	// applies to the plain listener and needs its listen.
 	RTSP struct {
-		Listen string `yaml:"listen"`
-		App    string `yaml:"app"`
-		UDP    bool   `yaml:"udp"`
+		Listen    string `yaml:"listen"`
+		TLSListen string `yaml:"tls_listen"`
+		App       string `yaml:"app"`
+		UDP       bool   `yaml:"udp"`
 	} `yaml:"rtsp"`
 	// SRT is the shared SRT server: an empty listen turns it off; app
 	// defaults to "live"; latency_ms defaults to 120, from 1 to 65535.
@@ -70,7 +88,8 @@ const (
 )
 
 // Resolved returns s with the defaults filled in, from constants only: it
-// never looks at the file system, and leaves transcoder.binary "" as "".
+// never looks at the file system, and leaves transcoder.binary, the
+// tls files and every tls_listen as given.
 func (s Server) Resolved() Server {
 	def := func(p *string, v string) {
 		if *p == "" {
@@ -144,6 +163,7 @@ func (s Server) check() []error {
 			errs = append(errs, fmt.Errorf("%s: %s must not start or end with /", a.key, spec.Quote(a.v)))
 		}
 	}
+	errs = append(errs, r.checkTLS()...)
 	if r.RTSP.UDP && r.RTSP.Listen == "" {
 		errs = append(errs, fmt.Errorf("server.rtsp.udp: needs server.rtsp.listen"))
 	}
@@ -159,6 +179,45 @@ func (s Server) check() []error {
 	case "json", "text":
 	default:
 		errs = append(errs, fmt.Errorf("server.log.format: %s, want json or text", spec.Quote(r.Log.Format)))
+	}
+	return errs
+}
+
+// checkTLS returns the errors of server.tls and the tls_listen keys of
+// the resolved section r: the pair is both files or neither, a tls_listen
+// is host:port and needs the pair, and it is not the same text as its
+// plain sibling's listen unless the port is 0.
+func (r Server) checkTLS() []error {
+	var errs []error
+	hasPair := r.TLS.CertFile != "" && r.TLS.KeyFile != ""
+	switch {
+	case r.TLS.CertFile != "" && r.TLS.KeyFile == "":
+		errs = append(errs, fmt.Errorf("server.tls.cert_file: needs server.tls.key_file"))
+	case r.TLS.KeyFile != "" && r.TLS.CertFile == "":
+		errs = append(errs, fmt.Errorf("server.tls.key_file: needs server.tls.cert_file"))
+	}
+	for _, l := range []struct{ name, listen, tls string }{
+		{"http", r.HTTP.Listen, r.HTTP.TLSListen},
+		{"api", r.API.Listen, r.API.TLSListen},
+		{"rtmp", r.RTMP.Listen, r.RTMP.TLSListen},
+		{"rtsp", r.RTSP.Listen, r.RTSP.TLSListen},
+	} {
+		if l.tls == "" {
+			continue
+		}
+		key := "server." + l.name + ".tls_listen"
+		err := checkListen(l.tls)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", key, err))
+		}
+		if !hasPair {
+			errs = append(errs, fmt.Errorf("%s: needs server.tls.cert_file and server.tls.key_file", key))
+		}
+		if err == nil && l.tls == l.listen {
+			if _, port, _ := net.SplitHostPort(l.tls); strings.TrimLeft(port, "0") != "" {
+				errs = append(errs, fmt.Errorf("%s: %s is also server.%s.listen", key, spec.Quote(l.tls), l.name))
+			}
+		}
 	}
 	return errs
 }
@@ -182,10 +241,27 @@ func checkListen(v string) error {
 
 // CheckFiles looks at the file system, which Parse never does: a
 // transcoder.binary that is given must be a regular file (and on Unix
-// have an execute bit), and assets_dir, when given, a directory. The
-// server calls it once, at start. It returns Errors or nil.
+// have an execute bit), assets_dir, when given, a directory, and
+// tls.cert_file and tls.key_file, when given, regular files. It never
+// reads a file: whether the pair loads is the server's check. The server
+// calls it once, at start. It returns Errors or nil.
 func (s Server) CheckFiles() error {
 	var errs Errors
+	for _, f := range []struct{ key, path string }{
+		{"server.tls.cert_file", s.TLS.CertFile},
+		{"server.tls.key_file", s.TLS.KeyFile},
+	} {
+		if f.path == "" {
+			continue
+		}
+		fi, err := os.Stat(f.path)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%s: %w", f.key, err))
+		case !fi.Mode().IsRegular():
+			errs = append(errs, fmt.Errorf("%s: %s is not a regular file", f.key, f.path))
+		}
+	}
 	if b := s.Transcoder.Binary; b != "" {
 		fi, err := os.Stat(b)
 		switch {
