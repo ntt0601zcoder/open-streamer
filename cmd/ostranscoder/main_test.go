@@ -811,3 +811,189 @@ func TestServeShots(t *testing.T) {
 	assert.Equal(t, uint64(1), last.ThumbnailsFailed)
 	assert.Equal(t, uint64(4), last.In)
 }
+
+// monoFixture is an operator's font.
+const monoFixture = "../../testdata/fixtures/fonts/DejaVuSansMono.ttf"
+
+// zeroTablesFont is 4 kB of zeros behind a valid table directory: the
+// host's check takes it, FreeType does not.
+func zeroTablesFont(t *testing.T) []byte {
+	t.Helper()
+	tags := []string{"cmap", "glyf", "head", "hhea", "hmtx", "loca", "maxp"}
+	b := make([]byte, 4096)
+	copy(b, "\x00\x01\x00\x00")
+	b[5] = byte(len(tags))
+	for i, tag := range tags {
+		r := b[12+16*i:]
+		copy(r, tag)
+		r[10] = 0x02 // offset 512
+		r[15] = 0x40 // length 64
+	}
+	require.NoError(t, picture.CheckFont(b))
+	return b
+}
+
+// TestProbeFontFlag: -probe font FILE prints "font: ok" and exits 0 for a
+// font FreeType draws with, and otherwise one line "font: <reason>" without
+// the file's path, exiting 3; without a file it is bad usage.
+func TestProbeFontFlag(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, b []byte) string {
+		p := dir + "/" + name
+		require.NoError(t, os.WriteFile(p, b, 0o600))
+		return p
+	}
+	mono, err := os.ReadFile(monoFixture)
+	require.NoError(t, err)
+	big := make([]byte, picture.MaxFontBytes+1)
+	copy(big, mono)
+	link := dir + "/link.ttf"
+	require.NoError(t, os.Symlink(write("target.ttf", mono), link))
+	for _, tc := range []struct {
+		name, path string
+		code       int
+	}{
+		{"font", write("mono.ttf", mono), 0},
+		{"text file", write("notes.txt", []byte("hello\n")), exitProbeFailed},
+		{"missing", dir + "/missing.ttf", exitProbeFailed},
+		{"directory", dir, exitProbeFailed},
+		{"symbolic link", link, exitProbeFailed},
+		{"freetype refuses", write("zeros.ttf", zeroTablesFont(t)), exitProbeFailed},
+		{"too big", write("big.ttf", big), exitProbeFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stdout, stderr := runMain(t, "-probe font "+tc.path)
+			t.Logf("exit %d, stdout %q", code, stdout)
+			require.Equal(t, tc.code, code, "stdout %q, stderr %q", stdout, stderr)
+			require.True(t, strings.HasPrefix(stdout, "font: "), "stdout %q", stdout)
+			assert.Equal(t, 1, strings.Count(stdout, "\n"), "stdout %q", stdout)
+			assert.True(t, strings.HasSuffix(stdout, "\n"), "stdout %q", stdout)
+			assert.NotContains(t, stdout, dir, "the file's path is in stdout")
+			if tc.code == 0 {
+				assert.Equal(t, "font: ok\n", stdout)
+			} else {
+				assert.NotEqual(t, "font: ok\n", stdout)
+				assert.NotEqual(t, "font: \n", stdout)
+			}
+		})
+	}
+
+	for _, args := range []string{"-probe font", "-probe font a b"} {
+		code, stdout, stderr := runMain(t, args)
+		assert.Equal(t, 2, code, "%q", args)
+		assert.Empty(t, stdout, "%q", args)
+		assert.Contains(t, stderr, "usage: ostranscoder [-version | -probe nvenc | -probe font FILE]", "%q", args)
+	}
+}
+
+// cudaHidesNVENC records Task 5 Step 5 on the GPU host (GTX 1650, driver 595.99.02,
+// FFmpeg 8.1): CUDA_VISIBLE_DEVICES= dist/ostranscoder-amd64/ostranscoder
+// -probe nvenc exits 3 (cuInit: CUDA_ERROR_NO_DEVICE), so an empty
+// CUDA_VISIBLE_DEVICES in a child's environment makes NVENC unavailable to
+// it, and no session is opened.
+const cudaHidesNVENC = true
+
+// firstGOP returns the video frames before the source's second key.
+func firstGOP(t *testing.T) []media.Frame {
+	t.Helper()
+	video := ofKind(source(t), media.KindVideo)
+	for i, f := range video {
+		if i > 0 && f.Key {
+			return video[:i]
+		}
+	}
+	t.Fatal("the fixture has one GOP")
+	return nil
+}
+
+// TestChildRefusal: a NoFallback rung whose NVENC cannot open makes the
+// child write a fatal Error with Code ErrorEncoderRefused and the rung, and
+// exit 1, with no Frame of any rung. NVENC is unavailable without
+// /dev/nvidiactl (CI, the peers image); on a GPU host the child runs with
+// an empty CUDA_VISIBLE_DEVICES, which hides the device (cudaHidesNVENC).
+func TestChildRefusal(t *testing.T) {
+	env := append(os.Environ(), envChild+"=1")
+	if _, err := os.Stat("/dev/nvidiactl"); err == nil {
+		if !cudaHidesNVENC {
+			t.Skip("an empty CUDA_VISIBLE_DEVICES does not hide NVENC on this host; TestNoFallbackRefuses proves the refusal")
+		}
+		env = append(env, "CUDA_VISIBLE_DEVICES=")
+	}
+	gop := firstGOP(t)
+	a, b := socketpair(t)
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^$") //nolint:gosec // the test binary itself
+	cmd.Env = env
+	cmd.ExtraFiles = []*os.File{a}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	require.NoError(t, cmd.Start())
+	a.Close()
+	h := newHost(t, fileConn(t, b))
+
+	require.NoError(t, h.send(wire.Configure{Rungs: []wire.Rung{
+		{Height: 120, BitrateKbps: 150, Encoder: "nvenc", NoFallback: true},
+		{Height: 90, BitrateKbps: 100},
+	}}))
+	// The child stops reading at the error, so later writes may fail.
+	_ = h.sendFrames(gop)
+	_ = h.send(wire.Stop{})
+	err := cmd.Wait()
+	<-h.done
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var exit *exec.ExitError
+	require.ErrorAs(t, err, &exit, "stderr: %s", stderr.String())
+	assert.Equal(t, 1, exit.ExitCode(), "stderr: %s", stderr.String())
+	requireHello(t, h.msgs, cmd.Process.Pid)
+	c := collect(h.msgs)
+	require.Len(t, c.errs, 1, "stderr: %s", stderr.String())
+	e := c.errs[0]
+	t.Logf("error: %+v", e)
+	assert.Equal(t, 0, e.Rung)
+	assert.Equal(t, wire.ErrorEncoderRefused, e.Code)
+	assert.True(t, e.Fatal)
+	assert.Contains(t, e.Message, "no_fallback")
+	assert.Empty(t, c.frames, "no Frame of any rung")
+	for _, m := range h.msgs {
+		_, isFrame := m.(wire.Frame)
+		assert.False(t, isFrame, "a Frame was written")
+	}
+}
+
+// TestChildOtherFatalCode: a fatal error that is not a refusal keeps
+// ErrorOther.
+func TestChildOtherFatalCode(t *testing.T) {
+	h, errc := startChild(t, run)
+	require.NoError(t, h.send(wire.Configure{}))
+	e := h.wait(t, errc)
+	require.Error(t, e.runErr)
+	c := collect(e.msgs)
+	require.Len(t, c.errs, 1)
+	assert.Equal(t, wire.ErrorOther, c.errs[0].Code)
+	assert.Equal(t, errorRung, c.errs[0].Rung)
+}
+
+// TestServeWatermarkFont: an operator's font in Configure and in
+// SetWatermark draws without an error.
+func TestServeWatermarkFont(t *testing.T) {
+	mono, err := os.ReadFile(monoFixture)
+	require.NoError(t, err)
+	src := source(t)
+	video := ofKind(src, media.KindVideo)
+	h, errc := startChild(t, run)
+	require.NoError(t, h.send(wire.Configure{
+		Rungs:     []wire.Rung{{Height: 120, BitrateKbps: 150}},
+		Watermark: &picture.Watermark{Text: "live", Font: mono},
+	}))
+	half := len(src) / 2
+	require.NoError(t, h.sendFrames(src[:half]))
+	require.NoError(t, h.send(wire.SetWatermark{W: &picture.Watermark{Text: "live", Font: mono, Position: picture.Center}}))
+	require.NoError(t, h.sendFrames(src[half:]))
+	require.NoError(t, h.send(wire.Stop{}))
+
+	e := h.wait(t, errc)
+	require.NoError(t, e.runErr)
+	c := collect(e.msgs)
+	require.Empty(t, c.errs)
+	require.Len(t, c.frames[0], len(video))
+}

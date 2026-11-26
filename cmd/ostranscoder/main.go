@@ -12,15 +12,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/asticode/go-astiav"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/native"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/wire"
 )
 
@@ -36,9 +40,10 @@ const errorRung = -1
 // exitProbeFailed is the exit status of a probe that failed.
 const exitProbeFailed = 3
 
-// main prints the version with -version, probes NVENC with -probe nvenc
-// (exit 0 or 3), and otherwise serves the wire protocol on fd 3: exit 0
-// after Stop or EOF from the host, 1 on an error, 2 on bad usage.
+// main prints the version with -version, probes NVENC with -probe nvenc or
+// a font file with -probe font FILE (exit 0 or 3), and otherwise serves the
+// wire protocol on fd 3: exit 0 after Stop or EOF from the host, 1 on an
+// error, 2 on bad usage.
 func main() {
 	// libav's default log callback writes to stderr.
 	astiav.SetLogLevel(astiav.LogLevelWarning)
@@ -48,8 +53,10 @@ func main() {
 		return
 	case len(os.Args) == 3 && os.Args[1] == "-probe" && os.Args[2] == "nvenc":
 		os.Exit(probeNVENC(os.Stdout))
+	case len(os.Args) == 4 && os.Args[1] == "-probe" && os.Args[2] == "font":
+		os.Exit(probeFont(os.Stdout, os.Args[3]))
 	case len(os.Args) != 1:
-		fmt.Fprintln(os.Stderr, "usage: ostranscoder [-version | -probe nvenc]")
+		fmt.Fprintln(os.Stderr, "usage: ostranscoder [-version | -probe nvenc | -probe font FILE]")
 		os.Exit(2)
 	}
 	conn, err := hostConn()
@@ -72,6 +79,57 @@ func probeNVENC(w io.Writer) int {
 	}
 	_, _ = fmt.Fprintln(w, "nvenc: ok")
 	return 0
+}
+
+// probeFont reads at most picture.MaxFontBytes+1 bytes of the file at path
+// (a regular file, not a link), checks them with picture.CheckFont, then
+// draws with them (native.ProbeFont), prints "font: ok" or one line
+// "font: <reason>" to w, and returns the exit status: 0, or
+// exitProbeFailed. The reason never holds path: the host shows it, and
+// the path is the host's business.
+func probeFont(w io.Writer, path string) int {
+	err := checkFontFile(path)
+	if err == nil {
+		_, _ = fmt.Fprintln(w, "font: ok")
+		return 0
+	}
+	reason := strings.Join(strings.Fields(err.Error()), " ")
+	reason = strings.TrimPrefix(reason, "font: ")
+	_, _ = fmt.Fprintf(w, "font: %s\n", reason)
+	return exitProbeFailed
+}
+
+// checkFontFile reports why the file at path is not a font the child can
+// draw with. No error it returns holds path: those of the open and the
+// read are replaced by their cause.
+func checkFontFile(path string) error {
+	f, err := picture.OpenRegular(path)
+	if err != nil {
+		return withoutPath("cannot open the file", err)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, picture.MaxFontBytes+1))
+	_ = f.Close()
+	if err != nil {
+		return withoutPath("cannot read the file", err)
+	}
+	if err := picture.CheckFont(b); err != nil {
+		return err
+	}
+	return native.ProbeFont(b)
+}
+
+// withoutPath is what err, from opening or reading a file, says
+// without the file's path: the system's reason (fs.PathError's Err), or
+// for the only other failure of picture.OpenRegular, that the file is not
+// a regular one.
+func withoutPath(what string, err error) error {
+	if pe, ok := errors.AsType[*fs.PathError](err); ok {
+		if errors.Is(pe.Err, syscall.ELOOP) {
+			return fmt.Errorf("%s: it is a symbolic link", what)
+		}
+		return fmt.Errorf("%s: %w", what, pe.Err)
+	}
+	return fmt.Errorf("%s: not a regular file", what)
 }
 
 // hostConn wraps fd 3 as a net.Conn, so that closing it unblocks a pending
@@ -194,7 +252,7 @@ func configure(r *wire.Reader, w *wire.Writer) (*child, error) {
 	for i, r := range cfg.Rungs {
 		rungs[i] = native.Rung{
 			Height: r.Height, BitrateKbps: r.BitrateKbps, MaxBitrateKbps: r.MaxBitrateKbps,
-			BFrames: r.BFrames, Preset: r.Preset, Encoder: r.Encoder,
+			BFrames: r.BFrames, Preset: r.Preset, Encoder: r.Encoder, NoFallback: r.NoFallback,
 		}
 	}
 	var audio *native.Audio
@@ -204,6 +262,7 @@ func configure(r *wire.Reader, w *wire.Writer) (*child, error) {
 	p, err := native.NewWith(native.Config{
 		Rungs: rungs, Audio: audio, Watermark: cfg.Watermark, Thumbnail: cfg.Thumbnail,
 	})
+	dropFont(cfg.Watermark)
 	if err != nil {
 		return nil, fatal(w, fmt.Errorf("ostranscoder: configure: %w", err))
 	}
@@ -214,9 +273,24 @@ func configure(r *wire.Reader, w *wire.Writer) (*child, error) {
 	}, nil
 }
 
-// fatal writes err to the host as a fatal Error, best effort, and returns it.
+// dropFont drops a decoded watermark's reference to its font once the
+// pipeline has it: the watermarker's is the only one the child keeps.
+func dropFont(w *picture.Watermark) {
+	if w != nil {
+		w.Font = nil
+	}
+}
+
+// fatal writes err to the host as a fatal Error, best effort, and returns
+// it. A NoFallback rung's refusal (*native.RefusedError) is written with
+// Code ErrorEncoderRefused and its rung; anything else with ErrorOther and
+// no rung.
 func fatal(w *wire.Writer, err error) error {
-	_ = w.Write(wire.Error{Rung: errorRung, Message: err.Error(), Fatal: true})
+	e := wire.Error{Rung: errorRung, Code: wire.ErrorOther, Message: err.Error(), Fatal: true}
+	if refused, ok := errors.AsType[*native.RefusedError](err); ok {
+		e.Rung, e.Code = refused.Rung, wire.ErrorEncoderRefused
+	}
+	_ = w.Write(e)
 	return err
 }
 
@@ -248,7 +322,9 @@ func (c *child) handle(res readResult) (stop bool, err error) {
 	case wire.SetWatermark:
 		// The host validated it: a watermark the child cannot take is
 		// fatal (R-C9), so the stream never goes out without it.
-		if err := c.p.SetWatermark(m.W); err != nil {
+		err := c.p.SetWatermark(m.W)
+		dropFont(m.W)
+		if err != nil {
 			return true, fatal(c.w, fmt.Errorf("ostranscoder: %w", err))
 		}
 		return false, nil

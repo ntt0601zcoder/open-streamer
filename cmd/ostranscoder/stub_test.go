@@ -25,7 +25,7 @@ func TestStubExits2(t *testing.T) {
 	out, err := build.CombinedOutput()
 	require.NoError(t, err, "go build: %s", out)
 
-	for _, args := range [][]string{{"-version"}, nil} {
+	for _, args := range [][]string{{"-version"}, {"-probe", "font", "x"}, nil} {
 		cmd := exec.CommandContext(t.Context(), bin, args...) //nolint:gosec // built above
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
