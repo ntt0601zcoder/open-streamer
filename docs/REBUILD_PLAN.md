@@ -660,25 +660,24 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   has lived 60 s. A panic is not recovered.
 - **Edits** (R-D6; M5b1's R-E2 and R-E3): `spec.Diff` gives a running stream
   one of three outcomes, with no field-by-field routing (v1's diff routing
-  caused most lifecycle and config findings): `outputs` when only the
-  output set changed (applied in place), `live` when the inputs, the
-  watermark or the audio language changed and maybe the outputs, nothing
-  else (the supervisor hands the inputs to `Pipeline.SetInputs`, the
-  watermark to `Transcoder.SetWatermark` and the language to every running
-  packager's `SetAudioLanguage`, and reattaches the outputs; M5b2's R-L5),
-  and `rebuild` for
-  anything else (the stream's pipeline is rebuilt). `SetInputs` is applied
-  between two frames and matches old and new entries by URL text, in order:
-  a kept entry keeps its reader, its listen socket and its retry time and
-  is never reopened, a removed one is closed, and an added one is opened as
-  `Run` would open an input in that position. A kept active input stays
-  active at its new index with no epoch change, while a removed active input
-  is closed as at a failure, without `EventFailed`, and the first frame of
-  the input that takes over is exactly one epoch change, counted as one
-  switch. Between the two the hub is silent (a new pull input's connect
-  time, up to the 10 s retry interval when only inputs in backoff are
-  left), so an operator who wants no gap adds the new input first, waits
-  for the fail-back, then removes the old one.
+  caused most lifecycle and config findings): `outputs` when only the output
+  set changed (applied in place), `live` when the inputs, the watermark or
+  the audio language changed and maybe the outputs, nothing else (the
+  supervisor hands the inputs to `Pipeline.SetInputs`, the watermark to
+  `Transcoder.SetWatermark` and the language to every running packager's
+  `SetAudioLanguage`, and reattaches the outputs; M5b2's R-L5), and
+  `rebuild` for anything else (the stream's pipeline is rebuilt).
+  `SetInputs` is applied between two frames and matches old and new entries
+  by URL text, in order: a kept entry keeps its reader, its listen socket
+  and its retry time and is never reopened, a removed one is closed, and an
+  added one is opened as `Run` would open an input in that position. A kept
+  active input stays active at its new index with no epoch change, while a
+  removed active input is closed as at a failure, without `EventFailed`, and
+  the first frame of the input that takes over is exactly one epoch change,
+  counted as one switch. Between the two the hub is silent (a new pull
+  input's connect time, up to the 10 s retry interval when only inputs in
+  backoff are left), so an operator who wants no gap adds the new input
+  first, waits for the fail-back, then removes the old one.
 - **Assets** (M5b1's R-E5 to R-E7, `internal/asset`): an asset is a regular
   file directly in `server.assets_dir`, either an image (`.png`, `.jpg`,
   `.jpeg`: at most 1 MiB and 2048 px per side, decoding in full as the
@@ -1167,23 +1166,23 @@ Out of M4c:
 | Metrics for `EncoderFallbacks` | Done in M5a: `openstreamer_transcoder_encoder_fallbacks_total{stream}` (R-D9); refusing the fallback is done in M5b1 (`no_fallback`, R-E9) |
 | NVENC in CI | The runners have no NVIDIA device; `make test-nvenc` is run by hand on this host (R-C12) |
 
-M5 runs in three parts (ruling R-D1 of the M5a plan), and M5b in two
-(ruling R-E1 of the M5b1 plan). M5a is the
-control-plane core and delivers the old M5 row's exit criterion: the spec,
-the one config file with its users, the supervisor, the manager, the API
-with its config editor, metrics (with `EncoderFallbacks`), logs,
-`cmd/openstreamer`, and the product names of a ladder. M5b1, live edits and
-assets: a running pipeline's inputs changed in place (`Pipeline.SetInputs`,
-§3.6), the watermark edited in place over the API (`Transcoder.SetWatermark`),
-the asset API (R-C8) with operator fonts (R-C7), and a rung that refuses
-the x264 fallback (wire version 3). M5b2, one declared audio language in
-the spec, the HLS masters and the MPD (done). M5c, transport security: HTTPS for the API and the HTTP
-outputs, RTMPS (listen, pull, push), RTSPS with SRTP by its own ruling, SRT
-encryption (input and output), redaction of credentials in URL paths and
-queries (the M2c note), and secrets as write-only spec fields. M6 and the M7
-soak need only M5a; M5b2 and M5c may run beside M6. Until M5b1 an input
-edit rebuilt the stream (R-D6), and assets were files the operator copied
-into a directory; until M5c the Basic credentials and every stream key cross the
+M5 runs in three parts (ruling R-D1 of the M5a plan), and M5b in two (ruling
+R-E1 of the M5b1 plan). M5a is the control-plane core and delivers the old
+M5 row's exit criterion: the spec, the one config file with its users, the
+supervisor, the manager, the API with its config editor, metrics (with
+`EncoderFallbacks`), logs, `cmd/openstreamer`, and the product names of a
+ladder. M5b1, live edits and assets: a running pipeline's inputs changed in
+place (`Pipeline.SetInputs`, §3.6), the watermark edited in place over the
+API (`Transcoder.SetWatermark`), the asset API (R-C8) with operator fonts
+(R-C7), and a rung that refuses the x264 fallback (wire version 3). M5b2,
+one declared audio language in the spec, the HLS masters and the MPD (done).
+M5c, transport security: HTTPS for the API and the HTTP outputs, RTMPS
+(listen, pull, push), RTSPS with SRTP by its own ruling, SRT encryption
+(input and output), redaction of credentials in URL paths and queries (the
+M2c note), and secrets as write-only spec fields. M6 and the M7 soak need
+only M5a; M5b2 and M5c may run beside M6. Until M5b1 an input edit rebuilt
+the stream (R-D6), and assets were files the operator copied into a
+directory; until M5c the Basic credentials and every stream key cross the
 network in clear, so the API listens on loopback by default (R-D8).
 
 M5a's rulings are in its plan: R-D2 (one binary, one config file), R-D3
@@ -1266,7 +1265,7 @@ URI-less entry over a live sliding window with ffprobe 6.1 and 8, VLC
 `TestM5b2AudioLanguageLadder`, whose only peers are ffmpeg and ffprobe;
 `TestM5b2Players` runs in the amd64 `test` job.
 
-Out of M5b2 (R-L1):
+Out of M5b2 (R-L1), and its known limits:
 
 | Item | Reason |
 |---|---|
@@ -1275,6 +1274,8 @@ Out of M5b2 (R-L1):
 | An `ISO_639_language_descriptor` in TS (HLS-TS, HTTP-TS, SRT, push) | The Multi-audio milestone |
 | RTMP and RTSP metadata | The Multi-audio milestone |
 | An `osdev` flag | The Multi-audio milestone |
+| Known limit: when the lowest known audio track has left the window while a higher one continues, the MPD drops `lang`, while the CMAF master still labels the gap-only track | R-L3 as written: both label the lowest known audio track, which has no set in the MPD; the Multi-audio milestone |
+| Known limit: no player or e2e row covers the audio-only CMAF master's URI-less entry | Conform covers it (`TestAudioLanguageConforms`); players are proved on the ABR TS master's entry (`TestM5b2Players`) |
 
 M2 is split in three parts:
 
@@ -1968,18 +1969,12 @@ branches. That is a repository setting, which no commit can change.
 
 - media, pkg/hls and ingest:
   - name the subtests of the ingest row for the URI-less audio entry;
-  - a doc note on `hls.Rendition.Language`: the caller validates it,
-    `Encode` writes it as given;
   - add a 35-byte tag to `ValidLanguageSyntax`'s accepted rows.
 - spec and config:
   - reflow `Diff`'s doc comment;
   - pin that the syntax error comes before "the layout has no audio", with
     a bad tag under a layout of `[video]`;
   - a config round-trip test for `audio_language`.
-- packager:
-  - `lowestTracks` is called for every track of every period, not once
-    per MPD;
-  - a comment on the nil language pointer (nil means "").
 
 ### Carried from M1
 

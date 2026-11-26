@@ -280,7 +280,9 @@ DASH, the first rendition elsewhere), and each rendition also as
 tag such as `vi` or `en-US` (a primary subtag of 2 or 3 letters, then
 subtags of 1 to 8 letters or digits, 35 bytes at most), checked for its
 form only and written as given. It appears as `LANGUAGE` in the HLS masters
-(`cmaf/master.m3u8`, and `hls/index.m3u8` of a stream with a ladder) and as
+(`cmaf/master.m3u8`, and the `<name>/hls/index.m3u8` of a stream with a
+ladder, whose per-rendition `<name>_<label>/hls/index.m3u8` are media
+playlists and carry none, though their CMAF master and MPD do) and as
 `lang` in the DASH MPD. HLS (TS) of a stream without a ladder is a single
 media playlist with no master, so it carries no language. A stream whose
 `layout` has no audio refuses the field. Changing it is a `live` edit: the

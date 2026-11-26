@@ -10,6 +10,8 @@ import (
 type Rendition struct {
 	Type, GroupID, Name, URI string
 	// Language is the LANGUAGE attribute, written after NAME when not empty.
+	// Encode writes it unescaped, inside quotes, so the caller must pass a
+	// validated tag (for example, one media.ValidLanguage accepts).
 	Language string
 	Default  bool
 }
