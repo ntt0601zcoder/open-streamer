@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/asset"
 	"github.com/ntt0601zcoder/open-streamer/internal/auth"
 	"github.com/ntt0601zcoder/open-streamer/internal/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
@@ -126,6 +127,14 @@ type fakeBackend struct {
 	calls     []string // "Get cam", "PutStream cam", ...
 	ifMatch   []string
 	gotConfig []byte
+
+	// The assets: a real store in a temp dir.
+	assets    *asset.Store
+	usedBy    map[string][]string                       // the used_by of an asset
+	assetErr  error                                     // what every asset method returns when set
+	putHook   func(ctx context.Context, name string)    // runs in PutAsset before the body is read, outside mu
+	openHook  func(io.ReadSeekCloser) io.ReadSeekCloser // wraps the file Asset returns
+	putErrors []error                                   // the errors PutAsset's store returned
 }
 
 func newFakeBackend() *fakeBackend {
@@ -261,6 +270,83 @@ func (f *fakeBackend) Reload(context.Context) (ApplyResult, error) {
 	return f.result, f.reloadErr
 }
 
+// assetOf is the document of inf, with the used_by the test set.
+func (f *fakeBackend) assetOf(inf asset.Info) Asset {
+	return Asset{
+		Name: inf.Name, Kind: string(inf.Kind), Type: inf.Type, Size: inf.Size,
+		Modified: inf.Modified, ETag: inf.ETag, UsedBy: f.usedBy[inf.Name],
+	}
+}
+
+func (f *fakeBackend) Assets() ([]Asset, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.call("Assets")
+	if f.assetErr != nil {
+		return nil, f.assetErr
+	}
+	list, err := f.assets.List()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Asset, len(list))
+	for i := len(list) - 1; i >= 0; i-- { // reversed on purpose
+		out[len(list)-1-i] = f.assetOf(list[i])
+	}
+	return out, nil
+}
+
+func (f *fakeBackend) Asset(name string) (Asset, io.ReadSeekCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.call("Asset " + name)
+	if f.assetErr != nil {
+		return Asset{}, nil, f.assetErr
+	}
+	file, inf, err := f.assets.Open(name)
+	if err != nil {
+		return Asset{}, nil, err
+	}
+	var rc io.ReadSeekCloser = file
+	if f.openHook != nil {
+		rc = f.openHook(rc)
+	}
+	return f.assetOf(inf), rc, nil
+}
+
+func (f *fakeBackend) PutAsset(ctx context.Context, name string, body io.Reader, ifMatch string, ifNoneMatch bool) (AssetPut, bool, error) {
+	f.mu.Lock()
+	f.call("PutAsset " + name)
+	f.ifMatch = append(f.ifMatch, ifMatch)
+	hook, fail := f.putHook, f.assetErr
+	f.mu.Unlock()
+	if hook != nil {
+		hook(ctx, name)
+	}
+	if fail != nil {
+		return AssetPut{}, false, fail
+	}
+	inf, created, err := f.assets.Put(ctx, name, body, ifMatch, ifNoneMatch)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err != nil {
+		f.putErrors = append(f.putErrors, err)
+		return AssetPut{}, false, err
+	}
+	return AssetPut{Asset: f.assetOf(inf)}, created, nil
+}
+
+func (f *fakeBackend) DeleteAsset(_ context.Context, name, ifMatch string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.call("DeleteAsset " + name)
+	f.ifMatch = append(f.ifMatch, ifMatch)
+	if f.assetErr != nil {
+		return f.assetErr
+	}
+	return f.assets.Delete(name, ifMatch)
+}
+
 // env is an API over a fake backend, with the users ops (editor) and eye
 // (viewer), a limiter on a fake clock and a captured log.
 type env struct {
@@ -273,6 +359,7 @@ type env struct {
 	users      atomic.Pointer[auth.Users]
 	usersCalls atomic.Int64
 	metricsHit atomic.Int64
+	assetDir   string // the fake backend's asset store
 }
 
 const camSpec = `{"inputs":[{"url":"udp://239.0.0.1:5000"}],"outputs":{"hls":true}}`
@@ -287,6 +374,10 @@ func newEnv(t *testing.T) *env {
 	}
 	e.lim = auth.NewLimiter(e.clock.Now)
 	e.users.Store(usersWith(t, edPass, viPass))
+	e.assetDir = t.TempDir()
+	store, err := asset.Open(e.assetDir, asset.Options{})
+	require.NoError(t, err)
+	e.be.assets = store
 	a, err := New(Options{
 		Backend: e.be,
 		Users: func() *auth.Users {
@@ -307,8 +398,11 @@ func newEnv(t *testing.T) *env {
 	return e
 }
 
-// seedCam stores the stream cam with a status and a shot.
+// seedCam stores the stream cam with a status and a shot, and the asset
+// logo.png.
 func (e *env) seedCam() {
+	_, _, err := e.be.assets.Put(context.Background(), "logo.png", bytes.NewReader(logoPNG), "", false)
+	require.NoError(e.t, err)
 	sp, err := spec.Decode(strings.NewReader(camSpec))
 	require.NoError(e.t, err)
 	sp.Name = "cam"
@@ -379,11 +473,16 @@ func errOf(t *testing.T, rec *httptest.ResponseRecorder) errorDoc {
 }
 
 // routeRequest returns a request for rt that its handler accepts: the
-// stream cam, a body where one is needed, and one second for the profiles
-// (the default is 30 s).
+// stream cam or the asset logo.png, a body where one is needed, and one
+// second for the profiles (the default is 30 s).
 func routeRequest(rt Route) (target string, opts []reqOpt) {
 	target = strings.ReplaceAll(rt.Path, "{name}", "cam")
+	if rt.Path == pathAsset {
+		target = strings.ReplaceAll(rt.Path, "{name}", "logo.png")
+	}
 	switch {
+	case rt.Method == http.MethodPut && rt.Path == pathAsset:
+		opts = append(opts, body("application/octet-stream", logoPNG))
 	case rt.Method == http.MethodPut && rt.Path == pathStream:
 		opts = append(opts, body("application/json", []byte(camSpec)))
 	case rt.Method == http.MethodPut && rt.Path == pathConfig:

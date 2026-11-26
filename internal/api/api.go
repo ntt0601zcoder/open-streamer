@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/pprof"
@@ -40,6 +41,11 @@ type Backend interface {
 	PutStream(ctx context.Context, sp spec.Stream, ifMatch string) (out stream.Outcome, err error)
 	DeleteStream(ctx context.Context, name, ifMatch string) error
 	Reload(ctx context.Context) (ApplyResult, error)
+	Assets() ([]Asset, error)
+	// Asset returns the asset as an open regular file (asset.Store.Open); the handler closes it.
+	Asset(name string) (Asset, io.ReadSeekCloser, error)
+	PutAsset(ctx context.Context, name string, body io.Reader, ifMatch string, ifNoneMatch bool) (res AssetPut, created bool, err error)
+	DeleteAsset(ctx context.Context, name, ifMatch string) error
 }
 
 // ApplyResult is what a whole-config write or a reload did.
@@ -110,6 +116,10 @@ func (a *API) routeTable() []routeEntry {
 		{Route{http.MethodDelete, pathStream, auth.Editor}, http.HandlerFunc(a.deleteStream)},
 		{Route{http.MethodGet, pathStream + "/status", auth.Viewer}, http.HandlerFunc(a.streamStatus)},
 		{Route{http.MethodGet, pathStream + "/thumbnail.jpg", auth.Viewer}, http.HandlerFunc(a.thumbnail)},
+		{Route{http.MethodGet, pathAssets, auth.Viewer}, http.HandlerFunc(a.listAssets)},
+		{Route{http.MethodGet, pathAsset, auth.Viewer}, http.HandlerFunc(a.getAsset)},
+		{Route{http.MethodPut, pathAsset, auth.Editor}, http.HandlerFunc(a.putAsset)},
+		{Route{http.MethodDelete, pathAsset, auth.Editor}, http.HandlerFunc(a.deleteAsset)},
 		{Route{http.MethodGet, pathConfig, auth.Editor}, http.HandlerFunc(a.getConfig)},
 		{Route{http.MethodPut, pathConfig, auth.Editor}, http.HandlerFunc(a.putConfig)},
 		{Route{http.MethodGet, pathConfig + "/status", auth.Viewer}, http.HandlerFunc(a.configStatus)},
@@ -148,6 +158,8 @@ type API struct {
 	now    func() time.Time
 	mux    *http.ServeMux
 	routes map[string]Route // by the mux's pattern, "METHOD path"
+	slots  chan struct{}    // the asset uploads that hold a slot
+	timing timing
 
 	authFailures, authBlocked atomic.Uint64
 
@@ -182,6 +194,8 @@ func New(opt Options) (*API, error) {
 		mux:      http.NewServeMux(),
 		routes:   make(map[string]Route),
 		requests: make(map[series]uint64),
+		slots:    make(chan struct{}, uploadSlots),
+		timing:   defaultTiming,
 	}
 	if a.log == nil {
 		a.log = slog.New(slog.DiscardHandler)

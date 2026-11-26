@@ -166,6 +166,10 @@ func TestRoles(t *testing.T) {
 		"DELETE /api/v1/streams/{name}":            auth.Editor,
 		"GET /api/v1/streams/{name}/status":        auth.Viewer,
 		"GET /api/v1/streams/{name}/thumbnail.jpg": auth.Viewer,
+		"GET /api/v1/assets":                       auth.Viewer,
+		"GET /api/v1/assets/{name}":                auth.Viewer,
+		"PUT /api/v1/assets/{name}":                auth.Editor,
+		"DELETE /api/v1/assets/{name}":             auth.Editor,
 		"GET /api/v1/config":                       auth.Editor,
 		"PUT /api/v1/config":                       auth.Editor,
 		"GET /api/v1/config/status":                auth.Viewer,
@@ -538,7 +542,7 @@ func TestWritesNeedRequestedBy(t *testing.T) {
 		assert.Less(t, rec.Code, 300, "%s %s: %s", rt.Method, target, rec.Body.String())
 		assert.Len(t, e.be.callList(), 1)
 	}
-	assert.Equal(t, 4, writes, "PUT and DELETE of a stream, PUT of the config, POST reload")
+	assert.Equal(t, 6, writes, "PUT and DELETE of a stream and of an asset, PUT of the config, POST reload")
 
 	// What a cross-site form could send: a bodyless POST with only an
 	// Authorization header.

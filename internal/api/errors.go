@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/asset"
 	"github.com/ntt0601zcoder/open-streamer/internal/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/logging"
 	"github.com/ntt0601zcoder/open-streamer/internal/stream"
@@ -31,6 +33,13 @@ const (
 	codeWriteFailed  = "config_write_failed"
 	codeInternal     = "internal"
 	codeUnavailable  = "unavailable"
+	codeInvalidAsset = "invalid_asset"
+	codeAssetsFull   = "assets_full"
+	codeAssetsOff    = "assets_off"
+	codeAssetInUse   = "asset_in_use"
+	codeAssetWrite   = "asset_write_failed"
+	codeProbeFailed  = "probe_failed"
+	codeSkipped      = "config_invalid_entries"
 
 	msgInternal = "internal error"
 )
@@ -72,10 +81,53 @@ func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
 	var (
 		syntax *config.SyntaxError
 		list   config.Errors
+		inUse  *AssetInUseError
+		tooBig *http.MaxBytesError
 	)
 	switch {
 	case errors.Is(err, ErrNotFound), errors.Is(err, config.ErrNoStream):
 		writeError(w, http.StatusNotFound, codeNotFound, "not found", nil)
+	case errors.Is(err, asset.ErrNotFound), errors.Is(err, asset.ErrName):
+		writeError(w, http.StatusNotFound, codeNotFound, "no such asset", nil)
+	case errors.Is(err, asset.ErrContent):
+		// Reason is the check's own text, which names no path.
+		reason := asset.Reason(err)
+		if reason == "" {
+			reason = "the content is not what the name says"
+		}
+		writeError(w, http.StatusUnprocessableEntity, codeInvalidAsset, reason, nil)
+	case errors.Is(err, asset.ErrTooLarge), errors.As(err, &tooBig):
+		writeError(w, http.StatusRequestEntityTooLarge, codeTooLarge,
+			fmt.Sprintf("an image is at most %d bytes, a font at most %d", asset.MaxBytes(asset.Image), asset.MaxBytes(asset.Font)), nil)
+	case errors.Is(err, asset.ErrBody):
+		// A timeout, a cut connection or a body shorter than its
+		// Content-Length: the client's side, and nothing was stored.
+		writeError(w, http.StatusBadRequest, codeBadRequest, "the body could not be read", nil)
+	case errors.Is(err, asset.ErrFull):
+		writeError(w, http.StatusInsufficientStorage, codeAssetsFull,
+			fmt.Sprintf("the assets directory is full: at most %d files and %d bytes", asset.MaxFiles, asset.MaxTotalBytes), nil)
+	case errors.Is(err, asset.ErrOff):
+		writeError(w, http.StatusConflict, codeAssetsOff, "server.assets_dir is not set", nil)
+	case errors.As(err, &inUse):
+		writeError(w, http.StatusConflict, codeAssetInUse,
+			fmt.Sprintf("the asset is in use by %d streams; take it out of them first", len(inUse.Streams)),
+			capped(slices.Clone(inUse.Streams)))
+	case errors.Is(err, asset.ErrPrecondition):
+		writeError(w, http.StatusPreconditionFailed, codePrecondition, "the If-Match or If-None-Match condition does not hold", nil)
+	case errors.Is(err, asset.ErrWrite):
+		// Its text names the directory: it is the operator's, in the log,
+		// and the client gets a fixed message. A failure after the rename
+		// leaves the new bytes in place.
+		a.log.Error("api: the asset was not written", "error", logging.Scrub(err.Error()))
+		writeError(w, http.StatusInternalServerError, codeAssetWrite, "the asset could not be written; the cause is in the server's log", nil)
+	case errors.Is(err, asset.ErrProbe):
+		// The probe could not judge the font (it says nothing about it);
+		// its error can name a temp path, so it is only logged.
+		a.log.Error("api: the font probe did not run", "error", logging.Scrub(err.Error()))
+		writeError(w, http.StatusServiceUnavailable, codeProbeFailed, "the font could not be checked; try again", nil)
+	case errors.Is(err, ErrSkippedEntries):
+		writeError(w, http.StatusConflict, codeSkipped,
+			"the config holds entries that were skipped at start; fix or remove them first", nil)
 	case errors.Is(err, ErrPrecondition):
 		writeError(w, http.StatusPreconditionFailed, codePrecondition, "the If-Match header does not match", nil)
 	case errors.Is(err, ErrPreconditionRequired):

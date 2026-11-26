@@ -3,7 +3,7 @@
   "info": {
     "title": "Open Streamer API",
     "version": "1",
-    "description": "The REST API of Open Streamer: the streams, the config editor, the reload and the status documents. Every route but /healthz needs HTTP Basic credentials of a user in the config file; a viewer reads, an editor reads and writes (x-role on each operation). A viewer's ?secrets=1 is 403 on every authenticated route, not only on the stream routes. Every response has Cache-Control: no-store (the thumbnail: no-cache) and X-Content-Type-Options: nosniff. A request no route answers gets a plain-text 404 or 405, without authentication. The editor also has net/http/pprof under /debug/pprof/. The API has no TLS before M5c: keep it on loopback or behind a TLS reverse proxy. Run the server under a service manager that restarts it: there is no per-stream panic recovery, so a panic ends the process and the restart restores every stream from the config file."
+    "description": "The REST API of Open Streamer: the streams, the assets (watermark images and fonts), the config editor, the reload and the status documents. Every route but /healthz needs HTTP Basic credentials of a user in the config file; a viewer reads, an editor reads and writes (x-role on each operation). A viewer's ?secrets=1 is 403 on every authenticated route, not only on the stream routes. Every response has Cache-Control: no-store (the thumbnail and an asset's file: no-cache) and X-Content-Type-Options: nosniff. A request no route answers gets a plain-text 404 or 405, without authentication. The editor also has net/http/pprof under /debug/pprof/. The API has no TLS before M5c: keep it on loopback or behind a TLS reverse proxy. Run the server under a service manager that restarts it: there is no per-stream panic recovery, so a panic ends the process and the restart restores every stream from the config file."
   },
   "security": [
     {
@@ -489,6 +489,302 @@
         }
       }
     },
+    "/api/v1/assets": {
+      "get": {
+        "operationId": "listAssets",
+        "summary": "Every asset, sorted by name.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The assets.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "assets"
+                  ],
+                  "properties": {
+                    "assets": {
+                      "type": "array",
+                      "description": "The assets, sorted by name. A file that is not a regular file, has no asset name, or is over its kind's limit is not listed.",
+                      "items": {
+                        "$ref": "#/components/schemas/Asset"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/assets/{name}": {
+      "get": {
+        "operationId": "getAsset",
+        "summary": "One asset's file.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/assetName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bytes, streamed. Content-Type is the asset's type, Content-Disposition is attachment, Cache-Control is no-cache; Range requests are served.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "font/ttf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "font/otf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match holds the asset's ETag."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/TooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "put": {
+        "operationId": "putAsset",
+        "summary": "Create or replace one asset.",
+        "x-role": "editor",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "description": "The body is checked (an image must decode as the format its name says, a font must be a single sfnt face that the font probe accepts) and stored whole: a reader sees the old bytes or the new ones. Every stream with a supervisor that names the asset is given the new bytes, and every stream left stopped that names it is tried again. At most 2 uploads run at once: an upload waits up to 30 s for a slot. Once it has one, its body must arrive within 30 s plus 1 s per 256 KiB of its kind's limit (34 s for an image, 126 s for a font).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/assetName"
+          },
+          {
+            "$ref": "#/components/parameters/requestedBy"
+          },
+          {
+            "$ref": "#/components/parameters/assetIfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ifNoneMatchStar"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "The file's bytes: at most 1048576 for an image, 25165824 for a font. A larger Content-Length is refused before the body is read.",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The asset was replaced.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetPut"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The asset was created.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetPut"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/TooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteAsset",
+        "summary": "Delete one asset.",
+        "x-role": "editor",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "description": "Refused while a stream names the asset (asset_in_use) or while the config holds entries the start skipped (config_invalid_entries).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/assetName"
+          },
+          {
+            "$ref": "#/components/parameters/requestedBy"
+          },
+          {
+            "$ref": "#/components/parameters/assetIfMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The asset is gone."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
     "/api/v1/config": {
       "get": {
         "operationId": "getConfig",
@@ -804,6 +1100,37 @@
           "type": "string",
           "minLength": 1
         }
+      },
+      "assetName": {
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "description": "The asset's name: an image (.png, .jpg, .jpeg) or a font (.ttf, .otf), lower case. A name no asset can have is a 404, and the server is not asked.",
+        "schema": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}\\.(png|jpg|jpeg|ttf|otf)$"
+        }
+      },
+      "assetIfMatch": {
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "description": "One tag, exactly as an ETag header gave it, or *: the write is refused with 412 when the asset has another tag, and also when it does not exist. A list of tags and a weak tag (W/) never match. The tag is cached by the file's identity, size and modification time: a file edited in place by hand, at the same size within one tick of the file system's clock, can keep its old tag, and a write with that tag is then accepted (hand edits are outside the API's contract).",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "ifNoneMatchStar": {
+        "name": "If-None-Match",
+        "in": "header",
+        "required": false,
+        "description": "Only *: the upload is refused with 412 when the asset exists. Any other value is a 400.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "*"
+          ]
+        }
       }
     },
     "headers": {
@@ -816,7 +1143,7 @@
     },
     "responses": {
       "BadRequest": {
-        "description": "bad_request: a body that is not one document of the expected shape, a name other than the path's, or a write without X-Requested-By.",
+        "description": "bad_request: a body that is not one document of the expected shape or could not be read, a name other than the path's, an asset upload's If-None-Match other than *, or a write without X-Requested-By.",
         "content": {
           "application/json": {
             "schema": {
@@ -855,7 +1182,7 @@
         }
       },
       "NotFound": {
-        "description": "not_found: no such stream, an invalid name in the path, or no thumbnail yet.",
+        "description": "not_found: no such stream or asset, an invalid name in the path, or no thumbnail yet.",
         "content": {
           "application/json": {
             "schema": {
@@ -865,7 +1192,7 @@
         }
       },
       "Conflict": {
-        "description": "conflict: a listen address or a copy:// cycle conflicts with another stream or the server (errors lists each). config_changed: the config file was edited by hand; reload first. config_unreadable (a reload only): the config file cannot be read, or on Unix is not mode 0600; message says why, and nothing changed.",
+        "description": "conflict: a listen address or a copy:// cycle conflicts with another stream or the server (errors lists each). config_changed: the config file was edited by hand; reload first. config_unreadable (a reload only): the config file cannot be read, or on Unix is not mode 0600; message says why, and nothing changed. assets_off (the asset routes): server.assets_dir is not set. asset_in_use (an asset DELETE): streams name the asset; errors lists them. config_invalid_entries (an asset DELETE): the config holds entries the start skipped, which could name the asset; fix or remove them first.",
         "content": {
           "application/json": {
             "schema": {
@@ -875,7 +1202,7 @@
         }
       },
       "PreconditionFailed": {
-        "description": "precondition_failed: the If-Match header does not match.",
+        "description": "precondition_failed: the If-Match header does not match; for an asset upload, also If-None-Match: * on an asset that exists.",
         "content": {
           "application/json": {
             "schema": {
@@ -885,7 +1212,7 @@
         }
       },
       "TooLarge": {
-        "description": "too_large: the body is over the limit.",
+        "description": "too_large: the body is over the limit (an asset: 1048576 bytes for an image, 25165824 for a font).",
         "content": {
           "application/json": {
             "schema": {
@@ -905,7 +1232,17 @@
         }
       },
       "Unprocessable": {
-        "description": "invalid_config: the config that would result is invalid. invalid_spec: the stream cannot run on this server (for one, it turns on rtmp, rtsp or srt while that server.*.listen is empty); it takes precedence over conflict. errors lists every one.",
+        "description": "invalid_config: the config that would result is invalid. invalid_spec: the stream cannot run on this server (for one, it turns on rtmp, rtsp or srt while that server.*.listen is empty); it takes precedence over conflict. errors lists every one. invalid_asset (an asset upload): the bytes are not what the name says; message says why.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "InsufficientStorage": {
+        "description": "assets_full: the assets directory would hold more than 256 files or 536870912 bytes.",
         "content": {
           "application/json": {
             "schema": {
@@ -944,7 +1281,7 @@
         }
       },
       "Internal": {
-        "description": "config_write_failed (a write only): the edit was valid but the config file could not be written (a read-only directory, a full disk); message says why, and nothing was applied. internal: anything else; the cause is in the server's log.",
+        "description": "config_write_failed (a write only): the edit was valid but the config file could not be written (a read-only directory, a full disk); message says why, and nothing was applied. asset_write_failed (an asset write): the asset could not be written or removed; the cause is in the server's log. internal: anything else; the cause is in the server's log.",
         "content": {
           "application/json": {
             "schema": {
@@ -954,7 +1291,7 @@
         }
       },
       "Unavailable": {
-        "description": "unavailable: the server is stopping, or too many logins are waiting (then with Retry-After: 1).",
+        "description": "unavailable: the server is stopping, too many logins are waiting (then with Retry-After: 1), an asset upload waited 30 s for one of the 2 upload slots (then with Retry-After: 1), or the request was cancelled. probe_failed (a font upload): the font could not be checked; try again.",
         "headers": {
           "Retry-After": {
             "schema": {
@@ -1631,6 +1968,142 @@
           "restart_required"
         ]
       },
+      "Asset": {
+        "type": "object",
+        "description": "One asset: a watermark image or a font in server.assets_dir.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The asset's name."
+          },
+          "kind": {
+            "type": "string",
+            "description": "What the asset is, by its name.",
+            "enum": [
+              "image",
+              "font"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "description": "The media type, by the content: image/png, image/jpeg, font/ttf or font/otf."
+          },
+          "size": {
+            "type": "integer",
+            "description": "The size in bytes."
+          },
+          "modified": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The file's modification time."
+          },
+          "etag": {
+            "type": "string",
+            "description": "The entity tag: a hash of the bytes, the same value as the ETag header."
+          },
+          "used_by": {
+            "type": "array",
+            "description": "The streams whose spec names the asset, sorted; [] when none.",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "type",
+          "size",
+          "modified",
+          "etag",
+          "used_by"
+        ]
+      },
+      "AssetPut": {
+        "type": "object",
+        "description": "The answer to an asset upload: the asset, and what each stream that names it did with the new bytes.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The asset's name."
+          },
+          "kind": {
+            "type": "string",
+            "description": "What the asset is, by its name.",
+            "enum": [
+              "image",
+              "font"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "description": "The media type, by the content: image/png, image/jpeg, font/ttf or font/otf."
+          },
+          "size": {
+            "type": "integer",
+            "description": "The size in bytes."
+          },
+          "modified": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The file's modification time."
+          },
+          "etag": {
+            "type": "string",
+            "description": "The entity tag: a hash of the bytes, the same value as the ETag header."
+          },
+          "used_by": {
+            "type": "array",
+            "description": "The streams whose spec names the asset, sorted; [] when none.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "refreshed": {
+            "type": "array",
+            "description": "One per stream with a supervisor that names the asset; [] when none.",
+            "items": {
+              "type": "object",
+              "required": [
+                "stream",
+                "ok"
+              ],
+              "properties": {
+                "stream": {
+                  "type": "string",
+                  "description": "The stream's name."
+                },
+                "ok": {
+                  "type": "boolean",
+                  "description": "The transcoder took the new bytes; the child may not have drawn them yet."
+                },
+                "error": {
+                  "type": "string",
+                  "description": "Why it did not; absent when ok. Between two generations, the next build takes the new bytes."
+                }
+              }
+            }
+          },
+          "retried": {
+            "type": "array",
+            "description": "The streams left stopped that name the asset (one could not run for a missing or bad asset), tried again; [] when none.",
+            "items": {
+              "$ref": "#/components/schemas/Outcome"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "type",
+          "size",
+          "modified",
+          "etag",
+          "used_by",
+          "refreshed",
+          "retried"
+        ]
+      },
       "Error": {
         "type": "object",
         "description": "The error document.",
@@ -1672,7 +2145,14 @@
               "too_many_attempts",
               "config_write_failed",
               "internal",
-              "unavailable"
+              "unavailable",
+              "invalid_asset",
+              "assets_full",
+              "assets_off",
+              "asset_in_use",
+              "asset_write_failed",
+              "probe_failed",
+              "config_invalid_entries"
             ]
           },
           "message": {
@@ -1681,7 +2161,7 @@
           },
           "errors": {
             "type": "array",
-            "description": "Every single error, for the codes that have several: conflict, invalid_config, invalid_spec.",
+            "description": "Every single error, for the codes that have several: conflict, invalid_config, invalid_spec; for asset_in_use, the names of the streams.",
             "items": {
               "type": "string"
             }
