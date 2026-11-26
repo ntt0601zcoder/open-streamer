@@ -551,8 +551,12 @@ func TestSupervisorRefresh(t *testing.T) {
 			// Without a watermark there is nothing to refresh.
 			require.Equal(t, spec.ChangeLive, answer(t, s.Submit(withWatermark(sp, nil))))
 			require.NoError(t, refreshed(t, s.Refresh()))
+			// SetWatermark calls that pile up collapse to the latest: the
+			// child has the first before the second is made.
+			want = append(want, "set none")
+			waitLines(t, lines, want...)
 			require.Equal(t, spec.ChangeLive, answer(t, s.Submit(withWatermark(sp, &spec.Watermark{Text: "t"}))))
-			want = append(want, "set none", "set text:t")
+			want = append(want, "set text:t")
 			waitLines(t, lines, want...)
 			st := s.Status()
 			assert.Equal(t, uint64(1), st.Generation)
