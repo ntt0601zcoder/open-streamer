@@ -24,6 +24,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/mux/fmp4"
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/segment"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
@@ -99,6 +100,50 @@ func packClip(t *testing.T, name string, opt Options) (*Packager, []hub.Delivery
 	p := NewPackager(h, opt)
 	p.Run(context.Background(), sub)
 	return p, ds
+}
+
+// A packager that joins a live hub is given the cached GOP, whose keyframe
+// is followed by audio presented before it. With Join its first segment
+// starts every track at the keyframe; without it, as ever, with audio only.
+func TestPackagerJoin(t *testing.T) {
+	h, _, ds := clip(t, "h264_aac.ts")
+	// The cached GOP of a subscriber that joins late: from the second
+	// keyframe on.
+	keys, from := 0, -1
+	rate := map[int]float64{}
+	for i, d := range ds {
+		rate[d.Frame.Track] = float64(fmp4.Timescale(d.Frame.Config))
+		if d.Frame.Kind() == media.KindVideo && d.Frame.Key {
+			if keys++; keys == 2 {
+				from = i
+			}
+		}
+	}
+	require.GreaterOrEqual(t, from, 0)
+	starts := func(opt Options) (video, audio float64) {
+		p := NewPackager(h, opt)
+		for _, d := range ds[from:] {
+			p.Handle(d)
+		}
+		p.End()
+		segs := p.Snapshot().Segments
+		require.NotEmpty(t, segs)
+		require.Len(t, segs[0].Parts, 2)
+		for _, part := range segs[0].Parts {
+			at := float64(part.Timing.Earliest) / rate[part.Track]
+			if rate[part.Track] == 90000 {
+				video = at
+			} else {
+				audio = at
+			}
+		}
+		return video, audio
+	}
+	video, audio := starts(Options{})
+	require.Less(t, audio, video-0.05, "the fixture's audio does not trail its keyframes: the test shows nothing")
+	video, audio = starts(Options{Join: true})
+	assert.InDelta(t, video, audio, 0.03, "the first segment starts with audio only")
+	assert.GreaterOrEqual(t, audio, video-0.0001)
 }
 
 // segmentsOf cuts deliveries the way the packager does.

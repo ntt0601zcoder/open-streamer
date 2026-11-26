@@ -87,6 +87,13 @@ type Options struct {
 	// AlignVideo keeps every video track's part of a segment starting on a
 	// keyframe at the segment's Start (ruling R-B8; see the package doc).
 	AlignVideo bool
+	// Join is for a segmenter that starts in the middle of a stream, on a
+	// replayed GOP: its first segment opens as one after Lost > 0 does, so
+	// the frames of the other tracks presented before its Start, which
+	// arrive after the keyframe that opens it, are dropped instead of kept.
+	// Without it the first segment would start with audio only. It is not a
+	// Discontinuity: nothing precedes it.
+	Join bool
 }
 
 // Segment is one run of frames from every track, cut on an anchor keyframe.
@@ -209,13 +216,13 @@ func New(opt Options) *Segmenter {
 		m = 5 * t
 	}
 	return &Segmenter{
-		target: t, maxDur: max(m, t), anchor: -1, align: opt.AlignVideo,
+		target: t, maxDur: max(m, t), anchor: -1, align: opt.AlignVideo, lost: opt.Join,
 		reached: map[int]int64{}, audio: map[int]bool{}, timedOut: map[int]bool{},
 	}
 }
 
 // Dropped returns the number of frames discarded: those that arrived before
-// a segment could open, early non-anchor frames after a loss, and, under
+// a segment could open, early non-anchor frames after a loss or a Join, and, under
 // AlignVideo, the video frames its rules leave out.
 func (s *Segmenter) Dropped() uint64 { return s.dropped }
 

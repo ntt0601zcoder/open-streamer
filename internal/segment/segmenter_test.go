@@ -101,6 +101,71 @@ func TestSegmentLost(t *testing.T) {
 	assert.EqualValues(t, 500000, segs[1].Start)
 }
 
+// A segmenter that joins a running stream gets the cached GOP: its keyframe,
+// then the audio the source interleaves behind it, presented before it.
+func TestSegmentJoinDropsEarlyAudio(t *testing.T) {
+	const k = 500000
+	feed := func(s *Segmenter) []Segment {
+		var segs []Segment
+		segs = append(segs, s.Push(vid(1, k, true))...)
+		for i := int64(0); i < 20; i++ { // 0.3 s behind the keyframe, on to 0.1 s past it
+			segs = append(segs, s.Push(aud(k-27000+i*aDur))...)
+		}
+		segs = append(segs, video(s, 1, k+3600, 60, 90000)...)
+		return append(segs, s.Flush()...)
+	}
+	first := func(seg Segment, track int) int64 {
+		for _, f := range seg.Frames {
+			if f.Track == track {
+				return f.PTS
+			}
+		}
+		t.Fatalf("no frame of track %d", track)
+		return 0
+	}
+
+	// Off, the default: the audio before the keyframe is kept, as ever.
+	s := New(Options{})
+	segs := feed(s)
+	require.NotEmpty(t, segs)
+	assert.EqualValues(t, k, segs[0].Start)
+	assert.EqualValues(t, k-27000, first(segs[0], 1), "the default changed")
+	assert.Zero(t, s.Dropped())
+	assert.EqualValues(t, 15, s.Late())
+
+	// On: the first segment's audio starts at its Start.
+	s = New(Options{Join: true})
+	segs = feed(s)
+	require.NotEmpty(t, segs)
+	assert.EqualValues(t, k, segs[0].Start)
+	assert.False(t, segs[0].Discontinuity, "nothing precedes the first segment")
+	assert.EqualValues(t, 0, segs[0].Seq)
+	got := first(segs[0], 1)
+	assert.GreaterOrEqual(t, got, int64(k))
+	assert.Less(t, got, int64(k+aDur))
+	assert.EqualValues(t, 15, s.Dropped())
+	assert.Zero(t, s.Late())
+	// Only the first segment: later ones are cut as ever.
+	for _, seg := range segs[1:] {
+		assert.False(t, seg.Discontinuity)
+	}
+
+	// Audio that leads the keyframe in arrival, as at a stream's start, is
+	// superseded as without Join, and the option is kept for the segment
+	// the keyframe opens.
+	s = New(Options{Join: true})
+	require.Empty(t, s.Push(aud(k-2*aDur)))
+	require.Empty(t, s.Push(aud(k-aDur)))
+	require.Empty(t, s.Push(vid(1, k, true)))
+	require.Empty(t, s.Push(aud(k-aDur/2)))
+	require.Empty(t, s.Push(aud(k+aDur/2)))
+	segs = s.Flush()
+	require.Len(t, segs, 1)
+	assert.EqualValues(t, k, segs[0].Start)
+	assert.EqualValues(t, k+aDur/2, first(segs[0], 1))
+	assert.EqualValues(t, 3, s.Dropped())
+}
+
 func TestSegmentLostDropsEarlyAudio(t *testing.T) {
 	s := New(Options{})
 	require.Empty(t, video(s, 1, 0, 10, 90000))

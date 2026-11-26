@@ -631,19 +631,14 @@ func (m *m5a) readSession(out stream.Output, served string, d time.Duration) <-c
 	return ch
 }
 
-// m5aAV requires a capture without an error and without a violation (but
-// of the rules in tolerate) that holds video and audio frames, and returns
-// the number of capture epochs it holds. (A segmented read ends when one
+// m5aAV requires a capture without an error and without a violation that
+// holds video and audio frames, and returns the number of capture epochs it holds. (A segmented read ends when one
 // playlist has its span, and the audio playlist of an fMP4 master can be a
 // segment ahead of the video's, so the count is over every track.)
-func m5aAV(t *testing.T, what string, c conform.Capture, err error, tolerate ...string) int {
+func m5aAV(t *testing.T, what string, c conform.Capture, err error) int {
 	t.Helper()
 	require.NoError(t, err, what)
 	for _, v := range c.Violations {
-		if slices.Contains(tolerate, v.Rule) {
-			t.Logf("%s: tolerated: %s", what, v)
-			continue
-		}
 		assert.Fail(t, "a conform violation", "%s: %s", what, v)
 	}
 	v, _ := byKind(c.Frames, media.KindVideo)
@@ -658,16 +653,16 @@ func m5aAV(t *testing.T, what string, c conform.Capture, err error, tolerate ...
 }
 
 // fresh reads 2 s of an output of a served name with a new reader, which
-// must get video and audio without a violation (but of the rules in
-// tolerate). For HLS it reads both the HLS-TS playlist and the fMP4 master.
-func (m *m5a) fresh(t *testing.T, out stream.Output, served string, tolerate ...string) {
+// must get video and audio without a violation. For HLS it reads both the
+// HLS-TS playlist and the fMP4 master.
+func (m *m5a) fresh(t *testing.T, out stream.Output, served string) {
 	t.Helper()
 	const span = 2 * time.Second
 	session := func() {
 		t.Helper()
 		select {
 		case r := <-m.readSession(out, served, span):
-			m5aAV(t, "a new reader of "+string(out), r.c, r.err, tolerate...)
+			m5aAV(t, "a new reader of "+string(out), r.c, r.err)
 		case <-time.After(span + 2*m5aRead):
 			require.Fail(t, "a new reader of "+string(out)+" did not return")
 		}
@@ -676,7 +671,7 @@ func (m *m5a) fresh(t *testing.T, out stream.Output, served string, tolerate ...
 		t.Helper()
 		select {
 		case r := <-m.readSegmented(format, served, span):
-			m5aAV(t, "a new reader of "+format, r.c, r.err, tolerate...)
+			m5aAV(t, "a new reader of "+format, r.c, r.err)
 		case <-time.After(span + 2*m5aRead):
 			require.Fail(t, "a new reader of "+format+" did not return")
 		}
@@ -1508,19 +1503,11 @@ func m5aEditOutputs(t *testing.T, row m5aEditRow) {
 		}, "the new pusher publishes and sink's input is back")
 	default:
 		m.listed(t, "cam", 2)
-		var tolerate []string
-		if len(row.outs) == 2 {
-			// A packager that starts in the middle of a stream starts on
-			// the hub's cached GOP, whose audio is the file's interleave
-			// (about 0.3 s) ahead of the keyframe in presentation time,
-			// and it packages that audio: its first epoch starts with
-			// audio only, which conform reports. A packager that starts
-			// with its stream does not. Reported with this task; the row
-			// requires what the brief does, that the output has frames.
-			tolerate = []string{conform.RuleStartOffset}
-		}
+		// With both off and on again, a new packager started in the middle
+		// of the stream, on the hub's cached GOP: it joins (live.Options.Join),
+		// so its first segment starts every track at the keyframe.
 		for _, out := range row.outs {
-			m.fresh(t, out, "cam", tolerate...)
+			m.fresh(t, out, "cam")
 		}
 		now, ok := m.srv.Manager().Packager(stream.OutHLS, "cam")
 		require.True(t, ok)

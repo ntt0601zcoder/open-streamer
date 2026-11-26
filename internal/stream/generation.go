@@ -398,12 +398,13 @@ func (s *Supervisor) publish(g *generation, o spec.Outputs) {
 }
 
 // startPackagers starts every packager of g, each subscribed under
-// "packager <served name>".
+// "packager <served name>". One that starts on a hub that is already live,
+// which is HLS and DASH turned on in the middle of a stream, joins it.
 func (s *Supervisor) startPackagers(g *generation) {
 	for _, ps := range g.packSpecs {
-		opt := live.Options{}
+		opt := live.Options{Join: ps.hub.Live()}
 		if ps.abr {
-			opt = live.Options{ABR: true, Logger: s.log}
+			opt.ABR, opt.Logger = true, s.log
 		}
 		ctx, cancel := context.WithCancel(g.ctx)
 		r := &packRun{

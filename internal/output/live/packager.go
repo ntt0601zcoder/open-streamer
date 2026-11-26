@@ -73,6 +73,11 @@ type Options struct {
 	// Logger receives the ABR warning about rungs left out of segments, at
 	// most once every 10 s; nil discards.
 	Logger *slog.Logger
+	// Join is for a packager that starts on a hub that is already live: it
+	// is given the cached GOP, and the audio presented before that GOP's
+	// keyframe arrives behind it. Join drops that audio, so the first
+	// segment does not start with audio only (segment.Options.Join).
+	Join bool
 }
 
 // RungStats counts what an ABR presentation lost of one video track (a
@@ -173,7 +178,7 @@ func NewPackager(h *hub.Hub, opt Options) *Packager {
 	if p.now == nil {
 		p.now = time.Now
 	}
-	p.seg = segment.New(segment.Options{Target: p.target, AlignVideo: p.abr})
+	p.seg = segment.New(segment.Options{Target: p.target, AlignVideo: p.abr, Join: opt.Join})
 	return p
 }
 

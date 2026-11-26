@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
+	"github.com/ntt0601zcoder/open-streamer/internal/mux/fmp4"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
 )
@@ -117,6 +118,17 @@ func TestSupervisorPackagerEdit(t *testing.T) {
 	assert.NotSame(t, pack, fresh)
 	assert.Contains(t, subscribers(h), "packager cam")
 	require.Eventually(t, func() bool { return len(fresh.Snapshot().Segments) > 0 }, waitFor, 5*time.Millisecond)
+	// It joined a live hub: its first segment starts every track at the
+	// keyframe, not with the audio the cached GOP holds from before it.
+	snap := fresh.Snapshot()
+	require.Len(t, snap.Segments[0].Parts, 2)
+	var starts []float64
+	for _, part := range snap.Segments[0].Parts {
+		tr, ok := snap.Track(part.Track)
+		require.True(t, ok)
+		starts = append(starts, float64(part.Timing.Earliest)/float64(fmp4.Timescale(tr.Config)))
+	}
+	assert.InDelta(t, starts[0], starts[1], 0.03, "a packager started mid-stream opens with audio only")
 
 	session.more(t, 20)
 	assert.Zero(t, session.lost.Load(), "the session lost frames over the packager edits")
