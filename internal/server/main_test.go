@@ -35,7 +35,8 @@ func TestMain(m *testing.M) {
 //	ok           "font: ok", exit 0
 //	bad          "font: bad tables" on stdout, a temp path on stderr, exit 3
 //	empty        exit 3 with nothing on stdout
-//	long         a noise line, a "font: " line of 400 bytes, 8 KiB more, exit 3
+//	long         a noise line, a "font: " line of 100 "€" (300 bytes), 8 KiB more, exit 3
+//	dirty        "font: " with control bytes and invalid UTF-8 in "bad tables", exit 3
 //	segv         death by SIGSEGV (Unix)
 //	usage        a stale bundle's usage line on stderr, exit 2
 //	stub         the stub build's line on stderr, exit 2
@@ -58,11 +59,14 @@ func fakeProbe(mode string) {
 		fmt.Println("font: bad tables")
 		fmt.Fprintln(os.Stderr, "/tmp/secret/path: cannot load")
 		os.Exit(exitProbeFailed)
+	case mode == "dirty":
+		fmt.Print("font: \tbad\x01 ta\x7fbles\xff\r\n")
+		os.Exit(exitProbeFailed)
 	case mode == "empty":
 		os.Exit(exitProbeFailed)
 	case mode == "long":
 		fmt.Println("noise before the verdict")
-		fmt.Println("font: " + strings.Repeat("é", 200))
+		fmt.Println("font: " + strings.Repeat("€", 100))
 		fmt.Println(strings.Repeat("z", 8<<10))
 		os.Exit(exitProbeFailed)
 	case mode == "segv":

@@ -336,3 +336,41 @@ func TestExampleConfig(t *testing.T) {
 	assert.Equal(t, "viewer", p.Doc.Users[1].Role)
 	require.Len(t, p.Doc.Streams, 1)
 }
+
+// TestExampleCommentedStream uncomments the example's commented stream
+// cam2, with its no_fallback and font keys, and parses it, so that the
+// block keeps up with the spec.
+func TestExampleCommentedStream(t *testing.T) {
+	b, err := os.ReadFile("openstreamer.example.yaml")
+	require.NoError(t, err)
+	text := string(b)
+	const start = "  # - name: cam2\n"
+	i := strings.Index(text, start)
+	require.GreaterOrEqual(t, i, 0, "the example has no commented stream cam2")
+	block := strings.Split(strings.TrimRight(text[i:], "\n"), "\n")
+	for n, line := range block {
+		rest, ok := strings.CutPrefix(line, "  # ")
+		require.True(t, ok, "line %d of the block is not commented: %q", n, line)
+		for _, key := range []string{"# no_fallback:", "# font:"} {
+			if trimmed := strings.TrimLeft(rest, " "); strings.HasPrefix(trimmed, key) {
+				rest = rest[:len(rest)-len(trimmed)] + strings.TrimPrefix(trimmed, "# ")
+			}
+		}
+		block[n] = "  " + rest
+	}
+	text = text[:i] + strings.Join(block, "\n") + "\n"
+	const placeholder = "REPLACE-WITH-OUTPUT-OF-openstreamer-hash-password"
+	hash := auth.NewHash(editorPW, []byte("0123456789abcdef"), 1000).String()
+	p, err := config.Parse([]byte(strings.ReplaceAll(text, placeholder, hash)), config.Options{RequiredIterations: 1000})
+	require.NoError(t, err)
+	require.Len(t, p.Doc.Streams, 2)
+	cam2 := p.Doc.Streams[1]
+	require.Equal(t, "cam2", cam2.Name)
+	require.NotNil(t, cam2.Transcode)
+	require.NotEmpty(t, cam2.Transcode.Renditions)
+	assert.Equal(t, "nvenc", cam2.Transcode.Renditions[0].Encoder)
+	assert.True(t, cam2.Transcode.Renditions[0].NoFallback)
+	require.NotNil(t, cam2.Transcode.Watermark)
+	assert.Equal(t, "brand.ttf", cam2.Transcode.Watermark.Font)
+	assert.Equal(t, []string{"brand.ttf"}, cam2.Assets())
+}

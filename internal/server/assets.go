@@ -50,10 +50,13 @@ var fontProbeLimit = 10 * time.Second
 // with the reason of its stdout line "font: …", or death by a signal that
 // is not the context's kill. Anything else (another status, the limit, an
 // end of ctx, an exec error) says nothing about the font and is an error,
-// whose text names the binary and the status but never the temp path.
+// whose text names the binary and the status but never the temp path. The
+// end of the caller's own ctx is that ctx's error, and the limit is an
+// error of its own: the server tells a client that hung up from a probe
+// that ran out of time.
 func fontProber(binary string, env []string, limit time.Duration) func(ctx context.Context, path string) (bool, string, error) {
-	return func(ctx context.Context, path string) (bool, string, error) {
-		ctx, cancel := context.WithTimeout(ctx, limit)
+	return func(parent context.Context, path string) (bool, string, error) {
+		ctx, cancel := context.WithTimeout(parent, limit)
 		defer cancel()
 		out := &cappedBuffer{max: probeStdoutMax}
 		cmd := exec.CommandContext(ctx, binary, "-probe", "font", path)
@@ -66,11 +69,11 @@ func fontProber(binary string, env []string, limit time.Duration) func(ctx conte
 		}
 		// A context kill is a SIGKILL: it must not read as a crash on the
 		// font, so the context is asked before the wait status.
-		if cerr := ctx.Err(); cerr != nil {
-			if errors.Is(cerr, context.DeadlineExceeded) {
-				return false, "", fmt.Errorf("server: probe font with %s: no verdict within %s: %w", binary, limit, cerr)
-			}
-			return false, "", fmt.Errorf("server: probe font with %s: %w", binary, cerr)
+		if perr := parent.Err(); perr != nil {
+			return false, "", fmt.Errorf("server: probe font with %s: %w", binary, perr)
+		}
+		if ctx.Err() != nil {
+			return false, "", fmt.Errorf("server: probe font with %s: no verdict within %s", binary, limit)
 		}
 		var exit *exec.ExitError
 		if !errors.As(err, &exit) {
@@ -87,14 +90,21 @@ func fontProber(binary string, env []string, limit time.Duration) func(ctx conte
 }
 
 // probeReason returns the reason of the first line of stdout that starts
-// with "font: ", without that prefix and cut to probeReasonMax bytes, or
-// probeNoReason when there is none.
+// with "font: ", without that prefix, as valid UTF-8 without control
+// characters, and cut to probeReasonMax bytes; or probeNoReason when there
+// is none.
 func probeReason(stdout []byte) string {
 	for line := range strings.SplitSeq(string(stdout), "\n") {
 		rest, ok := strings.CutPrefix(line, probePrefix)
 		if !ok {
 			continue
 		}
+		rest = strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f {
+				return -1
+			}
+			return r
+		}, strings.ToValidUTF8(rest, ""))
 		rest = strings.TrimSpace(rest)
 		if len(rest) > probeReasonMax {
 			rest = strings.ToValidUTF8(rest[:probeReasonMax], "")
@@ -164,12 +174,19 @@ func (s *Server) Asset(name string) (api.Asset, io.ReadSeekCloser, error) {
 // the asset, the text in force is applied again, as PutStream does for an
 // unchanged document (nothing is written), which tries those streams
 // again: their outcomes are Retried. An error of that apply is logged and
-// leaves Retried empty: the asset is stored either way.
+// leaves Retried empty: the asset is stored either way. Not while the text
+// in force holds entries the start skipped: its strict parse would fail
+// every time, for the errors load_errors already reports.
 //
 // An asset.ErrWrite can come after the rename, with the new bytes in place,
-// so the streams are refreshed then too, and the error returned.
+// so the streams are refreshed then too, and the error returned. A probe
+// cut short by the end of ctx (the client went away) is that ctx's error,
+// not asset.ErrProbe: it says nothing about the probe.
 func (s *Server) PutAsset(ctx context.Context, name string, body io.Reader, ifMatch string, ifNoneMatch bool) (api.AssetPut, bool, error) {
 	inf, created, err := s.assets.Put(ctx, name, body, ifMatch, ifNoneMatch)
+	if err != nil && errors.Is(err, asset.ErrProbe) && ctx.Err() != nil {
+		return api.AssetPut{}, false, fmt.Errorf("server: put asset: %w", ctx.Err())
+	}
 	if err != nil && !errors.Is(err, asset.ErrWrite) {
 		return api.AssetPut{}, false, err
 	}
@@ -178,7 +195,12 @@ func (s *Server) PutAsset(ctx context.Context, name string, body io.Reader, ifMa
 	m := s.Manager()
 	refreshed := m.RefreshAsset(ctx, name)
 	var retried []stream.Outcome
-	if names := s.stoppedNaming(name); len(names) > 0 {
+	switch names := s.stoppedNaming(name); {
+	case len(names) == 0:
+	case s.skipped:
+		s.log.Debug("server: assets: the config holds entries the start skipped: the streams left stopped are not tried again",
+			"asset", name)
+	default:
 		res, aerr := s.apply(ctx, s.applied, true)
 		if aerr != nil {
 			s.log.Error("server: assets: the streams left stopped were not tried again",

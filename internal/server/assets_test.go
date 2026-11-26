@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"image"
@@ -220,6 +221,27 @@ func TestPutAssetRetriesStopped(t *testing.T) {
 		assert.Equal(t, file, s.fileText())
 	})
 
+	t.Run("not while the config holds skipped entries", func(t *testing.T) {
+		dir := t.TempDir()
+		bad := "  - name: bad\n    inputs:\n      - url: rtmp://src.example/live/bad\n    colour: blue\n    outputs: {hls: true}\n"
+		s := testConfig(t, func(su *setup) {
+			su.Text = withAssets(testExe(t), dir, cam, bad)
+			su.Opt.TranscoderEnv = fakeEnv("ok")
+		})
+		require.Len(t, s.status().LoadErrors, 2)
+		loaded := s.status().LoadedAt
+		const errorLine = `"level":"ERROR"`
+		errs := strings.Count(s.logs.String(), errorLine)
+		res, err := s.put("logo.png", pngOf(t, 4))
+		require.NoError(t, err)
+		assert.Empty(t, res.Retried)
+		assert.Equal(t, errs, strings.Count(s.logs.String(), errorLine), "the upload logged an error")
+		assert.Equal(t, loaded, s.status().LoadedAt, "the text in force was applied again")
+		assert.FileExists(t, filepath.Join(dir, "logo.png"))
+		st, _ := s.Status("cam")
+		assert.Equal(t, "stopped", st.State)
+	})
+
 	t.Run("no stream left stopped names it: no apply", func(t *testing.T) {
 		dir := t.TempDir()
 		s := testConfig(t, func(su *setup) {
@@ -279,6 +301,28 @@ func TestDeleteAssetInUse(t *testing.T) {
 	assert.Contains(t, r.body, "logo.png")
 }
 
+// probeLog is the API's log line of a font probe that did not run.
+const probeLog = `"msg":"api: the font probe did not run"`
+
+// apiProbeFails uploads font over the API and checks an ErrProbe row: a
+// 503, logged once with the binary bin and the status, and nothing stored
+// in dir.
+func apiProbeFails(t *testing.T, s *testServer, dir, bin string, font []byte, row, status string) {
+	t.Helper()
+	before := strings.Count(s.logs.String(), probeLog)
+	r := s.do(http.MethodPut, "/api/v1/assets/brand.ttf", "ops", string(font), "Content-Type", "application/octet-stream")
+	assert.Equal(t, http.StatusServiceUnavailable, r.code, row+": "+r.body)
+	assert.Contains(t, r.body, "probe_failed", row)
+	logs := s.logs.String()
+	assert.Equal(t, before+1, strings.Count(logs, probeLog), row)
+	if i := strings.LastIndex(logs, probeLog); i >= 0 {
+		last, _, _ := strings.Cut(logs[i:], "\n")
+		assert.Contains(t, last, bin, row)
+		assert.Contains(t, last, status, row)
+	}
+	assert.Empty(t, dirNames(t, dir), row)
+}
+
 // The font probe's verdicts: only exit 3 and a crash refuse a font;
 // anything else says nothing about it.
 func TestFontProbe(t *testing.T) {
@@ -302,22 +346,9 @@ func TestFontProbe(t *testing.T) {
 		t.Helper()
 		assert.Empty(t, dirNames(t, dir), row)
 	}
-	const probeLog = `"msg":"api: the font probe did not run"`
-	// apiFails checks an ErrProbe row over the API: a 503, logged once with
-	// the binary and the status, and nothing stored.
 	apiFails := func(row, status string) {
 		t.Helper()
-		before := strings.Count(s.logs.String(), probeLog)
-		r := s.do(http.MethodPut, "/api/v1/assets/brand.ttf", "ops", string(font), "Content-Type", "application/octet-stream")
-		assert.Equal(t, http.StatusServiceUnavailable, r.code, row+": "+r.body)
-		assert.Contains(t, r.body, "probe_failed", row)
-		logs := s.logs.String()
-		assert.Equal(t, before+1, strings.Count(logs, probeLog), row)
-		last := logs[strings.LastIndex(logs, probeLog):]
-		last = last[:strings.IndexByte(last, '\n')]
-		assert.Contains(t, last, exe, row)
-		assert.Contains(t, last, status, row)
-		empty(row)
+		apiProbeFails(t, s, dir, exe, font, row, status)
 	}
 	// probeFails checks an ErrProbe row: the error and nothing stored, then
 	// the same over the API.
@@ -364,11 +395,18 @@ func TestFontProbe(t *testing.T) {
 		_, err := s.put("brand.ttf", font)
 		require.ErrorIs(t, err, asset.ErrContent)
 		reason := asset.Reason(err)
-		assert.LessOrEqual(t, len(reason), probeReasonMax)
-		assert.Greater(t, len(reason), probeReasonMax-4)
+		// 85 three-byte runes are 255 bytes: the cut at 256 falls inside
+		// the 86th, which is dropped whole.
+		assert.Equal(t, strings.Repeat("€", 85), reason)
 		assert.True(t, utf8.ValidString(reason))
-		assert.True(t, strings.HasPrefix(reason, "éé"), reason)
 		empty("long")
+	})
+	t.Run("exit 3 with control bytes and invalid UTF-8 in the reason", func(t *testing.T) {
+		setMode("dirty")
+		_, err := s.put("brand.ttf", font)
+		require.ErrorIs(t, err, asset.ErrContent)
+		assert.Equal(t, "bad tables", asset.Reason(err))
+		empty("dirty")
 	})
 	t.Run("killed by SIGSEGV refuses it", func(t *testing.T) {
 		if !canSegv {
@@ -408,6 +446,59 @@ func TestFontProbe(t *testing.T) {
 		empty("sleep")
 		apiFails("sleep", "no verdict within")
 	})
+	// A client that goes away during the probe is not a probe that did not
+	// run: its error is its ctx's, and the API does not log it.
+	t.Run("the client goes away during the probe", func(t *testing.T) {
+		pidFile := filepath.Join(t.TempDir(), "pid")
+		setMode("sleep:" + pidFile)
+		ctx, cancel := context.WithCancel(bg)
+		defer cancel()
+		go func() {
+			for {
+				if _, err := os.Stat(pidFile); err == nil || ctx.Err() != nil {
+					cancel()
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+		start := time.Now()
+		_, _, err := s.PutAsset(ctx, "brand.ttf", bytes.NewReader(font), "", false)
+		require.ErrorIs(t, err, context.Canceled)
+		assert.NotErrorIs(t, err, asset.ErrProbe)
+		assert.Less(t, time.Since(start), fontProbeLimit, "the probe ran to its limit")
+		empty("hang-up")
+
+		// Over the API: the request ends, and no probe failure is logged.
+		require.NoError(t, os.Remove(pidFile))
+		const reqLog = `"msg":"api: request"`
+		probes, requests := strings.Count(s.logs.String(), probeLog), strings.Count(s.logs.String(), reqLog)
+		hctx, hcancel := context.WithCancel(bg)
+		defer hcancel()
+		done := make(chan error, 1)
+		go func() {
+			req, err := http.NewRequestWithContext(hctx, http.MethodPut, "http://"+s.Addrs().API+"/api/v1/assets/brand.ttf", bytes.NewReader(font))
+			if err != nil {
+				done <- err
+				return
+			}
+			req.SetBasicAuth("ops", editorPW)
+			req.Header.Set("X-Requested-By", "test")
+			req.Header.Set("Content-Type", "application/octet-stream")
+			res, err := client.Do(req)
+			if err == nil {
+				_ = res.Body.Close()
+			}
+			done <- err
+		}()
+		require.Eventually(t, func() bool { _, err := os.Stat(pidFile); return err == nil }, waitFor, 5*time.Millisecond)
+		hcancel()
+		require.Error(t, <-done)
+		require.Eventually(t, func() bool { return strings.Count(s.logs.String(), reqLog) > requests },
+			waitFor, 5*time.Millisecond, "the request did not end")
+		assert.Equal(t, probes, strings.Count(s.logs.String(), probeLog), "a hang-up logged as a probe failure")
+		empty("hang-up over the API")
+	})
 
 	t.Run("a binary that does not exist", func(t *testing.T) {
 		bin := filepath.Join(t.TempDir(), "ostranscoder")
@@ -419,6 +510,7 @@ func TestFontProbe(t *testing.T) {
 		require.ErrorIs(t, err, asset.ErrProbe)
 		assert.Contains(t, err.Error(), bin)
 		assert.Empty(t, dirNames(t, dir))
+		apiProbeFails(t, s, dir, bin, font, "no binary", "no such file")
 	})
 	t.Run("without a transcoder: no probe", func(t *testing.T) {
 		dir := t.TempDir()

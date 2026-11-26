@@ -205,6 +205,8 @@ with two lists:
 - `retried`: the streams that were left stopped because the asset was missing
   are tried again, and start with the upload (`started`; `unchanged` when
   something else still stands in their way).
+  Nothing is tried again while the config holds an entry that was skipped at
+  start: fix or remove that entry, and the edit tries them.
 
 A `DELETE` of an asset that a stream names, running or disabled, is 409
 `asset_in_use` with the stream names: take it out of their watermarks first.
