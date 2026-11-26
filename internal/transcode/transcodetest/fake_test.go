@@ -133,9 +133,9 @@ func video(cfg *media.TrackConfig, pts int64, epoch uint32, key bool) wire.Frame
 	return wire.Frame{Rung: -1, F: media.Frame{Config: cfg, PTS: pts, DTS: pts, Epoch: epoch, Key: key, Data: [][]byte{{0x65}}}}
 }
 
-func TestFakeHelloIsVersion2(t *testing.T) {
+func TestFakeHelloIsVersion3(t *testing.T) {
 	f, h := startFakeHello(t)
-	assert.Equal(t, uint32(2), h.Version)
+	assert.Equal(t, uint32(3), h.Version)
 	f.stop(t)
 }
 

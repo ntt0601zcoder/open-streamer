@@ -77,7 +77,12 @@ func TestReadHello(t *testing.T) {
 
 	_, err = readHello(helloBytes(t, wire.Hello{Version: 1, PID: 42}))
 	require.ErrorIs(t, err, errVersion)
-	assert.Contains(t, err.Error(), "1, want 2")
+	assert.Contains(t, err.Error(), "1, want 3")
+
+	// A version 2 child (before fonts and no_fallback) is refused the same way.
+	_, err = readHello(helloBytes(t, wire.Hello{Version: 2, PID: 42}))
+	require.ErrorIs(t, err, errVersion)
+	assert.Contains(t, err.Error(), "2, want 3")
 
 	_, err = readHello(helloBytes(t, wire.Stats{In: 1}))
 	require.Error(t, err)

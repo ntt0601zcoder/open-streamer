@@ -456,7 +456,7 @@ func TestThumbnailerVersionMismatch(t *testing.T) {
 			select {
 			case err := <-errc:
 				require.ErrorIs(t, err, errVersion)
-				assert.ErrorContains(t, err, "1, want 2")
+				assert.ErrorContains(t, err, "1, want 3")
 			case <-time.After(10 * time.Second):
 				t.Fatal("Run did not fail")
 			}

@@ -16,7 +16,7 @@ import (
 )
 
 // Version is the protocol version a Hello announces.
-const Version = 2
+const Version = 3
 
 // MaxMessage is the largest envelope, in bytes after the 4-byte length.
 const MaxMessage = 32 << 20
@@ -33,8 +33,9 @@ var (
 	// ErrLimit means the Writer refused a message that the Reader would
 	// reject for one of its limits: too many NAL units, parameter sets,
 	// rungs or stats entries, an integer outside the field's range, a
-	// watermark text, watermark image, shot JPEG or encoder name over its
-	// size limit, or more than MaxMessage bytes (then also ErrTooLarge).
+	// watermark text, watermark image, watermark font, shot JPEG or encoder
+	// name over its size limit, or more than MaxMessage bytes (then also
+	// ErrTooLarge).
 	// Nothing was written; the stream is still usable.
 	ErrLimit = errors.New("wire: message exceeds a protocol limit")
 	// ErrConfigTable means the Writer has sent as many distinct configs as
@@ -93,9 +94,12 @@ type Configure struct {
 
 // Rung is one video rendition to encode. BFrames -1 means none, 0 means the
 // encoder default. Encoder is "", "x264" or "nvenc"; "" means x264.
+// NoFallback makes an NVENC rung that cannot be opened fail the build
+// instead of encoding with libx264 (R-E9).
 type Rung struct {
 	Height, BitrateKbps, MaxBitrateKbps, BFrames int
 	Preset, Encoder                              string
+	NoFallback                                   bool
 }
 
 // AudioEncode asks for AAC re-encoding.
@@ -141,11 +145,21 @@ type Stats struct {
 	EncoderFallbacks, Thumbnails, ThumbnailsFailed uint64
 }
 
+// ErrorCode says what kind of failure an Error reports.
+type ErrorCode uint32
+
+// Error codes. A Reader reads a code it does not know as ErrorOther.
+const (
+	ErrorOther          ErrorCode = iota
+	ErrorEncoderRefused           // a no_fallback rung could not open its encoder (R-E9)
+)
+
 // Error reports a child failure.
 type Error struct {
 	Rung    int
 	Message string
 	Fatal   bool
+	Code    ErrorCode
 }
 
 // Stop asks the child to flush and exit, host to child.
@@ -196,10 +210,7 @@ func (w *Writer) Write(m Message) error {
 			body = appendEnvelope(body, fHello, appendHello(nil, v))
 		}
 	case Configure:
-		var b []byte
-		if b, err = appendConfigure(nil, v); err == nil {
-			body = appendEnvelope(body, fConfigure, b)
-		}
+		body, err = appendConfigure(body, v)
 	case Frame:
 		var b []byte
 		b, newCfg, newID, err = w.appendFrame(nil, v)
@@ -221,16 +232,7 @@ func (w *Writer) Write(m Message) error {
 	case Stop:
 		body = appendEnvelope(body, fStop, nil)
 	case SetWatermark:
-		var b []byte
-		if v.W != nil {
-			var wm []byte
-			if wm, err = appendWatermark(nil, *v.W); err == nil {
-				b = appendBytes(nil, 1, wm)
-			}
-		}
-		if err == nil {
-			body = appendEnvelope(body, fSetWatermark, b)
-		}
+		body, err = appendSetWatermark(body, v)
 	case Shot:
 		var b []byte
 		if b, err = appendShot(nil, v.S); err == nil {
@@ -286,6 +288,32 @@ func appendBytes(dst []byte, field protowire.Number, v []byte) []byte {
 	return protowire.AppendBytes(dst, v)
 }
 
+// appendBytesHead writes the tag and length of a bytes field of n bytes,
+// whose value the caller appends next.
+func appendBytesHead(dst []byte, field protowire.Number, n int) []byte {
+	dst = protowire.AppendTag(dst, field, protowire.BytesType)
+	return protowire.AppendVarint(dst, uint64(n))
+}
+
+// bytesLen is the encoded length of a bytes field of n bytes.
+func bytesLen(field protowire.Number, n int) int {
+	return protowire.SizeTag(field) + protowire.SizeBytes(n)
+}
+
+// appendEnvelopeHead writes the tag and length of an envelope whose body is
+// n bytes, and grows dst so that the body fits without another copy.
+func appendEnvelopeHead(dst []byte, field protowire.Number, n int) []byte {
+	dst = appendBytesHead(dst, field, n)
+	if cap(dst)-len(dst) >= n {
+		return dst
+	}
+	// Not slices.Grow: its append of make([]byte, n) allocates a second n
+	// bytes when the race detector is on.
+	grown := make([]byte, len(dst), len(dst)+n)
+	copy(grown, dst)
+	return grown
+}
+
 // Hello: 1 version (varint), 2 pid (sint64).
 func appendHello(dst []byte, h Hello) []byte {
 	dst = appendUint(dst, 1, uint64(h.Version))
@@ -321,11 +349,46 @@ func int32s(name string, vs ...int) error {
 // 3 watermark (bytes, absent = none), 4 thumbnail (bytes, absent = none).
 // Rung: 1 height, 2 bitrate_kbps, 3 max_bitrate_kbps (varint),
 // 4 bframes (sint64), 5 preset (string), 6 encoder (string, absent when
-// empty).
+// empty), 7 no_fallback (bool, absent when false).
 // AudioEncode: 1 bitrate_kbps, 2 sample_rate, 3 channels (varint).
 // Absent means absent: a Configure without an encoder, watermark or
 // thumbnail has the bytes of wire version 1.
+//
+// appendConfigure appends the whole envelope to dst. The small fields are
+// encoded first, so that the lengths are known and a watermark's image and
+// font are copied once, straight into dst.
 func appendConfigure(dst []byte, c Configure) ([]byte, error) {
+	head, err := appendConfigureHead(nil, c)
+	if err != nil {
+		return nil, err
+	}
+	var wm watermarkEnc
+	n := len(head)
+	if c.Watermark != nil {
+		if wm, err = newWatermarkEnc(c.Watermark); err != nil {
+			return nil, err
+		}
+		n += bytesLen(3, wm.len())
+	}
+	var tail []byte
+	if t := c.Thumbnail; t != nil {
+		if err := int32s("thumbnail", t.IntervalSec, t.Height, t.Quality); err != nil {
+			return nil, err
+		}
+		tail = appendBytes(nil, 4, appendThumbnail(nil, *t))
+		n += len(tail)
+	}
+	dst = appendEnvelopeHead(dst, fConfigure, n)
+	dst = append(dst, head...)
+	if c.Watermark != nil {
+		dst = appendBytesHead(dst, 3, wm.len())
+		dst = wm.append(dst)
+	}
+	return append(dst, tail...), nil
+}
+
+// appendConfigureHead appends the rungs and the audio of c.
+func appendConfigureHead(dst []byte, c Configure) ([]byte, error) {
 	if len(c.Rungs) > MaxRungs {
 		return nil, limit("%d rungs, at most %d", len(c.Rungs), MaxRungs)
 	}
@@ -346,6 +409,7 @@ func appendConfigure(dst []byte, c Configure) ([]byte, error) {
 		b = appendSint(b, 4, int64(r.BFrames))
 		b = appendBytes(b, 5, []byte(r.Preset))
 		b = appendString(b, 6, r.Encoder)
+		b = appendBool(b, 7, r.NoFallback)
 		dst = appendBytes(dst, 1, b)
 	}
 	if a := c.Audio; a != nil {
@@ -358,20 +422,24 @@ func appendConfigure(dst []byte, c Configure) ([]byte, error) {
 		b = appendUint(b, 3, uint64(a.Channels))
 		dst = appendBytes(dst, 2, b)
 	}
-	if c.Watermark != nil {
-		b, err := appendWatermark(nil, *c.Watermark)
-		if err != nil {
-			return nil, err
-		}
-		dst = appendBytes(dst, 3, b)
-	}
-	if t := c.Thumbnail; t != nil {
-		if err := int32s("thumbnail", t.IntervalSec, t.Height, t.Quality); err != nil {
-			return nil, err
-		}
-		dst = appendBytes(dst, 4, appendThumbnail(nil, *t))
-	}
 	return dst, nil
+}
+
+// SetWatermark: 1 watermark (bytes, absent = remove).
+//
+// appendSetWatermark appends the whole envelope to dst, copying a
+// watermark's image and font once, as appendConfigure does.
+func appendSetWatermark(dst []byte, s SetWatermark) ([]byte, error) {
+	if s.W == nil {
+		return appendEnvelope(dst, fSetWatermark, nil), nil
+	}
+	wm, err := newWatermarkEnc(s.W)
+	if err != nil {
+		return nil, err
+	}
+	dst = appendEnvelopeHead(dst, fSetWatermark, bytesLen(1, wm.len()))
+	dst = appendBytesHead(dst, 1, wm.len())
+	return wm.append(dst), nil
 }
 
 // appendString writes a bytes field only when s is not empty.
@@ -391,29 +459,65 @@ func appendNonZero(dst []byte, field protowire.Number, v int) []byte {
 }
 
 // Watermark: 1 text (string), 2 image (bytes), 3 position (varint, at most
-// 255), 4 opacity_pct, 5 size_pct (sint64), 6 time_zone (string). Each field
-// is written only when it is not empty or zero. Integers are signed so that
-// an out-of-range value reaches Validate rather than the wire's limits.
-func appendWatermark(dst []byte, w picture.Watermark) ([]byte, error) {
+// 255), 4 opacity_pct, 5 size_pct (sint64), 6 time_zone (string), 7 font
+// (bytes). Each field is written only when it is not empty or zero.
+// Integers are signed so that an out-of-range value reaches Validate rather
+// than the wire's limits.
+//
+// watermarkEnc is a watermark with its small fields encoded: pre (field 1)
+// goes before the image and mid (fields 3 to 6) between the image and the
+// font, so that the length is known before the large fields are copied.
+type watermarkEnc struct {
+	w        *picture.Watermark
+	pre, mid []byte
+}
+
+func newWatermarkEnc(w *picture.Watermark) (watermarkEnc, error) {
 	if len(w.Text) > picture.MaxTextBytes {
-		return nil, limit("watermark text of %d bytes, at most %d", len(w.Text), picture.MaxTextBytes)
+		return watermarkEnc{}, limit("watermark text of %d bytes, at most %d", len(w.Text), picture.MaxTextBytes)
 	}
 	if len(w.Image) > picture.MaxImageBytes {
-		return nil, limit("watermark image of %d bytes, at most %d", len(w.Image), picture.MaxImageBytes)
+		return watermarkEnc{}, limit("watermark image of %d bytes, at most %d", len(w.Image), picture.MaxImageBytes)
+	}
+	if len(w.Font) > picture.MaxFontBytes {
+		return watermarkEnc{}, limit("watermark font of %d bytes, at most %d", len(w.Font), picture.MaxFontBytes)
 	}
 	if err := int32s("watermark", w.OpacityPct, w.SizePct); err != nil {
-		return nil, err
+		return watermarkEnc{}, err
 	}
-	dst = appendString(dst, 1, w.Text)
-	if len(w.Image) > 0 {
-		dst = appendBytes(dst, 2, w.Image)
-	}
+	e := watermarkEnc{w: w, pre: appendString(nil, 1, w.Text)}
 	if w.Position != 0 {
-		dst = appendUint(dst, 3, uint64(w.Position))
+		e.mid = appendUint(e.mid, 3, uint64(w.Position))
 	}
-	dst = appendNonZero(dst, 4, w.OpacityPct)
-	dst = appendNonZero(dst, 5, w.SizePct)
-	return appendString(dst, 6, w.TimeZone), nil
+	e.mid = appendNonZero(e.mid, 4, w.OpacityPct)
+	e.mid = appendNonZero(e.mid, 5, w.SizePct)
+	e.mid = appendString(e.mid, 6, w.TimeZone)
+	return e, nil
+}
+
+// len is the encoded length of the watermark.
+func (e watermarkEnc) len() int {
+	n := len(e.pre) + len(e.mid)
+	if len(e.w.Image) > 0 {
+		n += bytesLen(2, len(e.w.Image))
+	}
+	if len(e.w.Font) > 0 {
+		n += bytesLen(7, len(e.w.Font))
+	}
+	return n
+}
+
+// append appends the watermark's fields, e.len() bytes, to dst.
+func (e watermarkEnc) append(dst []byte) []byte {
+	dst = append(dst, e.pre...)
+	if len(e.w.Image) > 0 {
+		dst = appendBytes(dst, 2, e.w.Image)
+	}
+	dst = append(dst, e.mid...)
+	if len(e.w.Font) > 0 {
+		dst = appendBytes(dst, 7, e.w.Font)
+	}
+	return dst
 }
 
 // Thumbnail: 1 interval_sec, 2 height, 3 quality (sint64), each written only
@@ -531,16 +635,22 @@ func appendStats(dst []byte, s Stats) []byte {
 	return dst
 }
 
-// Error: 1 rung (sint64), 2 message (string), 3 fatal (bool).
+// Error: 1 rung (sint64), 2 message (string), 3 fatal (bool), 4 code
+// (varint, absent when zero; a code the Reader does not know reads as
+// ErrorOther).
 func appendError(dst []byte, e Error) []byte {
 	dst = appendSint(dst, 1, int64(e.Rung))
 	dst = appendBytes(dst, 2, []byte(e.Message))
-	return appendBool(dst, 3, e.Fatal)
+	dst = appendBool(dst, 3, e.Fatal)
+	if e.Code != ErrorOther {
+		dst = appendUint(dst, 4, uint64(e.Code))
+	}
+	return dst
 }
 
 // Reader decodes messages. It is not safe for concurrent use. A Frame's
-// Data, a watermark's Image and a Shot's JPEG share one buffer per message
-// that the Reader never reuses, so the caller may keep them.
+// Data, a watermark's Image and Font and a Shot's JPEG alias one buffer per
+// message that the Reader never reuses, so the caller may keep them.
 type Reader struct {
 	r       io.Reader
 	configs map[uint32]*media.TrackConfig
@@ -808,6 +918,10 @@ func decodeWatermark(b []byte) (picture.Watermark, error) {
 			var p []byte
 			p, err = f.bytes()
 			w.TimeZone = string(p)
+		case 7:
+			if w.Font, err = f.bytes(); err == nil && len(w.Font) > picture.MaxFontBytes {
+				err = bad("watermark font of %d bytes", len(w.Font))
+			}
 		}
 		return err
 	})
@@ -831,7 +945,6 @@ func decodeThumbnail(b []byte) (picture.Thumbnail, error) {
 	return t, err
 }
 
-// SetWatermark: 1 watermark (bytes, absent = remove).
 func decodeSetWatermark(b []byte) (Message, error) {
 	var s SetWatermark
 	err := fields(b, func(f field) error {
@@ -899,6 +1012,8 @@ func decodeRung(b []byte) (Rung, error) {
 				err = bad("rung encoder name of %d bytes", len(p))
 			}
 			r.Encoder = string(p)
+		case 7:
+			r.NoFallback, err = f.boolean()
 		}
 		return err
 	})
@@ -1104,6 +1219,11 @@ func decodeError(b []byte) (Message, error) {
 			e.Message = string(p)
 		case 3:
 			e.Fatal, err = f.boolean()
+		case 4:
+			var v uint64
+			if v, err = f.uint(); err == nil && v == uint64(ErrorEncoderRefused) {
+				e.Code = ErrorEncoderRefused
+			}
 		}
 		return err
 	})

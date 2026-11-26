@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"io"
 	"math"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -468,9 +469,9 @@ func TestWriterConfigTableFull(t *testing.T) {
 	assert.Equal(t, maxConfigs, NewWriter(io.Discard).configCap)
 }
 
-func TestVersionIsTwo(t *testing.T) {
+func TestVersionIsThree(t *testing.T) {
 	got := roundTrip(t, Hello{Version: Version})
-	assert.Equal(t, Hello{Version: 2}, got[0])
+	assert.Equal(t, Hello{Version: 3}, got[0])
 }
 
 func TestConfigureV2RoundTrip(t *testing.T) {
@@ -612,4 +613,189 @@ func TestV2Limits(t *testing.T) {
 	for i := range at {
 		assert.Equal(t, at[i], got[i], "message %d", i)
 	}
+}
+
+func fixtureFont(t testing.TB) []byte {
+	t.Helper()
+	b, err := os.ReadFile("../../../testdata/fixtures/fonts/DejaVuSansMono.ttf")
+	require.NoError(t, err)
+	return b
+}
+
+// A font of any size: the wire checks only the size, not the content.
+func fakeFont(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i * 7)
+	}
+	return b
+}
+
+func TestWatermarkFontRoundTrip(t *testing.T) {
+	font := fakeFont(300_000)
+	conf := Configure{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Text: "LIVE %H", Position: picture.TopRight, Font: font, TimeZone: "UTC"},
+		Thumbnail: &picture.Thumbnail{IntervalSec: 5},
+	}
+	set := SetWatermark{W: &picture.Watermark{Text: "x", Font: fixtureFont(t)}}
+	got := roundTrip(t, conf, set)
+	assert.Equal(t, conf, got[0])
+	assert.Equal(t, set, got[1])
+	assert.True(t, bytes.Equal(font, got[0].(Configure).Watermark.Font), "byte for byte")
+
+	// Over the limit: the writer refuses, and the reader rejects the same
+	// bytes encoded by hand.
+	big := make([]byte, picture.MaxFontBytes+1)
+	for name, m := range map[string]Message{
+		"configure": Configure{Watermark: &picture.Watermark{Text: "x", Font: big}},
+		"set":       SetWatermark{W: &picture.Watermark{Text: "x", Font: big}},
+	} {
+		var buf bytes.Buffer
+		err := NewWriter(&buf).Write(m)
+		require.ErrorIs(t, err, ErrLimit, name)
+		assert.NotErrorIs(t, err, ErrTooLarge, name)
+		assert.Zero(t, buf.Len(), name)
+	}
+	wm := appendBytes(appendString(nil, 1, "x"), 7, big)
+	for name, b := range map[string][]byte{
+		"configure": appendEnvelope(nil, fConfigure, appendBytes(nil, 3, wm)),
+		"set":       appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, wm)),
+	} {
+		_, err := NewReader(bytes.NewReader(record(b))).Read()
+		require.ErrorIs(t, err, ErrMalformed, name)
+	}
+
+	// At the limit, with every other field, it fits a message.
+	at := Configure{
+		Rungs:     make([]Rung, MaxRungs),
+		Audio:     &AudioEncode{BitrateKbps: 128, SampleRate: 48000, Channels: 2},
+		Watermark: &picture.Watermark{Text: strings.Repeat("a", picture.MaxTextBytes), Font: make([]byte, picture.MaxFontBytes)},
+		Thumbnail: &picture.Thumbnail{IntervalSec: 5, Height: 240, Quality: 70},
+	}
+	got = roundTrip(t, at)
+	assert.Equal(t, at, got[0])
+
+	// Without a font, a watermark has its version 2 bytes.
+	for _, tc := range []struct {
+		m    Message
+		want string
+	}{
+		{Configure{
+			Rungs:     []Rung{{Height: 240, BitrateKbps: 600, Encoder: "nvenc"}},
+			Watermark: &picture.Watermark{Text: "LIVE %H", Position: picture.BottomRight, OpacityPct: 60, SizePct: 7, TimeZone: "UTC"},
+			Thumbnail: &picture.Thumbnail{IntervalSec: 5},
+		}, "00000031122f0a1308f00110d804180020002a0032056e76656e631a140a074c49564520254818032078280e32035554432202080a"},
+		{
+			SetWatermark{W: &picture.Watermark{Image: []byte{0x89, 'P', 'N', 'G'}, Position: picture.Center, SizePct: 100}},
+			"0000000f420d0a0b120489504e47180428c801",
+		},
+		{SetWatermark{W: &picture.Watermark{Text: "x", Font: []byte{}}}, "0000000742050a030a0178"},
+	} {
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).Write(tc.m))
+		assert.Equal(t, tc.want, hex.EncodeToString(buf.Bytes()), "%T", tc.m)
+	}
+}
+
+// nestedWatermark encodes w the way version 2 did, one nested buffer per
+// message, with the font as field 7.
+func nestedWatermark(w picture.Watermark) []byte {
+	b := appendString(nil, 1, w.Text)
+	if len(w.Image) > 0 {
+		b = appendBytes(b, 2, w.Image)
+	}
+	if w.Position != 0 {
+		b = appendUint(b, 3, uint64(w.Position))
+	}
+	b = appendNonZero(b, 4, w.OpacityPct)
+	b = appendNonZero(b, 5, w.SizePct)
+	b = appendString(b, 6, w.TimeZone)
+	if len(w.Font) > 0 {
+		b = appendBytes(b, 7, w.Font)
+	}
+	return b
+}
+
+// The writer appends a font once, straight into the envelope: writing a
+// Configure with a 4 MiB font allocates less than 6 MiB in all, and the
+// bytes are those of the nested encoding.
+func TestWatermarkFontOneCopy(t *testing.T) {
+	font := fakeFont(4 << 20)
+	wm := &picture.Watermark{Text: "LIVE %H:%M", Position: picture.BottomLeft, OpacityPct: 80, SizePct: 6, TimeZone: "UTC", Font: font}
+	c := Configure{
+		Rungs:     []Rung{{Height: 720, BitrateKbps: 2500, Preset: "fast"}, {Height: 360, BitrateKbps: 600}},
+		Audio:     &AudioEncode{BitrateKbps: 128, SampleRate: 48000, Channels: 2},
+		Watermark: wm,
+		Thumbnail: &picture.Thumbnail{IntervalSec: 5},
+	}
+
+	var buf bytes.Buffer
+	require.NoError(t, NewWriter(&buf).Write(c))
+	// The rungs and the audio as a Configure without the rest writes them.
+	var plain bytes.Buffer
+	require.NoError(t, NewWriter(&plain).Write(Configure{Rungs: c.Rungs, Audio: c.Audio}))
+	head, n := protowire.ConsumeBytes(plain.Bytes()[5:])
+	require.Positive(t, n)
+	body := append(bytes.Clone(head), appendBytes(nil, 3, nestedWatermark(*wm))...)
+	body = appendBytes(body, 4, appendThumbnail(nil, *c.Thumbnail))
+	assert.True(t, bytes.Equal(record(appendEnvelope(nil, fConfigure, body)), buf.Bytes()), "configure bytes")
+
+	buf.Reset()
+	require.NoError(t, NewWriter(&buf).Write(SetWatermark{W: wm}))
+	want := record(appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, nestedWatermark(*wm))))
+	assert.True(t, bytes.Equal(want, buf.Bytes()), "set watermark bytes")
+
+	for name, m := range map[string]Message{"configure": c, "set watermark": SetWatermark{W: wm}} {
+		w := NewWriter(io.Discard)
+		require.NoError(t, w.Write(m)) // warm up: the writer's small buffer
+		alloc := uint64(math.MaxUint64)
+		for range 3 {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			require.NoError(t, w.Write(m))
+			runtime.ReadMemStats(&after)
+			alloc = min(alloc, after.TotalAlloc-before.TotalAlloc)
+		}
+		assert.Less(t, alloc, uint64(6<<20), "%s: bytes allocated", name)
+		assert.Greater(t, alloc, uint64(4<<20), "%s: the envelope holds the font", name)
+	}
+}
+
+func TestRungNoFallbackRoundTrip(t *testing.T) {
+	c := Configure{Rungs: []Rung{{Height: 720, BitrateKbps: 2500, Encoder: "nvenc", NoFallback: true}, {Height: 360}}}
+	got := roundTrip(t, c)
+	assert.Equal(t, c, got[0])
+
+	// The flag is rung field 7, written only when true.
+	enc := func(r Rung) string {
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).Write(Configure{Rungs: []Rung{r}}))
+		return hex.EncodeToString(buf.Bytes())
+	}
+	assert.Equal(t, "0000000f120d0a0b08f0011000180020002a00", enc(Rung{Height: 240}))
+	assert.Equal(t, "00000011120f0a0d08f0011000180020002a003801", enc(Rung{Height: 240, NoFallback: true}))
+}
+
+func TestErrorCodeRoundTrip(t *testing.T) {
+	e := Error{Rung: 1, Message: "nvenc refused", Fatal: true, Code: ErrorEncoderRefused}
+	got := roundTrip(t, e, Error{Rung: 2})
+	assert.Equal(t, e, got[0])
+	assert.Equal(t, Error{Rung: 2}, got[1])
+
+	// An unknown code reads as ErrorOther.
+	body := appendSint(nil, 1, 1)
+	body = appendUint(body, 4, 99)
+	m, err := NewReader(bytes.NewReader(record(appendEnvelope(nil, fError, body)))).Read()
+	require.NoError(t, err)
+	assert.Equal(t, Error{Rung: 1, Code: ErrorOther}, m)
+
+	// Code 0 writes no field: version 2's bytes. The code is field 4.
+	var buf bytes.Buffer
+	require.NoError(t, NewWriter(&buf).Write(Error{Rung: 1, Message: "x", Fatal: true}))
+	assert.Equal(t, "00000009320708021201781801", hex.EncodeToString(buf.Bytes()))
+	buf.Reset()
+	require.NoError(t, NewWriter(&buf).Write(Error{Rung: 1, Message: "x", Fatal: true, Code: ErrorEncoderRefused}))
+	assert.Equal(t, "0000000b3209080212017818012001", hex.EncodeToString(buf.Bytes()))
 }

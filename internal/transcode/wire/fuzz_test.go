@@ -25,6 +25,8 @@ func FuzzRead(f *testing.F) {
 		Stop{},
 		SetWatermark{W: &picture.Watermark{Text: "%H:%M", Position: picture.BottomLeft, OpacityPct: 50, TimeZone: "UTC"}},
 		Shot{S: picture.Shot{PTS: -1, Epoch: 7, Width: 240, Height: 180, JPEG: []byte{0xff, 0xd8, 0xff}}},
+		Configure{Rungs: []Rung{{Height: 720, Encoder: "nvenc", NoFallback: true}}, Watermark: &picture.Watermark{Text: "x", Font: []byte("OTTO")}},
+		Error{Rung: 0, Message: "refused", Fatal: true, Code: ErrorEncoderRefused},
 	} {
 		if err := w.Write(m); err != nil {
 			f.Fatal(err)
