@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -22,6 +23,19 @@ import (
 const (
 	Version  = 1
 	MaxBytes = 4 << 20
+)
+
+// The bounds of what a parse reports, so that neither its work nor its
+// error text (which is logged, kept as the last reload error and sent to
+// the client) grows with a hostile document.
+const (
+	// MaxErrors is how many errors Parse and ParseLenient report, each
+	// list followed by one "and N more" when there were more.
+	MaxErrors = 100
+	// maxEntryErrors is how many reasons one stream entry's error joins.
+	maxEntryErrors = 10
+	// maxMessage is the longest message taken from the YAML library.
+	maxMessage = 300
 )
 
 // Document is the whole config file.
@@ -64,9 +78,50 @@ type SyntaxError struct{ Err error }
 func (e *SyntaxError) Error() string {
 	var te *yaml.TypeError
 	if errors.As(e.Err, &te) {
-		return "config: yaml: unmarshal errors: " + strings.Join(cutEach(te.Errors), "; ")
+		return "config: yaml: unmarshal errors: " + strings.Join(capped(cutEach(te.Errors), MaxErrors), "; ")
 	}
-	return "config: " + cutValue(e.Err.Error())
+	return "config: " + public(e.Err.Error())
+}
+
+// capped returns the first limit of msgs, followed by "and N more" when
+// there are more.
+func capped(msgs []string, limit int) []string {
+	if len(msgs) <= limit {
+		return msgs
+	}
+	return append(slices.Clone(msgs[:limit]), fmt.Sprintf("and %d more", len(msgs)-limit))
+}
+
+// cappedErrors is capped for errors, with limit MaxErrors.
+func cappedErrors(errs []error) []error {
+	if len(errs) <= MaxErrors {
+		return errs
+	}
+	return append(slices.Clone(errs[:MaxErrors]), fmt.Errorf("and %d more", len(errs)-MaxErrors))
+}
+
+// fieldRE finds the key the YAML library names in an unknown-key message.
+var fieldRE = regexp.MustCompile(`field (.*) not found in type `)
+
+// public makes a message of the YAML library fit for a client: the values
+// it quotes are hidden (cutValue), an unknown key is cut to 64 bytes, the
+// names of this package's private types are replaced, and the whole is cut
+// to maxMessage bytes.
+func public(msg string) string {
+	msg = cutValue(msg)
+	msg = fieldRE.ReplaceAllStringFunc(msg, func(m string) string {
+		key := fieldRE.FindStringSubmatch(m)[1]
+		if len(key) <= 64 {
+			return m
+		}
+		return "field " + strings.ToValidUTF8(key[:64], "") + "… not found in type "
+	})
+	msg = strings.ReplaceAll(msg, "in type config.rawDocument", "at the top level of the config")
+	msg = strings.ReplaceAll(msg, "into config.rawDocument", "into the config document")
+	if len(msg) > maxMessage {
+		msg = strings.ToValidUTF8(msg[:maxMessage], "") + "…"
+	}
+	return msg
 }
 
 // Errors is every validation error of a document.
@@ -121,7 +176,7 @@ func Parse(text []byte, opt Options) (Parsed, error) {
 	}
 	all = append(all, skipped...)
 	if len(all) > 0 {
-		return Parsed{}, all
+		return Parsed{}, Errors(cappedErrors(all))
 	}
 	return p, nil
 }
@@ -133,9 +188,13 @@ func Parse(text []byte, opt Options) (Parsed, error) {
 func ParseLenient(text []byte, opt Options) (p Parsed, skipped []error, err error) {
 	p, skipped, err = parse(text, opt)
 	if err != nil {
+		var es Errors
+		if errors.As(err, &es) {
+			err = Errors(cappedErrors(es))
+		}
 		return Parsed{}, nil, err
 	}
-	return p, skipped, nil
+	return p, cappedErrors(skipped), nil
 }
 
 // Hash is the config's ETag: `"` + hex(sha256(text)) + `"`.
@@ -161,13 +220,19 @@ func parse(text []byte, opt Options) (p Parsed, skipped []error, err error) {
 	if seq != nil {
 		entries = seq.Content
 	}
+	// The entries past the limit are counted, which fails the parse, and
+	// not looked at.
+	total := len(entries)
+	if total > spec.MaxStreams {
+		entries = entries[:spec.MaxStreams]
+	}
 	bad := make([][]string, len(entries))
 	for i, e := range entries {
 		for _, v := range walk(e, nil, true) {
 			bad[i] = append(bad[i], v.String())
 		}
 		if len(bad[i]) > 0 {
-			skipped = append(skipped, fmt.Errorf("%s: %s", entryRef(i, e), strings.Join(bad[i], "; ")))
+			skipped = append(skipped, fmt.Errorf("%s: %s", entryRef(i, e), strings.Join(capped(bad[i], maxEntryErrors), "; ")))
 		}
 	}
 	if len(top) > 0 {
@@ -192,8 +257,8 @@ func parse(text []byte, opt Options) (p Parsed, skipped []error, err error) {
 	errs = append(errs, raw.Server.check()...)
 	list, users, uerrs := checkUsers(raw.Users, opt)
 	errs = append(errs, uerrs...)
-	if n := len(entries); n > spec.MaxStreams {
-		errs = append(errs, fmt.Errorf("streams: %d streams, want at most %d", n, spec.MaxStreams))
+	if total > spec.MaxStreams {
+		errs = append(errs, fmt.Errorf("streams: %d streams, want at most %d", total, spec.MaxStreams))
 	}
 
 	streams := make([]spec.Stream, 0, len(entries))
@@ -378,9 +443,9 @@ func decodeEntry(e *yaml.Node) (spec.Stream, string) {
 		var msgs []string
 		var te *yaml.TypeError
 		if errors.As(err, &te) {
-			msgs = cutEach(te.Errors)
+			msgs = capped(cutEach(te.Errors), maxEntryErrors)
 		} else {
-			msgs = []string{cutValue(strings.TrimPrefix(err.Error(), "yaml: "))}
+			msgs = []string{public(strings.TrimPrefix(err.Error(), "yaml: "))}
 		}
 		off := e.Line - 1
 		for i, m := range msgs {
@@ -408,10 +473,12 @@ func cutValue(s string) string {
 	return s[:i] + "`…`" + s[j+1:]
 }
 
+// cutEach is public for each of at most MaxErrors+1 entries; the rest are
+// kept as they are, for capped to count.
 func cutEach(entries []string) []string {
-	out := make([]string, len(entries))
-	for i, e := range entries {
-		out[i] = cutValue(e)
+	out := slices.Clone(entries)
+	for i := range min(len(out), MaxErrors+1) {
+		out[i] = public(out[i])
 	}
 	return out
 }
@@ -425,7 +492,9 @@ func checkUsers(list []User, opt Options) ([]auth.User, *auth.Users, []error) {
 	}
 	var errs []error
 	if len(list) > auth.MaxUsers {
-		errs = append(errs, fmt.Errorf("users: %d users, want at most %d", len(list), auth.MaxUsers))
+		// Not looked at one by one: each would cost a hash parse and an
+		// error.
+		return nil, nil, []error{fmt.Errorf("users: %d users, want at most %d", len(list), auth.MaxUsers)}
 	}
 	out := make([]auth.User, 0, len(list))
 	seen := make(map[string]bool, len(list))

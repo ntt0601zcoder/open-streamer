@@ -984,6 +984,31 @@ func TestReloadUnreadable(t *testing.T) {
 	assert.Contains(t, res.body, `"code":"config_changed"`)
 }
 
+// The last reload error is bounded, whatever the file holds.
+func TestReloadErrorIsBounded(t *testing.T) {
+	text := baseText(streamYAML("cam", "{hls: true}"))
+	s := testConfig(t, func(su *setup) { su.Text = text })
+	var b strings.Builder
+	b.WriteString(text)
+	for i := range 1200 {
+		fmt.Fprintf(&b, "  - name: %s%d\n    colour: blue\n", strings.Repeat("x", 2000), i)
+	}
+	s.handEdit(b.String())
+	res := s.do(http.MethodPost, "/api/v1/reload", "ops", "")
+	require.Equal(t, http.StatusUnprocessableEntity, res.code)
+	assert.Less(t, len(res.body), 32<<10)
+	assert.Contains(t, res.body, "more")
+	last := s.status().LastReloadError
+	assert.NotEmpty(t, last)
+	assert.LessOrEqual(t, len(last), maxReloadError+16)
+	assert.Less(t, len(s.logs.String()), 256<<10)
+
+	assert.Equal(t, "short", bounded("short"))
+	cut := bounded(strings.Repeat("é", maxReloadError))
+	assert.LessOrEqual(t, len(cut), maxReloadError+16)
+	assert.True(t, strings.HasSuffix(cut, "é… (cut)"))
+}
+
 func TestRestartRequired(t *testing.T) {
 	text := baseText(streamYAML("cam", "{hls: true}"))
 	want := []string{"server.log.level", "server.rtmp.listen"}

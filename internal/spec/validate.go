@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
+	"unicode/utf8"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
@@ -23,7 +25,7 @@ func (s Stream) Validate() error {
 
 func (s Stream) validate() error {
 	if !ValidName(s.Name) {
-		return fmt.Errorf("name: %q is not a valid name", s.Name)
+		return fmt.Errorf("name: %s is not a valid name", Quote(s.Name))
 	}
 	if n := len(s.Inputs); n < 1 || n > MaxInputs {
 		return fmt.Errorf("inputs: %d inputs, want 1 to %d", n, MaxInputs)
@@ -35,10 +37,10 @@ func (s Stream) validate() error {
 	}
 	for i, l := range s.Layout {
 		if l != "video" && l != "audio" {
-			return fmt.Errorf("layout[%d]: %q is neither video nor audio", i, l)
+			return fmt.Errorf("layout[%d]: %s is neither video nor audio", i, Quote(l))
 		}
 		if slices.Contains(s.Layout[:i], l) {
-			return fmt.Errorf("layout[%d]: %q is repeated", i, l)
+			return fmt.Errorf("layout[%d]: %s is repeated", i, Quote(l))
 		}
 	}
 	if s.Transcode != nil {
@@ -58,7 +60,7 @@ func (t *Transcode) validate() error {
 			return fmt.Errorf("renditions[%d]%w", i, err)
 		}
 		if slices.ContainsFunc(t.Renditions[:i], func(o Rendition) bool { return o.Label == r.Label }) {
-			return fmt.Errorf("renditions[%d].label: %q is repeated", i, r.Label)
+			return fmt.Errorf("renditions[%d].label: %s is repeated", i, Quote(r.Label))
 		}
 	}
 	if t.Watermark != nil {
@@ -73,7 +75,7 @@ func (t *Transcode) validate() error {
 // rendition's own path: ".label: ...", or ": ..." for the whole rendition.
 func (r Rendition) validate() error {
 	if !ValidName(r.Label) {
-		return fmt.Errorf(".label: %q is not a valid label", r.Label)
+		return fmt.Errorf(".label: %s is not a valid label", Quote(r.Label))
 	}
 	if r.Copy {
 		if r != (Rendition{Label: r.Label, Copy: true}) {
@@ -90,7 +92,7 @@ func (r Rendition) validate() error {
 	switch r.Encoder {
 	case "", "x264", "nvenc":
 	default:
-		return fmt.Errorf(".encoder: %q, want x264 or nvenc", r.Encoder)
+		return fmt.Errorf(".encoder: %s, want x264 or nvenc", Quote(r.Encoder))
 	}
 	return nil
 }
@@ -102,12 +104,12 @@ func (w *Watermark) validate() error {
 		return fmt.Errorf(": set exactly one of text and image")
 	}
 	if w.Image != "" && !imageRE.MatchString(w.Image) {
-		return fmt.Errorf(".image: %q is not a png or jpeg asset name", w.Image)
+		return fmt.Errorf(".image: %s is not a png or jpeg asset name", Quote(w.Image))
 	}
 	switch w.Position {
 	case "", "tl", "tr", "bl", "br", "c":
 	default:
-		return fmt.Errorf(".position: %q, want tl, tr, bl, br or c", w.Position)
+		return fmt.Errorf(".position: %s, want tl, tr, bl, br or c", Quote(w.Position))
 	}
 	return nil
 }
@@ -125,6 +127,23 @@ func (o Outputs) validate() error {
 		}
 	}
 	return nil
+}
+
+// maxQuoted is how many bytes of a value an error message quotes.
+const maxQuoted = 64
+
+// Quote returns v quoted for an error message, cut to its first 64 bytes
+// and marked with … when it is longer: a message never grows with what a
+// client sent.
+func Quote(v string) string {
+	if len(v) <= maxQuoted {
+		return strconv.Quote(v)
+	}
+	n := maxQuoted
+	for n > 0 && !utf8.RuneStart(v[n]) {
+		n--
+	}
+	return strconv.Quote(v[:n]) + "…"
 }
 
 // checkURL checks an input or push URL. Its errors never quote the URL,

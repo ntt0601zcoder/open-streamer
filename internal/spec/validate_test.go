@@ -133,3 +133,47 @@ func TestValidateRejectsMaskedURL(t *testing.T) {
 	s.Inputs[0].URL = "rtsp://user:pw@host/a"
 	require.NoError(t, s.Validate())
 }
+
+// A message quotes at most 64 bytes of a value, on a rune boundary.
+func TestQuote(t *testing.T) {
+	assert.Equal(t, `"cam"`, Quote("cam"))
+	assert.Equal(t, `"a\nb"`, Quote("a\nb"))
+	exact := strings.Repeat("x", 64)
+	assert.Equal(t, `"`+exact+`"`, Quote(exact))
+	assert.Equal(t, `"`+exact+`"…`, Quote(exact+"y"))
+	assert.Equal(t, `"`+strings.Repeat("x", 63)+`"…`, Quote(strings.Repeat("x", 63)+"é!"), "no half rune")
+
+	named := func(name string) Stream {
+		return Stream{Name: name, Inputs: []Input{{URL: "udp://:5000"}}, Outputs: Outputs{HLS: true}}
+	}
+	long := named("cam")
+	long.Name = strings.Repeat("x", 100_000)
+	err := long.Validate()
+	require.Error(t, err)
+	assert.Less(t, len(err.Error()), 200)
+	for _, edit := range []func(*Stream){
+		func(s *Stream) { s.Layout = []string{long.Name} },
+		func(s *Stream) { s.Transcode = &Transcode{Renditions: []Rendition{{Label: long.Name}}} },
+		func(s *Stream) {
+			s.Transcode = &Transcode{Renditions: []Rendition{{Label: "a", Height: 720, BitrateKbps: 800, Encoder: long.Name}}}
+		},
+		func(s *Stream) {
+			s.Transcode = &Transcode{
+				Renditions: []Rendition{{Label: "a", Height: 720, BitrateKbps: 800}},
+				Watermark:  &Watermark{Image: long.Name},
+			}
+		},
+		func(s *Stream) {
+			s.Transcode = &Transcode{
+				Renditions: []Rendition{{Label: "a", Height: 720, BitrateKbps: 800}},
+				Watermark:  &Watermark{Text: "t", Position: long.Name},
+			}
+		},
+	} {
+		sp := named("cam")
+		edit(&sp)
+		err := sp.Validate()
+		require.Error(t, err)
+		assert.Less(t, len(err.Error()), 250, err.Error()[:100])
+	}
+}

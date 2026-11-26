@@ -20,6 +20,19 @@ import (
 // cannot be read for the stale check.
 const staleLogEvery = 10 * time.Second
 
+// maxReloadError is the longest last reload error kept and logged. The
+// parse bounds its own errors; this bounds whatever else a reload fails
+// with, such as one conflict per stream of a large file.
+const maxReloadError = 16 << 10
+
+// bounded returns s cut to maxReloadError bytes, marked when it was cut.
+func bounded(s string) string {
+	if len(s) <= maxReloadError {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxReloadError], "") + "… (cut)"
+}
+
 // state is the text in force and its status, published as one immutable
 // value. status.Stale is never set here: ConfigStatus asks the file.
 type state struct {
@@ -202,7 +215,7 @@ func (s *Server) Reload(ctx context.Context) (api.ApplyResult, error) {
 	now := time.Now()
 	s.lastReloadAt = &now
 	if err != nil {
-		s.lastReloadErr = logging.Scrub(err.Error())
+		s.lastReloadErr = bounded(logging.Scrub(err.Error()))
 		s.reloadsFailed.Add(1)
 		s.log.Error("server: config: reload failed", "error", s.lastReloadErr)
 		s.publish()

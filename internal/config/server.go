@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 )
 
 // Server is the server section: the shared servers, the transcoder, the
@@ -139,7 +141,7 @@ func (s Server) check() []error {
 		{"server.srt.app", r.SRT.App},
 	} {
 		if strings.HasPrefix(a.v, "/") || strings.HasSuffix(a.v, "/") {
-			errs = append(errs, fmt.Errorf("%s: %q must not start or end with /", a.key, a.v))
+			errs = append(errs, fmt.Errorf("%s: %s must not start or end with /", a.key, spec.Quote(a.v)))
 		}
 	}
 	if r.RTSP.UDP && r.RTSP.Listen == "" {
@@ -151,12 +153,12 @@ func (s Server) check() []error {
 	switch r.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
-		errs = append(errs, fmt.Errorf("server.log.level: %q, want debug, info, warn or error", r.Log.Level))
+		errs = append(errs, fmt.Errorf("server.log.level: %s, want debug, info, warn or error", spec.Quote(r.Log.Level)))
 	}
 	switch r.Log.Format {
 	case "json", "text":
 	default:
-		errs = append(errs, fmt.Errorf("server.log.format: %q, want json or text", r.Log.Format))
+		errs = append(errs, fmt.Errorf("server.log.format: %s, want json or text", spec.Quote(r.Log.Format)))
 	}
 	return errs
 }
@@ -169,11 +171,11 @@ func checkListen(v string) error {
 	}
 	_, port, err := net.SplitHostPort(v)
 	if err != nil {
-		return fmt.Errorf("%q is not host:port", v)
+		return fmt.Errorf("%s is not host:port", spec.Quote(v))
 	}
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 0 || n > 65535 || strings.TrimLeft(port, "0123456789") != "" {
-		return fmt.Errorf("%q: the port must be a number from 0 to 65535", v)
+		return fmt.Errorf("%s: the port must be a number from 0 to 65535", spec.Quote(v))
 	}
 	return nil
 }

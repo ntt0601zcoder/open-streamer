@@ -112,7 +112,7 @@ func editable(text []byte) (*yaml.Node, error) {
 		for i, v := range vs {
 			errs[i] = errors.New(v.String())
 		}
-		return nil, errs
+		return nil, Errors(cappedErrors(errs))
 	}
 	return root, nil
 }

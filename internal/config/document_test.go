@@ -567,3 +567,113 @@ func TestHash(t *testing.T) {
 	assert.Equal(t, h, Hash([]byte(head())))
 	assert.NotEqual(t, h, Hash(append([]byte("#\n"), text...)))
 }
+
+// A hostile document costs bounded work and gets a bounded answer.
+func TestParseIsBounded(t *testing.T) {
+	long := strings.Repeat("x", 100_000)
+
+	t.Run("entries past the limit are not looked at", func(t *testing.T) {
+		var b strings.Builder
+		b.WriteString(head() + "streams:\n")
+		for i := range spec.MaxStreams + 500 {
+			fmt.Fprintf(&b, "  - name: s%d\n    colour: blue\n", i)
+		}
+		_, skipped, err := parse([]byte(b.String()), testOpt)
+		var es Errors
+		require.ErrorAs(t, err, &es)
+		assert.Equal(t, "streams: 1500 streams, want at most 1000", es[0].Error())
+		require.Len(t, skipped, spec.MaxStreams)
+		assert.Contains(t, skipped[len(skipped)-1].Error(), "streams[999] (s999)")
+
+		_, err = Parse([]byte(b.String()), testOpt)
+		require.ErrorAs(t, err, &es)
+		require.Len(t, es, MaxErrors+1)
+		assert.Equal(t, "and 901 more", es[MaxErrors].Error())
+		assert.Less(t, len(err.Error()), 16<<10)
+	})
+	t.Run("the skipped entries of a start are capped", func(t *testing.T) {
+		var b strings.Builder
+		b.WriteString(head() + "streams:\n")
+		for i := range 250 {
+			fmt.Fprintf(&b, "  - name: s%d\n    colour: blue\n", i)
+		}
+		p, skipped, err := ParseLenient([]byte(b.String()), testOpt)
+		require.NoError(t, err)
+		assert.Empty(t, p.Doc.Streams)
+		require.Len(t, skipped, MaxErrors+1)
+		assert.Equal(t, "and 150 more", skipped[MaxErrors].Error())
+	})
+	t.Run("one entry with many faults", func(t *testing.T) {
+		var b strings.Builder
+		b.WriteString(head() + "streams:\n" + streamYAML("cam") + "    transcode:\n      renditions:\n")
+		for i := range 500 {
+			fmt.Fprintf(&b, "        - label: r%d\n          height: 0720\n", i)
+		}
+		_, err := Parse([]byte(b.String()), testOpt)
+		msg := errText(t, err)
+		assert.Contains(t, msg, "and 490 more")
+		assert.Less(t, len(msg), 2000)
+	})
+	t.Run("a long name is quoted cut", func(t *testing.T) {
+		_, err := Parse([]byte(head()+"streams:\n"+streamYAML(long)), testOpt)
+		msg := errText(t, err)
+		assert.Contains(t, msg, "is not a valid name")
+		assert.Contains(t, msg, strings.Repeat("x", 64)+`"…`)
+		assert.Less(t, len(msg), 400)
+	})
+	t.Run("a long value in the server section is quoted cut", func(t *testing.T) {
+		_, err := Parse([]byte(head()+"server:\n  log: {level: "+long+"}\n  http: {listen: "+long+"}\n  rtmp: {app: /"+long+"}\n"), testOpt)
+		msg := errText(t, err)
+		assert.Contains(t, msg, "server.log.level: ")
+		assert.Contains(t, msg, "is not host:port")
+		assert.Contains(t, msg, "must not start or end with /")
+		assert.Less(t, len(msg), 600)
+	})
+	t.Run("a long unknown key is cut", func(t *testing.T) {
+		long := long[:1000] // a longer plain key is no YAML
+		_, err := Parse([]byte(head()+"streams:\n"+streamYAML("cam", "    "+long+": 1")), testOpt)
+		msg := errText(t, err)
+		assert.Contains(t, msg, "streams[0] (cam): line 10: field "+strings.Repeat("x", 64)+"… not found in type spec.Stream")
+		assert.Less(t, len(msg), 400)
+
+		_, err = Parse([]byte(head()+long+": 1\n"), testOpt)
+		msg = errText(t, err)
+		assert.Contains(t, msg, "not found")
+		assert.Less(t, len(msg), 400)
+	})
+	t.Run("many top-level faults", func(t *testing.T) {
+		var b strings.Builder
+		b.WriteString(head())
+		for i := range 500 {
+			fmt.Fprintf(&b, "k%d: 1\n", i)
+		}
+		_, err := Parse([]byte(b.String()), testOpt)
+		var se *SyntaxError
+		require.ErrorAs(t, err, &se)
+		assert.Contains(t, err.Error(), "; and 400 more")
+		assert.Less(t, len(err.Error()), 16<<10)
+	})
+	t.Run("too many users are not looked at", func(t *testing.T) {
+		var b strings.Builder
+		b.WriteString("version: 1\nusers:\n")
+		for i := range 5000 {
+			fmt.Fprintf(&b, "  - name: BAD%d\n    role: none\n    password: x\n", i)
+		}
+		_, err := Parse([]byte(b.String()), testOpt)
+		var es Errors
+		require.ErrorAs(t, err, &es)
+		require.Len(t, es, 1)
+		assert.Equal(t, "users: 5000 users, want at most 64", es[0].Error())
+	})
+}
+
+// The messages name the config, not this package's private types.
+func TestParseErrorsArePublic(t *testing.T) {
+	_, err := Parse([]byte(head()+"colour: blue\n"), testOpt)
+	msg := errText(t, err)
+	assert.Equal(t, "config: yaml: unmarshal errors: line 6: field colour not found at the top level of the config", msg)
+	_, err = Parse([]byte("- a\n- b\n"), testOpt)
+	msg = errText(t, err)
+	assert.NotContains(t, msg, "rawDocument")
+	assert.Contains(t, msg, "into the config document")
+}
