@@ -81,7 +81,7 @@ const (
 	// EnvWatermarkLog names a file the child appends one line to per
 	// Configure and per SetWatermark: "configure text:<the text verbatim>",
 	// "configure image:<len>" or "configure none", and "set …" in the same
-	// forms.
+	// forms. A text line with a font ends in " font=<its length>".
 	EnvWatermarkLog = "OS_TRANSCODE_FAKE_WATERMARK_LOG"
 	// EnvFrameLog names a file the child appends one line to per received
 	// frame, "<video|audio> <track> <pts> <epoch> <key|->", written as the
@@ -92,6 +92,10 @@ const (
 	// never sent Configure, so EnvCrashAfter and EnvCloseThenExit, which
 	// fire only after Configure, cannot make it exit.
 	EnvExitAfterHello = "OS_TRANSCODE_FAKE_EXIT_AFTER_HELLO"
+	// EnvRefuse makes the fake child answer its first video frame with a fatal Error
+	// {Rung: <the value n, a rung index>, Code: ErrorEncoderRefused} and exit 1. Its Message mirrors
+	// native.RefusedError's text: "rung <n>: nvenc could not be opened and no_fallback is set: fake".
+	EnvRefuse = "OS_TRANSCODE_FAKE_REFUSE" // named as the fake's other switches are
 )
 
 // Counters are the media counters a child run with EnvCounters reports.
@@ -238,6 +242,10 @@ func Main() {
 			}
 		}
 	}
+	refuse := -1
+	if n, err := strconv.Atoi(os.Getenv(EnvRefuse)); err == nil {
+		refuse = n
+	}
 	var cfg wire.Configure
 	flushVideo := func() {
 		for _, f := range lagged {
@@ -278,6 +286,13 @@ func Main() {
 			in.Add(1)
 			isVideo := v.F.Kind() == media.KindVideo
 			frameLog.line(describeFrame(v.F, isVideo))
+			if isVideo && refuse >= 0 {
+				_ = w.Write(wire.Error{
+					Rung: refuse, Fatal: true, Code: wire.ErrorEncoderRefused,
+					Message: fmt.Sprintf("rung %d: nvenc could not be opened and no_fallback is set: fake", refuse),
+				})
+				os.Exit(1)
+			}
 			if delay > 0 {
 				time.Sleep(delay)
 			}
@@ -337,13 +352,16 @@ func (l *logFile) line(s string) {
 	}
 }
 
-// describeWatermark is "text:<text>", "image:<len>" or "none".
+// describeWatermark is "text:<text>", "text:<text> font=<len>",
+// "image:<len>" or "none".
 func describeWatermark(w *picture.Watermark) string {
 	switch {
 	case w == nil:
 		return "none"
 	case len(w.Image) > 0:
 		return "image:" + strconv.Itoa(len(w.Image))
+	case len(w.Font) > 0:
+		return "text:" + w.Text + " font=" + strconv.Itoa(len(w.Font))
 	default:
 		return "text:" + w.Text
 	}

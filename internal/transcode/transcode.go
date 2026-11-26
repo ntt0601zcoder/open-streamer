@@ -51,7 +51,11 @@
 //
 // Each encoded rendition names its encoder, x264 or NVENC (Video.Encoder);
 // a child without the hardware falls back to x264 and counts it in
-// ChildStats.EncoderFallbacks.
+// ChildStats.EncoderFallbacks. An NVENC rendition with Video.NoFallback does
+// not fall back (ruling R-E9): its child ends with a fatal wire.Error coded
+// wire.ErrorEncoderRefused, which Stats.EncoderRefusals counts, and is
+// respawned as any child that exits, so the next child tries NVENC again.
+// The last fatal message of a child ends its exit error (Event.Err).
 //
 // Options.Watermark is drawn on every encoded picture, so no rendition may
 // then copy its video (ruling R-C5). SetWatermark replaces it while Run
@@ -98,6 +102,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
@@ -145,6 +150,8 @@ type Video struct {
 	Height, BitrateKbps, MaxBitrateKbps, BFrames int
 	Preset                                       string
 	Encoder                                      string
+	// NoFallback makes an nvenc rendition fail the ladder when NVENC cannot be opened (R-E9).
+	NoFallback bool
 }
 
 // Audio describes the audio of every rendition: copied from the source, or
@@ -248,6 +255,9 @@ type Stats struct {
 	MaxQueued                                             int
 	PID                                                   int
 	Child                                                 ChildStats
+
+	// EncoderRefusals counts the children that ended because a NoFallback rendition could not open its encoder.
+	EncoderRefusals uint64
 }
 
 // ChildStats are the media counters the children report in their Stats
@@ -371,6 +381,10 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 			return nil, fmt.Errorf("transcode: new: rendition %d: empty or duplicate name %q", i, r.Name)
 		}
 		names[r.Name] = true
+		if r.Video.NoFallback && (r.Video.Copy || r.Video.Encoder != EncoderNVENC) {
+			// Only NVENC has an x264 fallback to refuse.
+			return nil, fmt.Errorf("transcode: new: rendition %q: no_fallback needs encoder nvenc", r.Name)
+		}
 		if r.Video.Copy {
 			t.copyVideo = append(t.copyVideo, i)
 			continue
@@ -393,7 +407,7 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 		t.encodeIdx = append(t.encodeIdx, i)
 		t.configure.Rungs = append(t.configure.Rungs, wire.Rung{
 			Height: v.Height, BitrateKbps: v.BitrateKbps, MaxBitrateKbps: v.MaxBitrateKbps,
-			BFrames: v.BFrames, Preset: v.Preset, Encoder: enc,
+			BFrames: v.BFrames, Preset: v.Preset, Encoder: enc, NoFallback: v.NoFallback,
 		})
 	}
 	if a := opt.Audio; !a.Copy {
@@ -503,7 +517,8 @@ func (t *Transcoder) checkWatermark(w *picture.Watermark) error {
 	return nil
 }
 
-// cloneWatermark copies w, so that the caller may change its own.
+// cloneWatermark copies w and its image, so that the caller may change its
+// own. The font is shared, not copied: its bytes are immutable (R-E8).
 func cloneWatermark(w *picture.Watermark) *picture.Watermark {
 	if w == nil {
 		return nil
@@ -800,7 +815,11 @@ func (s *run) exited() error {
 	if cause != nil {
 		err = fmt.Errorf("%w: %w", cause, err)
 	}
-	err = fmt.Errorf("transcode: child %d: %w", c.p.pid, err)
+	if c.lastWord != "" {
+		err = fmt.Errorf("transcode: child %d: %w: %s", c.p.pid, err, c.lastWord)
+	} else {
+		err = fmt.Errorf("transcode: child %d: %w", c.p.pid, err)
+	}
 	t.update(func(st *Stats) { st.Exits++ })
 	t.log.Warn("transcode: child exited", "pid", c.p.pid, "err", err)
 	t.emit(Event{Kind: EventExited, PID: c.p.pid, Err: err})
@@ -1085,6 +1104,11 @@ type child struct {
 	waitErr error
 	fatal   error
 	cause   error // why the reader gave up on the child, if it did
+	// Written by the reader: the message of the child's last fatal
+	// wire.Error, cut to maxLastWord bytes, and whether the child has sent
+	// an Error coded wire.ErrorEncoderRefused.
+	lastWord string
+	refused  bool
 
 	// Owned by the Run goroutine: set when Run killed the child for not
 	// taking its input.
@@ -1226,9 +1250,46 @@ func (t *Transcoder) readChild(c *child) error {
 			t.gotShot(v.S)
 		case wire.Error:
 			t.log.Warn("transcode: child error", "pid", c.p.pid, "rung", v.Rung, "fatal", v.Fatal, "msg", v.Message)
+			t.childError(c, v)
 		default:
 		}
 	}
+}
+
+// maxLastWord bounds the fatal message a child's exit error carries.
+const maxLastWord = 256
+
+// childError keeps the message of a fatal Error for the child's exit error
+// and counts a child's first refusal (R-E9). The message is the child's own
+// and may name a path in its temp directory: the status that shows it is
+// authenticated, and paths are not secrets. Called from c's reader
+// goroutine.
+func (t *Transcoder) childError(c *child, v wire.Error) {
+	if v.Fatal {
+		c.lastWord = cutMessage(v.Message)
+	}
+	if v.Code == wire.ErrorEncoderRefused && !c.refused {
+		c.refused = true
+		t.update(func(st *Stats) { st.EncoderRefusals++ })
+	}
+}
+
+// cutMessage cuts s to maxLastWord bytes, leaving out a rune that would be
+// cut in two.
+func cutMessage(s string) string {
+	if len(s) <= maxLastWord {
+		return s
+	}
+	s = s[:maxLastWord]
+	for i := len(s) - 1; i >= 0 && i >= len(s)-utf8.UTFMax; i-- {
+		if utf8.RuneStart(s[i]) {
+			if !utf8.FullRuneInString(s[i:]) {
+				s = s[:i]
+			}
+			break
+		}
+	}
+	return s
 }
 
 // socketEnded reports a read error that only means the child closed its

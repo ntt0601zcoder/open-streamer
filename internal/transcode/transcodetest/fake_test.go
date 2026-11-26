@@ -5,6 +5,7 @@ package transcodetest_test
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"image/jpeg"
 	"io"
 	"net"
@@ -250,6 +251,14 @@ func TestFakeWatermarkLog(t *testing.T) {
 	f.send(t, wire.Configure{Watermark: &picture.Watermark{Image: make([]byte, 1234)}})
 	f.stop(t)
 
+	// A font adds its size to a text line.
+	f = startFake(t, env)
+	f.send(t,
+		wire.Configure{Watermark: &picture.Watermark{Text: "LIVE", Font: []byte("OTTO font")}},
+		wire.SetWatermark{W: &picture.Watermark{Text: "y z", Font: make([]byte, 4321)}},
+	)
+	f.stop(t)
+
 	assert.Equal(t, []string{
 		"configure text:LIVE %H:%M ✓",
 		"set image:5",
@@ -257,7 +266,48 @@ func TestFakeWatermarkLog(t *testing.T) {
 		"set text:x",
 		"configure none",
 		"configure image:1234",
+		"configure text:LIVE font=9",
+		"set text:y z font=4321",
 	}, readLines(t, path))
+}
+
+// With EnvRefuse=1 the child echoes audio as usual, answers its first video
+// frame with a fatal Error for rung 1 coded ErrorEncoderRefused, whose
+// message mirrors native.RefusedError's, and exits 1 without echoing it.
+func TestFakeRefuse(t *testing.T) {
+	f := startFake(t, transcodetest.EnvRefuse+"=1")
+	cfg := h264(t)
+	audio := wire.Frame{Rung: -1, F: media.Frame{Config: aac(t), PTS: 0, DTS: 0, Key: true, Data: [][]byte{{0x21}}}}
+	f.send(t,
+		wire.Configure{Rungs: []wire.Rung{{Height: 240, Encoder: "nvenc"}, {Height: 180, Encoder: "nvenc", NoFallback: true}}},
+		audio,
+		video(cfg, 3600, 0, true),
+		video(cfg, 7200, 0, false),
+	)
+	var got []wire.Message
+	for {
+		m, err := f.r.Read()
+		if err != nil {
+			// The child exits with input unread: its end may reset rather
+			// than close, after what it wrote has been read.
+			if !errors.Is(err, syscall.ECONNRESET) {
+				require.ErrorIs(t, err, io.EOF)
+			}
+			break
+		}
+		if _, stats := m.(wire.Stats); !stats {
+			got = append(got, m)
+		}
+	}
+	require.Len(t, got, 2, "%+v", got)
+	echo, ok := got[0].(wire.Frame)
+	require.True(t, ok, "%T", got[0])
+	assert.Equal(t, -1, echo.Rung)
+	assert.Equal(t, wire.Error{
+		Rung: 1, Fatal: true, Code: wire.ErrorEncoderRefused,
+		Message: "rung 1: nvenc could not be opened and no_fallback is set: fake",
+	}, got[1])
+	assert.Equal(t, 1, f.wait(t))
 }
 
 // EnvFrameLog gets one line per received frame, written as it arrives.

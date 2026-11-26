@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"image"
 	"io/fs"
 	"log/slog"
 	"maps"
@@ -39,10 +40,34 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	if os.Getenv("OS_TRANSCODE_FAKE") == "1" {
+	switch os.Getenv("OS_TRANSCODE_FAKE") {
+	case "1":
 		transcodetest.Main()
+	case fatalChildMode:
+		fatalChild()
 	}
 	os.Exit(m.Run())
+}
+
+// fatalChildMode, as OS_TRANSCODE_FAKE, runs fatalChild instead of the fake.
+const fatalChildMode = "fatal"
+
+// fatalChild is a child that says Hello, reads its Configure, sends a fatal
+// Error whose message is 300 bytes and exits 1.
+func fatalChild() {
+	conn := os.NewFile(3, "transcode")
+	if conn == nil {
+		os.Exit(3)
+	}
+	w, r := wire.NewWriter(conn), wire.NewReader(conn)
+	if w.Write(wire.Hello{Version: wire.Version, PID: os.Getpid()}) != nil {
+		os.Exit(3)
+	}
+	if _, err := r.Read(); err != nil {
+		os.Exit(3)
+	}
+	_ = w.Write(wire.Error{Fatal: true, Message: strings.Repeat("x", 300)})
+	os.Exit(1)
 }
 
 // fakeOptions runs the test binary as the fake child.
@@ -2317,4 +2342,219 @@ func TestShotsFromAudioOnlyChild(t *testing.T) {
 		}
 		assert.Equal(t, k, second[0].PTS)
 	})
+}
+
+// nvencNoFallback is an NVENC rendition that must not fall back to x264.
+var nvencNoFallback = Rendition{Name: "n240", Video: Video{Height: 240, BitrateKbps: 600, Encoder: EncoderNVENC, NoFallback: true}}
+
+// NoFallback is for NVENC renditions only (R-E9).
+func TestNoFallbackOptions(t *testing.T) {
+	src := hub.New(hub.Options{})
+	_, err := New(src, Options{Binary: "x", Renditions: []Rendition{nvencNoFallback}})
+	require.NoError(t, err)
+	for _, enc := range []string{"", EncoderX264} {
+		r := nvencNoFallback
+		r.Video.Encoder = enc
+		_, err = New(src, Options{Binary: "x", Renditions: []Rendition{r}})
+		require.EqualError(t, err, `transcode: new: rendition "n240": no_fallback needs encoder nvenc`, "encoder %q", enc)
+	}
+	cp := Rendition{Name: "src", Video: Video{Copy: true, Encoder: EncoderNVENC, NoFallback: true}}
+	_, err = New(src, Options{Binary: "x", Renditions: []Rendition{encode240, cp}})
+	require.EqualError(t, err, `transcode: new: rendition "src": no_fallback needs encoder nvenc`)
+}
+
+// The flag goes into its rung of the child's Configure, and only its rung.
+func TestNoFallbackReachesChild(t *testing.T) {
+	opt := fakeOptions(t)
+	plain := Rendition{Name: "n180", Video: Video{Height: 180, BitrateKbps: 300, Encoder: EncoderNVENC}}
+	opt.Renditions = []Rendition{nvencNoFallback, plain, encode240}
+	cfg := sentConfigure(t, opt)
+	require.Len(t, cfg.Rungs, 3)
+	assert.Equal(t, wire.Rung{Height: 240, BitrateKbps: 600, Encoder: "nvenc", NoFallback: true}, cfg.Rungs[0])
+	assert.Equal(t, wire.Rung{Height: 180, BitrateKbps: 300, Encoder: "nvenc"}, cfg.Rungs[1])
+	assert.False(t, cfg.Rungs[2].NoFallback)
+}
+
+// gateAfter records the waits asked of it and fires one only when told to.
+type gateAfter struct {
+	mu     sync.Mutex
+	delays []time.Duration
+	chans  []chan time.Time
+	asked  chan struct{} // one token per call
+}
+
+func newGateAfter() *gateAfter { return &gateAfter{asked: make(chan struct{}, 64)} }
+
+func (g *gateAfter) After(d time.Duration) <-chan time.Time {
+	c := make(chan time.Time, 1)
+	g.mu.Lock()
+	g.delays = append(g.delays, d)
+	g.chans = append(g.chans, c)
+	g.mu.Unlock()
+	g.asked <- struct{}{}
+	return c
+}
+
+// wait waits for the next call.
+func (g *gateAfter) wait(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.asked:
+	case <-time.After(20 * time.Second):
+		t.Fatal("no wait was asked for")
+	}
+}
+
+// fire fires the wait of call i.
+func (g *gateAfter) fire(i int) {
+	g.mu.Lock()
+	c := g.chans[i]
+	g.mu.Unlock()
+	c <- time.Now()
+}
+
+// waits returns the waits asked for so far.
+func (g *gateAfter) waits() []time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.delays)
+}
+
+// A child that cannot open the encoder of a no_fallback rung ends with a
+// fatal Error coded ErrorEncoderRefused: the host counts it, names it in the
+// exit, and respawns with the usual backoff; no frame goes out, and nothing
+// counts as a fallback.
+func TestRefusalCounted(t *testing.T) {
+	g := newGateAfter()
+	opt := fakeOptions(t, transcodetest.EnvRefuse+"=0")
+	opt.RespawnMin = 0 // the default, 250 ms
+	opt.After = g.After
+	opt.Renditions = []Rendition{nvencNoFallback, encode180}
+	opt.Presentation = true
+	s := start(t, opt)
+
+	video := slices.DeleteFunc(fixtureSteps(t, "h264_aac.ts"), func(s step) bool {
+		return s.anchor == nil && s.f.Kind() != media.KindVideo
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	fed := play(ctx, s.src, longGOP(video, 100, 1), 4, false)
+	defer func() {
+		cancel()
+		<-fed
+	}()
+
+	g.wait(t) // the first respawn
+	exits := s.ev.of(EventExited)
+	require.Len(t, exits, 1)
+	st := s.tr.Stats()
+	assert.EqualValues(t, 1, st.EncoderRefusals)
+	assert.EqualValues(t, 1, st.Spawns)
+	assert.EqualValues(t, 1, st.Exits)
+	assert.Zero(t, st.Child.EncoderFallbacks)
+	require.NotZero(t, exits[0].PID)
+	require.Error(t, exits[0].Err)
+	assert.Contains(t, exits[0].Err.Error(), "no_fallback")
+	assert.Contains(t, exits[0].Err.Error(), fmt.Sprintf("transcode: child %d: ", exits[0].PID))
+	assert.True(t, strings.HasSuffix(exits[0].Err.Error(),
+		": rung 0: nvenc could not be opened and no_fallback is set: fake"), exits[0].Err.Error())
+
+	g.fire(0)
+	g.wait(t) // the second
+	st = s.tr.Stats()
+	assert.EqualValues(t, 2, st.EncoderRefusals)
+	assert.EqualValues(t, 2, st.Spawns)
+	assert.EqualValues(t, 2, st.Exits)
+	assert.Zero(t, st.Child.EncoderFallbacks)
+	assert.Len(t, s.ev.of(EventExited), 2)
+	ms := time.Millisecond
+	assert.Equal(t, []time.Duration{250 * ms, 500 * ms}, g.waits())
+	for i, n := range st.FramesOut {
+		assert.Zero(t, n, opt.Renditions[i].Name)
+	}
+	assert.Zero(t, st.PresentationOut)
+}
+
+// A child's last fatal Error message, cut to 256 bytes, ends its exit error;
+// the exit error of a child that sent none is what it was.
+func TestFatalMessageInExitError(t *testing.T) {
+	exitErr := func(t *testing.T, env ...string) error {
+		t.Helper()
+		ra := &recordAfter{full: make(chan struct{})}
+		opt := fakeOptions(t, env...)
+		opt.After = ra.After
+		opt.Renditions = []Rendition{encode240}
+		s := start(t, opt)
+		select {
+		case <-ra.full:
+		case <-time.After(20 * time.Second):
+			t.Fatal("no exit")
+		}
+		exits := s.ev.of(EventExited)
+		require.Len(t, exits, 1)
+		assert.Zero(t, s.tr.Stats().EncoderRefusals)
+		return exits[0].Err
+	}
+	t.Run("message", func(t *testing.T) {
+		err := exitErr(t, "OS_TRANSCODE_FAKE="+fatalChildMode)
+		assert.Regexp(t, `^transcode: child \d+: exit status 1: x{256}$`, err.Error())
+	})
+	t.Run("none", func(t *testing.T) {
+		err := exitErr(t, transcodetest.EnvCrashAfter+"=0")
+		assert.Regexp(t, `^transcode: child \d+: exit status 2$`, err.Error())
+	})
+}
+
+func TestCutMessage(t *testing.T) {
+	assert.Equal(t, "short", cutMessage("short"))
+	assert.Equal(t, strings.Repeat("x", 256), cutMessage(strings.Repeat("x", 300)))
+	// A rune that would be cut in two is left out.
+	s := strings.Repeat("x", 255) + "é" + "tail"
+	assert.Equal(t, strings.Repeat("x", 255), cutMessage(s))
+}
+
+// The fixture font, for watermarks that carry one.
+func fixtureFont(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile("../../testdata/fixtures/fonts/DejaVuSansMono.ttf")
+	require.NoError(t, err)
+	return b
+}
+
+// A watermark's font reaches the running child and the next one, and the
+// transcoder shares the caller's bytes rather than copying them (R-E8); an
+// image is still copied.
+func TestSetWatermarkCarriesFont(t *testing.T) {
+	font := fixtureFont(t)
+	steps := fixtureSteps(t, "h264_aac.ts")
+	opt := fakeOptions(t, crashOnce(t, 30)...)
+	opt.Renditions = []Rendition{encode240}
+	log := watermarkLog(t, &opt)
+	s := start(t, opt)
+	waitLog(t, log, "configure none")
+	w := &picture.Watermark{Text: "live", Font: font}
+	require.NoError(t, s.tr.SetWatermark(w))
+	want := fmt.Sprintf("text:live font=%d", len(font))
+	waitLog(t, log, "configure none", "set "+want)
+	s.tr.mu.Lock()
+	held := s.tr.watermark
+	s.tr.mu.Unlock()
+	assert.NotSame(t, w, held, "the struct is copied")
+	assert.Same(t, &font[0], &held.Font[0], "the font is shared")
+	assert.Len(t, held.Font, len(font))
+	s.feed(t, steps, 4)
+	assert.EqualValues(t, 2, s.tr.Stats().Spawns)
+	assert.Equal(t, []string{"configure none", "set " + want, "configure " + want}, logLines(t, log))
+
+	jpg, err := picture.EncodeJPEG(image.NewGray(image.Rect(0, 0, 8, 8)), 80)
+	require.NoError(t, err)
+	tr, err := New(hub.New(hub.Options{}), Options{Binary: "x", Renditions: []Rendition{encode240}, Watermark: &picture.Watermark{Image: jpg}})
+	require.NoError(t, err)
+	assert.NotSame(t, &jpg[0], &tr.watermark.Image[0], "New copies the image")
+	assert.Equal(t, jpg, tr.watermark.Image)
+	require.NoError(t, tr.SetWatermark(&picture.Watermark{Image: jpg}))
+	assert.NotSame(t, &jpg[0], &tr.watermark.Image[0], "SetWatermark copies the image")
+	assert.Equal(t, jpg, tr.watermark.Image)
+	tr, err = New(hub.New(hub.Options{}), Options{Binary: "x", Renditions: []Rendition{encode240}, Watermark: &picture.Watermark{Text: "x", Font: font}})
+	require.NoError(t, err)
+	assert.Same(t, &font[0], &tr.watermark.Font[0], "New shares the font")
 }
