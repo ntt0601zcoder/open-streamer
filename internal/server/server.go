@@ -79,6 +79,7 @@ type Server struct {
 	applied       []byte // the text in force
 	loadedAt      time.Time
 	loadErrs      []string // scrubbed: the entries the start skipped, and the streams that cannot run
+	skipped       bool     // the text in force holds entries the start skipped: it does not parse strictly
 	lastReloadAt  *time.Time
 	lastReloadErr string
 	restart       []string
@@ -208,6 +209,7 @@ func New(path string, opt Options) (*Server, error) {
 	for _, e := range skipped {
 		s.loadErrs = append(s.loadErrs, logging.Scrub(e.Error()))
 	}
+	s.skipped = len(skipped) > 0
 	// Load fails only on a manager that is closed or not empty, which this
 	// new one is not.
 	left, _ := m.Load(parsed.Doc.Streams)

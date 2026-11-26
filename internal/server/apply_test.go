@@ -489,6 +489,61 @@ func TestPutStreamKeepsComments(t *testing.T) {
 	assert.True(t, testParse(t, got).Doc.Streams[0].Outputs.DASH)
 }
 
+// A PUT of a stream's own document still repairs a file in which a skipped
+// entry repeats its name.
+func TestPutStreamNoOpStillRepairs(t *testing.T) {
+	cam := streamYAML("cam", "{hls: true}")
+	s := testConfig(t, func(su *setup) { su.Text = baseText(cam, cam) })
+	require.Len(t, s.status().LoadErrors, 1)
+	res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", streamJSON("cam", "rtmp://src.example/live/cam", `{"hls":true}`))
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	assert.Contains(t, res.body, `"applied":"unchanged"`)
+	assert.Empty(t, s.status().LoadErrors)
+	assert.Equal(t, 1, strings.Count(s.fileText(), "name: cam"))
+}
+
+// A PUT of the document a stream already has writes nothing: the file keeps
+// its layout, and the ETag stays.
+func TestPutStreamNoOpKeepsTheFile(t *testing.T) {
+	text := "version: 1\n\n" + serverYAML + "\n" + usersYAML() + "\nstreams:\n\n" +
+		streamYAML("cam", "{hls: true}") + "\n" + streamYAML("other", "{ hls: true }")
+	s := testConfig(t, func(su *setup) { su.Text = text })
+	var writes atomic.Int64
+	s.file.SetHook(func(step string) error {
+		if step == "created" {
+			writes.Add(1)
+		}
+		return nil
+	})
+	_, etag := s.ConfigText()
+	loaded := s.status().LoadedAt
+
+	res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", streamJSON("cam", "rtmp://src.example/live/cam", `{"hls":true}`))
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	assert.Contains(t, res.body, `"applied":"unchanged"`)
+	assert.Equal(t, text, s.fileText(), "the file was rewritten")
+	assert.Zero(t, writes.Load())
+	_, now := s.ConfigText()
+	assert.Equal(t, etag, now)
+	assert.False(t, s.status().Stale)
+	assert.False(t, s.status().LoadedAt.Before(loaded))
+
+	// A real edit still writes, and only then is the layout the encoder's.
+	res = s.do(http.MethodPut, "/api/v1/streams/cam", "ops", streamJSON("cam", "rtmp://src.example/live/cam", `{"hls":true,"dash":true}`))
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	assert.Contains(t, res.body, `"applied":"outputs"`)
+	assert.EqualValues(t, 1, writes.Load())
+	assert.NotEqual(t, text, s.fileText())
+	// A new stream writes too.
+	res = s.do(http.MethodPut, "/api/v1/streams/new", "ops", streamJSON("new", "rtmp://src.example/live/new", `{"hls":true}`))
+	require.Equal(t, http.StatusCreated, res.code, res.body)
+	assert.EqualValues(t, 2, writes.Load())
+	// The stale check still comes first.
+	s.handEdit(text)
+	res = s.do(http.MethodPut, "/api/v1/streams/other", "ops", streamJSON("other", "rtmp://src.example/live/other", `{"hls":true}`))
+	require.Equal(t, http.StatusConflict, res.code, res.body)
+}
+
 func TestPutConfigPreconditions(t *testing.T) {
 	text := baseText(streamYAML("cam", "{hls: true}"))
 	next := baseText(streamYAML("cam", "{hls: true, dash: true}"))

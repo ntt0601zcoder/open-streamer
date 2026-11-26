@@ -94,6 +94,7 @@ func (s *Server) apply(ctx context.Context, text []byte, write bool) (api.ApplyR
 		s.users.Store(p.Users)
 	}
 	s.applied, s.loadedAt = bytes.Clone(text), time.Now()
+	s.skipped = false
 	// The text parsed strictly, so no entry is skipped any more; what is
 	// left are the streams that still cannot run, each with the reason of
 	// this edit, which tried them again.
@@ -155,7 +156,11 @@ func (s *Server) PutConfig(ctx context.Context, text []byte, ifMatch string) (ap
 }
 
 // PutStream creates or replaces one stream: the entry of its name in the
-// text in force, also one the start skipped.
+// text in force, also one the start skipped. A document equal to the one
+// the stream has rewrites nothing: the text in force is applied as it is
+// (which still tries a stream left stopped again), so the file keeps its
+// layout, blank lines included. Not while the text still holds entries the
+// start skipped: one of them may repeat this name, and the edit removes it.
 func (s *Server) PutStream(ctx context.Context, sp spec.Stream, ifMatch string) (stream.Outcome, error) {
 	s.cfg.Lock()
 	defer s.cfg.Unlock()
@@ -165,9 +170,12 @@ func (s *Server) PutStream(ctx context.Context, sp spec.Stream, ifMatch string) 
 	if err := s.matchStream(sp.Name, ifMatch); err != nil {
 		return stream.Outcome{}, err
 	}
-	text, err := config.SetStream(s.applied, sp)
-	if err != nil {
-		return stream.Outcome{}, err
+	text := s.applied
+	if cur, ok := s.Manager().Get(sp.Name); !ok || s.skipped || spec.Diff(cur, sp) != spec.ChangeNone {
+		var err error
+		if text, err = config.SetStream(s.applied, sp); err != nil {
+			return stream.Outcome{}, err
+		}
 	}
 	res, err := s.apply(ctx, text, true)
 	if err != nil {
