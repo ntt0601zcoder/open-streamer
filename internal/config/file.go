@@ -22,6 +22,11 @@ var ErrStale = errors.New("config: the file changed on disk")
 // Unix, is not private to its owner.
 var ErrUnreadable = errors.New("config: the file cannot be read")
 
+// ErrWrite is what errors.Is finds in every error of Write but ErrStale:
+// the temp file could not be made (a read-only or foreign directory, a full
+// disk), written, synced or renamed, or the directory could not be synced.
+var ErrWrite = errors.New("config: the file cannot be written")
+
 // kinded is err, in which errors.Is also finds kind. Its text is err's.
 type kinded struct{ kind, err error }
 
@@ -83,7 +88,7 @@ func (f *File) Stale() (bool, error) {
 // returns ErrStale, and writes nothing, when the file changed on disk. A
 // failure after the rename is returned and the hash is not remembered: the
 // new text is on disk but the caller did not apply it, so the file is
-// stale until a reload adopts it.
+// stale until a reload adopts it. Every error but ErrStale is ErrWrite.
 func (f *File) Write(text []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -95,7 +100,7 @@ func (f *File) Write(text []byte) error {
 		return ErrStale
 	}
 	if err := f.replace(text); err != nil {
-		return err
+		return &kinded{kind: ErrWrite, err: err}
 	}
 	f.sum = sha256.Sum256(text)
 	return nil

@@ -188,7 +188,19 @@ func TestWriteRealErrorsRemoveTheTempFile(t *testing.T) {
 	}
 	err = f.Write([]byte(head() + "# next\n"))
 	require.ErrorContains(t, err, "config: write: ")
+	require.ErrorIs(t, err, ErrWrite)
+	require.NotErrorIs(t, err, ErrStale)
+	assert.True(t, strings.HasPrefix(err.Error(), "config: write: "), "the kind adds no text")
 	assert.Empty(t, tempFiles(t, dir))
+
+	// A stale file is not a failed write.
+	p2 := writeConfig(t, t.TempDir(), head())
+	f2, _, err := Open(p2)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(p2, []byte(head()+"# by hand\n"), 0o600))
+	err = f2.Write([]byte(head()))
+	require.ErrorIs(t, err, ErrStale)
+	require.NotErrorIs(t, err, ErrWrite)
 }
 
 func TestWriteCrashPoints(t *testing.T) {

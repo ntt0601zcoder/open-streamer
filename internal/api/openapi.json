@@ -944,7 +944,7 @@
         }
       },
       "Internal": {
-        "description": "internal: anything else; the cause is in the server's log.",
+        "description": "config_write_failed (a write only): the edit was valid but the config file could not be written (a read-only directory, a full disk); message says why, and nothing was applied. internal: anything else; the cause is in the server's log.",
         "content": {
           "application/json": {
             "schema": {
@@ -1654,6 +1654,7 @@
               "invalid_spec",
               "precondition_required",
               "too_many_attempts",
+              "config_write_failed",
               "internal",
               "unavailable"
             ]

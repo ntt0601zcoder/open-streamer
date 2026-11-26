@@ -50,7 +50,8 @@ when the API edits the config (a temp file in the same directory, then a
 rename), so the service user must own the file **and its directory**: keep it
 in a directory such as `/srv/openstreamer`, not a root-owned `/etc`. In a
 container, mount that directory, not the single file: a bind-mounted file
-cannot be renamed over.
+cannot be renamed over. When the file cannot be written, an API edit answers 500
+`config_write_failed` with the reason, and nothing is applied.
 
 **YAML rules.** Anchors, aliases and merge keys (`&a`, `*a`, `<<:`) are not
 supported. Numbers are plain decimal integers (`720`, not `0720`, `720.0` or

@@ -781,6 +781,8 @@ func TestDirSyncFails(t *testing.T) {
 	})
 	res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", streamJSON("cam", "rtmp://src.example/live/cam", `{"hls":true,"dash":true}`))
 	require.Equal(t, http.StatusInternalServerError, res.code, res.body)
+	assert.Contains(t, res.body, `"code":"config_write_failed"`)
+	assert.Contains(t, res.body, "fsync: input/output error")
 	s.file.SetHook(nil)
 
 	// The new text is on disk and nothing was applied.
@@ -806,6 +808,43 @@ func TestDirSyncFails(t *testing.T) {
 	assert.False(t, s.status().Stale)
 	_, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true}), "")
 	require.NoError(t, err)
+}
+
+// A write that fails for a reason that is not a changed file says so, with
+// the reason, and applies nothing.
+func TestWriteFailsReadOnlyDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("the directory cannot be made read-only for this user")
+	}
+	text := baseText(streamYAML("cam", "{hls: true}"))
+	s := testConfig(t, func(su *setup) { su.Text = text })
+	gen := s.generation("cam")
+	dir := filepath.Dir(s.path)
+	require.NoError(t, os.Chmod(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	for _, res := range []response{
+		s.do(http.MethodPut, "/api/v1/streams/cam", "ops", streamJSON("cam", "rtmp://src.example/live/cam", `{"hls":true,"dash":true}`)),
+		s.do(http.MethodDelete, "/api/v1/streams/cam", "ops", ""),
+		s.putConfig(text + "# a comment\n"),
+	} {
+		require.Equal(t, http.StatusInternalServerError, res.code, res.body)
+		assert.Contains(t, res.body, `"code":"config_write_failed"`)
+		assert.Contains(t, res.body, "the config file could not be written: config: write: ")
+		assert.Contains(t, res.body, "permission denied")
+		assert.NotContains(t, res.body, "internal error")
+	}
+	assert.Equal(t, 3, strings.Count(s.logs.String(), "the config file was not written"), "logged once each")
+	assert.Equal(t, text, s.fileText())
+	got, _ := s.Get("cam")
+	assert.False(t, got.Outputs.DASH)
+	assert.Equal(t, gen, s.generation("cam"))
+	assert.False(t, s.status().Stale)
+
+	// Writable again, the same edit is applied.
+	require.NoError(t, os.Chmod(dir, 0o700))
+	res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", streamJSON("cam", "rtmp://src.example/live/cam", `{"hls":true,"dash":true}`))
+	require.Equal(t, http.StatusOK, res.code, res.body)
 }
 
 func TestHandEditThenWrite(t *testing.T) {

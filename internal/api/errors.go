@@ -27,6 +27,7 @@ const (
 	codeInvalidSpec  = "invalid_spec"
 	codePrecondReq   = "precondition_required"
 	codeTooMany      = "too_many_attempts"
+	codeWriteFailed  = "config_write_failed"
 	codeInternal     = "internal"
 	codeUnavailable  = "unavailable"
 
@@ -85,6 +86,14 @@ func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
 		// private: nothing changed, and the operator must be told why. Not
 		// logged here: the reload logged it.
 		writeError(w, http.StatusConflict, codeUnreadable, "the config file cannot be read: "+err.Error(), nil)
+	case errors.Is(err, config.ErrWrite):
+		// The edit was judged and then could not be written (a read-only
+		// directory, a full disk): nothing was applied, and the operator
+		// can act on the reason. A failure after the rename leaves the new
+		// text on disk, and then the next write says config_changed.
+		reason := logging.Scrub(err.Error())
+		a.log.Error("api: the config file was not written", "error", reason)
+		writeError(w, http.StatusInternalServerError, codeWriteFailed, "the config file could not be written: "+reason, nil)
 	case errors.As(err, &syntax):
 		// Its Error hides the values the YAML library quoted.
 		writeError(w, http.StatusBadRequest, codeBadRequest, syntax.Error(), nil)

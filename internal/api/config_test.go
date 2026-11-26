@@ -111,6 +111,7 @@ func TestConfigPut(t *testing.T) {
 		{&config.SyntaxError{Err: errors.New("yaml: cannot unmarshal !!str `hunter2` into int")}, http.StatusBadRequest, codeBadRequest, 0},
 		{config.Errors{errors.New("a"), errors.New("b"), errors.New("c")}, http.StatusUnprocessableEntity, codeInvalidConf, 3},
 		{errors.New("rename: disk full"), http.StatusInternalServerError, codeInternal, 0},
+		{fmt.Errorf("server: %w", errors.Join(config.ErrWrite, errors.New("config: write: open /srv/os/.c.tmp: read-only file system, rtsp://u:hunter2@h/a"))), http.StatusInternalServerError, codeWriteFailed, 0},
 	} {
 		e.be.configErr = c.err
 		rec = e.do(http.MethodPut, "/api/v1/config", with(editor, yamlBody(configText), ifMatch)...)
@@ -121,6 +122,11 @@ func TestConfigPut(t *testing.T) {
 		assert.Empty(t, rec.Header().Get("ETag"), "an error has no ETag")
 		assert.NotContains(t, rec.Body.String(), "hunter2")
 	}
+	// The last row: the reason is in the message, scrubbed, and logged once.
+	assert.Contains(t, errOf(t, rec).Message, "the config file could not be written: ")
+	assert.Contains(t, errOf(t, rec).Message, "read-only file system")
+	assert.Equal(t, 1, strings.Count(e.logs.String(), "the config file was not written"))
+	assert.NotContains(t, e.logs.String(), "hunter2")
 	// The body is never logged.
 	assert.NotContains(t, e.logs.String(), "secretkey")
 	assert.NotContains(t, e.logs.String(), "pbkdf2")
