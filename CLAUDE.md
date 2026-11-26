@@ -22,7 +22,7 @@ make fixtures     # sh testdata/fixtures/gen.sh
 make tools        # install golangci-lint v2.14.0
 ```
 
-## The server (M5a)
+## The server (M5a, M5b1)
 
 `cmd/openstreamer` is the server binary; `cmd/osdev` stays the development harness. `openstreamer -config FILE` runs it, `openstreamer hash-password` reads a password from stdin and prints its hash, `openstreamer -version` prints the version.
 
@@ -43,10 +43,11 @@ Packages of the control plane:
 - `internal/stream`: `Supervisor` (one goroutine per stream, mailbox, `View`/`Status` behind atomic pointers, rebuild with backoff, no reconciler) and `Manager` (the set, `Check`, listen claims, `copy://` cycles, `Replace`, the output lookups).
 - `internal/api`: the REST API on `net/http.ServeMux`, Basic auth and roles, the hand-written `openapi.json` (kept equal to the routes and the spec by tests).
 - `internal/metrics` (Prometheus text, `metricstest` for tests), `internal/logging` (slog with a scrubbing handler), `internal/server` (listeners, wiring, the apply path).
+- `internal/asset`: the flat asset directory `server.assets_dir` (images `.png`/`.jpg`/`.jpeg`, fonts `.ttf`/`.otf`; content checks, the font probe `ostranscoder -probe font`, quota, temp-file-and-rename writes, SHA-256 ETags), served as `GET /api/v1/assets` and `GET`/`PUT`/`DELETE /api/v1/assets/{name}` (raw `application/octet-stream` body; writes are editor-only). A `PUT` refreshes every running watermark that names the asset (`Manager.RefreshAsset`); a `DELETE` of an asset a stream names is 409 `asset_in_use`.
 
 **One apply path (R-D4).** A whole-config `PUT /api/v1/config` (the client's exact bytes), a per-stream `PUT`/`DELETE /api/v1/streams/{name}` (a node-tree edit of the text in force), and a reload (SIGHUP or `POST /api/v1/reload`, the file as on disk) all end in `server.apply`, under one mutex: parse and validate the whole document, `Manager.Replace` judges the streams, the file is written inside `Replace`'s commit (API edits only), the streams change, and the users are replaced when their section changed. An API write is refused with 409 while the file on disk differs from the text in force; nothing is half applied. A stream the start left stopped (a conflict, a failed `Check`) is tried again by every apply that leaves it unchanged (`Manager.plan`: `started`, or still stopped with the reason refreshed, never failing the edit). A reload of a file that cannot be read is 409 `config_unreadable` (`config.ErrUnreadable`); a write that fails for another reason than a changed file is 500 `config_write_failed` (`config.ErrWrite`).
 
-**Two routes of an edit (R-D6).** `spec.Diff` gives `ChangeNone` (untouched), `ChangeOutputs` (applied in place by the supervisor's `reattach`: packagers, output flags via `hub.Refuse`, pushes keyed by URL; nothing else is touched) or `ChangeRebuild` (the generation is torn down and rebuilt at once). An input edit is a rebuild until M5b.
+**Three outcomes of an edit (R-D6, R-E2).** `spec.Diff` gives `ChangeNone` (untouched) or one of: `ChangeOutputs` (applied in place by the supervisor's `reattach`: packagers, output flags via `hub.Refuse`, pushes keyed by URL; nothing else is touched); `ChangeLive` (inputs and/or the watermark, maybe outputs: `Pipeline.SetInputs` swaps the inputs between two frames, keeping matched readers, at most one epoch change; `Transcoder.SetWatermark` swaps the picture, the old one stays on failure with `watermark: …` in `last_error`; `Supervisor.Refresh` rebuilds the watermark from the assets); or `ChangeRebuild` (the generation is torn down and rebuilt at once). The API answers `outputs`, `live` or `rebuild`.
 
 ## v1 is reference only
 
@@ -63,7 +64,7 @@ The v1 code lives on `main`. Read it with `git show main:<path>`; never copy it 
 - `hub.Write` never blocks, under any subscriber behaviour.
 - Audio frames always have `Key == true` and `RASL == false`.
 - Video `Frame.Data` never contains VPS, SPS, PPS or AUD NAL units; they live only in `TrackConfig`.
-- `internal/transcode/picture` is pure Go; operator text never enters a libavfilter graph string.
+- `internal/transcode/picture` is pure Go; operator text never enters a libavfilter graph string; an operator's font reaches the child as bytes, never as a path.
 - Fixtures are opened from tests as `../../testdata/fixtures/<name>` (or `../../../` from deeper packages).
 
 ## Conventions

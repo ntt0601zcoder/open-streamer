@@ -356,10 +356,12 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   later Frames refer to the ID. `Stats` carries the counters `In`, `Out`,
   `EncodeNanos`, `DroppedTracks`, `Reanchors`, `AudioDropped`, `AudioCorrupt`
   and `VideoCorrupt` (ruling R-T6a), and `EncoderFallbacks`, `Thumbnails` and
-  `ThumbnailsFailed`. The wire is version 2 (R-C13): every field version 2
-  added is absent when empty, so a Configure of x264 rungs with no watermark
-  and no thumbnail has version 1's bytes. The host rejects a child whose
-  Hello version differs, so server and bundle are deployed together.
+  `ThumbnailsFailed`. The wire is version 3 (R-C13; M5b1's R-E12): version
+  2 added the watermark and the thumbnails, version 3 a rung's `no_fallback`,
+  the watermark's font bytes and an Error's code. Every field added since
+  version 1 is absent when empty, so a Configure of x264 rungs with no
+  watermark and no thumbnail has version 1's bytes. The host rejects a child
+  whose Hello version differs, so server and bundle are deployed together.
 - **Time.** The host adds the rendition delay D = 45000 ticks (0.5 s, ruling
   R-M4c) to every frame and anchor of every rendition, copy tracks included,
   so renditions stay aligned with each other. D covers the encoder's reorder
@@ -490,9 +492,18 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   a respawn) tries NVENC again. The driver's session limit, sessions held by
   another process, a resolution below NVENC's minimum, a card without
   B-frames, a missing driver and a build without the encoder all end in this
-  fallback; a rung or a stream is never failed for them. `ostranscoder
-  -probe nvenc` opens and closes one NVENC encoder and exits 0 (`nvenc: ok`)
-  or 3 (`nvenc: <error>`).
+  fallback; a rung or a stream is never failed for them, unless the rung
+  sets `no_fallback` (M5b1's R-E9, valid only with `encoder: nvenc`). Then a
+  failed NVENC open fails the build, and since a build opens every rung or
+  none, the whole ladder: the child sends `Error{Rung, Code:
+  ErrorEncoderRefused, Fatal: true}` and exits 1, and the host counts
+  `Stats.EncoderRefusals` (once per refused build; the metric
+  `openstreamer_transcoder_encoder_refusals_total{stream}` and the status's
+  `transcoder.encoder_refusals`), ends the exit error with the child's
+  message and respawns by its backoff. No software frame is produced for any
+  rung of that ladder, whose outputs carry nothing until NVENC opens.
+  `ostranscoder -probe nvenc` opens and closes one NVENC encoder and exits 0
+  (`nvenc: ok`) or 3 (`nvenc: <error>`).
 - **Watermark (M4c).** It is drawn once, on the decoded picture before the
   ladder (R-C5), so every encoded rung carries it, scaled with the picture.
   A copy rung cannot carry it, so `New` and `SetWatermark` reject a
@@ -515,15 +526,24 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   building a text watermark first removes this user's `ostx-wm-<pid>-*`
   directories whose PID no process has), with `expansion=none` and the
   text read from a `textfile` that the child rewrites atomically (`reload=1`
-  when the text has a time directive). Operator text never enters a
+  when the text has a time directive). Since M5b1 the font may be an
+  operator's (R-E8): the spec's `font` names a font asset, for text only; the host
+  checks it with `picture.CheckFont` and sends its bytes in the watermark
+  (wire field 7), never a path, and the child writes them to `font.ttf` in
+  that directory, the path the graph already names. The child sets
+  `FONTCONFIG_FILE` to a directory, so drawtext never falls back to a system
+  font. A font's bytes are immutable and shared, never copied by
+  `cloneWatermark` or the supervisor. Operator text never enters a
   filter-graph string: the graph is built only from numbers and the paths
   the child makes, and a temp path with a character outside
   `[A-Za-z0-9_./-]` is refused. Images come from an asset library, a
   directory (R-C8): an asset name matches
   `^[a-z0-9][a-z0-9_-]{0,63}\.(png|jpg|jpeg)$` and the file is read once at
   stream start by `picture.LoadAsset`; `transcode.Options` and the wire
-  carry the bytes, so the transcoder never sees a path, and a changed file
-  is not reloaded. Live update (R-C9): `Transcoder.SetWatermark` sends one
+  carry the bytes, so the transcoder never sees a path. A file replaced
+  through the asset API is reloaded at once (R-E7); one changed by hand only
+  at the stream's next build, live edit or API replacement. Live update
+  (R-C9): `Transcoder.SetWatermark` sends one
   SetWatermark message and the child swaps its filter graph at the next
   decoded picture, with no drain, no IDR and no epoch. The host keeps the
   latest watermark and sends it in the next child's Configure, so a
@@ -637,11 +657,49 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   long-lived part returns, or building fails, the supervisor rebuilds the
   generation after 1 s, doubling up to 30 s, back to 1 s once a generation
   has lived 60 s. A panic is not recovered.
-- **Edits** (R-D6): changing the output set is applied in place; changing
-  inputs is applied in place from M5b; any other change rebuilds the
-  stream's pipeline. `spec.Diff` makes the choice, so there are two routes
-  and no field-by-field routing. This replaces v1's diff routing, which
-  caused most lifecycle and config findings.
+- **Edits** (R-D6; M5b1's R-E2 and R-E3): `spec.Diff` gives a running stream
+  one of three outcomes, with no field-by-field routing (v1's diff routing
+  caused most lifecycle and config findings): `outputs` when only the
+  output set changed (applied in place), `live` when the inputs or the
+  watermark changed and maybe the outputs, nothing else (the supervisor
+  hands the inputs to `Pipeline.SetInputs` and the watermark to
+  `Transcoder.SetWatermark`, and reattaches the outputs), and `rebuild` for
+  anything else (the stream's pipeline is rebuilt). `SetInputs` is applied
+  between two frames and matches old and new entries by URL text, in order:
+  a kept entry keeps its reader, its listen socket and its retry time and
+  is never reopened, a removed one is closed, and an added one is opened as
+  `Run` would open an input in that position. A kept active input stays
+  active at its new index with no epoch change, while a removed active input
+  is closed as at a failure, without `EventFailed`, and the first frame of
+  the input that takes over is exactly one epoch change, counted as one
+  switch. Between the two the hub is silent (a new pull input's connect
+  time, up to the 10 s retry interval when only inputs in backoff are
+  left), so an operator who wants no gap adds the new input first, waits
+  for the fail-back, then removes the old one.
+- **Assets** (M5b1's R-E5 to R-E7, `internal/asset`): an asset is a regular
+  file directly in `server.assets_dir`, either an image (`.png`, `.jpg`,
+  `.jpeg`: at most 1 MiB and 2048 px per side, decoding in full as the
+  format its extension names) or a font (`.ttf`, `.otf`: at most 24 MiB,
+  passing `picture.CheckFont` and, with a configured transcoder,
+  `ostranscoder -probe font`, whose own verdict alone refuses a font); there
+  is no metadata file and no subdirectory, so files copied in by hand are
+  assets too, and the directory holds at most 256 assets and 512 MiB. A
+  write is a temp file, `fsync`, rename and directory `fsync`, and the
+  entity tag is the first 16 hex digits of the bytes' SHA-256.
+  `GET /api/v1/assets` (viewer) lists them, each with the streams that name
+  it; `GET`, `PUT` and `DELETE /api/v1/assets/{name}` read one (viewer),
+  create or replace it from a raw `application/octet-stream` body with
+  optional `If-Match` or `If-None-Match: *` (editor), and remove it
+  (editor). A name outside the rule is 404, content the name does not allow
+  422, a body over its kind's limit 413, a full directory 507, a probe that
+  could not run 503; at most two uploads are read at once, each under its
+  own read deadline of 30 s plus 1 s per 256 KiB of its kind's limit. A
+  replacement makes every running stream that names the asset build its
+  watermark again (`Manager.RefreshAsset`, through `Supervisor.Refresh`) and
+  retries the streams left stopped that name it, and the answer reports
+  both; a delete is refused with 409 `asset_in_use` while any stream of the
+  config names the asset, and the check and the removal run under the apply
+  mutex, while an upload's read, checks and probe run outside it.
 - **Failover:** the supervisor switches to the next healthy input by priority.
   The switch is an epoch change and nothing else; the transcoder keeps running.
 - **API** (R-D7, `internal/api`): REST under `/api/v1` on `net/http.ServeMux`
@@ -729,6 +787,7 @@ internal/transcode/    host side of the transcoder: supervisor, epoch map, DTS m
 internal/spec/         the stream document: validation, redaction, ETag, Diff
 internal/config/       the one YAML config file: parse, node edits, atomic writes
 internal/auth/         users, PBKDF2 password hashes, the failed-login limiter
+internal/asset/        the asset directory: images and fonts, checks, quota, atomic writes
 internal/stream/       supervisor and manager
 internal/api/          REST API and its OpenAPI document
 internal/server/       the openstreamer process: listeners, wiring, the apply path
@@ -753,7 +812,8 @@ before the code they check.
 | M4b ([plan](superpowers/plans/2026-11-25-m4b-abr-outputs.md), done) | ABR outputs: the transcoder's presentation hub with its keyframe barrier, the segmenter's `AlignVideo` (a rung that misses a segment start lists a gap), the packager's ABR mode (HLS TS variants under a multivariant playlist, the HLS fMP4 master, DASH Representations in one video set), `osconform`'s ABR rules (variants aligned, BANDWIDTH honest), osdev's `<name>_abr` | M4a | A ladder is served as one ABR presentation that passes M3's scenarios. Proved by `TestM4bMatrix` (steady-state, epoch-change, slow-consumer, no-B-frames, B-frames, and 15 fps and 10 fps sources, whose encoders trail by 2 s and 3 s of stream time, each read back over HLS TS, HLS fMP4 and DASH with the ABR rules, every frame once, discontinuities at the same media sequence number in every playlist), `TestM4bSwitchTS` (segments from alternating TS variants decode as one stream), `TestM4bRespawn` (the clip fed twice; a killed child is exactly one new epoch, at one media sequence number in every variant, opened by rung 0's IDR), `TestM4bRungGap` (a rung whose IDR a loss swallowed lists a gap, end to end), `TestM4bPlayers` (ffprobe, VLC and GStreamer; GStreamer DASH on 1.28 only, ruling R-B9), the segmenter, transcoder, packager, conform and osdev suites, and the `transcode-e2e-arm64` CI job (`TestM4bMatrix`, `TestM4bRespawn`, `TestM4bSwitchTS`, `TestM4bRungGap`) |
 | M4c ([plan](superpowers/plans/2026-11-25-m4c-picture-features.md), done) | Picture features: NVENC rungs (`h264_nvenc`, chosen per rung, with a per-rung fallback to libx264), the watermark (text with time directives, or an image from the asset library) drawn before the ladder and updated live, thumbnails from the decoder for transcoded, copy-video and passthrough streams, wire version 2, osdev's `-watermark`, `-thumbnail` and `/live/<name>/thumbnail.jpg`, and the root cause of R-T7b' | M4a | On the GPU host (this machine, a GTX 1650): the same ladder with 3 NVENC rungs, run by a make target and recorded in the PR. The watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams. Proved by `TestM4cNVENCMatrix`, `TestM4cNVENCProbe` and `TestM4cNVENCSessions` (run by `make test-nvenc`, evidence below), `TestM4cWatermarkEveryRung`, `TestM4cWatermarkABR`, `TestM4cThumbnailsTranscoded`, `TestM4cThumbnailsPassthrough` and `TestM4cThumbnailsCopyVideo`, with `TestM4cWatermarkLiveUpdate`, `TestM4cWatermarkRespawn`, `TestM4cFrozen` (no watermark, no thumbnails and x264 rungs give M4b's output), the picture, native, transcode and osdev suites, and the `transcode-e2e-arm64` CI job |
 | M5a ([plan](superpowers/plans/2026-11-26-m5a-control-plane-core.md), done) | Control-plane core: the stream document (`internal/spec`), one YAML config file for server settings, users and streams (`internal/config`) with atomic rewrites and reload on SIGHUP, the per-stream supervisor with in-place output edits, the manager, the REST API with Basic auth and two roles (`internal/auth`), its whole-config editor and its OpenAPI document, Prometheus metrics (with `EncoderFallbacks`), redacted JSON logs, `cmd/openstreamer` and its config, and the product names of a ladder (R-D3) | M2, M3, M4 | A spec created over the API serves every output; editing outputs does not interrupt other outputs; a restart restores every stream. Proved by `TestM5aEveryOutput`, `TestM5aEditOutputs` (each output switched off and on while a reader of every other output must hold every hub frame once), `TestM5aConfigPut` (the same through the whole-config editor, comments kept), `TestM5aReload`, `TestM5aHandEditThenWrite`, `TestM5aRebuildIsTheOtherRoute`, `TestM5aRestartRestores`, `TestM5aLadder`, `TestM5aPeers`, `TestM5aNoSecretsLeak` and `TestM5aRoles`, with the spec, config, auth, stream, api, metrics, logging and server suites |
-| M5b | Live edits and assets: a running pipeline's inputs changed in place, the watermark edited in place over the API, the asset API (upload, listing, replacement; R-C8) with operator fonts (R-C7), a rung that refuses the x264 fallback (wire version 3), audio language in the spec, the HLS masters and the MPD | M5a | Replacing a running stream's inputs is exactly one epoch change and ends no output session; an uploaded image and font appear on every rung; a strict NVENC rung fails instead of falling back and is counted; `osconform` reads the languages |
+| M5b1 ([plan](superpowers/plans/2026-11-26-m5b1-live-edits-assets.md), done) | Live edits and assets: a running pipeline's inputs edited in place, the live watermark edit, the asset API (upload, listing, replacement; R-C8) with operator fonts (R-C7), `no_fallback` on an NVENC rung (wire version 3), and M5a's three carry items (`TestManagerConcurrentReplaces` on held sockets, error lists capped, the listener notes in the README) | M5a | Replacing a running stream's inputs is exactly one epoch change and ends no output session; an uploaded image and font appear on every rung; a strict NVENC rung fails instead of falling back and is counted. Proved by `TestM5b1ReplaceInputs`, `TestM5b1ReplaceInputsLadder`, `TestM5b1Assets` and `TestM5b1NoFallback`, with the pipeline, spec, asset, transcode, native, stream, api and server suites |
+| M5b2 | Audio language: the spec field, the HLS masters' `LANGUAGE`, the MPD's `lang`, M4b's multi-audio minors | M5a | `osconform` reads the languages |
 | M5c | Transport security: HTTPS for the API and the HTTP outputs, RTMPS (listen, pull, push), RTSPS and SRTP, SRT encryption (input and output), credentials in URL paths and queries redacted, secrets as write-only spec fields | M5a | ffmpeg publishes and plays over each secured protocol against our server; no secret appears in a response, a log or a metric |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5a | Feature tests; DVR playback passes `osconform` |
 | M7 | Cutover | M1–M6 | The [soak plan](SOAK_TEST_PLAN.md) runs for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
@@ -935,7 +995,7 @@ Out of M4b:
 |---|---|
 | AVERAGE-BANDWIDTH and FRAME-RATE in the masters | R-B5: BANDWIDTH is the window's peak; add on demand |
 | I-frame playlists (`EXT-X-I-FRAME-STREAM-INF`) | Trick play is not a v2.0 goal |
-| Several audio languages | Neither the masters nor the MPD carry a language (no `LANGUAGE`, no `lang`), and every TS variant muxes every audio track; language selection comes with M5b's audio language in the stream spec |
+| Several audio languages | Neither the masters nor the MPD carry a language (no `LANGUAGE`, no `lang`), and every TS variant muxes every audio track; language selection comes with M5b2's audio language in the stream spec |
 | ABR over RTMP, RTSP, SRT and HTTP-TS | Single-rendition protocols: each rendition stays its own stream, `<name>_<label>`, and the product serves rendition 0 as `<name>` there (M5a's R-D3); R-B2 |
 | LL-HLS | Not part of the M4b row, as for M3 |
 | Product naming of the presentation | Done in M5a (R-D3): the product serves the presentation as `<name>` on HLS and DASH and has no `<name>_abr`; osdev keeps `<name>_abr` (R-B2) |
@@ -1095,30 +1155,31 @@ Out of M4c:
 | NVENC reference B-frames (`b_ref_mode`) | R-C3: disabled always, as `b-pyramid=none` on x264 (R-T7b'); Backlog |
 | The full-GPU path (cuvid, `scale_cuda`, `overlay_cuda`) | R-C2: frames stay on the CPU; needs a watermark that renders on the GPU; Backlog |
 | HEVC and AV1 NVENC | Rungs encode H.264 only; add on demand |
-| An operator font, and non-Latin text | R-C7: the embedded DejaVu Sans only, so CJK and Arabic shaping render as empty boxes; Backlog |
+| An operator font, and non-Latin text | R-C7: the embedded DejaVu Sans only, so CJK and Arabic shaping render as empty boxes; operator fonts done in M5b1 (R-E8) |
 | Several watermarks, colours, rotation, tiling | R-C6: one watermark, white text with a black border or an image |
 | A watermark on a copy rung | R-C5: `New` rejects it; a branded source resolution needs one more encoded rung |
 | Thumbnail history, sprite sheets, files | R-C10: the latest shot only, in memory |
-| The asset API (upload, listing, replacement) | M5b, in front of the same directory (R-C8) |
-| Metrics for `EncoderFallbacks` | Done in M5a: `openstreamer_transcoder_encoder_fallbacks_total{stream}` (R-D9); refusing the fallback is M5b |
+| The asset API (upload, listing, replacement) | Done in M5b1, in front of the same directory (R-C8; R-E5 to R-E7) |
+| Metrics for `EncoderFallbacks` | Done in M5a: `openstreamer_transcoder_encoder_fallbacks_total{stream}` (R-D9); refusing the fallback is done in M5b1 (`no_fallback`, R-E9) |
 | NVENC in CI | The runners have no NVIDIA device; `make test-nvenc` is run by hand on this host (R-C12) |
 
-M5 runs in three parts (ruling R-D1 of the M5a plan). M5a is the
+M5 runs in three parts (ruling R-D1 of the M5a plan), and M5b in two
+(ruling R-E1 of the M5b1 plan). M5a is the
 control-plane core and delivers the old M5 row's exit criterion: the spec,
 the one config file with its users, the supervisor, the manager, the API
 with its config editor, metrics (with `EncoderFallbacks`), logs,
-`cmd/openstreamer`, and the product names of a ladder. M5b, live edits and
+`cmd/openstreamer`, and the product names of a ladder. M5b1, live edits and
 assets: a running pipeline's inputs changed in place (`Pipeline.SetInputs`,
-§3.6), the watermark edited in place over the API (`Transcoder.SetWatermark`
-exists), the asset API (R-C8) with operator fonts (R-C7), a rung that refuses
-the x264 fallback (wire version 3), and audio language in the spec, the HLS
-masters and the MPD. M5c, transport security: HTTPS for the API and the HTTP
+§3.6), the watermark edited in place over the API (`Transcoder.SetWatermark`),
+the asset API (R-C8) with operator fonts (R-C7), and a rung that refuses
+the x264 fallback (wire version 3). M5b2, audio language in the spec, the
+HLS masters and the MPD. M5c, transport security: HTTPS for the API and the HTTP
 outputs, RTMPS (listen, pull, push), RTSPS with SRTP by its own ruling, SRT
 encryption (input and output), redaction of credentials in URL paths and
 queries (the M2c note), and secrets as write-only spec fields. M6 and the M7
-soak need only M5a; M5b and M5c may run beside M6. Until M5b an input edit
-rebuilds the stream (R-D6), and assets are files the operator copies into a
-directory; until M5c the Basic credentials and every stream key cross the
+soak need only M5a; M5b2 and M5c may run beside M6. Until M5b1 an input
+edit rebuilt the stream (R-D6), and assets were files the operator copied
+into a directory; until M5c the Basic credentials and every stream key cross the
 network in clear, so the API listens on loopback by default (R-D8).
 
 M5a's rulings are in its plan: R-D2 (one binary, one config file), R-D3
@@ -1152,14 +1213,33 @@ Out of M5a:
 
 | Item | Reason |
 |---|---|
-| Inputs edited in place, the live watermark edit, the asset API, operator fonts, refusing the x264 fallback | M5b; until then an input edit rebuilds the stream (R-D6) and assets are files in `server.assets_dir` |
-| Audio language | M5b |
+| Inputs edited in place, the live watermark edit, the asset API, operator fonts, refusing the x264 fallback | Done in M5b1; until then an input edit rebuilt the stream (R-D6) and assets were files in `server.assets_dir` |
+| Audio language | M5b2 |
 | HTTPS, RTMPS, RTSPS and SRTP, SRT encryption, credentials in URL paths or queries, write-only secrets | M5c; until then the API listens on loopback by default (R-D8) |
 | `PATCH` and per-field edits | R-D7: a stream is replaced whole by `PUT`, or the whole config |
 | Histograms and per-stream session counts | R-D9; per-stream sessions are M6's |
 | Applying a `server` change without a restart | R-D4: reported as `restart_required` |
 | A user API, more roles, sessions or tokens instead of Basic auth | R-D8: users change only with the whole config |
 | Config history | R-D4: an overwritten config is gone |
+
+M5b1's rulings are in its plan: R-E1 (the split of M5b), R-E2 (`ChangeLive`),
+R-E3 (`Pipeline.SetInputs`), R-E4 (the live watermark edit), R-E5 to R-E7
+(the asset model, its API, replacement and deletion under running streams),
+R-E8 (operator fonts), R-E9 (`no_fallback`), R-E10 (the proof), R-E11
+(listeners fixed at start) and R-E12 (one wire bump); the design is §3.5 and
+§3.6.
+
+Out of M5b1:
+
+| Item | Reason |
+|---|---|
+| Audio language | M5b2 |
+| Hot-reloadable listeners | R-E11: a `server` change still needs a restart, so adding a listener and its first output takes two steps |
+| Asset versions and metadata | R-E5: the directory is the model; a replaced asset is gone |
+| Multipart uploads | R-E6: a raw `PUT` body; a UI uploads with `fetch` |
+| A `no_fallback` rung that fails alone | R-E9: a build opens every rung or none, so one strict rung fails the whole ladder |
+| Font collections and WOFF | R-E8: `.ttc` and WOFF are refused; a CJK collection needs a single-face file |
+| A replace of the active input without a gap | R-E3: add the new input, wait for the fail-back, then remove the old one |
 
 M2 is split in three parts:
 
@@ -1187,7 +1267,7 @@ Out of M2a:
 | Packed-audio HLS renditions | `.aac` segments with ID3 timestamps |
 | Single-file fMP4 HLS | `EXT-X-MAP` with `BYTERANGE` |
 | A video-only mode when an HLS audio rendition stalls | The stall fails the whole input |
-| Changing a running pipeline's inputs in place | §3.6; M5b's supervisor adds it (in M5a an input edit rebuilds the stream) |
+| Changing a running pipeline's inputs in place | §3.6; done in M5b1 (`Pipeline.SetInputs`, R-E3; in M5a an input edit rebuilt the stream) |
 | Reordered access units packed in one PES | Dropped until M2c's `pkg/h26x` gives their picture order counts (done in M2c) |
 | Dropping video to the next keyframe after a TS loss | Frames after the lost one pass through: decoders conceal, and a lossy feed would otherwise freeze |
 | A late join with an inter-track skew above the 2 s backward-jump limit | Loses one GOP once, at start-up |
@@ -1262,7 +1342,10 @@ Items accepted for later, not yet placed in a milestone:
 - **Split `internal/e2e` by milestone, or run the transcode scenarios in their
   own job.** The package alone took over 10 min on the 2-core runners (CI run
   45755846031), so `make test` and `make cover` now allow 20 min; a split
-  would bring the per-package time back down.
+  would bring the per-package time back down. With M5b1's four scenarios
+  the package took 342 s on this 8-core host, in four runs of 340 to
+  342 s (local; CI figure recorded at push); R-E10 splits it before a merge
+  when CI reads above 17 min.
 
 - **Per-input RTSP sync mode** (`?sync=sr|initial`): `sr` (the default) keeps
   M2c's confirmed sender-report rule; `initial` uses sender reports only for
@@ -1364,15 +1447,29 @@ Items accepted for later, not yet placed in a milestone:
   `h264_nvenc`, with `overlay_cuda`, so the decode, the scalers and the
   per-rung upload leave the CPU and the bus. It needs a watermark that
   renders on the GPU, and thumbnails taken from GPU frames.
-- **Operator fonts for the watermark** (R-C7). Text renders only with the
-  embedded DejaVu Sans, so glyphs outside it (CJK, Arabic shaping) are empty
-  boxes. Let an operator pick a font from the asset library (M5b's API in
-  front of the same directory).
+- **Operator fonts for the watermark (closed in M5b1**, R-E8). The
+  watermark's `font` names a font asset, uploaded through the asset API and
+  probed by the child's FreeType; shaping and glyph coverage are the font's
+  and the FFmpeg build's.
 - **A fallback to libx264 can overload a host sized for NVENC** (R-C4):
   the overflow silently pays CPU for every rung that fell back. The count is
   exported since M5a (`openstreamer_transcoder_encoder_fallbacks_total`,
-  beside `Stats.Child.EncoderFallbacks` and the child's warning); letting a
-  stream refuse the fallback is M5b's.
+  beside `Stats.Child.EncoderFallbacks` and the child's warning). Letting a
+  stream refuse the fallback is closed in M5b1 (`no_fallback`, R-E9); what
+  remains is the overload on a host whose rungs allow the fallback.
+- **A replaced active input leaves the hub silent until its successor
+  delivers (R-E3).** A new pull input's connect time, nothing when the
+  successor was already probing, up to `RetryInterval` (10 s) when only kept
+  inputs in backoff are left; players see a discontinuity. The workaround is
+  to add the new input, wait for the fail-back hold, then remove the old one.
+- **A font that passes the probe and fails later respawns the child until
+  the watermark is edited (R-E8).** A watermark the child cannot build is
+  fatal (R-C9), so FreeType failing on later text crash-loops the ladder.
+- **A refused ladder retries every 5 s for ever (R-E9).** On a host whose
+  GPU is gone, a `no_fallback` ladder spawns, decodes to its first picture
+  and exits every 5 s; `encoder_refusals` and `last_error` are the signs.
+- **Hand-copied assets reach a running stream only at its next build, edit
+  or API replacement (R-E7).** Nothing watches the directory.
 - **HLS `MEDIA-SEQUENCE` and the DASH timeline go backwards on the same
   URL** (M5a's R-D5, R-D6). A rebuild, for an edit or a failure, and a
   process restart start a new packager, so a player that stayed on the URL
@@ -1747,9 +1844,9 @@ Items accepted for later, not yet placed in a milestone:
   anyway); the doc should say that struct fields are not scrubbed by name
   (a `Password` field in a URL-less struct passes).
 - spec: `redact.Masked` refuses any RTMP stream key that ends in the mask
-  (a false positive); a full
+  (a false positive); ~~a full
   `layout` list (`video` and `audio`) is not normalised to the empty one, so
-  that edit rebuilds needlessly.
+  that edit rebuilds needlessly~~ (done in M5b1, R-E2).
 - hub: `Refuse("")` refuses everything and is unguarded (no caller passes
   it); `TestRefuseRace` asserts only that nothing panics.
 - auth: `TestLimiterRefusedReserveEvictsNothing` passes trivially.
@@ -1760,8 +1857,8 @@ Items accepted for later, not yet placed in a milestone:
   config path hangs `Open`; the `Unwrap` of its errors relies on how
   `spec.Validate` wraps.
 - stream: a thumbnail-only child reports PID 0; an 8-hex push ID collision
-  would make the scrape fail with 500; a stale input error may survive an
-  edit that clears it; `serve` drains the whole mailbox before it checks
+  would make the scrape fail with 500; ~~a stale input error may survive an
+  edit that clears it~~ (done in M5b1); `serve` drains the whole mailbox before it checks
   its context; the manager takes two
   snapshots per scrape; the claim normalisation lacks tests for a reserved
   `::` and for `localhost`.
@@ -1772,6 +1869,55 @@ Items accepted for later, not yet placed in a milestone:
 **Note for the user:** make the `transcoder-amd64`, `transcoder-arm64` and
 `transcode-e2e-arm64` CI jobs required checks on the `rebuild` and `main`
 branches. That is a repository setting, which no commit can change.
+
+#### M5b1 deferred minors
+
+- spec:
+  - an image error is reported before a font's "needs text".
+- pipeline:
+  - other `stepTo` tests may share the fake-clock timer race (unaudited).
+- picture:
+  - seed `FuzzCheckFont` with the fixture, an `OTTO` and a 12-byte header;
+  - doubled `picture:` error prefix;
+  - `CheckFont` accepts overlapping or duplicate tables (directory only).
+- native and cmd/ostranscoder:
+  - the NVENC opt-in gate exists in four copies.
+- transcode host:
+  - a test note on the wire carriage of `NoFallback`;
+  - control characters in a child's fatal message are not stripped;
+  - `TestRefusalCounted` takes zero `FramesOut` as "no software frame".
+- asset:
+  - `Delete`'s doc should say an `ErrWrite` can follow the remove;
+  - Windows reserved names (`con.png`) are allowed.
+- stream, live edits:
+  - comment the window of the `input ` prefix clear (live.go:116);
+  - doubled `watermark: … watermark:` prefix;
+  - a successful `SetInputs` does not clear an `inputs: ` error;
+  - `applyWatermark` logs and returns;
+  - no test of a watermark failure and an inputs success in one edit;
+  - `plan` calls `spec.Diff` twice.
+- stream, assets:
+  - `Refreshed.OK`'s comment: the transcoder took the bytes, not the child;
+  - the concurrent test should count outcomes per kind;
+  - `RefreshAsset` posts refreshes when its context is already done;
+  - no scrub test, no stopped-at-load `AssetUsers` row;
+  - the watermark log is not per child.
+- stream, test helpers (`leases`):
+  - the `held()` comment overstates;
+  - the initial create is not routed through the `inUse` watch;
+  - the port-prefix heuristic;
+  - `Live()` lags the holder briefly.
+- api:
+  - a duplicate `capped` helper (config has one);
+  - no slot-wait timeout test, no guard that `WriteTimeout` exceeds 30 s;
+  - a waiter on a real connection misses its client's hang-up;
+  - the deadline tests' margins (base 2 s);
+  - release upload slots in `t.Cleanup`;
+  - `ErrTooLarge` on `GET` and `DELETE` (404 or 409?);
+  - a `MaxBytesReader` comment;
+  - no test that a panic releases the slot.
+- testpeer:
+  - filter the peer list by an untagged `go list`, not a guard test.
 
 ### Carried from M1
 
