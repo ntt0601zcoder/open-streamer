@@ -538,11 +538,12 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   the child makes, and a temp path with a character outside
   `[A-Za-z0-9_./-]` is refused. Images come from an asset library, a
   directory (R-C8): an asset name matches
-  `^[a-z0-9][a-z0-9_-]{0,63}\.(png|jpg|jpeg)$` and the file is read once at
-  stream start by `picture.LoadAsset`; `transcode.Options` and the wire
-  carry the bytes, so the transcoder never sees a path. A file replaced
-  through the asset API is reloaded at once (R-E7); one changed by hand only
-  at the stream's next build, live edit or API replacement. Live update
+  `^[a-z0-9][a-z0-9_-]{0,63}\.(png|jpg|jpeg)$` and the file is read by
+  `picture.LoadAsset` at each build, watermark edit or refresh;
+  `transcode.Options` and the wire carry the bytes, so the transcoder never
+  sees a path. A file replaced through the asset API is reloaded at once
+  (R-E7); one changed by hand only at the stream's next build, watermark
+  edit (an edit that changes the watermark) or API replacement. Live update
   (R-C9): `Transcoder.SetWatermark` sends one
   SetWatermark message and the child swaps its filter graph at the next
   decoded picture, with no drain, no IDR and no epoch. The host keeps the
@@ -1875,10 +1876,18 @@ branches. That is a repository setting, which no commit can change.
 - spec:
   - an image error is reported before a font's "needs text".
 - pipeline:
-  - other `stepTo` tests may share the fake-clock timer race (unaudited).
+  - other `stepTo` tests may share the fake-clock timer race (unaudited);
+  - an edit during the layout wait (nil `Layout` only) parks a moved
+    attempt until `layoutAt`;
+  - `SetInputs` before `Run` opens the original inputs first;
+  - test gap: removing an active passive input (verified correct by
+    overlay in the final review);
+  - test gaps: duplicates with one copy active, and `SetInputs` under a
+    paced active input;
+  - `SetInputs(nil)` after `Run` returns "no input" rather than
+    `ErrNotRunning`.
 - picture:
   - seed `FuzzCheckFont` with the fixture, an `OTTO` and a 12-byte header;
-  - doubled `picture:` error prefix;
   - `CheckFont` accepts overlapping or duplicate tables (directory only).
 - native and cmd/ostranscoder:
   - the NVENC opt-in gate exists in four copies.
@@ -1890,8 +1899,7 @@ branches. That is a repository setting, which no commit can change.
   - `Delete`'s doc should say an `ErrWrite` can follow the remove;
   - Windows reserved names (`con.png`) are allowed.
 - stream, live edits:
-  - comment the window of the `input ` prefix clear (live.go:116);
-  - doubled `watermark: … watermark:` prefix;
+  - comment the window of the `input ` prefix clear (in `applyLive`);
   - a successful `SetInputs` does not clear an `inputs: ` error;
   - `applyWatermark` logs and returns;
   - no test of a watermark failure and an inputs success in one edit;
@@ -1899,9 +1907,10 @@ branches. That is a repository setting, which no commit can change.
 - stream, assets:
   - `Refreshed.OK`'s comment: the transcoder took the bytes, not the child;
   - the concurrent test should count outcomes per kind;
-  - `RefreshAsset` posts refreshes when its context is already done;
   - no scrub test, no stopped-at-load `AssetUsers` row;
-  - the watermark log is not per child.
+  - the watermark log is not per child;
+  - `loaded_at` moves on a retry (consistent with `PutStream`);
+  - a refresh answers ok when the spec has no watermark (harmless).
 - stream, test helpers (`leases`):
   - the `held()` comment overstates;
   - the initial create is not routed through the `inUse` watch;
