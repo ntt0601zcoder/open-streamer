@@ -1509,3 +1509,75 @@ func TestTSMasterAudioLanguage(t *testing.T) {
 		assert.Contains(t, string(body), "#EXTINF:")
 	})
 }
+
+// TestAudioLanguageConforms is the writer x conform matrix: every master and
+// MPD the packager writes with a declared language reads back through
+// conform, expecting that language, with no audio-language violation and
+// exactly that language read.
+func TestAudioLanguageConforms(t *testing.T) {
+	const lang = "vi"
+	// twoAudioLadder is synthLadder's ladder with its audio track copied onto
+	// a second audio track, packaged in ABR mode.
+	twoAudioLadder := func(t *testing.T, opt Options) *Packager {
+		t.Helper()
+		audio := len(ladderSizes)
+		var ds []hub.Delivery
+		for _, d := range synthLadder(t, 1, 0, 250) {
+			ds = append(ds, d)
+			if d.Frame.Track == audio {
+				d.Frame.Track = audio + 1
+				ds = append(ds, d)
+			}
+		}
+		opt.ABR = true
+		return packFeed(t, opt, ds, media.Anchor{Epoch: 1, Wall: t0})
+	}
+	const (
+		cmafMaster = "/live/s/cmaf/master.m3u8"
+		mpd        = "/live/s/cmaf/index.mpd"
+		tsMaster   = "/live/s/hls/index.m3u8"
+	)
+	for _, tc := range []struct {
+		name string
+		pack func(t *testing.T, opt Options) *Packager
+		abr  bool
+		path string
+	}{
+		{"audio only, CMAF master", audioOnlyFeed, false, cmafMaster},
+		{"audio only, MPD", audioOnlyFeed, false, mpd},
+		{"audio only ABR, CMAF master", audioOnlyFeed, true, cmafMaster},
+		{"audio only ABR, MPD", audioOnlyFeed, true, mpd},
+		{"A/V, CMAF master", avFeed, false, cmafMaster},
+		{"A/V, MPD", avFeed, false, mpd},
+		{"ladder ABR, TS master", func(t *testing.T, opt Options) *Packager { return ladderFeed(t, opt, 0, 1, 2, 3) }, true, tsMaster},
+		{"ladder ABR, CMAF master", func(t *testing.T, opt Options) *Packager { return ladderFeed(t, opt, 0, 1, 2, 3) }, true, cmafMaster},
+		{"ladder ABR, MPD", func(t *testing.T, opt Options) *Packager { return ladderFeed(t, opt, 0, 1, 2, 3) }, true, mpd},
+		{"two audio, CMAF master", twoAudioFeed, false, cmafMaster},
+		{"two audio ABR, TS master", twoAudioLadder, true, tsMaster},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := tc.pack(t, Options{ABR: tc.abr, AudioLanguage: lang})
+			srv := httptest.NewServer(serve(p))
+			defer srv.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			opt := conform.ReadOptions{Once: true, AudioLanguage: lang}
+			var c conform.Capture
+			var err error
+			if strings.HasSuffix(tc.path, ".mpd") {
+				c, err = conform.ReadDASH(ctx, srv.URL+tc.path, opt)
+			} else {
+				c, err = conform.ReadHLS(ctx, srv.URL+tc.path, opt)
+			}
+			require.NoError(t, err)
+			assert.Equal(t, []string{lang}, c.AudioLanguages)
+			// Only rule audio-language is judged here: the synthetic
+			// fixtures may break unrelated rules, which are filtered out by
+			// rule name only.
+			// No rule needs filtering out: these fixtures break none, so every
+			// rule is judged, audio-language among them.
+			assert.Empty(t, c.Violations)
+			assert.True(t, slices.ContainsFunc(c.Frames, func(f media.Frame) bool { return f.Kind() == media.KindAudio }), "audio read")
+		})
+	}
+}
