@@ -2,10 +2,15 @@ package rtmpsrv
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"io"
+	"maps"
 	"net"
+	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -17,6 +22,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 // fakeSink is a PublishSink that keeps every conn it is offered.
@@ -1108,4 +1114,844 @@ func TestPlayHandlerUnregister(t *testing.T) {
 	ln, err = new(net.ListenConfig).Listen(context.Background(), "tcp", addr)
 	require.NoError(t, err)
 	require.NoError(t, ln.Close())
+}
+
+// tlsErrors collects the calls of a listener's TLSOptions.OnError.
+type tlsErrors struct {
+	mu    sync.Mutex
+	addrs []string
+	errs  []error
+}
+
+func (e *tlsErrors) onError(remote net.Addr, err error) {
+	e.mu.Lock()
+	e.addrs = append(e.addrs, remote.String())
+	e.errs = append(e.errs, err)
+	e.mu.Unlock()
+}
+
+func (e *tlsErrors) remotes() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string{}, e.addrs...)
+}
+
+// wait waits for n calls and returns their addresses: a failure is counted
+// just before it is reported.
+func (e *tlsErrors) wait(t *testing.T, n int) []string {
+	t.Helper()
+	require.Eventually(t, func() bool { return len(e.remotes()) >= n }, 5*time.Second, 5*time.Millisecond,
+		"want %d OnError calls", n)
+	return e.remotes()
+}
+
+// mustRegisterPlayTLS registers h for app on an RTMPS listener and
+// unregisters it when the test ends.
+func mustRegisterPlayTLS(t *testing.T, r *Registry, addr, app string, h PlayHandler, cfg rtmp.Config, pol Policy, opt TLSOptions) func() {
+	t.Helper()
+	unregister, err := r.RegisterPlayTLS(addr, app, h, cfg, pol, opt)
+	require.NoError(t, err)
+	t.Cleanup(unregister)
+	return unregister
+}
+
+// mustRegisterTLS registers sink for path on the RTMPS listener of addr and
+// unregisters it when the test ends.
+func mustRegisterTLS(t *testing.T, r *Registry, addr, path string, sink PublishSink) func() {
+	t.Helper()
+	unregister, err := r.RegisterPublishTLS(addr, path, sink)
+	require.NoError(t, err)
+	t.Cleanup(unregister)
+	return unregister
+}
+
+// recordingConn keeps every byte read from the conn: the peer's TLS records.
+type recordingConn struct {
+	net.Conn
+	mu sync.Mutex
+	in []byte
+}
+
+func (c *recordingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.mu.Lock()
+	c.in = append(c.in, p[:n]...)
+	c.mu.Unlock()
+	return n, err
+}
+
+// lastRecord is the content type of the last whole TLS record received, or
+// 0 when there is none or the bytes do not end on a record boundary.
+func (c *recordingConn) lastRecord() byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var typ byte
+	for b := c.in; len(b) > 0; {
+		if len(b) < 5 || len(b) < 5+int(binary.BigEndian.Uint16(b[3:5])) {
+			return 0
+		}
+		typ = b[0]
+		b = b[5+int(binary.BigEndian.Uint16(b[3:5])):]
+	}
+	return typ
+}
+
+// recordAlert is the TLS record content type of an alert, close_notify
+// included. Up to TLS 1.2 it is visible in the record header.
+const recordAlert = 21
+
+// dialer is an rtmp.Config.Dial that keeps the connections it opened, each
+// wrapped by wrap when that is set.
+type dialer struct {
+	local string // the local IP to dial from, when set
+	wrap  func(net.Conn) net.Conn
+
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (d *dialer) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	var nd net.Dialer
+	if d.local != "" {
+		nd.LocalAddr = &net.TCPAddr{IP: net.ParseIP(d.local)}
+	}
+	c, err := nd.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	if d.wrap != nil {
+		c = d.wrap(c)
+	}
+	d.mu.Lock()
+	d.conns = append(d.conns, c)
+	d.mu.Unlock()
+	return c, nil
+}
+
+// last is the connection opened last.
+func (d *dialer) last(t *testing.T) net.Conn {
+	t.Helper()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	require.NotEmpty(t, d.conns, "nothing was dialled")
+	return d.conns[len(d.conns)-1]
+}
+
+func (d *dialer) closeAll() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.conns {
+		_ = c.Close()
+	}
+}
+
+// endsWithin reports whether the peer ended c within d: a read fails with
+// anything but a timeout. What the peer sends before is dropped.
+func endsWithin(c net.Conn, d time.Duration) bool {
+	_ = c.SetReadDeadline(time.Now().Add(d))
+	buf := make([]byte, 4096)
+	for {
+		if _, err := c.Read(buf); err != nil {
+			var ne net.Error
+			return !errors.As(err, &ne) || !ne.Timeout()
+		}
+	}
+}
+
+// clientHello returns the first flight of a TLS client: one ClientHello
+// record.
+func clientHello(t *testing.T) []byte {
+	t.Helper()
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+	go func() {
+		// The handshake fails once the pipe closes.
+		_ = tls.Client(client, &tls.Config{ServerName: "localhost", MinVersion: tls.VersionTLS12}).HandshakeContext(context.Background())
+	}()
+	hello := make([]byte, 5, 1024)
+	_, err := io.ReadFull(server, hello)
+	require.NoError(t, err)
+	hello = append(hello, make([]byte, binary.BigEndian.Uint16(hello[3:5]))...)
+	_, err = io.ReadFull(server, hello[5:])
+	require.NoError(t, err)
+	return hello
+}
+
+// waitTLSFailures waits for the listener on addr to have counted n failed
+// TLS handshakes.
+func waitTLSFailures(t *testing.T, r *Registry, addr string, n uint64) {
+	t.Helper()
+	require.Eventually(t, func() bool { return r.Stats(addr).TLSHandshakeFailures == n },
+		5*time.Second, 5*time.Millisecond, "want %d failed TLS handshakes, have %d", n, r.Stats(addr).TLSHandshakeFailures)
+}
+
+// counterKeys are the keys Stats.Counters has had since before RTMPS: every
+// RTMP listen input reports them, and must not gain one.
+var counterKeys = []string{
+	"rejected_busy", "rejected_flood", "rejected_play_caps",
+	"rejected_play_publish_path", "rejected_play_unknown", "rejected_unknown",
+}
+
+// framePlayer is a PlayHandler that writes frames to each player, then
+// waits for its end.
+type framePlayer struct {
+	frames []rtmp.Media
+}
+
+func (h *framePlayer) Live(string) bool { return true }
+
+func (h *framePlayer) Serve(ctx context.Context, conn *rtmp.ServerConn, _ string) {
+	for _, m := range h.frames {
+		if conn.WriteMedia(m) != nil {
+			return
+		}
+	}
+	select {
+	case <-ctx.Done():
+	case <-conn.Done():
+	}
+}
+
+// An RTMPS listener takes publishers and players as a plain one does: the
+// sink and the player get the same frames over either, the handshake is the
+// registry's own and Accept gets the bare *tls.Conn, while the connection
+// hook keeps the TCP connection.
+func TestRegistryTLS(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	frames := []rtmp.Media{
+		{Type: rtmp.MsgAudio, Timestamp: 0, Payload: []byte{0xAF, 0x00, 0x12, 0x10}},
+		{Type: rtmp.MsgVideo, Timestamp: 10, Payload: []byte{0x17, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xAD}},
+		{Type: rtmp.MsgAudio, Timestamp: 23, Payload: []byte{0xAF, 0x01, 0x21, 0x00}},
+	}
+	type result struct {
+		published, played []rtmp.Media
+		hooked, accepted  []net.Conn
+		playerIn          *recordingConn // what the player received, below TLS
+		playerEnd         error
+		stats             Stats
+	}
+	// run publishes frames to pub/<key> and plays live/s, on a listener of
+	// scheme, then unregisters the play handler and reads the player to its
+	// end.
+	run := func(t *testing.T, scheme string) result {
+		t.Helper()
+		var (
+			res result
+			mu  sync.Mutex
+		)
+		r := &Registry{
+			ConnHook: func(c net.Conn) {
+				mu.Lock()
+				res.hooked = append(res.hooked, c)
+				mu.Unlock()
+			},
+			accept: func(ctx context.Context, c net.Conn, cfg rtmp.Config, decide func(rtmp.Request) error) (*rtmp.ServerConn, error) {
+				mu.Lock()
+				res.accepted = append(res.accepted, c)
+				mu.Unlock()
+				return rtmp.Accept(ctx, c, cfg, decide)
+			},
+		}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		sink := newFakeSink()
+		t.Cleanup(sink.close)
+		h := &framePlayer{frames: frames}
+		var unplay func()
+		if scheme == "rtmps" {
+			unplay = mustRegisterPlayTLS(t, r, addr, "live", h, rtmp.Config{}, Policy{}, TLSOptions{Config: ca.Server(t)})
+			mustRegisterTLS(t, r, addr, "pub/"+vKey, sink)
+		} else {
+			unplay = mustRegisterPlay(t, r, addr, "live", h, Policy{})
+			mustRegister(t, r, addr, "pub/"+vKey, sink, Policy{})
+		}
+		// TLS 1.2 at most, so that an alert record can be told from data.
+		d := &dialer{wrap: func(c net.Conn) net.Conn { return &recordingConn{Conn: c} }}
+		t.Cleanup(d.closeAll)
+		cfg := rtmp.Config{TLS: ca.Client(), Dial: d.dial}
+		cfg.TLS.MaxVersion = tls.VersionTLS12
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		p, err := rtmp.Publish(ctx, scheme+"://"+addr+"/pub/"+vKey, cfg)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = p.Close() })
+		sc := sink.next(t)
+		assert.Equal(t, "pub/"+vKey, sc.Request().Path())
+		for _, m := range frames {
+			require.NoError(t, p.WriteMedia(m))
+		}
+		for range frames {
+			m, err := sc.ReadMedia()
+			require.NoError(t, err)
+			res.published = append(res.published, m)
+		}
+
+		c, err := rtmp.PlayWith(ctx, scheme+"://"+addr+"/live/s", cfg)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		res.playerIn = d.last(t).(*recordingConn)
+		for n := 0; n < len(frames); {
+			m, err := c.ReadMedia()
+			require.NoError(t, err)
+			res.played = append(res.played, m)
+			if m.Type != rtmp.MsgDataAMF0 {
+				n++
+			}
+		}
+		res.stats = r.Stats(addr)
+		unplay()
+		for err == nil {
+			_, err = c.ReadMedia()
+		}
+		res.playerEnd = err
+		mu.Lock()
+		defer mu.Unlock()
+		return res
+	}
+	plain := run(t, "rtmp")
+	secure := run(t, "rtmps")
+
+	assert.Equal(t, frames, plain.published, "the plain listener's publish")
+	assert.Equal(t, plain.published, secure.published, "an RTMPS publisher's frames are a plain one's")
+	assert.Equal(t, plain.played, secure.played, "an RTMPS player's frames are a plain one's")
+	assert.GreaterOrEqual(t, len(secure.played), len(frames))
+
+	// The existing fields count an RTMPS listener's sessions the same way.
+	for name, st := range map[string]Stats{"rtmp": plain.stats, "rtmps": secure.stats} {
+		assert.Equal(t, 1, st.Routes, name)
+		assert.Equal(t, 1, st.Apps, name)
+		assert.Equal(t, 1, st.Players, name)
+		assert.Equal(t, map[string]int{"live/s": 1}, st.StreamPlayers, name)
+		assert.Zero(t, st.PrePublish, name)
+		assert.Zero(t, st.TLSHandshakeFailures, name)
+		assert.Equal(t, counterKeys, slices.Sorted(maps.Keys(st.Counters())), "%s: Counters has the keys it had", name)
+	}
+
+	// R-S8: the hook has the TCP connection, whose close is immediate, and
+	// Accept the *tls.Conn itself, the only type pkg/rtmp's close rule knows.
+	require.Len(t, secure.hooked, 2)
+	require.Len(t, secure.accepted, 2)
+	for i := range secure.hooked {
+		assert.IsType(t, (*net.TCPConn)(nil), secure.hooked[i], "the hook's conn")
+		tc, ok := secure.accepted[i].(*tls.Conn)
+		require.True(t, ok, "Accept got a %T, want a *tls.Conn", secure.accepted[i])
+		assert.Same(t, secure.hooked[i], tc.NetConn(), "the TLS conn is over the hook's")
+		assert.IsType(t, (*net.TCPConn)(nil), plain.accepted[i], "a plain listener's Accept")
+	}
+
+	// A healthy player is told the end: crypto/tls reports io.EOF for a
+	// connection cut on a record boundary too, so the record is the proof.
+	assert.ErrorIs(t, secure.playerEnd, io.EOF)
+	assert.EqualValues(t, recordAlert, secure.playerIn.lastRecord(), "the last TLS record the player got is close_notify")
+
+	t.Run("a failed handshake is no counter", func(t *testing.T) {
+		r := &Registry{}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		mustRegisterPlayTLS(t, r, addr, "live", newFakePlayer(), rtmp.Config{}, Policy{}, TLSOptions{Config: ca.Server(t)})
+		c := idleTCP(t, addr)
+		_, err := c.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+		require.NoError(t, err)
+		waitTLSFailures(t, r, addr, 1)
+		counters := r.Stats(addr).Counters()
+		assert.Equal(t, counterKeys, slices.Sorted(maps.Keys(counters)))
+		for k, v := range counters {
+			assert.Zero(t, v, k)
+		}
+	})
+	t.Run("options without a config", func(t *testing.T) {
+		r := &Registry{}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		_, err := r.RegisterPlayTLS(addr, "live", newFakePlayer(), rtmp.Config{}, Policy{}, TLSOptions{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "rtmpsrv:")
+		assert.Zero(t, r.Stats(addr).ID, "nothing was opened")
+	})
+}
+
+// A listener is plain or TLS for as long as it is open, and a registration
+// of the other kind is refused without changing anything. A TLS publish
+// route never opens a listener.
+func TestRegistryTLSKinds(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	opt := TLSOptions{Config: ca.Server(t)}
+	r := &Registry{}
+	addr := "127.0.0.1:" + freeTCPPort(t)
+	refused := func(t *testing.T) {
+		t.Helper()
+		var d net.Dialer
+		c, err := d.DialContext(context.Background(), "tcp", addr)
+		if err == nil {
+			_ = c.Close()
+		}
+		require.Error(t, err, "something listens on %s", addr)
+	}
+
+	// No listener: a TLS publish route does not open one.
+	_, err := r.RegisterPublishTLS(addr, "pub/"+vKey, newFakeSink())
+	require.ErrorIs(t, err, ErrNoTLSListener)
+	assert.NotContains(t, err.Error(), vKey)
+	assert.Zero(t, r.Stats(addr).ID)
+	refused(t)
+
+	// A TLS listener refuses the plain calls.
+	unplay := mustRegisterPlayTLS(t, r, addr, "live", newFakePlayer(), rtmp.Config{}, Policy{}, opt)
+	before := r.Stats(addr)
+	_, err = r.RegisterPublish(addr, "pub/"+vKey, newFakeSink(), rtmp.Config{}, Policy{})
+	require.ErrorIs(t, err, ErrTLSListener)
+	assert.NotContains(t, err.Error(), vKey)
+	_, err = r.RegisterPlay(addr, "other", newFakePlayer(), rtmp.Config{}, Policy{})
+	require.ErrorIs(t, err, ErrTLSListener)
+	assert.Equal(t, before, r.Stats(addr), "a refused call changes nothing")
+	// The TLS calls share it, as the plain ones share a plain listener.
+	unpublish := mustRegisterTLS(t, r, addr, "pub/"+vKey, newFakeSink())
+	unother := mustRegisterPlayTLS(t, r, addr, "other", newFakePlayer(), rtmp.Config{}, Policy{}, opt)
+	st := r.Stats(addr)
+	assert.Equal(t, before.ID, st.ID)
+	assert.Equal(t, 1, st.Routes)
+	assert.Equal(t, 2, st.Apps)
+	_, err = r.RegisterPublishTLS(addr, "pub/"+vKey, newFakeSink())
+	require.Error(t, err, "a duplicate path")
+	assert.NotErrorIs(t, err, ErrNoTLSListener)
+
+	// The last unregister closes it, and the address is free for either
+	// kind: a plain play opens a plain listener.
+	unother()
+	unplay()
+	assert.Equal(t, before.ID, r.Stats(addr).ID, "the publish route keeps the listener")
+	unpublish()
+	assert.Zero(t, r.Stats(addr).ID)
+	refused(t)
+	h := newFakePlayer()
+	mustRegisterPlay(t, r, addr, "live", h, Policy{})
+	mustPlay(t, "rtmp://"+addr+"/live/s", rtmp.Config{})
+	h.next(t)
+
+	// A plain listener refuses the TLS calls.
+	before = r.Stats(addr)
+	_, err = r.RegisterPlayTLS(addr, "other", newFakePlayer(), rtmp.Config{}, Policy{}, opt)
+	require.ErrorIs(t, err, ErrPlainListener)
+	_, err = r.RegisterPublishTLS(addr, "pub/"+vKey, newFakeSink())
+	require.ErrorIs(t, err, ErrPlainListener)
+	assert.NotContains(t, err.Error(), vKey)
+	assert.Equal(t, before, r.Stats(addr), "a refused call changes nothing")
+	mustPlay(t, "rtmp://"+addr+"/live/s", rtmp.Config{}) // still plain
+	h.next(t)
+}
+
+// The wrong protocol, or silence, on an RTMPS listener: each such client is
+// ended by the handshake timeout, holds a pre-publish place meanwhile, and
+// is one failure of its own listener.
+func TestRegistryTLSWrongProtocol(t *testing.T) {
+	const (
+		handshakeTimeout = 200 * time.Millisecond
+		limit            = 1200 * time.Millisecond
+	)
+	ca := tlstest.NewCA(t)
+
+	t.Run("bad clients", func(t *testing.T) {
+		r := &Registry{}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		errs := &tlsErrors{}
+		mustRegisterPlayTLS(t, r, addr, "live", newFakePlayer(), rtmp.Config{HandshakeTimeout: handshakeTimeout}, Policy{},
+			TLSOptions{Config: ca.Server(t), OnError: errs.onError})
+		want := make([]string, 0, 3)
+
+		// A plain RTMP player.
+		d := &dialer{}
+		t.Cleanup(d.closeAll)
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := rtmp.PlayWith(ctx, "rtmp://"+addr+"/live/s", rtmp.Config{Dial: d.dial})
+		if c != nil {
+			_ = c.Close()
+		}
+		require.Error(t, err)
+		assert.Less(t, time.Since(start), limit, "a plain player")
+		want = append(want, d.last(t).LocalAddr().String())
+		waitTLSFailures(t, r, addr, 1)
+
+		// A client that sends nothing.
+		silent := idleTCP(t, addr)
+		assert.True(t, endsWithin(silent, limit), "a silent client was not ended")
+		want = append(want, silent.LocalAddr().String())
+		waitTLSFailures(t, r, addr, 2)
+
+		// A client that stops in the middle of its ClientHello.
+		hello := clientHello(t)
+		half := idleTCP(t, addr)
+		_, err = half.Write(hello[:len(hello)/2])
+		require.NoError(t, err)
+		assert.True(t, endsWithin(half, limit), "a client mid-handshake was not ended")
+		want = append(want, half.LocalAddr().String())
+		waitTLSFailures(t, r, addr, 3)
+
+		assert.Equal(t, want, errs.wait(t, 3), "one OnError call for each, with its address")
+		errs.mu.Lock()
+		for _, err := range errs.errs {
+			assert.ErrorContains(t, err, "rtmpsrv: tls handshake:")
+		}
+		errs.mu.Unlock()
+		st := r.Stats(addr)
+		assert.Equal(t, counterKeys, slices.Sorted(maps.Keys(st.Counters())))
+		assert.Zero(t, st.RejectedFlood)
+
+		// Each gave its pre-publish place back: as many clients as one
+		// address may have are admitted again, to fail in their turn.
+		waitPrePublish(t, r, addr, 0)
+		for range defaultMaxPrePublishPerIP {
+			idleTCP(t, addr)
+		}
+		waitTLSFailures(t, r, addr, 3+defaultMaxPrePublishPerIP)
+		assert.Zero(t, r.Stats(addr).RejectedFlood, "a client was turned away: a place was not given back")
+		waitPrePublish(t, r, addr, 0)
+	})
+
+	t.Run("silent clients fill the pre-publish cap", func(t *testing.T) {
+		// The default handshake timeout, so that the silent clients hold
+		// their places for the whole row.
+		r := &Registry{}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		errs := &tlsErrors{}
+		mustRegisterPlayTLS(t, r, addr, "live", newFakePlayer(), rtmp.Config{}, Policy{},
+			TLSOptions{Config: ca.Server(t), OnError: errs.onError})
+		sink := newFakeSink()
+		t.Cleanup(sink.close)
+		mustRegisterTLS(t, r, addr, "pub/"+vKey, sink)
+		for range defaultMaxPrePublishPerIP {
+			idleTCP(t, addr)
+		}
+		waitPrePublish(t, r, addr, defaultMaxPrePublishPerIP)
+		start := time.Now()
+		assert.True(t, endsWithin(idleTCP(t, addr), 2*time.Second), "the client over the cap was not closed")
+		assert.Less(t, time.Since(start), time.Second, "the client over the cap waited for a handshake")
+		assert.EqualValues(t, 1, r.Stats(addr).RejectedFlood)
+
+		// The accept loop is not held up: another address publishes.
+		d := &dialer{local: "127.0.0.2"}
+		t.Cleanup(d.closeAll)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		p, err := rtmp.Publish(ctx, "rtmps://"+addr+"/pub/"+vKey, rtmp.Config{TLS: ca.Client(), Dial: d.dial})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = p.Close() })
+		sink.next(t)
+		st := r.Stats(addr)
+		assert.Equal(t, defaultMaxPrePublishPerIP, st.PrePublish)
+		assert.Zero(t, st.TLSHandshakeFailures, "a connection closed over the cap is no failed handshake")
+		assert.Empty(t, errs.remotes())
+	})
+
+	t.Run("a TLS client on a plain listener", func(t *testing.T) {
+		r := &Registry{}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		h := newFakePlayer()
+		unregister, err := r.RegisterPlay(addr, "live", h, rtmp.Config{HandshakeTimeout: handshakeTimeout}, Policy{})
+		require.NoError(t, err)
+		t.Cleanup(unregister)
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := rtmp.PlayWith(ctx, "rtmps://"+addr+"/live/s", rtmp.Config{TLS: ca.Client()})
+		if c != nil {
+			_ = c.Close()
+		}
+		require.Error(t, err)
+		assert.Less(t, time.Since(start), limit)
+		waitPrePublish(t, r, addr, 0)
+		assert.Zero(t, r.Stats(addr).TLSHandshakeFailures, "a plain listener has no TLS handshake")
+		mustPlay(t, "rtmp://"+addr+"/live/s", rtmp.Config{}) // the listener goes on
+		h.next(t)
+	})
+
+	t.Run("unregister during handshakes", func(t *testing.T) {
+		// The default handshake timeout: only the unregister ends them.
+		r := &Registry{}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		errs := &tlsErrors{}
+		unregister := mustRegisterPlayTLS(t, r, addr, "live", newFakePlayer(), rtmp.Config{}, Policy{MaxPrePublishPerIP: 8},
+			TLSOptions{Config: ca.Server(t), OnError: errs.onError})
+		hello := clientHello(t)
+		conns := make([]net.Conn, 5)
+		for i := range conns {
+			conns[i] = idleTCP(t, addr)
+			if i%2 == 1 { // some silent, some mid-ClientHello
+				_, err := conns[i].Write(hello[:len(hello)/2])
+				require.NoError(t, err)
+			}
+		}
+		waitPrePublish(t, r, addr, len(conns))
+		l := r.lookup(addr)
+		require.NotNil(t, l)
+		start := time.Now()
+		unregister()
+		assert.Less(t, time.Since(start), time.Second, "the unregister waited for the handshakes")
+		for _, c := range conns {
+			assert.True(t, endsWithin(c, time.Second), "a client mid-handshake was not closed")
+		}
+		assert.Zero(t, l.tlsFailures.Load(), "a handshake that shutdown cut short is no failure")
+		assert.Empty(t, errs.remotes(), "nor is it reported")
+		l.mu.Lock()
+		assert.Zero(t, l.pending, "every session gave its pre-publish place back")
+		assert.Empty(t, l.perIP)
+		l.mu.Unlock()
+	})
+
+	t.Run("two registries", func(t *testing.T) {
+		var (
+			regs  [2]*Registry
+			addrs [2]string
+			errs  [2]*tlsErrors
+		)
+		for i := range regs {
+			regs[i], addrs[i], errs[i] = &Registry{}, "127.0.0.1:"+freeTCPPort(t), &tlsErrors{}
+			mustRegisterPlayTLS(t, regs[i], addrs[i], "live", newFakePlayer(), rtmp.Config{HandshakeTimeout: handshakeTimeout}, Policy{},
+				TLSOptions{Config: ca.Server(t), OnError: errs[i].onError})
+		}
+		bad := func(i int) string {
+			c := idleTCP(t, addrs[i])
+			_, err := c.Write([]byte("not a ClientHello"))
+			require.NoError(t, err)
+			return c.LocalAddr().String()
+		}
+		first := bad(0)
+		waitTLSFailures(t, regs[0], addrs[0], 1)
+		assert.Equal(t, []string{first}, errs[0].wait(t, 1))
+		assert.Empty(t, errs[1].remotes(), "the other registry's listener was told")
+		assert.Zero(t, regs[1].Stats(addrs[1]).TLSHandshakeFailures)
+		second := bad(1)
+		waitTLSFailures(t, regs[1], addrs[1], 1)
+		assert.Equal(t, []string{second}, errs[1].wait(t, 1))
+		assert.Equal(t, []string{first}, errs[0].remotes())
+		assert.EqualValues(t, 1, regs[0].Stats(addrs[0]).TLSHandshakeFailures)
+	})
+}
+
+// stallPlayer is a PlayHandler for players that stop reading. Once gate
+// closes, and when write is set, it writes to its player until a WriteMedia
+// fails and reports that call; then it waits for the route's end, whatever
+// the conn does, and lingers.
+type stallPlayer struct {
+	write   bool
+	linger  time.Duration
+	gate    chan struct{}
+	results chan stallResult
+}
+
+type stallResult struct {
+	err  error
+	took time.Duration
+}
+
+func (h *stallPlayer) Live(string) bool { return true }
+
+func (h *stallPlayer) Serve(ctx context.Context, conn *rtmp.ServerConn, _ string) {
+	if h.write {
+		select {
+		case <-h.gate:
+		case <-ctx.Done():
+			return
+		}
+		// Small messages, so that the call that stalls does little else:
+		// the players' buffers fill over the calls before it.
+		frame := rtmp.Media{Type: rtmp.MsgVideo, Payload: make([]byte, 16<<10)}
+		var res stallResult
+		for range 4096 {
+			start := time.Now()
+			if res.err = conn.WriteMedia(frame); res.err != nil {
+				res.took = time.Since(start)
+				break
+			}
+		}
+		h.results <- res
+	}
+	<-ctx.Done()
+	time.Sleep(h.linger)
+}
+
+// R-S8: unregistering a play handler closes its players at once, however
+// many have stopped reading, and a route's end closes a player still in its
+// decision by its TCP connection.
+func TestRegistryTLSUnregisterStalled(t *testing.T) {
+	const (
+		players      = 100
+		writeTimeout = 200 * time.Millisecond
+		slack        = 300 * time.Millisecond
+	)
+	ca := tlstest.NewCA(t)
+	pol := Policy{
+		MaxPrePublish: 2 * players, MaxPrePublishPerIP: 2 * players,
+		MaxPlayersPerStream: 2 * players, MaxPlayersPerIP: 2 * players,
+	}
+	// shrink makes the buffers between the server and a player that stops
+	// reading small.
+	shrink := func(c net.Conn) net.Conn {
+		_ = c.(*net.TCPConn).SetReadBuffer(4096)
+		_ = c.(*net.TCPConn).SetWriteBuffer(4096)
+		return c
+	}
+	// play connects the players, which read nothing after their play
+	// started.
+	play := func(t *testing.T, r *Registry, addr string) {
+		t.Helper()
+		d := &dialer{wrap: shrink}
+		t.Cleanup(d.closeAll)
+		cfg := rtmp.Config{TLS: ca.Client(), Dial: d.dial}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		errc := make(chan error, players)
+		for range players {
+			go func() {
+				_, err := rtmp.PlayWith(ctx, "rtmps://"+addr+"/live/s", cfg)
+				errc <- err
+			}()
+		}
+		for range players {
+			require.NoError(t, <-errc)
+		}
+		require.Eventually(t, func() bool { return r.Stats(addr).Players == players }, 5*time.Second, 5*time.Millisecond)
+	}
+
+	t.Run("after the write timeout", func(t *testing.T) {
+		r := &Registry{ConnHook: func(c net.Conn) { shrink(c) }}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		h := &stallPlayer{write: true, gate: make(chan struct{}), results: make(chan stallResult, players)}
+		unplay := mustRegisterPlayTLS(t, r, addr, "live", h, rtmp.Config{WriteTimeout: writeTimeout}, pol, TLSOptions{Config: ca.Server(t)})
+		play(t, r, addr)
+		close(h.gate)
+		for range players {
+			select {
+			case res := <-h.results:
+				require.ErrorIs(t, res.err, os.ErrDeadlineExceeded, "WriteMedia to a stalled player")
+				assert.LessOrEqual(t, res.took, writeTimeout+slack, "the WriteMedia that timed out")
+			case <-time.After(30 * time.Second):
+				t.Fatal("a WriteMedia to a stalled player never failed")
+			}
+		}
+		// Every player's buffer is still full: nothing was read.
+		start := time.Now()
+		unplay()
+		assert.Less(t, time.Since(start), time.Second, "unregistering %d stalled players", players)
+		assert.Zero(t, r.Stats(addr).ID)
+	})
+
+	t.Run("no write failed before", func(t *testing.T) {
+		// The unregister's Close is the first of each session: with no
+		// write in flight, tls.Conn.Close sends close_notify into a full
+		// buffer, which costs 100 ms a session. The handler is slow to
+		// return, so that it is the unregister that closes: one after the
+		// other, the closes would last until the handlers returned and
+		// closed the rest themselves.
+		var (
+			mu   sync.Mutex
+			raws []net.Conn
+		)
+		r := &Registry{ConnHook: func(c net.Conn) {
+			shrink(c)
+			mu.Lock()
+			raws = append(raws, c)
+			mu.Unlock()
+		}}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		const linger = 600 * time.Millisecond
+		h := &stallPlayer{linger: linger}
+		unplay := mustRegisterPlayTLS(t, r, addr, "live", h, rtmp.Config{PingInterval: time.Minute}, pol, TLSOptions{Config: ca.Server(t)})
+		play(t, r, addr)
+		// Fill each player's buffers below TLS, on the TCP connection the
+		// hook was given, and keep them full: no write of the session fails
+		// or is in flight, and a close_notify has nowhere to go. A buffer
+		// filled once would not do: the kernel takes a little more after a
+		// while. The writers end when their connection closes.
+		mu.Lock()
+		conns := append([]net.Conn{}, raws...)
+		mu.Unlock()
+		require.Len(t, conns, players)
+		var (
+			written atomic.Int64
+			fill    sync.WaitGroup
+		)
+		for _, c := range conns {
+			fill.Go(func() {
+				junk := make([]byte, 64<<10)
+				for {
+					n, err := c.Write(junk)
+					written.Add(int64(n))
+					if err != nil {
+						return
+					}
+				}
+			})
+		}
+		// Every writer is stalled once none has finished a write for a while.
+		for last, since := int64(-1), time.Now(); time.Since(since) < 150*time.Millisecond; time.Sleep(10 * time.Millisecond) {
+			if n := written.Load(); n != last {
+				last, since = n, time.Now()
+			}
+		}
+		start := time.Now()
+		done := make(chan time.Duration, 1)
+		go func() {
+			unplay()
+			done <- time.Since(start)
+		}()
+		fill.Wait() // every connection is closed
+		assert.Less(t, time.Since(start), linger-200*time.Millisecond, "closing %d stalled players", players)
+		took := <-done
+		assert.Less(t, took, time.Second, "unregistering %d stalled players", players)
+		assert.GreaterOrEqual(t, took, linger, "the unregister did not wait for the handlers")
+		assert.Zero(t, r.Stats(addr).ID)
+	})
+
+	t.Run("a route's end closes the raw connection", func(t *testing.T) {
+		// Accept is replaced by one that asks for a play and then waits, as
+		// a player whose command exchange stalls after the decision would:
+		// only admit's AfterFunc can end the connection.
+		release := make(chan struct{})
+		decided := make(chan error, 1)
+		r := &Registry{accept: func(_ context.Context, c net.Conn, _ rtmp.Config, decide func(rtmp.Request) error) (*rtmp.ServerConn, error) {
+			decided <- decide(rtmp.Request{Play: true, App: "live", Stream: "s"})
+			<-release
+			_ = c.Close()
+			return nil, errors.New("stalled after the decision")
+		}}
+		addr := "127.0.0.1:" + freeTCPPort(t)
+		unplay := mustRegisterPlayTLS(t, r, addr, "live", newFakePlayer(), rtmp.Config{}, Policy{}, TLSOptions{Config: ca.Server(t)})
+		// TLS 1.2 at most, so that an alert record can be told from data.
+		in := &recordingConn{Conn: idleTCP(t, addr)}
+		cfg := ca.Client()
+		cfg.ServerName, cfg.MaxVersion = "127.0.0.1", tls.VersionTLS12
+		tc := tls.Client(in, cfg)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, tc.HandshakeContext(ctx))
+		require.NoError(t, <-decided)
+		require.Equal(t, 1, r.Stats(addr).Players)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			unplay() // waits for the session, which waits for release
+		}()
+		start := time.Now()
+		_ = tc.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err := tc.Read(make([]byte, 1))
+		assert.Less(t, time.Since(start), time.Second, "the route's end did not close the connection at once")
+		// The TCP connection was closed, not the TLS one: no close_notify.
+		// crypto/tls reports io.EOF for a connection cut on a record
+		// boundary too, so the records are the proof: the handshake's
+		// (type 22) are all there is.
+		assert.Error(t, err)
+		assert.EqualValues(t, 22, in.lastRecord(), "the connection was closed through TLS")
+		select {
+		case <-done:
+			t.Fatal("the unregister did not wait for the session")
+		case <-time.After(50 * time.Millisecond):
+		}
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the unregister did not return")
+		}
+	})
 }

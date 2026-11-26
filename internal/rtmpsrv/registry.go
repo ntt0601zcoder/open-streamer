@@ -3,10 +3,17 @@
 // it. A publisher is routed by its path, which is its stream key and stays
 // secret; a player by the app its handler registered, with the rest of its
 // path as the stream name. Every rejection reads the same to the client.
+//
+// A listener is plain (RTMP) or TLS (RTMPS) for as long as it is open, by the
+// registration that opened it. An RTMPS listener runs the TLS handshake of
+// each connection itself, in the session's goroutine, after the pre-publish
+// caps admitted the connection and within the RTMP handshake's timeout; a
+// handshake that fails is counted and reported to that listener alone.
 package rtmpsrv
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"maps"
@@ -39,6 +46,24 @@ const (
 // stream that is not live and every cap, so a client cannot probe which
 // stream keys exist.
 var errStreamNotAvailable = fmt.Errorf("rtmpsrv: %w", rtmp.ErrStreamNotAvailable)
+
+// ErrPlainListener and ErrTLSListener refuse a registration whose kind is not
+// the kind of the listener already open on the address. ErrNoTLSListener
+// refuses a TLS publish route on an address that has no TLS listener.
+var (
+	ErrPlainListener = errors.New("the address has a plain RTMP listener")
+	ErrTLSListener   = errors.New("the address has an RTMPS listener")
+	ErrNoTLSListener = errors.New("the address has no RTMPS listener")
+)
+
+// TLSOptions are an RTMPS listener's, taken from the registration that opens
+// it.
+type TLSOptions struct {
+	Config *tls.Config // must not be nil
+	// OnError, when set, is called for each connection whose TLS handshake
+	// failed, in the session's goroutine.
+	OnError func(remote net.Addr, err error)
+}
 
 // PublishSink receives the publishers of one listen path.
 //
@@ -116,8 +141,9 @@ type acceptFunc func(ctx context.Context, c net.Conn, cfg rtmp.Config, decide fu
 // before the first register.
 type Registry struct {
 	// ConnHook, when set, is called with every connection a listener takes
-	// a session for, before the handshake, in the session's goroutine.
-	// Tests use it to shrink socket buffers.
+	// a session for, before the handshake, in the session's goroutine. It
+	// is the TCP connection, on an RTMPS listener too. Tests use it to
+	// shrink socket buffers.
 	ConnHook func(net.Conn)
 
 	accept acceptFunc // nil means rtmp.Accept
@@ -162,16 +188,20 @@ type playSlot struct {
 
 // listener is one TCP listener and its sessions.
 type listener struct {
-	reg    *Registry
-	key    string
-	ln     net.Listener
-	cfg    rtmp.Config
-	pol    Policy
-	accept acceptFunc
-	now    func() time.Time
-	ctx    context.Context // ends every session's Accept on shutdown
-	cancel context.CancelFunc
-	wg     sync.WaitGroup // the accept loop and every session
+	reg *Registry
+	key string
+	ln  net.Listener
+	// tls is set on an RTMPS listener: serve runs the TLS handshake of every
+	// connection with it. tlsError is the listener's TLSOptions.OnError.
+	tls      *tls.Config
+	tlsError func(remote net.Addr, err error)
+	cfg      rtmp.Config
+	pol      Policy
+	accept   acceptFunc
+	now      func() time.Time
+	ctx      context.Context // ends every session's Accept on shutdown
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup // the accept loop and every session
 
 	id     uint64                // its number in the registry, from 1
 	routes map[string]*route     // publish routes by path; registry mu
@@ -186,6 +216,7 @@ type listener struct {
 
 	rejectedUnknown, rejectedBusy, rejectedFlood                   atomic.Uint64
 	rejectedPlayUnknown, rejectedPlayPublishPath, rejectedPlayCaps atomic.Uint64
+	tlsFailures                                                    atomic.Uint64
 }
 
 // RegisterPublish routes publishers of path on addr to sink. The first
@@ -194,8 +225,29 @@ type listener struct {
 // returned unregister removes the route; the last one on the address closes
 // the listener and waits for its sessions to end. It is idempotent.
 // unregister must not be called while holding a lock that the sink's Offer
-// or Busy takes (see PublishSink).
+// or Busy takes (see PublishSink). On an address whose listener is RTMPS it
+// returns ErrTLSListener.
 func (r *Registry) RegisterPublish(addr, path string, sink PublishSink, cfg rtmp.Config, pol Policy) (unregister func(), err error) {
+	return r.registerPublish(addr, path, sink, func(key string, add func(*listener) error) (*listener, error) {
+		return r.attach(key, cfg, pol, nil, true, add)
+	})
+}
+
+// RegisterPublishTLS routes publishers of path on the RTMPS listener that is
+// already open on addr. It never opens one: without a listener it returns
+// ErrNoTLSListener, and on a plain one ErrPlainListener. The route and its
+// unregister are RegisterPublish's.
+func (r *Registry) RegisterPublishTLS(addr, path string, sink PublishSink) (unregister func(), err error) {
+	return r.registerPublish(addr, path, sink, func(key string, add func(*listener) error) (*listener, error) {
+		return r.attach(key, rtmp.Config{}, Policy{}, &TLSOptions{}, false, add)
+	})
+}
+
+// registerPublish adds the publish route of path to the listener that attach
+// finds or opens for addr.
+func (r *Registry) registerPublish(addr, path string, sink PublishSink,
+	attach func(key string, add func(*listener) error) (*listener, error),
+) (unregister func(), err error) {
 	key, err := AddrKey(addr)
 	if err != nil {
 		return nil, err
@@ -204,7 +256,7 @@ func (r *Registry) RegisterPublish(addr, path string, sink PublishSink, cfg rtmp
 	if app, stream, ok := strings.Cut(path, "/"); !ok || app == "" || stream == "" {
 		return nil, fmt.Errorf("rtmpsrv: listen %s: path %q needs an app and a stream name", key, redact.RTMPKey(path))
 	}
-	l, err := r.attach(key, cfg, pol, func(l *listener) error {
+	l, err := attach(key, func(l *listener) error {
 		if _, dup := l.routes[path]; dup {
 			return fmt.Errorf("rtmpsrv: listen %s: path %s is already registered", key, redact.RTMPKey(path))
 		}
@@ -237,8 +289,31 @@ func (r *Registry) RegisterPublish(addr, path string, sink PublishSink, cfg rtmp
 // RegisterPublish. The returned unregister cancels the ctx of every Serve,
 // closes the players, waits for every session that reached h, and closes
 // the listener when it was the address's last registration. It is
-// idempotent.
+// idempotent. On an address whose listener is RTMPS it returns
+// ErrTLSListener.
 func (r *Registry) RegisterPlay(addr, app string, h PlayHandler, cfg rtmp.Config, pol Policy) (unregister func(), err error) {
+	return r.registerPlay(addr, app, h, cfg, pol, nil)
+}
+
+// RegisterPlayTLS is RegisterPlay on an RTMPS listener: the first
+// registration on the address opens it and wraps every connection with
+// opt.Config; later ones share it, and their opt is ignored as their cfg and
+// pol are. The TLS handshake of a connection is bounded by
+// cfg.HandshakeTimeout (rtmp.DefaultHandshakeTimeout when zero), and the RTMP
+// handshake's own timeout starts after it. A handshake that fails is counted
+// in Stats.TLSHandshakeFailures and reported to opt.OnError, unless the
+// listener was closing. On an address whose listener is plain it returns
+// ErrPlainListener.
+func (r *Registry) RegisterPlayTLS(addr, app string, h PlayHandler, cfg rtmp.Config, pol Policy, opt TLSOptions) (unregister func(), err error) {
+	if opt.Config == nil {
+		return nil, fmt.Errorf("rtmpsrv: listen %s: an RTMPS listener needs a TLS config", addr)
+	}
+	return r.registerPlay(addr, app, h, cfg, pol, &opt)
+}
+
+// registerPlay adds the play handler of app to the listener on addr, which
+// is RTMPS when opt is set and plain otherwise.
+func (r *Registry) registerPlay(addr, app string, h PlayHandler, cfg rtmp.Config, pol Policy, opt *TLSOptions) (unregister func(), err error) {
 	key, err := AddrKey(addr)
 	if err != nil {
 		return nil, err
@@ -248,7 +323,7 @@ func (r *Registry) RegisterPlay(addr, app string, h PlayHandler, cfg rtmp.Config
 		return nil, fmt.Errorf("rtmpsrv: listen %s: play needs an app", key)
 	}
 	var pr *playRoute
-	l, err := r.attach(key, cfg, pol, func(l *listener) error {
+	l, err := r.attach(key, cfg, pol, opt, true, func(l *listener) error {
 		if _, dup := l.plays[app]; dup {
 			return fmt.Errorf("rtmpsrv: listen %s: play app %q is already registered", key, app)
 		}
@@ -272,9 +347,13 @@ func (r *Registry) RegisterPlay(addr, app string, h PlayHandler, cfg rtmp.Config
 				}
 				return func() {
 					pr.cancel()
+					// Each on its own: closing a TLS player that stopped
+					// reading takes 100 ms (rtmp.ServerConn.Close).
+					var closing sync.WaitGroup
 					for _, c := range conns {
-						_ = c.Close()
+						closing.Go(func() { _ = c.Close() })
 					}
+					closing.Wait()
 					pr.wg.Wait()
 				}
 			})
@@ -282,18 +361,30 @@ func (r *Registry) RegisterPlay(addr, app string, h PlayHandler, cfg rtmp.Config
 	}, nil
 }
 
-// attach runs add on the listener for key, opening it with cfg and pol when
-// there is none. A listener opened for an add that fails is closed again.
-func (r *Registry) attach(key string, cfg rtmp.Config, pol Policy, add func(*listener) error) (*listener, error) {
+// attach runs add on the listener for key, which must be RTMPS when opt is
+// set and plain when it is nil. When there is none and open is set, it opens
+// one of that kind with cfg, pol and opt; without open it refuses. A listener
+// opened for an add that fails is closed again, and a refused call opens and
+// changes nothing.
+func (r *Registry) attach(key string, cfg rtmp.Config, pol Policy, opt *TLSOptions, open bool, add func(*listener) error) (*listener, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if l := r.listeners[key]; l != nil {
+		switch {
+		case opt != nil && l.tls == nil:
+			return nil, fmt.Errorf("rtmpsrv: listen %s: %w", key, ErrPlainListener)
+		case opt == nil && l.tls != nil:
+			return nil, fmt.Errorf("rtmpsrv: listen %s: %w", key, ErrTLSListener)
+		}
 		if err := add(l); err != nil {
 			return nil, err
 		}
 		return l, nil
 	}
-	l, err := r.bind(key, cfg, pol)
+	if !open {
+		return nil, fmt.Errorf("rtmpsrv: listen %s: %w", key, ErrNoTLSListener)
+	}
+	l, err := r.bind(key, cfg, pol, opt)
 	if err != nil {
 		return nil, err
 	}
@@ -311,9 +402,9 @@ func (r *Registry) attach(key string, cfg rtmp.Config, pol Policy, add func(*lis
 	return l, nil
 }
 
-// bind opens the TCP listener for key; attach starts its accept loop. r.mu
-// is held.
-func (r *Registry) bind(key string, cfg rtmp.Config, pol Policy) (*listener, error) {
+// bind opens the TCP listener for key, an RTMPS one when opt is set; attach
+// starts its accept loop. r.mu is held.
+func (r *Registry) bind(key string, cfg rtmp.Config, pol Policy, opt *TLSOptions) (*listener, error) {
 	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", key)
 	if err != nil {
 		return nil, fmt.Errorf("rtmpsrv: listen %s: %w", key, err)
@@ -328,11 +419,15 @@ func (r *Registry) bind(key string, cfg rtmp.Config, pol Policy) (*listener, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r.seq++
-	return &listener{
+	l := &listener{
 		reg: r, key: key, id: r.seq, ln: ln, cfg: cfg, pol: pol.withDefaults(), accept: accept, now: now,
 		ctx: ctx, cancel: cancel, routes: map[string]*route{}, plays: map[string]*playRoute{},
 		perIP: map[string]int{}, streams: map[string]int{}, ipPlay: map[string]int{},
-	}, nil
+	}
+	if opt != nil {
+		l.tls, l.tlsError = opt.Config, opt.OnError
+	}
+	return l, nil
 }
 
 // detach runs remove under r.mu, then the function it returns, if any,
@@ -391,9 +486,15 @@ type Stats struct {
 	// StreamPlayers counts them by play path (<app>/<name>).
 	Players       int
 	StreamPlayers map[string]int
+	// TLSHandshakeFailures counts the connections of an RTMPS listener whose
+	// TLS handshake failed, those that the closing listener cut short left
+	// out. It is read with Stats(addr), like every other counter of the
+	// listener, and Counters leaves it out.
+	TLSHandshakeFailures uint64
 }
 
-// Counters returns the rejection counters by their stats names.
+// Counters returns the rejection counters by their stats names. It has no
+// TLSHandshakeFailures: an RTMP listen input reports every key of it.
 func (s Stats) Counters() map[string]uint64 {
 	return map[string]uint64{
 		"rejected_unknown":           s.RejectedUnknown,
@@ -426,6 +527,7 @@ func (r *Registry) Stats(addr string) Stats {
 	st.RejectedPlayUnknown = l.rejectedPlayUnknown.Load()
 	st.RejectedPlayPublishPath = l.rejectedPlayPublishPath.Load()
 	st.RejectedPlayCaps = l.rejectedPlayCaps.Load()
+	st.TLSHandshakeFailures = l.tlsFailures.Load()
 	return st
 }
 
@@ -515,17 +617,38 @@ func peerKey(a net.Addr) string {
 }
 
 // serve runs the command exchange on c, then offers a publisher to the
-// sink of its path or plays a player through the handler of its app.
+// sink of its path or plays a player through the handler of its app. On an
+// RTMPS listener the TLS handshake comes first, and the session runs on the
+// *tls.Conn itself, never a wrapper of it: rtmp.Accept's close rule knows no
+// other TLS connection. c stays the TCP connection, whose close never waits:
+// it is what the hook and admit are given.
 func (l *listener) serve(c net.Conn, ip string) {
 	defer l.wg.Done()
 	if hook := l.reg.ConnHook; hook != nil {
 		hook(c)
 	}
+	conn := c
+	if l.tls != nil {
+		tc, err := l.handshake(c)
+		if err != nil {
+			l.leave(ip)
+			_ = c.Close()
+			if l.ctx.Err() != nil {
+				return // cut short by the closing listener: no failure
+			}
+			l.tlsFailures.Add(1)
+			if l.tlsError != nil {
+				l.tlsError(c.RemoteAddr(), fmt.Errorf("rtmpsrv: tls handshake: %w", err))
+			}
+			return
+		}
+		conn = tc
+	}
 	var (
 		rt   *route
 		slot *playSlot
 	)
-	sc, err := l.accept(l.ctx, c, l.cfg, func(req rtmp.Request) error {
+	sc, err := l.accept(l.ctx, conn, l.cfg, func(req rtmp.Request) error {
 		var err error
 		if req.Play {
 			slot, err = l.admit(c, req, ip)
@@ -555,6 +678,23 @@ func (l *listener) serve(c net.Conn, ip string) {
 	l.release(rt)
 }
 
+// handshake runs the server's TLS handshake on c, within the RTMP
+// handshake's timeout and the listener's life. On an error the caller closes
+// c: nothing was agreed, so there is no close_notify to send.
+func (l *listener) handshake(c net.Conn) (*tls.Conn, error) {
+	timeout := l.cfg.HandshakeTimeout
+	if timeout <= 0 {
+		timeout = rtmp.DefaultHandshakeTimeout
+	}
+	ctx, cancel := context.WithTimeout(l.ctx, timeout)
+	defer cancel()
+	tc := tls.Server(c, l.tls)
+	if err := tc.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	return tc, nil
+}
+
 // playTarget splits a normalised play path into the app that owns it and
 // the stream name: the name is the last segment and the app everything
 // before it, so a registered app owns the path only when the remainder
@@ -575,7 +715,8 @@ func playTarget(path string) (app, name string, ok bool) {
 // name, or a name containing "/"), of a stream that is not Live, and one
 // over a player cap. An admitted player holds its route (the route's wg)
 // and its player slots until endPlay, and its raw conn is closed if the
-// route is unregistered meanwhile.
+// route is unregistered meanwhile: c is the TCP connection, on an RTMPS
+// listener too, so that this close never waits on the peer.
 func (l *listener) admit(c net.Conn, req rtmp.Request, ip string) (*playSlot, error) {
 	path, _ := rtmp.NormalizePath(req.App, req.Stream)
 	app, name, target := playTarget(path)

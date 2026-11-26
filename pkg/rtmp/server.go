@@ -111,7 +111,9 @@ type ServerConn struct {
 // gets the same answer, NetStream.Publish.BadName or
 // NetStream.Play.StreamNotFound with the description "stream not
 // available", and the error is returned wrapped. A nil decide accepts every
-// request. ctx bounds only Accept. On any error c is closed.
+// request. ctx bounds only Accept. On any error c is closed. For RTMP over
+// TLS, c must be the *tls.Conn itself after its handshake, never a wrapper of
+// it: the bounded close (see ServerConn.Close) recognises no other type.
 //
 // An accepted play conn keeps the pre-publish chunk limits and starts its
 // reader goroutine before Accept returns; the caller writes media with
