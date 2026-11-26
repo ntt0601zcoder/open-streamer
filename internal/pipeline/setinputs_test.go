@@ -535,6 +535,11 @@ func TestSetInputsDuplicates(t *testing.T) {
 }
 
 func TestSetInputsSameList(t *testing.T) {
+	t.Run("active", sameListActive)
+	t.Run("idle", sameListIdle)
+}
+
+func sameListActive(t *testing.T) {
 	r := newEditRig(t, func(set *timedSet) byURL {
 		return byURL{"fake://a": liveInput(set, 0), "passive://l": hangInput()}
 	}, "fake://a", "passive://l")
@@ -560,6 +565,38 @@ func TestSetInputsSameList(t *testing.T) {
 	assert.Equal(t, 1, l.count(), "nothing opened")
 	assert.Equal(t, []EventKind{EventActive}, r.ev.kinds(), "no event")
 	assert.Len(t, epochIDs(drain(r.sub)), 1)
+}
+
+// sameListIdle is the list in force again while no input is active and a
+// search runs: the search goes on, one input at a time.
+func sameListIdle(t *testing.T) {
+	// A fails at 2 s; the search tries B, which hangs; C waits its turn.
+	r := newEditRig(t, func(set *timedSet) byURL {
+		return byURL{
+			"fake://a": failingInput(set, 0, 2*time.Second),
+			"fake://b": hangInput(),
+			"fake://c": hangInput(),
+		}
+	}, "fake://a", "fake://b", "fake://c")
+	waitActive(t, r.ev, 0)
+	stepTo(t, r.set, 2*time.Second)
+	a, b, c := r.m["fake://a"], r.m["fake://b"], r.m["fake://c"]
+	waitOpens(t, b, 2) // at start-up and by the search
+	waitReaders(t, b, 2)
+	waitOpens(t, c, 1)
+	stepTo(t, r.set, 2200*time.Millisecond)
+	require.Equal(t, -1, r.p.Stats().Active)
+	evs := len(r.ev.kinds())
+
+	setInputs(t, r.p, "fake://a", "fake://b", "fake://c")
+	waitOpens(t, c, 1) // nothing opened: C is still after B in the search
+	stepTo(t, r.set, 2440*time.Millisecond)
+	assert.Equal(t, 1, a.count(), "nothing opened")
+	assert.Equal(t, 2, b.count(), "nothing opened")
+	assert.Equal(t, 1, c.count(), "the search is unchanged: one pull input at a time")
+	assert.False(t, b.reader(1).isClosed(), "nothing closed")
+	assert.Len(t, r.ev.kinds(), evs, "no event")
+	r.stop()
 }
 
 func TestSetInputsErrors(t *testing.T) {

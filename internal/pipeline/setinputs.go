@@ -31,8 +31,14 @@ type edit struct {
 //
 // Inputs are matched by URL text, duplicates in order. With no input active
 // after the change, every added input opens at once; a kept input that
-// waits out a backoff still waits. It must not be called from OnEvent,
-// which runs in the Run goroutine.
+// waits out a backoff still waits. The list in force again changes nothing.
+//
+// Run applies the change between two of its steps, so SetInputs deadlocks
+// when Run cannot go on: it must not be called from OnEvent, which runs in
+// the Run goroutine, nor while holding a lock that OnEvent takes. Once Run
+// has taken the request, SetInputs waits for the answer whatever ctx does:
+// the wait lasts as long as closing the inputs that go, which waits for a
+// pending Open to return. An Open must therefore honour its context.
 func (p *Pipeline) SetInputs(ctx context.Context, urls []string) error {
 	if len(urls) == 0 {
 		return errors.New("pipeline: set inputs: no input")
@@ -71,6 +77,9 @@ func (p *Pipeline) Inputs() []string {
 // failure does, without an event or a backoff: the next activation's Break
 // is the one epoch change.
 func (p *Pipeline) setInputs(ctx context.Context, urls []string) error {
+	if slices.Equal(p.opt.Inputs, urls) {
+		return nil // nothing to change: a search goes on as it was
+	}
 	passive := make([]bool, len(urls))
 	for i, u := range urls {
 		spec, err := p.opt.Parse(u)
