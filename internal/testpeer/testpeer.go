@@ -4,7 +4,10 @@ package testpeer
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -624,4 +627,75 @@ func probeReason(out string, err error) string {
 	default:
 		return err.Error()
 	}
+}
+
+// frontSetup bounds a front connection's TLS handshake and its dial of the
+// backend.
+const frontSetup = 10 * time.Second
+
+// TLSFront listens on 127.0.0.1:0 with c and copies each connection's bytes to and from a new TCP connection to backend,
+// until either side closes or the test ends. It returns the listener's host:port. It is how a plain peer (ffmpeg -listen 1)
+// becomes an RTMPS server, as a TLS terminator does in a deployment.
+//
+// The backend is dialled only once the client's handshake is done, so a client that does not trust c's certificate
+// never reaches a backend that takes one connection only.
+func TLSFront(t testing.TB, backend string, c *tls.Config) (addr string) {
+	t.Helper()
+	l, err := tls.Listen("tcp", "127.0.0.1:0", c)
+	if err != nil {
+		t.Fatalf("testpeer: tls front: %v", err)
+		return ""
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return // the listener is closed
+			}
+			wg.Go(func() { front(ctx, conn, backend) })
+		}
+	})
+	t.Cleanup(func() {
+		cancel()
+		_ = l.Close()
+		wg.Wait()
+	})
+	return l.Addr().String()
+}
+
+// front serves one connection of a TLSFront: the handshake, the dial of
+// backend, then both copies; the end of either copy, or of ctx, closes both
+// connections.
+func front(ctx context.Context, client net.Conn, backend string) {
+	defer func() { _ = client.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = client.Close() })
+	defer stop()
+	sctx, cancel := context.WithTimeout(ctx, frontSetup)
+	defer cancel()
+	if tc, ok := client.(*tls.Conn); ok {
+		if err := tc.HandshakeContext(sctx); err != nil {
+			return
+		}
+	}
+	plain, err := new(net.Dialer).DialContext(sctx, "tcp", backend)
+	if err != nil {
+		return
+	}
+	defer func() { _ = plain.Close() }()
+	stopPlain := context.AfterFunc(ctx, func() { _ = plain.Close() })
+	defer stopPlain()
+	done := make(chan struct{}, 2)
+	pipe := func(dst, src net.Conn) {
+		_, _ = io.Copy(dst, src)
+		// What src sent is written; closing both ends the other copy.
+		_ = dst.Close()
+		_ = src.Close()
+		done <- struct{}{}
+	}
+	go pipe(plain, client)
+	go pipe(client, plain)
+	<-done
+	<-done
 }

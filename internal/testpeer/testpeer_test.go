@@ -1,15 +1,22 @@
 package testpeer
 
 import (
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 // recorder is a testing.TB whose Skipf and Fatalf record instead of ending
@@ -361,4 +368,146 @@ func TestProbeReason(t *testing.T) {
 	} {
 		assert.Equal(t, tt.want, probeReason(tt.out, err), "%q", tt.out)
 	}
+}
+
+// echoConn is one connection an echoServer accepted; ended is closed when
+// its client's side has ended.
+type echoConn struct {
+	net.Conn
+	ended chan struct{}
+}
+
+// echoServer is a plain TCP server on 127.0.0.1:0 that echoes every
+// connection; conns receives each accepted connection.
+func echoServer(t *testing.T) (addr string, conns <-chan echoConn) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0") //nolint:noctx // a test listener
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	ch := make(chan echoConn, 8)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			ec := echoConn{c, make(chan struct{})}
+			ch <- ec
+			go func() {
+				_, _ = io.Copy(c, c)
+				_ = c.Close()
+				close(ec.ended)
+			}()
+		}
+	}()
+	return l.Addr().String(), ch
+}
+
+// closed reports whether a read of c ends, without data, within 5 s.
+func closed(c net.Conn) bool {
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := c.Read(make([]byte, 1))
+	var ne net.Error
+	return n == 0 && err != nil && (!errors.As(err, &ne) || !ne.Timeout())
+}
+
+func TestTLSFront(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	backend, conns := echoServer(t)
+	accepted := func() echoConn {
+		select {
+		case c := <-conns:
+			return c
+		case <-time.After(5 * time.Second):
+			require.Fail(t, "the backend got no connection")
+			return echoConn{}
+		}
+	}
+	dial := func(addr string, cfg *tls.Config) (*tls.Conn, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		conn, err := (&tls.Dialer{Config: cfg}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return conn.(*tls.Conn), nil
+	}
+	var (
+		addr string
+		left *tls.Conn // the connection the subtest leaves open
+	)
+	t.Run("serves", func(t *testing.T) {
+		addr = TLSFront(t, backend, ca.Server(t))
+		host, _, err := net.SplitHostPort(addr)
+		require.NoError(t, err)
+		assert.Equal(t, "127.0.0.1", host)
+
+		// Bytes go both ways: what the client writes comes back from the
+		// echo, more than one TLS record of it.
+		c, err := dial(addr, ca.Client())
+		require.NoError(t, err)
+		b := accepted()
+		sent := make([]byte, 100<<10)
+		for i := range sent {
+			sent[i] = byte(i)
+		}
+		go func() { _, _ = c.Write(sent) }()
+		got := make([]byte, len(sent))
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err = io.ReadFull(c, got)
+		require.NoError(t, err)
+		assert.Equal(t, sent, got)
+
+		// The client closes: the backend's connection ends.
+		require.NoError(t, c.Close())
+		select {
+		case <-b.ended:
+		case <-time.After(5 * time.Second):
+			assert.Fail(t, "the backend's connection did not end with the client's")
+		}
+
+		// The backend closes: the client's connection ends.
+		c2, err := dial(addr, ca.Client())
+		require.NoError(t, err)
+		require.NoError(t, accepted().Close())
+		assert.True(t, closed(c2), "the client's connection ends with the backend's")
+		_ = c2.Close()
+
+		// A client that does not trust the certificate never reaches the
+		// backend.
+		_, err = dial(addr, tlstest.NewCA(t).Client())
+		require.Error(t, err)
+		select {
+		case <-conns:
+			assert.Fail(t, "an unverified client reached the backend")
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		// A backend that is not there: the connection is closed.
+		gone, err := net.Listen("tcp", "127.0.0.1:0") //nolint:noctx // a test listener
+		require.NoError(t, err)
+		goneAddr := gone.Addr().String()
+		require.NoError(t, gone.Close())
+		c3, err := dial(TLSFront(t, goneAddr, ca.Server(t)), ca.Client())
+		require.NoError(t, err)
+		assert.True(t, closed(c3), "no backend: the connection is closed")
+		_ = c3.Close()
+
+		// One connection stays open to the subtest's end.
+		left, err = dial(addr, ca.Client())
+		require.NoError(t, err)
+		_ = accepted()
+	})
+	// The subtest has ended: the connection it left open is closed, and so
+	// is its listener.
+	require.NotNil(t, left)
+	assert.True(t, closed(left), "the test's end closes an open connection")
+	_ = left.Close()
+	_, err := net.DialTimeout("tcp", addr, time.Second) //nolint:noctx // a test dial
+	require.Error(t, err, "the listener closes at the test's end")
+
+	// A listener that cannot be made fails the test.
+	rec := &recorder{TB: t}
+	assert.Empty(t, TLSFront(rec, backend, &tls.Config{MinVersion: tls.VersionTLS12}))
+	assert.True(t, rec.failed)
 }

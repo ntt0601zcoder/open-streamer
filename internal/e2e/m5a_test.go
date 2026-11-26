@@ -120,6 +120,11 @@ type m5a struct {
 	logs           *m5aLog
 	user, password string
 	stop           func() // cancels Run and waits for it; idempotent
+	// base is the API's origin and hc the client of the API requests; ""
+	// and nil mean the plain listener and m5aClient (the M5c1 scenarios
+	// set them to the TLS listener and a client that trusts its CA).
+	base string
+	hc   *http.Client
 }
 
 // m5aHash is the hash of password at the scenarios' iteration count.
@@ -229,6 +234,12 @@ var m5aClient = &http.Client{Timeout: time.Minute}
 // credentials.
 func m5aDo(t *testing.T, method, u, user, password string, body []byte, hdr ...string) m5aResp {
 	t.Helper()
+	return m5aDoWith(t, m5aClient, method, u, user, password, body, hdr...)
+}
+
+// m5aDoWith is m5aDo through the client c.
+func m5aDoWith(t *testing.T, c *http.Client, method, u, user, password string, body []byte, hdr ...string) m5aResp {
+	t.Helper()
 	req, err := http.NewRequestWithContext(context.Background(), method, u, bytes.NewReader(body))
 	require.NoError(t, err)
 	if user != "" {
@@ -237,7 +248,7 @@ func m5aDo(t *testing.T, method, u, user, password string, body []byte, hdr ...s
 	for i := 0; i+1 < len(hdr); i += 2 {
 		req.Header.Set(hdr[i], hdr[i+1])
 	}
-	res, err := m5aClient.Do(req)
+	res, err := c.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = res.Body.Close() }()
 	b, err := io.ReadAll(res.Body)
@@ -252,7 +263,14 @@ func (m *m5a) do(t *testing.T, method, path string, body []byte, hdr ...string) 
 	if method != http.MethodGet {
 		hdr = append([]string{"X-Requested-By", "e2e"}, hdr...)
 	}
-	return m5aDo(t, method, "http://"+m.addrs.API+path, m.user, m.password, body, hdr...)
+	base, c := m.base, m.hc
+	if base == "" {
+		base = "http://" + m.addrs.API
+	}
+	if c == nil {
+		c = m5aClient
+	}
+	return m5aDoWith(t, c, method, base+path, m.user, m.password, body, hdr...)
 }
 
 // get reads an API path.
@@ -822,6 +840,9 @@ type m5aRowOpt struct {
 	taps []string
 	// watch is the output whose packager rule (d) samples; "" samples none.
 	watch stream.Output
+	// tls, when set, has the row's RTMP, RTSP and HTTP-TS readers come
+	// through the server's TLS listeners, verifying it against its CA.
+	tls *m5c1
 }
 
 // m5aRow measures "not interrupted" for one stream (R-D12): a tap, one
@@ -894,11 +915,23 @@ func m5aOpen(t *testing.T, m *m5a, name string, opt m5aRowOpt) *m5aRow { //nolin
 	for _, out := range opt.sessions {
 		switch out {
 		case stream.OutRTMP:
-			r.rtmp = readPlay(m.url(out, name))
+			if opt.tls != nil {
+				r.rtmp = readPlayTLS(opt.tls.tlsURL(out, name), opt.tls.ca.Client())
+			} else {
+				r.rtmp = readPlay(m.url(out, name))
+			}
 		case stream.OutRTSP:
-			r.rtsp = readRTSP(m.url(out, name))
+			if opt.tls != nil {
+				r.rtsp = readRTSPTLS(opt.tls.tlsURL(out, name), opt.tls.ca.Client())
+			} else {
+				r.rtsp = readRTSP(m.url(out, name))
+			}
 		case stream.OutHTTPTS:
-			r.raw[out] = rawHTTP(m.url(out, name))
+			if opt.tls != nil {
+				r.raw[out] = rawHTTPWith(opt.tls.client, opt.tls.tlsURL(out, name))
+			} else {
+				r.raw[out] = rawHTTP(m.url(out, name))
+			}
 		case stream.OutSRT:
 			r.raw[out] = rawSRT(m.addrs.SRT, "live/"+name)
 		case stream.OutHLS, stream.OutDASH:

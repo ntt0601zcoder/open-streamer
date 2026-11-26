@@ -388,8 +388,15 @@ func gstLinkLine(line string) bool {
 // run, in the background.
 func runGst(t *testing.T, gst testpeer.Peer, pipeline []string, run time.Duration) <-chan gstResult {
 	t.Helper()
+	return runGstDirs(t, gst, nil, pipeline, run)
+}
+
+// runGstDirs is runGst with the directories the pipeline reads, which are
+// mounted for the image.
+func runGstDirs(t *testing.T, gst testpeer.Peer, dirs, pipeline []string, run time.Duration) <-chan gstResult {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), runLimit)
-	cmd := gst.Command(ctx, t, testpeer.Run{Interrupt: run}, append([]string{"-v", "-e"}, pipeline...)...)
+	cmd := gst.Command(ctx, t, testpeer.Run{Dirs: dirs, Interrupt: run}, append([]string{"-v", "-e"}, pipeline...)...)
 	pr, pw, err := os.Pipe()
 	require.NoError(t, err)
 	cmd.Stdout, cmd.Stderr = pw, pw
@@ -831,11 +838,20 @@ type vlcPair struct {
 
 func startVLCPair(t *testing.T, vlc testpeer.Peer, u string) *vlcPair {
 	t.Helper()
+	return startVLCPairWith(t, vlc, nil, nil, u)
+}
+
+// startVLCPairWith is startVLCPair with options both instances get before
+// the URL, and the directories those options name, which are mounted for
+// the image.
+func startVLCPairWith(t *testing.T, vlc testpeer.Peer, dirs, opts []string, u string) *vlcPair {
+	t.Helper()
 	dir := t.TempDir()
 	file := filepath.Join(dir, "dump.ts")
+	sout := []string{"--sout", "#duplicate{dst=display,dst=std{access=file,mux=ts,dst=" + file + "}}"}
 	return &vlcPair{
-		disp:    startVLC(t, vlc, nil, u),
-		dump:    startVLC(t, vlc, []string{dir}, "--sout", "#duplicate{dst=display,dst=std{access=file,mux=ts,dst="+file+"}}", u),
+		disp:    startVLC(t, vlc, dirs, slices.Concat(opts, []string{u})...),
+		dump:    startVLC(t, vlc, slices.Concat([]string{dir}, dirs), slices.Concat(opts, sout, []string{u})...),
 		file:    file,
 		started: time.Now(),
 	}
@@ -861,7 +877,13 @@ func (p *vlcPair) finish(t *testing.T, ffprobe string) {
 // HLS fMP4 and DASH rows (ruling R-T1c).
 func vlcPlays(t *testing.T, vlc testpeer.Peer, ffprobe, u string, tolerate bool) {
 	t.Helper()
-	p := startVLCPair(t, vlc, u)
+	vlcPlaysWith(t, vlc, ffprobe, nil, nil, u, tolerate)
+}
+
+// vlcPlaysWith is vlcPlays with startVLCPairWith's directories and options.
+func vlcPlaysWith(t *testing.T, vlc testpeer.Peer, ffprobe string, dirs, opts []string, u string, tolerate bool) {
+	t.Helper()
+	p := startVLCPairWith(t, vlc, dirs, opts, u)
 	p.tolerate = tolerate
 	time.Sleep(time.Until(p.started.Add(vlcStatsAfter)))
 	st, ok := p.disp.stats(t)

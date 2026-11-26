@@ -171,7 +171,7 @@ func ReadRTSP(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 		return fmt.Errorf("conform: read: rtsp: %w", err)
 	}
 	c, err := rtsp.Dial(rctx, dialURL, rtsp.Config{
-		Timeout: timeout, IdleTimeout: timeout, Transport: transport, Dial: opt.Dial,
+		Timeout: timeout, IdleTimeout: timeout, Transport: transport, Dial: opt.Dial, TLS: opt.TLS,
 	})
 	if err != nil {
 		return Capture{}, fail(err)

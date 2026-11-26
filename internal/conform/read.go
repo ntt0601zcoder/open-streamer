@@ -3,6 +3,7 @@ package conform
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -69,6 +70,10 @@ type ReadOptions struct {
 	// Dial, when set, opens ReadRTSP's control connection; tests use it to
 	// interpose on the stream.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// TLS is the client config ReadRTMP uses for an rtmps:// URL and
+	// ReadRTSP for an rtsps:// one; nil means the system roots. The HTTP
+	// readers take theirs from Client.
+	TLS *tls.Config
 	// AlignedSequences makes ReadHLS require that the media playlists of a
 	// master number their segments alike: equal MEDIA-SEQUENCE, so one
 	// media sequence number is one segment in every rendition. RFC 8216bis

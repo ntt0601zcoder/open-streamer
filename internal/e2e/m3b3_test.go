@@ -280,7 +280,10 @@ func rawSRT(addr, streamID string) <-chan rawResult {
 }
 
 // rawHTTP reads the body of u until it ends, in the background.
-func rawHTTP(u string) <-chan rawResult {
+func rawHTTP(u string) <-chan rawResult { return rawHTTPWith(http.DefaultClient, u) }
+
+// rawHTTPWith is rawHTTP through the client c, which must have no Timeout.
+func rawHTTPWith(c *http.Client, u string) <-chan rawResult {
 	ch := make(chan rawResult, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), runLimit)
@@ -290,7 +293,7 @@ func rawHTTP(u string) <-chan rawResult {
 			ch <- rawResult{err: err}
 			return
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := c.Do(req)
 		if err != nil {
 			ch <- rawResult{err: err}
 			return

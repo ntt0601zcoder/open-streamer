@@ -209,7 +209,10 @@ jobs:
   # M5a scenarios need no transcoder and run in the test job), and the M5b1
   # scenarios that need the child (TestM5b1ReplaceInputsLadder,
   # TestM5b1Assets, TestM5b1NoFallback, each about 10 s; TestM5b1ReplaceInputs
-  # is passthrough and runs in the test job). The
+  # is passthrough and runs in the test job), and M5c1's ffmpeg scenario
+  # over TLS (TestM5c1FFmpeg, about 13 s: it needs no transcoder, and runs
+  # here so that apt's ffmpeg on arm64 publishes and plays over RTMPS, RTSPS
+  # and HTTPS too; the other M5c1 scenarios run in the test job). The
   # whole set took about 85 s with -race on an amd64 workstation, well
   # inside the 10 min timeout of this job's step. Their only peers are the bundle and apt's
   # ffmpeg and ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a
@@ -224,7 +227,7 @@ jobs:
       OS_REQUIRE_PEERS: "1"
       OS_TRANSCODE_E2E_ARM: "1"
       E2E_PKGS: ./internal/e2e/ ./internal/transcode/
-      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cWatermarkABR TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen TestM5aLadder TestM5b1ReplaceInputsLadder TestM5b1Assets TestM5b1NoFallback TestM5b2AudioLanguageLadder
+      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cWatermarkABR TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen TestM5aLadder TestM5b1ReplaceInputsLadder TestM5b1Assets TestM5b1NoFallback TestM5b2AudioLanguageLadder TestM5c1FFmpeg
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

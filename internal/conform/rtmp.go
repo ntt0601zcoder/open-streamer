@@ -126,7 +126,7 @@ func ReadRTMP(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 		}
 		return fmt.Errorf("conform: read: rtmp: %w", err)
 	}
-	c, err := rtmp.PlayWith(rctx, u, rtmp.Config{HandshakeTimeout: timeout, CommandTimeout: timeout})
+	c, err := rtmp.PlayWith(rctx, u, rtmp.Config{HandshakeTimeout: timeout, CommandTimeout: timeout, TLS: opt.TLS})
 	if err != nil {
 		return Capture{}, fail(err)
 	}
