@@ -463,7 +463,14 @@ func (m *m5a) running(t *testing.T, name string) stream.Status {
 // answers.
 func (m *m5a) listed(t *testing.T, served string, n int) {
 	t.Helper()
-	name, _, _ := strings.Cut(served, "_")
+	// A served name is a stream's, or <stream>_<label>. A stream of the
+	// whole name comes first, so a name that holds a "_" is not cut.
+	name := served
+	if _, ok := m.srv.Manager().Get(served); !ok {
+		if i := strings.LastIndexByte(served, '_'); i >= 0 {
+			name = served[:i]
+		}
+	}
 	m5aUntil(t, m5aWait, func() bool {
 		outs := m.status(t, name).Outputs
 		for _, f := range m5aFormats {
@@ -720,14 +727,15 @@ func (m *m5a) refused(t *testing.T, out stream.Output, served string) { //nolint
 }
 
 // m5aWatch samples a stream's packager every 200 ms: the pointer the
-// manager answers for one output, and the Seq of its newest segment.
+// manager answers for one output, and the Seq of every segment in its
+// window.
 type m5aWatch struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	what   string
 
 	packs   []*live.Packager // the distinct pointers, in the order seen
-	seqs    []uint64         // the distinct newest Seq, in the order seen
+	seqs    map[uint64]bool  // every Seq seen in a snapshot's window
 	missing int              // samples at which the manager had no packager
 	samples int
 }
@@ -735,7 +743,10 @@ type m5aWatch struct {
 // watchPackager starts sampling Packager(out, served).
 func (m *m5a) watchPackager(out stream.Output, served string) *m5aWatch {
 	ctx, cancel := context.WithCancel(context.Background())
-	w := &m5aWatch{cancel: cancel, done: make(chan struct{}), what: fmt.Sprintf("Packager(%s, %s)", out, served)}
+	w := &m5aWatch{
+		cancel: cancel, done: make(chan struct{}), what: fmt.Sprintf("Packager(%s, %s)", out, served),
+		seqs: map[uint64]bool{},
+	}
 	go func() {
 		defer close(w.done)
 		tick := time.NewTicker(200 * time.Millisecond)
@@ -748,10 +759,10 @@ func (m *m5a) watchPackager(out stream.Output, served string) *m5aWatch {
 				if len(w.packs) == 0 || w.packs[len(w.packs)-1] != p {
 					w.packs = append(w.packs, p)
 				}
-				if segs := p.Snapshot().Segments; len(segs) > 0 {
-					if seq := segs[len(segs)-1].Seq; len(w.seqs) == 0 || w.seqs[len(w.seqs)-1] != seq {
-						w.seqs = append(w.seqs, seq)
-					}
+				// The whole window, not its newest segment: two segments
+				// may close between two samples.
+				for _, seg := range p.Snapshot().Segments {
+					w.seqs[seg.Seq] = true
 				}
 			}
 			select {
@@ -771,14 +782,16 @@ func (w *m5aWatch) end() {
 }
 
 // check is rule (d) of the segmented outputs: one packager for the whole
-// row, and the Seq of its newest segment one run that increases by one.
+// row, and the Seqs of the segments its windows held, taken together, one
+// run without a hole.
 func (w *m5aWatch) check(t *testing.T) {
 	t.Helper()
 	assert.Zero(t, w.missing, "%s: samples without a packager, of %d", w.what, w.samples)
 	assert.Len(t, w.packs, 1, "%s: the same packager at every sample", w.what)
-	require.GreaterOrEqual(t, len(w.seqs), 5, "%s: the newest segments seen: %v", w.what, w.seqs)
-	for i := 1; i < len(w.seqs); i++ {
-		require.Equal(t, w.seqs[i-1]+1, w.seqs[i], "%s: the newest Seq increases by one: %v", w.what, w.seqs)
+	seqs := slices.Sorted(maps.Keys(w.seqs))
+	require.GreaterOrEqual(t, len(seqs), 5, "%s: the segments seen: %v", w.what, seqs)
+	for i := 1; i < len(seqs); i++ {
+		require.Equal(t, seqs[i-1]+1, seqs[i], "%s: the Seqs seen are one run: %v", w.what, seqs)
 	}
 }
 
@@ -935,6 +948,8 @@ func (r *m5aRow) counters(t *testing.T) map[string]float64 {
 	c["rebuilds"] = float64(st.Rebuilds)
 	if len(st.Pushes) > 0 {
 		c["pushes[0].connects"] = float64(st.Pushes[0].Connects)
+		// A push that was not touched lost no frame.
+		c["pushes[0].resyncs"] = m5aFind(t, s, "openstreamer_push_resyncs_total", "target", st.Pushes[0].ID)
 	}
 	if st.Transcoder != nil {
 		c["transcoder.pid"] = float64(st.Transcoder.PID)
@@ -2002,15 +2017,14 @@ func TestM5aPeers(t *testing.T) {
 		}
 		// ffmpeg's FLV demuxer shows an onMetaData that is not at
 		// timestamp 0, which the RTMP output sends at every epoch change,
-		// as a text stream of its own: it is neither video nor audio, and
-		// it is there only when the probe crosses a loop of the file.
-		var av []string
-		for _, s := range streams {
-			if strings.HasPrefix(s, "video:") || strings.HasPrefix(s, "audio:") {
-				av = append(av, s)
-			}
+		// as a text stream of its own: it is there only when the probe
+		// crosses a loop of the file. That one stream, on the RTMP URL, is
+		// all that is left out: anything else on any URL fails.
+		got := streams
+		if strings.HasPrefix(u, "rtmp://") {
+			got = slices.DeleteFunc(slices.Clone(streams), func(s string) bool { return s == "subtitle:text" })
 		}
-		assert.ElementsMatch(t, []string{"video:h264", "audio:aac"}, av, "%s: streams %v", u, streams)
+		assert.ElementsMatch(t, []string{"video:h264", "audio:aac"}, got, "%s: streams %v", u, streams)
 		t.Logf("%s: %v", u, streams)
 	}
 }
@@ -2018,22 +2032,37 @@ func TestM5aPeers(t *testing.T) {
 // m5aSecrets are what must never leave the server but where an editor asks
 // for it: the stream secrets and the API users' passwords and hashes.
 func m5aSecrets() (streams, users []string) {
-	return []string{"hunter2-pw", "pushkey-0123456789"},
+	return []string{"hunter2-pw", "pushkey-0123456789", "listenkey-0123456789", "srtpass-0123456789"},
 		[]string{m5aEditorPW, m5aViewerPW, m5aHash(m5aEditorPW), m5aHash(m5aViewerPW)}
 }
 
 // TestM5aNoSecretsLeak runs a stream whose first input and whose push hold
-// a secret and are refused, so that both end up in errors, and looks for
-// the secrets in everything the server says.
+// a secret and are refused, so that both end up in errors; a stream whose
+// first input is an SRT caller with a passphrase that nobody answers; and a
+// stream that waits on an RTMP listen input, whose publish path is its key.
+// Then it looks for the secrets in everything the server says.
 func TestM5aNoSecretsLeak(t *testing.T) {
 	const input, push = "rtsp://user:hunter2-pw@127.0.0.1:1/x", "rtmp://127.0.0.1:1/live/pushkey-0123456789"
+	const srtInput = "srt://127.0.0.1:1?passphrase=srtpass-0123456789"
 	m := m5aServer(t, "")
+	listenInput := "rtmp://" + m.addrs.RTMP + "/in/listenkey-0123456789?mode=listen"
 	cam2 := m5aSpec("cam2", input)
 	cam2.Inputs = append(cam2.Inputs, spec.Input{URL: m5aSource(t)})
 	cam2.Outputs.Push = []spec.Push{{URL: push}}
 	code, _ := m.put(t, cam2)
 	require.Equal(t, http.StatusCreated, code)
-	time.Sleep(5 * time.Second)
+	cam5 := m5aSpec("cam5", srtInput)
+	cam5.Inputs = append(cam5.Inputs, spec.Input{URL: m5aSource(t)})
+	code, _ = m.put(t, cam5)
+	require.Equal(t, http.StatusCreated, code)
+	code, _ = m.put(t, m5aSpec("cam6", listenInput))
+	require.Equal(t, http.StatusCreated, code)
+	// Both failures are in the statuses before anything is read.
+	m5aUntil(t, m5aWait, func() bool {
+		st2, st5 := m.status(t, "cam2"), m.status(t, "cam5")
+		return st2.LastError != "" && len(st2.Pushes) == 1 && st2.Pushes[0].LastError != "" && st2.ActiveInput == 1 &&
+			st5.LastError != "" && st5.ActiveInput == 1
+	}, "cam2 and cam5 run on their second inputs, with their failures as last errors")
 
 	streamSecrets, userSecrets := m5aSecrets()
 	all := slices.Concat(streamSecrets, userSecrets)
@@ -2047,17 +2076,30 @@ func TestM5aNoSecretsLeak(t *testing.T) {
 	bad := m5aSpec("cam3", "gopher://user:hunter2-pw@127.0.0.1:1/x")
 	badBody, err := json.Marshal(bad)
 	require.NoError(t, err)
+	// A second stream on cam6's listen address and publish path: the
+	// conflict's text names the address, never the path.
+	dup, err := json.Marshal(m5aSpec("cam7", listenInput))
+	require.NoError(t, err)
 	eye := m.as(m5aViewer, m5aViewerPW)
 	for _, who := range []*m5a{eye, m} {
-		for _, path := range []string{
-			"/metrics", "/api/v1/streams/cam2", "/api/v1/streams", "/api/v1/streams/cam2/status", "/api/v1/config/status",
-		} {
+		paths := []string{"/metrics", "/api/v1/streams", "/api/v1/config/status"}
+		for _, name := range []string{"cam2", "cam5", "cam6"} {
+			paths = append(paths, "/api/v1/streams/"+name, "/api/v1/streams/"+name+"/status")
+		}
+		for _, path := range paths {
 			code, body := who.get(t, path)
 			require.Equal(t, http.StatusOK, code, "%s as %s", path, who.user)
 			clean(path+" as "+who.user, string(body), all)
 		}
-		resp := who.do(t, http.MethodPut, "/api/v1/streams/cam3", badBody, "Content-Type", "application/json")
-		want := http.StatusUnprocessableEntity
+		resp := who.do(t, http.MethodPut, "/api/v1/streams/cam7", dup, "Content-Type", "application/json")
+		want := http.StatusConflict
+		if who == eye {
+			want = http.StatusForbidden
+		}
+		assert.Equal(t, want, resp.code, "the PUT of a taken listen input as %s: %s", who.user, resp.body)
+		clean("the answer to a PUT of a taken listen input as "+who.user, string(resp.body), all)
+		resp = who.do(t, http.MethodPut, "/api/v1/streams/cam3", badBody, "Content-Type", "application/json")
+		want = http.StatusUnprocessableEntity
 		if who == eye {
 			want = http.StatusForbidden
 		}
@@ -2069,6 +2111,9 @@ func TestM5aNoSecretsLeak(t *testing.T) {
 	require.Len(t, st.Pushes, 1)
 	assert.NotEmpty(t, st.Pushes[0].LastError, "pushes[0].last_error")
 	assert.Equal(t, 1, st.ActiveInput, "cam2 runs on its second input")
+	st5 := m.status(t, "cam5")
+	assert.Contains(t, st5.LastError, "srt", "cam5's last_error is its SRT input's")
+	assert.NotEqual(t, "running", m.status(t, "cam6").State, "cam6 waits for a publisher")
 
 	logs := m.logs.String()
 	clean("the log", logs, all)
@@ -2084,13 +2129,17 @@ func TestM5aNoSecretsLeak(t *testing.T) {
 	}
 
 	// The deliberate exceptions, for the editor only.
-	code, body := m.get(t, "/api/v1/streams/cam2?secrets=1")
-	require.Equal(t, http.StatusOK, code)
-	for _, s := range streamSecrets {
-		assert.Contains(t, string(body), s, "GET cam2?secrets=1 as the editor")
+	for name, own := range map[string][]string{
+		"cam2": {"hunter2-pw", "pushkey-0123456789"}, "cam5": {"srtpass-0123456789"}, "cam6": {"listenkey-0123456789"},
+	} {
+		code, body := m.get(t, "/api/v1/streams/"+name+"?secrets=1")
+		require.Equal(t, http.StatusOK, code)
+		for _, s := range own {
+			assert.Contains(t, string(body), s, "GET %s?secrets=1 as the editor", name)
+		}
+		clean("GET "+name+"?secrets=1", string(body), userSecrets)
+		assert.Equal(t, http.StatusForbidden, eye.do(t, http.MethodGet, "/api/v1/streams/"+name+"?secrets=1", nil).code)
 	}
-	clean("GET cam2?secrets=1", string(body), userSecrets)
-	assert.Equal(t, http.StatusForbidden, eye.do(t, http.MethodGet, "/api/v1/streams/cam2?secrets=1", nil).code)
 	text, _ := m.configText(t)
 	for _, s := range slices.Concat(streamSecrets, []string{m5aHash(m5aEditorPW), m5aHash(m5aViewerPW)}) {
 		assert.Contains(t, text, s, "GET /api/v1/config as the editor")
@@ -2102,9 +2151,11 @@ func TestM5aNoSecretsLeak(t *testing.T) {
 	// makes a restart possible.
 	p, err := config.Parse([]byte(m.fileText(t)), config.Options{RequiredIterations: m5aIter})
 	require.NoError(t, err)
-	require.Len(t, p.Doc.Streams, 1)
+	require.Len(t, p.Doc.Streams, 3)
 	assert.Equal(t, input, p.Doc.Streams[0].Inputs[0].URL)
 	assert.Equal(t, push, p.Doc.Streams[0].Outputs.Push[0].URL)
+	assert.Equal(t, srtInput, p.Doc.Streams[1].Inputs[0].URL)
+	assert.Equal(t, listenInput, p.Doc.Streams[2].Inputs[0].URL)
 }
 
 // TestM5aRoles checks who may do what: nothing without credentials but
