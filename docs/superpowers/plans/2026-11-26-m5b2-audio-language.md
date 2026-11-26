@@ -338,7 +338,8 @@ func TestM5b2AudioLanguage(t *testing.T)
 // and video frames within 15 s. ffmpeg only, so it runs in the arm64 job too. Budget 45 s.
 func TestM5b2AudioLanguageLadder(t *testing.T)
 
-// TestM5b2Players: M4b's replay (liveABR with live.Options{ABR: true, AudioLanguage: "vi"}) serves the ABR TS master over a live
+// TestM5b2Players: M4b's replay (liveABR(t, steps, passes) unchanged; SetAudioLanguage("vi") on the packager it returns, before the
+// first playlist request) serves the ABR TS master over a live
 // sliding window; ffprobe 6.1 and 8 report language "vi"; vlcPlays and gstPlays, unchanged, pass on hls/index.m3u8 and on
 // cmaf/master.m3u8 with audio decoded. Peers only: amd64 test job, not the arm64 list.
 func TestM5b2Players(t *testing.T)
