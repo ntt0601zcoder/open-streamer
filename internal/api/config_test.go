@@ -186,4 +186,23 @@ func TestReloadAndStatus(t *testing.T) {
 	rec = e.do(http.MethodGet, "/api/v1/config/status", viewer...)
 	assert.JSONEq(t, `{"etag":"\"e\"","loaded_at":"2026-11-26T10:00:00Z","stale":false,"load_errors":[],"restart_required":[]}`,
 		rec.Body.String())
+
+	// With server.tls: the certificate in force, and the latest read's
+	// error when it failed.
+	notAfter := time.Date(2027, 2, 24, 10, 0, 0, 0, time.UTC)
+	e.be.cstatus = ConfigStatus{ETag: `"e"`, LoadedAt: at, Certificate: &CertStatus{
+		NotAfter: notAfter, Names: []string{"media.example", "192.0.2.7"}, LoadedAt: at,
+	}}
+	rec = e.do(http.MethodGet, "/api/v1/config/status", viewer...)
+	assert.JSONEq(t, `{"etag":"\"e\"","loaded_at":"2026-11-26T10:00:00Z","stale":false,"load_errors":[],"restart_required":[],`+
+		`"certificate":{"not_after":"2027-02-24T10:00:00Z","names":["media.example","192.0.2.7"],"loaded_at":"2026-11-26T10:00:00Z"}}`,
+		rec.Body.String())
+	e.be.cstatus.Certificate = &CertStatus{
+		NotAfter: notAfter, LoadedAt: at, LastError: "certs: reload: /etc/os/key.pem: tls: private key does not match public key",
+	}
+	rec = e.do(http.MethodGet, "/api/v1/config/status", viewer...)
+	assert.JSONEq(t, `{"etag":"\"e\"","loaded_at":"2026-11-26T10:00:00Z","stale":false,"load_errors":[],"restart_required":[],`+
+		`"certificate":{"not_after":"2027-02-24T10:00:00Z","names":[],"loaded_at":"2026-11-26T10:00:00Z",`+
+		`"last_error":"certs: reload: /etc/os/key.pem: tls: private key does not match public key"}}`,
+		rec.Body.String())
 }

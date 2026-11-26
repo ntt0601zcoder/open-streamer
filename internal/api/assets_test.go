@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -598,6 +599,130 @@ func TestAssetDeadlines(t *testing.T) {
 		}
 		assert.GreaterOrEqual(t, time.Since(start), 600*time.Millisecond)
 		assert.True(t, bytes.Equal(big, got.Bytes()), "every byte: got %d of %d", got.Len(), len(big))
+	})
+}
+
+// serveTLS runs the API behind an httptest TLS server with short read and
+// write timeouts, HTTP/1.1 only, and returns it. Its built-in certificate is
+// enough: the client's trust is not under test here.
+func serveTLS(t *testing.T, e *env, readTimeout, writeTimeout time.Duration) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(e.api)
+	srv.Config.ReadTimeout, srv.Config.WriteTimeout = readTimeout, writeTimeout
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// rawTLSConn dials srv and finishes a TLS handshake with it; readBuffer, when
+// positive, is the socket's receive buffer, set before the handshake.
+func rawTLSConn(t *testing.T, srv *httptest.Server, readBuffer int) *tls.Conn {
+	t.Helper()
+	raw := rawConn(t, srv.Listener.Addr().String())
+	if readBuffer > 0 {
+		require.NoError(t, raw.SetReadBuffer(readBuffer))
+	}
+	tr, ok := srv.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	cfg := tr.TLSClientConfig.Clone()
+	cfg.ServerName = "127.0.0.1"
+	c := tls.Client(raw, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, c.HandshakeContext(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// The asset routes' deadlines are the same over TLS: a tls.Conn passes the
+// deadlines the handlers set to the TCP connection under it.
+func TestAssetDeadlinesTLS(t *testing.T) {
+	e := newEnv(t)
+	// As TestAssetDeadlines, with a short slot wait: a slot that a cut
+	// upload kept would answer the next upload 503 within it.
+	e.api.timing = timing{base: time.Second, per256KiB: 30 * time.Millisecond, slotWait: 500 * time.Millisecond, writeMore: time.Second}
+	srv := serveTLS(t, e, 200*time.Millisecond, 200*time.Millisecond)
+	putHead := func(name string, n int) string {
+		return head(http.MethodPut, "/api/v1/assets/"+name, "Content-Type: application/octet-stream", fmt.Sprintf("Content-Length: %d", n))
+	}
+
+	t.Run("stalled body", func(t *testing.T) {
+		// Both slots, each held by an upload that stalls mid-body.
+		conns := make([]*tls.Conn, uploadSlots)
+		for i := range conns {
+			conns[i] = rawTLSConn(t, srv, 0)
+			_, err := io.WriteString(conns[i], putHead(fmt.Sprintf("stall%d.png", i), len(logoPNG)))
+			require.NoError(t, err)
+			_, err = conns[i].Write(logoPNG[:len(logoPNG)/2])
+			require.NoError(t, err)
+			require.NoError(t, conns[i].SetReadDeadline(time.Now().Add(10*time.Second)))
+		}
+		start := time.Now()
+		var wg sync.WaitGroup
+		for _, c := range conns {
+			wg.Go(func() {
+				res, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodPut})
+				if err == nil { // or the connection was closed
+					b, _ := io.ReadAll(res.Body)
+					_ = res.Body.Close()
+					assert.Equal(t, http.StatusBadRequest, res.StatusCode, string(b))
+					assert.Contains(t, string(b), `"code":"bad_request"`)
+					assert.Contains(t, string(b), "the body could not be read")
+				}
+				assert.GreaterOrEqual(t, time.Since(start), 900*time.Millisecond, "its own deadline, not the server's ReadTimeout")
+			})
+		}
+		wg.Wait()
+		for _, n := range e.dirEntries() {
+			assert.NotContains(t, n, "stall", "no file and no temp file")
+		}
+		// Their slots are free: the next upload does not wait for one.
+		start = time.Now()
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, srv.URL+"/api/v1/assets/next.png", bytes.NewReader(logoPNG))
+		require.NoError(t, err)
+		req.SetBasicAuth("ops", edPass)
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("X-Requested-By", "test")
+		res, err := srv.Client().Do(req)
+		require.NoError(t, err)
+		b, _ := io.ReadAll(res.Body)
+		require.NoError(t, res.Body.Close())
+		assert.Equal(t, http.StatusCreated, res.StatusCode, string(b))
+		assert.Less(t, time.Since(start), 500*time.Millisecond)
+	})
+
+	t.Run("stalled reader", func(t *testing.T) {
+		big := fontOf(t, 8<<20) // more than the loopback's buffers hold
+		_, _, err := e.be.assets.Put(context.Background(), "big.ttf", bytes.NewReader(big), "", false)
+		require.NoError(t, err)
+		c := rawTLSConn(t, srv, 32<<10)
+		_, err = io.WriteString(c, head(http.MethodGet, "/api/v1/assets/big.ttf"))
+		require.NoError(t, err)
+		start := time.Now()
+		require.NoError(t, c.SetReadDeadline(time.Now().Add(10*time.Second)))
+		br := bufio.NewReaderSize(c, 64<<10)
+		res, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+		require.NoError(t, err)
+		defer res.Body.Close()
+		require.Equal(t, http.StatusOK, res.StatusCode)
+		// deadline(8 MiB) is 1.96 s from the handler's start: stall past it.
+		time.Sleep(3 * time.Second)
+		n, err := io.Copy(io.Discard, res.Body)
+		require.Error(t, err, "the body ended cleanly")
+		var ne net.Error
+		assert.False(t, errors.As(err, &ne) && ne.Timeout(), "the server did not cut it: %v", err)
+		assert.Less(t, n, int64(len(big)), "cut short")
+		assert.Less(t, time.Since(start), 8*time.Second)
+	})
+
+	t.Run("slow body", func(t *testing.T) {
+		c := rawTLSConn(t, srv, 0)
+		_, err := io.WriteString(c, putHead("slow.png", len(logoPNG)))
+		require.NoError(t, err)
+		sendSlowly(t, c, logoPNG, 6, 120*time.Millisecond) // the last piece at 600 ms, three times the server's ReadTimeout
+		code, b, err := readPutAnswer(t, c)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusCreated, code, string(b))
 	})
 }
 

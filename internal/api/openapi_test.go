@@ -179,6 +179,7 @@ func TestOpenAPIMatchesSpec(t *testing.T) {
 		"PutStreamResult":  reflect.TypeFor[putResult](),
 		"ApplyResult":      reflect.TypeFor[ApplyResult](),
 		"ConfigStatus":     reflect.TypeFor[ConfigStatus](),
+		"CertStatus":       reflect.TypeFor[CertStatus](),
 		"Asset":            reflect.TypeFor[Asset](),
 		"AssetPut":         reflect.TypeFor[AssetPut](),
 		"Error":            reflect.TypeFor[errorBody](),

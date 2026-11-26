@@ -52,6 +52,8 @@ const (
 	// transcoderName is the transcoder looked for next to the executable
 	// when the config names none.
 	transcoderName = "ostranscoder"
+	// certPoll is how often Run looks at the certificate files (R-S3).
+	certPoll = 30 * time.Second
 )
 
 // Options are what New takes beside the config file.
@@ -75,6 +77,9 @@ type Options struct {
 	// their TLS handshake timeout; 0 means 10 s. Tests only;
 	// cmd/openstreamer never sets it.
 	HeaderTimeout time.Duration
+	// CertPoll is how often Run looks at the certificate files (R-S3); 0
+	// means 30 s. Tests only; cmd/openstreamer never sets it.
+	CertPoll time.Duration
 }
 
 // Addrs are the listeners' addresses, host:port as bound; "" when off. HTTPS,
@@ -118,8 +123,14 @@ type Server struct {
 	staleLogged              atomic.Int64 // when a Stale error was last logged, Unix nanoseconds
 
 	// store is the certificate of every TLS listener; nil without
-	// server.tls.
-	store *certs.Store
+	// server.tls. certPoll is how often Run's watch looks at its files.
+	store    *certs.Store
+	certPoll time.Duration
+	// certMu orders the certificate's log lines; certLogged is the text of
+	// the reload error last logged, "" once a reload succeeded. Never taken
+	// with cfg held, nor cfg with it.
+	certMu     sync.Mutex
+	certLogged string
 	// httpsFailures and apiFailures count the failed TLS handshakes of the
 	// media and the API listener; the RTMPS and RTSPS listeners count their
 	// own.
@@ -197,6 +208,10 @@ func New(path string, opt Options) (*Server, error) {
 		stopRTSP: func() {},
 		stopSRT:  func() {},
 		failed:   make(chan error, 4),
+		certPoll: opt.CertPoll,
+	}
+	if s.certPoll <= 0 {
+		s.certPoll = certPoll
 	}
 	s.users.Store(parsed.Users)
 	s.apiCtx, s.apiCancel = context.WithCancel(context.Background())
@@ -751,6 +766,14 @@ func (s *Server) Run(ctx context.Context) error {
 	defer stopManager()
 	var mwg, hwg sync.WaitGroup
 	mwg.Go(func() { s.Manager().Run(mctx) })
+	// The certificate's files are watched until the stop begins, which a
+	// listener's failure starts too.
+	wctx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	if s.store != nil {
+		s.certLoaded()
+		hwg.Go(func() { s.store.Watch(wctx, s.certPoll, s.certReport) })
+	}
 	serve := func(name string, srv *http.Server, ln net.Listener) {
 		hwg.Go(func() {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -786,6 +809,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// server's listeners. A TLS handshake that fails from here on is the
 	// stop's doing.
 	s.stopping.Store(true)
+	stopWatch()
 	shutdown(ctx, s.apiSrv, s.apiTLS)
 	s.apiCancel() // a request still waiting for a rebuild
 	stopManager()

@@ -3,6 +3,7 @@ package server
 import (
 	"github.com/ntt0601zcoder/open-streamer/internal/asset"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
+	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
 )
 
 // reason is one "why it ended" or "why it was refused" counter.
@@ -24,6 +25,12 @@ func (s *Server) collect(w *metrics.Writer) {
 		restart = 1
 	}
 	w.Gauge("openstreamer_config_restart_required", "1 while the file's server section differs from the running one.", restart)
+
+	// No series without server.tls; the certificate is asked of its store
+	// at each scrape, as a poll changes it outside cfg.
+	if s.store != nil {
+		s.collectTLS(w)
+	}
 
 	// No series without an assets directory, nor while it cannot be read.
 	if t := s.assets.Totals(); t != nil {
@@ -121,5 +128,36 @@ func (s *Server) collect(w *metrics.Writer) {
 			w.Counter("openstreamer_output_rejected_total", "Connection requests refused, by output and reason.",
 				float64(r.n), metrics.L("output", o.name), metrics.L("reason", r.name))
 		}
+	}
+}
+
+// collectTLS writes the certificate's series and the failed handshakes of
+// each TLS listener that is on.
+func (s *Server) collectTLS(w *metrics.Writer) {
+	info := s.store.Info()
+	w.Gauge("openstreamer_tls_certificate_not_after_seconds", "When the certificate in force expires, in Unix seconds.",
+		float64(info.NotAfter.Unix()))
+	// The result values are those of openstreamer_config_reloads_total, and
+	// unchanged: a read that found the same leaf.
+	const reloads = "openstreamer_tls_certificate_reloads_total"
+	const reloadsHelp = "Reads of the certificate pair, the start's included, by result."
+	w.Counter(reloads, reloadsHelp, float64(info.Changed), metrics.L("result", "ok"))
+	w.Counter(reloads, reloadsHelp, float64(info.Unchanged), metrics.L("result", "unchanged"))
+	w.Counter(reloads, reloadsHelp, float64(info.Failed), metrics.L("result", "error"))
+	const failures = "openstreamer_tls_handshake_failures_total"
+	const failuresHelp = "TLS handshakes that failed, by listener."
+	if s.mediaTLS != nil {
+		w.Counter(failures, failuresHelp, float64(s.httpsFailures.Load()), metrics.L("listener", "https"))
+	}
+	if s.apiTLS != nil {
+		w.Counter(failures, failuresHelp, float64(s.apiFailures.Load()), metrics.L("listener", "api"))
+	}
+	if s.addrs.RTMPS != "" {
+		n := rtmpsrv.Default.Stats(s.addrs.RTMPS).TLSHandshakeFailures
+		w.Counter(failures, failuresHelp, float64(n), metrics.L("listener", "rtmps"))
+	}
+	if s.addrs.RTSPS != "" {
+		n := s.rtsp.Stats().Server.TLSHandshakeFailures
+		w.Counter(failures, failuresHelp, float64(n), metrics.L("listener", "rtsps"))
 	}
 }

@@ -212,7 +212,15 @@ func (s *Server) DeleteStream(ctx context.Context, name, ifMatch string) error {
 // Reload applies the file as it is on disk; SIGHUP calls it too. On an
 // error nothing changed, and the error is logged, counted and kept for
 // ConfigStatus as well as returned: a SIGHUP has no caller to tell.
+//
+// With server.tls it reads the certificate pair again first, before it
+// takes cfg (R-S3): a new certificate never waits for an apply, and is
+// taken whatever the config's reload then does. Its result is reported as
+// a poll's is, and is not this function's.
 func (s *Server) Reload(ctx context.Context) (api.ApplyResult, error) {
+	if s.store != nil {
+		s.certReport(s.store.Reload())
+	}
 	s.cfg.Lock()
 	defer s.cfg.Unlock()
 	text, err := s.file.Read()
@@ -244,7 +252,8 @@ func (s *Server) ConfigText() ([]byte, string) {
 }
 
 // ConfigStatus returns the status of the config in force, with Stale asked
-// of the file now: a hand edit is not something the server sees happen. It
+// of the file now: a hand edit is not something the server sees happen, and
+// the certificate asked of its store now: a poll changes it outside cfg. It
 // never waits for an apply. A file that cannot be read is stale.
 func (s *Server) ConfigStatus() api.ConfigStatus {
 	status := s.state.Load().status
@@ -252,6 +261,14 @@ func (s *Server) ConfigStatus() api.ConfigStatus {
 	status.RestartRequired = slices.Clone(status.RestartRequired)
 	stale, err := s.file.Stale()
 	status.Stale = stale
+	if s.store != nil {
+		c := s.store.Info()
+		names := c.DNSNames
+		if names == nil {
+			names = []string{}
+		}
+		status.Certificate = &api.CertStatus{NotAfter: c.NotAfter, Names: names, LoadedAt: c.LoadedAt, LastError: c.LastError}
+	}
 	if err != nil {
 		now := time.Now().UnixNano()
 		if last := s.staleLogged.Load(); (last == 0 || now-last >= int64(staleLogEvery)) && s.staleLogged.CompareAndSwap(last, now) {

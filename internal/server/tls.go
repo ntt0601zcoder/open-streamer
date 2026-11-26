@@ -6,7 +6,53 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 )
+
+// certLoaded writes the line of the pair in force: "server: tls: certificate
+// loaded" with not_after and names, at info, or at warning with expired when
+// the leaf has expired (R-S3: the files are the operator's word). Run writes
+// it once at the start, and certReport after each read that took a new leaf.
+func (s *Server) certLoaded() {
+	s.certMu.Lock()
+	defer s.certMu.Unlock()
+	s.certLoadedLocked()
+}
+
+// certLoadedLocked is certLoaded with certMu held.
+func (s *Server) certLoadedLocked() {
+	info := s.store.Info()
+	attrs := []any{"not_after", info.NotAfter, "names", info.DNSNames}
+	if time.Now().After(info.NotAfter) {
+		s.log.Warn("server: tls: certificate loaded", append(attrs, "expired", true)...)
+		return
+	}
+	s.log.Info("server: tls: certificate loaded", attrs...)
+}
+
+// certReport reports one read of the pair, by the poll or by Reload: a new
+// leaf is logged; a failure is logged at error once per distinct text, not
+// again until a read succeeds or the text changes; a read that found the
+// same leaf logs nothing. The text names the file and the reason, never the
+// key's content (internal/certs).
+func (s *Server) certReport(changed bool, err error) {
+	s.certMu.Lock()
+	defer s.certMu.Unlock()
+	if err != nil {
+		text := err.Error()
+		// A read that succeeded since, by the other caller, has the last word.
+		if text == s.certLogged || s.store.Info().LastError != text {
+			return
+		}
+		s.certLogged = text
+		s.log.Error("server: tls: reload failed", "error", text)
+		return
+	}
+	s.certLogged = ""
+	if changed {
+		s.certLoadedLocked()
+	}
+}
 
 // trackListener is the TCP listener under an HTTPS listener: it remembers
 // each raw connection until it closes, so that the stop can close the ones

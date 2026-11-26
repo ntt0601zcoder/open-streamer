@@ -114,5 +114,12 @@ func (a *API) configStatus(w http.ResponseWriter, _ *http.Request) {
 		st.RestartRequired = []string{}
 	}
 	st.LastReloadError = logging.Scrub(st.LastReloadError)
+	if st.Certificate != nil {
+		c := *st.Certificate // the backend's value is not written to
+		if c.Names == nil {
+			c.Names = []string{}
+		}
+		st.Certificate = &c
+	}
 	writeJSON(w, http.StatusOK, st)
 }

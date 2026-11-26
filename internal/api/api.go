@@ -57,13 +57,23 @@ type ApplyResult struct {
 
 // ConfigStatus is the state of the config in force and of the file.
 type ConfigStatus struct {
-	ETag            string     `json:"etag"`
-	LoadedAt        time.Time  `json:"loaded_at"`   // when the config in force was loaded, reloaded or written
-	Stale           bool       `json:"stale"`       // the file on disk differs: a reload is pending, API writes are refused
-	LoadErrors      []string   `json:"load_errors"` // what the start skipped, and the streams that cannot run
-	LastReloadAt    *time.Time `json:"last_reload_at,omitempty"`
-	LastReloadError string     `json:"last_reload_error,omitempty"`
-	RestartRequired []string   `json:"restart_required"`
+	ETag            string      `json:"etag"`
+	LoadedAt        time.Time   `json:"loaded_at"`   // when the config in force was loaded, reloaded or written
+	Stale           bool        `json:"stale"`       // the file on disk differs: a reload is pending, API writes are refused
+	LoadErrors      []string    `json:"load_errors"` // what the start skipped, and the streams that cannot run
+	LastReloadAt    *time.Time  `json:"last_reload_at,omitempty"`
+	LastReloadError string      `json:"last_reload_error,omitempty"`
+	RestartRequired []string    `json:"restart_required"`
+	Certificate     *CertStatus `json:"certificate,omitempty"` // nil without server.tls
+}
+
+// CertStatus is the certificate of the TLS listeners, read when it is asked
+// for.
+type CertStatus struct {
+	NotAfter  time.Time `json:"not_after"`
+	Names     []string  `json:"names"`
+	LoadedAt  time.Time `json:"loaded_at"`
+	LastError string    `json:"last_error,omitempty"` // of the latest reload; the certificate in force is the one before it
 }
 
 // The errors a Backend returns beside those of internal/config and

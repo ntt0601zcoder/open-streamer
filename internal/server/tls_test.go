@@ -28,10 +28,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/api"
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
 	"github.com/ntt0601zcoder/open-streamer/internal/logging"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/metrics/metricstest"
 	"github.com/ntt0601zcoder/open-streamer/internal/rtmpsrv"
+	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 	"github.com/ntt0601zcoder/open-streamer/internal/stream"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtsp"
@@ -1099,5 +1102,485 @@ func TestTLSOutputs(t *testing.T) {
 			require.NotEmpty(t, sf, "kind %d over rtsps", kind)
 			assert.Greater(t, overlap(pf, sf), 10, "kind %d: %d plain frames, %d over rtsps", kind, len(pf), len(sf))
 		}
+	})
+}
+
+// certLoaded and certFailed are the messages of the certificate's log lines.
+const (
+	certLoaded = "server: tls: certificate loaded"
+	certFailed = "server: tls: reload failed"
+)
+
+// replaceFile writes data to a temporary name beside path and renames it
+// over path, as a rotation tool does: no reader sees half a file.
+func replaceFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	tmp := path + ".tmp"
+	require.NoError(t, os.WriteFile(tmp, data, 0o600))
+	require.NoError(t, os.Rename(tmp, path))
+}
+
+// newPair writes a new leaf of the CA for 127.0.0.1 and localhost over
+// cert and the key.pem beside it, the certificate first, and returns its
+// serial.
+func newPair(t *testing.T, ca *tlstest.CA, cert string) *big.Int {
+	t.Helper()
+	certPEM, keyPEM := ca.Issue(t, 24*time.Hour, "127.0.0.1", "localhost")
+	replaceFile(t, cert, certPEM)
+	replaceFile(t, filepath.Join(filepath.Dir(cert), "key.pem"), keyPEM)
+	return leafSerial(t, cert)
+}
+
+// leafOf is the first certificate of a PEM file.
+func leafOf(t *testing.T, certFile string) *x509.Certificate {
+	t.Helper()
+	data, err := os.ReadFile(certFile)
+	require.NoError(t, err)
+	block, _ := pem.Decode(data)
+	require.NotNil(t, block)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+	return cert
+}
+
+// servedSerials is the serial each TLS listener presents to a new
+// handshake.
+func servedSerials(t *testing.T, s *testServer, ca *tlstest.CA) map[string]*big.Int {
+	t.Helper()
+	a := s.Addrs()
+	out := map[string]*big.Int{}
+	for name, addr := range map[string]string{"https": a.HTTPS, "api": a.APITLS, "rtmps": a.RTMPS, "rtsps": a.RTSPS} {
+		conn, err := dialTLS(addr, ca.Client())
+		require.NoError(t, err, name)
+		out[name] = conn.ConnectionState().PeerCertificates[0].SerialNumber
+		require.NoError(t, conn.Close(), name)
+	}
+	return out
+}
+
+// allServe reports whether every TLS listener presents serial.
+func allServe(t *testing.T, s *testServer, ca *tlstest.CA, serial *big.Int) bool {
+	t.Helper()
+	for _, got := range servedSerials(t, s, ca) {
+		if got.Cmp(serial) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// scrape is one scrape of /metrics.
+func (s *testServer) scrape() []metricstest.Sample {
+	s.t.Helper()
+	res := s.do(http.MethodGet, "/metrics", "ops", "")
+	require.Equal(s.t, http.StatusOK, res.code, res.body)
+	samples, err := metricstest.Parse(strings.NewReader(res.body))
+	require.NoError(s.t, err)
+	return samples
+}
+
+// certReloads is the certificate's reload counters of a scrape, by result.
+func certReloads(t *testing.T, samples []metricstest.Sample) map[string]float64 {
+	t.Helper()
+	out := map[string]float64{}
+	for _, result := range []string{"ok", "unchanged", "error"} {
+		v, ok := metricstest.Find(samples, "openstreamer_tls_certificate_reloads_total", "result", result)
+		require.True(t, ok, "no series for result %q", result)
+		out[result] = v
+	}
+	return out
+}
+
+// moved is after minus before, result by result.
+func moved(before, after map[string]float64) map[string]float64 {
+	out := map[string]float64{}
+	for k, v := range after {
+		out[k] = v - before[k]
+	}
+	return out
+}
+
+// reader counts what a long-lived session has read so far; done is closed
+// with err set when it stopped.
+type reader struct {
+	n    atomic.Int64
+	mu   sync.Mutex
+	err  error
+	done chan struct{}
+}
+
+func (r *reader) stop(err error) {
+	r.mu.Lock()
+	r.err = err
+	r.mu.Unlock()
+	close(r.done)
+}
+
+func (r *reader) stopped() error {
+	select {
+	case <-r.done:
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.err
+	default:
+		return nil
+	}
+}
+
+// grows requires the reader to read more within waitFor, still running.
+func (r *reader) grows(t *testing.T, what string) {
+	t.Helper()
+	from := r.n.Load()
+	require.Eventually(t, func() bool { return r.n.Load() > from+10 }, waitFor, 5*time.Millisecond, "%s stopped reading: %v", what, r.stopped())
+	select {
+	case <-r.done:
+		require.Fail(t, what+" ended", "%v", r.stopped())
+	default:
+	}
+}
+
+// readHTTPTS reads url over https with the CA's client until ctx ends; it
+// returns the reader and the serial its connection was given.
+func readHTTPTS(ctx context.Context, t *testing.T, ca *tlstest.CA, url string) (*reader, *big.Int) {
+	t.Helper()
+	tr := &http.Transport{TLSClientConfig: ca.Client()}
+	t.Cleanup(tr.CloseIdleConnections)
+	var res *http.Response
+	require.Eventually(t, func() bool {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return false
+		}
+		res, err = (&http.Client{Transport: tr}).Do(req) //nolint:bodyclose // closed by the reader's goroutine
+		if err == nil && res.StatusCode != http.StatusOK {
+			_ = res.Body.Close()
+			return false
+		}
+		return err == nil
+	}, waitFor, 50*time.Millisecond, "no HTTP-TS response from %s", url)
+	r := &reader{done: make(chan struct{})}
+	go func() {
+		defer res.Body.Close()
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := res.Body.Read(buf)
+			r.n.Add(int64(n))
+			if err != nil {
+				r.stop(err)
+				return
+			}
+		}
+	}()
+	return r, res.TLS.PeerCertificates[0].SerialNumber
+}
+
+// readRTMPS plays url over RTMPS until ctx ends, counting media messages.
+func readRTMPS(ctx context.Context, t *testing.T, ca *tlstest.CA, url string) *reader {
+	t.Helper()
+	var c *rtmp.ClientConn
+	require.Eventually(t, func() bool {
+		var err error
+		c, err = rtmp.PlayWith(ctx, url, rtmp.Config{TLS: ca.Client()})
+		return err == nil
+	}, waitFor, 50*time.Millisecond, "no play of %s", url)
+	r := &reader{done: make(chan struct{})}
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	go func() {
+		defer stop()
+		defer func() { _ = c.Close() }()
+		for {
+			if _, err := c.ReadMedia(); err != nil {
+				r.stop(err)
+				return
+			}
+			r.n.Add(1)
+		}
+	}()
+	return r
+}
+
+// R-S3 and Review Focus 1: the poll reads the pair again, a rotation half
+// done keeps the pair in force, and no session is touched.
+func TestCertificateRotates(t *testing.T) {
+	const poll = 50 * time.Millisecond
+	ca, cert, key := tlsPair(t)
+	path := writeConfig(t, tlsText(tlsServerYAML(cert, key), fileStream(t, "cam", "{httpts: true, rtmp: true}")))
+	s := tlsStartPath(t, path, ca, func(o *Options) {
+		o.Open = nil
+		o.CertPoll = poll
+	})
+	s.generation("cam")
+	a := s.Addrs()
+	first := leafSerial(t, cert)
+	require.True(t, allServe(t, s, ca, first))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts, tsSerial := readHTTPTS(ctx, t, ca, "https://"+a.HTTPS+"/live/cam/stream.ts")
+	assert.Equal(t, first, tsSerial)
+	player := readRTMPS(ctx, t, ca, "rtmps://"+a.RTMPS+"/live/cam")
+	ts.grows(t, "the HTTP-TS reader")
+	player.grows(t, "the RTMPS player")
+	lines := func(msg string) int { return len(logLines(t, s.logs.String(), msg)) }
+	require.Equal(t, 1, lines(certLoaded), "the start's line")
+
+	// A new pair: the poll takes it. Nothing is asserted about a failure a
+	// tick between the two renames may see.
+	before, loaded := certReloads(t, s.scrape()), lines(certLoaded)
+	second := newPair(t, ca, cert)
+	require.NotEqual(t, first, second)
+	began := time.Now()
+	require.Eventually(t, func() bool { return allServe(t, s, ca, second) }, 2*time.Second, 10*time.Millisecond)
+	t.Logf("the new serial was served after %s", time.Since(began))
+	ts.grows(t, "the HTTP-TS reader")
+	player.grows(t, "the RTMPS player")
+	st := s.ConfigStatus()
+	require.NotNil(t, st.Certificate)
+	assert.True(t, leafOf(t, cert).NotAfter.Equal(st.Certificate.NotAfter))
+	assert.Empty(t, st.RestartRequired)
+	time.Sleep(3 * poll) // however many polls run
+	assert.InDelta(t, 1, moved(before, certReloads(t, s.scrape()))["ok"], 0)
+	require.Equal(t, loaded+1, lines(certLoaded))
+	line := logLines(t, s.logs.String(), certLoaded)[loaded]
+	assert.Equal(t, "INFO", line["level"])
+	assert.Equal(t, st.Certificate.NotAfter.Format(time.RFC3339), line["not_after"])
+	assert.ElementsMatch(t, []any{"localhost", "127.0.0.1"}, line["names"])
+
+	// Only a new certificate: the pair in force stays, every tick tries
+	// again, and the failure is logged once, without the key.
+	before, failed := certReloads(t, s.scrape()), lines(certFailed)
+	certPEM, keyPEM := ca.Issue(t, 24*time.Hour, "127.0.0.1", "localhost")
+	replaceFile(t, cert, certPEM)
+	third := leafSerial(t, cert)
+	var errs float64
+	require.Eventually(t, func() bool {
+		errs = moved(before, certReloads(t, s.scrape()))["error"]
+		return errs >= 1
+	}, 2*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return moved(before, certReloads(t, s.scrape()))["error"] > errs }, 2*time.Second, 10*time.Millisecond,
+		"a failed read is tried again on a later tick")
+	assert.True(t, allServe(t, s, ca, second), "the pair in force stays")
+	st = s.ConfigStatus()
+	assert.NotEmpty(t, st.Certificate.LastError)
+	require.Equal(t, failed+1, lines(certFailed))
+	fail := logLines(t, s.logs.String(), certFailed)[failed]
+	assert.Equal(t, "ERROR", fail["level"])
+	assert.Equal(t, st.Certificate.LastError, fail["error"])
+	body := strings.Split(strings.TrimSpace(string(keyPEM)), "\n")
+	for _, b := range body[1 : len(body)-1] {
+		assert.NotContains(t, s.logs.String(), b, "key material in the log")
+		assert.NotContains(t, st.Certificate.LastError, b)
+	}
+	// Then the matching key.
+	before = certReloads(t, s.scrape())
+	replaceFile(t, key, keyPEM)
+	require.Eventually(t, func() bool { return allServe(t, s, ca, third) }, 2*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return s.ConfigStatus().Certificate.LastError == "" }, 2*time.Second, 5*time.Millisecond)
+	time.Sleep(3 * poll)
+	assert.InDelta(t, 1, moved(before, certReloads(t, s.scrape()))["ok"], 0)
+	assert.Equal(t, failed+1, lines(certFailed), "no further failure line")
+	ts.grows(t, "the HTTP-TS reader")
+	player.grows(t, "the RTMPS player")
+
+	// Nothing written: only unchanged may move, and nothing is logged.
+	before, text := certReloads(t, s.scrape()), s.logs.String()
+	time.Sleep(3 * poll)
+	d := moved(before, certReloads(t, s.scrape()))
+	assert.Zero(t, d["ok"])
+	assert.Zero(t, d["error"])
+	assert.Len(t, logLines(t, s.logs.String(), "server: tls:"), len(logLines(t, text, "server: tls:")))
+}
+
+// R-S3: SIGHUP and POST /api/v1/reload read the pair first, before the
+// config's lock, whatever the config's reload then does.
+func TestCertificateReloadOnSIGHUPPath(t *testing.T) {
+	sc := newScript(t)
+	path, ca := tlsConfig(t, streamYAML("cam", "{hls: true}"))
+	s := tlsStartPath(t, path, ca, func(o *Options) {
+		o.Open = sc.Open
+		o.CertPoll = time.Hour
+	})
+	s.generation("cam")
+	text := s.fileText()
+	cert := certFileOf(t, path)
+
+	before := certReloads(t, s.scrape())
+	serial := newPair(t, ca, cert)
+	_, err := s.Reload(bg)
+	require.NoError(t, err)
+	assert.True(t, allServe(t, s, ca, serial), "taken at once")
+	assert.InDelta(t, 1, moved(before, certReloads(t, s.scrape()))["ok"], 0)
+	// The same pair again: counted as unchanged, and not logged.
+	before, logged := certReloads(t, s.scrape()), len(logLines(t, s.logs.String(), "server: tls:"))
+	_, err = s.Reload(bg)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]float64{"ok": 0, "unchanged": 1, "error": 0}, moved(before, certReloads(t, s.scrape())))
+	assert.Len(t, logLines(t, s.logs.String(), "server: tls:"), logged)
+
+	// A failure is logged once per distinct text, and again after a read
+	// that succeeded.
+	failedLines := func() int { return len(logLines(t, s.logs.String(), certFailed)) }
+	halfDone := func() []byte {
+		certPEM, keyPEM := ca.Issue(t, 24*time.Hour, "127.0.0.1", "localhost")
+		replaceFile(t, cert, certPEM)
+		return keyPEM
+	}
+	before, logged = certReloads(t, s.scrape()), failedLines()
+	keyPEM := halfDone()
+	for range 2 {
+		_, err = s.Reload(bg)
+		require.NoError(t, err, "the config's reload is not the certificate's")
+	}
+	assert.InDelta(t, 2, moved(before, certReloads(t, s.scrape()))["error"], 0)
+	assert.Equal(t, logged+1, failedLines())
+	replaceFile(t, filepath.Join(filepath.Dir(cert), "key.pem"), keyPEM)
+	_, err = s.Reload(bg)
+	require.NoError(t, err)
+	assert.True(t, allServe(t, s, ca, leafSerial(t, cert)))
+	keyPEM = halfDone()
+	_, err = s.Reload(bg)
+	require.NoError(t, err)
+	assert.Equal(t, logged+2, failedLines(), "the same text again, after a success")
+	replaceFile(t, filepath.Join(filepath.Dir(cert), "key.pem"), keyPEM)
+	_, err = s.Reload(bg)
+	require.NoError(t, err)
+	assert.Empty(t, s.ConfigStatus().Certificate.LastError)
+
+	// A config text that does not parse: the certificate is still taken.
+	s.handEdit("version: 1\n\t{{{\n")
+	serial = newPair(t, ca, cert)
+	_, err = s.Reload(bg)
+	require.Error(t, err)
+	assert.True(t, allServe(t, s, ca, serial), "taken although the config's reload failed")
+	assert.Empty(t, s.ConfigStatus().Certificate.LastError)
+	s.handEdit(text)
+	_, err = s.Reload(bg)
+	require.NoError(t, err)
+
+	// An apply in flight holds s.cfg: the certificate does not wait for it.
+	release := sc.hold()
+	t.Cleanup(release)
+	edit := specOf("cam", spec.Outputs{HLS: true})
+	edit.Layout = heldLayout
+	put := make(chan error, 1)
+	go func() {
+		_, err := s.PutStream(bg, edit, "")
+		put <- err
+	}()
+	require.Eventually(t, func() bool { return strings.Contains(s.fileText(), "layout") }, waitFor, time.Millisecond)
+	serial = newPair(t, ca, cert)
+	reload := make(chan error, 1)
+	go func() {
+		_, err := s.Reload(bg)
+		reload <- err
+	}()
+	require.Eventually(t, func() bool { return allServe(t, s, ca, serial) }, waitFor, 5*time.Millisecond)
+	select {
+	case err := <-reload:
+		require.Fail(t, "the reload did not wait for the apply", "%v", err)
+	case err := <-put:
+		require.Fail(t, "the apply was not held", "%v", err)
+	default:
+	}
+	release()
+	for name, ch := range map[string]chan error{"put": put, "reload": reload} {
+		select {
+		case err := <-ch:
+			require.NoError(t, err, name)
+		case <-time.After(waitFor):
+			require.Fail(t, name+" did not return")
+		}
+	}
+}
+
+func TestCertificateStatusAndMetrics(t *testing.T) {
+	// startLines waits for the start's certificate line, which Run writes,
+	// and returns the certificate lines.
+	startLines := func(t *testing.T, s *testServer) []map[string]any {
+		t.Helper()
+		require.Eventually(t, func() bool { return len(logLines(t, s.logs.String(), certLoaded)) > 0 }, waitFor, time.Millisecond)
+		return logLines(t, s.logs.String(), certLoaded)
+	}
+	failures := func(samples []metricstest.Sample) map[string]float64 {
+		out := map[string]float64{}
+		for _, x := range samples {
+			if x.Name == "openstreamer_tls_handshake_failures_total" {
+				out[x.Labels["listener"]] = x.Value
+			}
+		}
+		return out
+	}
+
+	t.Run("without server.tls", func(t *testing.T) {
+		s := testConfig(t, nil)
+		assert.Nil(t, s.ConfigStatus().Certificate)
+		assert.Nil(t, s.status().Certificate)
+		res := s.do(http.MethodGet, "/metrics", "ops", "")
+		require.Equal(t, http.StatusOK, res.code)
+		assert.NotContains(t, res.body, "openstreamer_tls_")
+		assert.NotContains(t, s.logs.String(), "server: tls:")
+	})
+
+	t.Run("with server.tls", func(t *testing.T) {
+		path, ca := tlsConfig(t, "")
+		s := tlsStartPath(t, path, ca, nil)
+		leaf := leafOf(t, certFileOf(t, path))
+		for _, c := range []*api.CertStatus{s.ConfigStatus().Certificate, s.status().Certificate} {
+			require.NotNil(t, c)
+			assert.True(t, leaf.NotAfter.Equal(c.NotAfter))
+			assert.ElementsMatch(t, []string{"localhost", "127.0.0.1"}, c.Names)
+			assert.False(t, c.LoadedAt.IsZero())
+			assert.Empty(t, c.LastError)
+		}
+		res := s.do(http.MethodGet, "/api/v1/config/status", "eye", "")
+		require.Equal(t, http.StatusOK, res.code)
+		assert.Contains(t, res.body, `"certificate":{"not_after":"`)
+		assert.NotContains(t, res.body, "last_error")
+
+		samples := s.scrape()
+		v, ok := metricstest.Find(samples, "openstreamer_tls_certificate_not_after_seconds")
+		require.True(t, ok)
+		assert.InDelta(t, float64(leaf.NotAfter.Unix()), v, 0)
+		assert.Equal(t, map[string]float64{"ok": 1, "unchanged": 0, "error": 0}, certReloads(t, samples))
+		assert.Equal(t, map[string]float64{"https": 0, "api": 0, "rtmps": 0, "rtsps": 0}, failures(samples))
+		garbage(t, s.Addrs().RTMPS)
+		require.Eventually(t, func() bool { return failures(s.scrape())["rtmps"] == 1 }, waitFor, 5*time.Millisecond)
+		assert.Equal(t, map[string]float64{"https": 0, "api": 0, "rtmps": 1, "rtsps": 0}, failures(s.scrape()))
+
+		lines := startLines(t, s)
+		require.Len(t, lines, 1)
+		assert.Equal(t, "INFO", lines[0]["level"])
+		assert.Equal(t, leaf.NotAfter.UTC().Format(time.RFC3339), lines[0]["not_after"])
+		assert.ElementsMatch(t, []any{"localhost", "127.0.0.1"}, lines[0]["names"])
+		assert.NotContains(t, lines[0], "expired")
+	})
+
+	t.Run("one TLS listener", func(t *testing.T) {
+		ca, cert, key := tlsPair(t)
+		server := "server:\n" +
+			"  tls: {cert_file: \"" + cert + "\", key_file: \"" + key + "\"}\n" +
+			"  http: {listen: \"127.0.0.1:0\"}\n" +
+			"  api: {listen: \"127.0.0.1:0\"}\n" +
+			"  rtmp: {listen: \"127.0.0.1:0\", tls_listen: \"127.0.0.1:0\"}\n"
+		s := tlsStartPath(t, writeConfig(t, tlsText(server)), ca, nil)
+		samples := s.scrape()
+		assert.Equal(t, map[string]float64{"rtmps": 0}, failures(samples), "a series for each listener that is on")
+		_, ok := metricstest.Find(samples, "openstreamer_tls_certificate_not_after_seconds")
+		assert.True(t, ok)
+	})
+
+	t.Run("an expired leaf", func(t *testing.T) {
+		ca := tlstest.NewCA(t)
+		certPEM, keyPEM := ca.Issue(t, -time.Hour, "127.0.0.1", "localhost")
+		dir := t.TempDir()
+		cert, key := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+		require.NoError(t, os.WriteFile(cert, certPEM, 0o600))
+		require.NoError(t, os.WriteFile(key, keyPEM, 0o600))
+		s := tlsStartPath(t, writeConfig(t, tlsText(tlsServerYAML(cert, key))), ca, nil)
+		lines := startLines(t, s)
+		require.Len(t, lines, 1)
+		assert.Equal(t, "WARN", lines[0]["level"], "taken, and logged as a warning")
+		assert.Equal(t, true, lines[0]["expired"])
+		assert.True(t, s.ConfigStatus().Certificate.NotAfter.Before(time.Now()))
 	})
 }

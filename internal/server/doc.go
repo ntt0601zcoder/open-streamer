@@ -43,6 +43,13 @@
 // the raw connections of the HTTPS listeners are closed after shutdownWait,
 // so a reader that takes nothing cannot hold it up with its close_notify.
 //
+// The certificate's content is live (R-S3): Run looks at its files every
+// 30 s and reads them again when they changed, and SIGHUP and POST
+// /api/v1/reload read them before they take cfg. New handshakes get the
+// pair in force; a pair that does not load keeps the old one. The status's
+// certificate and the openstreamer_tls_ series are asked of the store when
+// they are read, never kept under cfg.
+//
 // # Locks
 //
 // cfg serialises the writers. The readers never take it: the text in force
@@ -58,7 +65,7 @@
 // With an RTSPS listener New also starts the RTSP server's ServeTLS loop,
 // stopped and waited for with its Serve loop. Run starts the two HTTP
 // servers, each one's Serve loop and, with a TLS listener, its ServeTLS
-// loop, and the manager's Run, and stops and waits for all of them, New's
-// included, before it returns: a Server that New returned must be Run,
-// once.
+// loop, the manager's Run and, with server.tls, the certificate's watch,
+// and stops and waits for all of them, New's included, before it returns: a
+// Server that New returned must be Run, once.
 package server

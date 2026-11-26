@@ -1963,6 +1963,14 @@
             "items": {
               "type": "string"
             }
+          },
+          "certificate": {
+            "description": "The certificate of the TLS listeners, read at the time of the request; absent without server.tls.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CertStatus"
+              }
+            ]
           }
         },
         "required": [
@@ -1971,6 +1979,38 @@
           "stale",
           "load_errors",
           "restart_required"
+        ]
+      },
+      "CertStatus": {
+        "type": "object",
+        "description": "The certificate pair in force. Its files are read again every 30 s when they changed, and at every reload; the paths themselves need a restart.",
+        "properties": {
+          "not_after": {
+            "type": "string",
+            "description": "When the leaf in force expires.",
+            "format": "date-time"
+          },
+          "names": {
+            "type": "array",
+            "description": "The leaf's subject alternative names: DNS names and IP addresses.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "loaded_at": {
+            "type": "string",
+            "description": "When the leaf in force was first read.",
+            "format": "date-time"
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Why the latest read of the pair failed; the certificate in force is the one before it. Absent when it did not fail."
+          }
+        },
+        "required": [
+          "not_after",
+          "names",
+          "loaded_at"
         ]
       },
       "Asset": {
