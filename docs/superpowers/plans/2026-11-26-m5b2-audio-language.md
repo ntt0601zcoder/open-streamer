@@ -55,7 +55,7 @@
     - **(c)** `ReadOptions.AudioLanguage` is set and a master or MPD version that has audio carries the expected value on none of its audio renditions or sets. "Has audio" means an audio rendition, an `AUDIO=` group, an audio entry in CODECS (`mp4a`, `ac-3`, `ec-3`, `opus`), or an audio set;
     - **(d)** `ReadOptions.AudioLanguage` is set and the URL read is a media playlist ("no master to carry a language").
   - An unlabelled extra audio set is not a violation (R-L3). Each violation is reported once per (URL, value) pair.
-  - `osconform -audio-language <tag>` sets the option. A value failing `media.ValidLanguage` exits 2. When `AudioLanguages` is non-empty, osconform prints `osconform: audio languages: <a>, <b>` on stderr.
+  - `osconform -audio-language <tag>` sets the option. A value failing `media.ValidLanguageSyntax` exits 2 (a foreign stream may use a tag the server would not accept). When `AudioLanguages` is non-empty, osconform prints `osconform: audio languages: <a>, <b>` on stderr.
 
 ## Global Constraints
 
@@ -132,6 +132,7 @@ func ValidLanguageSyntax(s string) bool // internal/media
 
 // In hls.Rendition: Language string // LANGUAGE; written after NAME when not empty, read by ParseMultivariant.
 // In dash.AdaptationSet: Lang string `xml:"lang,attr,omitempty"` // after mimeType in field order.
+// In dash.Representation: MimeType string `xml:"mimeType,attr,omitempty"` // read by conform (R-L6); never written by the packager.
 ```
 
 - [ ] **Step 1: Write the failing tests.**
@@ -146,7 +147,7 @@ func TestEncodeRenditionLanguage(t *testing.T) // Rendition{Type:"AUDIO",GroupID
 // Language "" writes no LANGUAGE (TestMultivariantEncodeGolden stays byte-identical)
 func TestParseRenditionLanguage(t *testing.T) // round trip of the above; a master from another packager with LANGUAGE="en-US" and no URI
 func TestMPDAdaptationSetLang(t *testing.T) // AdaptationSet{ContentType:"audio",MimeType:"audio/mp4",Lang:"vi"} marshals with lang="vi";
-// Lang "" writes no lang attribute; unmarshal reads it back
+// Lang "" writes no lang attribute; unmarshal reads it back; a Representation's mimeType="audio/mp4" is read into MimeType
 func TestHLSPullAudioInVariant(t *testing.T) // internal/ingest: an httptest master with R-L4's URI-less line and AUDIO="aud" on two TS
 // variants: the pull fetches only the chosen variant's playlist (never a rendition playlist) and its reader yields audio and video frames
 ```
@@ -302,7 +303,7 @@ func TestReadDASHAudioLanguages(t *testing.T) // an audio set lang="vi" → ["vi
 // and no contentType counts as audio; AudioLanguage "vi": two audio sets, one lang="vi" and one unlabelled → no violation; one audio
 // set without lang → violation (c); polling an MPD that changes vi → en gives ["vi","en"], each violation once
 func TestOsconformAudioLanguage(t *testing.T) // -audio-language vi against a fixture with vi: exit 0, stdout empty and stderr has
-// "osconform: audio languages: vi"; against en: exit 1 and stdout has the audio-language violation; -audio-language "bad tag": exit 2
+// "osconform: audio languages: vi"; against en: exit 1 and stdout has the audio-language violation; -audio-language "bad tag": exit 2; -audio-language x-klingon is accepted
 ```
 
 - [ ] **Step 2: Run** `go test -count=1 ./internal/conform/ ./cmd/osconform/`. Expect it to fail.
@@ -325,7 +326,7 @@ func TestOsconformAudioLanguage(t *testing.T) // -audio-language vi against a fi
 ```go
 // TestM5b2AudioLanguage: a passthrough stream cam (m5b1Clip; HLS, DASH and HTTP-TS on; audio_language "vi").
 // conform.ReadHLS(cmaf/master.m3u8, Once, AudioLanguage "vi") and conform.ReadDASH(cmaf/index.mpd, Once, AudioLanguage "vi"): no
-// violation, AudioLanguages ["vi"]. ffprobe (host, and in the peers image) of the CMAF master and of the MPD reports the audio stream's
+// violation, AudioLanguages ["vi"]. ffprobe (testpeer's ffprobe; version 8 on the host and 6.1 in make test-ci-peers) of the CMAF master and of the MPD reports the audio stream's
 // language tag "vi". An m5aOpen row with a session reader on HTTP-TS; PUT cam with "en": "live", generation unchanged; within 5 s both
 // reads report ["en"]; PUT with "": "live"; the master and the MPD carry no LANGUAGE and no lang; no
 // openstreamer_output_sessions_ended_total series moved, assertUninterrupted(row). Budget 40 s.
@@ -340,8 +341,9 @@ func TestM5b2AudioLanguageLadder(t *testing.T)
 
 // TestM5b2Players: M4b's replay (liveABR(t, steps, passes) unchanged; SetAudioLanguage("vi") on the packager it returns, before the
 // first playlist request) serves the ABR TS master over a live
-// sliding window; ffprobe 6.1 and 8 report language "vi"; vlcPlays and gstPlays, unchanged, pass on hls/index.m3u8 and on
-// cmaf/master.m3u8 with audio decoded. Peers only: amd64 test job, not the arm64 list.
+// sliding window; ffprobe (8 on the host, 6.1 in the peers run) reports language "vi"; gstPlays, unchanged, passes on hls/index.m3u8
+// (where R-L4's new form is) and vlcPlays, unchanged, on hls/index.m3u8 and cmaf/master.m3u8, with audio decoded. Needs the transcoder
+// bundle (m4bRuns) and the peers: amd64 test job, not the arm64 list.
 func TestM5b2Players(t *testing.T)
 ```
 
