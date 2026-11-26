@@ -122,11 +122,16 @@ func (r *mrig) status(name string) Status {
 	return st
 }
 
-// waitRunning waits until every stream of names has an active input.
+// waitRunning waits until every stream of names has an active input and
+// its supervisor's View is that of the running generation: Status says
+// "running" a moment before the View is published.
 func (r *mrig) waitRunning(names ...string) {
 	r.t.Helper()
 	for _, name := range names {
-		require.Eventually(r.t, func() bool { return r.status(name).State == "running" }, waitFor, time.Millisecond,
+		require.Eventually(r.t, func() bool {
+			st, s := r.status(name), r.sup(name)
+			return st.State == "running" && s != nil && s.View().Gen != 0 && s.View().Gen == st.Generation
+		}, waitFor, time.Millisecond,
 			"%s: state %q, want running (last error %q)", name, r.status(name).State, r.status(name).LastError)
 	}
 }
