@@ -1021,3 +1021,26 @@ func TestRedactRTMPStreamKey(t *testing.T) {
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), vStreamKey)
 }
+
+// A Close that runs while another is in progress returns only once the
+// listener is unregistered and its port is free.
+func TestRTMPListenSecondCloseWaits(t *testing.T) {
+	for range 10 {
+		port := stableTCPPort(t)
+		addr := "127.0.0.1:" + port
+		l := newRTMPListen(Spec{Live: true, Passive: true}, addr, time.Now)
+		unregister, err := rtmpListeners.RegisterPublish(addr, "live/s", l, rtmp.Config{}, rtmpsrv.Policy{})
+		require.NoError(t, err)
+		l.unregister = unregister
+		first := make(chan struct{})
+		go func() { _ = l.Close(); close(first) }()
+		<-l.done // the first Close has begun
+		require.NoError(t, l.Close())
+		assert.Zero(t, rtmpListeners.Stats(addr).ID, "unregistered when the second Close returns")
+		ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", addr)
+		if assert.NoError(t, err, "the port is free when the second Close returns") {
+			require.NoError(t, ln.Close())
+		}
+		<-first
+	}
+}

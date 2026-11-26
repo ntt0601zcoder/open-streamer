@@ -156,6 +156,7 @@ type rtmpListen struct {
 	cache      media.ConfigCache
 	wake       chan struct{} // a publisher was offered; capacity 1
 	done       chan struct{} // closed by Close
+	closeMu    sync.Mutex    // held for the whole of Close; taken before mu
 
 	// The reading goroutine's own state.
 	sess   *rtmpSession // being read; nil while waiting for a publisher
@@ -438,6 +439,10 @@ func (l *rtmpListen) Stats() map[string]uint64 {
 // Close implements Reader. It unregisters the path, closing the TCP
 // listener when this was its last path, and closes the publishers.
 func (l *rtmpListen) Close() error {
+	// A Close during another waits until the route is gone and the
+	// listener released.
+	l.closeMu.Lock()
+	defer l.closeMu.Unlock()
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()

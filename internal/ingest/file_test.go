@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -400,4 +402,40 @@ func TestOpenContextAbortsBlockedOpen(t *testing.T) {
 	_, err := openTS(ctx, pr, nil, Spec{}, &media.ConfigCache{})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// slowCloseRC behaves like a socket whose Close unblocks a pending Read at
+// once but releases the descriptor only later, and whose second Close
+// returns at once while the first is still running (as an internal/poll FD
+// does).
+type slowCloseRC struct {
+	unblock chan struct{}
+	closing atomic.Bool
+	closed  atomic.Bool
+}
+
+func (s *slowCloseRC) Read([]byte) (int, error) {
+	<-s.unblock
+	return 0, net.ErrClosed
+}
+
+func (s *slowCloseRC) Close() error {
+	if !s.closing.CompareAndSwap(false, true) {
+		return net.ErrClosed
+	}
+	close(s.unblock)
+	time.Sleep(50 * time.Millisecond)
+	s.closed.Store(true)
+	return nil
+}
+
+// An open aborted by its ctx returns only once the ctx's close of rc has
+// finished, so the socket behind it is released.
+func TestOpenTSAbortWaitsForClose(t *testing.T) {
+	rc := &slowCloseRC{unblock: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := openTS(ctx, rc, nil, Spec{}, &media.ConfigCache{})
+	require.Error(t, err)
+	assert.True(t, rc.closed.Load(), "openTS returned while the ctx's close was still running")
 }

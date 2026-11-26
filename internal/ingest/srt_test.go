@@ -554,3 +554,25 @@ func TestSRTWithFFmpeg(t *testing.T) {
 		clockCheck(t, r, res.frames)
 	})
 }
+
+// A Close that runs while another is in progress returns only once the
+// listener's socket is closed.
+func TestSRTListenerSecondCloseWaits(t *testing.T) {
+	for range 10 {
+		port := stableUDPPort(t)
+		ln, err := srt.Listen("srt", "127.0.0.1:"+strconv.Itoa(port), srt.DefaultConfig())
+		require.NoError(t, err)
+		l := &srtListener{
+			ln: ln, now: time.Now, conns: make(chan srt.Conn, 1),
+			done: make(chan struct{}), doneStat: map[string]uint64{},
+		}
+		l.acceptWG.Add(1)
+		go l.acceptLoop()
+		first := make(chan struct{})
+		go func() { _ = l.Close(); close(first) }()
+		<-l.done // the first Close has begun
+		require.NoError(t, l.Close())
+		assert.False(t, udpPortBound(port), "the port is free when the second Close returns")
+		<-first
+	}
+}

@@ -115,6 +115,7 @@ type srtListener struct {
 	conns    chan srt.Conn // accepted publishers, at most one in flight
 	done     chan struct{} // closed by Close
 	acceptWG sync.WaitGroup
+	closeMu  sync.Mutex // held for the whole of Close; taken before mu
 
 	mu       sync.Mutex // guards the fields below
 	busy     bool       // a publisher is accepted or being read
@@ -341,6 +342,9 @@ func (l *srtListener) Stats() map[string]uint64 {
 
 // Close implements Reader.
 func (l *srtListener) Close() error {
+	// A Close during another waits until the socket is closed.
+	l.closeMu.Lock()
+	defer l.closeMu.Unlock()
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()

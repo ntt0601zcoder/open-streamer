@@ -83,15 +83,35 @@ func newTSReader(rc io.ReadCloser, now func() time.Time, spec Spec, cache *media
 	return r, nil
 }
 
+// onceCloser closes its ReadCloser once. A Close that runs while the first
+// is in progress waits for it, and every Close returns the first one's error.
+type onceCloser struct {
+	io.ReadCloser
+	once sync.Once
+	err  error
+}
+
+// Close implements io.Closer.
+func (c *onceCloser) Close() error {
+	c.once.Do(func() { c.err = c.ReadCloser.Close() })
+	return c.err
+}
+
 // openTS is newTSReader with ctx bounding the wait for the first PMT: when
-// ctx ends first, rc is closed, which fails the open.
+// ctx ends first, rc is closed, which fails the open. rc is closed once, so a
+// failed open returns only after that close has finished: a socket's
+// blocked Read returns before its descriptor is released, and its second
+// Close returns at once.
 func openTS(ctx context.Context, rc io.ReadCloser, now func() time.Time, spec Spec, cache *media.ConfigCache) (*tsReader, error) {
+	rc = &onceCloser{ReadCloser: rc}
 	stop := context.AfterFunc(ctx, func() { _ = rc.Close() })
 	r, err := newTSReader(rc, now, spec, cache, nil)
-	if !stop() && err == nil {
-		// ctx ended after the PMT but before stop: rc is closed.
+	if !stop() {
+		// ctx ended before stop: wait for its close of rc to finish.
 		_ = rc.Close()
-		return nil, fmt.Errorf("ingest: ts reader: %w", ctx.Err())
+		if err == nil {
+			return nil, fmt.Errorf("ingest: ts reader: %w", ctx.Err())
+		}
 	}
 	if err != nil {
 		if ctx.Err() != nil {
