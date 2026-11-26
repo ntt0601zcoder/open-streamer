@@ -48,8 +48,9 @@ server:
   # key the server looks for ostranscoder next to its own executable.
   # transcoder:
   #   binary: /usr/local/bin/ostranscoder
-  # The directory of watermark images.
-  # assets_dir: /etc/openstreamer/assets
+  # The directory of watermark images and fonts, which /api/v1/assets
+  # manages: regular files only, not symbolic links.
+  # assets_dir: /srv/openstreamer/assets
   log:
     level: info   # debug, info, warn, error
     format: json  # json, text
@@ -84,3 +85,29 @@ streams:
       rtmp: true
       rtsp: true
       srt: true
+
+  # A stream with a ladder and a watermark needs the transcoder, and its
+  # assets in assets_dir.
+  # - name: cam2
+  #   inputs:
+  #     - url: rtsp://camera.example/stream2
+  #   transcode:
+  #     renditions:
+  #       - label: "1080"
+  #         height: 1080
+  #         bitrate_kbps: 5000
+  #         encoder: nvenc
+  #         # Fail, and retry, when NVENC cannot be opened, instead of
+  #         # encoding in software; it takes the other renditions down too.
+  #         # no_fallback: true
+  #       - label: "720"
+  #         height: 720
+  #         bitrate_kbps: 2500
+  #     watermark:
+  #       text: LIVE
+  #       position: br
+  #       # A TTF or OTF asset to draw the text with; without it, DejaVu Sans.
+  #       # font: brand.ttf
+  #   outputs:
+  #     hls: true
+  #     dash: true

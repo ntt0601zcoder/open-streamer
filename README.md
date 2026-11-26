@@ -124,12 +124,24 @@ curl -u ops -X PUT http://127.0.0.1:8081/api/v1/config \
   -H "If-Match: $etag" --data-binary @openstreamer.yaml
 ```
 
-The answer lists each stream's outcome (`unchanged`, `outputs`, `rebuild`,
-`created`, `started`, `stopped`, `deleted`) and any `restart_required` keys. An
-invalid document is 422 with every error and changes nothing; a stale
-`If-Match` is 412. Changing only a stream's outputs is applied in place, so its
-other outputs keep their viewers; any other change to a stream restarts that
-stream, and streams that did not change are not touched.
+The answer lists each stream's outcome (`unchanged`, `outputs`, `live`,
+`rebuild`, `created`, `started`, `stopped`, `deleted`) and any
+`restart_required` keys. An invalid document is 422 with every error and
+changes nothing; a stale `If-Match` is 412. Streams that did not change are not
+touched. A running stream that changed is edited in one of three ways:
+
+- `outputs`: only its outputs changed. They are edited in place, and the
+  other outputs keep their viewers.
+- `live`: its inputs or its watermark changed (and maybe its outputs, and
+  nothing else). They are applied while it runs: no output session ends and
+  the transcoder is not restarted. Replacing the input in use is one
+  discontinuity for the players (HLS shows one `EXT-X-DISCONTINUITY`). To
+  switch inputs without a gap, add the new input first, above the old one,
+  wait for the fail-back hold of 10 s so that it takes over, then remove the
+  old one.
+- `rebuild`: anything else (the ladder's renditions, `no_fallback`, adding or
+  removing the whole `transcode`, `layout`, `thumbnail`): the stream is
+  rebuilt, and its viewers reconnect.
 
 A stream that could not run when the server started (its listen address was
 taken by another stream, an asset was missing) is left `stopped`, with the
@@ -152,6 +164,87 @@ config file changed on disk; reload first"), so neither side overwrites the
 other. An invalid file at reload keeps the running config; the error is in the
 log and in `GET /api/v1/config/status`. A file that cannot be read at reload,
 or whose mode is no longer 0600, is 409 `config_unreadable` with the reason.
+
+### Assets
+
+Watermark images and fonts are assets: regular files directly in
+`server.assets_dir`, which the API manages. A watermark names them
+(`watermark.image`, `watermark.font`).
+
+| Route | Role | |
+|---|---|---|
+| `GET /api/v1/assets` | viewer | every asset: `name`, `kind`, `type`, `size`, `modified`, `etag`, and `used_by`, the streams that name it |
+| `GET /api/v1/assets/{name}` | viewer | the bytes, with an `ETag` |
+| `PUT /api/v1/assets/{name}` | editor | creates (201) or replaces (200) it |
+| `DELETE /api/v1/assets/{name}` | editor | removes it (204) |
+
+A name is lower case: a letter or digit, then up to 63 letters, digits, `_` or
+`-`, then `.png`, `.jpg` or `.jpeg` for an image, `.ttf` or `.otf` for a font.
+Any other name is 404. An image is at most 1 MiB and 2048 pixels a side and
+must be what its extension says; a font is at most 24 MiB. The directory holds
+at most 256 assets and 512 MiB in all (507 `assets_full` beyond). Without
+`server.assets_dir` every route answers 409 `assets_off`.
+
+Upload the raw bytes:
+
+```sh
+curl -u ops -X PUT http://127.0.0.1:8081/api/v1/assets/logo.png \
+  -H 'X-Requested-By: curl' -H 'Content-Type: application/octet-stream' \
+  --data-binary @logo.png
+```
+
+`If-Match` (a tag, or `*`) makes it a replacement of that version, and
+`If-None-Match: *` a creation only; a failed condition is 412. Content the
+name does not allow is 422 `invalid_asset` with the reason, and a body over
+the limit is 413; a refused upload stores nothing. The answer is the asset
+with two lists:
+
+- `refreshed`: one entry per running stream that names the asset, with `ok`
+  when its picture took the new bytes (and `error` when not). The upload
+  reaches those streams without an edit or a restart.
+- `retried`: the streams that were left stopped because the asset was missing
+  are tried again, and start with the upload (`started`; `unchanged` when
+  something else still stands in their way).
+
+A `DELETE` of an asset that a stream names, running or disabled, is 409
+`asset_in_use` with the stream names: take it out of their watermarks first.
+While the config holds an entry that was skipped at start it is 409
+`config_invalid_entries`, since nobody can tell what that entry names.
+
+An upload has 30 s plus 1 s per 256 KiB of its kind's limit to arrive (34 s
+for an image, 126 s for a font), so a link slower than about 2 Mbit/s cannot
+upload the largest font. At most two uploads are read at once; a third waits
+up to 30 s, then gets 503.
+
+Files copied into the directory by hand are assets too, but a running stream
+takes them only at its next rebuild or edit; upload through the API to reach
+it at once. An asset must be a regular file: a symbolic link is not one, so a
+Kubernetes ConfigMap or Secret mount, which is made of links, does not work as
+an assets directory; copy the files in instead. A hand edit is outside the
+API's contract: a file replaced by hand with one of the same size within the
+same timestamp tick may keep its old `ETag`, so an `If-Match` taken before the
+hand edit can still pass.
+
+**Fonts.** `watermark.font` names a font asset for a text watermark; without
+it the text is drawn in DejaVu Sans. A font is a TTF or OTF file with one face:
+collections (`.ttc`) and WOFF are refused, so extract the face you need. When
+the server has a transcoder, an upload is also checked by it
+(`ostranscoder -probe font`, at most 10 s), which loads the font and draws
+with it: a font it cannot use is 422 `invalid_asset` with its reason. A check
+that cannot run (an old transcoder bundle, a timeout) says nothing about the
+font: it is 503 `probe_failed`, logged, and nothing is stored.
+
+**`no_fallback`.** A rendition with `encoder: nvenc` falls back to the software
+encoder (libx264) when NVENC cannot be opened, and counts it in
+`openstreamer_transcoder_encoder_fallbacks_total`. With `no_fallback: true` it
+does not: the transcoder fails instead, and since a ladder opens all its
+renditions or none, **the stream's other renditions go down with it**, the
+software ones included. The stream keeps reading its source, its ladder
+outputs carry nothing, and the transcoder is retried (250 ms, doubling to
+5 s) until NVENC opens. Each refusal counts in
+`openstreamer_transcoder_encoder_refusals_total{stream}` and in
+`transcoder.encoder_refusals` of the stream's status, with the reason in its
+`last_error`.
 
 ### Running it as a service
 
