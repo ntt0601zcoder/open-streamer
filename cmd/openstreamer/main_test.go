@@ -200,8 +200,23 @@ func TestRun(t *testing.T) {
 	code, _, errOut = runOnce(t, "-config", "x.yaml", "hunter2-secret")
 	assert.Equal(t, 2, code)
 	assert.NotContains(t, errOut, "hunter2-secret")
-	code, _, _ = runOnce(t, "-nope")
+	code, _, errOut = runOnce(t, "-nope")
 	assert.Equal(t, 2, code)
+	assert.Equal(t, "openstreamer: unknown or malformed flag\n"+usageText, errOut)
+	// Neither is a flag the command does not have, nor a value it cannot
+	// parse.
+	for _, args := range [][]string{
+		{"-password=hunter2-secret"}, {"--hunter2-secret"}, {"-version=hunter2-secret"}, {"-config"},
+	} {
+		code, out, errOut = runOnce(t, args...)
+		assert.Equal(t, 2, code, args)
+		assert.Empty(t, out)
+		assert.Equal(t, "openstreamer: unknown or malformed flag\n"+usageText, errOut, args)
+	}
+	code, out, errOut = runOnce(t, "-h")
+	assert.Equal(t, 0, code)
+	assert.Empty(t, out)
+	assert.Equal(t, usageText, errOut)
 
 	hash := editorHash(t)
 	if runtime.GOOS != "windows" {

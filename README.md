@@ -12,7 +12,8 @@ bin/openstreamer -config /srv/openstreamer/openstreamer.yaml
 ```
 
 The server prints the address of each listener it bound (`http 0.0.0.0:8080`,
-`api 127.0.0.1:8081`, …) and runs until SIGINT or SIGTERM. Streams with a
+`api 127.0.0.1:8081`, …) and runs until SIGINT or SIGTERM, which stop it in
+order; a second one ends it at once. Streams with a
 ladder or a thumbnail need the transcoder: set `server.transcoder.binary` to
 the bundle's `ostranscoder` (keep its `lib/` beside it), or put `ostranscoder`
 next to `openstreamer`. Passthrough streams need no transcoder.

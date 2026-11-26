@@ -31,12 +31,29 @@ const usageText = `usage: openstreamer -config FILE     run the server
 `
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "hash-password" {
+		// No signal is caught here: a SIGINT while the password is read
+		// from a pipe or a file ends the process, as it does any filter.
+		// The terminal prompt catches signals itself, to restore the echo.
+		os.Exit(run(context.Background(), args, os.Stdin, os.Stdout, os.Stderr, nil))
+	}
+	ctx, stop := signals()
 	// Registered before the server starts, and never stopped: a SIGHUP
 	// during start-up or shutdown must not end the process.
-	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr, notifyHUP())
+	code := run(ctx, args, os.Stdin, os.Stdout, os.Stderr, notifyHUP())
 	stop()
 	os.Exit(code)
+}
+
+// signals returns the context that SIGINT and SIGTERM end, which starts
+// the orderly stop. The first signal also gives both back their default
+// action, so a second one ends the process at once: a stop that hangs can
+// always be interrupted from the keyboard or by the service manager.
+func signals() (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	context.AfterFunc(ctx, stop)
+	return ctx, stop
 }
 
 // run is the command. It returns the exit code: 0 after a clean stop, 1
@@ -47,14 +64,19 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return hashPassword(args[1:], stdin, stdout, stderr)
 	}
 	fs := flag.NewFlagSet("openstreamer", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() { _, _ = io.WriteString(stderr, usageText) }
+	// The flag package's own messages quote the argument it could not
+	// parse, which may be a password meant for hash-password: nothing of
+	// it is printed.
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
 	path := fs.String("config", "", "the config file")
 	showVersion := fs.Bool("version", false, "print the version")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			_, _ = io.WriteString(stderr, usageText)
 			return 0
 		}
+		_, _ = io.WriteString(stderr, "openstreamer: unknown or malformed flag\n"+usageText)
 		return 2
 	}
 	switch {
