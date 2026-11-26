@@ -573,10 +573,11 @@ func ProbeFont(font []byte) error {
 		return fmt.Errorf("transcode: probe font: fill picture: %w", err)
 	}
 	if _, err := m.apply(fr); err != nil {
-		if de, ok := errors.AsType[*drawtextError](err); ok {
-			// The text is the probe's own, so the font is the likely cause;
-			// libav's error is all that is known about why.
-			return fmt.Errorf("transcode: probe font: drawtext cannot load it: %w", de.libav)
+		if errors.As(err, new(*drawtextError)) {
+			// The text is the probe's own, so the font is the likely cause.
+			// libav's error is left out: when FreeType refuses the font it
+			// is fontconfig's ENOENT, which reads as a missing file.
+			return errors.New("transcode: probe font: drawtext cannot load it")
 		}
 		return fmt.Errorf("transcode: probe font: %w", err)
 	}

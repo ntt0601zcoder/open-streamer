@@ -859,7 +859,7 @@ func TestProbeFontFlag(t *testing.T) {
 		{"missing", dir + "/missing.ttf", exitProbeFailed, "font: cannot open the file: no such file"},
 		{"directory", dir, exitProbeFailed, "font: cannot open the file: not a regular file\n"},
 		{"symbolic link", link, exitProbeFailed, "font: cannot open the file: it is a symbolic link\n"},
-		{"freetype refuses", write("zeros.ttf", zeroTablesFont(t)), exitProbeFailed, "font: drawtext cannot load it: "},
+		{"freetype refuses", write("zeros.ttf", zeroTablesFont(t)), exitProbeFailed, "font: drawtext cannot load it\n"},
 		{"too big", write("big.ttf", big), exitProbeFailed, "font: 25165825 bytes, over 25165824\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -873,6 +873,9 @@ func TestProbeFontFlag(t *testing.T) {
 			assert.True(t, strings.HasPrefix(stdout, tc.prefix), "stdout %q, want a start of %q", stdout, tc.prefix)
 			assert.NotContains(t, stdout, "transcode:", "an internal prefix in stdout")
 			assert.NotContains(t, stdout, "font: font:")
+			if tc.name == "freetype refuses" {
+				assert.Equal(t, "font: drawtext cannot load it\n", stdout)
+			}
 			if tc.code == 0 {
 				assert.Equal(t, "font: ok\n", stdout)
 			} else {
