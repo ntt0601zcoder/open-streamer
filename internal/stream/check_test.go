@@ -194,3 +194,61 @@ func TestCheckSkipsParseWithOpen(t *testing.T) {
 	open := func(context.Context, string) (ingest.Reader, error) { return nil, errors.New("not opened by Check") }
 	require.NoError(t, Check(sp, served(Env{Open: open})))
 }
+
+// fixtureFont is a font the picture package accepts.
+const fixtureFont = "../../testdata/fixtures/fonts/DejaVuSansMono.ttf"
+
+// Check reads a watermark's font from the assets directory.
+func TestCheckWatermarkFont(t *testing.T) {
+	font, err := os.ReadFile(fixtureFont)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "mono.ttf"), font, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "fake.ttf"), onePixelPNG, 0o600))
+	env := served(Env{AssetsDir: dir})
+	fakeChild(t, &env)
+	with := func(name string) spec.Stream {
+		sp := textSpec("hello")
+		sp.Transcode.Watermark.Font = name
+		require.NoError(t, sp.Validate())
+		return sp
+	}
+	require.NoError(t, Check(with("mono.ttf"), env))
+	opt, err := ladderOf(with("mono.ttf"), env)
+	require.NoError(t, err)
+	assert.Equal(t, font, opt.Watermark.Font)
+
+	noDir := env
+	noDir.AssetsDir = ""
+	for name, row := range map[string]struct {
+		sp   spec.Stream
+		env  Env
+		want string
+	}{
+		"missing":          {with("gone.ttf"), env, `gone\.ttf`},
+		"not a font":       {with("fake.ttf"), env, `font`},
+		"no assets dir":    {with("mono.ttf"), noDir, `^stream: check: transcode: watermark: a font needs the assets directory, which is not configured$`},
+		"image, no dir":    {withWatermark(textSpec("x"), &spec.Watermark{Image: "logo.png"}), noDir, `^stream: check: transcode: watermark: an image needs the assets directory, which is not configured$`},
+		"unknown position": {withWatermark(textSpec("x"), &spec.Watermark{Text: "x", Position: "zz"}), env, `^stream: check: transcode: watermark: unknown position "zz"$`},
+	} {
+		err := Check(row.sp, row.env)
+		require.Error(t, err, name)
+		assert.Regexp(t, `^stream: check: transcode: watermark: `, err.Error(), name)
+		assert.Regexp(t, row.want, err.Error(), name)
+	}
+}
+
+// NoFallback reaches the transcoder's options.
+func TestLadderNoFallback(t *testing.T) {
+	env := served(Env{})
+	fakeChild(t, &env)
+	sp := ladderSpec("720", "360")
+	sp.Transcode.Renditions[1].Encoder = "nvenc"
+	sp.Transcode.Renditions[1].NoFallback = true
+	require.NoError(t, sp.Validate())
+	require.NoError(t, Check(sp, env))
+	opt, err := ladderOf(sp, env)
+	require.NoError(t, err)
+	assert.False(t, opt.Renditions[0].Video.NoFallback)
+	assert.True(t, opt.Renditions[1].Video.NoFallback)
+}

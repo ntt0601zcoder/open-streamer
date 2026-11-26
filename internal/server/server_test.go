@@ -357,16 +357,17 @@ func (s *script) hold() (release func()) {
 	}
 }
 
-// opened reports whether a reader was opened for the URL u.
-func (s *script) opened(u string) bool {
+// opens counts the readers opened for the URL u.
+func (s *script) opens(u string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	n := 0
 	for _, x := range s.urls {
 		if x == u {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
 }
 
 type scriptReader struct {

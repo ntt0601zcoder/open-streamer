@@ -9,6 +9,8 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/logging"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
 )
 
 // The restart backoff: it starts at backoffMin, doubles up to backoffMax,
@@ -28,10 +30,13 @@ const (
 	stopFailed             // a part of the generation ended, or it could not be built
 )
 
-// edit is one Submit: the new spec and where its answer goes.
+// edit is one mailbox entry: a Submit, with the new spec and where its
+// answer goes, or a Refresh.
 type edit struct {
-	sp  spec.Stream
-	ans chan spec.Change // buffered: an answer never blocks
+	sp      spec.Stream
+	ans     chan spec.Change // buffered: an answer never blocks
+	refresh bool             // a Refresh: sp and ans are unset
+	ref     chan error       // a Refresh's answer; buffered
 }
 
 // answer sends the edit's Change and closes its channel.
@@ -40,9 +45,24 @@ func (e edit) answer(c spec.Change) {
 	close(e.ans)
 }
 
+// refreshed sends a Refresh's answer and closes its channel.
+func (e edit) refreshed(err error) {
+	e.ref <- err
+	close(e.ref)
+}
+
+// drop closes the entry's channel without a value.
+func (e edit) drop() {
+	if e.refresh {
+		close(e.ref)
+		return
+	}
+	close(e.ans)
+}
+
 // Supervisor runs one stream: it builds a generation from the spec, serves
-// it, applies output edits in place, and rebuilds it for any other edit or
-// after a failure.
+// it, applies output, input and watermark edits in place, and rebuilds it
+// for any other edit or after a failure.
 type Supervisor struct {
 	name  string
 	env   Env
@@ -71,6 +91,11 @@ type Supervisor struct {
 	// View is swapped in, before reattach goes on. It is a seam for the
 	// tests of reattach's order; nothing sets it outside them.
 	published func(*View)
+	// setWatermark and setInputs, when set, stand in for the transcoder's
+	// SetWatermark and the pipeline's SetInputs. They are seams for the tests
+	// of the live edit; nothing sets them outside them.
+	setWatermark func(*transcode.Transcoder, *picture.Watermark) error
+	setInputs    func(context.Context, []string) error
 
 	// mu guards what Status, Shot and Collect read. Only the Run goroutine
 	// writes spec, cur and pushes, so it reads them without mu.
@@ -156,11 +181,17 @@ func (s *Supervisor) View() *View { return s.view.Load() }
 // supervisor's name and is not disabled.
 func (s *Supervisor) Submit(sp spec.Stream) <-chan spec.Change {
 	e := edit{sp: cloneSpec(sp), ans: make(chan spec.Change, 1)}
+	s.post(e)
+	return e.ans
+}
+
+// post queues e, or drops it when the mailbox is closed. It never blocks.
+func (s *Supervisor) post(e edit) {
 	s.box.Lock()
 	if s.box.closed {
 		s.box.Unlock()
-		close(e.ans)
-		return e.ans
+		e.drop()
+		return
 	}
 	s.box.queue = append(s.box.queue, e)
 	s.box.Unlock()
@@ -168,10 +199,9 @@ func (s *Supervisor) Submit(sp spec.Stream) <-chan spec.Change {
 	case s.signal <- struct{}{}:
 	default:
 	}
-	return e.ans
 }
 
-// take removes the oldest queued edit.
+// take removes the oldest queued entry.
 func (s *Supervisor) take() (edit, bool) {
 	s.box.Lock()
 	defer s.box.Unlock()
@@ -184,15 +214,15 @@ func (s *Supervisor) take() (edit, bool) {
 	return e, true
 }
 
-// closeMailbox closes the channel of every edit not answered, and makes
-// every later Submit return a closed channel.
+// closeMailbox closes the channel of every edit and refresh not answered,
+// and makes every later Submit and Refresh return a closed channel.
 func (s *Supervisor) closeMailbox() {
 	s.box.Lock()
 	queue := s.box.queue
 	s.box.queue, s.box.closed = nil, true
 	s.box.Unlock()
 	for _, e := range append(s.pending, queue...) {
-		close(e.ans)
+		e.drop()
 	}
 	s.pending = nil
 	s.mu.Lock()
@@ -249,8 +279,8 @@ func (s *Supervisor) Run(ctx context.Context) {
 	}
 }
 
-// serve applies the queued edits to g until ctx ends, an edit asks for a
-// rebuild, or a part of g ends.
+// serve applies the queued edits and refreshes to g, in order, until ctx
+// ends, an edit asks for a rebuild, or a part of g ends.
 func (s *Supervisor) serve(ctx context.Context, g *generation) stop {
 	for {
 		if ctx.Err() != nil {
@@ -261,6 +291,10 @@ func (s *Supervisor) serve(ctx context.Context, g *generation) stop {
 			if !ok {
 				break
 			}
+			if e.refresh {
+				e.refreshed(s.refresh(g))
+				continue
+			}
 			switch spec.Diff(s.spec, e.sp) {
 			case spec.ChangeNone:
 				e.answer(spec.ChangeNone)
@@ -269,7 +303,10 @@ func (s *Supervisor) serve(ctx context.Context, g *generation) stop {
 				s.setSpec(e.sp)
 				s.reattach(g, old, e.sp.Outputs) //nolint:contextcheck // the outputs run under g's context, a child of ctx
 				e.answer(spec.ChangeOutputs)
-			case spec.ChangeLive, spec.ChangeRebuild: // ChangeLive: applied in place from Task 8
+			case spec.ChangeLive:
+				s.applyLive(g, s.spec, e.sp) //nolint:contextcheck // it runs under g's context, a child of ctx
+				e.answer(spec.ChangeLive)
+			case spec.ChangeRebuild:
 				// Answered after the next generation's reattach, or its
 				// failed build. The edits behind it stay queued for that
 				// generation.
@@ -291,7 +328,8 @@ func (s *Supervisor) serve(ctx context.Context, g *generation) stop {
 }
 
 // idle waits out a backoff of wait. It is false when ctx ended. An edit
-// that changes the spec replaces it and ends the wait.
+// that changes the spec replaces it and ends the wait; a refresh has nothing
+// to refresh.
 func (s *Supervisor) idle(ctx context.Context, wait time.Duration) bool {
 	var timer <-chan time.Time
 	for {
@@ -301,6 +339,11 @@ func (s *Supervisor) idle(ctx context.Context, wait time.Duration) bool {
 			if !ok {
 				break
 			}
+			if e.refresh {
+				// The next build reads the asset.
+				e.refreshed(ErrNoGeneration)
+				continue
+			}
 			switch spec.Diff(s.spec, e.sp) {
 			case spec.ChangeNone:
 				e.answer(spec.ChangeNone)
@@ -309,7 +352,11 @@ func (s *Supervisor) idle(ctx context.Context, wait time.Duration) bool {
 				s.setSpec(e.sp)
 				e.answer(spec.ChangeOutputs)
 				changed = true
-			case spec.ChangeLive, spec.ChangeRebuild: // ChangeLive: applied in place from Task 8
+			case spec.ChangeLive:
+				// Nothing runs: the next generation is built from it.
+				s.liveIdle(e)
+				changed = true
+			case spec.ChangeRebuild:
 				s.rebuildFor(e)
 				changed = true
 			}

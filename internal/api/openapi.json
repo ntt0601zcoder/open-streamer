@@ -1438,6 +1438,10 @@
             "type": "integer",
             "description": "How often an encoder fell back to another."
           },
+          "encoder_refusals": {
+            "type": "integer",
+            "description": "Transcoder children that ended because a no_fallback rendition could not open its encoder."
+          },
           "thumbnails": {
             "type": "integer",
             "description": "The shots made."
@@ -1448,6 +1452,7 @@
           "spawns",
           "exits",
           "encoder_fallbacks",
+          "encoder_refusals",
           "thumbnails"
         ]
       },
@@ -1498,13 +1503,14 @@
           },
           "applied": {
             "type": "string",
-            "description": "created: a new stream. started: it was disabled or stopped and now runs; also a stream that did not differ but had been left stopped because it could not run (a listen address in use, a missing asset), which every edit and reload tries again. stopped: the stream has no supervisor after the edit (it is disabled). unchanged: nothing differed; a stream left stopped that still cannot run stays so, with its last_error refreshed. outputs: only the outputs differed, applied in place. rebuild: the stream was rebuilt. deleted: the stream is gone.",
+            "description": "created: a new stream. started: it was disabled or stopped and now runs; also a stream that did not differ but had been left stopped because it could not run (a listen address in use, a missing asset), which every edit and reload tries again. stopped: the stream has no supervisor after the edit (it is disabled). unchanged: nothing differed; a stream left stopped that still cannot run stays so, with its last_error refreshed. outputs: only the outputs differed, applied in place. live: the inputs or the watermark of a running stream were changed in place; no session ended. rebuild: the stream was rebuilt. deleted: the stream is gone.",
             "enum": [
               "created",
               "started",
               "stopped",
               "unchanged",
               "outputs",
+              "live",
               "rebuild",
               "deleted"
             ]
@@ -1536,6 +1542,7 @@
               "stopped",
               "unchanged",
               "outputs",
+              "live",
               "rebuild",
               "deleted"
             ]

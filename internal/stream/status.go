@@ -44,7 +44,7 @@ type Status struct {
 	Since       time.Time    `json:"since"`                   // when the generation started
 	Restarts    uint64       `json:"restarts"`                // rebuilds after a failure
 	Rebuilds    uint64       `json:"rebuilds"`                // rebuilds for an edit
-	LastError   string       `json:"last_error,omitempty"`    // scrubbed; prefixed "input N: ", "transcoder: ", "thumbnailer: " or "build: "
+	LastError   string       `json:"last_error,omitempty"`    // scrubbed; prefixed "input N: ", "inputs: ", "watermark: ", "transcoder: ", "thumbnailer: " or "build: "
 	LastErrorAt *time.Time   `json:"last_error_at,omitempty"` // when LastError was recorded
 	Served      []string     `json:"served"`
 	Outputs     spec.Outputs `json:"outputs"`      // push URLs redacted
@@ -69,6 +69,7 @@ type Transcoder struct {
 	Spawns           uint64 `json:"spawns"`
 	Exits            uint64 `json:"exits"`
 	EncoderFallbacks uint64 `json:"encoder_fallbacks"`
+	EncoderRefusals  uint64 `json:"encoder_refusals"`
 	Thumbnails       uint64 `json:"thumbnails"`
 }
 
@@ -175,7 +176,7 @@ func (s *Supervisor) Status() Status {
 	if tr, ok := g.child(); ok {
 		st.Transcoder = &Transcoder{
 			PID: tr.PID, Spawns: tr.spawns, Exits: tr.exits,
-			EncoderFallbacks: tr.Child.EncoderFallbacks, Thumbnails: tr.thumbnails,
+			EncoderFallbacks: tr.Child.EncoderFallbacks, EncoderRefusals: tr.EncoderRefusals, Thumbnails: tr.thumbnails,
 		}
 	}
 	for _, r := range n.pushes {
@@ -365,6 +366,9 @@ func collectChild(w *metrics.Writer, l func(...string) []metrics.Label, g *gener
 		}
 		w.Counter("openstreamer_transcoder_encoder_fallbacks_total", "Rungs that fell back to the software encoder.",
 			float64(c.Child.EncoderFallbacks), l()...)
+		w.Counter("openstreamer_transcoder_encoder_refusals_total",
+			"Transcoder children that ended because a no_fallback rendition could not open its encoder.",
+			float64(c.EncoderRefusals), l()...)
 		const mediaErrs = "Media errors the transcoder child reported, by kind."
 		for _, e := range []struct {
 			kind string

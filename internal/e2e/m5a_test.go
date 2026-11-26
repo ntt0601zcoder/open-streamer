@@ -1558,7 +1558,9 @@ func TestM5aRebuildIsTheOtherRoute(t *testing.T) {
 	require.EqualValues(t, 1, m.status(t, "cam").Generation)
 	time.Sleep(3 * time.Second)
 
-	cam.Inputs = append(cam.Inputs, spec.Input{URL: m5aSource(t)})
+	// An edit of the inputs alone is applied in place; this layout keeps
+	// both kinds and is not the default, so it rebuilds.
+	cam.Layout = []string{"audio", "video"}
 	code, applied = m.put(t, cam)
 	require.Equal(t, http.StatusOK, code)
 	require.Equal(t, "rebuild", applied)

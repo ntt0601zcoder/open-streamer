@@ -316,8 +316,9 @@ func viewOutputs(v *View) []Output {
 	return out
 }
 
-// Any edit outside the outputs rebuilds the stream at once, without a
-// backoff, and is answered when the new generation is served.
+// An edit outside the outputs, the inputs and the watermark rebuilds the
+// stream at once, without a backoff, and is answered when the new
+// generation is served.
 func TestSupervisorRebuildOnOtherEdits(t *testing.T) {
 	r := newRig(t)
 	sp := camSpec()
@@ -326,7 +327,7 @@ func TestSupervisorRebuildOnOtherEdits(t *testing.T) {
 	old := s.View()
 
 	next := sp
-	next.Inputs = append(slices.Clone(sp.Inputs), spec.Input{URL: "http://backup.test/cam.ts"})
+	next.Layout = []string{"audio", "video"}
 	require.Equal(t, spec.ChangeRebuild, answer(t, s.Submit(next)))
 	v := s.View()
 	assert.Equal(t, uint64(2), v.Gen, "the answer came before the new generation was served")
@@ -339,7 +340,6 @@ func TestSupervisorRebuildOnOtherEdits(t *testing.T) {
 	st := s.Status()
 	assert.Equal(t, uint64(1), st.Rebuilds)
 	assert.Equal(t, uint64(0), st.Restarts)
-	assert.Len(t, st.Inputs, 2)
 	assert.False(t, r.after.called(), "an edit's rebuild waited a backoff")
 	waitState(t, s, "running")
 

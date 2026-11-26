@@ -263,8 +263,8 @@ var positions = map[string]picture.Position{
 }
 
 // ladderOf returns the transcoder options of a spec with a ladder: rendition
-// i is named <name>_<label>, the presentation hub is on, and an image
-// watermark is read from env.AssetsDir, so the asset must exist now.
+// i is named <name>_<label>, the presentation hub is on, and a watermark's
+// image and font are read from env.AssetsDir, so the assets must exist now.
 func ladderOf(sp spec.Stream, env Env) (transcode.Options, error) {
 	t := sp.Transcode
 	opt := transcode.Options{
@@ -281,33 +281,18 @@ func ladderOf(sp spec.Stream, env Env) (transcode.Options, error) {
 			Name: sp.Name + "_" + r.Label,
 			Video: transcode.Video{
 				Copy: r.Copy, Height: r.Height, BitrateKbps: r.BitrateKbps, MaxBitrateKbps: r.MaxBitrateKbps,
-				BFrames: r.BFrames, Preset: r.Preset, Encoder: r.Encoder,
+				BFrames: r.BFrames, Preset: r.Preset, Encoder: r.Encoder, NoFallback: r.NoFallback,
 			},
 		})
 	}
 	if encodes(sp) && env.Transcoder == "" {
 		return opt, errors.New("encoding needs the transcoder, which is not configured")
 	}
-	if w := t.Watermark; w != nil {
-		pos, ok := positions[w.Position]
-		if !ok {
-			return opt, fmt.Errorf("watermark: unknown position %q", w.Position)
-		}
-		pw := picture.Watermark{
-			Text: w.Text, Position: pos, OpacityPct: w.OpacityPct, SizePct: w.SizePct, TimeZone: w.TimeZone,
-		}
-		if w.Image != "" {
-			if env.AssetsDir == "" {
-				return opt, errors.New("watermark: an image needs the assets directory, which is not configured")
-			}
-			img, err := picture.LoadAsset(env.AssetsDir, w.Image)
-			if err != nil {
-				return opt, fmt.Errorf("watermark: %w", err)
-			}
-			pw.Image = img
-		}
-		opt.Watermark = &pw
+	w, err := watermarkOf(sp, env)
+	if err != nil {
+		return opt, fmt.Errorf("watermark: %w", err)
 	}
+	opt.Watermark = w
 	if sp.Thumbnail != nil && encodes(sp) {
 		th := thumbnailOf(sp)
 		opt.Thumbnail = &th

@@ -21,7 +21,7 @@ import (
 // Outcome is what an edit did to one stream.
 type Outcome struct {
 	Name    string `json:"name"`
-	Applied string `json:"applied"` // "created", "started", "stopped", "unchanged", "outputs", "rebuild", "deleted"
+	Applied string `json:"applied"` // "created", "started", "stopped", "unchanged", "outputs", "live", "rebuild", "deleted"
 }
 
 // What an edit can do to a stream.
@@ -31,6 +31,7 @@ const (
 	appliedStopped   = "stopped"   // it changed and has no supervisor now: disabled
 	appliedUnchanged = "unchanged" // the spec is the same
 	appliedOutputs   = "outputs"   // a running stream's outputs were edited in place
+	appliedLive      = "live"      // a running stream's inputs or watermark were edited in place
 	appliedRebuild   = "rebuild"   // a running stream is rebuilt
 	appliedDeleted   = "deleted"   // the name is gone
 )
@@ -316,8 +317,13 @@ func (m *Manager) plan(streams []spec.Stream) ([]step, error) {
 		case !had:
 			st.sp, st.act, st.applied = cloneSpec(sp), actStart, appliedStarted
 		default:
-			st.sp, st.act, st.applied = cloneSpec(sp), actSubmit, appliedOutputs
-			if c := spec.Diff(old.sp, sp); c == spec.ChangeLive || c == spec.ChangeRebuild { // ChangeLive: applied in place from Task 8
+			st.sp, st.act = cloneSpec(sp), actSubmit
+			switch spec.Diff(old.sp, sp) {
+			case spec.ChangeNone, spec.ChangeOutputs: // ChangeNone has its own case above
+				st.applied = appliedOutputs
+			case spec.ChangeLive:
+				st.applied = appliedLive
+			case spec.ChangeRebuild:
 				st.applied = appliedRebuild
 			}
 		}

@@ -644,6 +644,11 @@ func TestEditKeepsRememberedLogin(t *testing.T) {
 	assert.Equal(t, base+1, hashes.Load())
 }
 
+// heldLayout is the layout heldRebuild's edit sets: an edit of the inputs
+// alone is applied in place, and this one rebuilds while it keeps both
+// kinds.
+var heldLayout = []string{"audio", "video"}
+
 // heldRebuild starts a server with the stream cam, holds its teardown, and
 // sends a per-stream PUT that rebuilds it. It returns once the edit is in
 // the file, with the PUT still waiting for the rebuild.
@@ -659,7 +664,7 @@ func heldRebuild(t *testing.T) (s *testServer, sc *script, release, hangUp func(
 	release = sc.hold()
 	t.Cleanup(release)
 	edit := specOf("cam", spec.Outputs{HLS: true})
-	edit.Inputs[0].URL = "rtmp://src.example/live/cam2"
+	edit.Layout = heldLayout
 	done = make(chan error, 1)
 	ctx, hangUp := context.WithCancel(context.Background())
 	t.Cleanup(hangUp)
@@ -667,7 +672,7 @@ func heldRebuild(t *testing.T) (s *testServer, sc *script, release, hangUp func(
 		_, err := s.PutStream(ctx, edit, "")
 		done <- err
 	}()
-	require.Eventually(t, func() bool { return strings.Contains(s.fileText(), "live/cam2") }, waitFor, time.Millisecond)
+	require.Eventually(t, func() bool { return strings.Contains(s.fileText(), "layout") }, waitFor, time.Millisecond)
 	select {
 	case err := <-done:
 		require.Fail(t, "the PUT did not wait for the rebuild", "%v", err)
@@ -690,27 +695,27 @@ func TestClientGoneDuringRebuild(t *testing.T) {
 	assert.Equal(t, file, string(text))
 	assert.Equal(t, config.Hash([]byte(file)), etag)
 	assert.False(t, s.ConfigStatus().Stale)
-	cam := func(streams []spec.Stream) string {
+	cam := func(streams []spec.Stream) []string {
 		for _, sp := range streams {
 			if sp.Name == "cam" {
-				return sp.Inputs[0].URL
+				return sp.Layout
 			}
 		}
-		return ""
+		return nil
 	}
-	assert.Equal(t, "rtmp://src.example/live/cam2", cam(testParse(t, file).Doc.Streams))
+	assert.Equal(t, heldLayout, cam(testParse(t, file).Doc.Streams))
 	got, _ := s.Get("cam")
-	assert.Equal(t, "rtmp://src.example/live/cam2", got.Inputs[0].URL)
+	assert.Equal(t, heldLayout, got.Layout)
 
 	// A later edit of another stream keeps the first: nothing is reverted.
 	out, err := s.PutStream(bg, specOf("other", spec.Outputs{HLS: true, DASH: true}), "")
 	require.NoError(t, err)
 	assert.Equal(t, "outputs", out.Applied)
-	assert.Equal(t, "rtmp://src.example/live/cam2", cam(testParse(t, s.fileText()).Doc.Streams))
-	assert.False(t, sc.opened("rtmp://src.example/live/cam2"), "the teardown is still held")
+	assert.Equal(t, heldLayout, cam(testParse(t, s.fileText()).Doc.Streams))
+	assert.Equal(t, 1, sc.opens("rtmp://src.example/live/cam"), "the teardown is still held")
 
 	release()
-	require.Eventually(t, func() bool { return sc.opened("rtmp://src.example/live/cam2") }, waitFor, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return sc.opens("rtmp://src.example/live/cam") == 2 }, waitFor, 5*time.Millisecond)
 	s.generation("cam")
 }
 
@@ -722,7 +727,7 @@ func TestStatusDoesNotWaitForApply(t *testing.T) {
 	assert.Less(t, time.Since(t0), 100*time.Millisecond)
 	// The apply has not finished: the text in force is still the old one,
 	// and the file, which is ahead of it, reads as stale until it has.
-	assert.NotContains(t, string(text), "live/cam2")
+	assert.NotContains(t, string(text), "layout")
 	assert.Equal(t, etag, st.ETag)
 	// The streams, the users and the metrics do not wait either.
 	t0 = time.Now()
@@ -739,7 +744,7 @@ func TestStatusDoesNotWaitForApply(t *testing.T) {
 		require.Fail(t, "the PUT did not return")
 	}
 	text, _ = s.ConfigText()
-	assert.Contains(t, string(text), "live/cam2")
+	assert.Contains(t, string(text), "layout")
 	assert.False(t, s.ConfigStatus().Stale)
 }
 

@@ -206,7 +206,7 @@ func TestManagerReplaceCreatesAndEdits(t *testing.T) {
 	_, ok = r.m.Hub(OutRTMP, "cam")
 	assert.True(t, ok)
 
-	cam.Inputs = []spec.Input{{URL: "http://source.test/other.ts"}}
+	cam.Layout = []string{"audio", "video"}
 	assert.Equal(t, outcomes("cam", "rebuild"), r.replace(cam))
 	assert.Equal(t, uint64(2), r.status("cam").Generation)
 	assert.Equal(t, uint64(1), r.status("cam").Rebuilds)
@@ -218,7 +218,7 @@ func TestManagerReplaceCreatesAndEdits(t *testing.T) {
 	assert.Equal(t, "stopped", st.State)
 	assert.Equal(t, -1, st.ActiveInput)
 	assert.Equal(t, []string{"cam"}, st.Served)
-	assert.Equal(t, []string{"http://source.test/other.ts"}, st.Inputs)
+	assert.Equal(t, []string{"http://source.test/cam.ts"}, st.Inputs)
 	assert.Empty(t, st.LastError)
 	_, ok = r.m.Hub(OutRTMP, "cam")
 	assert.False(t, ok)
@@ -573,7 +573,7 @@ func TestManagerListenClaim(t *testing.T) {
 			outcomes("a", "unchanged", "b", "created", "c", "created"),
 		},
 		{"a keeping its inputs", []spec.Stream{outputEdit(a, OutRTSP, false)}, outcomes("a", "outputs")},
-		{"a rebuilt with its inputs", []spec.Stream{withInputs(a, aUDP, aRTMP)}, outcomes("a", "rebuild")},
+		{"a edited in place with its inputs", []spec.Stream{withInputs(a, aUDP, aRTMP)}, outcomes("a", "live")},
 		{"a deleted, b taking its URLs", []spec.Stream{withInputs(b, aRTMP, aUDP)}, outcomes("a", "deleted", "b", "created")},
 	}
 	for _, row := range accepted {

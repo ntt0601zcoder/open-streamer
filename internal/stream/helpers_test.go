@@ -103,6 +103,7 @@ type script struct {
 	eofAfter  int           // a reader returns io.EOF after that many frames; 0 never
 	closeGate chan struct{} // a reader's Close blocks until it is closed; nil never blocks
 	urls      []string
+	closed    []string // the URL of every reader closed, in order
 }
 
 func newScript(t testing.TB) *script {
@@ -119,7 +120,33 @@ func (s *script) Open(_ context.Context, url string) (ingest.Reader, error) {
 	if s.openErr != nil {
 		return nil, s.openErr
 	}
-	return &scriptReader{s: s, closed: make(chan struct{})}, nil
+	return &scriptReader{s: s, url: url, closed: make(chan struct{})}, nil
+}
+
+// opened counts the Open calls for url so far.
+func (s *script) opened(url string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, u := range s.urls {
+		if u == url {
+			n++
+		}
+	}
+	return n
+}
+
+// closes counts the readers of url that were closed.
+func (s *script) closes(url string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, u := range s.closed {
+		if u == url {
+			n++
+		}
+	}
+	return n
 }
 
 // Opens counts the Open calls so far.
@@ -137,6 +164,7 @@ func (s *script) set(f func(*script)) {
 
 type scriptReader struct {
 	s      *script
+	url    string
 	n      int // frames read; Read goroutine only
 	closed chan struct{}
 	once   sync.Once
@@ -176,7 +204,12 @@ func (r *scriptReader) Close() error {
 	if gate != nil {
 		<-gate
 	}
-	r.once.Do(func() { close(r.closed) })
+	r.once.Do(func() {
+		close(r.closed)
+		r.s.mu.Lock()
+		r.s.closed = append(r.s.closed, r.url)
+		r.s.mu.Unlock()
+	})
 	return nil
 }
 
@@ -321,6 +354,9 @@ type rig struct {
 	cancel context.CancelFunc
 	// published becomes the supervisors' seam of the same name.
 	published func(*View)
+	// tune, when set, is called with each supervisor before it runs: it sets
+	// the seams of the live edit.
+	tune func(*Supervisor)
 }
 
 // newRig returns a scripted Env; tune r.env before start.
@@ -346,6 +382,9 @@ func (r *rig) startAfter(sp spec.Stream, after <-chan struct{}) *Supervisor {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := NewSupervisor(sp, r.env, after)
 	s.published = r.published
+	if r.tune != nil {
+		r.tune(s)
+	}
 	go s.Run(ctx)
 	r.t.Cleanup(func() {
 		cancel()
