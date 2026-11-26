@@ -24,7 +24,8 @@ const (
 	// nvencGOP is the NVENC keyframe interval, long enough that the
 	// source's keys force every IDR, like x264Params' keyint.
 	nvencGOP = 600
-	// probeWidth, probeHeight and probeFPS are the encoder ProbeNVENC opens.
+	// probeWidth, probeHeight and probeFPS are the encoder ProbeNVENC
+	// opens; probeWidth × probeHeight is also the picture ProbeFont draws.
 	probeWidth, probeHeight, probeFPS = 256, 144, 25
 	// probeKbps is the probe encoder's bitrate.
 	probeKbps = 200

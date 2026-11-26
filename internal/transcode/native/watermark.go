@@ -3,6 +3,7 @@
 package native
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"image"
@@ -43,14 +44,21 @@ type graphKey struct {
 
 // watermarker draws one watermark on decoded pictures through a libavfilter
 // graph, built for one watermark and one picture format and rebuilt when
-// either changes. Text goes through drawtext from a file the child writes,
-// so it never enters the graph string.
+// either changes. Text goes through drawtext from files the child writes,
+// the text and the font, so neither enters the graph string, which is the
+// same whatever the font.
 type watermarker struct {
 	now func() time.Time
 	// dir holds font.ttf and text; "" until a text watermark needs it.
 	dir string
+	// font is what <dir>/font.ttf holds as last written: the built-in
+	// dejaVuSans, or the operator's font, the slice the watermark carried.
+	// It is the one reference the child keeps to that font (R-E8): the
+	// resolved wm has none, and the callers drop theirs once set returns.
+	// nil until the directory has a font.
+	font []byte
 
-	wm  *picture.Watermark // resolved; nil when off
+	wm  *picture.Watermark // resolved, without Font; nil when off
 	loc *time.Location
 	img *image.NRGBA // the decoded image of an image watermark
 
@@ -76,7 +84,11 @@ func newWatermarker(now func() time.Time) *watermarker {
 func (m *watermarker) active() bool { return m.wm != nil }
 
 // set validates w and makes it the watermark from the next picture; nil
-// removes it. An error leaves the current watermark in place.
+// removes it. A text watermark's font (the built-in one when w.Font is
+// empty) replaces <dir>/font.ttf when it differs from the one there. An
+// error leaves the current watermark in place. The watermarker keeps
+// w.Font, which nobody may change afterwards; the caller may drop its own
+// reference.
 func (m *watermarker) set(w *picture.Watermark) error {
 	if w == nil {
 		m.wm, m.loc, m.img = nil, nil, nil
@@ -96,11 +108,52 @@ func (m *watermarker) set(w *picture.Watermark) error {
 		if img, err = picture.DecodeImage(r.Image); err != nil {
 			return fmt.Errorf("watermark: %w", err)
 		}
-	} else if err := m.ensureDir(); err != nil {
-		return err
+	} else {
+		if err := m.ensureDir(); err != nil {
+			return err
+		}
+		if err := m.syncFont(r.Font); err != nil {
+			return err
+		}
 	}
+	r.Font = nil
 	m.wm, m.loc, m.img = &r, loc, img
 	m.freeGraph()
+	return nil
+}
+
+// syncFont makes <dir>/font.ttf hold font, the built-in one when empty,
+// unless it already does.
+func (m *watermarker) syncFont(font []byte) error {
+	if len(font) == 0 {
+		font = dejaVuSans
+	}
+	if m.font != nil && bytes.Equal(font, m.font) {
+		return nil
+	}
+	if err := m.writeFont(font); err != nil {
+		return err
+	}
+	m.font = font
+	return nil
+}
+
+// writeFont replaces <dir>/font.ttf with font atomically, through
+// font.tmp, making the directory again if it is gone. A graph that has the
+// old file open keeps reading it.
+func (m *watermarker) writeFont(font []byte) error {
+	if err := os.MkdirAll(m.dir, 0o700); err != nil {
+		return fmt.Errorf("watermark: temp dir: %w", err)
+	}
+	tmp := filepath.Join(m.dir, "font.tmp")
+	if err := os.WriteFile(tmp, font, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("watermark: write font: %w", err)
+	}
+	if err := os.Rename(tmp, filepath.Join(m.dir, "font.ttf")); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("watermark: write font: %w", err)
+	}
 	return nil
 }
 
@@ -114,9 +167,9 @@ const wmDirPrefix = "ostx-wm-"
 // the kernel as a process group and 4294967297 as pid 1.
 var wmDirName = regexp.MustCompile(`^` + wmDirPrefix + `([1-9][0-9]{0,6})-[0-9]+$`)
 
-// ensureDir creates the private directory and writes the font into it,
-// after sweeping the directories that dead children left behind
-// (sweepStaleDirs): a child killed or crashed never runs close.
+// ensureDir creates the private directory, after sweeping the directories
+// that dead children left behind (sweepStaleDirs): a child killed or
+// crashed never runs close. set writes the font into it.
 func (m *watermarker) ensureDir() error {
 	if m.dir != "" {
 		return nil
@@ -129,10 +182,6 @@ func (m *watermarker) ensureDir() error {
 	if !safePath.MatchString(dir) {
 		_ = os.RemoveAll(dir)
 		return fmt.Errorf("watermark: temp dir %q has a character outside [A-Za-z0-9_./-]", dir)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "font.ttf"), dejaVuSans, 0o600); err != nil {
-		_ = os.RemoveAll(dir)
-		return fmt.Errorf("watermark: write font: %w", err)
 	}
 	m.dir = dir
 	return nil
@@ -251,17 +300,21 @@ func (m *watermarker) writeTextFile(s string) error {
 // restoreFiles writes the font and the text again if they are gone, as when
 // a temp cleaner ages the directory on a long stream: drawtext would
 // otherwise fall back to fontconfig for the font (against R-C7) and fail on
-// the text.
+// the text. The font written is the current one, the operator's included.
 func (m *watermarker) restoreFiles() error {
 	if err := os.MkdirAll(m.dir, 0o700); err != nil {
 		return fmt.Errorf("watermark: temp dir: %w", err)
 	}
-	font := filepath.Join(m.dir, "font.ttf")
-	switch _, err := os.Stat(font); {
+	switch _, err := os.Stat(filepath.Join(m.dir, "font.ttf")); {
 	case errors.Is(err, fs.ErrNotExist):
-		if err := os.WriteFile(font, dejaVuSans, 0o600); err != nil {
-			return fmt.Errorf("watermark: write font: %w", err)
+		font := m.font
+		if font == nil {
+			font = dejaVuSans
 		}
+		if err := m.writeFont(font); err != nil {
+			return err
+		}
+		m.font = font
 	case err != nil:
 		return fmt.Errorf("watermark: font: %w", err)
 	}
@@ -273,6 +326,12 @@ func (m *watermarker) restoreFiles() error {
 	}
 	return nil
 }
+
+// errDrawtext is the error of a text graph drawtext could not be created
+// for. It loads the font as it is created: FreeType refusing font.ttf fails
+// here (fontconfig knows no font to fall back to, noSystemFonts), as does
+// an unreadable text file. libav's own error is then fontconfig's ENOENT.
+var errDrawtext = errors.New("drawtext could not load the font or read the text")
 
 // opacity is OpacityPct as a libavfilter alpha with two decimals.
 func opacity(pct int) string { return fmt.Sprintf("%.2f", float64(pct)/100) }
@@ -361,6 +420,9 @@ func (m *watermarker) build(k graphKey, pts int64) error {
 		m.desc = m.textGraph(k.h)
 	}
 	if err := g.Parse(m.desc, inputs, outputs); err != nil {
+		if m.img == nil {
+			return fmt.Errorf("watermark: parse graph: %w: %w", errDrawtext, err)
+		}
 		return fmt.Errorf("watermark: parse graph: %w", err)
 	}
 	if err := g.Configure(); err != nil {
@@ -452,4 +514,48 @@ func (m *watermarker) close() {
 		m.dir = ""
 	}
 	m.hasWritten = false
+	m.font = nil
+}
+
+// probeText, probeSizePct and the picture size are what ProbeFont draws.
+const (
+	probeText    = "Ag"
+	probeSizePct = 20
+)
+
+// ProbeFont draws text with the font on a 256×144 picture and reports why
+// that fails: the watermark's checks (CheckFont among them), then FreeType
+// through drawtext, exactly as a text watermark would load it. Its private
+// directory is removed before it returns. The error holds no path but the
+// child's temp directory's, in an I/O failure.
+func ProbeFont(font []byte) error {
+	if len(font) == 0 {
+		return errors.New("transcode: probe font: empty")
+	}
+	m := newWatermarker(nil)
+	defer m.close()
+	if err := m.set(&picture.Watermark{Text: probeText, SizePct: probeSizePct, Font: font}); err != nil {
+		return fmt.Errorf("transcode: probe font: %w", err)
+	}
+	fr := astiav.AllocFrame()
+	defer fr.Free()
+	fr.SetWidth(probeWidth)
+	fr.SetHeight(probeHeight)
+	fr.SetPixelFormat(astiav.PixelFormatYuv420P)
+	fr.SetSampleAspectRatio(astiav.NewRational(1, 1))
+	if err := fr.AllocBuffer(0); err != nil {
+		return fmt.Errorf("transcode: probe font: alloc picture: %w", err)
+	}
+	if err := fr.ImageFillBlack(); err != nil {
+		return fmt.Errorf("transcode: probe font: fill picture: %w", err)
+	}
+	if _, err := m.apply(fr); err != nil {
+		if errors.Is(err, errDrawtext) {
+			// The text is the probe's own: the font is what failed, and
+			// libav's error says nothing about it.
+			return errors.New("transcode: probe font: FreeType cannot load it")
+		}
+		return fmt.Errorf("transcode: probe font: %w", err)
+	}
+	return nil
 }

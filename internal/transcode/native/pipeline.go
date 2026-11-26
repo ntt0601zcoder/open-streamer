@@ -54,8 +54,10 @@ type Rung struct {
 // required.
 //
 // Watermark is drawn on every decoded picture before the ladder, so every
-// rung carries it; it needs at least one rung. Now is the clock of a text
-// watermark's time directives; nil means time.Now.
+// rung carries it; it needs at least one rung. Its Font, when set, is kept
+// by the pipeline and must not change; the caller may drop its reference
+// once NewWith returns. Now is the clock of a text watermark's time
+// directives; nil means time.Now.
 //
 // Thumbnail asks for JPEG shots, taken from the decoded picture before the
 // watermark. With rungs the pipeline shoots a picture every IntervalSec of
@@ -467,7 +469,8 @@ func (p *Pipeline) Flush() ([]Output, error) {
 }
 
 // SetWatermark replaces the watermark from the next decoded picture on; nil
-// removes it. The encoders, timestamps and epoch are untouched. An invalid
+// removes it. Its Font is kept as in NewWith. The encoders, timestamps and
+// epoch are untouched. An invalid
 // watermark, or one on a pipeline without rungs, is an error that leaves the
 // pipeline as it was. A watermark that then fails to build at the next
 // picture fails the pipeline.

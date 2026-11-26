@@ -796,3 +796,215 @@ func TestWatermarkNegativePTS(t *testing.T) {
 		assert.True(t, near(got, magenta, 40), "picture %d: %v", i, got)
 	}
 }
+
+// monoFont is the fixture DejaVu Sans Mono, an operator's font.
+func monoFont(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile("../../../testdata/fixtures/fonts/DejaVuSansMono.ttf")
+	require.NoError(t, err)
+	return b
+}
+
+// badFont is 4 kB of zeros behind a valid table directory: CheckFont takes
+// it, FreeType does not.
+func badFont(t *testing.T) []byte {
+	t.Helper()
+	tags := []string{"cmap", "glyf", "head", "hhea", "hmtx", "loca", "maxp"}
+	b := make([]byte, 4096)
+	copy(b, "\x00\x01\x00\x00")
+	b[5] = byte(len(tags))
+	for i, tag := range tags {
+		r := b[12+16*i:]
+		copy(r, tag)
+		r[10] = 0x02 // offset 512
+		r[15] = 0x40 // length 64
+	}
+	require.NoError(t, picture.CheckFont(b))
+	return b
+}
+
+// blackFrame is a 640×360 black yuv420p picture, freed at the end of the
+// test.
+func blackFrame(t *testing.T) *astiav.Frame {
+	t.Helper()
+	fr := astiav.AllocFrame()
+	t.Cleanup(fr.Free)
+	fr.SetWidth(640)
+	fr.SetHeight(360)
+	fr.SetPixelFormat(astiav.PixelFormatYuv420P)
+	fr.SetSampleAspectRatio(astiav.NewRational(1, 1))
+	require.NoError(t, fr.AllocBuffer(0))
+	require.NoError(t, fr.ImageFillBlack())
+	return fr
+}
+
+// litBox draws the watermark on fr and returns the bounding box of the
+// pixels whose luma is over 128.
+func litBox(t *testing.T, m *watermarker, fr *astiav.Frame) image.Rectangle {
+	t.Helper()
+	out, err := m.apply(fr)
+	require.NoError(t, err)
+	b, err := out.Data().Bytes(1)
+	require.NoError(t, err)
+	w, h := out.Width(), out.Height()
+	require.GreaterOrEqual(t, len(b), w*h)
+	box := image.Rectangle{}
+	for y := range h {
+		for x := range w {
+			if b[y*w+x] > 128 {
+				box = box.Union(image.Rect(x, y, x+1, y+1))
+			}
+		}
+	}
+	require.False(t, box.Empty(), "no lit pixel")
+	return box
+}
+
+// requireFontFile checks that <dir>/font.ttf holds want.
+func requireFontFile(t *testing.T, m *watermarker, want []byte, msg string) {
+	t.Helper()
+	got, err := os.ReadFile(filepath.Join(m.dir, "font.ttf"))
+	require.NoError(t, err, msg)
+	require.True(t, bytes.Equal(want, got), "%s: font.ttf holds %d bytes, not the %d expected", msg, len(got), len(want))
+}
+
+// newTestWatermarker returns a watermarker in a private TMPDIR, closed at
+// the end of the test.
+func newTestWatermarker(t *testing.T) *watermarker {
+	t.Helper()
+	t.Setenv("TMPDIR", t.TempDir())
+	m := newWatermarker(nil)
+	t.Cleanup(m.close)
+	return m
+}
+
+// TestWatermarkFont: the operator's font draws the text. Eight i's are at
+// least 1.5 times as wide in a monospaced font, whose i is as wide as an m,
+// and the graph string is the same: the font goes into the watermarker's
+// own font.ttf, never into the string.
+func TestWatermarkFont(t *testing.T) {
+	mono := monoFont(t)
+	fr := blackFrame(t)
+	m := newTestWatermarker(t)
+
+	wm := picture.Watermark{Text: "iiiiiiii", SizePct: 20, Position: picture.TopLeft}
+	require.NoError(t, m.set(&wm))
+	sans := litBox(t, m, fr)
+	sansDesc := m.desc
+
+	wm.Font = mono
+	require.NoError(t, m.set(&wm))
+	wide := litBox(t, m, fr)
+	t.Logf("lit width: built-in %d, mono %d", sans.Dx(), wide.Dx())
+	assert.GreaterOrEqual(t, float64(wide.Dx()), 1.5*float64(sans.Dx()))
+	assert.Equal(t, sansDesc, m.desc, "the graph string does not change with the font")
+
+	// The watermarker holds the font once: its own reference, the caller's
+	// slice; the resolved watermark it keeps has none.
+	assert.Nil(t, m.wm.Font)
+	require.NotEmpty(t, m.font)
+	assert.Same(t, &mono[0], &m.font[0])
+
+	desc := m.desc
+	for _, f := range [][]byte{dejaVuSans, mono} {
+		assert.NotContains(t, desc, string(f[:16]))
+	}
+	assert.Less(t, len(desc), 1024)
+	for _, kv := range []string{"fontfile=" + m.dir + "/font.ttf:", "textfile=" + m.dir + "/text:"} {
+		require.Equal(t, 1, strings.Count(desc, kv), "%q in %q", kv, desc)
+		desc = strings.Replace(desc, kv, "", 1)
+	}
+	assert.NotContains(t, desc, "/", "a path outside the watermarker's directory in %q", m.desc)
+}
+
+// TestWatermarkFontChange: changing the font on one watermarker rewrites
+// font.ttf, and the text widens and narrows again.
+func TestWatermarkFontChange(t *testing.T) {
+	mono := monoFont(t)
+	fr := blackFrame(t)
+	m := newTestWatermarker(t)
+	wm := picture.Watermark{Text: "iiiiiiii", SizePct: 20}
+
+	require.NoError(t, m.set(&wm))
+	first := litBox(t, m, fr)
+	requireFontFile(t, m, dejaVuSans, "built-in")
+
+	wm.Font = mono
+	require.NoError(t, m.set(&wm))
+	wide := litBox(t, m, fr)
+	requireFontFile(t, m, mono, "mono")
+	assert.GreaterOrEqual(t, float64(wide.Dx()), 1.5*float64(first.Dx()))
+
+	wm.Font = nil
+	require.NoError(t, m.set(&wm))
+	again := litBox(t, m, fr)
+	requireFontFile(t, m, dejaVuSans, "built-in again")
+	assert.Equal(t, first, again)
+	_, err := os.Stat(filepath.Join(m.dir, "font.tmp"))
+	require.ErrorIs(t, err, os.ErrNotExist, "font.tmp is renamed away")
+}
+
+// TestWatermarkFontRestored: a temp cleaner removes font.ttf under an
+// operator's font: the next build writes that font back, not DejaVu.
+func TestWatermarkFontRestored(t *testing.T) {
+	mono := monoFont(t)
+	fr := blackFrame(t)
+	m := newTestWatermarker(t)
+	wm := picture.Watermark{Text: "iiiiiiii", SizePct: 20, Font: mono}
+	require.NoError(t, m.set(&wm))
+	wide := litBox(t, m, fr)
+
+	require.NoError(t, os.Remove(filepath.Join(m.dir, "font.ttf")))
+	// The same watermark: set has nothing new to write, so only the build
+	// can bring the file back.
+	require.NoError(t, m.set(&wm))
+	assert.Equal(t, wide, litBox(t, m, fr))
+	requireFontFile(t, m, mono, "restored")
+
+	require.NoError(t, os.RemoveAll(m.dir))
+	require.NoError(t, m.set(&wm))
+	assert.Equal(t, wide, litBox(t, m, fr))
+	requireFontFile(t, m, mono, "directory restored")
+}
+
+// TestWatermarkBadFont: a font CheckFont takes and FreeType refuses fails
+// the build with an error about the font.
+func TestWatermarkBadFont(t *testing.T) {
+	fr := blackFrame(t)
+	m := newTestWatermarker(t)
+	require.NoError(t, m.set(&picture.Watermark{Text: "a", Font: badFont(t)}))
+	_, err := m.apply(fr)
+	require.ErrorContains(t, err, "font")
+}
+
+func TestProbeFont(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	require.NoError(t, ProbeFont(monoFont(t)))
+	err := ProbeFont(badFont(t))
+	require.ErrorContains(t, err, "font")
+	require.Error(t, ProbeFont(nil))
+	require.Error(t, ProbeFont([]byte("not a font")))
+	assert.Empty(t, ostxDirs(t), "the probe removes its directory")
+}
+
+// TestPipelineWatermarkFont: a font in Config and in SetWatermark reaches
+// the picture.
+func TestPipelineWatermarkFont(t *testing.T) {
+	src := source(t, "h264_aac.ts")
+	plain := unmarked(t, src)
+	mono := monoFont(t)
+	p := newWMPipeline(t, Config{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Text: "a", Position: picture.BottomLeft, Font: mono},
+	})
+	outs, rest := pushVideoCount(t, p, src, 30)
+	requireFontFile(t, p.video.wm, mono, "configured")
+	require.NoError(t, p.SetWatermark(&picture.Watermark{Text: "a", Position: picture.BottomLeft}))
+	outs = append(outs, run(t, p, rest)...)
+	requireFontFile(t, p.video.wm, dejaVuSans, "set without a font")
+	imgs := decodeRung(t, outs, 0)
+	require.Len(t, imgs, len(plain))
+	for _, i := range []int{0, len(imgs) - 1} {
+		assert.Greater(t, band(imgs[i], plain[i], textBand), 2.0, "picture %d has no text", i)
+	}
+}
