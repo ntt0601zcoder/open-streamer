@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"runtime"
 	"slices"
@@ -1132,20 +1134,83 @@ func TestManagerChainSurvivesCancelledWaiter(t *testing.T) {
 	assert.NotContains(t, logs.String(), vKey)
 }
 
-// Concurrent edits of one stream with real listen inputs neither deadlock
-// nor let two of its supervisors hold its sockets at once: the UDP input
-// gets data, so it has a reader, which closes its socket 10 ms late. Not
-// parallel: the goroutine count is this test's.
+// The ledger of leases sees an overlap, and a reader's Close releases its
+// lease only after the delay.
+func TestLeases(t *testing.T) {
+	l := newLeases(t, 10*time.Millisecond)
+	udpURL, port := l.udp()
+	idleURL := l.idle("rtmp://lease/in/" + vKey + "?mode=listen")
+	stopSend := sendFixture(t, port)
+	defer stopSend()
+
+	r, err := l.Open(context.Background(), udpURL)
+	require.NoError(t, err)
+	f, err := r.Read()
+	require.NoError(t, err)
+	assert.NotEmpty(t, f.Data)
+	idle, err := l.Open(context.Background(), idleURL)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), l.Live())
+
+	_, err = l.Open(context.Background(), udpURL)
+	require.ErrorIs(t, err, errOverlap)
+	assert.EqualError(t, err, "lease: overlap")
+	_, err = l.Open(context.Background(), idleURL)
+	require.ErrorIs(t, err, errOverlap)
+	require.Len(t, l.Overlaps(), 2)
+	assert.Equal(t, udpURL+": open 3 while open 1 holds it", l.Overlaps()[0])
+	assert.NotContains(t, l.Overlaps()[1], vKey)
+
+	read := make(chan error, 1)
+	go func() {
+		_, err := idle.Read()
+		read <- err
+	}()
+	begin := time.Now()
+	require.NoError(t, r.Close())
+	require.NoError(t, idle.Close())
+	assert.GreaterOrEqual(t, time.Since(begin), 20*time.Millisecond, "each Close waits the delay")
+	assert.ErrorIs(t, <-read, io.EOF)
+	assert.Zero(t, l.Live())
+
+	// Released: the next holder opens, and reads.
+	r, err = l.Open(context.Background(), udpURL)
+	require.NoError(t, err)
+	_, err = r.Read()
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	assert.Len(t, l.Overlaps(), 2)
+	assert.Equal(t, int64(5), l.Opens())
+
+	// An Open waiting for its first PMT ends with its context, and lets go.
+	quiet, _ := l.udp()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = l.Open(ctx, quiet)
+	require.ErrorIs(t, err, errLeaseAborted)
+	assert.Zero(t, l.Live())
+}
+
+// Concurrent edits of one stream neither deadlock nor let two generations of
+// it hold an input at once: its inputs are leases of sockets the test holds,
+// so no bind happens and no foreign process can take a port, and the ledger
+// sees any overlap. The UDP input gets data, so it has a reader, which lets
+// go of its lease 10 ms late. Not parallel: the goroutine count is this
+// test's.
 func TestManagerConcurrentReplaces(t *testing.T) {
-	sp, port := listenSpec(t)
+	l := newLeases(t, 10*time.Millisecond)
+	udpURL, port := l.udp()
+	sp := camSpec()
+	sp.Inputs = []spec.Input{{URL: l.idle("rtmp://lease/in/" + vKey + "?mode=listen")}, {URL: udpURL}}
+	sp.Outputs = spec.Outputs{HTTPTS: true, RTSP: true}
+	require.NoError(t, sp.Validate())
 	var logs syncBuffer
 	logger, err := logging.New(&logs, "debug", "text")
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 	before := runtime.NumGoroutine()
 
-	open := &heldOpen{delay: 10 * time.Millisecond}
-	m := NewManager(served(Env{Open: open.Open, Logger: logger}))
+	m := NewManager(served(Env{Open: l.Open, Logger: logger}))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stopSend := sendFixture(t, port)
@@ -1158,11 +1223,13 @@ func TestManagerConcurrentReplaces(t *testing.T) {
 	_, err = m.Replace(ctx, []spec.Stream{sp}, nil)
 	require.NoError(t, err)
 	stopSample := sampleStatus(m, "cam")
-	// held waits until the stream has a reader, which lets go of its socket
-	// late: the next edit meets a slow teardown.
+	// held waits until the stream has a reader of the UDP input, which lets
+	// go of its lease late: the next edit meets a slow teardown. The idle
+	// input holds one lease from the start; the UDP input's reader is the
+	// second.
 	held := func() {
 		for end := time.Now().Add(waitFor); time.Now().Before(end); time.Sleep(time.Millisecond) {
-			if open.live.Load() > 0 {
+			if l.Live() > 1 {
 				return
 			}
 		}
@@ -1229,7 +1296,7 @@ func TestManagerConcurrentReplaces(t *testing.T) {
 		"last error %q", sup.Status().LastError)
 	samples := scrapeManager(t, m)
 	assert.True(t, metricFound(samples, "openstreamer_stream_up", 1, "stream", "cam"))
-	assert.Greater(t, open.opens.Load(), int64(2))
+	assert.Greater(t, l.Opens(), int64(2))
 
 	for _, e := range stopSample() {
 		assertNoSocketErrors(t, "a status", e)
@@ -1243,6 +1310,7 @@ func TestManagerConcurrentReplaces(t *testing.T) {
 	stopSend()
 	assertNoSocketErrors(t, "the log", logs.String())
 	assert.NotContains(t, logs.String(), vKey)
+	assert.Empty(t, l.Overlaps(), "two generations of cam never hold an input at once")
 
 	deadline := time.Now().Add(2 * time.Second)
 	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
@@ -1252,6 +1320,127 @@ func TestManagerConcurrentReplaces(t *testing.T) {
 		buf := make([]byte, 1<<20)
 		t.Errorf("goroutines: %d before, %d after\n%s", before, after, buf[:runtime.Stack(buf, true)])
 	}
+}
+
+// inUse is what a status says when an input could not bind its port.
+const inUse = "address already in use"
+
+// A rebuild binds its inputs' real ports again: ten sequential rebuilds of a
+// stream with an RTMP and a UDP listen input never meet their own previous
+// generation on a port. A failed bind does not fail the build (the pipeline
+// reports the input and retries it), so its sign is the status text. When it
+// shows, the stream is deleted and waited for, so that nothing of ours holds
+// the port, and the test binds it: still taken, the holder is foreign and the
+// test starts over on new ports; free, our own previous generation held it
+// when the next one bound, which is an overlap.
+func TestManagerRebindsAfterRebuild(t *testing.T) {
+	var logs syncBuffer
+	logger, err := logging.New(&logs, "debug", "text")
+	require.NoError(t, err)
+	open := &heldOpen{delay: 10 * time.Millisecond}
+	r := &mrig{t: t}
+	r.m = NewManager(served(Env{Open: open.Open, Logger: logger}))
+	r.run()
+
+	// taken binds the ports of sp that lastErr names (both when it names
+	// neither) and reports whether one of them is still taken.
+	taken := func(sp spec.Stream, lastErr string) bool {
+		networks := []string{"tcp", "udp"} // the RTMP input, then the UDP one
+		var hosts [2]string
+		var named [2]bool
+		for i := range networks {
+			u, err := url.Parse(sp.Inputs[i].URL)
+			require.NoError(t, err)
+			hosts[i], named[i] = u.Host, strings.Contains(lastErr, ":"+u.Port())
+		}
+		busy := false
+		for i, network := range networks {
+			if named[i] || named == [2]bool{} {
+				busy = bound(t, network, hosts[i]) || busy
+			}
+		}
+		return busy
+	}
+
+	// rebuilds runs the ten edits on sp; it returns the status text of a
+	// failed bind, "" when there was none.
+	rebuilds := func(sp spec.Stream) string {
+		assert.Equal(t, outcomes("cam", "created"), r.replace(sp))
+		r.waitRunning("cam")
+		for i := range 10 {
+			if i%2 == 0 {
+				sp.Layout = []string{"audio", "video"}
+			} else {
+				sp.Layout = nil
+			}
+			gen := r.status("cam").Generation
+			edit := time.Now()
+			assert.Equal(t, outcomes("cam", "rebuild"), r.replace(sp), "edit %d", i)
+			for {
+				st := r.status("cam")
+				if strings.Contains(st.LastError, inUse) {
+					return st.LastError
+				}
+				if st.State == "running" && st.Generation > gen && time.Since(edit) >= 200*time.Millisecond {
+					break
+				}
+				require.Less(t, time.Since(edit), waitFor, "edit %d: state %q, generation %d (last error %q)",
+					i, st.State, st.Generation, st.LastError)
+				time.Sleep(time.Millisecond)
+			}
+		}
+		return ""
+	}
+
+	const restarts = 3
+	for attempt := 0; ; attempt++ {
+		sp, port := listenSpec(t)
+		stopSend := sendFixture(t, port)
+		lastErr := rebuilds(sp)
+		st := r.status("cam")
+		sup := r.sup("cam")
+		assert.Equal(t, outcomes("cam", "deleted"), r.replace())
+		select {
+		case <-sup.Done():
+		case <-time.After(waitFor):
+			require.FailNow(t, "the supervisor did not stop")
+		}
+		stopSend()
+		// Done means every reader has let go: one still open is ours, and
+		// whatever holds the port then proves nothing about a foreigner.
+		require.Zero(t, open.live.Load(), "an input reader outlived its supervisor (last error %q)", lastErr)
+		if lastErr == "" {
+			break
+		}
+		if !taken(sp, lastErr) {
+			require.FailNow(t, "overlap: the port was free once our stream had stopped, so its previous generation held it when the next one bound",
+				"status %+v\nlog:\n%s", st, logs.String())
+		}
+		require.Less(t, attempt, restarts, "a foreign process took our ports %d times: %s", attempt+1, lastErr)
+		t.Logf("attempt %d: a foreign process holds a port (%s): starting over on new ports", attempt+1, lastErr)
+	}
+	assert.NotContains(t, logs.String(), vKey)
+}
+
+// bound binds addr on network ("tcp" or "udp") and reports whether it is
+// taken; a bind that succeeds is closed at once.
+func bound(t testing.TB, network, addr string) bool {
+	t.Helper()
+	var lc net.ListenConfig
+	if network == "udp" {
+		pc, err := lc.ListenPacket(context.Background(), network, addr)
+		if err != nil {
+			return true
+		}
+		require.NoError(t, pc.Close())
+		return false
+	}
+	ln, err := lc.Listen(context.Background(), network, addr)
+	if err != nil {
+		return true
+	}
+	require.NoError(t, ln.Close())
+	return false
 }
 
 // A lookup, a status request and a scrape do not wait for an edit that is

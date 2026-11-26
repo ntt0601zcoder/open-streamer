@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -436,3 +440,208 @@ func currentGen(s *Supervisor) *generation {
 	defer s.mu.Unlock()
 	return s.cur
 }
+
+// leaseRead bounds a lease's read of its held socket, so that a reader
+// notices its release within it.
+const leaseRead = 50 * time.Millisecond
+
+// errOverlap is what leases.Open returns for a URL that is still held.
+var errOverlap = errors.New("lease: overlap")
+
+// errLeaseAborted is what a lease's read returns once the context of the
+// Open that is waiting for its first PMT has ended.
+var errLeaseAborted = errors.New("lease: open aborted")
+
+// leases hands out exclusive use of sockets the test binds once and holds
+// until it ends. An Open for a URL whose previous reader has not returned
+// from Close is an overlap: two generations of one stream held one input
+// at the same time.
+type leases struct {
+	t     testing.TB
+	delay time.Duration
+	opens atomic.Int64
+	live  atomic.Int64
+
+	mu       sync.Mutex
+	held     map[string]*lease // by URL
+	overlaps []string
+}
+
+// lease is one leased URL: its held socket (nil for an idle URL) and the
+// open number of its live holder (0: free). holder is guarded by leases.mu.
+type lease struct {
+	pc     net.PacketConn
+	holder int64
+}
+
+// newLeases returns an empty set of leases whose sockets are closed when the
+// test ends. delay is how long a reader's Close waits before it releases its
+// lease: a slow teardown.
+func newLeases(t testing.TB, delay time.Duration) *leases {
+	t.Helper()
+	l := &leases{t: t, delay: delay, held: map[string]*lease{}}
+	t.Cleanup(func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		for _, ls := range l.held {
+			if ls.pc != nil {
+				_ = ls.pc.Close()
+			}
+		}
+	})
+	return l
+}
+
+// udp binds 127.0.0.1:0 once, holds it for the test and returns its URL
+// "udp://127.0.0.1:<port>" and the port.
+func (l *leases) udp() (url string, port int) {
+	l.t.Helper()
+	pc, err := new(net.ListenConfig).ListenPacket(context.Background(), "udp", "127.0.0.1:0")
+	require.NoError(l.t, err)
+	port = pc.LocalAddr().(*net.UDPAddr).Port
+	url = "udp://127.0.0.1:" + strconv.Itoa(port)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.held[url] = &lease{pc: pc}
+	return url, port
+}
+
+// idle returns url, leased: its reader delivers nothing until it is closed
+// (the RTMP listen input's stand-in).
+func (l *leases) idle(url string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.held[url] = &lease{}
+	return url
+}
+
+// Open is an Env.Open. For a leased URL it returns ingest.NewTSReader over a
+// reader of the held socket's datagrams (an idle reader for an idle URL);
+// its Close waits delay, then releases the lease, and never closes the held
+// socket. An Open of a URL that is still held records the overlap and fails
+// with errOverlap.
+func (l *leases) Open(ctx context.Context, url string) (ingest.Reader, error) {
+	n := l.opens.Add(1)
+	l.mu.Lock()
+	ls := l.held[url]
+	switch {
+	case ls == nil:
+		l.mu.Unlock()
+		return nil, fmt.Errorf("lease: no lease for %s", ingest.Redact(url))
+	case ls.holder != 0:
+		l.overlaps = append(l.overlaps, fmt.Sprintf("%s: open %d while open %d holds it", ingest.Redact(url), n, ls.holder))
+		l.mu.Unlock()
+		return nil, errOverlap
+	}
+	ls.holder = n
+	l.mu.Unlock()
+	l.live.Add(1)
+	c := &leaseConn{l: l, ls: ls, released: make(chan struct{}), aborted: make(chan struct{})}
+	if ls.pc == nil {
+		return &idleReader{c: c}, nil
+	}
+	// NewTSReader blocks until the first PMT: the end of ctx aborts it, and
+	// it then closes c, which releases the lease.
+	stop := context.AfterFunc(ctx, c.abort)
+	r, err := ingest.NewTSReader(c, nil)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("lease: open: %w", err)
+	}
+	return r, nil
+}
+
+// Overlaps returns one line per overlap seen: the URL, redacted, and both
+// holders' open numbers.
+func (l *leases) Overlaps() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.overlaps)
+}
+
+// Opens counts the Open calls so far.
+func (l *leases) Opens() int64 { return l.opens.Load() }
+
+// Live counts the readers that hold their lease.
+func (l *leases) Live() int64 { return l.live.Load() }
+
+// leaseConn is one holder of a lease: an io.ReadCloser of the held socket's
+// datagrams.
+type leaseConn struct {
+	l        *leases
+	ls       *lease
+	released chan struct{} // closed when Close has released the lease
+	aborted  chan struct{} // closed when the Open's ctx ended
+	abortOne sync.Once
+	closeOne sync.Once
+
+	buf      []byte // Read only: the datagram being served
+	off, end int
+}
+
+func (c *leaseConn) abort() { c.abortOne.Do(func() { close(c.aborted) }) }
+
+// Read serves the held socket's datagrams. A read of a released lease
+// returns io.EOF at once; a datagram read after the release is dropped.
+func (c *leaseConn) Read(p []byte) (int, error) {
+	for c.off == c.end {
+		select {
+		case <-c.released:
+			return 0, io.EOF
+		case <-c.aborted:
+			return 0, errLeaseAborted
+		default:
+		}
+		if c.buf == nil {
+			c.buf = make([]byte, 64<<10)
+		}
+		if err := c.ls.pc.SetReadDeadline(time.Now().Add(leaseRead)); err != nil {
+			return 0, err //nolint:wrapcheck // io.Reader contract
+		}
+		n, _, err := c.ls.pc.ReadFrom(c.buf)
+		var ne net.Error
+		switch {
+		case n > 0:
+			c.off, c.end = 0, n
+		case errors.As(err, &ne) && ne.Timeout():
+		case err != nil:
+			return 0, err //nolint:wrapcheck // io.Reader contract
+		}
+	}
+	select {
+	case <-c.released:
+		return 0, io.EOF
+	default:
+	}
+	n := copy(p, c.buf[c.off:c.end])
+	c.off += n
+	return n, nil
+}
+
+// Close waits the leases' delay, then releases the lease; a concurrent
+// Close returns when it is released. The held socket stays open.
+func (c *leaseConn) Close() error {
+	c.closeOne.Do(func() {
+		time.Sleep(c.l.delay)
+		c.l.mu.Lock()
+		c.ls.holder = 0
+		c.l.mu.Unlock()
+		c.l.live.Add(-1)
+		close(c.released)
+	})
+	return nil
+}
+
+// idleReader is the reader of an idle lease: it delivers nothing until it
+// is closed.
+type idleReader struct{ c *leaseConn }
+
+func (r *idleReader) Read() (ingest.Frame, error) {
+	<-r.c.released
+	return ingest.Frame{}, io.EOF
+}
+
+func (r *idleReader) Kinds() []media.Kind      { return nil }
+func (r *idleReader) Spec() ingest.Spec        { return ingest.Spec{Passive: true, Live: true} }
+func (r *idleReader) Stats() map[string]uint64 { return nil }
+func (r *idleReader) Close() error             { return r.c.Close() }
