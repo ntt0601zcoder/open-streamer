@@ -212,3 +212,32 @@ func TestParseDurationOverflow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 9223372036*time.Second, d)
 }
+
+func TestMPDAdaptationSetLang(t *testing.T) {
+	audio := func(lang string) MPD {
+		return MPD{Periods: []Period{{AdaptationSets: []AdaptationSet{{
+			ContentType: "audio", MimeType: "audio/mp4", Lang: lang,
+			Representations: []Representation{{ID: "a1", Codecs: "mp4a.40.2"}},
+		}}}}}
+	}
+
+	b := audio("vi").Encode()
+	assert.Contains(t, string(b), `<AdaptationSet contentType="audio" mimeType="audio/mp4" lang="vi">`)
+	got, err := Parse(b)
+	require.NoError(t, err)
+	assert.Equal(t, "vi", got.Periods[0].AdaptationSets[0].Lang)
+
+	b = audio("").Encode()
+	assert.NotContains(t, string(b), "lang=")
+	assert.Contains(t, string(b), `<AdaptationSet contentType="audio" mimeType="audio/mp4">`)
+	assert.NotContains(t, string(b), `<Representation id="a1" mimeType`, "the packager never writes a representation mimeType")
+
+	// Another packager puts the mimeType on the representation.
+	m, err := Parse([]byte(`<MPD><Period><AdaptationSet lang="en-US">` +
+		`<Representation id="a" mimeType="audio/mp4" codecs="mp4a.40.2"/></AdaptationSet></Period></MPD>`))
+	require.NoError(t, err)
+	as := m.Periods[0].AdaptationSets[0]
+	assert.Equal(t, "en-US", as.Lang)
+	assert.Equal(t, "", as.MimeType)
+	assert.Equal(t, "audio/mp4", as.Representations[0].MimeType)
+}

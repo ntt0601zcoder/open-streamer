@@ -9,7 +9,9 @@ import (
 // Rendition is an EXT-X-MEDIA entry.
 type Rendition struct {
 	Type, GroupID, Name, URI string
-	Default                  bool
+	// Language is the LANGUAGE attribute, written after NAME when not empty.
+	Language string
+	Default  bool
 }
 
 // Variant is an EXT-X-STREAM-INF entry.
@@ -37,6 +39,9 @@ func (p MultivariantPlaylist) Encode() []byte {
 	}
 	for _, r := range p.Renditions {
 		fmt.Fprintf(&b, "#EXT-X-MEDIA:TYPE=%s,GROUP-ID=\"%s\",NAME=\"%s\"", r.Type, r.GroupID, r.Name)
+		if r.Language != "" {
+			fmt.Fprintf(&b, ",LANGUAGE=\"%s\"", r.Language)
+		}
 		if r.Default {
 			b.WriteString(",DEFAULT=YES,AUTOSELECT=YES")
 		}
@@ -123,7 +128,10 @@ func parseRendition(val string) (Rendition, error) {
 	if a["TYPE"] == "" {
 		return Rendition{}, fmt.Errorf("hls: EXT-X-MEDIA: missing TYPE")
 	}
-	return Rendition{Type: a["TYPE"], GroupID: a["GROUP-ID"], Name: a["NAME"], URI: a["URI"], Default: a["DEFAULT"] == "YES"}, nil
+	return Rendition{
+		Type: a["TYPE"], GroupID: a["GROUP-ID"], Name: a["NAME"], URI: a["URI"],
+		Language: a["LANGUAGE"], Default: a["DEFAULT"] == "YES",
+	}, nil
 }
 
 func parseVariant(val string) (Variant, error) {

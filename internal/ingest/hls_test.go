@@ -903,3 +903,73 @@ func TestHLSPullInjectedClock(t *testing.T) {
 	defer mu.Unlock()
 	assert.Less(t, reloads, 15, "reloads paced, not spinning")
 }
+
+// A master whose audio entry has no URI (R-L4's form, as our packager writes
+// it for audio-only CMAF and the TS ABR master) carries the audio in the
+// variant: the pull plays the variant alone and never asks for a rendition
+// playlist.
+func TestHLSPullAudioInVariant(t *testing.T) {
+	segs := tsSegments(t)
+	master := "#EXTM3U\n#EXT-X-VERSION:3\n" +
+		"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"audio\",LANGUAGE=\"vi\",DEFAULT=YES,AUTOSELECT=YES\n" +
+		"#EXT-X-STREAM-INF:BANDWIDTH=500000,CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"aud\"\nlow/index.m3u8\n" +
+		"#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"aud\"\nhigh/index.m3u8\n"
+	var (
+		mu        sync.Mutex
+		playlists []string
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/master.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		playlists = append(playlists, r.URL.Path)
+		mu.Unlock()
+		_, _ = io.WriteString(w, master)
+	})
+	for _, name := range []string{"low", "high"} {
+		mux.HandleFunc("/"+name+"/index.m3u8", func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			playlists = append(playlists, r.URL.Path)
+			mu.Unlock()
+			_, _ = w.Write(vodPlaylist(2, []string{"0.ts", "1.ts"}))
+		})
+		mux.HandleFunc("/"+name+"/{n}", func(w http.ResponseWriter, r *http.Request) {
+			var n int
+			if _, err := fmt.Sscanf(r.PathValue("n"), "%d.ts", &n); err != nil || n >= 2 {
+				t.Errorf("unexpected request %s", r.URL)
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(segs[n])
+		})
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s", r.URL)
+		http.NotFound(w, r)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	for _, tc := range []struct{ query, want string }{
+		{"", "/high/index.m3u8"},
+		{"?variant=0", "/low/index.m3u8"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			mu.Lock()
+			playlists = nil
+			mu.Unlock()
+			r, err := ingest.Open(context.Background(), srv.URL+"/master.m3u8"+tc.query, ingest.Env{})
+			require.NoError(t, err)
+			assert.Equal(t, []media.Kind{media.KindVideo, media.KindAudio}, r.Kinds())
+			res := pullAll(r)
+			require.ErrorIs(t, res.err, io.EOF)
+			require.NoError(t, r.Close())
+			counts := trackCounts(res.frames)
+			assert.Equal(t, fixtureTrackCounts(t, bytes.Join(segs[:2], nil)), counts)
+			assert.Positive(t, counts[0], "video frames")
+			assert.Positive(t, counts[1], "audio frames")
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Equal(t, []string{"/master.m3u8", tc.want}, playlists, "the chosen variant's playlist only")
+		})
+	}
+}

@@ -108,6 +108,55 @@ func TestMultivariantEncodeGolden(t *testing.T) {
 	assert.Equal(t, want, string(p.Encode()))
 }
 
+// languageRendition is R-L4's audio entry for audio inside the variant.
+var languageRendition = Rendition{Type: "AUDIO", GroupID: "aud", Name: "audio", Language: "vi", Default: true}
+
+func TestEncodeRenditionLanguage(t *testing.T) {
+	encode := func(r Rendition) string {
+		return string(MultivariantPlaylist{Version: 7, Renditions: []Rendition{r}}.Encode())
+	}
+	head := "#EXTM3U\n#EXT-X-VERSION:7\n"
+
+	assert.Equal(t, head+"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"audio\",LANGUAGE=\"vi\",DEFAULT=YES,AUTOSELECT=YES\n",
+		encode(languageRendition))
+
+	withURI := languageRendition
+	withURI.URI = "a1.m3u8"
+	assert.Equal(t, head+"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"audio\",LANGUAGE=\"vi\",DEFAULT=YES,AUTOSELECT=YES,URI=\"a1.m3u8\"\n",
+		encode(withURI))
+
+	noLang := withURI
+	noLang.Language = ""
+	assert.Equal(t, head+"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"audio\",DEFAULT=YES,AUTOSELECT=YES,URI=\"a1.m3u8\"\n",
+		encode(noLang))
+	assert.NotContains(t, encode(noLang), "LANGUAGE")
+}
+
+func TestParseRenditionLanguage(t *testing.T) {
+	withURI := languageRendition
+	withURI.URI = "a1.m3u8"
+	for _, r := range []Rendition{languageRendition, withURI} {
+		in := MultivariantPlaylist{
+			Version:    7,
+			Renditions: []Rendition{r},
+			Variants:   []Variant{{URI: "v1.m3u8", Codecs: "avc1.64001f,mp4a.40.2", Audio: "aud", Bandwidth: 2000000}},
+		}
+		out, err := ParseMultivariant(in.Encode())
+		require.NoError(t, err)
+		assert.Equal(t, in, out)
+	}
+
+	// Another packager's master: LANGUAGE before NAME, extra attributes,
+	// and no URI.
+	src := "#EXTM3U\n#EXT-X-VERSION:6\n" +
+		"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"stereo\",LANGUAGE=\"en-US\",NAME=\"English\",AUTOSELECT=YES,DEFAULT=YES,CHANNELS=\"2\"\n" +
+		"#EXT-X-STREAM-INF:BANDWIDTH=800000,CODECS=\"avc1.4d401e,mp4a.40.2\",AUDIO=\"stereo\"\nlow.m3u8\n"
+	p, err := ParseMultivariant([]byte(src))
+	require.NoError(t, err)
+	require.Len(t, p.Renditions, 1)
+	assert.Equal(t, Rendition{Type: "AUDIO", GroupID: "stereo", Name: "English", Language: "en-US", Default: true}, p.Renditions[0])
+}
+
 func TestMultivariantRoundTrip(t *testing.T) {
 	in := MultivariantPlaylist{
 		Version: 7, Independent: true,

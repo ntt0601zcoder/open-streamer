@@ -76,14 +76,17 @@ type Period struct {
 type AdaptationSet struct {
 	ContentType      string           `xml:"contentType,attr,omitempty"`
 	MimeType         string           `xml:"mimeType,attr,omitempty"`
+	Lang             string           `xml:"lang,attr,omitempty"`
 	SegmentAlignment bool             `xml:"segmentAlignment,attr,omitempty"`
 	SegmentTemplate  *SegmentTemplate `xml:"SegmentTemplate,omitempty"`
 	Representations  []Representation `xml:"Representation"`
 }
 
-// Representation is one encoding of an adaptation set.
+// Representation is one encoding of an adaptation set. MimeType is read
+// from other packagers' MPDs; the packager writes it on the adaptation set.
 type Representation struct {
 	ID                        string                     `xml:"id,attr"`
+	MimeType                  string                     `xml:"mimeType,attr,omitempty"`
 	Codecs                    string                     `xml:"codecs,attr,omitempty"`
 	Bandwidth                 int                        `xml:"bandwidth,attr,omitempty"`
 	Width                     int                        `xml:"width,attr,omitempty"`
