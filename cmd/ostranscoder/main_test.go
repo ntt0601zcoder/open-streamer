@@ -596,8 +596,18 @@ func TestMainOverFD3(t *testing.T) {
 // stdout and stderr.
 func runMain(t *testing.T, args string) (code int, stdout, stderr string) {
 	t.Helper()
+	return runMainEnv(t, args, "")
+}
+
+// runMainEnv is runMain with env, when not empty, added to the child's
+// environment.
+func runMainEnv(t *testing.T, args, env string) (code int, stdout, stderr string) {
+	t.Helper()
 	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^$") //nolint:gosec // the test binary itself
 	cmd.Env = append(os.Environ(), envChild+"=1", envArgs+"="+args)
+	if env != "" {
+		cmd.Env = append(cmd.Env, env)
+	}
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -834,8 +844,11 @@ func zeroTablesFont(t *testing.T) []byte {
 }
 
 // TestProbeFontFlag: -probe font FILE prints "font: ok" and exits 0 for a
-// font FreeType draws with, and otherwise one line "font: <reason>" without
-// the file's path, exiting 3; without a file it is bad usage.
+// font FreeType draws with; a verdict on the font is one line
+// "font: <reason>" without the file's path, exiting 3; a failure of the
+// probe itself (the file cannot be opened or read, the temp dir cannot be
+// used) prints nothing to stdout and exits 1, since it says nothing about
+// the font; without a file it is bad usage.
 func TestProbeFontFlag(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name string, b []byte) string {
@@ -849,23 +862,33 @@ func TestProbeFontFlag(t *testing.T) {
 	copy(big, mono)
 	link := dir + "/link.ttf"
 	require.NoError(t, os.Symlink(write("target.ttf", mono), link))
+	monoPath := write("mono.ttf", mono)
+	noTmp := dir + "/no-such-tmp"
 	for _, tc := range []struct {
 		name, path string
+		env        string // added to the child's environment
 		code       int
-		prefix     string // what stdout starts with, when pinned
+		prefix     string // what stdout starts with, for exit 0 and 3
+		stderr     string // what stderr holds, for exit 1
 	}{
-		{"font", write("mono.ttf", mono), 0, "font: ok\n"},
-		{"text file", write("notes.txt", []byte("hello\n")), exitProbeFailed, "font: 6 bytes, shorter than"},
-		{"missing", dir + "/missing.ttf", exitProbeFailed, "font: cannot open the file: no such file"},
-		{"directory", dir, exitProbeFailed, "font: cannot open the file: not a regular file\n"},
-		{"symbolic link", link, exitProbeFailed, "font: cannot open the file: it is a symbolic link\n"},
-		{"freetype refuses", write("zeros.ttf", zeroTablesFont(t)), exitProbeFailed, "font: drawtext cannot load it\n"},
-		{"too big", write("big.ttf", big), exitProbeFailed, "font: 25165825 bytes, over 25165824\n"},
+		{"font", monoPath, "", 0, "font: ok\n", ""},
+		{"text file", write("notes.txt", []byte("hello\n")), "", exitProbeFailed, "font: 6 bytes, shorter than", ""},
+		{"freetype refuses", write("zeros.ttf", zeroTablesFont(t)), "", exitProbeFailed, "font: drawtext cannot load it\n", ""},
+		{"too big", write("big.ttf", big), "", exitProbeFailed, "font: 25165825 bytes, over 25165824\n", ""},
+		{"missing", dir + "/missing.ttf", "", 1, "", "cannot open the file: no such file"},
+		{"directory", dir, "", 1, "", "cannot open the file: not a regular file"},
+		{"symbolic link", link, "", 1, "", "cannot open the file: it is a symbolic link"},
+		{"unusable TMPDIR", monoPath, "TMPDIR=" + noTmp, 1, "", "temp dir"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			code, stdout, stderr := runMain(t, "-probe font "+tc.path)
-			t.Logf("exit %d, stdout %q", code, stdout)
+			code, stdout, stderr := runMainEnv(t, "-probe font "+tc.path, tc.env)
+			t.Logf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
 			require.Equal(t, tc.code, code, "stdout %q, stderr %q", stdout, stderr)
+			if tc.code == 1 {
+				assert.Empty(t, stdout, "a failure of the probe printed a verdict")
+				assert.Contains(t, stderr, tc.stderr)
+				return
+			}
 			require.True(t, strings.HasPrefix(stdout, "font: "), "stdout %q", stdout)
 			assert.Equal(t, 1, strings.Count(stdout, "\n"), "stdout %q", stdout)
 			assert.True(t, strings.HasSuffix(stdout, "\n"), "stdout %q", stdout)

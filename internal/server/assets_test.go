@@ -426,9 +426,17 @@ func TestFontProbe(t *testing.T) {
 		setMode("stub")
 		probeFails("stub", "exit status 2")
 	})
-	t.Run("exit 1", func(t *testing.T) {
+	t.Run("exit 1 with a path on stderr", func(t *testing.T) {
 		setMode("exit1")
+		_, err := s.put("brand.ttf", font)
+		require.ErrorIs(t, err, asset.ErrProbe)
+		assert.NotContains(t, err.Error(), "/tmp/secret", "stderr reached the error")
 		probeFails("exit1", "exit status 1")
+		r := s.do(http.MethodPut, "/api/v1/assets/brand.ttf", "ops", string(font), "Content-Type", "application/octet-stream")
+		assert.Equal(t, http.StatusServiceUnavailable, r.code, r.body)
+		assert.NotContains(t, r.body, "/tmp/secret", "stderr reached the client")
+		assert.NotContains(t, r.body, dir, "the assets dir reached the client")
+		assert.NotContains(t, s.logs.String(), "/tmp/secret", "stderr reached the log")
 	})
 	t.Run("past the limit", func(t *testing.T) {
 		pidFile := filepath.Join(t.TempDir(), "pid")

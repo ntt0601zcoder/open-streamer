@@ -546,18 +546,36 @@ const (
 	probeSizePct = 20
 )
 
+// FontRefusedError is a ProbeFont error that is a verdict on the font:
+// the watermark's checks refused it (CheckFont among them), or drawtext
+// could not load it. Every other ProbeFont error (the temp directory,
+// writing the font, a picture's alloc or fill) is the probe's own failure
+// and says nothing about the font. Its text holds no path.
+type FontRefusedError struct{ Reason error }
+
+func (e *FontRefusedError) Error() string { return "transcode: probe font: " + e.Reason.Error() }
+
+func (e *FontRefusedError) Unwrap() error { return e.Reason }
+
 // ProbeFont draws text with the font on a 256×144 picture and reports why
 // that fails: the watermark's checks (CheckFont among them), then FreeType
-// through drawtext, exactly as a text watermark would load it. Its private
-// directory is removed before it returns. The error holds no path but the
-// child's temp directory's, in an I/O failure.
+// through drawtext, exactly as a text watermark would load it. Those
+// failures are a *FontRefusedError; any other error is an I/O or libav
+// failure of the probe itself, which can hold the child's temp
+// directory's path. Its private directory is removed before it returns.
 func ProbeFont(font []byte) error {
 	if len(font) == 0 {
-		return errors.New("transcode: probe font: empty")
+		return &FontRefusedError{errors.New("empty")}
+	}
+	w := &picture.Watermark{Text: probeText, SizePct: probeSizePct, Font: font}
+	if err := w.Validate(); err != nil {
+		return &FontRefusedError{err}
 	}
 	m := newWatermarker(nil)
 	defer m.close()
-	if err := m.set(&picture.Watermark{Text: probeText, SizePct: probeSizePct, Font: font}); err != nil {
+	// w passed Validate, so set fails only on the temp directory or the
+	// font's write.
+	if err := m.set(w); err != nil {
 		return fmt.Errorf("transcode: probe font: %w", err)
 	}
 	fr := astiav.AllocFrame()
@@ -577,7 +595,7 @@ func ProbeFont(font []byte) error {
 			// The text is the probe's own, so the font is the likely cause.
 			// libav's error is left out: when FreeType refuses the font it
 			// is fontconfig's ENOENT, which reads as a missing file.
-			return errors.New("transcode: probe font: drawtext cannot load it")
+			return &FontRefusedError{errors.New("drawtext cannot load it")}
 		}
 		return fmt.Errorf("transcode: probe font: %w", err)
 	}

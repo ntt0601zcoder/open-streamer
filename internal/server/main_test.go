@@ -78,6 +78,8 @@ func fakeProbe(mode string) {
 		fmt.Fprintln(os.Stderr, "ostranscoder: built without libav (the libav build tag); cannot transcode")
 		os.Exit(2)
 	case mode == "exit1":
+		// As the real probe does when its own temp dir cannot be used.
+		fmt.Fprintln(os.Stderr, "ostranscoder: transcode: probe font: watermark: temp dir: stat /tmp/secret/tmpdir: no such file or directory")
 		os.Exit(1)
 	case strings.HasPrefix(mode, "sleep:"):
 		_ = os.WriteFile(strings.TrimPrefix(mode, "sleep:"), []byte(strconv.Itoa(os.Getpid())), 0o600)

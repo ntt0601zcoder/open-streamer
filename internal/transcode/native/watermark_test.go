@@ -1020,9 +1020,17 @@ func TestProbeFont(t *testing.T) {
 	require.NoError(t, ProbeFont(monoFont(t)))
 	err := ProbeFont(badFont(t))
 	require.EqualError(t, err, "transcode: probe font: drawtext cannot load it")
-	require.Error(t, ProbeFont(nil))
-	require.Error(t, ProbeFont([]byte("not a font")))
+	refused := new(*FontRefusedError)
+	assert.ErrorAs(t, err, refused, "drawtext's refusal is a verdict")
+	assert.ErrorAs(t, ProbeFont(nil), refused, "an empty font is a verdict")
+	assert.ErrorAs(t, ProbeFont([]byte("not a font")), refused, "CheckFont's refusal is a verdict")
 	assert.Empty(t, ostxDirs(t), "the probe removes its directory")
+
+	// A temp dir that cannot be used is the probe's failure, not a verdict.
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "gone"))
+	err = ProbeFont(monoFont(t))
+	require.ErrorContains(t, err, "temp dir")
+	assert.NotErrorAs(t, err, refused, "an I/O failure read as a verdict")
 }
 
 // TestPipelineWatermarkFont: a font in Config and in SetWatermark reaches

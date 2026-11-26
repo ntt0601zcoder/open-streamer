@@ -41,9 +41,9 @@ const errorRung = -1
 const exitProbeFailed = 3
 
 // main prints the version with -version, probes NVENC with -probe nvenc or
-// a font file with -probe font FILE (exit 0 or 3), and otherwise serves the
-// wire protocol on fd 3: exit 0 after Stop or EOF from the host, 1 on an
-// error, 2 on bad usage.
+// a font file with -probe font FILE (exit 0, 3, or 1 when the probe itself
+// fails), and otherwise serves the wire protocol on fd 3: exit 0 after Stop
+// or EOF from the host, 1 on an error, 2 on bad usage.
 func main() {
 	// libav's default log callback writes to stderr.
 	astiav.SetLogLevel(astiav.LogLevelWarning)
@@ -54,7 +54,7 @@ func main() {
 	case len(os.Args) == 3 && os.Args[1] == "-probe" && os.Args[2] == "nvenc":
 		os.Exit(probeNVENC(os.Stdout))
 	case len(os.Args) == 4 && os.Args[1] == "-probe" && os.Args[2] == "font":
-		os.Exit(probeFont(os.Stdout, os.Args[3]))
+		os.Exit(probeFont(os.Stdout, os.Stderr, os.Args[3]))
 	case len(os.Args) != 1:
 		fmt.Fprintln(os.Stderr, "usage: ostranscoder [-version | -probe nvenc | -probe font FILE]")
 		os.Exit(2)
@@ -83,40 +83,59 @@ func probeNVENC(w io.Writer) int {
 
 // probeFont reads at most picture.MaxFontBytes+1 bytes of the file at path
 // (a regular file, not a link), checks them with picture.CheckFont, then
-// draws with them (native.ProbeFont), prints "font: ok" or one line
-// "font: <reason>" to w, and returns the exit status: 0, or
-// exitProbeFailed. The reason never holds path: the host shows it, and
-// the path is the host's business.
-func probeFont(w io.Writer, path string) int {
-	err := checkFontFile(path)
+// draws with them (native.ProbeFont), and returns the exit status. Only a
+// verdict on the font prints a line to w and exits exitProbeFailed:
+// CheckFont's refusal or ProbeFont's *native.FontRefusedError, as
+// "font: <reason>". A font that draws prints "font: ok" and exits 0.
+// Every other failure (opening or reading the file, which is the host's
+// own temp file; the probe's temp directory, writing the font, a
+// picture's alloc or fill) says nothing about the font: its text goes to
+// errw, nothing to w, and the exit status is 1. No reason printed to w
+// holds a path: the host shows it.
+func probeFont(w, errw io.Writer, path string) int {
+	b, err := readFontFile(path)
+	if err != nil {
+		_, _ = fmt.Fprintf(errw, "ostranscoder: probe font: %v\n", err)
+		return 1
+	}
+	if err := picture.CheckFont(b); err != nil {
+		return refuseFont(w, err)
+	}
+	err = native.ProbeFont(b)
 	if err == nil {
 		_, _ = fmt.Fprintln(w, "font: ok")
 		return 0
 	}
+	if refused, ok := errors.AsType[*native.FontRefusedError](err); ok {
+		return refuseFont(w, refused.Reason)
+	}
+	_, _ = fmt.Fprintf(errw, "ostranscoder: %v\n", err)
+	return 1
+}
+
+// refuseFont prints the verdict "font: <reason>" on one line to w and
+// returns exitProbeFailed.
+func refuseFont(w io.Writer, err error) int {
 	reason := strings.Join(strings.Fields(err.Error()), " ")
-	reason = strings.TrimPrefix(reason, "transcode: probe font: ")
 	reason = strings.TrimPrefix(reason, "font: ")
 	_, _ = fmt.Fprintf(w, "font: %s\n", reason)
 	return exitProbeFailed
 }
 
-// checkFontFile reports why the file at path is not a font the child can
-// draw with. No error it returns holds path: those of the open and the
+// readFontFile reads at most picture.MaxFontBytes+1 bytes of the regular
+// file at path. No error it returns holds path: those of the open and the
 // read are replaced by their cause.
-func checkFontFile(path string) error {
+func readFontFile(path string) ([]byte, error) {
 	f, err := picture.OpenRegular(path)
 	if err != nil {
-		return withoutPath("cannot open the file", err)
+		return nil, withoutPath("cannot open the file", err)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, picture.MaxFontBytes+1))
 	_ = f.Close()
 	if err != nil {
-		return withoutPath("cannot read the file", err)
+		return nil, withoutPath("cannot read the file", err)
 	}
-	if err := picture.CheckFont(b); err != nil {
-		return err
-	}
-	return native.ProbeFont(b)
+	return b, nil
 }
 
 // withoutPath is what err, from opening or reading a file, says
