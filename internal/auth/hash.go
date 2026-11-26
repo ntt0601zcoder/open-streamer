@@ -18,7 +18,7 @@ import (
 const (
 	Prefix           = "pbkdf2-sha256"
 	Iterations       = 600000 // what HashPassword uses
-	MinIterations    = 600000 // what a config file must have
+	MinIterations    = 600000 // ParseHash's floor; a config file must have exactly Iterations
 	MaxIterations    = 10000000
 	SaltBytes        = 16
 	KeyBytes         = 32

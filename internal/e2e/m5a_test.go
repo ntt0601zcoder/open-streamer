@@ -1910,9 +1910,11 @@ func TestM5aRestartRestores(t *testing.T) {
 // thumbnail through the server: the names it is served under, the
 // thumbnail, the transcoder's metrics, and an edit of its outputs, which
 // touches neither the players nor the child.
+//
+// It runs in the arm64 job too: its readers are our own (conform's RTSP,
+// RTMP and segmented readers), with no external SRT or RTSP peer.
 func TestM5aLadder(t *testing.T) {
 	bin := testpeer.OSTranscoder(t)
-	skipOnArm(t)
 	path := filepath.Join(t.TempDir(), "openstreamer.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(m5aConfig("", bin)), 0o600))
 	m := m5aStart(t, path)

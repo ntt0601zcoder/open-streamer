@@ -13,8 +13,11 @@ func platform(w *Writer) {
 		w.Gauge("process_open_fds", "Number of open file descriptors.", float64(len(ents)))
 	}
 	raw, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		return
+	}
 	cpu, rssPages, ok := parseStat(string(raw))
-	if err != nil || !ok {
+	if !ok {
 		return
 	}
 	w.Gauge("process_resident_memory_bytes", "Resident memory size in bytes.", rssPages*float64(os.Getpagesize()))
