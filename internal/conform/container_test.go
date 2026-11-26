@@ -2070,6 +2070,32 @@ func TestReadHLSAudioLanguages(t *testing.T) {
 	})
 }
 
+func TestAudioCodec(t *testing.T) {
+	for _, tc := range []struct {
+		codec string
+		want  bool
+	}{
+		{"mp4a.40.2", true},
+		{" MP4A.40.5", true},
+		{"ac-3", true},
+		{"ec-3", true},
+		{"Opus", true},
+		{"fLaC", true},
+		{"flac", true},
+		{"ac-4.02.01.01", true},
+		{"AC-4", true},
+		{"alac", true},
+		{"mhm1.0x0D", true},
+		{"MHM1", true},
+		{"avc1.4d401e", false},
+		{"hvc1.1.6.L93.B0", false},
+		{"stpp.ttml.im1t", false},
+		{"", false},
+	} {
+		assert.Equal(t, tc.want, audioCodec(tc.codec), "%q", tc.codec)
+	}
+}
+
 // langMPD builds a static MPD of a video set and the given audio sets, each
 // with its own representation of h264_aac.ts's audio, and reads it.
 func langMPD(t *testing.T, want string, edit func(sets []dash.AdaptationSet)) Capture {

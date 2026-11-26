@@ -769,11 +769,12 @@ func (c *hlsCapture) masterLanguages(u string, m hls.MultivariantPlaylist) {
 }
 
 // audioCodec reports whether a CODECS entry is an audio codec: mp4a, ac-3,
-// ec-3 or opus, by its first dot-separated part.
+// ec-3, opus, fLaC, ac-4, alac or mhm1, by its first dot-separated part,
+// compared case-insensitively.
 func audioCodec(codec string) bool {
 	head, _, _ := strings.Cut(strings.TrimSpace(codec), ".")
 	switch strings.ToLower(head) {
-	case "mp4a", "ac-3", "ec-3", "opus":
+	case "mp4a", "ac-3", "ec-3", "opus", "flac", "ac-4", "alac", "mhm1":
 		return true
 	}
 	return false
