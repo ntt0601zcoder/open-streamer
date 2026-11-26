@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
+	"github.com/ntt0601zcoder/open-streamer/internal/logging"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/live"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
@@ -503,6 +504,78 @@ func (m *Manager) Status(name string) (Status, bool) {
 		st.LastErrorAt = &at
 	}
 	return st, true
+}
+
+// Refreshed is what RefreshAsset did to one stream.
+type Refreshed struct {
+	Stream string `json:"stream"`
+	OK     bool   `json:"ok"`              // the running picture has the new bytes
+	Error  string `json:"error,omitempty"` // scrubbed; "between generations: taken at the next build" for ErrNoGeneration
+}
+
+// The Error texts of RefreshAsset that are not a build's error.
+const (
+	refreshBetween   = "between generations: taken at the next build"
+	refreshCancelled = "cancelled"
+	refreshStopped   = "stopped: the stream's supervisor has ended"
+)
+
+// AssetUsers returns the names of the streams whose spec refers to the asset, sorted: running, disabled or left
+// stopped. It cannot see a config entry the start skipped (such an entry never became a stream): the server
+// refuses asset deletes while one exists.
+func (m *Manager) AssetUsers(name string) []string {
+	cur := *m.streams.Load()
+	var out []string
+	for _, n := range slices.Sorted(maps.Keys(cur)) {
+		if slices.Contains(cur[n].sp.Assets(), name) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// RefreshAsset tells every stream that has a supervisor and refers to the asset to load it again, waits for
+// their answers (or for ctx: the rest are reported with Error "cancelled"), and returns one entry per such
+// stream, by name.
+//
+// Every refresh is asked for before the first wait, so a stream's answer
+// does not wait behind another's, and ctx ends only the waits: a refresh
+// that was asked for is still done. A supervisor that stops before it
+// answers is reported with OK false.
+func (m *Manager) RefreshAsset(ctx context.Context, name string) []Refreshed {
+	cur := *m.streams.Load()
+	var out []Refreshed
+	var waits []<-chan error
+	for _, n := range slices.Sorted(maps.Keys(cur)) {
+		e := cur[n]
+		if e.sup == nil || !slices.Contains(e.sp.Assets(), name) {
+			continue
+		}
+		out = append(out, Refreshed{Stream: n})
+		waits = append(waits, e.sup.Refresh())
+	}
+	for i, w := range waits {
+		if ctx.Err() != nil {
+			out[i].Error = refreshCancelled
+			continue
+		}
+		select {
+		case err, ok := <-w:
+			switch {
+			case !ok:
+				out[i].Error = refreshStopped
+			case err == nil:
+				out[i].OK = true
+			case errors.Is(err, ErrNoGeneration):
+				out[i].Error = refreshBetween
+			default:
+				out[i].Error = logging.Scrub(err.Error())
+			}
+		case <-ctx.Done():
+			out[i].Error = refreshCancelled
+		}
+	}
+	return out
 }
 
 // Shot returns the latest thumbnail of the stream name and when it arrived.

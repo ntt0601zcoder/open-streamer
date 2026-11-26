@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -28,6 +29,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics/metricstest"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/transcodetest"
 )
 
 // mrig is a manager under test, running, with a scripted world.
@@ -1616,4 +1618,323 @@ func TestManagerCollect(t *testing.T) {
 	release()
 	r.sc.set(func(s *script) { s.closeGate = nil })
 	r.waitRunning("a")
+}
+
+// A live input edit is judged as any other: its listen claims against the
+// other streams', and its copy:// cycles.
+func TestManagerLiveInputClaims(t *testing.T) {
+	// Numbers only: the scripted Open binds nothing.
+	const p, q, p2 = 16000, 16001, 16002
+	udp := func(port int) string { return fmt.Sprintf("udp://:%d", port) }
+	r := newMrig(t)
+	a := withInputs(named("a"), udp(p))
+	b := withInputs(named("b"), udp(q))
+	c := withInputs(named("c"), "copy://a")
+	r.replace(a, b, c)
+	r.waitRunning("a", "b", "c")
+	assert.Equal(t, 1, r.sc.opened(udp(p)))
+
+	// Onto b's address: refused, and nothing changed.
+	err := r.refuse(withInputs(a, udp(q)), b, c)
+	assert.ErrorIs(t, err, ErrConflict)
+	assert.NotErrorIs(t, err, ErrInvalid)
+	assert.Contains(t, err.Error(), `stream "a"`)
+	assert.Contains(t, err.Error(), "udp :16001")
+	assert.Contains(t, err.Error(), `stream "b"`)
+	got, ok := r.m.Get("a")
+	require.True(t, ok)
+	assert.Equal(t, a, got)
+	st := r.status("a")
+	assert.Equal(t, []string{udp(p)}, st.Inputs)
+	assert.Equal(t, uint64(1), st.Generation)
+	assert.Equal(t, 1, r.sc.opened(udp(q)), "b's address was opened for a")
+	assert.Equal(t, 1, r.sc.opened(udp(p)))
+	assert.Equal(t, 0, r.sc.closes(udp(p)), "a's reader was closed")
+
+	// A second listen input beside the first: live, and the first reader
+	// stays.
+	a2 := withInputs(a, udp(p), udp(p2))
+	assert.Equal(t, outcomes("a", "live", "b", "unchanged", "c", "unchanged"), r.replace(a2, b, c))
+	require.Eventually(t, func() bool { return slices.Equal(r.status("a").Inputs, []string{udp(p), udp(p2)}) },
+		waitFor, time.Millisecond)
+	r.waitRunning("a")
+	st = r.status("a")
+	assert.Equal(t, uint64(1), st.Generation)
+	assert.Equal(t, 0, st.ActiveInput)
+	assert.Equal(t, 1, r.sc.opened(udp(p)), "the first reader was opened again")
+	assert.Equal(t, 0, r.sc.closes(udp(p)), "the first reader was closed")
+
+	// A copy of c, which copies a: a cycle. The claims and the cycles are
+	// both ErrConflict (claims.go), whatever the input edit is.
+	err = r.refuse(withInputs(a2, udp(p), "copy://c"), b, c)
+	assert.ErrorIs(t, err, ErrConflict)
+	assert.Contains(t, err.Error(), "copy cycle a -> c -> a")
+	got, ok = r.m.Get("a")
+	require.True(t, ok)
+	assert.Equal(t, a2, got)
+	assert.Equal(t, uint64(1), r.status("a").Generation)
+	assert.Equal(t, 1, r.sc.opened(udp(p)))
+}
+
+// imageSpec is a one-rung ladder name, on an input of its own, with the
+// watermark image logo.png.
+func imageSpec(name string) spec.Stream {
+	sp := ladderSpec("720")
+	sp.Name = name
+	sp.Inputs = []spec.Input{{URL: "http://source.test/" + name + ".ts"}}
+	sp.Transcode.Watermark = &spec.Watermark{Image: "logo.png"}
+	return sp
+}
+
+// AssetUsers finds the streams whose spec names the asset, with or without a
+// supervisor.
+func TestManagerAssetUsers(t *testing.T) {
+	r := newMrig(t, func(env *Env) {
+		fakeChild(t, env)
+		env.AssetsDir = writeAsset(t, "logo.png")
+	})
+	a := imageSpec("a")
+	b := ladderSpec("720")
+	b.Name, b.Disabled = "b", true
+	b.Transcode.Watermark = &spec.Watermark{Text: "t", Font: "f.ttf"}
+	c := named("c")
+	r.replace(a, b, c)
+	assert.Equal(t, []string{"a"}, r.m.AssetUsers("logo.png"))
+	assert.Equal(t, []string{"b"}, r.m.AssetUsers("f.ttf"))
+	assert.Nil(t, r.m.AssetUsers("other.png"))
+	assert.Nil(t, r.m.AssetUsers(""))
+	// Both naming it, sorted.
+	b2 := imageSpec("b")
+	b2.Disabled = true
+	r.replace(a, b2, c)
+	assert.Equal(t, []string{"a", "b"}, r.m.AssetUsers("logo.png"))
+	assert.Nil(t, r.m.AssetUsers("f.ttf"))
+}
+
+// countLines counts the lines of the log that are line.
+func countLines(lines func() []string, line string) int {
+	n := 0
+	for _, l := range lines() {
+		if l == line {
+			n++
+		}
+	}
+	return n
+}
+
+// RefreshAsset asks the streams that run with the asset to load it again,
+// and reports each one's answer.
+func TestManagerRefreshAsset(t *testing.T) {
+	after := newFakeAfter()
+	path := filepath.Join(t.TempDir(), "watermark.log")
+	r := newMrig(t, func(env *Env) {
+		fakeChild(t, env, transcodetest.EnvWatermarkLog+"="+path)
+		env.AssetsDir = writeAsset(t, "logo.png")
+		env.After = after.After
+	})
+	lines := func() []string {
+		b, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		require.NoError(t, err)
+		return strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	}
+	asset := filepath.Join(r.m.env.AssetsDir, "logo.png")
+	d := imageSpec("d")
+	d.Disabled = true
+	r.replace(imageSpec("a"), imageSpec("b"), imageSpec("c"), d)
+	r.waitRunning("a", "b", "c")
+	configured := fmt.Sprintf("configure image:%d", len(onePixelPNG))
+	require.Eventually(t, func() bool { return countLines(lines, configured) == 3 }, waitFor, time.Millisecond,
+		"the children's watermark log: %q", lines())
+	// c between generations: its backoff waits for the fake clock.
+	failGen(t, r.sup("c"), "transcoder")
+	after.next(t)
+	require.Equal(t, "backoff", r.status("c").State)
+
+	// The file replaced by other valid bytes.
+	other := otherPNG(t)
+	require.NoError(t, os.WriteFile(asset, other, 0o600))
+	assert.Equal(t, []Refreshed{
+		{Stream: "a", OK: true},
+		{Stream: "b", OK: true},
+		{Stream: "c", Error: "between generations: taken at the next build"},
+	}, r.m.RefreshAsset(context.Background(), "logo.png"))
+	set := fmt.Sprintf("set image:%d", len(other))
+	require.Eventually(t, func() bool { return countLines(lines, set) == 2 }, waitFor, time.Millisecond,
+		"the children's watermark log: %q", lines())
+	assert.Equal(t, "backoff", r.status("c").State, "a refresh ended the backoff")
+	assert.False(t, after.called(), "a refresh started another backoff")
+
+	// The file removed: each running stream keeps its picture and says why.
+	require.NoError(t, os.Remove(asset))
+	got := r.m.RefreshAsset(context.Background(), "logo.png")
+	require.Len(t, got, 3)
+	for _, g := range got[:2] {
+		assert.False(t, g.OK, g.Stream)
+		assert.Contains(t, g.Error, "logo.png", g.Stream)
+	}
+	assert.Equal(t, Refreshed{Stream: "c", Error: "between generations: taken at the next build"}, got[2])
+	assert.Equal(t, []string{"a", "b"}, []string{got[0].Stream, got[1].Stream})
+	assert.Equal(t, 2, countLines(lines, set), "a failed refresh set a watermark")
+	for _, name := range []string{"a", "b"} {
+		assert.Equal(t, "running", r.status(name).State, name)
+		assert.Equal(t, uint64(1), r.status(name).Generation, name)
+	}
+
+	// An asset nobody uses.
+	assert.Nil(t, r.m.RefreshAsset(context.Background(), "other.png"))
+
+	// A cancelled ctx: no wait.
+	require.NoError(t, os.WriteFile(asset, onePixelPNG, 0o600))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	assert.Equal(t, []Refreshed{
+		{Stream: "a", Error: "cancelled"},
+		{Stream: "b", Error: "cancelled"},
+		{Stream: "c", Error: "cancelled"},
+	}, r.m.RefreshAsset(ctx, "logo.png"))
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+// A supervisor that has stopped reports its refresh as not done, at once.
+func TestManagerRefreshAssetStopped(t *testing.T) {
+	r := newMrig(t, func(env *Env) {
+		fakeChild(t, env)
+		env.AssetsDir = writeAsset(t, "logo.png")
+	})
+	r.replace(imageSpec("a"))
+	r.waitRunning("a")
+	sup := r.sup("a")
+	r.stop()
+	select {
+	case <-sup.Done():
+	case <-time.After(waitFor):
+		require.FailNow(t, "the supervisor did not stop")
+	}
+	got := r.m.RefreshAsset(context.Background(), "logo.png")
+	require.Len(t, got, 1)
+	assert.Equal(t, "a", got[0].Stream)
+	assert.False(t, got[0].OK)
+	assert.NotEmpty(t, got[0].Error)
+	assert.NotEqual(t, "cancelled", got[0].Error)
+}
+
+// Concurrent live edits and refreshes neither deadlock nor overlap two
+// readers of an input, nor rebuild the stream.
+func TestManagerConcurrentLiveEdits(t *testing.T) {
+	l := newLeases(t, 10*time.Millisecond)
+	u1, p1 := l.udp()
+	u2, p2 := l.udp()
+	assets := t.TempDir()
+	font, err := os.ReadFile(fixtureFont)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(assets, "f.ttf"), font, 0o600))
+	env := served(Env{Open: l.Open, AssetsDir: assets})
+	fakeChild(t, &env)
+	sp := ladderSpec("720")
+	sp.Inputs = []spec.Input{{URL: u1}}
+	sp.Outputs = spec.Outputs{HTTPTS: true, RTSP: true}
+	sp.Transcode.Watermark = &spec.Watermark{Text: "w", Font: "f.ttf"}
+	require.NoError(t, sp.Validate())
+
+	m := NewManager(env)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop1, stop2 := sendFixture(t, p1), sendFixture(t, p2)
+	defer stop1()
+	defer stop2()
+	ran := make(chan struct{})
+	go func() {
+		defer close(ran)
+		m.Run(ctx)
+	}()
+	_, err = m.Replace(ctx, []spec.Stream{sp}, nil)
+	require.NoError(t, err)
+	sup := (*m.streams.Load())["cam"].sup
+	require.NotNil(t, sup)
+	waitRunning(t, sup)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var wg sync.WaitGroup
+	var edits, refreshes atomic.Int64
+	for i := range 20 {
+		wg.Go(func() {
+			for n := 0; time.Now().Before(deadline); n++ {
+				if i%4 == 3 {
+					assert.Equal(t, []Refreshed{{Stream: "cam", OK: true}}, m.RefreshAsset(ctx, "f.ttf"))
+					refreshes.Add(1)
+					continue
+				}
+				set := m.List()
+				if !assert.Len(t, set, 1) {
+					return
+				}
+				c := &set[0]
+				switch i % 4 {
+				case 0: // the input swapped for the other
+					next := u1
+					if c.Inputs[0].URL == u1 {
+						next = u2
+					}
+					c.Inputs = []spec.Input{{URL: next}}
+				case 1: // a new text
+					c.Transcode.Watermark = &spec.Watermark{Text: fmt.Sprintf("w%d.%d", i, n), Font: "f.ttf"}
+				case 2: // an output toggled
+					c.Outputs.RTSP = !c.Outputs.RTSP
+				}
+				out, err := m.Replace(ctx, set, nil)
+				assert.NoError(t, err)
+				edits.Add(1)
+				for _, o := range out {
+					assert.Contains(t, []string{"live", "outputs", "unchanged"}, o.Applied)
+				}
+				time.Sleep(time.Duration(i%3) * time.Millisecond)
+			}
+		})
+	}
+	last := cloneSpec(sp)
+	last.Inputs = []spec.Input{{URL: u2}}
+	last.Transcode.Watermark = &spec.Watermark{Text: "last", Font: "f.ttf"}
+	last.Outputs.SRT = true
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		wg.Wait()
+		_, err := m.Replace(ctx, []spec.Stream{last}, nil)
+		assert.NoError(t, err)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(20 * time.Second):
+		buf := make([]byte, 1<<20)
+		require.FailNow(t, "deadlock", "%s", buf[:runtime.Stack(buf, true)])
+	}
+
+	t.Logf("%d edits, %d refreshes", edits.Load(), refreshes.Load())
+	assert.Greater(t, edits.Load(), int64(40))
+	assert.Greater(t, refreshes.Load(), int64(10))
+	assert.Equal(t, []spec.Stream{last}, m.List())
+	assert.Same(t, sup, (*m.streams.Load())["cam"].sup)
+	assert.Equal(t, spec.ChangeNone, spec.Diff(last, sup.snapshot().sp))
+	assert.Equal(t, last.Outputs, sup.View().Outputs)
+	require.Eventually(t, func() bool { return sup.Status().State == "running" }, waitFor, time.Millisecond,
+		"last error %q", sup.Status().LastError)
+	st := sup.Status()
+	assert.Equal(t, []string{u2}, st.Inputs)
+	assert.Equal(t, uint64(1), st.Generation, "an edit rebuilt the stream")
+	assert.Equal(t, uint64(1), sup.View().Gen)
+	assert.Zero(t, st.Rebuilds)
+	assert.Zero(t, st.Restarts)
+	assert.Greater(t, l.Opens(), int64(2))
+
+	cancel()
+	select {
+	case <-ran:
+	case <-time.After(waitFor):
+		require.FailNow(t, "Run did not return")
+	}
+	assert.Empty(t, l.Overlaps(), "two readers of one input at once")
 }
