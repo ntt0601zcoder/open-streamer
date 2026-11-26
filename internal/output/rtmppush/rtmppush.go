@@ -1,6 +1,14 @@
 // Package rtmppush publishes a hub's stream to an RTMP server: a push
 // target such as a CDN ingest or a restreaming service.
 //
+// A target is rtmp://, or rtmps:// (RTMP over TLS, default port 443),
+// which verifies the server against Options.RTMP.TLS (nil: the system
+// roots) with the URL's host as the server name. rtmps+insecure:// is
+// rtmps:// with verification turned off for that one target: it is
+// published as rtmps://, so the target never sees "insecure". A failed
+// verification is an ordinary failure: it is backed off like any other,
+// and LastError names the x509 reason.
+//
 // A Pusher keeps one connection to its target at a time. Each connection
 // waits until the hub is live (hub.Live, polled), so no idle publish is
 // held on the target, then publishes (rtmp.Publish, with the target's
@@ -25,6 +33,7 @@ package rtmppush
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/url"
@@ -77,8 +86,9 @@ type Options struct {
 	// again at MinBackoff after a connection published for 30 s, whatever
 	// ended it) and when each republish happened. Default time.Now.
 	Now func() time.Time
-	// RTMP is the client Config of each connection (Dial and timeouts);
-	// WriteTimeout and KeepQuery are set by the Pusher.
+	// RTMP is the client Config of each connection (Dial, timeouts, and
+	// TLS for an rtmps:// target); WriteTimeout and KeepQuery are set by
+	// the Pusher, and so is TLS for an rtmps+insecure:// target.
 	RTMP rtmp.Config
 }
 
@@ -128,7 +138,8 @@ type Stats struct {
 // String are safe from any goroutine.
 type Pusher struct {
 	h        *hub.Hub
-	target   string
+	target   string // as given
+	dial     string // what rtmp.Publish gets: target, rtmps+insecure:// as rtmps://
 	redacted string
 	scrubber *strings.Replacer
 	opt      Options
@@ -140,8 +151,9 @@ type Pusher struct {
 }
 
 // New returns a Pusher of h to target, an rtmp://host[:port]/app[/…]/key
-// URL; its query is sent to the target verbatim. Errors never contain the
-// URL.
+// URL, or the same with rtmps:// or rtmps+insecure:// (the scheme in any
+// case); its query is sent to the target verbatim. Errors never contain
+// the URL.
 func New(h *hub.Hub, target string, opt Options) (*Pusher, error) {
 	if h == nil {
 		return nil, errors.New("rtmppush: new: no hub")
@@ -170,9 +182,14 @@ func New(h *hub.Hub, target string, opt Options) (*Pusher, error) {
 	}
 	opt.RTMP.WriteTimeout = opt.WriteTimeout
 	opt.RTMP.KeepQuery = true
+	dial := target
+	if insecure(target) {
+		dial, opt.RTMP.TLS = insecureTarget(target, opt.RTMP.TLS)
+	}
 	return &Pusher{
 		h:        h,
 		target:   target,
+		dial:     dial,
 		redacted: redact.URL(target),
 		scrubber: scrubber(target),
 		opt:      opt,
@@ -180,15 +197,16 @@ func New(h *hub.Hub, target string, opt Options) (*Pusher, error) {
 	}, nil
 }
 
-// checkTarget accepts rtmp://host[:port]/app[/…]/key. Its errors never
-// contain the URL.
+// checkTarget accepts rtmp://host[:port]/app[/…]/key, and the same with
+// rtmps:// or rtmps+insecure:// (redact.RTMPScheme, which refuses
+// rtmp+insecure://). Its errors never contain the URL.
 func checkTarget(target string) error {
 	u, err := url.Parse(target)
 	if err != nil {
 		return errors.New("invalid URL")
 	}
-	if u.Scheme != "rtmp" || u.Opaque != "" {
-		return errors.New("not an rtmp:// URL")
+	if !redact.RTMPScheme(u.Scheme) || u.Opaque != "" {
+		return errors.New("not an rtmp:// or rtmps:// URL")
 	}
 	if u.Hostname() == "" {
 		return errors.New("the URL has no host")
@@ -198,6 +216,37 @@ func checkTarget(target string) error {
 		return errors.New("the URL needs an app and a stream key")
 	}
 	return nil
+}
+
+// insecureScheme is the scheme of an rtmps:// target whose certificate is
+// not verified.
+const insecureScheme = "rtmps+insecure"
+
+// insecure reports whether target, which checkTarget accepted, is an
+// rtmps+insecure:// URL.
+func insecure(target string) bool {
+	u, err := url.Parse(target)
+	return err == nil && u.Scheme == insecureScheme // url.Parse lower-cases it
+}
+
+// insecureTarget translates an rtmps+insecure:// target, which checkTarget
+// accepted, for pkg/rtmp, which knows only rtmps:// and a *tls.Config: the
+// same URL with the scheme rtmps, byte for byte after it, and a clone of
+// cfg (a new config when nil) with InsecureSkipVerify set, for this target
+// only; cfg itself is not modified. The scheme never reaches the target:
+// the tcUrl says rtmps://.
+//
+// internal/ingest holds the twin of this translation for rtmps+insecure://
+// inputs; the two change together.
+func insecureTarget(target string, cfg *tls.Config) (string, *tls.Config) {
+	// The scheme ends at the first ':' (RFC 3986), as url.Parse reads it.
+	dial := "rtmps" + target[strings.IndexByte(target, ':'):]
+	c := cfg.Clone()
+	if c == nil {
+		c = &tls.Config{}
+	}
+	c.InsecureSkipVerify = true
+	return dial, c
 }
 
 // scrubber replaces the target's secrets in text: the stream key, with its
@@ -248,7 +297,8 @@ func (p *Pusher) scrub(err error) string {
 	return p.scrubber.Replace(err.Error())
 }
 
-// String returns the target, redacted.
+// String returns the target, redacted, with its scheme as given, in lower
+// case.
 func (p *Pusher) String() string { return p.redacted }
 
 // Stats returns the counters.
@@ -376,7 +426,7 @@ func (p *Pusher) connection(ctx context.Context, rs *resume) (end, time.Duration
 		return why, 0, nil
 	}
 	p.setState(StateConnecting)
-	conn, err := rtmp.Publish(ctx, p.target, p.opt.RTMP)
+	conn, err := rtmp.Publish(ctx, p.dial, p.opt.RTMP)
 	if err != nil {
 		if ctx.Err() != nil {
 			return endCanceled, 0, nil

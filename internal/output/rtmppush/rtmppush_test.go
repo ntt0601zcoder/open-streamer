@@ -27,6 +27,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 const waitFor = 10 * time.Second
@@ -347,7 +348,8 @@ func TestPushNewRejects(t *testing.T) {
 	defer h.Close()
 	for _, bad := range []string{
 		"http://h/live/" + vKey,
-		"rtmps://u:" + vPass + "@h/live/" + vKey,
+		"rtmp+insecure://u:" + vPass + "@h/live/" + vKey + "?token=" + vToken,
+		"rtmps+other://u:" + vPass + "@h/live/" + vKey,
 		"srt://h:9000?passphrase=" + vToken,
 		"rtmp://h/" + vKey,
 		"rtmp:///live/" + vKey,
@@ -949,4 +951,182 @@ func TestPushFFmpegListener(t *testing.T) {
 		assert.Contains(t, string(probe), s)
 	}
 	assert.Equal(t, uint64(1), p.Stats().Connects)
+}
+
+// The secrets of TestPushTLS, built so the source holds neither whole.
+var (
+	tlsKey   = "s3cret" + "key"
+	tlsToken = "tok-" + "opensesame"
+)
+
+func TestCheckTargetTLS(t *testing.T) {
+	for _, ok := range []string{
+		"rtmps://h/live/k",
+		"rtmps+insecure://h:443/live/k?token=t",
+		"RTMPS://h/live/k",
+	} {
+		assert.NoError(t, checkTarget(ok), "%q", ok)
+	}
+	for _, bad := range []string{
+		"rtmp+insecure://h/live/k",
+		"https://h/live/k",
+		"rtmps+other://h/live/k",
+	} {
+		err := checkTarget(bad)
+		require.Error(t, err, "%q", bad)
+		assert.Equal(t, "not an rtmp:// or rtmps:// URL", err.Error(), "%q", bad)
+	}
+	// Through New, the refusal is prefixed and never quotes the URL.
+	h := hub.New(hub.Options{})
+	defer h.Close()
+	target := "rtmp+insecure://u:" + vPass + "@h/live/" + vKey + "?token=" + vToken
+	_, err := New(h, target, Options{})
+	require.Error(t, err)
+	assert.Equal(t, "rtmppush: new: not an rtmp:// or rtmps:// URL", err.Error())
+}
+
+// pushAll publishes the h264_aac clip through a Pusher of opt to srv's
+// path, from its first GOP to the hub's close, and returns what srv
+// received and the request it saw.
+func pushAll(t *testing.T, srv *rtmptest.PublishServer, target string, opt Options) ([]rtmp.Media, rtmp.Request) {
+	t.Helper()
+	h := hub.New(hub.Options{})
+	defer h.Close()
+	gop, rest := firstGOP(looped(t, "h264_aac.ts", 1))
+	for _, f := range gop {
+		h.Write(f)
+	}
+	p := newPusher(t, h, target, opt)
+	_, done := run(t, p)
+	require.Eventually(t, func() bool { return p.Stats().State == StatePublishing && len(h.Stats()) == 1 },
+		waitFor, time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	<-feed(ctx, h, rest, 8)
+	h.Close()
+	require.NoError(t, waitRun(t, done))
+	require.Eventually(t, func() bool { return len(srv.Ends()) == 1 }, waitFor, time.Millisecond)
+	require.ErrorIs(t, srv.Ends()[0], io.EOF, "the publish ended with FCUnpublish")
+	st := p.Stats()
+	assert.Equal(t, uint64(1), st.Connects)
+	assert.Zero(t, st.Failures)
+	assert.Empty(t, st.LastError)
+	reqs := srv.Requests()
+	require.Len(t, reqs, 1)
+	return srv.Media(), reqs[0]
+}
+
+// dials records when each connection attempt dials, then dials.
+type dials struct {
+	mu sync.Mutex
+	at []time.Time
+}
+
+func (d *dials) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	d.mu.Lock()
+	d.at = append(d.at, time.Now())
+	d.mu.Unlock()
+	var nd net.Dialer
+	return nd.DialContext(ctx, network, addr)
+}
+
+func (d *dials) get() []time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]time.Time(nil), d.at...)
+}
+
+func TestPushTLS(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	path := "live/" + tlsKey + "?token=" + tlsToken
+	noSecrets := func(what, s string) {
+		t.Helper()
+		assert.NotContains(t, s, tlsKey, what)
+		assert.NotContains(t, s, tlsToken, what)
+	}
+
+	plain := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{})
+	want, _ := pushAll(t, plain, plain.URL(path), Options{})
+	require.NotEmpty(t, want)
+
+	t.Run("verified", func(t *testing.T) {
+		srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{TLS: ca.Server(t)})
+		target := srv.URL(path)
+		require.True(t, strings.HasPrefix(target, "rtmps://"), target)
+		got, req := pushAll(t, srv, target, Options{RTMP: rtmp.Config{TLS: ca.Client()}})
+		assert.Equal(t, want, got, "the media over RTMPS equals the plain run's")
+		assert.Equal(t, tlsKey, req.Stream)
+		assert.Equal(t, "token="+tlsToken, req.Query)
+	})
+
+	t.Run("untrusted", func(t *testing.T) {
+		h := liveHub(t)
+		defer h.Close()
+		srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{TLS: ca.Server(t)})
+		const minBackoff = 150 * time.Millisecond
+		var (
+			mu    sync.Mutex
+			asked []time.Duration
+		)
+		after := func(d time.Duration) <-chan time.Time {
+			if d != livePoll {
+				mu.Lock()
+				asked = append(asked, d)
+				mu.Unlock()
+			}
+			return time.After(d)
+		}
+		d := &dials{}
+		p := newPusher(t, h, srv.URL(path), Options{
+			MinBackoff: minBackoff,
+			After:      after,
+			RTMP:       rtmp.Config{Dial: d.Dial},
+		})
+		cancelRun, done := run(t, p)
+		require.Eventually(t, func() bool { return p.Stats().Failures >= 2 && len(d.get()) >= 2 },
+			waitFor, time.Millisecond)
+		cancelRun()
+		require.ErrorIs(t, waitRun(t, done), context.Canceled)
+
+		st := p.Stats()
+		assert.Zero(t, st.Connects, "never publishes")
+		assert.GreaterOrEqual(t, st.Failures, uint64(2))
+		assert.Contains(t, st.LastError, "x509")
+		noSecrets("LastError", st.LastError)
+		assert.Empty(t, srv.Requests(), "the handshake failed before any RTMP")
+		at := d.get()
+		assert.GreaterOrEqual(t, at[1].Sub(at[0]), minBackoff,
+			"the second attempt is not sooner than the first retry delay")
+		mu.Lock()
+		defer mu.Unlock()
+		require.GreaterOrEqual(t, len(asked), 2)
+		assert.Equal(t, []time.Duration{minBackoff, 2 * minBackoff}, asked[:2], "the plain back-off")
+	})
+
+	t.Run("insecure", func(t *testing.T) {
+		srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{TLS: ca.Server(t)})
+		target := "rtmps+insecure://" + srv.Addr + "/" + path
+		h := hub.New(hub.Options{})
+		defer h.Close()
+		p := newPusher(t, h, target, Options{})
+		assert.Equal(t, "rtmps+insecure://"+srv.Addr+"/live/s3xxxxx?token=xxxxx", p.String())
+		h.Close()
+
+		got, req := pushAll(t, srv, target, Options{})
+		assert.Equal(t, want, got)
+		assert.Equal(t, "live", req.App)
+		assert.Equal(t, tlsKey, req.Stream)
+		assert.Equal(t, "token="+tlsToken, req.Query, "the target's own query")
+		for _, s := range []string{req.App, req.Stream, req.Query, req.TCURL} {
+			assert.NotContains(t, s, "insecure")
+		}
+		assert.True(t, strings.HasPrefix(req.TCURL, "rtmps://"), req.TCURL)
+	})
+
+	t.Run("insecure keeps the caller's config", func(t *testing.T) {
+		srv := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{TLS: ca.Server(t)})
+		cfg := tlstest.NewCA(t).Client() // trusts another CA: verification would fail
+		_, _ = pushAll(t, srv, "RTMPS+INSECURE://"+srv.Addr+"/"+path, Options{RTMP: rtmp.Config{TLS: cfg}})
+		assert.False(t, cfg.InsecureSkipVerify, "the caller's config is not modified")
+	})
 }
