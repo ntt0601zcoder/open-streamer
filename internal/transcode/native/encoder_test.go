@@ -416,7 +416,10 @@ func TestProbeNVENC(t *testing.T) {
 // deviceOptInOrSkip skips a test where an NVENC device exists
 // (/dev/nvidiactl) unless OS_NVENC or OS_REQUIRE_NVENC is "1"; without a
 // device it runs. The same gate as cmd/ostranscoder's nvencProbeOrSkip and
-// testpeer.NVENCOptedIn: carry a change to one to all of them.
+// the NVENCOptedIn of the peer helpers: carry a change to one to all of
+// them. (That package is not named in this file: scripts/test-ci-peers.sh
+// picks the packages whose test files name it, and this one does not build
+// in its untagged run.)
 func deviceOptInOrSkip(t *testing.T) {
 	t.Helper()
 	_, err := os.Stat("/dev/nvidiactl")
