@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/config"
@@ -106,9 +107,9 @@ func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, stream.ErrInvalid):
 		// It takes precedence: every joined error is listed, the
 		// conflicts included.
-		writeError(w, http.StatusUnprocessableEntity, codeInvalidSpec, "the stream cannot run", texts(split(err)))
+		writeError(w, http.StatusUnprocessableEntity, codeInvalidSpec, "the stream cannot run", capped(texts(split(err))))
 	case errors.Is(err, stream.ErrConflict):
-		writeError(w, http.StatusConflict, codeConflict, "the stream conflicts with another", texts(split(err)))
+		writeError(w, http.StatusConflict, codeConflict, "the stream conflicts with another", capped(texts(split(err))))
 	case errors.Is(err, stream.ErrClosed):
 		writeError(w, http.StatusServiceUnavailable, codeUnavailable, "the server is stopping", nil)
 	case r.Context().Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
@@ -126,6 +127,16 @@ func texts(errs []error) []string {
 		out[i] = e.Error()
 	}
 	return out
+}
+
+// capped returns the first config.MaxErrors of list, followed by "and N
+// more" when there are more: an edit refused for every stream of a large
+// set answers with a bounded document.
+func capped(list []string) []string {
+	if len(list) <= config.MaxErrors {
+		return list
+	}
+	return append(list[:config.MaxErrors:config.MaxErrors], fmt.Sprintf("and %d more", len(list)-config.MaxErrors))
 }
 
 // isKind reports whether err is an edit error of the stream manager.

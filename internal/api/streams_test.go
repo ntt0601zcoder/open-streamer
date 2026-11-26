@@ -283,6 +283,47 @@ func TestErrorsFromManager(t *testing.T) {
 	}
 }
 
+// TestErrorsFromManagerCapped: an edit refused for more reasons than
+// config.MaxErrors lists the first MaxErrors in order, then "and N more".
+func TestErrorsFromManagerCapped(t *testing.T) {
+	reasons := func(kind error, n int) ([]string, error) {
+		errs := make([]error, n)
+		msgs := make([]string, n)
+		for i := range n {
+			msgs[i] = fmt.Sprintf(`stream "s%03d": reason %d`, i, i)
+			errs[i] = &reason{kind: kind, msg: msgs[i]}
+		}
+		return msgs, errors.Join(errs...)
+	}
+	for _, c := range []struct {
+		kind   error
+		status int
+		code   string
+	}{
+		{stream.ErrInvalid, http.StatusUnprocessableEntity, codeInvalidSpec},
+		{stream.ErrConflict, http.StatusConflict, codeConflict},
+	} {
+		t.Run(c.code, func(t *testing.T) {
+			e := newEnv(t)
+			msgs, err := reasons(c.kind, config.MaxErrors+50)
+			e.be.putErr = fmt.Errorf("server: apply: %w", err)
+			rec := e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, jsonBody(camSpec))...)
+			require.Equal(t, c.status, rec.Code, rec.Body.String())
+			doc := errOf(t, rec)
+			assert.Equal(t, c.code, doc.Code)
+			require.Len(t, doc.Errors, config.MaxErrors+1)
+			assert.Equal(t, msgs[:config.MaxErrors], doc.Errors[:config.MaxErrors])
+			assert.Equal(t, "and 50 more", doc.Errors[config.MaxErrors])
+
+			msgs, err = reasons(c.kind, config.MaxErrors)
+			e.be.putErr = err
+			rec = e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, jsonBody(camSpec))...)
+			require.Equal(t, c.status, rec.Code, rec.Body.String())
+			assert.Equal(t, msgs, errOf(t, rec).Errors, "exactly MaxErrors: no tail")
+		})
+	}
+}
+
 func TestPathNames(t *testing.T) {
 	e := newEnv(t)
 	e.seedCam()
