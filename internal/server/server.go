@@ -127,10 +127,12 @@ type Server struct {
 	store    *certs.Store
 	certPoll time.Duration
 	// certMu orders the certificate's log lines; certLogged is the text of
-	// the reload error last logged, "" once a reload succeeded. Never taken
-	// with cfg held, nor cfg with it.
+	// the reload error last logged, "" once a reload succeeded; certShown is
+	// Info.Changed of the pair last logged as loaded. Never taken with cfg
+	// held, nor cfg with it.
 	certMu     sync.Mutex
 	certLogged string
+	certShown  uint64
 	// httpsFailures and apiFailures count the failed TLS handshakes of the
 	// media and the API listener; the RTMPS and RTSPS listeners count their
 	// own.

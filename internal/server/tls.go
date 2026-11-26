@@ -7,22 +7,29 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/certs"
 )
 
-// certLoaded writes the line of the pair in force: "server: tls: certificate
-// loaded" with not_after and names, at info, or at warning with expired when
-// the leaf has expired (R-S3: the files are the operator's word). Run writes
-// it once at the start, and certReport after each read that took a new leaf.
+// certLoaded writes the start's line of the pair in force (F-18).
 func (s *Server) certLoaded() {
 	s.certMu.Lock()
 	defer s.certMu.Unlock()
-	s.certLoadedLocked()
+	s.certLine(s.store.Info())
 }
 
-// certLoadedLocked is certLoaded with certMu held.
-func (s *Server) certLoadedLocked() {
-	info := s.store.Info()
-	attrs := []any{"not_after", info.NotAfter, "names", info.DNSNames}
+// certLine writes the line of one loaded pair: "server: tls: certificate
+// loaded" with not_after and names, at info, or at warning with expired when
+// the leaf has expired (R-S3: the files are the operator's word). The caller
+// holds certMu. It remembers which pair it was by info.Changed, so a pair is
+// never logged twice.
+func (s *Server) certLine(info certs.Info) {
+	s.certShown = info.Changed
+	names := info.DNSNames
+	if names == nil {
+		names = []string{} // [] in the log, not null
+	}
+	attrs := []any{"not_after", info.NotAfter, "names", names}
 	if time.Now().After(info.NotAfter) {
 		s.log.Warn("server: tls: certificate loaded", append(attrs, "expired", true)...)
 		return
@@ -30,18 +37,38 @@ func (s *Server) certLoadedLocked() {
 	s.log.Info("server: tls: certificate loaded", attrs...)
 }
 
-// certReport reports one read of the pair, by the poll or by Reload: a new
-// leaf is logged; a failure is logged at error once per distinct text, not
-// again until a read succeeds or the text changes; a read that found the
-// same leaf logs nothing. The text names the file and the reason, never the
-// key's content (internal/certs).
+// certReload is a read of the pair outside the poll, by Reload: the read and
+// what it took are one step under certMu, so its line is its own pair's.
+func (s *Server) certReload() {
+	s.certMu.Lock()
+	defer s.certMu.Unlock()
+	changed, err := s.store.Reload()
+	s.certReportLocked(changed, err, s.store.Info())
+}
+
+// certReport is the poll's report of one read of the pair (Store.Watch).
 func (s *Server) certReport(changed bool, err error) {
 	s.certMu.Lock()
 	defer s.certMu.Unlock()
+	s.certReportLocked(changed, err, s.store.Info())
+}
+
+// certReportLocked reports one read of the pair, with info read after it
+// under certMu: a new leaf is logged; a failure is logged at error once per
+// distinct text, not again until a read succeeds or the text changes; a read
+// that found the same leaf logs nothing. The text names the file and the
+// reason, never the key's content (internal/certs).
+//
+// Only Reload reads the pair under certMu; the poll's read runs inside
+// Store.Watch, whose report carries no leaf. So info is the pair in force
+// after this read and any of Reload's that came between: when such a read
+// took a new leaf (Changed moved past the one this read made) or succeeded
+// (LastError is no longer this text), its own report says it, and this one
+// says nothing.
+func (s *Server) certReportLocked(changed bool, err error, info certs.Info) {
 	if err != nil {
 		text := err.Error()
-		// A read that succeeded since, by the other caller, has the last word.
-		if text == s.certLogged || s.store.Info().LastError != text {
+		if text == s.certLogged || info.LastError != text {
 			return
 		}
 		s.certLogged = text
@@ -49,8 +76,8 @@ func (s *Server) certReport(changed bool, err error) {
 		return
 	}
 	s.certLogged = ""
-	if changed {
-		s.certLoadedLocked()
+	if changed && info.Changed != s.certShown {
+		s.certLine(info)
 	}
 }
 

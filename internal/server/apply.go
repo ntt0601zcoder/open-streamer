@@ -219,7 +219,7 @@ func (s *Server) DeleteStream(ctx context.Context, name, ifMatch string) error {
 // a poll's is, and is not this function's.
 func (s *Server) Reload(ctx context.Context) (api.ApplyResult, error) {
 	if s.store != nil {
-		s.certReport(s.store.Reload())
+		s.certReload()
 	}
 	s.cfg.Lock()
 	defer s.cfg.Unlock()
@@ -262,12 +262,9 @@ func (s *Server) ConfigStatus() api.ConfigStatus {
 	stale, err := s.file.Stale()
 	status.Stale = stale
 	if s.store != nil {
+		// The API writes nil names as [].
 		c := s.store.Info()
-		names := c.DNSNames
-		if names == nil {
-			names = []string{}
-		}
-		status.Certificate = &api.CertStatus{NotAfter: c.NotAfter, Names: names, LoadedAt: c.LoadedAt, LastError: c.LastError}
+		status.Certificate = &api.CertStatus{NotAfter: c.NotAfter, Names: c.DNSNames, LoadedAt: c.LoadedAt, LastError: c.LastError}
 	}
 	if err != nil {
 		now := time.Now().UnixNano()

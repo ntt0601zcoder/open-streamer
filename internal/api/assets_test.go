@@ -691,10 +691,40 @@ func TestAssetDeadlinesTLS(t *testing.T) {
 		assert.Less(t, time.Since(start), 500*time.Millisecond)
 	})
 
-	t.Run("stalled reader", func(t *testing.T) {
-		big := fontOf(t, 8<<20) // more than the loopback's buffers hold
-		_, _, err := e.be.assets.Put(context.Background(), "big.ttf", bytes.NewReader(big), "", false)
+	big := fontOf(t, 8<<20) // more than the loopback's buffers hold
+	_, _, err := e.be.assets.Put(context.Background(), "big.ttf", bytes.NewReader(big), "", false)
+	require.NoError(t, err)
+
+	// The handler's write deadline, deadline(8 MiB) = 1.96 s, replaces the
+	// server's 200 ms WriteTimeout: a reader that takes 600 ms and more
+	// still gets every byte.
+	t.Run("slow reader", func(t *testing.T) {
+		c := rawTLSConn(t, srv, 32<<10)
+		_, err := io.WriteString(c, head(http.MethodGet, "/api/v1/assets/big.ttf"))
 		require.NoError(t, err)
+		require.NoError(t, c.SetReadDeadline(time.Now().Add(10*time.Second)))
+		br := bufio.NewReaderSize(c, 64<<10)
+		res, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+		require.NoError(t, err)
+		defer res.Body.Close()
+		require.Equal(t, http.StatusOK, res.StatusCode)
+		start := time.Now()
+		var got bytes.Buffer
+		chunk := make([]byte, 128<<10)
+		for {
+			n, err := io.ReadFull(res.Body, chunk)
+			got.Write(chunk[:n])
+			if err != nil {
+				require.True(t, errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF), err)
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		assert.GreaterOrEqual(t, time.Since(start), 600*time.Millisecond)
+		assert.True(t, bytes.Equal(big, got.Bytes()), "every byte: got %d of %d", got.Len(), len(big))
+	})
+
+	t.Run("stalled reader", func(t *testing.T) {
 		c := rawTLSConn(t, srv, 32<<10)
 		_, err = io.WriteString(c, head(http.MethodGet, "/api/v1/assets/big.ttf"))
 		require.NoError(t, err)

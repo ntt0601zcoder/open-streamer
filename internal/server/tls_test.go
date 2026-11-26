@@ -1569,6 +1569,22 @@ func TestCertificateStatusAndMetrics(t *testing.T) {
 		assert.True(t, ok)
 	})
 
+	t.Run("a leaf without names", func(t *testing.T) {
+		ca := tlstest.NewCA(t)
+		certPEM, keyPEM := ca.Issue(t, 24*time.Hour)
+		dir := t.TempDir()
+		cert, key := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+		require.NoError(t, os.WriteFile(cert, certPEM, 0o600))
+		require.NoError(t, os.WriteFile(key, keyPEM, 0o600))
+		s := tlsStartPath(t, writeConfig(t, tlsText(tlsServerYAML(cert, key))), ca, nil)
+		lines := startLines(t, s)
+		require.Len(t, lines, 1)
+		assert.Equal(t, []any{}, lines[0]["names"], "[], not null")
+		res := s.do(http.MethodGet, "/api/v1/config/status", "eye", "")
+		require.Equal(t, http.StatusOK, res.code)
+		assert.Contains(t, res.body, `"names":[]`)
+	})
+
 	t.Run("an expired leaf", func(t *testing.T) {
 		ca := tlstest.NewCA(t)
 		certPEM, keyPEM := ca.Issue(t, -time.Hour, "127.0.0.1", "localhost")
