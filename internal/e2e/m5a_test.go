@@ -175,8 +175,17 @@ func m5aServer(t *testing.T, streams string) *m5a {
 // test ends, or earlier through its stop.
 func m5aStart(t *testing.T, path string) *m5a {
 	t.Helper()
+	return m5aStartWith(t, path, server.Options{})
+}
+
+// m5aStartWith is m5aStart with the options a scenario adds (the
+// transcoder's environment, say): Version, LogOut and RequiredIterations
+// are the scenarios' own whatever opt holds.
+func m5aStartWith(t *testing.T, path string, opt server.Options) *m5a {
+	t.Helper()
 	logs := &m5aLog{}
-	srv, err := server.New(path, server.Options{Version: "e2e", LogOut: logs, RequiredIterations: m5aIter})
+	opt.Version, opt.LogOut, opt.RequiredIterations = "e2e", logs, m5aIter
+	srv, err := server.New(path, opt)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
