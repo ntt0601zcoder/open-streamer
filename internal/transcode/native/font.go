@@ -24,7 +24,9 @@ const noSystemFonts = "/"
 // drawn silently in whatever font fontconfig finds. With no font known to
 // fontconfig the fallback fails, and so does the graph. fontconfig reads the
 // variable each time drawtext asks it, so it is set once, here, before any
-// libav thread runs; the child draws nothing else with fontconfig.
+// libav thread runs; the child draws nothing else with fontconfig. The
+// variable is inherited by every subprocess of a binary that links this
+// package, test binaries included.
 func init() {
 	if err := os.Setenv("FONTCONFIG_FILE", noSystemFonts); err != nil {
 		panic("native: FONTCONFIG_FILE: " + err.Error())

@@ -191,6 +191,7 @@ func NewWith(c Config) (*Pipeline, error) {
 	if len(specs) > 0 {
 		wm := newWatermarker(c.Now)
 		if err := wm.set(c.Watermark); err != nil {
+			wm.close() // set may have made the private directory
 			return nil, fmt.Errorf("transcode: new pipeline: %w", err)
 		}
 		p.video = newVideoPath(specs, &p.stats, wm, p.thumb)

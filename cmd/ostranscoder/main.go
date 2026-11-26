@@ -94,6 +94,7 @@ func probeFont(w io.Writer, path string) int {
 		return 0
 	}
 	reason := strings.Join(strings.Fields(err.Error()), " ")
+	reason = strings.TrimPrefix(reason, "transcode: probe font: ")
 	reason = strings.TrimPrefix(reason, "font: ")
 	_, _ = fmt.Fprintf(w, "font: %s\n", reason)
 	return exitProbeFailed

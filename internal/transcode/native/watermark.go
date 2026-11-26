@@ -85,7 +85,8 @@ func (m *watermarker) active() bool { return m.wm != nil }
 
 // set validates w and makes it the watermark from the next picture; nil
 // removes it. A text watermark's font (the built-in one when w.Font is
-// empty) replaces <dir>/font.ttf when it differs from the one there. An
+// empty) replaces <dir>/font.ttf when it differs from the one there; nil
+// and an image watermark drop the font and remove font.ttf (dropFont). An
 // error leaves the current watermark in place. The watermarker keeps
 // w.Font, which nobody may change afterwards; the caller may drop its own
 // reference.
@@ -93,6 +94,7 @@ func (m *watermarker) set(w *picture.Watermark) error {
 	if w == nil {
 		m.wm, m.loc, m.img = nil, nil, nil
 		m.freeGraph()
+		m.dropFont()
 		return nil
 	}
 	if err := w.Validate(); err != nil {
@@ -119,7 +121,21 @@ func (m *watermarker) set(w *picture.Watermark) error {
 	r.Font = nil
 	m.wm, m.loc, m.img = &r, loc, img
 	m.freeGraph()
+	if img != nil {
+		m.dropFont()
+	}
 	return nil
+}
+
+// dropFont forgets the font, so that an operator's font is not held while
+// no text watermark needs it, and removes <dir>/font.ttf, best effort: the
+// next text watermark writes its font again, since m.font is nil. Call it
+// after freeGraph.
+func (m *watermarker) dropFont() {
+	m.font = nil
+	if m.dir != "" {
+		_ = os.Remove(filepath.Join(m.dir, "font.ttf"))
+	}
 }
 
 // syncFont makes <dir>/font.ttf hold font, the built-in one when empty,
@@ -327,11 +343,18 @@ func (m *watermarker) restoreFiles() error {
 	return nil
 }
 
-// errDrawtext is the error of a text graph drawtext could not be created
-// for. It loads the font as it is created: FreeType refusing font.ttf fails
-// here (fontconfig knows no font to fall back to, noSystemFonts), as does
-// an unreadable text file. libav's own error is then fontconfig's ENOENT.
-var errDrawtext = errors.New("drawtext could not load the font or read the text")
+// drawtextError is the error of a text graph drawtext could not be
+// created for, with libav's error. drawtext loads the font as it is
+// created: a font FreeType refuses fails here (fontconfig knows no font to
+// fall back to, noSystemFonts; libav's error is then fontconfig's ENOENT),
+// as does an unreadable text file or any other failure of drawtext's init.
+type drawtextError struct{ libav error }
+
+func (e *drawtextError) Error() string {
+	return "drawtext could not load the font or read the text: " + e.libav.Error()
+}
+
+func (e *drawtextError) Unwrap() error { return e.libav }
 
 // opacity is OpacityPct as a libavfilter alpha with two decimals.
 func opacity(pct int) string { return fmt.Sprintf("%.2f", float64(pct)/100) }
@@ -421,7 +444,7 @@ func (m *watermarker) build(k graphKey, pts int64) error {
 	}
 	if err := g.Parse(m.desc, inputs, outputs); err != nil {
 		if m.img == nil {
-			return fmt.Errorf("watermark: parse graph: %w: %w", errDrawtext, err)
+			return fmt.Errorf("watermark: parse graph: %w", &drawtextError{err})
 		}
 		return fmt.Errorf("watermark: parse graph: %w", err)
 	}
@@ -550,10 +573,10 @@ func ProbeFont(font []byte) error {
 		return fmt.Errorf("transcode: probe font: fill picture: %w", err)
 	}
 	if _, err := m.apply(fr); err != nil {
-		if errors.Is(err, errDrawtext) {
-			// The text is the probe's own: the font is what failed, and
-			// libav's error says nothing about it.
-			return errors.New("transcode: probe font: FreeType cannot load it")
+		if de, ok := errors.AsType[*drawtextError](err); ok {
+			// The text is the probe's own, so the font is the likely cause;
+			// libav's error is all that is known about why.
+			return fmt.Errorf("transcode: probe font: drawtext cannot load it: %w", de.libav)
 		}
 		return fmt.Errorf("transcode: probe font: %w", err)
 	}

@@ -852,14 +852,15 @@ func TestProbeFontFlag(t *testing.T) {
 	for _, tc := range []struct {
 		name, path string
 		code       int
+		prefix     string // what stdout starts with, when pinned
 	}{
-		{"font", write("mono.ttf", mono), 0},
-		{"text file", write("notes.txt", []byte("hello\n")), exitProbeFailed},
-		{"missing", dir + "/missing.ttf", exitProbeFailed},
-		{"directory", dir, exitProbeFailed},
-		{"symbolic link", link, exitProbeFailed},
-		{"freetype refuses", write("zeros.ttf", zeroTablesFont(t)), exitProbeFailed},
-		{"too big", write("big.ttf", big), exitProbeFailed},
+		{"font", write("mono.ttf", mono), 0, "font: ok\n"},
+		{"text file", write("notes.txt", []byte("hello\n")), exitProbeFailed, "font: 6 bytes, shorter than"},
+		{"missing", dir + "/missing.ttf", exitProbeFailed, "font: cannot open the file: no such file"},
+		{"directory", dir, exitProbeFailed, "font: cannot open the file: not a regular file\n"},
+		{"symbolic link", link, exitProbeFailed, "font: cannot open the file: it is a symbolic link\n"},
+		{"freetype refuses", write("zeros.ttf", zeroTablesFont(t)), exitProbeFailed, "font: drawtext cannot load it: "},
+		{"too big", write("big.ttf", big), exitProbeFailed, "font: 25165825 bytes, over 25165824\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			code, stdout, stderr := runMain(t, "-probe font "+tc.path)
@@ -869,6 +870,9 @@ func TestProbeFontFlag(t *testing.T) {
 			assert.Equal(t, 1, strings.Count(stdout, "\n"), "stdout %q", stdout)
 			assert.True(t, strings.HasSuffix(stdout, "\n"), "stdout %q", stdout)
 			assert.NotContains(t, stdout, dir, "the file's path is in stdout")
+			assert.True(t, strings.HasPrefix(stdout, tc.prefix), "stdout %q, want a start of %q", stdout, tc.prefix)
+			assert.NotContains(t, stdout, "transcode:", "an internal prefix in stdout")
+			assert.NotContains(t, stdout, "font: font:")
 			if tc.code == 0 {
 				assert.Equal(t, "font: ok\n", stdout)
 			} else {

@@ -823,8 +823,8 @@ func badFont(t *testing.T) []byte {
 	return b
 }
 
-// blackFrame is a 640×360 black yuv420p picture, freed at the end of the
-// test.
+// blackFrame is a 640×360 black yuv420p picture at PTS 0, freed at the end
+// of the test.
 func blackFrame(t *testing.T) *astiav.Frame {
 	t.Helper()
 	fr := astiav.AllocFrame()
@@ -835,6 +835,7 @@ func blackFrame(t *testing.T) *astiav.Frame {
 	fr.SetSampleAspectRatio(astiav.NewRational(1, 1))
 	require.NoError(t, fr.AllocBuffer(0))
 	require.NoError(t, fr.ImageFillBlack())
+	fr.SetPts(0) // an image watermark's overlay needs one
 	return fr
 }
 
@@ -967,6 +968,43 @@ func TestWatermarkFontRestored(t *testing.T) {
 	requireFontFile(t, m, mono, "directory restored")
 }
 
+// TestWatermarkFontDropped: an image watermark, or none, drops the
+// operator's font and removes font.ttf; the next text watermark writes its
+// font again and draws with it.
+func TestWatermarkFontDropped(t *testing.T) {
+	mono := monoFont(t)
+	fr := blackFrame(t)
+	m := newTestWatermarker(t)
+	text := picture.Watermark{Text: "iiiiiiii", SizePct: 20, Font: mono}
+	for _, tc := range []struct {
+		name string
+		w    *picture.Watermark
+	}{
+		{"image", &picture.Watermark{Image: magenta64(t)}},
+		{"none", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, m.set(&text))
+			wide := litBox(t, m, fr)
+			font := filepath.Join(m.dir, "font.ttf")
+			requireFontFile(t, m, mono, "mono")
+
+			require.NoError(t, m.set(tc.w))
+			assert.Nil(t, m.font, "the font is still held")
+			_, err := os.Stat(font)
+			require.ErrorIs(t, err, os.ErrNotExist, "font.ttf is left")
+			if tc.w != nil {
+				_, err = m.apply(fr)
+				require.NoError(t, err)
+			}
+
+			require.NoError(t, m.set(&text))
+			assert.Equal(t, wide, litBox(t, m, fr))
+			requireFontFile(t, m, mono, "mono again")
+		})
+	}
+}
+
 // TestWatermarkBadFont: a font CheckFont takes and FreeType refuses fails
 // the build with an error about the font.
 func TestWatermarkBadFont(t *testing.T) {
@@ -981,7 +1019,8 @@ func TestProbeFont(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	require.NoError(t, ProbeFont(monoFont(t)))
 	err := ProbeFont(badFont(t))
-	require.ErrorContains(t, err, "font")
+	require.ErrorContains(t, err, "transcode: probe font: drawtext cannot load it: ")
+	assert.NotContains(t, err.Error(), "FreeType")
 	require.Error(t, ProbeFont(nil))
 	require.Error(t, ProbeFont([]byte("not a font")))
 	assert.Empty(t, ostxDirs(t), "the probe removes its directory")
