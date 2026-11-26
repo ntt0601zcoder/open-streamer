@@ -44,9 +44,11 @@ const mask = "xxxxx"
 var secretKeys = []string{"passphrase", "password", "token", "secret", "key"}
 
 // URL returns rawURL with its password and secret query values hidden, and
-// for rtmp:// its stream name (the last path segment, the stream key) cut
-// to its first 2 characters (RTMPKey). A string without "://" is returned
-// as is; one that does not parse is "<invalid url>".
+// for an RTMP scheme (RTMPScheme: rtmp://, rtmps://, rtmps+insecure://)
+// its stream name (the last path segment, the stream key) cut to its first
+// 2 characters (RTMPKey). The scheme comes back in lower case. A string
+// without "://" is returned as is; one that does not parse is
+// "<invalid url>".
 func URL(rawURL string) string {
 	if !strings.Contains(rawURL, "://") {
 		return rawURL
@@ -80,8 +82,8 @@ func URL(rawURL string) string {
 		}
 		u.RawQuery = strings.Join(pairs, "&")
 	}
-	if strings.EqualFold(u.Scheme, "rtmp") {
-		u.Scheme = "rtmp"
+	if RTMPScheme(u.Scheme) {
+		u.Scheme = strings.ToLower(u.Scheme)
 		if p := strings.TrimRight(u.Path, "/"); p != "" {
 			u.Path, u.RawPath = RTMPKey(p), ""
 		}
@@ -90,6 +92,16 @@ func URL(rawURL string) string {
 		}
 	}
 	return u.String()
+}
+
+// RTMPScheme reports whether scheme (any case) is rtmp, rtmps or
+// rtmps+insecure: the schemes whose last path segment is a stream key.
+func RTMPScheme(scheme string) bool {
+	switch strings.ToLower(scheme) {
+	case "rtmp", "rtmps", "rtmps+insecure":
+		return true
+	}
+	return false
 }
 
 // RTMPKey masks the stream name of an RTMP path, its last segment, keeping
@@ -107,7 +119,7 @@ func RTMPKey(path string) string {
 
 // Masked reports whether rawURL carries the mask where URL writes it: as
 // the password, as a lone user, as the value of a secret query parameter,
-// or, for rtmp://, at the end of the stream name. Such a URL came back
+// or, for an RTMP scheme (RTMPScheme), at the end of the stream name. Such a URL came back
 // from URL, so it no longer holds the secret and must not be stored.
 func Masked(rawURL string) bool {
 	if !strings.Contains(rawURL, "://") {
@@ -138,7 +150,7 @@ func Masked(rawURL string) bool {
 			return true
 		}
 	}
-	if strings.EqualFold(u.Scheme, "rtmp") {
+	if RTMPScheme(u.Scheme) {
 		p := strings.TrimRight(u.Path, "/")
 		if u.Opaque != "" {
 			p = u.Opaque

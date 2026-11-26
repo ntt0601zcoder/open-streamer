@@ -146,3 +146,38 @@ func TestTag(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestURLTLSSchemes(t *testing.T) {
+	masked := []struct{ in, want string }{
+		{"rtmps://h/live/secretkey", "rtmps://h/live/sexxxxx"},
+		{"rtmps+insecure://u:pw@h:443/live/secretkey?token=t0k", "rtmps+insecure://u:xxxxx@h:443/live/sexxxxx?token=xxxxx"},
+		{"RTMPS://h/live/secretkey", "rtmps://h/live/sexxxxx"},
+		{"RTMPS+Insecure://h/live/secretkey", "rtmps+insecure://h/live/sexxxxx"},
+		{"rtsps://u:pw@cam/s", "rtsps://u:xxxxx@cam/s"},
+		{"rtsps+insecure://u:pw@cam/s", "rtsps+insecure://u:xxxxx@cam/s"},
+		{"rtmp://h/live/secretkey", "rtmp://h/live/sexxxxx"},
+		{"rtmp://u:pw@h:1935/live/secretkey?token=t0k", "rtmp://u:xxxxx@h:1935/live/sexxxxx?token=xxxxx"},
+		{"RTMP://h/live/secretkey", "rtmp://h/live/sexxxxx"},
+	}
+	for _, c := range masked {
+		assert.Equal(t, c.want, URL(c.in), c.in)
+		assert.True(t, Masked(c.want), c.want)
+		assert.False(t, Masked(c.in), c.in)
+	}
+	// rtsps paths are not stream keys.
+	for _, x := range []string{"rtsps://cam/live/secretkey", "rtsps+insecure://cam/live/secretkey"} {
+		assert.Equal(t, x, URL(x))
+		assert.False(t, Masked(x), x)
+	}
+	assert.False(t, Masked("rtsps://cam/live/abxxxxx"), "the mask in an rtsps path is not where URL writes it")
+	assert.True(t, Masked("rtmps+insecure://h/live/abxxxxx"))
+}
+
+func TestRTMPScheme(t *testing.T) {
+	for _, s := range []string{"rtmp", "rtmps", "rtmps+insecure", "RTMP", "RTMPS", "Rtmps+Insecure"} {
+		assert.True(t, RTMPScheme(s), s)
+	}
+	for _, s := range []string{"", "rtsp", "rtsps", "rtsps+insecure", "rtmpt", "rtmp+insecure", "http", "rtmps+"} {
+		assert.False(t, RTMPScheme(s), s)
+	}
+}
