@@ -18,6 +18,18 @@
 // they were bound, and the keys that differ from the ones the process
 // started with are reported as restart_required until it restarts.
 //
+// # Assets
+//
+// New opens the one asset.Store of server.assets_dir; a reload never opens
+// it again, since the server section is not applied while running. An
+// upload is read, checked and, for a font, probed by the transcoder
+// (`ostranscoder -probe font FILE`, 10 s) without the apply mutex; then,
+// under it, the streams that name the asset are refreshed, and a stream
+// left stopped that names it is tried again by applying the text in force,
+// which writes nothing. A delete takes the mutex for its reference check
+// and its removal, so a stream edit that starts using the asset and the
+// delete are in one order.
+//
 // # Locks
 //
 // cfg serialises the writers. The readers never take it: the text in force

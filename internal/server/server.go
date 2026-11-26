@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/api"
+	"github.com/ntt0601zcoder/open-streamer/internal/asset"
 	"github.com/ntt0601zcoder/open-streamer/internal/auth"
 	"github.com/ntt0601zcoder/open-streamer/internal/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
@@ -58,6 +59,9 @@ type Options struct {
 	// the test holds is how a teardown is held); nil means ingest.Open.
 	// cmd/openstreamer never sets it.
 	Open func(ctx context.Context, url string) (ingest.Reader, error)
+	// TranscoderEnv is added to the environment of every transcoder child
+	// and of the font probe. Tests only; cmd/openstreamer never sets it.
+	TranscoderEnv []string
 }
 
 // Addrs are the listeners' addresses, host:port as bound; "" when off.
@@ -77,6 +81,13 @@ type Server struct {
 	file    *config.File
 	users   atomic.Pointer[auth.Users]
 	state   atomic.Pointer[state] // the text in force and its status
+
+	// assets is the one Store of server.assets_dir, opened once in New and
+	// never again (a second Open would sweep the temp files of the uploads
+	// in flight); every method of the Store of no directory is
+	// asset.ErrOff. assetsOn is whether there is a directory.
+	assets   *asset.Store
+	assetsOn bool
 
 	// cfg serialises the writers and guards the fields below.
 	cfg           sync.Mutex
@@ -131,11 +142,26 @@ func New(path string, opt Options) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("server: new: %w", err)
 	}
+	transcoder := sec.Transcoder.Binary
+	if transcoder == "" {
+		transcoder = defaultTranscoder()
+	}
+	// Without a transcoder no font is probed: there is no child to hurt.
+	var assetOpt asset.Options
+	if transcoder != "" {
+		assetOpt.ProbeFont = fontProber(transcoder, opt.TranscoderEnv, fontProbeLimit)
+	}
+	assets, err := asset.Open(sec.AssetsDir, assetOpt)
+	if err != nil {
+		return nil, fmt.Errorf("server: new: %w", err)
+	}
 	s := &Server{
 		log:      log,
 		parseOpt: parseOpt,
 		started:  sec,
 		file:     file,
+		assets:   assets,
+		assetsOn: sec.AssetsDir != "",
 		applied:  text,
 		loadedAt: time.Now(),
 		restart:  []string{},
@@ -152,16 +178,13 @@ func New(path string, opt Options) (*Server, error) {
 		return nil, err
 	}
 
-	transcoder := sec.Transcoder.Binary
-	if transcoder == "" {
-		transcoder = defaultTranscoder()
-	}
 	env := stream.Env{
-		Transcoder: transcoder,
-		AssetsDir:  sec.AssetsDir,
-		Reserved:   reserved,
-		Logger:     log,
-		Open:       opt.Open,
+		Transcoder:    transcoder,
+		AssetsDir:     sec.AssetsDir,
+		Reserved:      reserved,
+		Logger:        log,
+		Open:          opt.Open,
+		TranscoderEnv: opt.TranscoderEnv,
 	}
 	if s.addrs.RTMP != "" {
 		env.RTMPPlay, env.RTMPApp = s.addrs.RTMP, sec.RTMP.App

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/ntt0601zcoder/open-streamer/internal/asset"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 )
 
@@ -10,7 +11,7 @@ type reason struct {
 	n    uint64
 }
 
-// collect writes the config's and the output servers' series.
+// collect writes the config's, the assets' and the output servers' series.
 func (s *Server) collect(w *metrics.Writer) {
 	st := s.state.Load().status
 	w.Gauge("openstreamer_config_load_errors", "Entries and streams the start skipped or left stopped.", float64(len(st.LoadErrors)))
@@ -23,6 +24,17 @@ func (s *Server) collect(w *metrics.Writer) {
 		restart = 1
 	}
 	w.Gauge("openstreamer_config_restart_required", "1 while the file's server section differs from the running one.", restart)
+
+	// No series without an assets directory, nor while it cannot be read.
+	if t := s.assets.Totals(); t != nil {
+		kinds := []asset.Kind{asset.Image, asset.Font}
+		for _, k := range kinds {
+			w.Gauge("openstreamer_assets", "Assets in the assets directory, by kind.", float64(t[k][0]), metrics.L("kind", string(k)))
+		}
+		for _, k := range kinds {
+			w.Gauge("openstreamer_assets_bytes", "Bytes of the assets in the assets directory, by kind.", float64(t[k][1]), metrics.L("kind", string(k)))
+		}
+	}
 
 	// Family by family, as the exposition groups them; an output whose
 	// listener is off has no series.
