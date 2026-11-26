@@ -184,23 +184,23 @@ func (s Server) check() []error {
 }
 
 // checkTLS returns the errors of server.tls and the tls_listen keys of
-// the resolved section r: the pair is both files or neither, a tls_listen
+// the resolved section s: the pair is both files or neither, a tls_listen
 // is host:port and needs the pair, and it is not the same text as its
 // plain sibling's listen unless the port is 0.
-func (r Server) checkTLS() []error {
+func (s Server) checkTLS() []error {
 	var errs []error
-	hasPair := r.TLS.CertFile != "" && r.TLS.KeyFile != ""
+	hasPair := s.TLS.CertFile != "" && s.TLS.KeyFile != ""
 	switch {
-	case r.TLS.CertFile != "" && r.TLS.KeyFile == "":
+	case s.TLS.CertFile != "" && s.TLS.KeyFile == "":
 		errs = append(errs, fmt.Errorf("server.tls.cert_file: needs server.tls.key_file"))
-	case r.TLS.KeyFile != "" && r.TLS.CertFile == "":
+	case s.TLS.KeyFile != "" && s.TLS.CertFile == "":
 		errs = append(errs, fmt.Errorf("server.tls.key_file: needs server.tls.cert_file"))
 	}
 	for _, l := range []struct{ name, listen, tls string }{
-		{"http", r.HTTP.Listen, r.HTTP.TLSListen},
-		{"api", r.API.Listen, r.API.TLSListen},
-		{"rtmp", r.RTMP.Listen, r.RTMP.TLSListen},
-		{"rtsp", r.RTSP.Listen, r.RTSP.TLSListen},
+		{"http", s.HTTP.Listen, s.HTTP.TLSListen},
+		{"api", s.API.Listen, s.API.TLSListen},
+		{"rtmp", s.RTMP.Listen, s.RTMP.TLSListen},
+		{"rtsp", s.RTSP.Listen, s.RTSP.TLSListen},
 	} {
 		if l.tls == "" {
 			continue

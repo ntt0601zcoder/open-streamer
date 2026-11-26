@@ -44,9 +44,11 @@ const mask = "xxxxx"
 var secretKeys = []string{"passphrase", "password", "token", "secret", "key"}
 
 // URL returns rawURL with its password and secret query values hidden, and
-// for an RTMP scheme (RTMPScheme: rtmp://, rtmps://, rtmps+insecure://)
-// its stream name (the last path segment, the stream key) cut to its first
-// 2 characters (RTMPKey). The scheme comes back in lower case. A string
+// for a scheme of the RTMP family (rtmpFamily: an RTMPScheme, or one of
+// them with "+insecure", such as rtmp+insecure:// which validation
+// refuses but an error may still quote) its stream name (the last path
+// segment, the stream key) cut to its first 2 characters (RTMPKey). The
+// scheme comes back in lower case, as url.Parse leaves it. A string
 // without "://" is returned as is; one that does not parse is
 // "<invalid url>".
 func URL(rawURL string) string {
@@ -82,8 +84,7 @@ func URL(rawURL string) string {
 		}
 		u.RawQuery = strings.Join(pairs, "&")
 	}
-	if RTMPScheme(u.Scheme) {
-		u.Scheme = strings.ToLower(u.Scheme)
+	if rtmpFamily(u.Scheme) {
 		if p := strings.TrimRight(u.Path, "/"); p != "" {
 			u.Path, u.RawPath = RTMPKey(p), ""
 		}
@@ -104,6 +105,13 @@ func RTMPScheme(scheme string) bool {
 	return false
 }
 
+// rtmpFamily reports whether scheme (any case) is an RTMPScheme, with or
+// without "+insecure": every scheme whose stream key URL and Masked hide,
+// including rtmp+insecure, which RTMPScheme does not accept.
+func rtmpFamily(scheme string) bool {
+	return RTMPScheme(strings.TrimSuffix(strings.ToLower(scheme), "+insecure"))
+}
+
 // RTMPKey masks the stream name of an RTMP path, its last segment, keeping
 // its first 2 characters; a name of up to 2 characters is masked whole.
 func RTMPKey(path string) string {
@@ -119,8 +127,9 @@ func RTMPKey(path string) string {
 
 // Masked reports whether rawURL carries the mask where URL writes it: as
 // the password, as a lone user, as the value of a secret query parameter,
-// or, for an RTMP scheme (RTMPScheme), at the end of the stream name. Such a URL came back
-// from URL, so it no longer holds the secret and must not be stored.
+// or, for a scheme of the RTMP family (rtmpFamily), at the end of the
+// stream name. Such a URL came back from URL, so it no longer holds the
+// secret and must not be stored.
 func Masked(rawURL string) bool {
 	if !strings.Contains(rawURL, "://") {
 		return false
@@ -150,7 +159,7 @@ func Masked(rawURL string) bool {
 			return true
 		}
 	}
-	if RTMPScheme(u.Scheme) {
+	if rtmpFamily(u.Scheme) {
 		p := strings.TrimRight(u.Path, "/")
 		if u.Opaque != "" {
 			p = u.Opaque

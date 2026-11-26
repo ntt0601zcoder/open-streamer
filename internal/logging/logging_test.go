@@ -81,6 +81,15 @@ func TestScrub(t *testing.T) {
 	if !strings.Contains(out, "rtmps+insecure://") {
 		t.Errorf("scheme lost in %q", out)
 	}
+	out = Scrub("refused rtmp+insecure://u:pw@h/live/secretkey?token=t0k here")
+	for _, s := range []string{"pw", "secretkey", "t0k"} {
+		if strings.Contains(out, s) {
+			t.Errorf("%q leaked in %q", s, out)
+		}
+	}
+	if !strings.Contains(out, "rtmp+insecure://") {
+		t.Errorf("scheme lost in %q", out)
+	}
 
 	out = Scrub(`rtsp://u:pa'ss"w<d@cam/1 down`)
 	for _, s := range []string{"pa'ss", `"w`, "w<d", "ss", "pa'"} {

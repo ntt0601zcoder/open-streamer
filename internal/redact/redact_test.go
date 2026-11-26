@@ -158,6 +158,8 @@ func TestURLTLSSchemes(t *testing.T) {
 		{"rtmp://h/live/secretkey", "rtmp://h/live/sexxxxx"},
 		{"rtmp://u:pw@h:1935/live/secretkey?token=t0k", "rtmp://u:xxxxx@h:1935/live/sexxxxx?token=xxxxx"},
 		{"RTMP://h/live/secretkey", "rtmp://h/live/sexxxxx"},
+		{"rtmp+insecure://u:pw@h/live/secretkey?token=t", "rtmp+insecure://u:xxxxx@h/live/sexxxxx?token=xxxxx"},
+		{"RTMP+INSECURE://h/live/secretkey", "rtmp+insecure://h/live/sexxxxx"},
 	}
 	for _, c := range masked {
 		assert.Equal(t, c.want, URL(c.in), c.in)
@@ -171,6 +173,16 @@ func TestURLTLSSchemes(t *testing.T) {
 	}
 	assert.False(t, Masked("rtsps://cam/live/abxxxxx"), "the mask in an rtsps path is not where URL writes it")
 	assert.True(t, Masked("rtmps+insecure://h/live/abxxxxx"))
+	assert.True(t, Masked("rtmp+insecure://h/live/abxxxxx"))
+}
+
+func TestRTMPFamily(t *testing.T) {
+	for _, s := range []string{"rtmp", "rtmps", "rtmps+insecure", "rtmp+insecure", "RTMP+Insecure"} {
+		assert.True(t, rtmpFamily(s), s)
+	}
+	for _, s := range []string{"", "rtsp", "rtsps+insecure", "http+insecure", "rtmpt", "rtmp+insecure+insecure", "+insecure"} {
+		assert.False(t, rtmpFamily(s), s)
+	}
 }
 
 func TestRTMPScheme(t *testing.T) {
