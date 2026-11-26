@@ -57,6 +57,7 @@ func NewCA(t testing.TB) *CA {
 }
 
 // Issue returns a leaf for hosts (DNS names and IP addresses), valid from an hour ago for d; d may be negative (expired).
+// A positive d under one hour also yields a leaf that has already expired, since its validity starts an hour ago.
 // A negative d makes a leaf that ended |d| before an hour ago and began an hour before that. The key is ECDSA P-256 in a
 // PKCS #8 "PRIVATE KEY" block; each call makes a new key and a new random serial.
 func (c *CA) Issue(t testing.TB, d time.Duration, hosts ...string) (certPEM, keyPEM []byte) {

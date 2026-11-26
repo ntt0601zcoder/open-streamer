@@ -239,18 +239,19 @@ func TestLoad(t *testing.T) {
 		cert, key []byte
 		missing   string // "cert" or "key": that file does not exist
 		blame     string // "cert" or "key": the file the error names
+		reason    string // when set, the error's exact fixed text after the file
 	}{
 		{name: "missing cert", key: good.key, missing: "cert", blame: "cert"},
 		{name: "missing key", cert: good.cert, missing: "key", blame: "key"},
 		{name: "key of another certificate", cert: good.cert, key: other.key, blame: "key"},
 		{name: "cert not PEM", cert: []byte("not a certificate\n"), key: good.key, blame: "cert"},
-		{name: "key not PEM", cert: good.cert, key: []byte("not a key\n"), blame: "key"},
-		{name: "certificate as the key", cert: good.cert, key: good.cert, blame: "key"},
+		{name: "key not PEM", cert: good.cert, key: []byte("not a key\n"), blame: "key", reason: "no PEM data"},
+		{name: "certificate as the key", cert: good.cert, key: good.cert, blame: "key", reason: "holds a certificate, not a private key"},
 		{name: "key as the certificate", cert: good.key, key: good.key, blame: "cert"},
 		{name: "cert PEM without a certificate", cert: pem.EncodeToMemory(&pem.Block{Type: "OTHER", Bytes: []byte{1}}), key: good.key, blame: "cert"},
-		{name: "key PEM without a key", cert: good.cert, key: pem.EncodeToMemory(&pem.Block{Type: "OTHER", Bytes: []byte{1}}), blame: "key"},
-		{name: "cert block not DER", cert: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte{1, 2, 3}}), key: good.key, blame: "cert"},
-		{name: "key block not DER", cert: good.cert, key: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte{1, 2, 3}}), blame: "key"},
+		{name: "key PEM without a key", cert: good.cert, key: pem.EncodeToMemory(&pem.Block{Type: "OTHER", Bytes: []byte{1}}), blame: "key", reason: "no PRIVATE KEY block"},
+		{name: "cert block not DER", cert: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte{1, 2, 3}}), key: good.key, blame: "cert", reason: "the certificate does not parse"},
+		{name: "key block not DER", cert: good.cert, key: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte{1, 2, 3}}), blame: "key", reason: "the private key does not parse as PKCS #1, PKCS #8 or SEC 1"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -268,10 +269,13 @@ func TestLoad(t *testing.T) {
 			msg := err.Error()
 			t.Log(msg)
 			assert.True(t, strings.HasPrefix(msg, "certs: load: "), msg)
+			blamed := keyFile
 			if c.blame == "cert" {
-				assert.Contains(t, msg, certFile)
-			} else {
-				assert.Contains(t, msg, keyFile)
+				blamed = certFile
+			}
+			assert.Contains(t, msg, blamed)
+			if c.reason != "" {
+				assert.Equal(t, "certs: load: "+blamed+": "+c.reason, msg)
 			}
 			assertNoKeyBytes(t, msg, good.key)
 			assertNoKeyBytes(t, msg, other.key)
@@ -504,9 +508,12 @@ func TestStoreWatch(t *testing.T) {
 	assert.Equal(t, 1, nTrue, "%v", got)
 	assert.Equal(t, serialOf(t, b.cert), served(t, addr, ca))
 
-	// No change reports nothing.
+	// No change reports nothing: no error and no new leaf. A trailing
+	// (false, nil) from a stat taken between the renames above is allowed.
 	time.Sleep(200 * time.Millisecond)
-	assert.Empty(t, r.take())
+	for _, x := range r.take() {
+		assert.False(t, x.err != nil || x.changed, "no change reported %v", x)
+	}
 
 	// A half-written pair is reported with an error on every tick until the
 	// next full write.
@@ -542,11 +549,11 @@ func TestStoreWatch(t *testing.T) {
 		r.waitFor(t, "unreadable key reported", isErr)
 		assert.NotEmpty(t, s.Info().LastError)
 
+		r.take()
 		require.NoError(t, os.Chmod(keyFile, 0o600))
 		fi2, err := os.Stat(keyFile)
 		require.NoError(t, err)
 		require.True(t, fi2.ModTime().Equal(touched), "chmod leaves the modification time")
-		r.take()
 		r.waitFor(t, "readable key reported", isOK(false))
 		assert.Empty(t, s.Info().LastError)
 		assert.Equal(t, serialOf(t, c.cert), served(t, addr, ca))

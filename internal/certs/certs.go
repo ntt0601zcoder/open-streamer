@@ -195,9 +195,9 @@ func same(a, b os.FileInfo) bool {
 }
 
 // read loads and checks the pair. Its errors start with the file at fault
-// and never hold the key file's content: both files are parsed here first,
-// with fixed reasons for the key, so whatever tls.X509KeyPair still refuses
-// is a key that does not fit the certificate, in its own fixed words.
+// and never hold file content: both files are parsed here first, with fixed
+// reasons, so whatever tls.X509KeyPair still refuses is a key that does not
+// fit the certificate, in its own fixed words.
 func read(certFile, keyFile string) (*pair, error) {
 	certPEM, err := os.ReadFile(certFile)
 	if err != nil {
@@ -213,7 +213,7 @@ func read(certFile, keyFile string) (*pair, error) {
 	}
 	leaf, err := x509.ParseCertificate(der)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", certFile, err)
+		return nil, fmt.Errorf("%s: the certificate does not parse", certFile)
 	}
 	if err := checkKey(keyPEM); err != nil {
 		return nil, fmt.Errorf("%s: %w", keyFile, err)
