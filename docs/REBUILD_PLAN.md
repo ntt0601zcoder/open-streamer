@@ -35,7 +35,7 @@ of the five can exist.
 | Transcoding | Per-stream subprocess on libav: decode once, encode an N-rung ladder, NVENC and software, audio AAC re-encode, passthrough per track |
 | Picture features (M4c) | Watermark (text with time directives, image from an asset library), applied before the ladder so every encoded rung carries it (a ladder with a copy-video rendition rejects it). Thumbnails: a JPEG every N seconds from the decoder, also for passthrough streams by decoding keyframes only |
 | Outputs | HLS (fMP4 and TS), DASH (fMP4), HTTP-TS, SRT, RTMP play, RTSP play, RTMP push-out |
-| Control | Declarative stream specs in a file store, REST API, per-stream supervisor, input failover by priority |
+| Control | Declarative stream specs in one YAML config file with the server settings and the users, REST API with Basic auth (viewer and editor), a whole-config editor, reload on SIGHUP, per-stream supervisor, input failover by priority |
 | Operations | Prometheus metrics, `slog` JSON logs, pprof, conformance CLI |
 | Platforms | The server is pure Go and builds for any OS. The transcoder runs on Linux amd64 and arm64 with glibc 2.39 or later (Ubuntu 24.04+, Debian 13+); `internal/transcode` returns `errors.ErrUnsupported` on non-Unix systems. Encoding is software (libx264) and NVIDIA NVENC (`h264_nvenc`, per rung). macOS, Windows, VAAPI, QSV and VideoToolbox are out of v2.0 (ruling R-M4d) |
 | Later in v2.0 (M6) | DVR and timeshift, RTMP auto-publish by template, templates, playback sessions and tokens, webhooks |
@@ -434,9 +434,15 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   the cache starts, comes first), and the merger counts into
   `Stats.PresentationOut` and `Stats.PresentationDropped`, not `FramesOut`
   or `MergeDropped` (R-B7).
-  osdev serves the presentation of stream `<name>` as `<name>_abr`, on HLS
-  (TS and fMP4) and DASH only; RTMP, RTSP, SRT, HTTP-TS and `copy://` do not
-  find it, and the label `abr` is reserved (R-B2; product naming is M5's).
+  The product names it (M5a's R-D3): a stream with a ladder is served as
+  `<name>`, which over HLS (TS and fMP4) and DASH is the presentation and
+  over HTTP-TS, RTMP, RTSP, SRT and RTMP push is rendition 0, the first in
+  the spec; each rendition is also its own stream `<name>_<label>` on every
+  enabled output; the source of a laddered stream is not served to players
+  (`copy://<name>` reads it), there is no `<name>_abr`, and `abr` is an
+  ordinary label. osdev keeps its development names: the presentation is
+  `<name>_abr`, on HLS and DASH only, and there the label `abr` is reserved
+  (R-B2).
 - **Passthrough** (`name=label:copy`) needs no child: copy tracks go from the
   host's subscription to the rendition's merger directly, and a stream whose
   renditions all copy never starts a transcoding child; with thumbnails on it
@@ -576,18 +582,83 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 
 ### 3.6 Control plane
 
-- **Stream spec:** a declarative document (inputs by priority, transcode
-  ladder, outputs). The file store writes each spec atomically (write and
-  rename).
-- **Supervisor:** one goroutine per stream owns all of that stream's state and
-  receives changes as messages, so there are no cross-stream locks. Changing
-  inputs or the output set is applied in place; any other change rebuilds the
-  stream's pipeline. This replaces v1's diff routing, which caused most
-  lifecycle and config findings.
+- **Stream spec and the config file** (M5a's R-D2, R-D4): a stream is a
+  declarative document (`internal/spec`: inputs by priority, layout,
+  transcode ladder, thumbnail, outputs and pushes), with a structural
+  `Validate`, a redacted copy and an `ETag`. All configuration is one YAML
+  file (`internal/config`, `-config path`, at most 4 MiB, mode 0600 on
+  Unix): `version: 1` and three sections, `server` (listeners, apps, the
+  transcoder binary, the assets directory, logging), `users` and `streams`.
+  It is decoded strictly (unknown and duplicate keys are errors), anchors,
+  aliases and merge keys are refused, and every scalar that resolves as a
+  number must be a plain decimal integer, so text that looks like a number
+  is quoted. Every API edit writes the whole file atomically: a temp file
+  `.<base>.<8 hex digits>.tmp` in the same directory, mode 0600, `fsync`,
+  rename, `fsync` of the directory (Unix; `EINVAL` and `ENOTSUP`, from a
+  file system that cannot `fsync` a directory, are ignored); a leftover
+  temp file is removed at the next start. A whole-config `PUT` writes the
+  client's exact bytes; a per-stream edit goes through the YAML node tree,
+  which keeps the head comments and re-emits the rest of the layout. A
+  hand edit is applied by a reload, on SIGHUP or `POST /api/v1/reload`.
+  The server remembers the SHA-256 of the text it last loaded, wrote or
+  reloaded: an API write that finds the file different is refused with 409
+  until a reload, so neither side overwrites the other. A reload and every
+  write are all or nothing on the whole document, with every error
+  reported. Only the start is lenient: a stream entry that does not decode,
+  fails `Validate` or repeats a name is skipped and reported, and blocks
+  later writes and reloads until it is fixed; an error in `version`,
+  `server` or `users` stops the start. A change in `server` is not applied
+  while running and is reported as `restart_required`.
+- **Users** (R-D8, `internal/auth`): HTTP Basic auth against the file's
+  `users`, each a name, a role and a password hash. `viewer` reads;
+  `editor` also writes and gets what holds stored secrets or process
+  internals (`GET /api/v1/config`, `?secrets=1`, pprof). A hash is
+  `pbkdf2-sha256$600000$<salt>$<key>` (PBKDF2-HMAC-SHA-256, a salt of at
+  least 16 bytes, a 32-byte key, unpadded standard base64, in canonical
+  form), made by `openstreamer hash-password`; any other iteration count,
+  a plaintext, an unknown role, more than 64 users or no editor is
+  refused. Unknown
+  names are verified against a dummy hash, successes are remembered under
+  a per-process HMAC key, at most 2 verifications run at once, and a
+  per-address-and-name limiter blocks after 5 failures for 1 s, doubling
+  up to 5 min; a remembered login touches no limiter state. Writes need an
+  `X-Requested-By` header. The API listens on `127.0.0.1:8081` by default,
+  apart from the media listener, because Basic credentials are only base64
+  until M5c's HTTPS.
+- **Supervisor** (R-D5, `internal/stream`): one goroutine per enabled
+  stream owns all of that stream's state (its hubs, pipeline, transcoder or
+  thumbnailer, packagers and pushers) and takes edits from a mailbox, in
+  order; readers (the output servers' lookups, the status, the metrics) see
+  only an immutable `View` and `Status` behind atomic pointers, so there is
+  no cross-stream lock. There is no periodic reconciler: a `Manager` runs a
+  supervisor for exactly the enabled specs, judges an edit of the set as a
+  whole (`stream.Check`, listen claims, `copy://` cycles) before the file
+  is written, and never lets two supervisors of one name overlap. Inside a
+  generation the pipeline and the transcoder retry on their own; when a
+  long-lived part returns, or building fails, the supervisor rebuilds the
+  generation after 1 s, doubling up to 30 s, back to 1 s once a generation
+  has lived 60 s. A panic is not recovered.
+- **Edits** (R-D6): changing the output set is applied in place; changing
+  inputs is applied in place from M5b; any other change rebuilds the
+  stream's pipeline. `spec.Diff` makes the choice, so there are two routes
+  and no field-by-field routing. This replaces v1's diff routing, which
+  caused most lifecycle and config findings.
 - **Failover:** the supervisor switches to the next healthy input by priority.
   The switch is an epoch change and nothing else; the transcoder keeps running.
-- **API:** REST with chi, documented by an OpenAPI file written by hand and
-  checked in CI.
+- **API** (R-D7, `internal/api`): REST under `/api/v1` on `net/http.ServeMux`
+  method and wildcard patterns, with no router library; auth, the body
+  limits and the request counter are hand-written wrappers. The config
+  editor is `GET` and `PUT /api/v1/config` (YAML, `If-Match` required);
+  `PUT` and `DELETE /api/v1/streams/{name}` (JSON) are thin wrappers over
+  the same apply path. Stream URLs are redacted in every response unless an
+  editor asks with `?secrets=1`, and a stream `PUT` that carries the mask is
+  refused. A stream's `ETag` and a push's ID are HMAC-SHA-256 tags under a
+  per-process random key, so a viewer cannot test guesses of a secret
+  against them; they change when the server restarts. The OpenAPI 3.1
+  document is written by hand as JSON, embedded and served at
+  `/api/v1/openapi.json`; `TestOpenAPIMatchesRoutes` and
+  `TestOpenAPIMatchesSpec` keep it equal to the registered routes and the
+  spec's fields.
 
 ### 3.7 Libraries
 
@@ -605,7 +676,10 @@ never as dependencies.
 | SRT | `datarhei/gosrt` (approved: a standalone library repository); used from M2a by the SRT caller and listener inputs |
 | Transcoding | `asticode/go-astiav` v0.41.0 on FFmpeg 8.1.3 shared (libavcodec 62), from FFmpeg-Builds (§3.5); cgo, behind the build tag `libav` (M4a) |
 | Transcoder protocol messages | `google.golang.org/protobuf`, `encoding/protowire` only: no codegen and no protoc (M4a) |
-| HTTP | `go-chi/chi/v5` |
+| HTTP | `net/http` (`ServeMux` patterns); no router library (R-D7) |
+| Metrics | our own text exposition, `internal/metrics` (R-D9) |
+| Config file | `go.yaml.in/yaml/v3` (R-D2) |
+| Password hashing | `crypto/pbkdf2`, standard library (R-D8) |
 
 Our own libraries:
 
@@ -653,9 +727,14 @@ internal/transcode/    host side of the transcoder: supervisor, epoch map, DTS m
   wire/                length-prefixed protobuf protocol, shared with the child
   native/              the libav pipeline (cgo, tag libav): decode once, encode N rungs
   transcodetest/       fake child and fixtures for host tests
-internal/stream/       supervisor and failover
-internal/store/        spec storage
-internal/api/          REST API
+internal/spec/         the stream document: validation, redaction, ETag, Diff
+internal/config/       the one YAML config file: parse, node edits, atomic writes
+internal/auth/         users, PBKDF2 password hashes, the failed-login limiter
+internal/stream/       supervisor and manager
+internal/api/          REST API and its OpenAPI document
+internal/server/       the openstreamer process: listeners, wiring, the apply path
+internal/metrics/      Prometheus text exposition
+internal/logging/      slog with a scrubbing handler
 pkg/...                our own reusable libraries (§3.7); no imports from internal/
 scripts/               FFmpeg-Builds fetch, transcoder bundle, CI-peer test runner
 testdata/fixtures/     generated clips and the script that makes them
@@ -674,8 +753,10 @@ before the code they check.
 | M4a ([plan](superpowers/plans/2026-11-24-m4a-transcoder-core.md), done) | Transcoder core: the segmenter fix that cuts audio at the video keyframe's PTS, `internal/transcode` (host, wire protocol, native libav pipeline, `cmd/ostranscoder`), a software H.264 ladder with AAC re-encode or copy, per-track passthrough, respawn, CI on Linux amd64 and arm64. Each rendition is served as its own stream, `<name>_<label>` | M1, M3 | A 3-rung software ladder plus a copied rendition passes M3's scenarios per rendition; the rungs' keyframes and segments align with the source's; a killed subprocess comes back as exactly one new epoch per rendition; the same on arm64 in CI. Proved by `TestM4aMatrix` (every rendition under steady-state, epoch-change, slow-consumer, no-B-frames and B-frames, plus SRT and RTSP on `t180`), `TestM4aKeyframesAligned`, `TestM4aRespawn`, `TestM4aVLC`, `TestSupervisorRealChild`, the native and supervisor suites (`internal/transcode/...`), and the `transcode-e2e-arm64` CI job |
 | M4b ([plan](superpowers/plans/2026-11-25-m4b-abr-outputs.md), done) | ABR outputs: the transcoder's presentation hub with its keyframe barrier, the segmenter's `AlignVideo` (a rung that misses a segment start lists a gap), the packager's ABR mode (HLS TS variants under a multivariant playlist, the HLS fMP4 master, DASH Representations in one video set), `osconform`'s ABR rules (variants aligned, BANDWIDTH honest), osdev's `<name>_abr` | M4a | A ladder is served as one ABR presentation that passes M3's scenarios. Proved by `TestM4bMatrix` (steady-state, epoch-change, slow-consumer, no-B-frames, B-frames, and 15 fps and 10 fps sources, whose encoders trail by 2 s and 3 s of stream time, each read back over HLS TS, HLS fMP4 and DASH with the ABR rules, every frame once, discontinuities at the same media sequence number in every playlist), `TestM4bSwitchTS` (segments from alternating TS variants decode as one stream), `TestM4bRespawn` (the clip fed twice; a killed child is exactly one new epoch, at one media sequence number in every variant, opened by rung 0's IDR), `TestM4bRungGap` (a rung whose IDR a loss swallowed lists a gap, end to end), `TestM4bPlayers` (ffprobe, VLC and GStreamer; GStreamer DASH on 1.28 only, ruling R-B9), the segmenter, transcoder, packager, conform and osdev suites, and the `transcode-e2e-arm64` CI job (`TestM4bMatrix`, `TestM4bRespawn`, `TestM4bSwitchTS`, `TestM4bRungGap`) |
 | M4c ([plan](superpowers/plans/2026-11-25-m4c-picture-features.md), done) | Picture features: NVENC rungs (`h264_nvenc`, chosen per rung, with a per-rung fallback to libx264), the watermark (text with time directives, or an image from the asset library) drawn before the ladder and updated live, thumbnails from the decoder for transcoded, copy-video and passthrough streams, wire version 2, osdev's `-watermark`, `-thumbnail` and `/live/<name>/thumbnail.jpg`, and the root cause of R-T7b' | M4a | On the GPU host (this machine, a GTX 1650): the same ladder with 3 NVENC rungs, run by a make target and recorded in the PR. The watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams. Proved by `TestM4cNVENCMatrix`, `TestM4cNVENCProbe` and `TestM4cNVENCSessions` (run by `make test-nvenc`, evidence below), `TestM4cWatermarkEveryRung`, `TestM4cWatermarkABR`, `TestM4cThumbnailsTranscoded`, `TestM4cThumbnailsPassthrough` and `TestM4cThumbnailsCopyVideo`, with `TestM4cWatermarkLiveUpdate`, `TestM4cWatermarkRespawn`, `TestM4cFrozen` (no watermark, no thumbnails and x264 rungs give M4b's output), the picture, native, transcode and osdev suites, and the `transcode-e2e-arm64` CI job |
-| M5 | Control plane: store, API, supervisor, metrics, logs | M2, M3 | A spec created over the API serves every output; editing outputs does not interrupt other outputs |
-| M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5 | Feature tests; DVR playback passes `osconform` |
+| M5a ([plan](superpowers/plans/2026-11-26-m5a-control-plane-core.md), done) | Control-plane core: the stream document (`internal/spec`), one YAML config file for server settings, users and streams (`internal/config`) with atomic rewrites and reload on SIGHUP, the per-stream supervisor with in-place output edits, the manager, the REST API with Basic auth and two roles (`internal/auth`), its whole-config editor and its OpenAPI document, Prometheus metrics (with `EncoderFallbacks`), redacted JSON logs, `cmd/openstreamer` and its config, and the product names of a ladder (R-D3) | M2, M3, M4 | A spec created over the API serves every output; editing outputs does not interrupt other outputs; a restart restores every stream. Proved by `TestM5aEveryOutput`, `TestM5aEditOutputs` (each output switched off and on while a reader of every other output must hold every hub frame once), `TestM5aConfigPut` (the same through the whole-config editor, comments kept), `TestM5aReload`, `TestM5aHandEditThenWrite`, `TestM5aRebuildIsTheOtherRoute`, `TestM5aRestartRestores`, `TestM5aLadder`, `TestM5aPeers`, `TestM5aNoSecretsLeak` and `TestM5aRoles`, with the spec, config, auth, stream, api, metrics, logging and server suites |
+| M5b | Live edits and assets: a running pipeline's inputs changed in place, the watermark edited in place over the API, the asset API (upload, listing, replacement; R-C8) with operator fonts (R-C7), a rung that refuses the x264 fallback (wire version 3), audio language in the spec, the HLS masters and the MPD | M5a | Replacing a running stream's inputs is exactly one epoch change and ends no output session; an uploaded image and font appear on every rung; a strict NVENC rung fails instead of falling back and is counted; `osconform` reads the languages |
+| M5c | Transport security: HTTPS for the API and the HTTP outputs, RTMPS (listen, pull, push), RTSPS and SRTP, SRT encryption (input and output), credentials in URL paths and queries redacted, secrets as write-only spec fields | M5a | ffmpeg publishes and plays over each secured protocol against our server; no secret appears in a response, a log or a metric |
+| M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5a | Feature tests; DVR playback passes `osconform` |
 | M7 | Cutover | M1–M6 | The [soak plan](SOAK_TEST_PLAN.md) runs for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
 
 M3 starts after M1, in parallel with M2, with `pkg/hls` (parser and writer,
@@ -714,7 +795,7 @@ Out of M3b1:
 
 | Item | Reason |
 |---|---|
-| RTMPS (TLS) | Needs certificates and their configuration: M5 |
+| RTMPS (TLS) | Needs certificates and their configuration: M5c |
 | Play authentication and tokens | M6 sessions and tokens |
 | Seek, pause, `receiveAudio` and `receiveVideo` | Live only: acknowledged and ignored |
 | AMF3 | Clients that ask for `objectEncoding` 3 are refused, as in M2b |
@@ -744,7 +825,7 @@ Out of M3b2:
 
 | Item | Reason |
 |---|---|
-| RTSPS and SRTP | Need TLS and its configuration: M5 |
+| RTSPS and SRTP | Need TLS and its configuration: M5c |
 | Play authentication and tokens | M6 sessions and tokens, as for RTMP play |
 | Multicast; RTSP over HTTP tunnelling | Rare for players; added on demand |
 | PAUSE, seek, `Scale` and `Speed` | Live only: PAUSE is answered 455 |
@@ -781,7 +862,7 @@ Out of M3b3:
 | Item | Reason |
 |---|---|
 | SRT caller push-out | Add on demand; the RTMP push-out covers pushing today |
-| SRT encryption | Needs credentials: M5; encrypted requests are refused |
+| SRT encryption | Needs credentials: M5c; encrypted requests are refused |
 | Publishing into the SRT output listener | The SRT inputs own publishing |
 | DASH placeholders | Periods carry their adaptation sets; there is nothing to align |
 | Silent AAC placeholder parts instead of gaps | Backlog: silent AAC placeholder parts |
@@ -855,10 +936,10 @@ Out of M4b:
 |---|---|
 | AVERAGE-BANDWIDTH and FRAME-RATE in the masters | R-B5: BANDWIDTH is the window's peak; add on demand |
 | I-frame playlists (`EXT-X-I-FRAME-STREAM-INF`) | Trick play is not a v2.0 goal |
-| Several audio languages | Neither the masters nor the MPD carry a language (no `LANGUAGE`, no `lang`), and every TS variant muxes every audio track; language selection comes with M5's stream spec |
-| ABR over RTMP, RTSP, SRT and HTTP-TS | Single-rendition protocols: each rendition stays its own stream, `<name>_<label>`; R-B2 |
+| Several audio languages | Neither the masters nor the MPD carry a language (no `LANGUAGE`, no `lang`), and every TS variant muxes every audio track; language selection comes with M5b's audio language in the stream spec |
+| ABR over RTMP, RTSP, SRT and HTTP-TS | Single-rendition protocols: each rendition stays its own stream, `<name>_<label>`, and the product serves rendition 0 as `<name>` there (M5a's R-D3); R-B2 |
 | LL-HLS | Not part of the M4b row, as for M3 |
-| Product naming of the presentation | osdev's `<name>_abr` is a development name (R-B2); M5 names it |
+| Product naming of the presentation | Done in M5a (R-D3): the product serves the presentation as `<name>` on HLS and DASH and has no `<name>_abr`; osdev keeps `<name>_abr` (R-B2) |
 
 M4c's rulings are in its plan (R-C1 to R-C13 and R-C10a); the design is
 §3.5's NVENC, watermark and thumbnail bullets, and §3.5's keyframes bullet
@@ -1019,9 +1100,65 @@ Out of M4c:
 | Several watermarks, colours, rotation, tiling | R-C6: one watermark, white text with a black border or an image |
 | A watermark on a copy rung | R-C5: `New` rejects it; a branded source resolution needs one more encoded rung |
 | Thumbnail history, sprite sheets, files | R-C10: the latest shot only, in memory |
-| The asset API (upload, listing, replacement) | M5, in front of the same directory (R-C8) |
-| Metrics for `EncoderFallbacks` | M5 exports metrics; until then `Stats` and the child's warning (R-C4); Backlog |
+| The asset API (upload, listing, replacement) | M5b, in front of the same directory (R-C8) |
+| Metrics for `EncoderFallbacks` | Done in M5a: `openstreamer_transcoder_encoder_fallbacks_total{stream}` (R-D9); refusing the fallback is M5b |
 | NVENC in CI | The runners have no NVIDIA device; `make test-nvenc` is run by hand on this host (R-C12) |
+
+M5 runs in three parts (ruling R-D1 of the M5a plan). M5a is the
+control-plane core and delivers the old M5 row's exit criterion: the spec,
+the one config file with its users, the supervisor, the manager, the API
+with its config editor, metrics (with `EncoderFallbacks`), logs,
+`cmd/openstreamer`, and the product names of a ladder. M5b, live edits and
+assets: a running pipeline's inputs changed in place (`Pipeline.SetInputs`,
+§3.6), the watermark edited in place over the API (`Transcoder.SetWatermark`
+exists), the asset API (R-C8) with operator fonts (R-C7), a rung that refuses
+the x264 fallback (wire version 3), and audio language in the spec, the HLS
+masters and the MPD. M5c, transport security: HTTPS for the API and the HTTP
+outputs, RTMPS (listen, pull, push), RTSPS with SRTP by its own ruling, SRT
+encryption (input and output), redaction of credentials in URL paths and
+queries (the M2c note), and secrets as write-only spec fields. M6 and the M7
+soak need only M5a; M5b and M5c may run beside M6. Until M5b an input edit
+rebuilds the stream (R-D6), and assets are files the operator copies into a
+directory; until M5c the Basic credentials and every stream key cross the
+network in clear, so the API listens on loopback by default (R-D8).
+
+M5a's rulings are in its plan: R-D2 (one binary, one config file), R-D3
+(product names), R-D4 (how the file is loaded, written and reloaded), R-D5
+(the supervisor), R-D6 (how an edit is applied), R-D7 (the API), R-D8
+(auth), R-D9 (metrics), R-D10 (logs), R-D11 (validation and listen claims),
+R-D12 (the proof) and R-D13 (RTMP on an ephemeral port); the design is
+§3.6. Facts the code settled while it ran, beyond §3.6: a stream's `ETag`
+and a push's ID (the metrics' `target` label) are HMAC-SHA-256 tags under a
+per-process key (`redact.Tag`), so they change at a restart and a client
+holding an old `ETag` gets one 412 and reads again. The config's `ETag`
+is the plain SHA-256 of its text, which viewers see in the config status;
+the text includes every user's randomly salted hash, so it cannot be
+guessed. Only a real verification that succeeds clears a limiter entry,
+and room among the 4096 tracked pairs is made only when a new pair is
+inserted: pairs under 5 failures first, oldest first, a blocked pair
+only when nothing else can go, never one with a login in flight. The API
+itself refuses a stream document that carries the redaction mask; a
+viewer's `?secrets=1` is 403 on every route; and a handler's panic after a
+part of the answer is written aborts the connection instead of ending it as
+a whole answer. `server.New` binds every listener and starts the streams
+through `Manager.Load`, so a server it returns must be run. The e2e
+scenarios run in `make test` and the amd64 `test` job, inside a 240 s
+budget; `transcode-e2e-arm64` runs `TestM5aLadder` against the arm64
+bundle; the `test` job builds `cmd/openstreamer` for Linux, Windows and
+macOS.
+
+Out of M5a:
+
+| Item | Reason |
+|---|---|
+| Inputs edited in place, the live watermark edit, the asset API, operator fonts, refusing the x264 fallback | M5b; until then an input edit rebuilds the stream (R-D6) and assets are files in `server.assets_dir` |
+| Audio language | M5b |
+| HTTPS, RTMPS, RTSPS and SRTP, SRT encryption, credentials in URL paths or queries, write-only secrets | M5c; until then the API listens on loopback by default (R-D8) |
+| `PATCH` and per-field edits | R-D7: a stream is replaced whole by `PUT`, or the whole config |
+| Histograms and per-stream session counts | R-D9; per-stream sessions are M6's |
+| Applying a `server` change without a restart | R-D4: reported as `restart_required` |
+| A user API, more roles, sessions or tokens instead of Basic auth | R-D8: users change only with the whole config |
+| Config history | R-D4: an overwritten config is gone |
 
 M2 is split in three parts:
 
@@ -1049,7 +1186,7 @@ Out of M2a:
 | Packed-audio HLS renditions | `.aac` segments with ID3 timestamps |
 | Single-file fMP4 HLS | `EXT-X-MAP` with `BYTERANGE` |
 | A video-only mode when an HLS audio rendition stalls | The stall fails the whole input |
-| Changing a running pipeline's inputs in place | §3.6; M5's supervisor adds it |
+| Changing a running pipeline's inputs in place | §3.6; M5b's supervisor adds it (in M5a an input edit rebuilds the stream) |
 | Reordered access units packed in one PES | Dropped until M2c's `pkg/h26x` gives their picture order counts (done in M2c) |
 | Dropping video to the next keyframe after a TS loss | Frames after the lost one pass through: decoders conceal, and a lossy feed would otherwise freeze |
 | A late join with an inter-track skew above the 2 s backward-jump limit | Loses one GOP once, at start-up |
@@ -1070,7 +1207,7 @@ Out of M2b:
 
 | Item | Reason |
 |---|---|
-| RTMPS (RTMP over TLS) | Needs certificates and their configuration: M5 |
+| RTMPS (RTMP over TLS) | Needs certificates and their configuration: M5c |
 | RTMPT and RTMPE | Obsolete |
 | Enhanced RTMP v2 multitrack, and codecs other than H.264, H.265 and AAC (AV1, VP9, Opus, MP3) | Outside §2's codec scope |
 | AMF3 command encoding | Clients that ask for `objectEncoding` 3 are refused |
@@ -1109,11 +1246,11 @@ Out of M2c:
 
 | Item | Reason |
 |---|---|
-| RTSP 2.0; RTSPS and SRTP | TLS is M5, like RTMPS; `rtsps://` is rejected with a clear error |
+| RTSP 2.0; RTSPS and SRTP | TLS is M5c, like RTMPS; `rtsps://` is rejected with a clear error |
 | UDP multicast transport; RTSP over HTTP tunnelling | Rare for pull |
 | MP4A-LATM, G.711, Opus, PCM | Outside §2's codec scope; such tracks are skipped with a reason |
 | H.264 packetization-mode 2; H.265 with `sprop-max-don-diff` above 0 | Interleaved, DON reordering; skipped with a reason |
-| Credentials in the URL path or query (`?user=&password=`) | Noted for M5's redaction work |
+| Credentials in the URL path or query (`?user=&password=`) | M5c's redaction work |
 | The RTSP server | M3b |
 | ONVIF | Outside M2c |
 
@@ -1223,13 +1360,54 @@ Items accepted for later, not yet placed in a milestone:
   renders on the GPU, and thumbnails taken from GPU frames.
 - **Operator fonts for the watermark** (R-C7). Text renders only with the
   embedded DejaVu Sans, so glyphs outside it (CJK, Arabic shaping) are empty
-  boxes. Let an operator pick a font from the asset library (M5's API in
+  boxes. Let an operator pick a font from the asset library (M5b's API in
   front of the same directory).
 - **A fallback to libx264 can overload a host sized for NVENC** (R-C4):
-  export `EncoderFallbacks` and let a stream refuse the fallback (M5). Today
-  the overflow silently pays CPU for every rung that fell back, and
-  `Stats.Child.EncoderFallbacks` and the child's warning are the only
-  signals.
+  the overflow silently pays CPU for every rung that fell back. The count is
+  exported since M5a (`openstreamer_transcoder_encoder_fallbacks_total`,
+  beside `Stats.Child.EncoderFallbacks` and the child's warning); letting a
+  stream refuse the fallback is M5b's.
+- **HLS `MEDIA-SEQUENCE` and the DASH timeline go backwards on the same
+  URL** (M5a's R-D5, R-D6). A rebuild, for an edit or a failure, and a
+  process restart start a new packager, so a player that stayed on the URL
+  must reload. Carry the sequence numbers and the availability start across
+  generations.
+- **A switch that stops serving a ladder's renditions as their own streams**
+  (R-D3). Each rung is also `<name>_<label>`, which costs N packagers when
+  HLS or DASH is on; a stream that serves only the presentation saves them.
+- **HTTP-TS has no session counters**, so `openstreamer_output_sessions`
+  lacks it.
+- **A panic in one stream's goroutines takes the process down** (R-D5). The
+  service manager restarts it and the config file brings every stream back;
+  decide on per-stream recovery after the soak.
+- **A per-stream API edit goes through a YAML node round trip** (R-D4): it
+  drops blank lines, re-indents sequences, normalises the spacing of line
+  comments, and loses the comments inside the edited entry and a line
+  comment on its `name:`. A text-level splice of the one entry would keep
+  the rest byte for byte.
+- **The login limiter's key includes the presented user name** (R-D8), so
+  invented names can keep both verification slots busy and delay a real
+  user's first (not yet remembered) login. A per-address secondary cap
+  would bound it.
+- **Behind a reverse proxy every API client shares one IP for the login
+  limiter** (R-D8): a trusted-proxy setting.
+- **A listen address handed from one stream to another in one edit** (R-D11):
+  delete `a` and give `b` its URLs, or rebuild `a` off a port that `b`
+  takes; the new owner may bind before the old one has let go, and gets one
+  transient bind error that the supervisor's retry heals.
+- **The listen-claim rule compares hosts as text** (R-D11): `localhost` and
+  `127.0.0.1` are different hosts to it, host names are case-sensitive, and
+  the multicast exemption needs an IP literal.
+- **Per-generation counters hide crash loops.** A stream's `input_switches`,
+  unmapped-track and clock-drift counters, and the transcoder's series,
+  start again at 0 with each generation, which Prometheus reads as a reset;
+  cumulative counters per stream would show a crash loop.
+- **RTMP: ffprobe sees an extra `subtitle:text` stream** when an
+  `onMetaData` arrives mid-stream at an epoch change (M3 behaviour, seen by
+  `TestM5aPeers`).
+- **JSON stream bodies decode looser than YAML**: `encoding/json` matches
+  keys case-insensitively and accepts duplicate keys, while the config file
+  refuses both.
 - **Transcoder: drop and count a persistently failing audio track instead of
   failing the pipeline.** An audio track the child cannot decode (or encode)
   makes the child exit; it is respawned and fails again, so one bad track
@@ -1535,6 +1713,45 @@ Items accepted for later, not yet placed in a milestone:
   the first shot of `TestThumbnailHTTP` is proved only by a unit test;
   `TestThumbnailFromChild` waits 300 ms for a Stats (flake risk).
 - e2e: the watermark's text band check scales with the picture width.
+
+#### M5a deferred minors
+
+- metrics: the doc should say that label values come from configuration
+  only, and that collectors may run concurrently; `metricstest.Parse` has
+  no tests of its own (negatives) and its scope (our own output only) is
+  undocumented; the `__` prefix and duplicate-label checks are untested;
+  `process_open_fds` counts the directory descriptor that reads it (one
+  too many).
+- logging: scrubbing is tested in the JSON format only; a URL password
+  with a literal space leaves its tail unscrubbed (such a URL is invalid
+  anyway); the doc should say that struct fields are not scrubbed by name
+  (a `Password` field in a URL-less struct passes).
+- spec: `redact.Masked` refuses any RTMP stream key that ends in the mask
+  (a false positive); `Validate` echoes long user values uncapped; a full
+  `layout` list (`video` and `audio`) is not normalised to the empty one, so
+  that edit rebuilds needlessly.
+- hub: `Refuse("")` refuses everything and is unguarded (no caller passes
+  it); `TestRefuseRace` asserts only that nothing panics.
+- auth: the limiter's comment overstates that a client "cannot flush its
+  own block" (20 000 verifications can); `TestLimiterRefusedReserveEvictsNothing`
+  passes trivially.
+- config: the branch of a real directory `fsync` failure is untested; the
+  unknown-key message prints the key verbatim; the same fault is a
+  `SyntaxError` (400) under `server` or `users` but `Errors` (422) inside a
+  stream; top-level type errors name `config.rawDocument`; a FIFO at the
+  config path hangs `Open`; the `Unwrap` of its errors relies on how
+  `spec.Validate` wraps.
+- stream: a thumbnail-only child reports PID 0; an 8-hex push ID collision
+  would make the scrape fail with 500; a stale input error may survive an
+  edit that clears it; `serve` drains the whole mailbox before it checks
+  its context; a test comment is misplaced; the manager takes two
+  snapshots per scrape; the claim normalisation lacks tests for a reserved
+  `::` and for `localhost`.
+- api: the config status `ETag` is an unkeyed hash (the text includes
+  randomly salted password hashes, so it is not guessable); `openapi.json` was generated by a
+  script that is not committed (the tests pin the result); a `Verify` that
+  ends with the request's context counts as a 503 and inflates that
+  series.
 
 **Note for the user:** make the `transcoder-amd64`, `transcoder-arm64` and
 `transcode-e2e-arm64` CI jobs required checks on the `rebuild` and `main`

@@ -22,6 +22,32 @@ make fixtures     # sh testdata/fixtures/gen.sh
 make tools        # install golangci-lint v2.14.0
 ```
 
+## The server (M5a)
+
+`cmd/openstreamer` is the server binary; `cmd/osdev` stays the development harness. `openstreamer -config FILE` runs it, `openstreamer hash-password` reads a password from stdin and prints its hash, `openstreamer -version` prints the version.
+
+All configuration is **one YAML file** (`internal/config`; documented example: `cmd/openstreamer/openstreamer.example.yaml`), at most 4 MiB, mode 0600 on Unix, decoded strictly:
+
+- `version: 1`.
+- `server`: `http.listen` (default `:8080`, `/live/`), `api.listen` (default `127.0.0.1:8081`: the API, `/metrics`, pprof), `rtmp.listen`/`app`, `rtsp.listen`/`app`/`udp`, `srt.listen`/`app`/`latency_ms` (empty `listen` turns a server off; `app` defaults to `live`, `latency_ms` to 120), `transcoder.binary` (default: `ostranscoder` next to the executable), `assets_dir`, `log.level` (`debug`, `info`, `warn`, `error`) and `log.format` (`json`, `text`). Never applied while running: reported as `restart_required`.
+- `users`: `name`, `role` (`viewer` reads; `editor` reads, writes, sees secrets and pprof), `password` (`pbkdf2-sha256$600000$<salt>$<key>`, exactly 600000 iterations). At least one editor, at most 64 users.
+- `streams`: `spec.Stream` documents (`name`, `disabled`, `inputs`, `layout`, `transcode`, `thumbnail`, `outputs` with `hls`, `dash`, `httpts`, `rtmp`, `rtsp`, `srt`, `push`). The `yaml` and `json` tags are equal.
+
+Anchors, aliases and merge keys are refused, and every number must be a plain decimal integer.
+
+Packages of the control plane:
+
+- `internal/spec`: the stream document; `Validate`, `Redacted`, `ETag` (a keyed tag, new at every start), `Diff`.
+- `internal/config`: parse (strict; lenient for streams at start), the node-tree edits `SetStream`/`DeleteStream`, `File` (atomic write, stale detection by SHA-256).
+- `internal/auth`: PBKDF2 hashes, `Users` (verification, remembered logins), the failed-login `Limiter`.
+- `internal/stream`: `Supervisor` (one goroutine per stream, mailbox, `View`/`Status` behind atomic pointers, rebuild with backoff, no reconciler) and `Manager` (the set, `Check`, listen claims, `copy://` cycles, `Replace`, the output lookups).
+- `internal/api`: the REST API on `net/http.ServeMux`, Basic auth and roles, the hand-written `openapi.json` (kept equal to the routes and the spec by tests).
+- `internal/metrics` (Prometheus text, `metricstest` for tests), `internal/logging` (slog with a scrubbing handler), `internal/server` (listeners, wiring, the apply path).
+
+**One apply path (R-D4).** A whole-config `PUT /api/v1/config` (the client's exact bytes), a per-stream `PUT`/`DELETE /api/v1/streams/{name}` (a node-tree edit of the text in force), and a reload (SIGHUP or `POST /api/v1/reload`, the file as on disk) all end in `server.apply`, under one mutex: parse and validate the whole document, `Manager.Replace` judges the streams, the file is written inside `Replace`'s commit (API edits only), the streams change, and the users are replaced when their section changed. An API write is refused with 409 while the file on disk differs from the text in force; nothing is half applied.
+
+**Two routes of an edit (R-D6).** `spec.Diff` gives `ChangeNone` (untouched), `ChangeOutputs` (applied in place by the supervisor's `reattach`: packagers, output flags via `hub.Refuse`, pushes keyed by URL; nothing else is touched) or `ChangeRebuild` (the generation is torn down and rebuilt at once). An input edit is a rebuild until M5b.
+
 ## v1 is reference only
 
 The v1 code lives on `main`. Read it with `git show main:<path>`; never copy it wholesale. Milestones bring back what they need from history.
@@ -29,7 +55,7 @@ The v1 code lives on `main`. Read it with `git show main:<path>`; never copy it 
 ## Invariants
 
 - Module path is `github.com/ntt0601zcoder/open-streamer`. No cgo in M1: `go build ./...`, `go vet ./...` and `go test ./...` work on a plain machine.
-- Libraries: only independent ones. The approved set for later milestones is mp4ff, pion, gosrt, go-astiav and chi (go-astiav is cgo and only for the transcoder in M4). M1 is limited to the M1 dependency list below. Never `bluenviron/*` (mediacommon, gortsplib, gohlslib) or `q191201771/lal`, and do not copy code from them.
+- Libraries: only independent ones. The approved set is mp4ff, pion, gosrt, go-astiav (cgo, only for the transcoder), protobuf's `protowire`, testify and `go.yaml.in/yaml/v3` (the config file). HTTP routing is `net/http`'s `ServeMux`, not chi (M5a's R-D7); metrics are our own text exposition, not `client_golang`; password hashing is the standard library's `crypto/pbkdf2`. M1 is limited to the M1 dependency list below. Never `bluenviron/*` (mediacommon, gortsplib, gohlslib) or `q191201771/lal`, and do not copy code from them.
 - What no independent library provides goes into our own reusable package under `pkg/`, which never imports `internal/`.
 - Module dependencies allowed in M1: the Go standard library, `Eyevinn/mp4ff`, `stretchr/testify`. MPEG-TS is our own `pkg/mpegts`. Tools run with `go run <tool>@<version>` or `go install`, never added to `go.mod`.
 - Timestamps on `media.Frame` are `int64` in 90 kHz ticks (`media.ClockRate = 90000`). No `time.Duration` and no milliseconds on the media path.
