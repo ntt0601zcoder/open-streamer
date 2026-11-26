@@ -1344,8 +1344,9 @@ Items accepted for later, not yet placed in a milestone:
   own job.** The package alone took over 10 min on the 2-core runners (CI run
   45755846031), so `make test` and `make cover` now allow 20 min; a split
   would bring the per-package time back down. With M5b1's four scenarios
-  the package took 342 s on this 8-core host, in four runs of 340 to
-  342 s (local; CI figure recorded at push); R-E10 splits it before a merge
+  the package took 672 s in the `test` job of CI run 45822908337, and the
+  `transcode-e2e-arm64` job's e2e step took 123 s, under its 10 min
+  timeout, so that job needs no change; R-E10 splits it before a merge
   when CI reads above 17 min.
 
 - **Per-input RTSP sync mode** (`?sync=sr|initial`): `sr` (the default) keeps
