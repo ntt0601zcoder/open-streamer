@@ -47,10 +47,28 @@ var (
 	ErrOff      = errors.New("asset: no assets directory")
 	ErrWrite    = errors.New("asset: write")                      // wrapped with the cause
 	ErrProbe    = errors.New("asset: the font probe did not run") // wrapped with the cause; says nothing about the font
+	ErrBody     = errors.New("asset: read the body")              // wrapped with the cause, e.g. an *http.MaxBytesError
 )
 
 // ErrPrecondition is a failed If-Match or If-None-Match condition.
 var ErrPrecondition = errors.New("asset: precondition failed")
+
+// contentError is ErrContent with the reason, which is safe to show a
+// client: it names no path.
+type contentError struct{ reason string }
+
+func (e *contentError) Error() string { return ErrContent.Error() + ": " + e.reason }
+func (e *contentError) Unwrap() error { return ErrContent }
+
+// Reason returns the client-safe reason inside an ErrContent error, without
+// any prefix, and "" for any other error.
+func Reason(err error) string {
+	var ce *contentError
+	if errors.As(err, &ce) {
+		return ce.reason
+	}
+	return ""
+}
 
 // Info describes one asset.
 type Info struct {
@@ -94,11 +112,11 @@ func MaxBytes(k Kind) int64 {
 // tempRE matches a temp file of a Put; its first group is the asset name.
 var tempRE = regexp.MustCompile(`^\.(.+)\.[0-9a-f]{8}\.tmp$`)
 
-// entry is a cached hash: valid while the file under the name has this size
-// and modification time.
+// entry is a cached hash: valid while the file under the name is the same
+// file (os.SameFile: on Unix the same device and inode, which a rename keeps)
+// with the same size and modification time.
 type entry struct {
-	size int64
-	mod  time.Time
+	fi   os.FileInfo
 	typ  string
 	etag string
 }
@@ -122,10 +140,15 @@ type Store struct {
 	maxTotal int64
 	hook     func(step string) error // a non-nil error stops a Put there, as a crash would
 	hashes   atomic.Int64            // files hashed by reading them
+	listHook func()                  // called by List after its ReadDir
 }
 
 // Open returns the store of dir and removes the temp files a crash left in it. dir "" gives a store
 // whose every method returns ErrOff.
+//
+// There must be one live Store per directory: a second Open of a directory in use deletes the temp files of
+// the first one's Puts in flight (their renames then fail with ErrWrite), and the two would not share the
+// lock that keeps the quota.
 func Open(dir string, opt Options) (*Store, error) {
 	if dir == "" {
 		return &Store{}, nil
@@ -151,6 +174,7 @@ func Open(dir string, opt Options) (*Store, error) {
 }
 
 // sweep removes the regular files named as a Put's temp file of an asset.
+// It assumes no other Store has the directory open (see Open).
 func (s *Store) sweep() error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -173,14 +197,22 @@ func (s *Store) sweep() error {
 
 func (s *Store) off() bool { return s == nil || s.dir == "" }
 
-// List returns the assets by name: only regular files with an asset name.
+// List returns the assets by name: only regular files with an asset name,
+// and none over its kind's MaxBytes (copied in by hand; the quota still
+// counts it).
 func (s *Store) List() ([]Info, error) {
 	if s.off() {
 		return nil, ErrOff
 	}
+	s.cmu.Lock()
+	epoch := s.epoch
+	s.cmu.Unlock()
 	entries, err := os.ReadDir(s.dir) // sorted by name
 	if err != nil {
 		return nil, fmt.Errorf("asset: list: %w", err)
+	}
+	if s.listHook != nil {
+		s.listHook()
 	}
 	out := make([]Info, 0, len(entries))
 	seen := make(map[string]bool, len(entries))
@@ -191,15 +223,19 @@ func (s *Store) List() ([]Info, error) {
 		}
 		inf, err := s.Stat(name)
 		if err != nil {
-			continue // gone, replaced by a non-regular file or unreadable since ReadDir: not an asset
+			continue // gone, not regular or unreadable since ReadDir, or over its limit: not listed
 		}
 		seen[name] = true
 		out = append(out, inf)
 	}
+	// Prune the entries of names that are gone, unless a Put or a Delete
+	// committed since the ReadDir: its entry may be one the listing missed.
 	s.cmu.Lock()
-	for name := range s.cache {
-		if !seen[name] {
-			delete(s.cache, name)
+	if s.epoch == epoch {
+		for name := range s.cache {
+			if !seen[name] {
+				delete(s.cache, name)
+			}
 		}
 	}
 	s.cmu.Unlock()
@@ -237,14 +273,14 @@ func (s *Store) Read(name string) ([]byte, Info, error) {
 	}
 	inf := Info{Name: name, Kind: kind, Size: int64(len(b)), Modified: fi.ModTime()}
 	e, epoch, ok := s.lookup(name, fi)
-	if ok && e.size == inf.Size {
+	if ok && e.fi.Size() == inf.Size {
 		inf.Type, inf.ETag = e.typ, e.etag
 		return b, inf, nil
 	}
 	s.hashes.Add(1)
 	inf.Type, inf.ETag = sniff(b), etag(b)
 	if int64(len(b)) == fi.Size() { // else the file changed while it was read
-		s.remember(name, epoch, entry{size: fi.Size(), mod: fi.ModTime(), typ: inf.Type, etag: inf.ETag})
+		s.remember(name, epoch, entry{fi: fi, typ: inf.Type, etag: inf.ETag})
 	}
 	return b, inf, nil
 }
@@ -305,9 +341,14 @@ func notAsset(path string, err error) bool {
 }
 
 // fileInfo returns the Info of the open asset f: the type and the ETag from
-// the cache when its size and modification time are fi's, else from reading
-// f, which is then rewound.
+// the cache when it holds fi's file, else from reading f, which is then
+// rewound. A file larger than its kind's MaxBytes (copied in by hand) is
+// ErrTooLarge, before anything is read: it is never hashed, and so never
+// while mu is held.
 func (s *Store) fileInfo(name string, kind Kind, f *os.File, fi os.FileInfo) (Info, error) {
+	if limit := MaxBytes(kind); fi.Size() > limit {
+		return Info{}, fmt.Errorf("%w: %q is %d bytes, over %d", ErrTooLarge, name, fi.Size(), limit)
+	}
 	inf := Info{Name: name, Kind: kind, Size: fi.Size(), Modified: fi.ModTime()}
 	e, epoch, ok := s.lookup(name, fi)
 	if ok {
@@ -329,17 +370,17 @@ func (s *Store) fileInfo(name string, kind Kind, f *os.File, fi os.FileInfo) (In
 		return Info{}, fmt.Errorf("asset: read %q: %w", name, err)
 	}
 	inf.Type, inf.ETag = sniff(head[:n]), etagOfHash(h)
-	s.remember(name, epoch, entry{size: fi.Size(), mod: fi.ModTime(), typ: inf.Type, etag: inf.ETag})
+	s.remember(name, epoch, entry{fi: fi, typ: inf.Type, etag: inf.ETag})
 	return inf, nil
 }
 
-// lookup returns the cache entry of name if it matches fi, and the epoch to
+// lookup returns the cache entry of name if it is fi's file, and the epoch to
 // pass to remember.
 func (s *Store) lookup(name string, fi os.FileInfo) (entry, uint64, bool) {
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
 	e, ok := s.cache[name]
-	return e, s.epoch, ok && e.size == fi.Size() && e.mod.Equal(fi.ModTime())
+	return e, s.epoch, ok && os.SameFile(e.fi, fi) && e.fi.Size() == fi.Size() && e.fi.ModTime().Equal(fi.ModTime())
 }
 
 // remember caches e for name unless a Put or a Delete has committed since
@@ -368,6 +409,11 @@ func (s *Store) commitEntry(name string, e *entry) {
 // Put checks and stores r under name: created reports whether the name was new. match, when not "", is an
 // If-Match value (a tag, or "*": the asset exists); noneMatch true is If-None-Match: * (the asset must not exist);
 // a failed condition is ErrPrecondition.
+//
+// An ErrWrite from the directory fsync comes after the rename: the new bytes
+// are then already visible under the name and their entry cached, only their
+// durability across a power loss is unknown. Every other error leaves the name
+// as it was. A read of r that fails is ErrBody wrapping the cause.
 func (s *Store) Put(ctx context.Context, name string, r io.Reader, match string, noneMatch bool) (info Info, created bool, err error) {
 	if s.off() {
 		return Info{}, false, ErrOff
@@ -379,14 +425,14 @@ func (s *Store) Put(ctx context.Context, name string, r io.Reader, match string,
 	limit := MaxBytes(kind)
 	b, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
-		return Info{}, false, fmt.Errorf("asset: put %q: read the body: %w", name, err)
+		return Info{}, false, fmt.Errorf("%w: %w", ErrBody, err)
 	}
 	if int64(len(b)) > limit {
 		return Info{}, false, fmt.Errorf("%w: a %s is at most %d bytes", ErrTooLarge, kind, limit)
 	}
 	typ, err := check(kind, name, b)
 	if err != nil {
-		return Info{}, false, fmt.Errorf("%w: %w", ErrContent, err)
+		return Info{}, false, &contentError{reason: err.Error()}
 	}
 	inf := Info{Name: name, Kind: kind, Type: typ, Size: int64(len(b)), ETag: etag(b)}
 
@@ -413,7 +459,7 @@ func (s *Store) Put(ctx context.Context, name string, r io.Reader, match string,
 			if reason == "" {
 				reason = "the font probe refused it"
 			}
-			return Info{}, false, fmt.Errorf("%w: %s", ErrContent, reason)
+			return Info{}, false, &contentError{reason: reason}
 		}
 	}
 	if err := s.step("probed"); err != nil {
@@ -433,7 +479,7 @@ func (s *Store) Put(ctx context.Context, name string, r io.Reader, match string,
 		return Info{}, false, fmt.Errorf("%w: %q exists", ErrPrecondition, name)
 	case match != "" && !exists:
 		return Info{}, false, fmt.Errorf("%w: %q does not exist", ErrPrecondition, name)
-	case match != "" && match != "*" && match != oldTag:
+	case match != "" && match != "*" && (oldTag == "" || match != oldTag):
 		return Info{}, false, fmt.Errorf("%w: %q has changed", ErrPrecondition, name)
 	}
 	count, total, err := s.usage()
@@ -450,7 +496,7 @@ func (s *Store) Put(ctx context.Context, name string, r io.Reader, match string,
 		return Info{}, false, fmt.Errorf("%w: rename: %w", ErrWrite, err)
 	}
 	keep = true
-	s.commitEntry(name, &entry{size: fi.Size(), mod: fi.ModTime(), typ: inf.Type, etag: inf.ETag})
+	s.commitEntry(name, &entry{fi: fi, typ: inf.Type, etag: inf.ETag})
 	if err := s.step("renamed"); err != nil {
 		return Info{}, false, err
 	}
@@ -547,6 +593,9 @@ func (s *Store) current(name, path string, kind Kind, wantTag bool) (exists bool
 		return true, fi.Size(), "", nil
 	}
 	inf, err := s.fileInfo(name, kind, f, fi)
+	if errors.Is(err, ErrTooLarge) {
+		return true, fi.Size(), "", nil // no tag of it was ever served: no If-Match tag matches
+	}
 	if err != nil {
 		return false, 0, "", fmt.Errorf("%w: %w", ErrWrite, err)
 	}
@@ -606,11 +655,11 @@ func (s *Store) Delete(name, match string) error {
 	}
 	if match != "" && match != "*" {
 		inf, err := s.fileInfo(name, kind, f, fi)
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrTooLarge) { // over the limit: no tag of it was ever served
 			_ = f.Close() // read only
 			return err
 		}
-		if inf.ETag != match {
+		if err != nil || inf.ETag != match {
 			_ = f.Close() // read only
 			return fmt.Errorf("%w: %q has changed", ErrPrecondition, name)
 		}

@@ -20,8 +20,14 @@
 // directory or a FIFO under an asset name is not listed and is not found. A
 // Put over such a link replaces the link, not its target.
 //
-// ETags are cached by name, size and modification time. Put writes the entry
-// of what it stored and Delete drops it, so the cache can only go stale for a
-// file changed by hand at the same size within one tick of the file system's
-// clock; a hand edit is outside the API's contract and that is accepted.
+// A file copied in by hand over its kind's limit is counted by the quota but
+// never read or hashed: it is not listed, Stat, Open and Read refuse it with
+// ErrTooLarge, no If-Match tag matches it, and an unconditional Delete
+// removes it.
+//
+// ETags are cached by name and file (os.SameFile), size and modification
+// time. Put writes the entry of what it stored and Delete drops it, so the
+// cache can only go stale for a file edited in place by hand at the same size
+// within one tick of the file system's clock; a hand edit is outside the
+// API's contract and that is accepted.
 package asset

@@ -18,6 +18,7 @@ import (
 	"io/fs"
 	"maps"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -617,6 +618,54 @@ func TestHandCopiedFiles(t *testing.T) {
 		}
 	}
 	refused(t, "x.png")
+	t.Run("over the limit", func(t *testing.T) {
+		path := filepath.Join(dir, "big.png")
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(img); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(picture.MaxImageBytes + 1); err != nil { // sparse
+			t.Fatal(err)
+		}
+		_ = f.Close()
+		s.hashes.Store(0)
+		if list, err := s.List(); err != nil || len(list) != 0 {
+			t.Errorf("listed: %+v, %v", list, err)
+		}
+		if _, err := s.Stat("big.png"); !errors.Is(err, ErrTooLarge) {
+			t.Errorf("stat: %v", err)
+		}
+		if f, _, err := s.Open("big.png"); !errors.Is(err, ErrTooLarge) {
+			if err == nil {
+				_ = f.Close()
+			}
+			t.Errorf("open: %v", err)
+		}
+		if _, _, err := s.Read("big.png"); !errors.Is(err, ErrTooLarge) {
+			t.Errorf("read: %v", err)
+		}
+		if _, _, err := s.Put(context.Background(), "big.png", bytes.NewReader(img), etagOf(img), false); !errors.Is(err, ErrPrecondition) {
+			t.Errorf("a Put with a tag: %v", err)
+		}
+		if err := s.Delete("big.png", etagOf(img)); !errors.Is(err, ErrPrecondition) {
+			t.Errorf("a Delete with a tag: %v", err)
+		}
+		if n := s.hashes.Load(); n != 0 {
+			t.Errorf("hashed %d times", n)
+		}
+		if got := s.Totals()[Image]; got != [2]int64{1, picture.MaxImageBytes + 1} {
+			t.Errorf("not counted toward the quota: %v", got)
+		}
+		if err := s.Delete("big.png", ""); err != nil {
+			t.Errorf("unconditional delete: %v", err)
+		}
+		if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("still there: %v", err)
+		}
+	})
 	t.Run("fifo", func(t *testing.T) {
 		path := filepath.Join(dir, "y.png")
 		mkfifo(t, path)
@@ -821,6 +870,135 @@ func TestConcurrentPuts(t *testing.T) {
 	assertNoTemp(t, dir)
 }
 
+// failingReader yields n bytes of b, then err.
+type failingReader struct {
+	b   []byte
+	n   int
+	err error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.n == 0 {
+		return 0, r.err
+	}
+	k := copy(p[:min(len(p), r.n)], r.b)
+	r.b, r.n = r.b[k:], r.n-k
+	return k, nil
+}
+
+func TestPutBodyError(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir, Options{})
+	img := pngBytes(t, noisy(16, 16, 1))
+	cut := errors.New("connection reset")
+	_, _, err := s.Put(context.Background(), "a.png", &failingReader{b: img, n: len(img) / 2, err: cut}, "", false)
+	if !errors.Is(err, ErrBody) || !errors.Is(err, cut) {
+		t.Errorf("a failing body: %v", err)
+	}
+	r := http.MaxBytesReader(nil, io.NopCloser(bytes.NewReader(img)), 10)
+	_, _, err = s.Put(context.Background(), "a.png", r, "", false)
+	var mb *http.MaxBytesError
+	if !errors.Is(err, ErrBody) || !errors.As(err, &mb) {
+		t.Errorf("a body over http.MaxBytesReader's limit: %v", err)
+	}
+	if len(snapshot(t, dir)) != 0 {
+		t.Error("the directory changed")
+	}
+}
+
+func TestReason(t *testing.T) {
+	dir := t.TempDir()
+	refuse := func(context.Context, string) (bool, string, error) { return true, "the glyphs are broken", nil }
+	broken := func(context.Context, string) (bool, string, error) { return false, "", errors.New("exit status 2") }
+	ctx := context.Background()
+	_, _, err := open(t, dir, Options{}).Put(ctx, "a.ttf", strings.NewReader("not a font at all"), "", false)
+	if r := Reason(err); r == "" || strings.Contains(r, "asset:") || !strings.HasPrefix(r, "font: ") {
+		t.Errorf("a bad font: %q from %v", r, err)
+	}
+	_, _, err = open(t, dir, Options{}).Put(ctx, "a.jpg", bytes.NewReader(pngBytes(t, noisy(4, 4, 1))), "", false)
+	if r := Reason(err); r != "image: the file is image/png, the name says image/jpeg" {
+		t.Errorf("a PNG as a.jpg: %q", r)
+	}
+	font := readFixtureFont(t)
+	_, _, err = open(t, dir, Options{ProbeFont: refuse}).Put(ctx, "a.ttf", bytes.NewReader(font), "", false)
+	if r := Reason(err); r != "the glyphs are broken" || !errors.Is(err, ErrContent) {
+		t.Errorf("a refused font: %q from %v", r, err)
+	}
+	_, _, err = open(t, dir, Options{ProbeFont: broken}).Put(ctx, "a.ttf", bytes.NewReader(font), "", false)
+	if r := Reason(err); r != "" {
+		t.Errorf("a probe that did not run: %q", r)
+	}
+	if Reason(nil) != "" || Reason(ErrContent) != "" || Reason(fmt.Errorf("x: %w", ErrFull)) != "" {
+		t.Error("a reason outside an ErrContent error")
+	}
+	wrapped := fmt.Errorf("api: %w", &contentError{reason: "r"})
+	if Reason(wrapped) != "r" || !errors.Is(wrapped, ErrContent) {
+		t.Errorf("wrapped: %q", Reason(wrapped))
+	}
+}
+
+// TestCacheSameFile: another file renamed over the name with the size and the
+// modification time of the cached one is hashed afresh.
+func TestCacheSameFile(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir, Options{})
+	a := pngBytes(t, noisy(4, 4, 1))
+	inf, _ := put(t, s, "a.png", a)
+	b := bytes.Clone(a)
+	b[len(b)-1] ^= 0xff
+	other := filepath.Join(dir, "other")
+	if err := os.WriteFile(other, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(other, inf.Modified, inf.Modified); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(other, filepath.Join(dir, "a.png")); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.Stat("a.png")
+	if err != nil || st.ETag != etagOf(b) || st.Size != inf.Size || st.Modified != inf.Modified {
+		t.Errorf("stat %+v, %v; want the ETag %s, not %s", st, err, etagOf(b), inf.ETag)
+	}
+}
+
+// TestListPruneEpoch: a listing does not prune an entry that a Put committed
+// after its ReadDir.
+func TestListPruneEpoch(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir, Options{})
+	put(t, s, "a.png", pngBytes(t, noisy(4, 4, 1)))
+	if _, err := os.ReadDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	// Stand in for a Put committing between List's ReadDir and its prune:
+	// an entry for a name the directory does not hold, then a commit.
+	fi, err := os.Stat(filepath.Join(dir, "a.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.listHook = func() { s.commitEntry("b.png", &entry{fi: fi, typ: "image/png", etag: `"b"`}) }
+	if _, err := s.List(); err != nil {
+		t.Fatal(err)
+	}
+	s.cmu.Lock()
+	_, ok := s.cache["b.png"]
+	s.cmu.Unlock()
+	if !ok {
+		t.Error("the entry of a Put after the ReadDir was pruned")
+	}
+	s.listHook = nil
+	if _, err := s.List(); err != nil {
+		t.Fatal(err)
+	}
+	s.cmu.Lock()
+	_, ok = s.cache["b.png"]
+	s.cmu.Unlock()
+	if ok {
+		t.Error("a quiet listing kept the entry of a name that is gone")
+	}
+}
+
 func TestPutWriteError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("directory permissions do not stop writes here")
@@ -899,13 +1077,13 @@ func TestCacheEpoch(t *testing.T) {
 	if !ok {
 		t.Fatal("Put left no entry")
 	}
-	s.commitEntry("a.png", &entry{size: fi.Size(), mod: fi.ModTime(), typ: "image/png", etag: `"new"`})
-	s.remember("a.png", epoch, entry{size: fi.Size(), mod: fi.ModTime(), typ: "image/png", etag: `"stale"`})
+	s.commitEntry("a.png", &entry{fi: fi, typ: "image/png", etag: `"new"`})
+	s.remember("a.png", epoch, entry{fi: fi, typ: "image/png", etag: `"stale"`})
 	if st, _ := s.Stat("a.png"); st.ETag != `"new"` {
 		t.Errorf("a reader from before the commit cached %s", st.ETag)
 	}
 	s.commitEntry("a.png", nil)
-	s.remember("a.png", epoch, entry{size: fi.Size(), mod: fi.ModTime(), typ: "image/png", etag: `"stale"`})
+	s.remember("a.png", epoch, entry{fi: fi, typ: "image/png", etag: `"stale"`})
 	if st, _ := s.Stat("a.png"); st.ETag != etagOf(img) {
 		t.Errorf("after a Delete: %s", st.ETag)
 	}
