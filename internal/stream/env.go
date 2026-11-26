@@ -2,14 +2,18 @@ package stream
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/certs"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
 	"github.com/ntt0601zcoder/open-streamer/internal/logging"
@@ -40,13 +44,22 @@ type Env struct {
 	Lookup     func(name string) (*hub.Hub, bool) // copy:// inputs; the Manager sets it
 	Transcoder string                             // path of ostranscoder; "" means none
 	AssetsDir  string                             // "" means no assets
-	// RTMPPlay is the server's RTMP play address, as bound, and RTMPApp its
-	// app, for Check's publish-path rule; "" means off.
+	// RTMPPlay is the server's RTMP play address, as bound; "" means off.
+	// RTMPApp is the play app of both RTMP listeners, set whenever either is
+	// on, for Check's publish-path rule.
 	RTMPPlay, RTMPApp string
 	// RTSPPlay and SRTPlay are the addresses of the server's RTSP and SRT
 	// servers, as bound; "" means off. Check refuses a stream that turns on
-	// an output whose server is off (RTMPPlay too): nobody could play it.
+	// an output whose servers are all off (RTMP and RTSP have two each, plain
+	// and TLS): nobody could play it.
 	RTSPPlay, SRTPlay string
+	// RTMPSPlay and RTSPSPlay are the server's RTMPS and RTSPS addresses, as
+	// bound; "" means off. An rtmps listen input must be on RTMPSPlay.
+	RTMPSPlay, RTSPSPlay string
+	// RootCAs are the roots of every TLS client of the streams (rtmps and
+	// rtsps inputs, https inputs, rtmps pushes); nil means the system's.
+	// Tests only; cmd/openstreamer never sets it.
+	RootCAs *x509.CertPool
 	// Reserved are the server's own listeners as bound (HTTP, API, RTMP,
 	// RTSP, SRT); the Manager's claims start from them.
 	Reserved []Claim
@@ -62,6 +75,38 @@ type Env struct {
 	Open func(ctx context.Context, url string) (ingest.Reader, error)
 	// TranscoderArgs and TranscoderEnv are for tests: the fake child.
 	TranscoderArgs, TranscoderEnv []string
+
+	// clients are the TLS clients of RootCAs, built once by NewManager for
+	// all of its supervisors (withClients); nil until then.
+	clients *clients
+}
+
+// clients are the TLS clients of the streams, built from Env.RootCAs.
+type clients struct {
+	tls  *tls.Config  // the base config of rtmps and rtsps inputs and rtmps pushes; never modified
+	http *http.Client // HTTP inputs; nil means ingest's default client (the system's roots)
+}
+
+// withClients returns env with its clients built from RootCAs, unless they
+// already are.
+func (e Env) withClients() Env {
+	if e.clients == nil {
+		c := &clients{tls: certs.Client(e.RootCAs, false)}
+		if e.RootCAs != nil {
+			c.http = ingest.NewHTTPClient(e.RootCAs)
+		}
+		e.clients = c
+	}
+	return e
+}
+
+// pushOptions returns the options of every pusher: the TLS client of an
+// rtmps:// target, the one of withClients when env has it.
+func (e Env) pushOptions() rtmppush.Options {
+	if e.clients == nil {
+		return rtmppush.Options{RTMP: rtmp.Config{TLS: certs.Client(e.RootCAs, false)}}
+	}
+	return rtmppush.Options{RTMP: rtmp.Config{TLS: e.clients.tls}}
 }
 
 // Claim is one listen address: a server listener's, or a stream's listen
@@ -71,6 +116,7 @@ type Claim struct {
 	Host  string // "" is the wildcard (0.0.0.0, ::, or no host)
 	Port  int
 	RTMP  bool   // an RTMP listener: RTMP claims on the same Host and Port share it
+	TLS   bool   // an RTMPS listener: shares only with RTMP claims that are TLS too
 	Path  string // an RTMP publish path; "" for a play listener and for every other claim
 	Owner string // a stream name, or "server"
 }
@@ -100,7 +146,7 @@ func Check(sp spec.Stream, env Env) error {
 				return checkErr(fmt.Sprintf("inputs[%d]", i), err)
 			}
 		}
-		if err := checkPublishPath(in.URL, env); err != nil {
+		if err := checkListenInput(in.URL, env); err != nil {
 			return checkErr(fmt.Sprintf("inputs[%d]", i), err)
 		}
 	}
@@ -108,15 +154,17 @@ func Check(sp spec.Stream, env Env) error {
 		return checkErr("layout", err)
 	}
 	for _, o := range []struct {
-		on         bool
-		addr, name string
+		on   bool
+		off  bool // every listener of the output is off
+		name string
+		keys string // the keys that turn one on
 	}{
-		{sp.Outputs.RTMP, env.RTMPPlay, "rtmp"},
-		{sp.Outputs.RTSP, env.RTSPPlay, "rtsp"},
-		{sp.Outputs.SRT, env.SRTPlay, "srt"},
+		{sp.Outputs.RTMP, env.RTMPPlay == "" && env.RTMPSPlay == "", "rtmp", "server.rtmp.listen or server.rtmp.tls_listen"},
+		{sp.Outputs.RTSP, env.RTSPPlay == "" && env.RTSPSPlay == "", "rtsp", "server.rtsp.listen or server.rtsp.tls_listen"},
+		{sp.Outputs.SRT, env.SRTPlay == "", "srt", "server.srt.listen"},
 	} {
-		if o.on && o.addr == "" {
-			return checkErr("outputs."+o.name, fmt.Errorf("the server's %s listener is off: set server.%s.listen and restart, or turn the output off", o.name, o.name))
+		if o.on && o.off {
+			return checkErr("outputs."+o.name, fmt.Errorf("the server's %s listener is off: set %s and restart, or turn the output off", o.name, o.keys))
 		}
 	}
 	scratch := hub.New(hub.Options{})
@@ -146,7 +194,7 @@ func Check(sp spec.Stream, env Env) error {
 		}
 	}
 	for i, p := range sp.Outputs.Push {
-		if _, err := rtmppush.New(scratch, p.URL, rtmppush.Options{}); err != nil {
+		if _, err := rtmppush.New(scratch, p.URL, env.pushOptions()); err != nil {
 			return checkErr(fmt.Sprintf("outputs.push[%d]", i), err)
 		}
 	}
@@ -163,42 +211,74 @@ func closeHubs(tr *transcode.Transcoder) {
 	}
 }
 
-// checkPublishPath refuses an RTMP listen input on the server's play
-// address that publishes under the play app: a publish path is never
-// playable, so a publisher at <RTMPApp>/<anything> would shadow the play
-// path of whichever stream has, or later gets, that name. Refusing the
-// whole app is the rule that does not depend on other streams.
-func checkPublishPath(input string, env Env) error {
-	if env.RTMPPlay == "" {
+// checkListenInput refuses an RTMP listen input that could never open, or
+// that would shadow a play path. An rtmps listen input must be on the
+// server's RTMPS listener, by its listener key (rtmpsrv.AddrKey), which is
+// how the registry finds it: a stream cannot open an RTMPS listener of its
+// own, because the certificate is the server's (R-S6). Then checkPublishPath
+// applies to it on that listener, as it does to a plain one on RTMPPlay.
+func checkListenInput(input string, env Env) error {
+	addr, path, secure, ok := rtmpListenKey(input)
+	if !ok {
 		return nil
 	}
-	play, err := rtmpsrv.AddrKey(env.RTMPPlay)
+	if !secure {
+		return checkPublishPath(addr, path, env.RTMPPlay, env.RTMPApp)
+	}
+	if env.RTMPSPlay == "" {
+		return errors.New("the server's RTMPS listener is off: set server.rtmp.tls_listen and server.tls, and restart")
+	}
+	key, err := rtmpsrv.AddrKey(env.RTMPSPlay)
+	if err != nil {
+		key = env.RTMPSPlay
+	}
+	if addr != key {
+		return fmt.Errorf("an rtmps listen input must be on the server's RTMPS listener %s", key)
+	}
+	return checkPublishPath(addr, path, env.RTMPSPlay, env.RTMPApp)
+}
+
+// checkPublishPath refuses an RTMP listen input, of listener key addr and
+// publish path path, on the server's play address play that publishes under
+// the play app: a publish path is never playable, so a publisher at
+// <playApp>/<anything> would shadow the play path of whichever stream has,
+// or later gets, that name. Refusing the whole app is the rule that does not
+// depend on other streams. play "" is off.
+func checkPublishPath(addr, path, play, playApp string) error {
+	if play == "" {
+		return nil
+	}
+	key, err := rtmpsrv.AddrKey(play)
 	if err != nil {
 		return nil //nolint:nilerr // no play listener to share: the server reports its own address
 	}
-	addr, path, ok := rtmpListenKey(input)
-	if !ok || addr != play {
+	if addr != key {
 		return nil
 	}
 	app := ""
 	if i := strings.LastIndexByte(path, '/'); i >= 0 {
 		app = path[:i]
 	}
-	if playApp, _ := rtmp.NormalizePath(env.RTMPApp, ""); playApp != "" && app == playApp {
-		return fmt.Errorf("an RTMP listen input on the play address may not publish under the play app %q: publish under another app", playApp)
+	if norm, _ := rtmp.NormalizePath(playApp, ""); norm != "" && app == norm {
+		return fmt.Errorf("an RTMP listen input on the play address may not publish under the play app %q: publish under another app", norm)
 	}
 	return nil
 }
 
 // rtmpListenKey returns the listener key and the publish path of an RTMP
-// listen input; ok is false for any other input.
-func rtmpListenKey(input string) (addr, path string, ok bool) {
+// listen input, rtmp:// or rtmps://, and whether it is rtmps:// (on the
+// server's RTMPS listener; ingest.TLSListen); ok is false for any other
+// input, an rtmps+insecure:// one included, which ingest refuses.
+func rtmpListenKey(input string) (addr, path string, secure, ok bool) {
+	if addr, path, ok := ingest.TLSListen(input); ok {
+		return addr, path, true, true
+	}
 	u, err := url.Parse(input)
 	if err != nil || !strings.EqualFold(u.Scheme, "rtmp") {
-		return "", "", false
+		return "", "", false, false
 	}
 	if mode := u.Query().Get("mode"); mode != "listen" && mode != "listener" {
-		return "", "", false
+		return "", "", false, false
 	}
 	port := u.Port()
 	if port == "" {
@@ -206,10 +286,10 @@ func rtmpListenKey(input string) (addr, path string, ok bool) {
 	}
 	addr, err = rtmpsrv.AddrKey(net.JoinHostPort(u.Hostname(), port))
 	if err != nil {
-		return "", "", false
+		return "", "", false, false
 	}
 	path, _ = rtmp.NormalizePath(u.Path, "")
-	return addr, path, true
+	return addr, path, false, true
 }
 
 // The functions below turn a spec into options. Check and the generation's

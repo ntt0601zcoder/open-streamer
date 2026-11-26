@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,12 +24,14 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics/metricstest"
+	"github.com/ntt0601zcoder/open-streamer/internal/output/rtmppush"
 	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/transcodetest"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp"
 	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 // errBoom fails a generation's runner.
@@ -1181,4 +1184,86 @@ func TestPushIDIsKeyed(t *testing.T) {
 	sum := sha256.Sum256([]byte(url))
 	assert.NotEqual(t, hex.EncodeToString(sum[:4]), id, "unkeyed")
 	assert.Equal(t, hex.EncodeToString(redact.Tag([]byte(url))[:4]), id)
+}
+
+// Env.RootCAs are the roots of the streams' TLS clients: a stream pulls
+// rtmps:// and pushes rtmps:// against servers of a private CA. With the
+// system's roots the pull fails with the x509 reason, which holds no key,
+// and the input is retried.
+func TestSupervisorTLSRoots(t *testing.T) {
+	ca := tlstest.NewCA(t)
+	t.Run("the CA's roots", func(t *testing.T) {
+		src := rtmptest.NewPlayServer(t, flvFixture(t), rtmptest.PlayOptions{Hold: true, TLS: ca.Server(t)})
+		sink := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{TLS: ca.Server(t)})
+		sp := camSpec()
+		sp.Inputs = []spec.Input{{URL: src.URL("live/" + vKey)}}
+		sp.Outputs = spec.Outputs{HTTPTS: true, Push: []spec.Push{{URL: sink.URL("live/" + vKey + "out")}}}
+		env := Env{RootCAs: ca.Pool()}
+		require.NoError(t, sp.Validate())
+		require.NoError(t, Check(sp, env))
+		ctx, cancel := context.WithCancel(context.Background())
+		s := NewSupervisor(sp, env, nil)
+		go s.Run(ctx)
+		defer func() {
+			cancel()
+			<-s.Done()
+		}()
+		waitRunning(t, s)
+		require.Eventually(t, func() bool { return len(s.Status().Tracks) > 0 }, waitFor, time.Millisecond,
+			"the source hub has no live track")
+		require.Eventually(t, func() bool {
+			return pushStats(t, s, sp.Outputs.Push[0].URL).State == string(rtmppush.StatePublishing) && len(sink.Media()) > 0
+		}, waitFor, time.Millisecond, "push %+v", pushStats(t, s, sp.Outputs.Push[0].URL))
+		reqs := src.Requests()
+		require.NotEmpty(t, reqs)
+		assert.Equal(t, "rtmps://"+src.Addr+"/live", reqs[0].TCURL)
+	})
+	t.Run("the system's roots", func(t *testing.T) {
+		ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		var accepts atomic.Int64
+		served := make(chan struct{})
+		go func() {
+			defer close(served)
+			cfg := ca.Server(t)
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				accepts.Add(1)
+				tc := tls.Server(c, cfg)
+				_ = tc.SetDeadline(time.Now().Add(5 * time.Second))
+				_ = tc.HandshakeContext(context.Background()) // fails: the client does not trust the CA
+				_ = tc.Close()
+			}
+		}()
+		defer func() {
+			_ = ln.Close()
+			<-served
+		}()
+		sp := camSpec()
+		sp.Inputs = []spec.Input{{URL: "rtmps://" + ln.Addr().String() + "/live/" + vKey}}
+		sp.Outputs = spec.Outputs{HTTPTS: true}
+		env := Env{}
+		require.NoError(t, Check(sp, env))
+		ctx, cancel := context.WithCancel(context.Background())
+		s := NewSupervisor(sp, env, nil)
+		go s.Run(ctx)
+		defer func() {
+			cancel()
+			<-s.Done()
+		}()
+		start := time.Now()
+		require.Eventually(t, func() bool { return accepts.Load() >= 2 }, 5*time.Second, 5*time.Millisecond,
+			"the input was not retried within the first back-off")
+		t.Logf("two attempts in %v", time.Since(start))
+		require.Eventually(t, func() bool { return s.Status().LastError != "" }, waitFor, time.Millisecond)
+		st := s.Status()
+		assert.Regexp(t, `^input 0: `, st.LastError)
+		assert.Contains(t, st.LastError, "x509")
+		assert.NotContains(t, st.LastError, vKey)
+		assert.Equal(t, "starting", st.State)
+		assert.Equal(t, uint64(1), st.Generation, "a failed open is retried by the pipeline, not by a rebuild")
+	})
 }

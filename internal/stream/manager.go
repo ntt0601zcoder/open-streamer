@@ -121,7 +121,8 @@ type Manager struct {
 }
 
 // NewManager returns an empty manager. env.Lookup is replaced by the
-// manager's CopyHub.
+// manager's CopyHub, and the TLS clients of env.RootCAs are built here, once
+// for every supervisor.
 func NewManager(env Env) *Manager {
 	m := &Manager{tails: map[string]<-chan struct{}{}}
 	m.ctx, m.stop = context.WithCancel(context.Background())
@@ -133,7 +134,7 @@ func NewManager(env Env) *Manager {
 		m.reserved = append(m.reserved, c)
 	}
 	env.Lookup = m.CopyHub
-	m.env = env
+	m.env = env.withClients()
 	m.streams.Store(&map[string]*entry{})
 	return m
 }

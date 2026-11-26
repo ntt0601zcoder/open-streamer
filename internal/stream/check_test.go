@@ -292,3 +292,78 @@ func TestLadderNoFallback(t *testing.T) {
 	assert.False(t, opt.Renditions[0].Video.NoFallback)
 	assert.True(t, opt.Renditions[1].Video.NoFallback)
 }
+
+// Check over TLS: an output needs either of its two listeners; an rtmps
+// listen input must be on the server's RTMPS listener, by its listener key,
+// and keeps out of the play app; a push may be rtmps:// or
+// rtmps+insecure://, never rtmp+insecure://. No text holds a key.
+func TestCheckTLS(t *testing.T) {
+	const tlsPlay = "127.0.0.1:1936"
+	type edit = func(*spec.Stream, *Env)
+	in := func(u string) edit {
+		return func(sp *spec.Stream, _ *Env) { sp.Inputs = []spec.Input{{URL: u}} }
+	}
+	rtmps := func(addr string) edit { return func(_ *spec.Stream, env *Env) { env.RTMPSPlay = addr } }
+	rtmpOffKeepApp := func(_ *spec.Stream, env *Env) { env.RTMPPlay = "" }
+	push := func(u string) edit {
+		return func(sp *spec.Stream, _ *Env) { sp.Outputs.Push = []spec.Push{{URL: u}} }
+	}
+	listen := func(host, path string) string { return "rtmps://" + host + "/" + path + "?mode=listen" }
+	rows := []struct {
+		name string
+		edit []edit
+		want string // "" passes; else a part of the error
+	}{
+		{"rtmp on RTMPS alone", []edit{rtmps(tlsPlay), rtmpOffKeepApp}, ""},
+		{"rtmp on, both RTMP listeners off", []edit{rtmpOffKeepApp}, "outputs.rtmp: the server's rtmp listener is off: set server.rtmp.listen or server.rtmp.tls_listen and restart, or turn the output off"},
+		{"rtsp on RTSPS alone", []edit{func(_ *spec.Stream, env *Env) { env.RTSPPlay, env.RTSPSPlay = "", "127.0.0.1:3220" }}, ""},
+		{"rtsp on, both RTSP listeners off", []edit{func(_ *spec.Stream, env *Env) { env.RTSPPlay = "" }}, "outputs.rtsp: the server's rtsp listener is off: set server.rtsp.listen or server.rtsp.tls_listen and restart, or turn the output off"},
+
+		{"an rtmps listen input on the RTMPS listener", []edit{rtmps(tlsPlay), in(listen(tlsPlay, "pub/"+vKey))}, ""},
+		{"0.0.0.0 against a wildcard bind", []edit{rtmps(":1936"), in(listen("0.0.0.0:1936", "pub/"+vKey))}, ""},
+		{"[::] against a wildcard bind", []edit{rtmps(":1936"), in(listen("[::]:1936", "pub/"+vKey))}, ""},
+		{"no host against a wildcard bind", []edit{rtmps(":1936"), in(listen(":1936", "pub/"+vKey))}, ""},
+		{"no host against a 0.0.0.0 bind", []edit{rtmps("0.0.0.0:1936"), in(listen(":1936", "pub/"+vKey))}, ""},
+		{"a host against a wildcard bind", []edit{rtmps(":1936"), in(listen(tlsPlay, "pub/"+vKey))}, "inputs[0]: an rtmps listen input must be on the server's RTMPS listener :1936"},
+		{"the RTMPS listener off", []edit{in(listen(tlsPlay, "pub/"+vKey))}, "inputs[0]: the server's RTMPS listener is off: set server.rtmp.tls_listen and server.tls, and restart"},
+		{"another port", []edit{rtmps(tlsPlay), in(listen("127.0.0.1:1937", "pub/"+vKey))}, "inputs[0]: an rtmps listen input must be on the server's RTMPS listener 127.0.0.1:1936"},
+		{"the default port, 443", []edit{rtmps(tlsPlay), in(listen("127.0.0.1", "pub/"+vKey))}, "inputs[0]: an rtmps listen input must be on the server's RTMPS listener 127.0.0.1:1936"},
+		{"the plain RTMP address", []edit{rtmps(tlsPlay), in(listen("192.0.2.1:19350", "pub/"+vKey))}, "inputs[0]: an rtmps listen input must be on the server's RTMPS listener 127.0.0.1:1936"},
+		{"a second input", []edit{rtmps(tlsPlay), func(sp *spec.Stream, _ *Env) {
+			sp.Inputs = append(sp.Inputs, spec.Input{URL: listen("127.0.0.1:1937", "pub/"+vKey)})
+		}}, "inputs[1]: an rtmps listen input must be on the server's RTMPS listener"},
+		{"under the play app", []edit{rtmps(tlsPlay), in(listen(tlsPlay, "play/"+vKey))}, "may not publish under the play app \"play\""},
+		{"under the play app, RTMPS alone", []edit{rtmps(tlsPlay), rtmpOffKeepApp, in(listen(tlsPlay, "play/"+vKey))}, "may not publish under the play app \"play\""},
+		{"under the play app, listener spelling", []edit{rtmps(tlsPlay), in("rtmps://" + tlsPlay + "/play/" + vKey + "?mode=listener")}, "may not publish under the play app"},
+		{"under the play app, upper-case scheme", []edit{rtmps(tlsPlay), in("RTMPS://" + tlsPlay + "/play/" + vKey + "?mode=listen")}, "may not publish under the play app"},
+		{"under another app", []edit{rtmps(tlsPlay), rtmpOffKeepApp, in(listen(tlsPlay, "in/"+vKey))}, ""},
+		{"an rtmps+insecure listen input", []edit{rtmps(tlsPlay), in("rtmps+insecure://" + tlsPlay + "/pub/" + vKey + "?mode=listen")}, "inputs[0]"},
+		{"an rtmps pull, the RTMPS listener off", []edit{in("rtmps://u:" + vPass + "@h/live/" + vKey)}, ""},
+		{"an rtmps+insecure pull", []edit{in("rtmps+insecure://h/live/" + vKey)}, ""},
+		{"an rtmp listen input on the RTMPS address", []edit{rtmps(tlsPlay), in("rtmp://" + tlsPlay + "/pub/" + vKey + "?mode=listen")}, ""}, // a claim conflict, not Check's
+
+		{"an rtmps push", []edit{push("rtmps://h/live/" + vKey)}, ""},
+		{"an rtmps+insecure push", []edit{push("rtmps+insecure://h/live/" + vKey)}, ""},
+		{"an rtmp+insecure push", []edit{push("rtmp+insecure://h/live/" + vKey)}, "outputs.push[0]: "},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			sp, env := camSpec(), served(Env{})
+			for _, e := range row.edit {
+				e(&sp, &env)
+			}
+			require.NoError(t, sp.Validate(), "the row must pass Validate: Check runs after it")
+			err := Check(sp, env)
+			if row.want == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), row.want)
+			assert.Regexp(t, `^stream: check: `, err.Error())
+			assert.NotContains(t, err.Error(), vPass)
+			assert.NotContains(t, err.Error(), vKey)
+			assert.Error(t, errors.Unwrap(err), "the cause is kept")
+		})
+	}
+}

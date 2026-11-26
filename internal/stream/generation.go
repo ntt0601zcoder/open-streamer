@@ -224,7 +224,7 @@ func (s *Supervisor) build(ctx context.Context) (*generation, error) {
 		g.shot = g.nailer.Shot
 	}
 	for _, p := range sp.Outputs.Push {
-		pusher, err := rtmppush.New(g.single[sp.Name], p.URL, rtmppush.Options{})
+		pusher, err := rtmppush.New(g.single[sp.Name], p.URL, s.env.pushOptions())
 		if err != nil {
 			return abandon(fmt.Errorf("push %s: %w", pushID(p.URL), err))
 		}
@@ -232,7 +232,7 @@ func (s *Supervisor) build(ctx context.Context) (*generation, error) {
 	}
 	popt := pipeline.Options{
 		Inputs:   inputsOf(sp),
-		Env:      ingest.Env{Lookup: s.env.Lookup},
+		Env:      ingest.Env{Lookup: s.env.Lookup, TLS: s.env.clients.tls, HTTP: s.env.clients.http},
 		Open:     s.env.Open,
 		Layout:   layout,
 		EndOnEOF: false,
@@ -347,7 +347,7 @@ func (s *Supervisor) reattach(g *generation, old, new spec.Outputs) {
 		if hasPush(old, p.URL) {
 			continue
 		}
-		if err := g.startPush(p.URL, g.single[s.name]); err != nil {
+		if err := g.startPush(p.URL, g.single[s.name], s.env.pushOptions()); err != nil {
 			// Check and build accepted this URL, so this does not happen;
 			// it is reported rather than assumed away.
 			s.fail("build: ", fmt.Errorf("push %s: %w", pushID(p.URL), err))
@@ -435,13 +435,14 @@ func (g *generation) stopPackagers() {
 	clear(g.packs)
 }
 
-// startPush starts the pusher of url on h.
-func (g *generation) startPush(url string, h *hub.Hub) error {
+// startPush starts the pusher of url on h, built with opt unless the
+// generation built it.
+func (g *generation) startPush(url string, h *hub.Hub, opt rtmppush.Options) error {
 	p := g.ready[url]
 	delete(g.ready, url)
 	if p == nil {
 		var err error
-		if p, err = rtmppush.New(h, url, rtmppush.Options{}); err != nil {
+		if p, err = rtmppush.New(h, url, opt); err != nil {
 			return err
 		}
 	}

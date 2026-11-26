@@ -123,6 +123,7 @@ func NewSupervisor(sp spec.Stream, env Env, after <-chan struct{}) *Supervisor {
 		env.Logger = slog.New(slog.DiscardHandler)
 	}
 	env.Logger = env.Logger.With("stream", sp.Name)
+	env = env.withClients() // a Manager's env has them already
 	s := &Supervisor{
 		name:   sp.Name,
 		env:    env,

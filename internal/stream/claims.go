@@ -94,14 +94,15 @@ func claimsOf(sp spec.Stream) []Claim {
 }
 
 // claimOf returns the listen claim of one input: an RTMP listen input claims
-// its path on the listener of its address; a UDP or an SRT listen input
-// claims its UDP address. A UDP input on a multicast group claims nothing:
-// any number of sockets join one group. Every other input, and one that does
-// not parse (Check refuses it), claims nothing.
+// its path on the listener of its address, an RTMPS listener for rtmps://;
+// a UDP or an SRT listen input claims its UDP address. A UDP input on a
+// multicast group claims nothing: any number of sockets join one group.
+// Every other input, and one that does not parse (Check refuses it), claims
+// nothing.
 func claimOf(input string) (Claim, bool) {
-	if key, path, ok := rtmpListenKey(input); ok {
+	if key, path, secure, ok := rtmpListenKey(input); ok {
 		host, port, ok := splitKey(key)
-		return Claim{RTMP: true, Host: host, Port: port, Path: path}, ok
+		return Claim{RTMP: true, TLS: secure, Host: host, Port: port, Path: path}, ok
 	}
 	parsed, err := ingest.Parse(input)
 	if err != nil || !parsed.Passive {
@@ -128,17 +129,24 @@ func claimOf(input string) (Claim, bool) {
 
 // conflict reports whether two claims cannot both be held (R-D11): the same
 // family and port, and the same host or a wildcard on either side. Two RTMP
-// claims on one address share its listener, and conflict only as two
-// publishers of one path.
+// claims on one address share its listener when both are TLS or neither is,
+// and conflict only as two publishers of one path; a plain and a TLS one
+// cannot share an address.
 func conflict(a, b Claim) bool {
 	if a.UDP != b.UDP || a.Port != b.Port {
 		return false
 	}
-	if a.RTMP && b.RTMP && a.Host == b.Host { // one shared RTMP listener
+	if sharing(a, b) { // one shared RTMP listener
 		// Two publishers of one path; a play listener ("" path) shares with all.
 		return a.Path != "" && a.Path == b.Path
 	}
 	return a.Host == b.Host || a.Host == "" || b.Host == ""
+}
+
+// sharing reports whether two claims are on one shared RTMP listener: both
+// RTMP, both TLS or both plain, on one host.
+func sharing(a, b Claim) bool {
+	return a.RTMP && b.RTMP && a.TLS == b.TLS && a.Host == b.Host
 }
 
 // taken returns the first claim of held that c conflicts with.
@@ -181,8 +189,16 @@ func claimErrors(name string, claims, held []Claim) []*editError {
 		if !ok {
 			continue
 		}
-		if c.RTMP && other.RTMP && c.Host == other.Host {
+		if sharing(c, other) {
 			errs = append(errs, conflictErr(name, "listen address %s has the RTMP publish path of an input of %s", c.addr(), other.holder()))
+			continue
+		}
+		if c.RTMP && other.RTMP && c.TLS != other.TLS {
+			kind := "RTMP"
+			if other.TLS {
+				kind = "RTMPS"
+			}
+			errs = append(errs, conflictErr(name, "listen address %s conflicts with the %s listener %s of %s", c.addr(), kind, other.addr(), other.holder()))
 			continue
 		}
 		errs = append(errs, conflictErr(name, "listen address %s conflicts with %s of %s", c.addr(), other.addr(), other.holder()))

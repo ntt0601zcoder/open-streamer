@@ -1964,3 +1964,28 @@ func TestManagerAudioLanguageOutcome(t *testing.T) {
 	assert.Equal(t, gen+1, r.status("cam").Generation)
 	assert.Equal(t, uint64(1), r.status("cam").Rebuilds)
 }
+
+// An input changed from rtmps:// to rtmps+insecure:// is another URL: a live
+// edit that reopens the input. spec.Validate accepts both: it checks no
+// scheme.
+func TestManagerReplaceTLSInput(t *testing.T) {
+	const verified, insecure = "rtmps://h/a/b", "rtmps+insecure://h/a/b"
+	r := newMrig(t)
+	cam := withInputs(camSpec(), verified)
+	require.NoError(t, cam.Validate())
+	assert.Equal(t, outcomes("cam", "created"), r.replace(cam))
+	r.waitRunning("cam")
+	sup, gen := r.sup("cam"), r.status("cam").Generation
+	require.Equal(t, 1, r.sc.opened(verified))
+
+	edited := withInputs(cam, insecure)
+	require.NoError(t, edited.Validate())
+	assert.Equal(t, spec.ChangeLive, spec.Diff(cam, edited))
+	assert.Equal(t, outcomes("cam", "live"), r.replace(edited))
+	require.Eventually(t, func() bool { return r.sc.opened(insecure) == 1 }, waitFor, time.Millisecond, "the input was not reopened")
+	require.Eventually(t, func() bool { return r.sc.closes(verified) == 1 }, waitFor, time.Millisecond, "the old input was not closed")
+	r.waitRunning("cam")
+	assert.Same(t, sup, r.sup("cam"))
+	assert.Equal(t, gen, r.status("cam").Generation)
+	assert.Equal(t, []string{"rtmps+insecure://h/a/xxxxx"}, r.status("cam").Inputs, "redacted, the scheme kept")
+}
