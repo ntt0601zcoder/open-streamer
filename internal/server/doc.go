@@ -30,6 +30,18 @@
 // and its removal, so a stream edit that starts using the asset and the
 // delete are in one order.
 //
+// # TLS
+//
+// With server.tls, New loads the one certificate (internal/certs) and each
+// tls_listen opens a TLS listener beside its plain sibling, served by the
+// same server: each http.Server serves both of its listeners (HTTP/1.1 only
+// over TLS), the RTMP play server is registered on both addresses and the
+// RTSP play server serves both listeners. A TLS handshake that fails is
+// counted per listener and logged once at debug, never after the stop
+// began; everything else net/http reports is logged at error. At the stop
+// the raw connections of the HTTPS listeners are closed after shutdownWait,
+// so a reader that takes nothing cannot hold it up with its close_notify.
+//
 // # Locks
 //
 // cfg serialises the writers. The readers never take it: the text in force

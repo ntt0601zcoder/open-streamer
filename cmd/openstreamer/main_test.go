@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/auth"
 	"github.com/ntt0601zcoder/open-streamer/internal/config"
+	"github.com/ntt0601zcoder/open-streamer/pkg/tlstest"
 )
 
 // waitFor bounds every wait of these tests.
@@ -373,4 +376,34 @@ func TestExampleCommentedStream(t *testing.T) {
 	require.NotNil(t, cam2.Transcode.Watermark)
 	assert.Equal(t, "brand.ttf", cam2.Transcode.Watermark.Font)
 	assert.Equal(t, []string{"brand.ttf"}, cam2.Assets())
+}
+
+// The TLS listeners are printed after their plain siblings, as bound.
+func TestRunPrintsTLS(t *testing.T) {
+	cert, key := tlstest.NewCA(t).Files(t, t.TempDir(), "127.0.0.1", "localhost")
+	text := configText(editorHash(t))
+	for _, name := range []string{"http", "api", "rtmp", "rtsp"} {
+		text = strings.Replace(text, name+`: {listen: "127.0.0.1:0"}`, name+`: {listen: "127.0.0.1:0", tls_listen: "127.0.0.1:0"}`, 1)
+	}
+	text = strings.Replace(text, "server:\n", "server:\n  tls: {cert_file: \""+cert+"\", key_file: \""+key+"\"}\n", 1)
+	r := startRun(t, text, nil)
+	lines := strings.Split(strings.TrimSpace(r.stdout.String()), "\n")
+	names := make([]string, 0, len(lines))
+	for _, line := range lines {
+		name, addr, ok := strings.Cut(line, " ")
+		require.True(t, ok, line)
+		names = append(names, name)
+		host, port, err := net.SplitHostPort(addr)
+		require.NoError(t, err, line)
+		assert.Equal(t, "127.0.0.1", host, line)
+		assert.NotEqual(t, "0", port, line)
+	}
+	assert.Equal(t, []string{"http", "https", "api", "api-tls", "rtmp", "rtmps", "rtsp", "rtsps", "srt"}, names)
+	for _, name := range []string{"https", "api-tls", "rtmps", "rtsps"} {
+		// Each is a TLS listener: a handshake gets a certificate.
+		c, err := tls.Dial("tcp", r.addrs[name], &tls.Config{InsecureSkipVerify: true}) //nolint:gosec,noctx // only that TLS is spoken
+		require.NoError(t, err, name)
+		require.NoError(t, c.Close())
+	}
+	assert.Equal(t, 0, r.stop())
 }

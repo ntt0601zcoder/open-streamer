@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +22,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/api"
 	"github.com/ntt0601zcoder/open-streamer/internal/asset"
 	"github.com/ntt0601zcoder/open-streamer/internal/auth"
+	"github.com/ntt0601zcoder/open-streamer/internal/certs"
 	"github.com/ntt0601zcoder/open-streamer/internal/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingest"
@@ -43,6 +46,9 @@ const (
 	// rtspUDPWait is how long New waits for the RTSP server to bind its
 	// UDP pair.
 	rtspUDPWait = 5 * time.Second
+	// headerTimeout is how long a client of an HTTP server gets to send its
+	// request header and, on a TLS listener, to finish its handshake.
+	headerTimeout = 10 * time.Second
 	// transcoderName is the transcoder looked for next to the executable
 	// when the config names none.
 	transcoderName = "ostranscoder"
@@ -62,10 +68,19 @@ type Options struct {
 	// TranscoderEnv is added to the environment of every transcoder child
 	// and of the font probe. Tests only; cmd/openstreamer never sets it.
 	TranscoderEnv []string
+	// RootCAs is passed to stream.Env.RootCAs: the roots of the streams'
+	// TLS clients. Tests only; cmd/openstreamer never sets it.
+	RootCAs *x509.CertPool
+	// HeaderTimeout is both HTTP servers' ReadHeaderTimeout, which is also
+	// their TLS handshake timeout; 0 means 10 s. Tests only;
+	// cmd/openstreamer never sets it.
+	HeaderTimeout time.Duration
 }
 
-// Addrs are the listeners' addresses, host:port as bound; "" when off.
-type Addrs struct{ HTTP, API, RTMP, RTSP, SRT string }
+// Addrs are the listeners' addresses, host:port as bound; "" when off. HTTPS,
+// APITLS, RTMPS and RTSPS are the TLS listeners beside HTTP, API, RTMP and
+// RTSP.
+type Addrs struct{ HTTP, HTTPS, API, APITLS, RTMP, RTMPS, RTSP, RTSPS, SRT string }
 
 // Server is the running process: the listeners, the manager and the config
 // in force. It implements api.Backend.
@@ -102,12 +117,25 @@ type Server struct {
 	reloadsOK, reloadsFailed atomic.Uint64
 	staleLogged              atomic.Int64 // when a Stale error was last logged, Unix nanoseconds
 
+	// store is the certificate of every TLS listener; nil without
+	// server.tls.
+	store *certs.Store
+	// httpsFailures and apiFailures count the failed TLS handshakes of the
+	// media and the API listener; the RTMPS and RTSPS listeners count their
+	// own.
+	httpsFailures, apiFailures atomic.Uint64
+	// stopping is set by Run before its first shutdown: a TLS handshake
+	// that fails from then on was cut short by the stop, and is neither
+	// counted nor logged.
+	stopping atomic.Bool
+
 	mediaLn, apiLn     net.Listener
+	mediaTLS, apiTLS   *trackListener // the HTTPS listeners; nil when off
 	mediaSrv, apiSrv   *http.Server
 	apiCtx             context.Context //nolint:containedctx // the API requests' base context, ended at shutdown
 	apiCancel          context.CancelFunc
-	rtmp               *rtmpplay.Server // nil when off
-	rtsp               *rtspplay.Server // nil when off
+	rtmp               *rtmpplay.Server // nil when both of its listeners are off
+	rtsp               *rtspplay.Server // nil when both of its listeners are off
 	srt                *srtout.Server   // nil when off
 	stopRTMP, stopRTSP func()
 	stopSRT            func()
@@ -172,6 +200,15 @@ func New(path string, opt Options) (*Server, error) {
 	}
 	s.users.Store(parsed.Users)
 	s.apiCtx, s.apiCancel = context.WithCancel(context.Background())
+	if sec.TLS.CertFile != "" {
+		if s.store, err = certs.Load(sec.TLS.CertFile, sec.TLS.KeyFile); err != nil {
+			return nil, fmt.Errorf("server: tls: %w", err)
+		}
+		warnKeyMode(log, sec.TLS.KeyFile)
+		if sec.HTTP.TLSListen == "" && sec.API.TLSListen == "" && sec.RTMP.TLSListen == "" && sec.RTSP.TLSListen == "" {
+			log.Warn("server: tls: a certificate is set and no tls_listen is: nothing is served over TLS; set server.http.tls_listen, server.api.tls_listen, server.rtmp.tls_listen or server.rtsp.tls_listen")
+		}
+	}
 	reserved, err := s.listen(sec)
 	if err != nil {
 		s.closeListeners()
@@ -185,11 +222,16 @@ func New(path string, opt Options) (*Server, error) {
 		Logger:        log,
 		Open:          opt.Open,
 		TranscoderEnv: opt.TranscoderEnv,
+		RootCAs:       opt.RootCAs,
 	}
-	if s.addrs.RTMP != "" {
-		env.RTMPPlay, env.RTMPApp = s.addrs.RTMP, sec.RTMP.App
+	// The play app is both RTMP listeners': with only the RTMPS one on, an
+	// rtmps listen input must still stay out of it.
+	if s.addrs.RTMP != "" || s.addrs.RTMPS != "" {
+		env.RTMPApp = sec.RTMP.App
 	}
-	env.RTSPPlay, env.SRTPlay = s.addrs.RTSP, s.addrs.SRT
+	env.RTMPPlay, env.RTMPSPlay = s.addrs.RTMP, s.addrs.RTMPS
+	env.RTSPPlay, env.RTSPSPlay = s.addrs.RTSP, s.addrs.RTSPS
+	env.SRTPlay = s.addrs.SRT
 	m := stream.NewManager(env)
 
 	reg := &metrics.Registry{}
@@ -213,22 +255,36 @@ func New(path string, opt Options) (*Server, error) {
 	reg.Register(m.Collect)
 	reg.Register(a.Collect)
 	reg.Register(s.collect)
+	header := opt.HeaderTimeout
+	if header <= 0 {
+		header = headerTimeout
+	}
 	s.apiSrv = &http.Server{
 		Handler:           a,
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: header,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
 		BaseContext:       func(net.Listener) context.Context { return s.apiCtx },
+		ErrorLog:          s.httpErrorLog("api", &s.apiFailures),
 	}
 	// No ReadTimeout or WriteTimeout: either would cut the long-lived
 	// HTTP-TS responses, and each handler sets its own write deadline.
 	s.mediaSrv = &http.Server{
 		Handler:           s.mediaHandler(),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: header,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
+		ErrorLog:          s.httpErrorLog("https", &s.httpsFailures),
+	}
+	// Each server serves both of its listeners. The TLS ones speak HTTP/1.1
+	// only (R-S4): the empty map is how net/http is told to offer no h2.
+	if s.store != nil {
+		for _, srv := range []*http.Server{s.apiSrv, s.mediaSrv} {
+			srv.TLSConfig = s.store.ServerConfig()
+			srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+		}
 	}
 
 	// Nothing fails from here on: Load starts the streams, which only Run
@@ -261,14 +317,15 @@ func loopback(addr string) bool {
 	return err == nil && ip.Unmap().IsLoopback()
 }
 
-// warnAPI logs once, at the start, that the API listens beyond loopback:
-// it has no TLS until M5c, so Basic credentials, the config and the stream
-// keys in it cross the network in clear.
+// warnAPI logs once, at the start, that the plain API listener is beyond
+// loopback: Basic credentials, the config and the stream keys in it cross
+// the network in clear there. The API for the network is
+// server.api.tls_listen (R-S5).
 func warnAPI(log *slog.Logger, addr string) {
 	if loopback(addr) {
 		return
 	}
-	log.Warn("server: api.listen is not a loopback address: the API has no TLS, so passwords and stream keys travel in clear; keep it on loopback or put a TLS reverse proxy in front",
+	log.Warn("server: api.listen is not a loopback address: that listener has no TLS, so passwords and stream keys travel in clear; keep it on loopback and serve the network from server.api.tls_listen",
 		"listen", addr)
 }
 
@@ -342,6 +399,17 @@ func (s *Server) listen(sec config.Server) ([]stream.Claim, error) {
 	if err := reserve(s.addrs.HTTP, stream.Claim{}); err != nil {
 		return nil, err
 	}
+	if sec.HTTP.TLSListen != "" {
+		ln, err := lc.Listen(ctx, "tcp", sec.HTTP.TLSListen)
+		if err != nil {
+			return nil, fmt.Errorf("server: http.tls_listen %s: %w", sec.HTTP.TLSListen, err)
+		}
+		s.mediaTLS = newTrackListener(ln)
+		s.addrs.HTTPS = ln.Addr().String()
+		if err := reserve(s.addrs.HTTPS, stream.Claim{}); err != nil {
+			return nil, err
+		}
+	}
 
 	if s.apiLn, err = lc.Listen(ctx, "tcp", sec.API.Listen); err != nil {
 		return nil, fmt.Errorf("server: api.listen %s: %w", sec.API.Listen, err)
@@ -350,10 +418,24 @@ func (s *Server) listen(sec config.Server) ([]stream.Claim, error) {
 	if err := reserve(s.addrs.API, stream.Claim{}); err != nil {
 		return nil, err
 	}
+	if sec.API.TLSListen != "" {
+		ln, err := lc.Listen(ctx, "tcp", sec.API.TLSListen)
+		if err != nil {
+			return nil, fmt.Errorf("server: api.tls_listen %s: %w", sec.API.TLSListen, err)
+		}
+		s.apiTLS = newTrackListener(ln)
+		s.addrs.APITLS = ln.Addr().String()
+		if err := reserve(s.addrs.APITLS, stream.Claim{}); err != nil {
+			return nil, err
+		}
+	}
 
-	if sec.RTMP.Listen != "" {
+	// One play server for both RTMP listeners, made when either is on.
+	if sec.RTMP.Listen != "" || sec.RTMP.TLSListen != "" {
 		s.rtmp = rtmpplay.New(s.lookup(stream.OutRTMP), rtmpplay.Options{})
-		addr, stop, err := registerRTMP(sec.RTMP.Listen, sec.RTMP.App, s.rtmp)
+	}
+	if sec.RTMP.Listen != "" {
+		addr, stop, err := registerRTMP(sec.RTMP.Listen, sec.RTMP.App, s.rtmp, nil)
 		if err != nil {
 			s.rtmp = nil
 			return nil, fmt.Errorf("server: rtmp.listen %s: %w", sec.RTMP.Listen, err)
@@ -365,18 +447,56 @@ func (s *Server) listen(sec config.Server) ([]stream.Claim, error) {
 			return nil, err
 		}
 	}
-
-	if sec.RTSP.Listen != "" {
-		ln, err := lc.Listen(ctx, "tcp", sec.RTSP.Listen)
+	if sec.RTMP.TLSListen != "" {
+		// The hook runs inside the listener's wait group: it only logs.
+		addr, stop, err := registerRTMP(sec.RTMP.TLSListen, sec.RTMP.App, s.rtmp, &rtmpsrv.TLSOptions{
+			Config:  s.store.ServerConfig(),
+			OnError: func(remote net.Addr, err error) { s.tlsFailed("rtmps", remote.String(), err.Error()) },
+		})
 		if err != nil {
-			return nil, fmt.Errorf("server: rtsp.listen %s: %w", sec.RTSP.Listen, err)
+			if s.addrs.RTMP == "" {
+				s.rtmp = nil
+			}
+			return nil, fmt.Errorf("server: rtmp.tls_listen %s: %w", sec.RTMP.TLSListen, err)
 		}
-		if err := s.startRTSP(ln, sec); err != nil {
-			return nil, fmt.Errorf("server: rtsp.listen %s: %w", sec.RTSP.Listen, err)
-		}
-		s.addrs.RTSP = ln.Addr().String()
-		if err := reserve(s.addrs.RTSP, stream.Claim{}); err != nil {
+		plain := s.stopRTMP
+		s.addrs.RTMPS, s.stopRTMP = addr, func() { plain(); stop() }
+		// The rtmps listen inputs on this address share the listener.
+		if err := reserve(addr, stream.Claim{RTMP: true, TLS: true}); err != nil {
 			return nil, err
+		}
+	}
+
+	// One play server for both RTSP listeners, made when either is on.
+	if sec.RTSP.Listen != "" || sec.RTSP.TLSListen != "" {
+		var ln, tlsLn net.Listener
+		if sec.RTSP.Listen != "" {
+			if ln, err = lc.Listen(ctx, "tcp", sec.RTSP.Listen); err != nil {
+				return nil, fmt.Errorf("server: rtsp.listen %s: %w", sec.RTSP.Listen, err)
+			}
+		}
+		if sec.RTSP.TLSListen != "" {
+			if tlsLn, err = lc.Listen(ctx, "tcp", sec.RTSP.TLSListen); err != nil {
+				if ln != nil {
+					_ = ln.Close()
+				}
+				return nil, fmt.Errorf("server: rtsp.tls_listen %s: %w", sec.RTSP.TLSListen, err)
+			}
+		}
+		if err := s.startRTSPBoth(ln, tlsLn, sec); err != nil {
+			return nil, fmt.Errorf("server: rtsp.listen %s: %w", sec.RTSP.Listen, err)
+		}
+		if ln != nil {
+			s.addrs.RTSP = ln.Addr().String()
+			if err := reserve(s.addrs.RTSP, stream.Claim{}); err != nil {
+				return nil, err
+			}
+		}
+		if tlsLn != nil {
+			s.addrs.RTSPS = tlsLn.Addr().String()
+			if err := reserve(s.addrs.RTSPS, stream.Claim{}); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -431,12 +551,13 @@ func resolveRTMP(addr string) (string, error) {
 }
 
 // registerRTMP registers the play handler on the process's RTMP registry,
-// which the listen inputs share, and returns the concrete address. When the
+// which the listen inputs share, and returns the concrete address: on an
+// RTMPS listener when tlsOpt is set, on a plain one otherwise. When the
 // configured port is 0 the pair resolve-and-register is tried up to
 // rtmpTries times, on any error: another process may take the port in
 // between, and another server of this process may be given the same one,
 // which the registry refuses as already registered.
-func registerRTMP(listen, app string, h rtmpsrv.PlayHandler) (addr string, stop func(), err error) {
+func registerRTMP(listen, app string, h rtmpsrv.PlayHandler, tlsOpt *rtmpsrv.TLSOptions) (addr string, stop func(), err error) {
 	tries := 1
 	if _, port, e := net.SplitHostPort(listen); e == nil && port == "0" {
 		tries = rtmpTries
@@ -445,18 +566,34 @@ func registerRTMP(listen, app string, h rtmpsrv.PlayHandler) (addr string, stop 
 		if addr, err = resolveRTMP(listen); err != nil {
 			continue
 		}
-		if stop, err = rtmpsrv.Default.RegisterPlay(addr, app, h, rtmp.Config{}, rtmpsrv.Policy{}); err == nil {
+		if tlsOpt != nil {
+			stop, err = rtmpsrv.Default.RegisterPlayTLS(addr, app, h, rtmp.Config{}, rtmpsrv.Policy{}, *tlsOpt)
+		} else {
+			stop, err = rtmpsrv.Default.RegisterPlay(addr, app, h, rtmp.Config{}, rtmpsrv.Policy{})
+		}
+		if err == nil {
 			return addr, stop, nil
 		}
 	}
 	return "", nil, err
 }
 
-// startRTSP serves RTSP players on ln, which it owns from here on. It
-// returns once the UDP pair, if any, is bound.
+// startRTSP serves RTSP players on the plain listener ln alone.
 func (s *Server) startRTSP(ln net.Listener, sec config.Server) error {
+	return s.startRTSPBoth(ln, nil, sec)
+}
+
+// startRTSPBoth serves RTSP players on ln and RTSPS players on tlsLn with
+// one play server; either may be nil, and it owns both from here on. It
+// returns once the UDP pair, if any, is bound: server.rtsp.udp is the plain
+// listener's, and RTSPS sessions are interleaved whatever it says.
+func (s *Server) startRTSPBoth(ln, tlsLn net.Listener, sec config.Server) error {
 	opt := rtspplay.Options{App: sec.RTSP.App}
-	if sec.RTSP.UDP {
+	if tlsLn != nil {
+		// The hook runs in the connection's goroutine: it only logs.
+		opt.Server.TLSError = func(remote net.Addr, err error) { s.tlsFailed("rtsps", remote.String(), err.Error()) }
+	}
+	if sec.RTSP.UDP && ln != nil {
 		host, _, _ := net.SplitHostPort(sec.RTSP.Listen)
 		if host == "" {
 			host = "0.0.0.0" // every interface
@@ -464,27 +601,41 @@ func (s *Server) startRTSP(ln net.Listener, sec config.Server) error {
 		opt.Server.UDPHost = host
 	}
 	srv := rtspplay.New(s.lookup(stream.OutRTSP), opt)
-	served := make(chan error, 1)
-	go func() { served <- srv.Serve(ln) }()
-	if sec.RTSP.UDP {
-		// Serve binds the pair before it accepts; wait for it so that a
-		// bind failure is a start-up error.
-		if ended, err := waitUDP(srv.UDPPorts, served, rtspUDPWait); err != nil {
-			// Serve has returned, or returns for this Close.
-			_ = srv.Close()
-			_ = ln.Close()
-			if !ended {
-				<-served
-			}
-			return err
-		}
-	}
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		if err := serveErr(<-served); err != nil {
-			s.fail(fmt.Errorf("server: rtsp: %w", err))
+	if ln != nil {
+		served := make(chan error, 1)
+		go func() { served <- srv.Serve(ln) }()
+		if sec.RTSP.UDP {
+			// Serve binds the pair before it accepts; wait for it so that a
+			// bind failure is a start-up error.
+			if ended, err := waitUDP(srv.UDPPorts, served, rtspUDPWait); err != nil {
+				// Serve has returned, or returns for this Close.
+				_ = srv.Close()
+				_ = ln.Close()
+				if tlsLn != nil {
+					_ = tlsLn.Close()
+				}
+				if !ended {
+					<-served
+				}
+				return err
+			}
 		}
-	})
+		wg.Go(func() {
+			if err := serveErr(<-served); err != nil {
+				s.fail(fmt.Errorf("server: rtsp: %w", err))
+			}
+		})
+	}
+	if tlsLn != nil {
+		// After the plain Serve, which is the one that binds the UDP pair.
+		cfg := s.store.ServerConfig()
+		wg.Go(func() {
+			if err := serveErr(srv.ServeTLS(tlsLn, cfg)); err != nil {
+				s.fail(fmt.Errorf("server: rtsps: %w", err))
+			}
+		})
+	}
 	s.rtsp = srv
 	s.stopRTSP = func() {
 		_ = srv.Close()
@@ -572,8 +723,14 @@ func (s *Server) closeListeners() {
 	if s.apiLn != nil {
 		_ = s.apiLn.Close()
 	}
+	if s.apiTLS != nil {
+		_ = s.apiTLS.Close()
+	}
 	if s.mediaLn != nil {
 		_ = s.mediaLn.Close()
+	}
+	if s.mediaTLS != nil {
+		_ = s.mediaTLS.Close()
 	}
 }
 
@@ -598,8 +755,21 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		})
 	}
+	// The certificate is the TLSConfig's, so ServeTLS is given no files.
+	serveTLS := func(name string, srv *http.Server, ln *trackListener) {
+		if ln == nil {
+			return
+		}
+		hwg.Go(func() {
+			if err := srv.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.fail(fmt.Errorf("server: %s: %w", name, err))
+			}
+		})
+	}
 	serve("api", s.apiSrv, s.apiLn)
+	serveTLS("api-tls", s.apiSrv, s.apiTLS)
 	serve("http", s.mediaSrv, s.mediaLn)
+	serveTLS("https", s.mediaSrv, s.mediaTLS)
 
 	var err error
 	select {
@@ -609,25 +779,41 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// No new edit comes in; then the streams stop, which closes every hub
 	// and so ends every player; then the output servers, which wait for
-	// their sessions; the media server last.
-	shutdown(ctx, s.apiSrv)
+	// their sessions; the media server last. Each stop covers both of its
+	// server's listeners. A TLS handshake that fails from here on is the
+	// stop's doing.
+	s.stopping.Store(true)
+	shutdown(ctx, s.apiSrv, s.apiTLS)
 	s.apiCancel() // a request still waiting for a rebuild
 	stopManager()
 	mwg.Wait()
 	s.stopRTMP()
 	s.stopRTSP()
 	s.stopSRT()
-	shutdown(ctx, s.mediaSrv)
+	shutdown(ctx, s.mediaSrv, s.mediaTLS)
 	hwg.Wait()
 	return err
 }
 
 // shutdown lets srv finish its requests for shutdownWait, then closes it.
 // ctx has ended already; only its values are kept.
-func shutdown(ctx context.Context, srv *http.Server) {
+//
+// tlsLn is srv's HTTPS listener, nil when off. net/http closes a TLS
+// connection with a close_notify, which a peer that reads nothing holds up
+// for seconds, in Close and in Shutdown's own close of an idle connection
+// alike. So at shutdownWait the raw connections still open are closed here,
+// whatever Shutdown is doing then, and the stop takes shutdownWait at most
+// (R-S8).
+func shutdown(ctx context.Context, srv *http.Server, tlsLn *trackListener) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownWait)
 	defer cancel()
+	if tlsLn != nil {
+		defer time.AfterFunc(shutdownWait, tlsLn.closeConns).Stop()
+	}
 	if err := srv.Shutdown(ctx); err != nil {
+		if tlsLn != nil {
+			tlsLn.closeConns()
+		}
 		_ = srv.Close()
 	}
 }

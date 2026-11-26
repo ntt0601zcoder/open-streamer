@@ -101,7 +101,15 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 	a := srv.Addrs()
 	for _, l := range []struct{ name, addr string }{
-		{"http", a.HTTP}, {"api", a.API}, {"rtmp", a.RTMP}, {"rtsp", a.RTSP}, {"srt", a.SRT},
+		{"http", a.HTTP},
+		{"https", a.HTTPS},
+		{"api", a.API},
+		{"api-tls", a.APITLS},
+		{"rtmp", a.RTMP},
+		{"rtmps", a.RTMPS},
+		{"rtsp", a.RTSP},
+		{"rtsps", a.RTSPS},
+		{"srt", a.SRT},
 	} {
 		if l.addr != "" {
 			_, _ = fmt.Fprintf(stdout, "%s %s\n", l.name, l.addr)

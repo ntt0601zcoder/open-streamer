@@ -32,6 +32,7 @@ package rtspplay
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"os"
@@ -165,6 +166,12 @@ func New(lookup func(name string) (*hub.Hub, bool), opt Options) *Server {
 // Serve accepts players on l until Close, then returns rtsp.ErrServerClosed.
 // The first Serve binds the UDP pair when Options.Server.UDPHost is set.
 func (s *Server) Serve(l net.Listener) error { return s.srv.Serve(l) }
+
+// ServeTLS serves RTSPS players on l, every connection wrapped with c, until
+// Close, then returns rtsp.ErrServerClosed. It may run beside Serve: the
+// players of both are the same Server's. Its sessions carry RTP interleaved
+// only, whatever Options.Server.UDPHost is.
+func (s *Server) ServeTLS(l net.Listener, c *tls.Config) error { return s.srv.ServeTLS(l, c) }
 
 // Close stops every listener, ends every session with a BYE (best effort)
 // and waits for them. It is idempotent.

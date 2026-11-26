@@ -61,7 +61,11 @@ type Env struct {
 	// Tests only; cmd/openstreamer never sets it.
 	RootCAs *x509.CertPool
 	// Reserved are the server's own listeners as bound (HTTP, API, RTMP,
-	// RTSP, SRT); the Manager's claims start from them.
+	// RTSP and SRT, and the TLS sibling of each of the first four); the
+	// Manager's claims start from them. The RTMP listener's claim is
+	// {RTMP: true} and the RTMPS listener's {RTMP: true, TLS: true}, each
+	// without a path: the listen inputs of its kind on that address share
+	// it.
 	Reserved []Claim
 	Logger   *slog.Logger // nil discards
 	// Now and After drive the supervisor's own timing and nothing else: the

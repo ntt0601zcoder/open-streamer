@@ -594,10 +594,19 @@ func TestWarnAPI(t *testing.T) {
 		assert.Contains(t, b.String(), `"level":"WARN"`)
 		assert.Contains(t, b.String(), "api.listen is not a loopback address")
 		assert.Contains(t, b.String(), "travel in clear")
+		// The fix it names is the TLS listener (R-S5).
+		assert.Contains(t, b.String(), "serve the network from server.api.tls_listen")
 	}
 	s := testConfig(t, nil)
 	assert.True(t, loopback(s.Addrs().API))
 	assert.NotContains(t, s.logs.String(), "api.listen is not a loopback")
+	// A loopback api.listen is not warned about with the TLS listeners on
+	// either, wherever they listen.
+	secure, _ := tlsStart(t, "", nil)
+	assert.True(t, loopback(secure.Addrs().API))
+	assert.NotEmpty(t, secure.Addrs().APITLS)
+	assert.NotContains(t, secure.logs.String(), "api.listen is not a loopback")
+	assert.NotContains(t, secure.logs.String(), `"level":"WARN"`)
 }
 
 func TestServerReserved(t *testing.T) {
