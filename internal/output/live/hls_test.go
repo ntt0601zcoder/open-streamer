@@ -1512,7 +1512,7 @@ func TestTSMasterAudioLanguage(t *testing.T) {
 
 // TestAudioLanguageConforms is the writer x conform matrix: every master and
 // MPD the packager writes with a declared language reads back through
-// conform, expecting that language, with no audio-language violation and
+// conform, expecting that language, with no violation of any rule and
 // exactly that language read.
 func TestAudioLanguageConforms(t *testing.T) {
 	const lang = "vi"
@@ -1571,9 +1571,6 @@ func TestAudioLanguageConforms(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, []string{lang}, c.AudioLanguages)
-			// Only rule audio-language is judged here: the synthetic
-			// fixtures may break unrelated rules, which are filtered out by
-			// rule name only.
 			// No rule needs filtering out: these fixtures break none, so every
 			// rule is judged, audio-language among them.
 			assert.Empty(t, c.Violations)
