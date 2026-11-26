@@ -713,6 +713,7 @@ func TestM5b1Assets(t *testing.T) {
 	code, errs := m5b1Error(t, res)
 	assert.Equal(t, "asset_in_use", code)
 	assert.Equal(t, []string{"cam"}, errs)
+	assert.NotContains(t, string(res.body), assetsDir, "the assets directory in the asset_in_use answer")
 	status, body := viewer.get(t, "/api/v1/assets")
 	require.Equal(t, http.StatusOK, status, "%s", body)
 	var list struct {
@@ -759,6 +760,7 @@ func TestM5b1Assets(t *testing.T) {
 	require.Equal(t, http.StatusUnprocessableEntity, res.code, "an HTML body as a PNG: %s", res.body)
 	code, _ = m5b1Error(t, res)
 	assert.Equal(t, "invalid_asset", code)
+	assert.NotContains(t, string(res.body), assetsDir, "the assets directory in the invalid_asset answer")
 	res = m5b1Asset(t, m, http.MethodPut, "..%2Fx.png", magentaPNG())
 	require.Equal(t, http.StatusNotFound, res.code, "a name with a path: %s", res.body)
 	assert.Empty(t, m5b1Names(t, assetsDir), "the assets directory")

@@ -1115,7 +1115,7 @@
         "name": "If-Match",
         "in": "header",
         "required": false,
-        "description": "One tag, exactly as an ETag header gave it, or *: the write is refused with 412 when the asset has another tag, and also when it does not exist. A list of tags and a weak tag (W/) never match. The tag is cached by the file's identity, size and modification time: a file edited in place by hand, at the same size within one tick of the file system's clock, can keep its old tag, and a write with that tag is then accepted (hand edits are outside the API's contract).",
+        "description": "One tag, exactly as an ETag header gave it, or *: the write is refused with 412 when the asset has another tag, and also when it does not exist. The header is compared as one exact strong tag, so a list of tags or a weak tag (W/\"…\") answers 412, even when it names the asset's tag. The tag is cached by the file's identity, size and modification time: a file edited in place by hand, at the same size within one tick of the file system's clock, can keep its old tag, and a write with that tag is then accepted (hand edits are outside the API's contract).",
         "schema": {
           "type": "string"
         }

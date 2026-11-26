@@ -188,6 +188,10 @@ func (a *API) putAsset(w http.ResponseWriter, r *http.Request) {
 	// body too large and does not store a cut one.
 	body := http.MaxBytesReader(w, r.Body, limit+1)
 	res, created, err := a.opt.Backend.PutAsset(r.Context(), name, body, r.Header.Get("If-Match"), noneMatch)
+	// The write deadline set above counts from the end of the read, but
+	// PutAsset may then wait for the server's apply mutex and for the
+	// running streams' refresh, so the answer gets a fresh one of its own.
+	_ = rc.SetWriteDeadline(time.Now().Add(a.timing.writeMore))
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		switch {
