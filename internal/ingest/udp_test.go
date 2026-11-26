@@ -335,7 +335,7 @@ func loopbackInterface(t *testing.T) string {
 }
 
 func TestUDPCloseUnblocksAndAbortsOpen(t *testing.T) {
-	port := freeUDPPort(t)
+	port := stableUDPPort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()

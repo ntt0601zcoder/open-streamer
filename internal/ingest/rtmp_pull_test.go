@@ -244,7 +244,7 @@ func requireBind1935(t *testing.T) {
 // We pull from ffmpeg serving the fixture; the frames pass the Clock clean.
 func TestRTMPFFmpegServerPull(t *testing.T) {
 	ffmpeg := testpeer.Require(t, "ffmpeg", "rtmp")
-	url := "rtmp://127.0.0.1:" + freeTCPPort(t) + "/live/s"
+	url := "rtmp://127.0.0.1:" + stableTCPPort(t) + "/live/s"
 	cmd := exec.CommandContext(t.Context(), ffmpeg, "-hide_banner", "-loglevel", "error", "-re",
 		"-i", fixturePath("h264_aac.ts"), "-c", "copy", "-f", "flv", "-listen", "1", url)
 	var stderr bytes.Buffer

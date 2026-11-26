@@ -863,7 +863,7 @@ func TestRTMPListenCloseUnblocks(t *testing.T) {
 	tags := fixtureTags(t, "h264_aac.flv")
 	want := sourceFrames(t, tags[:40])
 	cycle := func(t *testing.T, endPublisher bool) {
-		port := freeTCPPort(t)
+		port := stableTCPPort(t)
 		addr := "127.0.0.1:" + port
 		ch := openAsync(t, context.Background(), rtmpListenURL(port, "live/s"), Env{})
 		waitListening(t, addr)
@@ -976,7 +976,7 @@ func TestOpenRTMPListen(t *testing.T) {
 	assert.Contains(t, err.Error(), "live/skxxxxx")
 
 	// An open nobody publishes to ends with its ctx and frees the port.
-	port = freeTCPPort(t)
+	port = stableTCPPort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	_, err = Open(ctx, rtmpListenURL(port, "live/"+vStreamKey), Env{})

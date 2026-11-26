@@ -241,7 +241,7 @@ func TestSRTListenerReconnect(t *testing.T) {
 }
 
 func TestSRTListenerCloseUnblocks(t *testing.T) {
-	port := freeUDPPort(t)
+	port := stableUDPPort(t)
 	opened := openAsync(t, context.Background(), listenerURL(port, ""), Env{})
 	time.Sleep(200 * time.Millisecond)
 	pub := make(chan error, 1)
@@ -264,7 +264,7 @@ func TestSRTListenerCloseUnblocks(t *testing.T) {
 }
 
 func TestSRTOpenContextAbortsListener(t *testing.T) {
-	port := freeUDPPort(t)
+	port := stableUDPPort(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	_, err := Open(ctx, listenerURL(port, "&"+kPass+"="+vSecret+vSecret), Env{})
@@ -527,7 +527,7 @@ func TestSRTWithFFmpeg(t *testing.T) {
 	})
 
 	t.Run("our caller from ffmpeg listener", func(t *testing.T) {
-		port := freeUDPPort(t)
+		port := stableUDPPort(t)
 		cmd := exec.CommandContext(t.Context(), ffmpeg, "-hide_banner", "-loglevel", "error", "-re",
 			"-stream_loop", "-1", "-i", fixturePath("h264_aac.ts"), "-c", "copy", "-f", "mpegts",
 			fmt.Sprintf("srt://127.0.0.1:%d?mode=listener&latency=200000", port))
