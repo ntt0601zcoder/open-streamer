@@ -1131,6 +1131,10 @@
               "x264",
               "nvenc"
             ]
+          },
+          "no_fallback": {
+            "type": "boolean",
+            "description": "Fail the ladder when NVENC cannot be opened for this rendition, instead of encoding it with libx264; needs encoder nvenc."
           }
         },
         "required": [
@@ -1195,6 +1199,11 @@
           "time_zone": {
             "type": "string",
             "description": "An IANA time zone for a clock in the text; empty means none."
+          },
+          "font": {
+            "type": "string",
+            "description": "The name of a TTF or OTF file in the assets directory, for a text watermark; the built-in DejaVu Sans when empty.",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}\\.(ttf|otf)$"
           }
         }
       },

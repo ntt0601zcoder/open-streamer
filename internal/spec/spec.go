@@ -56,6 +56,9 @@ type Rendition struct {
 	BFrames        int    `json:"b_frames,omitempty" yaml:"b_frames,omitempty"`
 	Preset         string `json:"preset,omitempty" yaml:"preset,omitempty"`
 	Encoder        string `json:"encoder,omitempty" yaml:"encoder,omitempty"` // "", "x264", "nvenc"
+	// NoFallback makes an nvenc rung fail when NVENC cannot be opened,
+	// instead of encoding with libx264 (R-E9).
+	NoFallback bool `json:"no_fallback,omitempty" yaml:"no_fallback,omitempty"`
 }
 
 // Audio is the audio of every rung of a ladder.
@@ -74,6 +77,9 @@ type Watermark struct {
 	OpacityPct int    `json:"opacity_pct,omitempty" yaml:"opacity_pct,omitempty"`
 	SizePct    int    `json:"size_pct,omitempty" yaml:"size_pct,omitempty"`
 	TimeZone   string `json:"time_zone,omitempty" yaml:"time_zone,omitempty"`
+	// Font is a font asset's name (R-E8); text only; "" means the embedded
+	// font.
+	Font string `json:"font,omitempty" yaml:"font,omitempty"`
 }
 
 // Thumbnail is the operator preview of the source.
@@ -179,6 +185,22 @@ func (s Stream) Served() []string {
 	return names
 }
 
+// Assets returns the asset names the document refers to (the watermark's
+// image and font), sorted, without repeats.
+func (s Stream) Assets() []string {
+	if s.Transcode == nil || s.Transcode.Watermark == nil {
+		return nil
+	}
+	var names []string
+	for _, n := range []string{s.Transcode.Watermark.Image, s.Transcode.Watermark.Font} {
+		if n != "" {
+			names = append(names, n)
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
 // clone returns a deep copy of s; an empty slice stays empty.
 func (s Stream) clone() Stream {
 	s.Inputs = slices.Clone(s.Inputs)
@@ -200,11 +222,15 @@ func (s Stream) clone() Stream {
 	return s
 }
 
-// normal returns a deep copy of s with every empty slice nil.
+// normal returns a deep copy of s with every empty slice nil, and a layout
+// of video then audio, which is what an empty layout means, nil.
 func (s Stream) normal() Stream {
 	c := s.clone()
 	c.Inputs = nilIfEmpty(c.Inputs)
 	c.Layout = nilIfEmpty(c.Layout)
+	if slices.Equal(c.Layout, []string{"video", "audio"}) {
+		c.Layout = nil
+	}
 	if c.Transcode != nil {
 		c.Transcode.Renditions = nilIfEmpty(c.Transcode.Renditions)
 	}

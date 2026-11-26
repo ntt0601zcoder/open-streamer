@@ -11,4 +11,9 @@
 // choices the product offers. Ranges the transcoder owns (presets,
 // B-frames, sample rates, opacity, the thumbnail's fields) are left to the
 // stream manager's check.
+//
+// Diff sorts an edit into one of four classes, by how much of the stream it
+// touches: none, outputs only, live (the inputs or the watermark, applied
+// to the running pipeline) and rebuild. Assets names the asset files a
+// document refers to: the watermark's image or font.
 package spec

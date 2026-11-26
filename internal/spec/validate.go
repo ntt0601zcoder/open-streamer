@@ -13,6 +13,9 @@ import (
 // imageRE is the shape of a watermark image's asset name (R-C8).
 var imageRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}\.(png|jpg|jpeg)$`)
 
+// fontRE is the shape of a watermark font's asset name (R-E8).
+var fontRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}\.(ttf|otf)$`)
+
 // Validate checks the document's shape and returns the first failure,
 // naming its field as in "inputs[1].url: ...". Ranges the transcoder owns
 // are not checked here.
@@ -94,6 +97,9 @@ func (r Rendition) validate() error {
 	default:
 		return fmt.Errorf(".encoder: %s, want x264 or nvenc", Quote(r.Encoder))
 	}
+	if r.NoFallback && r.Encoder != "nvenc" {
+		return fmt.Errorf(".no_fallback: needs encoder nvenc")
+	}
 	return nil
 }
 
@@ -105,6 +111,14 @@ func (w *Watermark) validate() error {
 	}
 	if w.Image != "" && !imageRE.MatchString(w.Image) {
 		return fmt.Errorf(".image: %s is not a png or jpeg asset name", Quote(w.Image))
+	}
+	if w.Font != "" {
+		if w.Text == "" {
+			return fmt.Errorf(".font: needs text")
+		}
+		if !fontRE.MatchString(w.Font) {
+			return fmt.Errorf(".font: %s is not a ttf or otf asset name", Quote(w.Font))
+		}
 	}
 	switch w.Position {
 	case "", "tl", "tr", "bl", "br", "c":

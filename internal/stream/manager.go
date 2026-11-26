@@ -317,7 +317,7 @@ func (m *Manager) plan(streams []spec.Stream) ([]step, error) {
 			st.sp, st.act, st.applied = cloneSpec(sp), actStart, appliedStarted
 		default:
 			st.sp, st.act, st.applied = cloneSpec(sp), actSubmit, appliedOutputs
-			if spec.Diff(old.sp, sp) == spec.ChangeRebuild {
+			if c := spec.Diff(old.sp, sp); c == spec.ChangeLive || c == spec.ChangeRebuild { // ChangeLive: applied in place from Task 8
 				st.applied = appliedRebuild
 			}
 		}

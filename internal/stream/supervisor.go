@@ -269,7 +269,7 @@ func (s *Supervisor) serve(ctx context.Context, g *generation) stop {
 				s.setSpec(e.sp)
 				s.reattach(g, old, e.sp.Outputs) //nolint:contextcheck // the outputs run under g's context, a child of ctx
 				e.answer(spec.ChangeOutputs)
-			case spec.ChangeRebuild:
+			case spec.ChangeLive, spec.ChangeRebuild: // ChangeLive: applied in place from Task 8
 				// Answered after the next generation's reattach, or its
 				// failed build. The edits behind it stay queued for that
 				// generation.
@@ -309,7 +309,7 @@ func (s *Supervisor) idle(ctx context.Context, wait time.Duration) bool {
 				s.setSpec(e.sp)
 				e.answer(spec.ChangeOutputs)
 				changed = true
-			case spec.ChangeRebuild:
+			case spec.ChangeLive, spec.ChangeRebuild: // ChangeLive: applied in place from Task 8
 				s.rebuildFor(e)
 				changed = true
 			}

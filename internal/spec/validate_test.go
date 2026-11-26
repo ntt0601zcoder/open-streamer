@@ -177,3 +177,54 @@ func TestQuote(t *testing.T) {
 		assert.Less(t, len(err.Error()), 250, err.Error()[:100])
 	}
 }
+
+func TestValidateNoFallback(t *testing.T) {
+	encoded := func(encoder string) Stream {
+		s := full()
+		s.Transcode.Renditions = []Rendition{
+			{Label: "720", Height: 720, BitrateKbps: 3000, Encoder: encoder, NoFallback: true},
+		}
+		return s
+	}
+	require.NoError(t, encoded("nvenc").Validate())
+	for _, enc := range []string{"", "x264"} {
+		err := encoded(enc).Validate()
+		if assert.Error(t, err, enc) {
+			assert.Contains(t, err.Error(), "transcode.renditions[0].no_fallback: needs encoder nvenc", enc)
+		}
+	}
+
+	s := full()
+	s.Transcode.Renditions[0].NoFallback = true
+	err := s.Validate()
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "transcode.renditions[0]: a copy rendition sets nothing but its label")
+	}
+}
+
+func TestValidateFont(t *testing.T) {
+	text := func(font string) Stream {
+		s := full()
+		s.Transcode.Watermark = &Watermark{Text: "on air", Font: font}
+		return s
+	}
+	for _, font := range []string{"noto-sans.ttf", "a_b-c.otf", strings.Repeat("a", 64) + ".ttf"} {
+		assert.NoError(t, text(font).Validate(), font)
+	}
+	for _, font := range []string{
+		"Noto.ttf", "x.ttc", "x.woff", "../x.ttf", "x.png", "_x.ttf", ".ttf", "x.TTF",
+		strings.Repeat("a", 65) + ".ttf",
+	} {
+		err := text(font).Validate()
+		if assert.Error(t, err, font) {
+			assert.Contains(t, err.Error(), "transcode.watermark.font: "+Quote(font)+" is not a ttf or otf asset name", font)
+		}
+	}
+
+	s := full()
+	s.Transcode.Watermark = &Watermark{Image: "logo.png", Font: "noto-sans.ttf"}
+	err := s.Validate()
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "transcode.watermark.font: needs text")
+	}
+}

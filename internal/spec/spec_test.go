@@ -104,6 +104,61 @@ func TestRedacted(t *testing.T) {
 	assert.Equal(t, zero, zero.Redacted())
 }
 
+// The deep copy behind Redacted and ETag carries the M5b1 fields, and the
+// tag follows them.
+func TestCloneCopiesNewFields(t *testing.T) {
+	s := full()
+	s.Transcode.Renditions[2].NoFallback = true
+	s.Transcode.Watermark.Font = "noto-sans.ttf"
+
+	r := s.Redacted()
+	assert.True(t, r.Transcode.Renditions[2].NoFallback)
+	assert.Equal(t, "noto-sans.ttf", r.Transcode.Watermark.Font)
+	r.Transcode.Watermark.Font = "other.otf"
+	assert.Equal(t, "noto-sans.ttf", s.Transcode.Watermark.Font, "the receiver is unchanged")
+
+	b, err := json.Marshal(s.normal())
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"no_fallback":true`)
+	assert.Contains(t, string(b), `"font":"noto-sans.ttf"`)
+
+	e := s.ETag()
+	assert.Equal(t, e, s.clone().ETag())
+	noFallback := s.clone()
+	noFallback.Transcode.Renditions[2].NoFallback = false
+	assert.NotEqual(t, e, noFallback.ETag(), "no_fallback")
+	assert.NotEqual(t, s.Redacted().ETag(), noFallback.Redacted().ETag(), "no_fallback, redacted")
+	noFont := s.clone()
+	noFont.Transcode.Watermark.Font = ""
+	assert.NotEqual(t, e, noFont.ETag(), "font")
+	assert.NotEqual(t, s.Redacted().ETag(), noFont.Redacted().ETag(), "font, redacted")
+}
+
+func TestAssets(t *testing.T) {
+	s := full()
+	s.Transcode = nil
+	assert.Nil(t, s.Assets(), "no ladder")
+
+	s = full()
+	s.Transcode.Watermark = nil
+	assert.Nil(t, s.Assets(), "no watermark")
+
+	s = full()
+	assert.Nil(t, s.Assets(), "text with the embedded font")
+
+	s.Transcode.Watermark = &Watermark{Image: "logo.png"}
+	assert.Equal(t, []string{"logo.png"}, s.Assets(), "image only")
+
+	s.Transcode.Watermark = &Watermark{Text: "on air", Font: "noto-sans.ttf"}
+	assert.Equal(t, []string{"noto-sans.ttf"}, s.Assets(), "text and font")
+
+	// Not valid, but Assets still answers: sorted, without repeats.
+	s.Transcode.Watermark = &Watermark{Image: "z.png", Font: "a.ttf"}
+	assert.Equal(t, []string{"a.ttf", "z.png"}, s.Assets())
+	s.Transcode.Watermark = &Watermark{Image: "x", Font: "x"}
+	assert.Equal(t, []string{"x"}, s.Assets())
+}
+
 func TestETag(t *testing.T) {
 	a, b := full(), full()
 	a.Outputs.Push, b.Outputs.Push = nil, []Push{}
@@ -122,6 +177,8 @@ func TestETag(t *testing.T) {
 		"bitrate":   func(s *Stream) { s.Transcode.Renditions[1].BitrateKbps++ },
 		"audio":     func(s *Stream) { s.Transcode.Audio.Channels = 1 },
 		"watermark": func(s *Stream) { s.Transcode.Watermark.Position = "tl" },
+		"font":      func(s *Stream) { s.Transcode.Watermark.Font = "noto-sans.ttf" },
+		"fallback":  func(s *Stream) { s.Transcode.Renditions[2].NoFallback = true },
 		"thumbnail": func(s *Stream) { s.Thumbnail.Quality = 70 },
 		"output":    func(s *Stream) { s.Outputs.SRT = false },
 		"push":      func(s *Stream) { s.Outputs.Push[1].URL = "srt://c:9000" },
