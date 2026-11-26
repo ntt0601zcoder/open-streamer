@@ -99,6 +99,15 @@ invalid document is 422 with every error and changes nothing; a stale
 other outputs keep their viewers; any other change to a stream restarts that
 stream, and streams that did not change are not touched.
 
+A stream that could not run when the server started (its listen address was
+taken by another stream, an asset was missing) is left `stopped`, with the
+reason as its `last_error` and in `load_errors` of
+`GET /api/v1/config/status`. Every later edit and reload tries it again, even
+when its own document did not change: it answers `started` once nothing stands
+in its way, and until then it stays stopped with the reason refreshed, which
+never fails the edit. So after removing what was in the way, a `PUT` of the
+same document or a reload is enough.
+
 **Editing the file by hand.** Save the file, then reload it:
 
 ```sh

@@ -54,7 +54,7 @@ type ConfigStatus struct {
 	ETag            string     `json:"etag"`
 	LoadedAt        time.Time  `json:"loaded_at"`   // when the config in force was loaded, reloaded or written
 	Stale           bool       `json:"stale"`       // the file on disk differs: a reload is pending, API writes are refused
-	LoadErrors      []string   `json:"load_errors"` // what the start skipped or left stopped
+	LoadErrors      []string   `json:"load_errors"` // what the start skipped, and the streams that cannot run
 	LastReloadAt    *time.Time `json:"last_reload_at,omitempty"`
 	LastReloadError string     `json:"last_reload_error,omitempty"`
 	RestartRequired []string   `json:"restart_required"`

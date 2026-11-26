@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"os"
@@ -187,6 +190,162 @@ func TestStartIsLenient(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "started", out.Applied)
 		assert.Empty(t, s.status().LoadErrors)
+	})
+}
+
+// A stream the start left stopped is tried again by every edit and reload
+// that leaves it unchanged, and its record follows.
+func TestStoppedStreamStartsLater(t *testing.T) {
+	udp := freeUDP(t)
+	pair := func(name string) string {
+		return "  - name: " + name + "\n    inputs:\n      - url: udp://127.0.0.1:" + udp + "\n    outputs: {hls: true}\n"
+	}
+	u2JSON := streamJSON("u2", "udp://127.0.0.1:"+udp, `{"hls":true}`)
+	// two streams on one UDP port: the second is left stopped, naming the
+	// first.
+	begin := func(t *testing.T) *testServer {
+		s := testConfig(t, func(su *setup) { su.Text = baseText(pair("u1"), pair("u2")) })
+		s.generation("u1")
+		st, ok := s.Status("u2")
+		require.True(t, ok)
+		require.Equal(t, "stopped", st.State)
+		require.Contains(t, st.LastError, `of stream "u1"`)
+		require.Len(t, s.status().LoadErrors, 1)
+		return s
+	}
+	runs := func(t *testing.T, s *testServer) {
+		t.Helper()
+		s.generation("u2")
+		st, _ := s.Status("u2")
+		assert.Empty(t, st.LastError)
+		assert.Nil(t, st.LastErrorAt)
+		assert.Empty(t, s.status().LoadErrors)
+		assert.InDelta(t, 0, s.metric("openstreamer_config_load_errors"), 0)
+	}
+
+	t.Run("still in the way: unchanged, the reason refreshed", func(t *testing.T) {
+		s := begin(t)
+		before, _ := s.Status("u2")
+		time.Sleep(2 * time.Millisecond)
+		res := s.do(http.MethodPut, "/api/v1/streams/u2", "ops", u2JSON)
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		assert.Contains(t, res.body, `"applied":"unchanged"`)
+		after, _ := s.Status("u2")
+		assert.Equal(t, "stopped", after.State)
+		assert.True(t, after.LastErrorAt.After(*before.LastErrorAt))
+		require.Len(t, s.status().LoadErrors, 1)
+		res = s.do(http.MethodPost, "/api/v1/reload", "ops", "")
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		assert.Contains(t, res.body, `{"name":"u2","applied":"unchanged"}`)
+		require.Len(t, s.status().LoadErrors, 1)
+	})
+	t.Run("the delete of the stream in its way starts it", func(t *testing.T) {
+		s := begin(t)
+		res := s.do(http.MethodDelete, "/api/v1/streams/u1", "ops", "")
+		require.Equal(t, http.StatusNoContent, res.code, res.body)
+		runs(t, s)
+	})
+	t.Run("a reload that deletes the stream in its way starts it", func(t *testing.T) {
+		s := begin(t)
+		s.handEdit(baseText(pair("u2")))
+		res := s.do(http.MethodPost, "/api/v1/reload", "ops", "")
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		assert.Contains(t, res.body, `{"name":"u1","applied":"deleted"}`)
+		assert.Contains(t, res.body, `{"name":"u2","applied":"started"}`)
+		runs(t, s)
+	})
+
+	// An edit that puts another stream in its way leaves it stopped, and
+	// its reason no longer names the stream that is gone.
+	blocked := func(t *testing.T) *testServer {
+		s := testConfig(t, func(su *setup) { su.Text = baseText(pair("u1"), pair("u2")) })
+		s.generation("u1")
+		return s
+	}
+	t.Run("the reason names what is in the way now", func(t *testing.T) {
+		s := blocked(t)
+		u0 := spec.Stream{Name: "u0", Inputs: []spec.Input{{URL: "udp://127.0.0.1:" + udp}}, Outputs: spec.Outputs{HLS: true}}
+		_, etag := s.ConfigText()
+		res, err := s.PutConfig(bg, []byte(baseText(pair("u0"), pair("u2"))), etag)
+		require.NoError(t, err)
+		assert.Equal(t, "created", applied(t, res, u0.Name))
+		assert.Equal(t, "deleted", applied(t, res, "u1"))
+		assert.Equal(t, "unchanged", applied(t, res, "u2"))
+		st, _ := s.Status("u2")
+		assert.Contains(t, st.LastError, `of stream "u0"`)
+		assert.NotContains(t, st.LastError, "u1", "the error names a deleted stream")
+		errs := s.status().LoadErrors
+		require.Len(t, errs, 1)
+		assert.Contains(t, errs[0], `of stream "u0"`)
+	})
+
+	// The asset a watermark needs is missing at the start and written
+	// later: nothing in the config changes, and the same document starts
+	// the stream.
+	assets := func(t *testing.T) (*testServer, string, string) {
+		dir := t.TempDir()
+		bin := filepath.Join(t.TempDir(), "ostranscoder")
+		require.NoError(t, os.WriteFile(bin, []byte("#!/bin/sh\nexit 1\n"), 0o700))
+		wm := "  - name: wm\n    inputs:\n      - url: rtmp://src.example/live/wm\n" +
+			"    transcode:\n      renditions:\n        - {label: \"720\", height: 720, bitrate_kbps: 1000}\n" +
+			"      watermark: {image: logo.png}\n    outputs: {hls: true}\n"
+		s := testConfig(t, func(su *setup) {
+			su.Text = strings.Replace(baseText(wm), "server:\n",
+				"server:\n  transcoder: {binary: "+bin+"}\n  assets_dir: "+dir+"\n", 1)
+		})
+		st, ok := s.Status("wm")
+		require.True(t, ok)
+		require.Equal(t, "stopped", st.State)
+		require.Contains(t, st.LastError, "watermark")
+		require.Len(t, s.status().LoadErrors, 1)
+		doc := `{"name":"wm","inputs":[{"url":"rtmp://src.example/live/wm"}],` +
+			`"transcode":{"renditions":[{"label":"720","height":720,"bitrate_kbps":1000}],"audio":{},"watermark":{"image":"logo.png"}},` +
+			`"outputs":{"hls":true}}`
+		return s, filepath.Join(dir, "logo.png"), doc
+	}
+	logo := func(t *testing.T, path string) {
+		t.Helper()
+		var b bytes.Buffer
+		require.NoError(t, png.Encode(&b, image.NewRGBA(image.Rect(0, 0, 8, 8))))
+		require.NoError(t, os.WriteFile(path, b.Bytes(), 0o600))
+	}
+	started := func(t *testing.T, s *testServer) {
+		t.Helper()
+		st, ok := s.Status("wm")
+		require.True(t, ok)
+		assert.NotEqual(t, "stopped", st.State)
+		assert.NotContains(t, st.LastError, "watermark")
+		assert.Empty(t, s.status().LoadErrors)
+	}
+	t.Run("a PUT of the same document starts it", func(t *testing.T) {
+		s, path, doc := assets(t)
+		res := s.do(http.MethodPut, "/api/v1/streams/wm", "ops", doc)
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		assert.Contains(t, res.body, `"applied":"unchanged"`)
+		logo(t, path)
+		res = s.do(http.MethodPut, "/api/v1/streams/wm", "ops", doc)
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		assert.Contains(t, res.body, `"applied":"started"`)
+		started(t, s)
+		res = s.do(http.MethodPut, "/api/v1/streams/wm", "ops", doc)
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		assert.Contains(t, res.body, `"applied":"unchanged"`)
+	})
+	t.Run("a reload of the same file starts it", func(t *testing.T) {
+		s, path, _ := assets(t)
+		logo(t, path)
+		res := s.do(http.MethodPost, "/api/v1/reload", "ops", "")
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		assert.Contains(t, res.body, `{"name":"wm","applied":"started"}`)
+		started(t, s)
+	})
+	t.Run("a PUT of the same config starts it", func(t *testing.T) {
+		s, path, _ := assets(t)
+		logo(t, path)
+		res := s.putConfig(s.fileText())
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		assert.Contains(t, res.body, `{"name":"wm","applied":"started"}`)
+		started(t, s)
 	})
 }
 

@@ -78,7 +78,7 @@ type Server struct {
 	cfg           sync.Mutex
 	applied       []byte // the text in force
 	loadedAt      time.Time
-	loadErrs      []loadError
+	loadErrs      []string // scrubbed: the entries the start skipped, and the streams that cannot run
 	lastReloadAt  *time.Time
 	lastReloadErr string
 	restart       []string
@@ -205,35 +205,25 @@ func New(path string, opt Options) (*Server, error) {
 	// Nothing fails from here on: Load starts the streams, which only Run
 	// stops.
 	for _, e := range skipped {
-		s.loadErrs = append(s.loadErrs, loadError{text: logging.Scrub(e.Error())})
+		s.loadErrs = append(s.loadErrs, logging.Scrub(e.Error()))
 	}
-	s.loadErrs = append(s.loadErrs, stopped(m, m.Load(parsed.Doc.Streams))...)
+	// Load fails only on a manager that is closed or not empty, which this
+	// new one is not.
+	left, _ := m.Load(parsed.Doc.Streams)
+	s.loadErrs = append(s.loadErrs, stoppedTexts(left)...)
 	for _, e := range s.loadErrs {
-		log.Error("server: config: " + e.text)
+		log.Error("server: config: " + e)
 	}
 	s.manager.Store(m)
 	s.publish()
 	return s, nil
 }
 
-// stopped pairs Load's errors, one per stream it left stopped, in name
-// order, with those streams' names.
-func stopped(m *stream.Manager, errs []error) []loadError {
-	if len(errs) == 0 {
-		return nil
-	}
-	var names []string
-	for _, sp := range m.List() {
-		if st, ok := m.Status(sp.Name); ok && !sp.Disabled && st.State == "stopped" {
-			names = append(names, sp.Name)
-		}
-	}
-	out := make([]loadError, len(errs))
-	for i, e := range errs {
-		out[i] = loadError{text: logging.Scrub(e.Error())}
-		if len(names) == len(errs) {
-			out[i].name = names[i]
-		}
+// stoppedTexts returns the reasons of the streams that cannot run, scrubbed.
+func stoppedTexts(left []stream.Stopped) []string {
+	var out []string
+	for _, st := range left {
+		out = append(out, logging.Scrub(st.Err.Error()))
 	}
 	return out
 }

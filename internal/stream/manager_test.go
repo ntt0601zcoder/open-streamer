@@ -710,15 +710,21 @@ func TestManagerLoad(t *testing.T) {
 	set := []spec.Stream{z, r2, bad, x, dis, y, r1}
 
 	// Before Run: the supervisors start at once.
-	errs := r.m.Load(set)
-	require.Len(t, errs, 3)
-	assert.ErrorIs(t, errs[0], ErrInvalid)
-	assert.Contains(t, errs[0].Error(), `stream "bad": check: transcode:`)
-	assert.ErrorIs(t, errs[1], ErrConflict)
-	assert.Contains(t, errs[1].Error(), `stream "x": listen address udp :19000 conflicts with udp 127.0.0.1:19000 of the server`)
-	assert.ErrorIs(t, errs[2], ErrConflict)
-	assert.Contains(t, errs[2].Error(), `stream "z": listen address udp :15000 conflicts with udp :15000 of stream "y"`)
-	assert.Len(t, r.m.Load(set), 1, "a second Load is refused")
+	left, err := r.m.Load(set)
+	require.NoError(t, err)
+	require.Len(t, left, 3)
+	assert.Equal(t, "bad", left[0].Name)
+	assert.ErrorIs(t, left[0].Err, ErrInvalid)
+	assert.Contains(t, left[0].Err.Error(), `stream "bad": check: transcode:`)
+	assert.Equal(t, "x", left[1].Name)
+	assert.ErrorIs(t, left[1].Err, ErrConflict)
+	assert.Contains(t, left[1].Err.Error(), `stream "x": listen address udp :19000 conflicts with udp 127.0.0.1:19000 of the server`)
+	assert.Equal(t, "z", left[2].Name)
+	assert.ErrorIs(t, left[2].Err, ErrConflict)
+	assert.Contains(t, left[2].Err.Error(), `stream "z": listen address udp :15000 conflicts with udp :15000 of stream "y"`)
+	assert.Equal(t, left, r.m.Stopped())
+	_, err = r.m.Load(set)
+	assert.ErrorContains(t, err, "not empty", "a second Load is refused")
 	r.run()
 
 	r.waitRunning("r1", "r2", "y")
@@ -769,7 +775,7 @@ func TestManagerLoad(t *testing.T) {
 	assert.Equal(t, Outcome{Name: "z", Applied: "started"}, out[7])
 	r.waitRunning("z")
 	assert.Empty(t, r.status("z").LastError)
-	err := r.refuse(bad, dis, r1, r2, w, withInputs(x, "udp://:19000", "http://source.test/x.ts"), y, z2)
+	err = r.refuse(bad, dis, r1, r2, w, withInputs(x, "udp://:19000", "http://source.test/x.ts"), y, z2)
 	assert.ErrorIs(t, err, ErrConflict)
 	assert.Contains(t, err.Error(), `stream "x"`)
 
@@ -800,7 +806,8 @@ func TestManagerLoad(t *testing.T) {
 	out, err = r.m.Replace(context.Background(), nil, r.commit)
 	assert.ErrorIs(t, err, ErrClosed)
 	assert.Nil(t, out)
-	assert.Equal(t, []error{ErrClosed}, r.m.Load(nil))
+	_, err = r.m.Load(nil)
+	assert.ErrorIs(t, err, ErrClosed)
 	assert.Len(t, r.m.List(), 7, "a closed manager was edited")
 }
 
@@ -808,13 +815,80 @@ func TestManagerLoad(t *testing.T) {
 func TestManagerLoadCopyCycle(t *testing.T) {
 	r := &mrig{t: t, sc: newScript(t)}
 	r.m = NewManager(Env{Open: r.sc.Open})
-	errs := r.m.Load([]spec.Stream{withInputs(named("b"), "copy://a"), withInputs(named("a"), "copy://b")})
+	left, err := r.m.Load([]spec.Stream{withInputs(named("b"), "copy://a"), withInputs(named("a"), "copy://b")})
 	r.run()
-	require.Len(t, errs, 1)
-	assert.ErrorIs(t, errs[0], ErrConflict)
-	assert.Contains(t, errs[0].Error(), `stream "b": copy cycle b -> a -> b`)
+	require.NoError(t, err)
+	require.Len(t, left, 1)
+	assert.Equal(t, "b", left[0].Name)
+	assert.ErrorIs(t, left[0].Err, ErrConflict)
+	assert.Contains(t, left[0].Err.Error(), `stream "b": copy cycle b -> a -> b`)
 	assert.NotNil(t, r.sup("a"))
 	assert.Equal(t, "copy cycle b -> a -> b", r.status("b").LastError)
+}
+
+// A stream left stopped at load is tried again by every edit that leaves it
+// unchanged: it starts once nothing stands in its way, and until then keeps
+// a reason that is true now, without failing the edit.
+func TestManagerRetriesStopped(t *testing.T) {
+	r := &mrig{t: t, sc: newScript(t)}
+	r.m = NewManager(Env{Open: r.sc.Open})
+	a, b := withInputs(named("a"), "udp://:15000"), withInputs(named("b"), "udp://:15000")
+	c := withInputs(named("c"), "udp://:15000")
+	left, err := r.m.Load([]spec.Stream{a, b, c})
+	require.NoError(t, err)
+	require.Len(t, left, 2)
+	r.run()
+	r.waitRunning("a")
+	first := r.status("b")
+	require.NotNil(t, first.LastErrorAt)
+	assert.Contains(t, first.LastError, `of stream "a"`)
+
+	// Still in the way: unchanged, the edit is accepted, the reason is new.
+	time.Sleep(2 * time.Millisecond)
+	assert.Equal(t, outcomes("a", "unchanged", "b", "unchanged", "c", "unchanged"), r.replace(a, b, c))
+	again := r.status("b")
+	assert.Equal(t, "stopped", again.State)
+	assert.Contains(t, again.LastError, `of stream "a"`)
+	assert.True(t, again.LastErrorAt.After(*first.LastErrorAt), "the reason was not refreshed")
+	assert.Nil(t, r.sup("b"))
+	require.Len(t, r.m.Stopped(), 2)
+
+	// A touched stream comes first: d takes the port a gives up, and b and
+	// c, tried after it, name d now and do not fail the edit.
+	d := withInputs(named("d"), "udp://:15000")
+	assert.Equal(t, outcomes("a", "deleted", "b", "unchanged", "c", "unchanged", "d", "created"), r.replace(b, c, d))
+	r.waitRunning("d")
+	assert.Contains(t, r.status("b").LastError, `of stream "d"`)
+	assert.NotContains(t, r.status("b").LastError, `"a"`)
+	st := r.m.Stopped()
+	require.Len(t, st, 2)
+	assert.Equal(t, "b", st[0].Name)
+	assert.ErrorIs(t, st[0].Err, ErrConflict)
+	assert.Contains(t, st[0].Err.Error(), `stream "b": listen address udp :15000 conflicts with udp :15000 of stream "d"`)
+
+	// The way is free: the first of them by name starts, the other one now
+	// names it.
+	assert.Equal(t, outcomes("b", "started", "c", "unchanged", "d", "deleted"), r.replace(b, c))
+	r.waitRunning("b")
+	assert.Empty(t, r.status("b").LastError)
+	assert.Nil(t, r.status("b").LastErrorAt)
+	assert.Contains(t, r.status("c").LastError, `of stream "b"`)
+	st = r.m.Stopped()
+	require.Len(t, st, 1)
+	assert.Equal(t, "c", st[0].Name)
+
+	// The same set again: b runs on, untouched.
+	sup := r.sup("b")
+	assert.Equal(t, outcomes("b", "unchanged", "c", "unchanged"), r.replace(b, c))
+	assert.Same(t, sup, r.sup("b"))
+
+	// Disabling a stopped stream forgets its reason; nothing tries it.
+	c.Disabled = true
+	assert.Equal(t, outcomes("b", "deleted", "c", "stopped"), r.replace(c))
+	assert.Empty(t, r.status("c").LastError)
+	assert.Empty(t, r.m.Stopped())
+	assert.Equal(t, outcomes("c", "unchanged"), r.replace(c))
+	assert.Nil(t, r.sup("c"))
 }
 
 // syncBuffer is a log sink for concurrent writers.

@@ -40,9 +40,42 @@ type entry struct {
 	sp     spec.Stream
 	sup    *Supervisor        // nil: the stream is disabled, or was left stopped at load
 	cancel context.CancelFunc // sup's; nil without one
-	err    string             // why Load left it stopped; "" otherwise
+	err    string             // why it was left stopped, at load or at the last edit that tried it; "" otherwise
 	errAt  time.Time
+	cause  error // err's errors, joined; nil without err
 }
+
+// Stopped is an enabled stream that has no supervisor because it cannot
+// run: Err is why, and errors.Is finds ErrInvalid and ErrConflict in it.
+type Stopped struct {
+	Name string
+	Err  error
+}
+
+// failed returns the entry of a stream that is left stopped for errs.
+func failed(sp spec.Stream, errs []*editError) *entry {
+	msgs := make([]string, len(errs))
+	for i, err := range errs {
+		msgs[i] = err.msg
+	}
+	return &entry{sp: sp, err: strings.Join(msgs, "; "), errAt: time.Now(), cause: joined(errs)}
+}
+
+// stoppedOf returns the streams of set that are left stopped, by name.
+func stoppedOf(set map[string]*entry) []Stopped {
+	var out []Stopped
+	for _, name := range slices.Sorted(maps.Keys(set)) {
+		if e := set[name]; e.cause != nil {
+			out = append(out, Stopped{Name: name, Err: e.cause})
+		}
+	}
+	return out
+}
+
+// Stopped returns the enabled streams that have no supervisor because they
+// cannot run, sorted by name: the ones Load left stopped that no edit has
+// started since, each with the reason of the last time it was judged.
+func (m *Manager) Stopped() []Stopped { return stoppedOf(*m.streams.Load()) }
 
 // Manager owns the set of streams: one supervisor per stream that runs, the
 // listen claims between them and the server, and the lookups of the output
@@ -173,23 +206,23 @@ func joined(errs []*editError) error {
 // that fails Check, whose claims conflict with the server's or an earlier
 // stream's, or that closes a copy:// cycle with earlier streams, is kept in
 // the set without a supervisor, state "stopped", the reason as its LastError
-// and in the returned errors, one per such stream. It is called once, on an
-// empty manager.
-func (m *Manager) Load(streams []spec.Stream) []error {
+// and in the returned list, one item per such stream, sorted by name. Every
+// later edit tries such a stream again (see Replace). It is called once, on
+// an empty manager; the error is ErrClosed, or that it is not empty.
+func (m *Manager) Load(streams []spec.Stream) ([]Stopped, error) {
 	m.edit.Lock()
 	defer m.edit.Unlock()
 	if m.closed {
-		return []error{ErrClosed}
+		return nil, ErrClosed
 	}
 	if len(*m.streams.Load()) > 0 {
-		return []error{errors.New("stream: load: the manager is not empty")}
+		return nil, errors.New("stream: load: the manager is not empty")
 	}
 	sorted := slices.Clone(streams)
 	slices.SortFunc(sorted, func(a, b spec.Stream) int { return cmp.Compare(a.Name, b.Name) })
 	next := make(map[string]*entry, len(sorted))
 	held := slices.Clone(m.reserved)
 	running := map[string]spec.Stream{}
-	var out []error
 	for _, sp := range sorted {
 		e := &entry{sp: cloneSpec(sp)}
 		next[sp.Name] = e
@@ -199,19 +232,14 @@ func (m *Manager) Load(streams []spec.Stream) []error {
 		running[sp.Name] = e.sp
 		if errs := m.judge(e.sp, held, running); len(errs) > 0 {
 			delete(running, sp.Name)
-			msgs := make([]string, len(errs))
-			for i, err := range errs {
-				msgs[i] = err.msg
-			}
-			e.err, e.errAt = strings.Join(msgs, "; "), time.Now()
-			out = append(out, joined(errs))
+			next[sp.Name] = failed(e.sp, errs)
 			continue
 		}
 		held = append(held, claimsOf(e.sp)...)
 		m.start(e)
 	}
 	m.streams.Store(&next)
-	return out
+	return stoppedOf(next), nil
 }
 
 // act is what an edit does to one stream's supervisor.
@@ -223,6 +251,7 @@ const (
 	actSet               // a new entry without a supervisor; the old supervisor, if any, is cancelled
 	actStart             // a new entry with a new supervisor
 	actSubmit            // a new entry with the old supervisor, which gets the spec
+	actFail              // the entry stays stopped, with the reason of this edit
 )
 
 // step is one stream of an edit.
@@ -232,10 +261,12 @@ type step struct {
 	sp      spec.Stream // the new spec; unset for a deleted stream
 	act     act
 	applied string
+	errs    []*editError // actFail: why it still cannot run
 }
 
 // plan sorts every name of the current and the new set into steps, by name,
-// and judges the streams the edit creates or changes. edit is held.
+// and judges the streams the edit creates or changes; then it tries the
+// unchanged streams that were left stopped. edit is held.
 func (m *Manager) plan(streams []spec.Stream) ([]step, error) {
 	cur := *m.streams.Load()
 	fresh := make(map[string]spec.Stream, len(streams))
@@ -254,6 +285,7 @@ func (m *Manager) plan(streams []spec.Stream) ([]step, error) {
 	held := slices.Clone(m.reserved)    // the server's claims and the holders'
 	running := map[string]spec.Stream{} // the streams that have a supervisor after the edit
 	var touched []spec.Stream           // created or changed, and enabled: judged below
+	var retries []int                   // the steps of the unchanged streams left stopped: tried below
 	for _, name := range names {
 		old, sp := cur[name], fresh[name]
 		_, stays := fresh[name]
@@ -268,12 +300,15 @@ func (m *Manager) plan(streams []spec.Stream) ([]step, error) {
 				st.act = actSet
 			}
 		case spec.Diff(old.sp, sp) == spec.ChangeNone:
-			// Not judged again, whatever its state: a stream left stopped at
-			// load stays stopped, and holds nothing.
 			st.act, st.applied = actKeep, appliedUnchanged
-			if had {
+			switch {
+			case had:
 				held = append(held, claimsOf(old.sp)...)
 				running[name] = old.sp
+			case old.err != "" && !old.sp.Disabled:
+				// Left stopped because it could not run: what stood in its
+				// way may be gone, with this edit or since the last one.
+				retries = append(retries, len(steps))
 			}
 		case sp.Disabled:
 			// It is, or stays, without a supervisor.
@@ -302,6 +337,22 @@ func (m *Manager) plan(streams []spec.Stream) ([]step, error) {
 	}
 	if len(errs) > 0 {
 		return nil, joined(errs)
+	}
+
+	// The streams left stopped come last, in name order, so none of them
+	// takes what the edit itself asks for; one that still cannot run stays
+	// stopped with today's reason, and never fails the edit.
+	for _, i := range retries {
+		st := &steps[i]
+		sp := st.old.sp
+		running[st.name] = sp
+		if errs := m.judge(sp, held, running); len(errs) > 0 {
+			delete(running, st.name)
+			st.act, st.errs = actFail, errs
+			continue
+		}
+		held = append(held, claimsOf(sp)...)
+		st.sp, st.act, st.applied = sp, actStart, appliedStarted
 	}
 	return steps, nil
 }
@@ -333,6 +384,8 @@ func (m *Manager) apply(steps []step) []<-chan spec.Change {
 		case actSubmit:
 			waits = append(waits, st.old.sup.Submit(st.sp))
 			next[st.name] = &entry{sp: st.sp, sup: st.old.sup, cancel: st.old.cancel}
+		case actFail:
+			next[st.name] = failed(st.old.sp, st.errs)
 		}
 	}
 	m.streams.Store(&next) // last: a reader sees the edit whole
@@ -355,9 +408,14 @@ func (m *Manager) apply(steps []step) []<-chan spec.Change {
 // supervisors to apply the edit; they finish on their own.
 //
 // A stream without a supervisor (disabled, or left stopped at load) holds no
-// claims and is not judged while it stays as it is. One that changes and
-// stays disabled is "stopped". The streams have passed Validate and have
-// distinct names.
+// claims. A disabled one is not judged while it stays as it is; one that
+// changes and stays disabled is "stopped". An enabled stream that was left
+// stopped because it could not run, and that the edit does not change, is
+// tried again by every edit, after the streams the edit touches: judged as
+// a changed stream is, it starts ("started") when nothing stands in its way
+// any more, and otherwise stays stopped ("unchanged") with the reason
+// refreshed, which never fails the edit. The streams have passed Validate
+// and have distinct names.
 func (m *Manager) Replace(ctx context.Context, streams []spec.Stream, commit func() error) ([]Outcome, error) {
 	m.edit.Lock()
 	if m.closed {
@@ -413,7 +471,7 @@ func (m *Manager) List() []spec.Stream {
 }
 
 // Status returns the state of the stream name. A stream without a
-// supervisor reports state "stopped", with the reason Load left it so, if
+// supervisor reports state "stopped", with the reason it was left so, if
 // any, as its LastError.
 func (m *Manager) Status(name string) (Status, bool) {
 	e := (*m.streams.Load())[name]

@@ -1489,7 +1489,7 @@
           },
           "applied": {
             "type": "string",
-            "description": "created: a new stream. started: it was disabled or stopped and now runs. stopped: the stream has no supervisor after the edit (it is disabled). unchanged: nothing differed. outputs: only the outputs differed, applied in place. rebuild: the stream was rebuilt. deleted: the stream is gone.",
+            "description": "created: a new stream. started: it was disabled or stopped and now runs; also a stream that did not differ but had been left stopped because it could not run (a listen address in use, a missing asset), which every edit and reload tries again. stopped: the stream has no supervisor after the edit (it is disabled). unchanged: nothing differed; a stream left stopped that still cannot run stays so, with its last_error refreshed. outputs: only the outputs differed, applied in place. rebuild: the stream was rebuilt. deleted: the stream is gone.",
             "enum": [
               "created",
               "started",
@@ -1585,7 +1585,7 @@
           },
           "load_errors": {
             "type": "array",
-            "description": "What the start skipped or left stopped.",
+            "description": "The entries the start skipped, until an edit or a reload is applied, and the streams that cannot run and are left stopped, each with the reason of the last edit or reload, which tried it again.",
             "items": {
               "type": "string"
             }

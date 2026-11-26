@@ -20,11 +20,6 @@ import (
 // cannot be read for the stale check.
 const staleLogEvery = 10 * time.Second
 
-// loadError is one thing the start skipped or left stopped. name is the
-// stream Manager.Load left stopped; "" for an entry the lenient parse
-// skipped.
-type loadError struct{ name, text string }
-
 // state is the text in force and its status, published as one immutable
 // value. status.Stale is never set here: ConfigStatus asks the file.
 type state struct {
@@ -40,14 +35,11 @@ func (s *Server) publish() {
 		status: api.ConfigStatus{
 			ETag:            config.Hash(s.applied),
 			LoadedAt:        s.loadedAt,
-			LoadErrors:      make([]string, len(s.loadErrs)),
+			LoadErrors:      slices.Clone(s.loadErrs),
 			LastReloadAt:    s.lastReloadAt,
 			LastReloadError: s.lastReloadErr,
 			RestartRequired: slices.Clone(s.restart),
 		},
-	}
-	for i, e := range s.loadErrs {
-		st.status.LoadErrors[i] = e.text
 	}
 	s.state.Store(st)
 }
@@ -89,13 +81,10 @@ func (s *Server) apply(ctx context.Context, text []byte, write bool) (api.ApplyR
 		s.users.Store(p.Users)
 	}
 	s.applied, s.loadedAt = bytes.Clone(text), time.Now()
-	// The text parsed strictly, so no entry is skipped any more; a stream
-	// the start left stopped is still so only when the edit left it alone.
-	unchanged := map[string]bool{}
-	for _, o := range out {
-		unchanged[o.Name] = o.Applied == "unchanged"
-	}
-	s.loadErrs = slices.DeleteFunc(s.loadErrs, func(e loadError) bool { return e.name == "" || !unchanged[e.name] })
+	// The text parsed strictly, so no entry is skipped any more; what is
+	// left are the streams that still cannot run, each with the reason of
+	// this edit, which tried them again.
+	s.loadErrs = stoppedTexts(s.Manager().Stopped())
 	restart := s.started.Diff(p.Doc.Server.Resolved())
 	if restart == nil {
 		restart = []string{}
