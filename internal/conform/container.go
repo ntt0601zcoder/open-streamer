@@ -59,6 +59,14 @@ const (
 	// default audio rendition, does not exceed 1.1 times its BANDWIDTH
 	// (ReadOptions.AlignedSequences only).
 	RuleVariantBandwidth = "variant-bandwidth"
+	// RuleAudioLanguage: the audio language of an HLS master's TYPE=AUDIO
+	// renditions and of an MPD's audio adaptation sets (R-L6). A value must
+	// pass media.ValidLanguageSyntax. With ReadOptions.AudioLanguage set, no
+	// audio rendition or set carries another value, every master or MPD
+	// version that has audio carries it on one of them, and the URL read is
+	// not an HLS media playlist. Each violation is reported once per URL and
+	// value.
+	RuleAudioLanguage = "audio-language"
 )
 
 // frameRules are the rules CheckFrames knows.
@@ -101,6 +109,8 @@ type builder struct {
 	// epoch is a gap, with the summed EXTINF, in ticks, of the gaps before
 	// their first real entry in it: their tracks may start that late.
 	gapStart map[srcEpoch]int64
+	// langs are the distinct audio languages read, in the order first seen.
+	langs []string
 }
 
 // srcEpoch names one epoch of one source.
@@ -181,6 +191,37 @@ func (b *builder) once(key, rule string, track int, format string, args ...any) 
 	}
 	b.seen[key] = true
 	b.violate(rule, track, format, args...)
+}
+
+// checkAudioLanguages applies RuleAudioLanguage to one version of a master
+// or MPD read from u: labels are the languages of its audio renditions or
+// sets ("" when unlabelled), of names them ("renditions" or "adaptation
+// sets"), hasAudio says whether the version has audio, and want is
+// ReadOptions.AudioLanguage. The languages join b.langs. Values compare
+// case-insensitively, as BCP 47 tags do (RFC 5646 section 2.1.1).
+func (b *builder) checkAudioLanguages(u, want, of string, labels []string, hasAudio bool) {
+	found := false
+	for _, l := range labels {
+		if l == "" {
+			continue // an unlabelled extra rendition or set (R-L3)
+		}
+		if !slices.Contains(b.langs, l) {
+			b.langs = append(b.langs, l)
+		}
+		if !media.ValidLanguageSyntax(l) {
+			b.once("lang-syntax:"+u+"|"+l, RuleAudioLanguage, -1, "%s: audio language %q is not a BCP 47 tag", u, l)
+		}
+		switch {
+		case want == "":
+		case strings.EqualFold(l, want):
+			found = true
+		default:
+			b.once("lang-other:"+u+"|"+l, RuleAudioLanguage, -1, "%s: audio language %q, expected %q", u, l, want)
+		}
+	}
+	if want != "" && hasAudio && !found {
+		b.once("lang-none:"+u, RuleAudioLanguage, -1, "%s: the audio carries language %q on none of its %s", u, want, of)
+	}
 }
 
 // checkSegmentKey applies RuleSegmentKey to one segment's frames.
@@ -279,5 +320,5 @@ func (b *builder) finish() Capture {
 	if len(out) == 0 {
 		out = nil
 	}
-	return Capture{Frames: frames, Violations: out}
+	return Capture{Frames: frames, Violations: out, AudioLanguages: b.langs}
 }

@@ -41,6 +41,12 @@ var t0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 // when non-nil, rewrites the file whose path ends in suffix.
 func serve(t *testing.T, suffix string, edit func([]byte) []byte) string {
 	t.Helper()
+	return serveLang(t, suffix, edit, "")
+}
+
+// serveLang is serve with the packager's declared audio language.
+func serveLang(t *testing.T, suffix string, edit func([]byte) []byte, lang string) string {
+	t.Helper()
 	b, err := os.ReadFile("../../testdata/fixtures/h264_aac.ts")
 	require.NoError(t, err)
 	h := hub.New(hub.Options{})
@@ -65,7 +71,7 @@ func serve(t *testing.T, suffix string, edit func([]byte) []byte) string {
 		},
 	}).Run(ctx))
 	h.Close()
-	p := live.NewPackager(h, live.Options{Window: 100, Now: func() time.Time { return t0.Add(time.Hour) }})
+	p := live.NewPackager(h, live.Options{Window: 100, Now: func() time.Time { return t0.Add(time.Hour) }, AudioLanguage: lang})
 	p.Run(context.Background(), sub)
 	next := live.Handler(func(n string) (*live.Packager, bool) { return p, n == "s" })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -83,17 +89,18 @@ func serve(t *testing.T, suffix string, edit func([]byte) []byte) string {
 	return srv.URL + "/live/s/"
 }
 
-func runConform(t *testing.T, args ...string) (int, string) {
+// runConform runs osconform and returns its exit status, stdout and stderr.
+func runConform(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
-	var sb strings.Builder
-	code := run(context.Background(), args, &sb)
-	return code, sb.String()
+	var stdout, stderr strings.Builder
+	code := run(context.Background(), args, &stdout, &stderr)
+	return code, stdout.String(), stderr.String()
 }
 
 func TestOsconformExitCodes(t *testing.T) {
 	base := serve(t, "", nil)
 	for _, p := range []string{"hls/index.m3u8", "cmaf/master.m3u8", "cmaf/index.mpd"} {
-		code, out := runConform(t, "-url", base+p, "-once")
+		code, out, _ := runConform(t, "-url", base+p, "-once")
 		assert.Equal(t, 0, code, p)
 		assert.Empty(t, out, p)
 	}
@@ -104,7 +111,7 @@ func TestOsconformExitCodes(t *testing.T) {
 		m.Periods[0].AdaptationSets[0].Representations[0].Codecs = "avc1.4d401e"
 		return m.Encode()
 	})
-	code, out := runConform(t, "-url", bad+"cmaf/index.mpd", "-once")
+	code, out, _ := runConform(t, "-url", bad+"cmaf/index.mpd", "-once")
 	assert.Equal(t, 1, code)
 	assert.Equal(t, 1, strings.Count(out, "\n"), out)
 
@@ -114,21 +121,21 @@ func TestOsconformExitCodes(t *testing.T) {
 		m.Variants[0].Codecs = "avc1.4d401e,mp4a.40.2"
 		return m.Encode()
 	})
-	code, _ = runConform(t, "-url", bad+"cmaf/master.m3u8", "-once")
+	code, _, _ = runConform(t, "-url", bad+"cmaf/master.m3u8", "-once")
 	assert.Equal(t, 1, code)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "../../testdata/fixtures/h264_aac.ts")
 	}))
 	defer srv.Close()
-	code, _ = runConform(t, "-url", srv.URL+"/x.ts")
+	code, _, _ = runConform(t, "-url", srv.URL+"/x.ts")
 	assert.Equal(t, 0, code)
 
 	dead := httptest.NewServer(http.NotFoundHandler())
 	url := dead.URL
 	dead.Close()
 	for _, ext := range []string{"x.m3u8", "x.mpd", "x.ts"} {
-		code, _ = runConform(t, "-url", url+"/"+ext, "-once")
+		code, _, _ = runConform(t, "-url", url+"/"+ext, "-once")
 		assert.Equal(t, 2, code, ext)
 	}
 }
@@ -138,7 +145,7 @@ func TestOsconformExitCodes(t *testing.T) {
 // passes without it and fails with it.
 func TestOsconformAligned(t *testing.T) {
 	base := serve(t, "", nil)
-	code, out := runConform(t, "-url", base+"cmaf/master.m3u8", "-once", "-aligned")
+	code, out, _ := runConform(t, "-url", base+"cmaf/master.m3u8", "-once", "-aligned")
 	assert.Equal(t, 0, code, out)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+"cmaf/master.m3u8", nil)
@@ -157,9 +164,9 @@ func TestOsconformAligned(t *testing.T) {
 		pl.MediaSequence++
 		return pl.Encode()
 	})
-	code, out = runConform(t, "-url", bad+"cmaf/master.m3u8", "-once")
+	code, out, _ = runConform(t, "-url", bad+"cmaf/master.m3u8", "-once")
 	assert.Equal(t, 0, code, out)
-	code, out = runConform(t, "-url", bad+"cmaf/master.m3u8", "-once", "-aligned")
+	code, out, _ = runConform(t, "-url", bad+"cmaf/master.m3u8", "-once", "-aligned")
 	assert.Equal(t, 1, code)
 	assert.Contains(t, out, conform.RuleRenditionSequence)
 }
@@ -177,7 +184,7 @@ func TestOsconformTimeout(t *testing.T) {
 	defer close(stop)
 	for _, ext := range []string{"x.m3u8", "x.ts"} {
 		start := time.Now()
-		code, _ := runConform(t, "-url", srv.URL+"/"+ext, "-once", "-timeout", "200ms")
+		code, _, _ := runConform(t, "-url", srv.URL+"/"+ext, "-once", "-timeout", "200ms")
 		assert.Equal(t, 2, code, ext)
 		assert.Less(t, time.Since(start), 5*time.Second, ext)
 	}
@@ -195,7 +202,7 @@ func TestOsconformBadArgs(t *testing.T) {
 		"bad timeout": {"-url", "http://x/a.ts", "-timeout", "soon"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			code, out := runConform(t, args...)
+			code, out, _ := runConform(t, args...)
 			assert.Equal(t, 2, code)
 			assert.Empty(t, out)
 		})
@@ -245,24 +252,24 @@ func rtmpTags(t *testing.T, dropKey bool) []rtmp.FLVTag {
 
 func TestOsconformRTMP(t *testing.T) {
 	s := rtmptest.NewPlayServer(t, rtmpTags(t, false), rtmptest.PlayOptions{})
-	code, out := runConform(t, "-url", s.URL("live/s"))
+	code, out, _ := runConform(t, "-url", s.URL("live/s"))
 	assert.Equal(t, 0, code)
 	assert.Empty(t, out)
 
 	s = rtmptest.NewPlayServer(t, rtmpTags(t, true), rtmptest.PlayOptions{})
-	code, out = runConform(t, "-url", s.URL("live/s"))
+	code, out, _ = runConform(t, "-url", s.URL("live/s"))
 	assert.Equal(t, 1, code)
 	assert.Contains(t, out, "epoch-starts-on-key")
 
 	s = rtmptest.NewPlayServer(t, nil, rtmptest.PlayOptions{NotFound: true})
-	code, _ = runConform(t, "-url", s.URL("live/s"))
+	code, _, _ = runConform(t, "-url", s.URL("live/s"))
 	assert.Equal(t, 2, code)
 
 	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
-	code, _ = runConform(t, "-url", "rtmp://"+addr+"/live/s")
+	code, _, _ = runConform(t, "-url", "rtmp://"+addr+"/live/s")
 	assert.Equal(t, 2, code)
 }
 
@@ -352,11 +359,11 @@ func serveRTSP(t *testing.T, h rtsp.Handler) string {
 }
 
 func TestOsconformRTSP(t *testing.T) {
-	code, out := runConform(t, "-url", serveRTSP(t, newRTSPClip(t, false)), "-timeout", "10s")
+	code, out, _ := runConform(t, "-url", serveRTSP(t, newRTSPClip(t, false)), "-timeout", "10s")
 	assert.Equal(t, 0, code, out)
 	assert.Empty(t, out)
 
-	code, out = runConform(t, "-url", serveRTSP(t, newRTSPClip(t, true)), "-timeout", "10s")
+	code, out, _ = runConform(t, "-url", serveRTSP(t, newRTSPClip(t, true)), "-timeout", "10s")
 	assert.Equal(t, 1, code)
 	assert.Contains(t, out, "rtsp-sr-timely")
 
@@ -364,7 +371,7 @@ func TestOsconformRTSP(t *testing.T) {
 	require.NoError(t, err)
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
-	code, _ = runConform(t, "-url", "rtsp://"+addr+"/live/s", "-timeout", "2s")
+	code, _, _ = runConform(t, "-url", "rtsp://"+addr+"/live/s", "-timeout", "2s")
 	assert.Equal(t, 2, code)
 }
 
@@ -425,12 +432,12 @@ func srtPlay(t *testing.T) string {
 
 func TestOsconformSRT(t *testing.T) {
 	addr := srtPlay(t)
-	code, out := runConform(t, "-url", "srt://"+addr+"?streamid=live/s&latency=500", "-timeout", "10s")
+	code, out, _ := runConform(t, "-url", "srt://"+addr+"?streamid=live/s&latency=500", "-timeout", "10s")
 	assert.Equal(t, 0, code)
 	assert.Empty(t, out)
 
 	// A refused stream ID.
-	code, _ = runConform(t, "-url", "srt://"+addr+"?streamid=live/nope", "-timeout", "10s")
+	code, _, _ = runConform(t, "-url", "srt://"+addr+"?streamid=live/nope", "-timeout", "10s")
 	assert.Equal(t, 2, code)
 
 	// A stream with packets missing: continuity gaps.
@@ -462,7 +469,7 @@ func TestOsconformSRT(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}()
-	code, out = runConform(t, "-url", "srt://"+ln.Addr().String()+"?streamid=x", "-timeout", "10s")
+	code, out, _ = runConform(t, "-url", "srt://"+ln.Addr().String()+"?streamid=x", "-timeout", "10s")
 	ln.Close()
 	<-done
 	assert.Equal(t, 1, code)
@@ -473,7 +480,7 @@ func TestOsconformSRT(t *testing.T) {
 	require.NoError(t, err)
 	dead := l2.Addr().String()
 	l2.Close()
-	code, _ = runConform(t, "-url", "srt://"+dead+"?streamid=x", "-timeout", "1s")
+	code, _, _ = runConform(t, "-url", "srt://"+dead+"?streamid=x", "-timeout", "1s")
 	assert.Equal(t, 2, code)
 }
 
@@ -481,7 +488,7 @@ func TestOsconformSRT(t *testing.T) {
 func TestOsconformEmptyTS(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
 	defer srv.Close()
-	code, out := runConform(t, "-url", srv.URL+"/x.ts", "-timeout", "5s")
+	code, out, _ := runConform(t, "-url", srv.URL+"/x.ts", "-timeout", "5s")
 	assert.Equal(t, 2, code)
 	assert.NotContains(t, out, "ts-psi-present")
 }
@@ -498,7 +505,65 @@ func TestOsconformNoPSI(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(data) }))
 	defer srv.Close()
-	code, out := runConform(t, "-url", srv.URL+"/x.ts", "-timeout", "5s")
+	code, out, _ := runConform(t, "-url", srv.URL+"/x.ts", "-timeout", "5s")
 	assert.Equal(t, 1, code)
 	assert.Contains(t, out, "ts-psi-present")
+}
+
+// -audio-language checks the declared language of the masters and the MPD,
+// and the languages read are listed on stderr.
+func TestOsconformAudioLanguage(t *testing.T) {
+	vi := serveLang(t, "", nil, "vi")
+	en := serveLang(t, "", nil, "en")
+	for _, p := range []string{"cmaf/master.m3u8", "cmaf/index.mpd"} {
+		code, out, errOut := runConform(t, "-url", vi+p, "-once", "-audio-language", "vi")
+		assert.Equal(t, 0, code, p)
+		assert.Empty(t, out, p)
+		assert.Contains(t, errOut, "osconform: audio languages: vi\n", p)
+
+		code, out, errOut = runConform(t, "-url", en+p, "-once", "-audio-language", "vi")
+		assert.Equal(t, 1, code, p)
+		assert.Contains(t, out, conform.RuleAudioLanguage, p)
+		assert.Contains(t, errOut, "osconform: audio languages: en\n", p)
+
+		// Without the flag the languages are still listed.
+		code, out, errOut = runConform(t, "-url", en+p, "-once")
+		assert.Equal(t, 0, code, p)
+		assert.Empty(t, out, p)
+		assert.Contains(t, errOut, "osconform: audio languages: en\n", p)
+
+		// A private-use tag is accepted (exit 1 for the mismatch, not 2).
+		code, out, _ = runConform(t, "-url", vi+p, "-once", "-audio-language", "x-klingon")
+		assert.Equal(t, 1, code, p)
+		assert.Contains(t, out, conform.RuleAudioLanguage, p)
+	}
+
+	// Several languages are joined with ", ".
+	both := serveLang(t, "cmaf/master.m3u8", func(b []byte) []byte {
+		m, err := hls.ParseMultivariant(b)
+		require.NoError(t, err)
+		r := m.Renditions[0]
+		r.URI, r.Default, r.Language, r.Name = "", false, "en", "audio2"
+		m.Renditions = append(m.Renditions, r)
+		return m.Encode()
+	}, "vi")
+	code, _, errOut := runConform(t, "-url", both+"cmaf/master.m3u8", "-once")
+	assert.Equal(t, 0, code)
+	assert.Contains(t, errOut, "osconform: audio languages: vi, en\n")
+
+	// No language read: no line.
+	_, _, errOut = runConform(t, "-url", serve(t, "", nil)+"cmaf/master.m3u8", "-once")
+	assert.NotContains(t, errOut, "audio languages")
+
+	// HLS-TS without ABR is a media playlist: no master carries a language.
+	code, out, _ := runConform(t, "-url", vi+"hls/index.m3u8", "-once", "-audio-language", "vi")
+	assert.Equal(t, 1, code)
+	assert.Contains(t, out, conform.RuleAudioLanguage)
+
+	for _, bad := range []string{"bad tag", "e", "vi-"} {
+		code, out, errOut = runConform(t, "-url", vi+"cmaf/master.m3u8", "-once", "-audio-language", bad)
+		assert.Equal(t, 2, code, bad)
+		assert.Empty(t, out, bad)
+		assert.Contains(t, errOut, "-audio-language", bad)
+	}
 }

@@ -75,6 +75,10 @@ type ReadOptions struct {
 	// lets servers number renditions independently, so it is off by
 	// default; set it for servers that promise alignment (ours do).
 	AlignedSequences bool
+	// AudioLanguage, when set, is the language ReadHLS and ReadDASH expect
+	// on the audio (RuleAudioLanguage, R-L6 (b) to (d)). The other readers
+	// ignore it.
+	AudioLanguage string
 }
 
 const defaultTimeout = 30 * time.Second
@@ -92,6 +96,11 @@ type Capture struct {
 	// HLSGaps counts the EXT-X-GAP entries ReadHLS saw, once per playlist
 	// and media sequence number. Gap entries are never fetched.
 	HLSGaps int
+	// AudioLanguages are the distinct audio languages ReadHLS and ReadDASH
+	// read, in the order first seen: the LANGUAGE of the TYPE=AUDIO
+	// renditions of every master version, and the lang of the audio
+	// adaptation sets of every MPD version (R-L6).
+	AudioLanguages []string
 }
 
 // reader is the HTTP side shared by the readers.
@@ -344,6 +353,10 @@ func ReadHLS(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	c.master = bytes.Contains(body, []byte("#EXT-X-STREAM-INF"))
 	if !c.master {
 		c.lists = []*hlsPlaylist{{url: u, src: "pl0"}}
+		if opt.AudioLanguage != "" {
+			c.b.once("lang-media:"+u, RuleAudioLanguage, -1,
+				"%s: a media playlist, no master to carry a language (expected %q)", u, opt.AudioLanguage)
+		}
 	}
 	for pass := 0; ; pass++ {
 		if c.master {
@@ -673,13 +686,15 @@ func (c *hlsCapture) finalMaster(ctx context.Context, u string) {
 	_ = c.readMaster(u, body) // on error the union collected so far stands
 }
 
-// readMaster reads one version of the master: it adds its CODECS to the
-// union, marks the playlists it lists as active and adds the new ones.
+// readMaster reads one version of the master: it checks its audio
+// languages, adds its CODECS to the union, marks the playlists it lists as
+// active and adds the new ones.
 func (c *hlsCapture) readMaster(u string, body []byte) error {
 	m, err := hls.ParseMultivariant(body)
 	if err != nil {
 		return fmt.Errorf("conform: read: %s: %w", u, err)
 	}
+	c.masterLanguages(u, m)
 	var uris []string
 	for _, rd := range m.Renditions {
 		if rd.Default && rd.URI != "" && rd.Type == "AUDIO" {
@@ -731,6 +746,37 @@ func (c *hlsCapture) readMaster(u string, body []byte) error {
 		}
 	}
 	return nil
+}
+
+// masterLanguages applies RuleAudioLanguage to one version of the master.
+// It has audio when it has a TYPE=AUDIO rendition, a variant with an AUDIO
+// group, or an audio codec in a variant's CODECS.
+func (c *hlsCapture) masterLanguages(u string, m hls.MultivariantPlaylist) {
+	var labels []string
+	hasAudio := false
+	for _, rd := range m.Renditions {
+		if rd.Type == "AUDIO" {
+			hasAudio = true
+			labels = append(labels, rd.Language)
+		}
+	}
+	for _, v := range m.Variants {
+		if v.Audio != "" || slices.ContainsFunc(strings.Split(v.Codecs, ","), audioCodec) {
+			hasAudio = true
+		}
+	}
+	c.b.checkAudioLanguages(u, c.opt.AudioLanguage, "renditions", labels, hasAudio)
+}
+
+// audioCodec reports whether a CODECS entry is an audio codec: mp4a, ac-3,
+// ec-3 or opus, by its first dot-separated part.
+func audioCodec(codec string) bool {
+	head, _, _ := strings.Cut(strings.TrimSpace(codec), ".")
+	switch strings.ToLower(head) {
+	case "mp4a", "ac-3", "ec-3", "opus":
+		return true
+	}
+	return false
 }
 
 // done reports whether polling can stop: every playlist ended, or one has
@@ -1009,6 +1055,7 @@ type dashCapture struct {
 	r      reader
 	b      *builder
 	url    string
+	lang   string // ReadOptions.AudioLanguage
 	reps   map[string]*dashRep
 	inits  map[string]fmp4Init
 	bad    map[string]bool // inits that did not answer 200, reported once
@@ -1048,7 +1095,7 @@ type dashCapture struct {
 // so it does not see this.
 func ReadDASH(ctx context.Context, u string, opt ReadOptions) (Capture, error) {
 	c := &dashCapture{
-		r: newReader(opt), b: newBuilder(), url: u,
+		r: newReader(opt), b: newBuilder(), url: u, lang: opt.AudioLanguage,
 		reps: map[string]*dashRep{}, inits: map[string]fmp4Init{}, bad: map[string]bool{}, epochs: map[string]uint32{},
 		startKey: map[segID]bool{},
 	}
@@ -1120,6 +1167,7 @@ func (c *dashCapture) poll(ctx context.Context, m dash.MPD) error {
 	}
 	c.polled = true
 	c.docSegs = 0
+	c.languages(m)
 	var prevStart, prevEnd time.Duration
 	for pi, per := range m.Periods {
 		key := per.ID
@@ -1256,6 +1304,36 @@ func mediaSpan(sets []dashSet) time.Duration {
 		span = max(span, time.Duration(ticks*uint64(time.Second)/uint64(s.tpl.Timescale)))
 	}
 	return span
+}
+
+// languages applies RuleAudioLanguage to one version of the MPD: the lang
+// of the audio adaptation sets of every period.
+func (c *dashCapture) languages(m dash.MPD) {
+	var labels []string
+	hasAudio := false
+	for _, per := range m.Periods {
+		for _, as := range per.AdaptationSets {
+			if audioSet(as) {
+				hasAudio = true
+				labels = append(labels, as.Lang)
+			}
+		}
+	}
+	c.b.checkAudioLanguages(c.url, c.lang, "adaptation sets", labels, hasAudio)
+}
+
+// audioSet reports whether an adaptation set is audio: its contentType is
+// audio, or its mimeType (the set's, else its first representation's)
+// starts with audio/.
+func audioSet(as dash.AdaptationSet) bool {
+	if as.ContentType == "audio" {
+		return true
+	}
+	mt := as.MimeType
+	if mt == "" && len(as.Representations) > 0 {
+		mt = as.Representations[0].MimeType
+	}
+	return strings.HasPrefix(mt, "audio/")
 }
 
 // period resolves a period's representations and reads their inits.

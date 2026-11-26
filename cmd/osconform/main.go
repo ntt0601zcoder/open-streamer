@@ -7,6 +7,10 @@
 // variants aligned and BANDWIDTH honest. Our servers promise that; RFC 8216
 // does not require it, so it is off by default.
 //
+// With -audio-language, the HLS master or the MPD must carry that language
+// on its audio (a media playlist has no master to carry it); the languages
+// read are listed on stderr either way.
+//
 // Exit status: 0 clean, 1 violations found, 2 read error (an MPEG-TS stream
 // that ends before its first byte is one) or bad arguments.
 package main
@@ -23,16 +27,17 @@ import (
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/conform"
+	"github.com/ntt0601zcoder/open-streamer/internal/media"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	code := run(ctx, os.Args[1:], os.Stdout)
+	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }
 
-func run(ctx context.Context, args []string, stdout io.Writer) int {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("osconform", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	u := fs.String("url", "", "URL of a .m3u8, .mpd or .ts output, an rtmp:// stream, an rtsp:// stream, or an srt:// stream (streamid and latency in the query)")
@@ -41,20 +46,25 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	timeout := fs.Duration("timeout", 30*time.Second, "limit on each request, and on a stall of the .ts, RTMP, RTSP or SRT stream")
 	aligned := fs.Bool("aligned", false, "HLS: require the master's media playlists to number their segments alike, and check that variants are aligned and BANDWIDTH is honest")
 	mtu := fs.Int("mtu", 0, "largest RTP payload accepted from an RTSP stream (0: 1200)")
+	lang := fs.String("audio-language", "", "HLS and DASH: the BCP 47 language the master's audio renditions or the MPD's audio sets must carry")
 	if err := fs.Parse(args); err != nil {
-		fmt.Fprintf(os.Stderr, "osconform: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "osconform: %v\n", err)
 		return 2
 	}
 	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "osconform: unexpected argument %q\n", fs.Arg(0))
+		_, _ = fmt.Fprintf(stderr, "osconform: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if *lang != "" && !media.ValidLanguageSyntax(*lang) {
+		_, _ = fmt.Fprintf(stderr, "osconform: -audio-language %q is not a BCP 47 tag\n", *lang)
 		return 2
 	}
 	pu, err := url.Parse(*u)
 	if err != nil || *u == "" {
-		fmt.Fprintln(os.Stderr, "osconform: -url is required and must be a valid URL")
+		_, _ = fmt.Fprintln(stderr, "osconform: -url is required and must be a valid URL")
 		return 2
 	}
-	opt := conform.ReadOptions{Duration: *dur, Once: *once, Timeout: *timeout, MTU: *mtu, AlignedSequences: *aligned}
+	opt := conform.ReadOptions{Duration: *dur, Once: *once, Timeout: *timeout, MTU: *mtu, AlignedSequences: *aligned, AudioLanguage: *lang}
 	var read func(context.Context, string, conform.ReadOptions) (conform.Capture, error)
 	switch p := strings.ToLower(pu.Path); {
 	case strings.EqualFold(pu.Scheme, "rtmp"):
@@ -70,19 +80,22 @@ func run(ctx context.Context, args []string, stdout io.Writer) int {
 	case strings.HasSuffix(p, ".ts"):
 		read = conform.ReadTS
 	default:
-		fmt.Fprintln(os.Stderr, "osconform: -url must end in .m3u8, .mpd or .ts, or be an rtmp://, rtsp:// or srt:// URL")
+		_, _ = fmt.Fprintln(stderr, "osconform: -url must end in .m3u8, .mpd or .ts, or be an rtmp://, rtsp:// or srt:// URL")
 		return 2
 	}
 	c, err := read(ctx, *u, opt)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "osconform: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "osconform: %v\n", err)
 		return 2
+	}
+	if len(c.AudioLanguages) > 0 {
+		_, _ = fmt.Fprintf(stderr, "osconform: audio languages: %s\n", strings.Join(c.AudioLanguages, ", "))
 	}
 	for _, v := range c.Violations {
 		_, _ = fmt.Fprintln(stdout, v.String())
 	}
 	if c.RTPLost > 0 {
-		fmt.Fprintf(os.Stderr, "osconform: %d RTP packets lost\n", c.RTPLost)
+		_, _ = fmt.Fprintf(stderr, "osconform: %d RTP packets lost\n", c.RTPLost)
 	}
 	if len(c.Violations) > 0 {
 		return 1

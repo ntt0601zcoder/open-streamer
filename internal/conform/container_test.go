@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1674,7 +1675,7 @@ func dashRepFiles(t *testing.T, m map[string][]byte, id string, segs [][]media.F
 	return dash.Representation{
 		ID: id, Codecs: codec, Bandwidth: 1000,
 		SegmentTemplate: &dash.SegmentTemplate{
-			Timescale: 90000, Initialization: "$RepresentationID$-init.mp4", Media: "$RepresentationID$-$Number$.m4s",
+			Timescale: fmp4.Timescale(cfg), Initialization: "$RepresentationID$-init.mp4", Media: "$RepresentationID$-$Number$.m4s",
 			StartNumber: &start, Timeline: &dash.SegmentTimeline{S: tl},
 		},
 	}
@@ -1883,4 +1884,293 @@ func TestVariantBandwidthLargestWins(t *testing.T) {
 			assert.Equal(t, tc.want, countRule(c.Violations, RuleVariantBandwidth), "%v", c.Violations)
 		})
 	}
+}
+
+// langFiles writes a video playlist a.m3u8 and an audio playlist aud.m3u8
+// into m and returns their codec strings.
+func langFiles(t *testing.T, m map[string][]byte) (video, audio string) {
+	t.Helper()
+	vsegs := videoSegs(t)
+	asegs := audioSegs(t, vsegs)
+	addHLS(t, m, "a", vsegs, false, nil)
+	addHLS(t, m, "aud", asegs, false, nil)
+	video, err := media.CodecString(vsegs[0][0].Config)
+	require.NoError(t, err)
+	audio, err = media.CodecString(asegs[0][0].Config)
+	require.NoError(t, err)
+	return video, audio
+}
+
+// langViolations returns the RuleAudioLanguage violations.
+func langViolations(vs []Violation) []Violation {
+	var out []Violation
+	for _, v := range vs {
+		if v.Rule == RuleAudioLanguage {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func TestReadHLSAudioLanguages(t *testing.T) {
+	m := map[string][]byte{}
+	video, audio := langFiles(t, m)
+	both := video + "," + audio
+	withURI := func(lang string) hls.MultivariantPlaylist {
+		return hls.MultivariantPlaylist{
+			Version:    7,
+			Renditions: []hls.Rendition{{Type: "AUDIO", GroupID: "aud", Name: "audio", Language: lang, URI: "aud.m3u8", Default: true}},
+			Variants:   []hls.Variant{{URI: "a.m3u8", Codecs: both, Audio: "aud", Bandwidth: 1e9}},
+		}
+	}
+	uriless := func(lang string) hls.MultivariantPlaylist {
+		mp := withURI(lang)
+		mp.Renditions[0].URI = ""
+		return mp
+	}
+	read := func(t *testing.T, mp hls.MultivariantPlaylist, want string) Capture {
+		t.Helper()
+		mm := maps.Clone(m)
+		mm["/master.m3u8"] = mp.Encode()
+		c, err := ReadHLS(context.Background(), files(t, mm)+"/master.m3u8", ReadOptions{Once: true, AudioLanguage: want})
+		require.NoError(t, err)
+		return c
+	}
+
+	for _, tc := range []struct {
+		name string
+		mp   hls.MultivariantPlaylist
+		want string
+		got  []string
+	}{
+		{"URI rendition", withURI("vi"), "", []string{"vi"}},
+		{"URI rendition, expected", withURI("vi"), "vi", []string{"vi"}},
+		{"URI-less rendition", uriless("en-US"), "", []string{"en-US"}},
+		{"URI-less rendition, expected", uriless("en-US"), "en-US", []string{"en-US"}},
+		{"private use", withURI("x-klingon"), "", []string{"x-klingon"}},
+		// BCP 47 tags compare case-insensitively (RFC 5646 section 2.1.1).
+		{"case", withURI("vi-VN"), "VI-vn", []string{"vi-VN"}},
+		{"unlabelled", withURI(""), "", nil},
+		{"no audio", hls.MultivariantPlaylist{Version: 7, Variants: []hls.Variant{{URI: "a.m3u8", Codecs: video, Bandwidth: 1e9}}}, "vi", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := read(t, tc.mp, tc.want)
+			assert.Equal(t, tc.got, c.AudioLanguages)
+			assert.Empty(t, c.Violations)
+			assert.NotZero(t, countKind(c.Frames, media.KindVideo))
+		})
+	}
+
+	t.Run("bad syntax", func(t *testing.T) {
+		c := read(t, withURI("e"), "")
+		assert.Equal(t, []string{"e"}, c.AudioLanguages)
+		require.Len(t, c.Violations, 1, "%v", c.Violations)
+		assert.Equal(t, RuleAudioLanguage, c.Violations[0].Rule)
+		assert.Contains(t, c.Violations[0].Detail, `"e"`)
+	})
+
+	t.Run("other language", func(t *testing.T) {
+		c := read(t, withURI("en"), "vi")
+		assert.Equal(t, []string{"en"}, c.AudioLanguages)
+		vs := langViolations(c.Violations)
+		assert.Len(t, c.Violations, len(vs), "%v", c.Violations)
+		// (b) names both values; (c): no rendition carries "vi".
+		require.Len(t, vs, 2, "%v", vs)
+		assert.Contains(t, vs[0].Detail, `"en"`)
+		assert.Contains(t, vs[0].Detail, `"vi"`)
+		assert.Contains(t, vs[1].Detail, `"vi"`)
+	})
+
+	t.Run("audio without a rendition", func(t *testing.T) {
+		// (c): CODECS lists mp4a, but no AUDIO rendition carries the language.
+		mp := hls.MultivariantPlaylist{Version: 7, Variants: []hls.Variant{{URI: "a.m3u8", Codecs: both, Bandwidth: 1e9}}}
+		c := read(t, mp, "vi")
+		assert.Empty(t, c.AudioLanguages)
+		require.Len(t, c.Violations, 1, "%v", c.Violations)
+		assert.Equal(t, RuleAudioLanguage, c.Violations[0].Rule)
+		assert.Contains(t, c.Violations[0].Detail, `"vi"`)
+
+		// An AUDIO= group alone is audio too.
+		mp = hls.MultivariantPlaylist{Version: 7, Variants: []hls.Variant{{URI: "a.m3u8", Codecs: video, Audio: "aud", Bandwidth: 1e9}}}
+		c = read(t, mp, "vi")
+		assert.Equal(t, []string{RuleAudioLanguage}, rules(c.Violations))
+		// Without the option, neither is a violation.
+		c = read(t, mp, "")
+		assert.Empty(t, c.Violations)
+	})
+
+	t.Run("media playlist", func(t *testing.T) {
+		u := files(t, m) + "/a.m3u8"
+		c, err := ReadHLS(context.Background(), u, ReadOptions{Once: true, AudioLanguage: "vi"})
+		require.NoError(t, err)
+		require.Len(t, c.Violations, 1, "%v", c.Violations)
+		assert.Equal(t, RuleAudioLanguage, c.Violations[0].Rule)
+		assert.Contains(t, c.Violations[0].Detail, "no master")
+		c, err = ReadHLS(context.Background(), u, once())
+		require.NoError(t, err)
+		assert.Empty(t, c.Violations)
+	})
+
+	t.Run("every master version", func(t *testing.T) {
+		// Once with two aligned variants reads the master again at the end:
+		// that version's language is read too, and each value is reported
+		// once.
+		mm := maps.Clone(m)
+		addHLS(t, mm, "b", videoSegs(t), false, nil)
+		version := func(lang string) []byte {
+			mp := withURI(lang)
+			mp.Variants = append(mp.Variants, hls.Variant{URI: "b.m3u8", Codecs: both, Audio: "aud", Bandwidth: 1e9})
+			return mp.Encode()
+		}
+		var mu sync.Mutex
+		n := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/master.m3u8" {
+				mu.Lock()
+				n++
+				k := n
+				mu.Unlock()
+				if k == 1 {
+					_, _ = w.Write(version("vi"))
+				} else {
+					_, _ = w.Write(version("e"))
+				}
+				return
+			}
+			b, ok := mm[r.URL.Path]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(b)
+		}))
+		t.Cleanup(srv.Close)
+		c, err := ReadHLS(context.Background(), srv.URL+"/master.m3u8", ReadOptions{Once: true, AlignedSequences: true, AudioLanguage: "vi"})
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+		assert.Equal(t, []string{"vi", "e"}, c.AudioLanguages)
+		// "e": (a) bad syntax, (b) not "vi", (c) no rendition says "vi".
+		assert.Len(t, langViolations(c.Violations), 3, "%v", c.Violations)
+	})
+}
+
+// langMPD builds a static MPD of a video set and the given audio sets, each
+// with its own representation of h264_aac.ts's audio, and reads it.
+func langMPD(t *testing.T, want string, edit func(sets []dash.AdaptationSet)) Capture {
+	t.Helper()
+	m := map[string][]byte{}
+	vsegs := videoSegs(t)
+	asegs := audioSegs(t, vsegs)
+	sets := []dash.AdaptationSet{
+		{ContentType: "video", MimeType: "video/mp4", Representations: []dash.Representation{dashRepFiles(t, m, "v", vsegs, nil, 1)}},
+		{ContentType: "audio", MimeType: "audio/mp4", Representations: []dash.Representation{dashRepFiles(t, m, "a", asegs, nil, 1)}},
+		{ContentType: "audio", MimeType: "audio/mp4", Representations: []dash.Representation{dashRepFiles(t, m, "a2", asegs, nil, 1)}},
+	}
+	edit(sets)
+	sets = slices.DeleteFunc(sets, func(s dash.AdaptationSet) bool { return s.Representations == nil })
+	m["/index.mpd"] = dash.MPD{Type: "static", Periods: []dash.Period{{ID: "p0", AdaptationSets: sets}}}.Encode()
+	c, err := ReadDASH(context.Background(), files(t, m)+"/index.mpd", ReadOptions{Once: true, AudioLanguage: want})
+	require.NoError(t, err)
+	assert.NotZero(t, countKind(c.Frames, media.KindAudio))
+	return c
+}
+
+func TestReadDASHAudioLanguages(t *testing.T) {
+	oneAudio := func(sets []dash.AdaptationSet) { sets[2].Representations = nil }
+	for _, tc := range []struct {
+		name string
+		want string
+		edit func(sets []dash.AdaptationSet)
+		got  []string
+		viol int
+	}{
+		{"audio set", "", func(s []dash.AdaptationSet) { oneAudio(s); s[1].Lang = "vi" }, []string{"vi"}, 0},
+		{"audio set, expected", "vi", func(s []dash.AdaptationSet) { oneAudio(s); s[1].Lang = "vi" }, []string{"vi"}, 0},
+		{"video set ignored", "vi", func(s []dash.AdaptationSet) { oneAudio(s); s[0].Lang = "en"; s[1].Lang = "vi" }, []string{"vi"}, 0},
+		{"mimeType only", "vi", func(s []dash.AdaptationSet) {
+			oneAudio(s)
+			s[1].ContentType, s[1].Lang = "", "en"
+		}, []string{"en"}, 2},
+		{"representation mimeType", "vi", func(s []dash.AdaptationSet) {
+			oneAudio(s)
+			s[1].ContentType, s[1].MimeType, s[1].Lang = "", "", "en"
+			s[1].Representations[0].MimeType = "audio/mp4"
+		}, []string{"en"}, 2},
+		{"not audio", "vi", func(s []dash.AdaptationSet) {
+			// No contentType and no audio mimeType: not an audio set, so
+			// the MPD has no audio.
+			oneAudio(s)
+			s[1].ContentType, s[1].MimeType, s[1].Lang = "", "", "en"
+		}, nil, 0},
+		{"unlabelled extra set", "vi", func(s []dash.AdaptationSet) { s[1].Lang = "vi" }, []string{"vi"}, 0},
+		{"unlabelled only", "vi", oneAudio, nil, 1},
+		{"unlabelled, no option", "", oneAudio, nil, 0},
+		{"bad syntax", "", func(s []dash.AdaptationSet) { oneAudio(s); s[1].Lang = "e" }, []string{"e"}, 1},
+		{"private use", "", func(s []dash.AdaptationSet) { oneAudio(s); s[1].Lang = "x-klingon" }, []string{"x-klingon"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := langMPD(t, tc.want, tc.edit)
+			assert.Equal(t, tc.got, c.AudioLanguages)
+			vs := langViolations(c.Violations)
+			assert.Len(t, c.Violations, len(vs), "%v", c.Violations)
+			assert.Len(t, vs, tc.viol, "%v", vs)
+		})
+	}
+
+	t.Run("polling", func(t *testing.T) {
+		// The MPD says "vi", then "en" twice (the last static, to end the
+		// read): both are listed, and each violation is reported once.
+		m := map[string][]byte{}
+		vsegs := videoSegs(t)
+		asegs := audioSegs(t, vsegs)
+		v := dashRepFiles(t, m, "v", vsegs, nil, 1)
+		a := dashRepFiles(t, m, "a", asegs, nil, 1)
+		mpd := func(typ, lang string) []byte {
+			return dash.MPD{Type: typ, MinimumUpdatePeriod: dash.Duration(10 * time.Millisecond), Periods: []dash.Period{{
+				ID: "p0", AdaptationSets: []dash.AdaptationSet{
+					{ContentType: "video", MimeType: "video/mp4", Representations: []dash.Representation{v}},
+					{ContentType: "audio", MimeType: "audio/mp4", Lang: lang, Representations: []dash.Representation{a}},
+				},
+			}}}.Encode()
+		}
+		var mu sync.Mutex
+		n := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/index.mpd" {
+				mu.Lock()
+				n++
+				k := n
+				mu.Unlock()
+				switch k {
+				case 1:
+					_, _ = w.Write(mpd("dynamic", "vi"))
+				case 2:
+					_, _ = w.Write(mpd("dynamic", "en"))
+				default:
+					_, _ = w.Write(mpd("static", "en"))
+				}
+				return
+			}
+			b, ok := m[r.URL.Path]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(b)
+		}))
+		t.Cleanup(srv.Close)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c, err := ReadDASH(ctx, srv.URL+"/index.mpd", ReadOptions{Duration: time.Hour, AudioLanguage: "vi"})
+		require.NoError(t, err)
+		assert.Equal(t, 3, n)
+		assert.Equal(t, []string{"vi", "en"}, c.AudioLanguages)
+		vs := langViolations(c.Violations)
+		assert.Len(t, c.Violations, len(vs), "%v", c.Violations)
+		// (b) "en" is not "vi", and (c) the "en" versions carry "vi" on no
+		// set: each once, though two versions say "en".
+		require.Len(t, vs, 2, "%v", vs)
+		assert.Contains(t, vs[0].Detail, `"en"`)
+		assert.NotEqual(t, vs[0].Detail, vs[1].Detail)
+	})
 }
