@@ -1,4 +1,4 @@
-.PHONY: test lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers ostranscoder test-transcode test-nvenc
+.PHONY: test lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers ostranscoder test-transcode test-nvenc openstreamer
 
 test:
 	go test -race -shuffle=on -count=1 -timeout=10m ./...
@@ -28,6 +28,11 @@ covercheck:
 
 fixtures:
 	sh testdata/fixtures/gen.sh
+
+# The server, pure Go, at bin/openstreamer. The version is the tag, or the
+# commit when there is none.
+openstreamer:
+	go build -ldflags "-X main.version=$(shell git describe --tags --always --dirty)" -o bin/openstreamer ./cmd/openstreamer
 
 # The packages whose tests use ffmpeg, ffprobe, VLC or GStreamer, run in a
 # throwaway container of testdata/peers/Dockerfile.ci (CI's Ubuntu 24.04

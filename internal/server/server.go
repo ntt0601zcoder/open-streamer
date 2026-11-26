@@ -238,13 +238,19 @@ func stopped(m *stream.Manager, errs []error) []loadError {
 	return out
 }
 
-// defaultTranscoder returns the ostranscoder next to the executable, or ""
+// defaultTranscoder returns the ostranscoder next to this executable, or ""
 // when there is none.
 func defaultTranscoder() string {
 	exe, err := os.Executable()
 	if err != nil {
 		return ""
 	}
+	return transcoderBeside(exe)
+}
+
+// transcoderBeside returns the ostranscoder in the directory of exe, or ""
+// when there is none.
+func transcoderBeside(exe string) string {
 	name := transcoderName
 	if runtime.GOOS == "windows" {
 		name += ".exe"

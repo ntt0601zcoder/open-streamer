@@ -671,3 +671,85 @@ func listenUDP(t *testing.T, addr string) net.PacketConn {
 	require.NoError(t, err, addr)
 	return pc
 }
+
+func TestTranscoderBeside(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "openstreamer")
+	assert.Empty(t, transcoderBeside(exe))
+	name := transcoderName
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	require.NoError(t, os.Mkdir(filepath.Join(dir, name), 0o700))
+	assert.Empty(t, transcoderBeside(exe), "a directory is no transcoder")
+	require.NoError(t, os.Remove(filepath.Join(dir, name)))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o700))
+	assert.Equal(t, filepath.Join(dir, name), transcoderBeside(exe))
+	// The test binary has none beside it, and the file names none: the
+	// streams run without one, and the config in force still says "".
+	s := testConfig(t, nil)
+	assert.Empty(t, defaultTranscoder())
+	assert.Empty(t, s.started.Transcoder.Binary)
+}
+
+func TestServerRTSPOverUDP(t *testing.T) {
+	s := testConfig(t, func(su *setup) {
+		su.Text = strings.Replace(baseText(), `rtsp: {listen: "127.0.0.1:0"}`, `rtsp: {listen: "127.0.0.1:0", udp: true}`, 1)
+	})
+	ports := s.rtsp.UDPPorts()
+	assert.NotZero(t, ports[0])
+	assert.NotZero(t, ports[1])
+	s.stop()
+	// The pair is free again.
+	require.NoError(t, listenUDP(t, fmt.Sprintf("127.0.0.1:%d", ports[0])).Close())
+}
+
+func TestListenerFailsAfterStart(t *testing.T) {
+	srv, err := New(writeConfig(t, baseText(streamYAML("cam", "{hls: true}"))),
+		Options{LogOut: io.Discard, RequiredIterations: testIter, Open: newScript(t).Open})
+	require.NoError(t, err)
+	a := srv.Addrs()
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(context.Background()) }()
+	// The API listener is closed under the server.
+	require.NoError(t, srv.apiLn.Close())
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "server: api: ")
+	case <-time.After(waitFor):
+		require.Fail(t, "Run did not end on the listener's failure")
+	}
+	// The same stop as for a cancelled ctx: everything is released.
+	for _, addr := range []string{a.HTTP, a.API, a.RTMP, a.RTSP} {
+		require.NoError(t, listenTCP(t, addr).Close())
+	}
+	require.NoError(t, listenUDP(t, a.SRT).Close())
+	st, ok := srv.Status("cam")
+	require.True(t, ok)
+	assert.NotEqual(t, "running", st.State)
+}
+
+func TestStatusAndShotThroughTheAPI(t *testing.T) {
+	s := testConfig(t, func(su *setup) {
+		su.Text = baseText(streamYAML("cam", "{hls: true}"),
+			"  - name: off\n    disabled: true\n    inputs:\n      - url: rtmp://src.example/live/off\n    outputs: {hls: true}\n")
+	})
+	s.generation("cam")
+	for _, name := range []string{"cam", "off"} {
+		res := s.do(http.MethodGet, "/api/v1/streams/"+name+"/status", "eye", "")
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		// A stream that never ran has no zero time in its status.
+		assert.NotContains(t, res.body, "0001-01-01", name)
+	}
+	assert.Contains(t, s.do(http.MethodGet, "/api/v1/streams/off/status", "eye", "").body, `"state":"stopped"`)
+	res := s.do(http.MethodGet, "/api/v1/streams/cam/thumbnail.jpg", "eye", "")
+	assert.Equal(t, http.StatusNotFound, res.code, "a stream without a thumbnail")
+	// The config is an editor's.
+	assert.Equal(t, http.StatusForbidden, s.do(http.MethodGet, "/api/v1/config", "eye", "").code)
+	res = s.do(http.MethodGet, "/api/v1/config", "ops", "")
+	require.Equal(t, http.StatusOK, res.code)
+	assert.Equal(t, s.fileText(), res.body)
+	_, etag := s.ConfigText()
+	assert.Equal(t, etag, res.header.Get("ETag"))
+}

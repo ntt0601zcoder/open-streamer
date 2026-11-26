@@ -10,6 +10,7 @@ make test-ci-peers # peer packages in osv2-ci-peers:m4a (CI's Ubuntu 24.04: ffmp
 make ostranscoder  # bundle cmd/ostranscoder (cgo, -tags libav) with the pinned FFmpeg 8.1 libs into dist/ostranscoder-<arch>/, built in osv2-ci-peers:m4a
 make test-transcode # go test -race -tags libav $(ARGS) in osv2-ci-peers:m4a; ARGS defaults to the cgo packages (scripts/ffmpeg-dev.sh fetches FFmpeg)
 make test-nvenc     # GPU host only: the NVENC proof (scripts/test-nvenc.sh); refuses while NVENC is in use (OS_NVENC_SHARED=1 warns); writes dist/nvenc-report/report.md. NVENC device tests are opt-in (OS_NVENC=1, which it sets): make test never opens a session
+make openstreamer # the server, pure Go, at bin/openstreamer (-config FILE; cmd/openstreamer/openstreamer.example.yaml)
 make lint         # golangci-lint run ./...
 make fmt          # gofumpt if installed, else gofmt
 make tidy         # go mod tidy

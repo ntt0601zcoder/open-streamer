@@ -1,0 +1,85 @@
+# An example config for openstreamer. The whole configuration is this one
+# file: the server's listeners, the API's users and the streams.
+#
+#   openstreamer -config /etc/openstreamer/openstreamer.yaml
+#
+# The file holds password hashes and stream keys: it must be private to its
+# owner (chmod 600), or the server does not start. The server rewrites it
+# when the API edits the config, so in a container mount its directory, not
+# the single file.
+#
+# After an edit by hand, apply it with SIGHUP or POST /api/v1/reload. An
+# edit through the API is refused while a hand edit is waiting for that.
+#
+# Numbers are plain decimal integers (720, not 0720 or 720.0), text that
+# looks like a number is quoted, and anchors, aliases and merge keys
+# (&a, *a, <<:) are not supported.
+version: 1
+
+# A change in this section is not applied while the server runs: it is
+# reported as restart_required until the process is restarted.
+server:
+  # HLS, DASH and HTTP-TS, under /live/<stream>/. Default ":8080".
+  http:
+    listen: ":8080"
+  # The API, the metrics and pprof. Default "127.0.0.1:8081"; it has no TLS,
+  # so put a reverse proxy in front before it leaves the machine.
+  api:
+    listen: "127.0.0.1:8081"
+  # The shared RTMP listener: players of rtmp://host:19350/live/<stream>,
+  # and the streams' RTMP listen inputs on the same address. Leave listen
+  # out to turn it off.
+  rtmp:
+    listen: ":19350"
+    app: live
+  # RTSP players: rtsp://host:5554/live/<stream>. udp also offers RTP over
+  # UDP; without it RTP is interleaved on the TCP connection.
+  rtsp:
+    listen: ":5554"
+    app: live
+    udp: false
+  # SRT receivers: srt://host:9999?streamid=live/<stream>.
+  srt:
+    listen: ":9999"
+    app: live
+    latency_ms: 120
+  # The transcoder, for streams with a ladder or a thumbnail. Without this
+  # key the server looks for ostranscoder next to its own executable.
+  # transcoder:
+  #   binary: /usr/local/bin/ostranscoder
+  # The directory of watermark images.
+  # assets_dir: /etc/openstreamer/assets
+  log:
+    level: info   # debug, info, warn, error
+    format: json  # json, text
+
+# The API's users. A viewer reads; an editor reads and writes, and sees the
+# stream keys. At least one editor is needed. Make each hash with
+#
+#   openstreamer hash-password
+#
+# which asks for the password on the terminal (or reads it from a pipe) and
+# prints the hash. The placeholders below are not hashes, so this example
+# does not load until they are replaced.
+users:
+  - name: ops
+    role: editor
+    password: "REPLACE-WITH-OUTPUT-OF-openstreamer-hash-password"
+  - name: grafana
+    role: viewer
+    password: "REPLACE-WITH-OUTPUT-OF-openstreamer-hash-password"
+
+# The streams. Each is served as /live/<name>/... over HTTP and under
+# <app>/<name> on the other outputs that are on.
+streams:
+  - name: cam1
+    # By priority: the first input that works is used, the next ones are
+    # fallbacks.
+    inputs:
+      - url: rtsp://camera.example/stream1
+    outputs:
+      hls: true
+      dash: true
+      rtmp: true
+      rtsp: true
+      srt: true
