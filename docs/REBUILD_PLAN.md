@@ -661,10 +661,12 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
 - **Edits** (R-D6; M5b1's R-E2 and R-E3): `spec.Diff` gives a running stream
   one of three outcomes, with no field-by-field routing (v1's diff routing
   caused most lifecycle and config findings): `outputs` when only the
-  output set changed (applied in place), `live` when the inputs or the
-  watermark changed and maybe the outputs, nothing else (the supervisor
-  hands the inputs to `Pipeline.SetInputs` and the watermark to
-  `Transcoder.SetWatermark`, and reattaches the outputs), and `rebuild` for
+  output set changed (applied in place), `live` when the inputs, the
+  watermark or the audio language changed and maybe the outputs, nothing
+  else (the supervisor hands the inputs to `Pipeline.SetInputs`, the
+  watermark to `Transcoder.SetWatermark` and the language to every running
+  packager's `SetAudioLanguage`, and reattaches the outputs; M5b2's R-L5),
+  and `rebuild` for
   anything else (the stream's pipeline is rebuilt). `SetInputs` is applied
   between two frames and matches old and new entries by URL text, in order:
   a kept entry keeps its reader, its listen socket and its retry time and
@@ -814,7 +816,8 @@ before the code they check.
 | M4c ([plan](superpowers/plans/2026-11-25-m4c-picture-features.md), done) | Picture features: NVENC rungs (`h264_nvenc`, chosen per rung, with a per-rung fallback to libx264), the watermark (text with time directives, or an image from the asset library) drawn before the ladder and updated live, thumbnails from the decoder for transcoded, copy-video and passthrough streams, wire version 2, osdev's `-watermark`, `-thumbnail` and `/live/<name>/thumbnail.jpg`, and the root cause of R-T7b' | M4a | On the GPU host (this machine, a GTX 1650): the same ladder with 3 NVENC rungs, run by a make target and recorded in the PR. The watermark appears on every rung; thumbnails refresh at the configured interval on transcoded and passthrough streams. Proved by `TestM4cNVENCMatrix`, `TestM4cNVENCProbe` and `TestM4cNVENCSessions` (run by `make test-nvenc`, evidence below), `TestM4cWatermarkEveryRung`, `TestM4cWatermarkABR`, `TestM4cThumbnailsTranscoded`, `TestM4cThumbnailsPassthrough` and `TestM4cThumbnailsCopyVideo`, with `TestM4cWatermarkLiveUpdate`, `TestM4cWatermarkRespawn`, `TestM4cFrozen` (no watermark, no thumbnails and x264 rungs give M4b's output), the picture, native, transcode and osdev suites, and the `transcode-e2e-arm64` CI job |
 | M5a ([plan](superpowers/plans/2026-11-26-m5a-control-plane-core.md), done) | Control-plane core: the stream document (`internal/spec`), one YAML config file for server settings, users and streams (`internal/config`) with atomic rewrites and reload on SIGHUP, the per-stream supervisor with in-place output edits, the manager, the REST API with Basic auth and two roles (`internal/auth`), its whole-config editor and its OpenAPI document, Prometheus metrics (with `EncoderFallbacks`), redacted JSON logs, `cmd/openstreamer` and its config, and the product names of a ladder (R-D3) | M2, M3, M4 | A spec created over the API serves every output; editing outputs does not interrupt other outputs; a restart restores every stream. Proved by `TestM5aEveryOutput`, `TestM5aEditOutputs` (each output switched off and on while a reader of every other output must hold every hub frame once), `TestM5aConfigPut` (the same through the whole-config editor, comments kept), `TestM5aReload`, `TestM5aHandEditThenWrite`, `TestM5aRebuildIsTheOtherRoute`, `TestM5aRestartRestores`, `TestM5aLadder`, `TestM5aPeers`, `TestM5aNoSecretsLeak` and `TestM5aRoles`, with the spec, config, auth, stream, api, metrics, logging and server suites |
 | M5b1 ([plan](superpowers/plans/2026-11-26-m5b1-live-edits-assets.md), done) | Live edits and assets: a running pipeline's inputs edited in place, the live watermark edit, the asset API (upload, listing, replacement; R-C8) with operator fonts (R-C7), `no_fallback` on an NVENC rung (wire version 3), and M5a's three carry items (`TestManagerConcurrentReplaces` on held sockets, error lists capped, the listener notes in the README) | M5a | Replacing a running stream's inputs is exactly one epoch change and ends no output session; an uploaded image and font appear on every rung; a strict NVENC rung fails instead of falling back and is counted. Proved by `TestM5b1ReplaceInputs`, `TestM5b1ReplaceInputsLadder`, `TestM5b1Assets` and `TestM5b1NoFallback`, with the pipeline, spec, asset, transcode, native, stream, api and server suites |
-| M5b2 | Audio language: the spec field, the HLS masters' `LANGUAGE`, the MPD's `lang`, M4b's multi-audio minors | M5a | `osconform` reads the languages |
+| M5b2 ([plan](superpowers/plans/2026-11-26-m5b2-audio-language.md), done) | Audio language: the spec field, the HLS masters' `LANGUAGE`, the MPD's `lang` | M5a | `osconform` reads the languages. Proved by `TestM5b2AudioLanguage`, `TestM5b2AudioLanguageLadder` and `TestM5b2Players`, with the media, hls, dash, ingest, spec, live, stream and conform suites |
+| Multi-audio | Several audio tracks chosen and labelled by language, languages from the source, the TS language descriptor, M4b's multi-audio minors | M5b2 | Not yet planned |
 | M5c | Transport security: HTTPS for the API and the HTTP outputs, RTMPS (listen, pull, push), RTSPS and SRTP, SRT encryption (input and output), credentials in URL paths and queries redacted, secrets as write-only spec fields | M5a | ffmpeg publishes and plays over each secured protocol against our server; no secret appears in a response, a log or a metric |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5a | Feature tests; DVR playback passes `osconform` |
 | M7 | Cutover | M1–M6 | The [soak plan](SOAK_TEST_PLAN.md) runs for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
@@ -996,7 +999,7 @@ Out of M4b:
 |---|---|
 | AVERAGE-BANDWIDTH and FRAME-RATE in the masters | R-B5: BANDWIDTH is the window's peak; add on demand |
 | I-frame playlists (`EXT-X-I-FRAME-STREAM-INF`) | Trick play is not a v2.0 goal |
-| Several audio languages | Neither the masters nor the MPD carry a language (no `LANGUAGE`, no `lang`), and every TS variant muxes every audio track; language selection comes with M5b2's audio language in the stream spec |
+| Several audio languages | One declared language is written since M5b2 (`audio_language`: the masters' `LANGUAGE` and the MPD's `lang`, on the lowest audio track), and every TS variant still muxes every audio track; selection among several languages waits for the Multi-audio milestone |
 | ABR over RTMP, RTSP, SRT and HTTP-TS | Single-rendition protocols: each rendition stays its own stream, `<name>_<label>`, and the product serves rendition 0 as `<name>` there (M5a's R-D3); R-B2 |
 | LL-HLS | Not part of the M4b row, as for M3 |
 | Product naming of the presentation | Done in M5a (R-D3): the product serves the presentation as `<name>` on HLS and DASH and has no `<name>_abr`; osdev keeps `<name>_abr` (R-B2) |
@@ -1173,8 +1176,8 @@ with its config editor, metrics (with `EncoderFallbacks`), logs,
 assets: a running pipeline's inputs changed in place (`Pipeline.SetInputs`,
 §3.6), the watermark edited in place over the API (`Transcoder.SetWatermark`),
 the asset API (R-C8) with operator fonts (R-C7), and a rung that refuses
-the x264 fallback (wire version 3). M5b2, audio language in the spec, the
-HLS masters and the MPD. M5c, transport security: HTTPS for the API and the HTTP
+the x264 fallback (wire version 3). M5b2, one declared audio language in
+the spec, the HLS masters and the MPD (done). M5c, transport security: HTTPS for the API and the HTTP
 outputs, RTMPS (listen, pull, push), RTSPS with SRTP by its own ruling, SRT
 encryption (input and output), redaction of credentials in URL paths and
 queries (the M2c note), and secrets as write-only spec fields. M6 and the M7
@@ -1215,7 +1218,7 @@ Out of M5a:
 | Item | Reason |
 |---|---|
 | Inputs edited in place, the live watermark edit, the asset API, operator fonts, refusing the x264 fallback | Done in M5b1; until then an input edit rebuilt the stream (R-D6) and assets were files in `server.assets_dir` |
-| Audio language | M5b2 |
+| Audio language | Done in M5b2 (`audio_language`) |
 | HTTPS, RTMPS, RTSPS and SRTP, SRT encryption, credentials in URL paths or queries, write-only secrets | M5c; until then the API listens on loopback by default (R-D8) |
 | `PATCH` and per-field edits | R-D7: a stream is replaced whole by `PUT`, or the whole config |
 | Histograms and per-stream session counts | R-D9; per-stream sessions are M6's |
@@ -1234,13 +1237,44 @@ Out of M5b1:
 
 | Item | Reason |
 |---|---|
-| Audio language | M5b2 |
+| Audio language | Done in M5b2 (`audio_language`) |
 | Hot-reloadable listeners | R-E11: a `server` change still needs a restart, so adding a listener and its first output takes two steps |
 | Asset versions and metadata | R-E5: the directory is the model; a replaced asset is gone |
 | Multipart uploads | R-E6: a raw `PUT` body; a UI uploads with `fetch` |
 | A `no_fallback` rung that fails alone | R-E9: a build opens every rung or none, so one strict rung fails the whole ladder |
 | Font collections and WOFF | R-E8: `.ttc` and WOFF are refused; a CJK collection needs a single-face file |
 | A replace of the active input without a gap | R-E3: add the new input, wait for the fail-back, then remove the old one |
+
+M5b2's rulings are in its plan: R-L1 (the scope: one declared language),
+R-L2 (the value: a BCP 47 tag checked for syntax only, kept as given),
+R-L3 (which track it labels), R-L4 (where it is written), R-L5 (an edit is
+`live`) and R-L6 (what `conform` reads and checks); the design is §3.6's
+Edits bullet. `audio_language` labels the stream's lowest audio track. The
+fMP4 master's audio rendition gains `LANGUAGE`, and the MPD's
+AdaptationSets of that track gain `lang`. Where the audio is inside the
+variants (the audio-only fMP4 master and the ABR TS master) the master
+gains one `TYPE=AUDIO` entry without a `URI`, in group `aud`, and every
+variant names the group. HLS-TS without a ladder is a media playlist, so
+it has no master to carry a language. With no language declared every
+playlist and MPD is byte for byte what M5b1 wrote. `conform` reports the
+languages it read (`Capture.AudioLanguages`) and its rule `audio-language`
+checks them against an expected one (`osconform -audio-language`, for
+`.m3u8` and `.mpd` URLs only); it compares tags without regard to case, and
+judges an MPD as a whole across its periods. `TestM5b2Players` plays the
+URI-less entry over a live sliding window with ffprobe 6.1 and 8, VLC
+3.0.20 and GStreamer 1.24. `transcode-e2e-arm64` runs
+`TestM5b2AudioLanguageLadder`, whose only peers are ffmpeg and ffprobe;
+`TestM5b2Players` runs in the amd64 `test` job.
+
+Out of M5b2 (R-L1):
+
+| Item | Reason |
+|---|---|
+| Several audio tracks, chosen or labelled by language | The Multi-audio milestone (§5) |
+| Languages from the source (the PMT, the HLS rendition list, the SDP) | The Multi-audio milestone |
+| An `ISO_639_language_descriptor` in TS (HLS-TS, HTTP-TS, SRT, push) | The Multi-audio milestone |
+| RTMP and RTSP metadata | The Multi-audio milestone |
+| An `osdev` flag | The Multi-audio milestone |
 
 M2 is split in three parts:
 
@@ -1929,6 +1963,23 @@ branches. That is a repository setting, which no commit can change.
   - no test that a panic releases the slot.
 - testpeer:
   - filter the peer list by an untagged `go list`, not a guard test.
+
+#### M5b2 deferred minors
+
+- media, pkg/hls and ingest:
+  - name the subtests of the ingest row for the URI-less audio entry;
+  - a doc note on `hls.Rendition.Language`: the caller validates it,
+    `Encode` writes it as given;
+  - add a 35-byte tag to `ValidLanguageSyntax`'s accepted rows.
+- spec and config:
+  - reflow `Diff`'s doc comment;
+  - pin that the syntax error comes before "the layout has no audio", with
+    a bad tag under a layout of `[video]`;
+  - a config round-trip test for `audio_language`.
+- packager:
+  - `lowestTracks` is called for every track of every period, not once
+    per MPD;
+  - a comment on the nil language pointer (nil means "").
 
 ### Carried from M1
 

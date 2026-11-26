@@ -132,13 +132,13 @@ touched. A running stream that changed is edited in one of three ways:
 
 - `outputs`: only its outputs changed. They are edited in place, and the
   other outputs keep their viewers.
-- `live`: its inputs or its watermark changed (and maybe its outputs, and
-  nothing else). They are applied while it runs: no output session ends and
-  the transcoder is not restarted. Replacing the input in use is one
-  discontinuity for the players (HLS shows one `EXT-X-DISCONTINUITY`). To
-  switch inputs without a gap, add the new input first, above the old one,
-  wait for the fail-back hold of 10 s so that it takes over, then remove the
-  old one.
+- `live`: its inputs, its watermark or its `audio_language` changed (and
+  maybe its outputs, and nothing else). They are applied while it runs: no
+  output session ends and the transcoder is not restarted. Replacing the
+  input in use is one discontinuity for the players (HLS shows one
+  `EXT-X-DISCONTINUITY`). To switch inputs without a gap, add the new input
+  first, above the old one, wait for the fail-back hold of 10 s so that it
+  takes over, then remove the old one.
 - `rebuild`: anything else (the ladder's renditions, `no_fallback`, adding or
   removing the whole `transcode`, `layout`, `thumbnail`): the stream is
   rebuilt, and its viewers reconnect.
@@ -275,6 +275,16 @@ A stream with a ladder is served as `cam1` (the ABR presentation over HLS and
 DASH, the first rendition elsewhere), and each rendition also as
 `cam1_<label>`. The thumbnail is an operator preview behind the API:
 `/api/v1/streams/cam1/thumbnail.jpg`. Playback needs no credentials.
+
+`audio_language` declares the language of a stream's audio. It is a BCP 47
+tag such as `vi` or `en-US` (a primary subtag of 2 or 3 letters, then
+subtags of 1 to 8 letters or digits, 35 bytes at most), checked for its
+form only and written as given. It appears as `LANGUAGE` in the HLS masters
+(`cmaf/master.m3u8`, and `hls/index.m3u8` of a stream with a ladder) and as
+`lang` in the DASH MPD. HLS (TS) of a stream without a ladder is a single
+media playlist with no master, so it carries no language. A stream whose
+`layout` has no audio refuses the field. Changing it is a `live` edit: the
+next master or MPD a player fetches has the new value.
 
 ### Metrics and logs
 

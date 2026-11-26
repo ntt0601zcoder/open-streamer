@@ -79,6 +79,8 @@ streams:
     # fallbacks.
     inputs:
       - url: rtsp://camera.example/stream1
+    # The language of the audio (BCP 47), written in the HLS masters and the MPD.
+    # audio_language: vi
     outputs:
       hls: true
       dash: true
