@@ -1435,18 +1435,12 @@ func TestServeTLSWrongProtocol(t *testing.T) {
 			return ts.srv.Stats().Connections+int(ts.srv.Stats().TLSHandshakeFailures) >= 3
 		})
 
-		// A good client is served while the silent ones wait: no
-		// handshake runs in the accept loop.
+		// A good client is served beside them; that it does not wait for
+		// them is the next subtest's, which has the headroom to tell.
 		cfg := testConfig()
 		cfg.TLS = ts.ca.Client()
 		c := dial(t, "rtsps://"+ts.addr+"/live/cam", cfg)
-		played := time.Since(start)
 		firstPlayed(t, c, 3)
-		if played < readTimeout {
-			assert.LessOrEqual(t, ts.srv.Stats().TLSHandshakeFailures, uint64(1), "only the plaintext client can have failed yet")
-		} else {
-			t.Logf("the good client played after %v: the machine is too slow to tell it did not wait", played)
-		}
 
 		var wg sync.WaitGroup
 		closed := make([]bool, 3)
@@ -1490,6 +1484,40 @@ func TestServeTLSWrongProtocol(t *testing.T) {
 		assert.Equal(t, 200, r.do("OPTIONS", "*").StatusCode, "the server still serves")
 		assert.Zero(t, ts.srv.Stats().TLSHandshakeFailures)
 		assert.Empty(t, reported.seen())
+	})
+
+	// No handshake runs in the accept loop: with two clients that will stay
+	// silent for the whole 5 s read timeout, a good client plays within 1 s.
+	t.Run("a good client does not wait for silent ones", func(t *testing.T) {
+		const longTimeout = 5 * time.Second
+		h := newHandler()
+		h.play = producer(5 * time.Millisecond)
+		var reported tlsErrors
+		ts := startTLSServer(t, h, rtsp.ServerConfig{ReadTimeout: longTimeout, MaxPendingPerIP: 8, TLSError: reported.report})
+		silent := []net.Conn{dialTCP(t, ts.addr), dialTCP(t, ts.addr)}
+		write(t, silent[1], halfHello(t))
+		// Both connected first, so the listener hands them out before the
+		// good client. Nothing waits for them to be pending here: the good
+		// client's own dial is what an accept loop stuck in a handshake fails.
+
+		cfg := testConfig()
+		cfg.TLS = ts.ca.Client()
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), longTimeout)
+		defer cancel()
+		c, err := rtsp.Dial(ctx, "rtsps://"+ts.addr+"/live/cam", cfg)
+		require.NoError(t, err, "the good client must not wait for the silent ones")
+		t.Cleanup(func() { _ = c.Close() })
+		firstPlayed(t, c, 3)
+		assert.Less(t, time.Since(start), time.Second, "the good client plays at once")
+		st := ts.srv.Stats()
+		assert.Equal(t, 3, st.Connections, "the silent clients still wait")
+		assert.Equal(t, 1, st.Sessions)
+		assert.Zero(t, st.TLSHandshakeFailures)
+		assert.Empty(t, reported.seen())
+		for _, sc := range silent {
+			assert.False(t, closedWithin(sc, 50*time.Millisecond), "a silent client is not closed before the read timeout")
+		}
 	})
 
 	t.Run("the pending cap counts silent TLS clients", func(t *testing.T) {

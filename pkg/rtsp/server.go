@@ -156,7 +156,9 @@ type ServerStats struct {
 	// an SR or RR).
 	ProtocolErrors uint64
 	// Timeouts counts connections ended by the read timeout or the pending
-	// lifetime and sessions ended by the write or session timeout.
+	// lifetime and sessions ended by the write or session timeout. A TLS
+	// handshake that did not finish in time is not counted here but in
+	// TLSHandshakeFailures.
 	Timeouts uint64
 	// UDPStrangers counts datagrams on the RTCP socket of the UDP pair from
 	// an address that is no session's client RTCP port.
@@ -491,8 +493,12 @@ func (c *serverConn) serve() {
 			// BYE and end the session with ErrSessionClosed.
 			<-c.sess.done
 		case errors.Is(err, errStop):
+			// Closed without the write mutex: on a TLS connection a write
+			// in flight suppresses the close_notify. Accepted: the peer
+			// asked for the end.
 			c.sess.end(ErrTeardown)
 		default:
+			// Without the write mutex too: the peer or an error ended it.
 			c.sess.end(fmt.Errorf("rtsp: session: connection ended: %w", err))
 		}
 	}

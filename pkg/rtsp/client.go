@@ -742,7 +742,10 @@ func (c *Client) writeFrame(ch int, data []byte) error {
 }
 
 // fail ends the session with err: the first call wins, closes the
-// connection and wakes every waiter.
+// connection and wakes every waiter. It closes without the write mutex
+// (only Close takes it first), so on a TLS connection a write in flight
+// suppresses the close_notify: accepted, these are error paths and closes
+// the server started.
 func (c *Client) fail(err error) {
 	c.failOnce.Do(func() {
 		c.err = err
@@ -846,7 +849,8 @@ func (c *Client) ReadPacket() (Packet, error) {
 
 // Close sends TEARDOWN (waiting at most 100 ms), closes the connection and
 // waits for the client's goroutines. Over TLS the close sends close_notify,
-// for at most 100 ms more when the server has stopped reading. It is
+// for at most 200 ms more when the server has stopped reading: up to 100 ms
+// for a write in flight to end, and 100 ms for the close (closeConn). It is
 // idempotent.
 func (c *Client) Close() error {
 	c.shutdown(context.Background())
