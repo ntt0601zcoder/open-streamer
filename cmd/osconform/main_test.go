@@ -192,19 +192,26 @@ func TestOsconformTimeout(t *testing.T) {
 
 func TestOsconformBadArgs(t *testing.T) {
 	for name, args := range map[string][]string{
-		"no url":      {},
-		"bad flag":    {"-nope"},
-		"extra arg":   {"-url", "http://x/a.ts", "y"},
-		"bad suffix":  {"-url", "http://x/a.txt"},
-		"bad scheme":  {"-url", "rtmps://x/live/s"},
-		"bad url":     {"-url", "http://a b/a.ts"},
-		"bad duratio": {"-url", "http://x/a.ts", "-duration", "soon"},
-		"bad timeout": {"-url", "http://x/a.ts", "-timeout", "soon"},
+		"no url":       {},
+		"bad flag":     {"-nope"},
+		"extra arg":    {"-url", "http://x/a.ts", "y"},
+		"bad suffix":   {"-url", "http://x/a.txt"},
+		"bad scheme":   {"-url", "rtmps://x/live/s"},
+		"bad url":      {"-url", "http://a b/a.ts"},
+		"bad duratio":  {"-url", "http://x/a.ts", "-duration", "soon"},
+		"bad timeout":  {"-url", "http://x/a.ts", "-timeout", "soon"},
+		"lang on ts":   {"-url", "http://x/a.ts", "-audio-language", "vi"},
+		"lang on rtmp": {"-url", "rtmp://x/live/s", "-audio-language", "vi"},
+		"lang on rtsp": {"-url", "rtsp://x/live/s", "-audio-language", "vi"},
+		"lang on srt":  {"-url", "srt://x:9000?streamid=live/s", "-audio-language", "vi"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			code, out, _ := runConform(t, args...)
+			code, out, errOut := runConform(t, args...)
 			assert.Equal(t, 2, code)
 			assert.Empty(t, out)
+			if strings.HasPrefix(name, "lang on") {
+				assert.Equal(t, "osconform: -audio-language applies to HLS and DASH only\n", errOut)
+			}
 		})
 	}
 }

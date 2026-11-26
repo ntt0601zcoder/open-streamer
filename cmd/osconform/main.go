@@ -7,9 +7,9 @@
 // variants aligned and BANDWIDTH honest. Our servers promise that; RFC 8216
 // does not require it, so it is off by default.
 //
-// With -audio-language, the HLS master or the MPD must carry that language
-// on its audio (a media playlist has no master to carry it); the languages
-// read are listed on stderr either way.
+// With -audio-language, which applies to HLS and DASH only, the HLS master
+// or the MPD must carry that language on its audio (a media playlist has no
+// master to carry it). The languages read are listed on stderr either way.
 //
 // Exit status: 0 clean, 1 violations found, 2 read error (an MPEG-TS stream
 // that ends before its first byte is one) or bad arguments.
@@ -46,7 +46,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	timeout := fs.Duration("timeout", 30*time.Second, "limit on each request, and on a stall of the .ts, RTMP, RTSP or SRT stream")
 	aligned := fs.Bool("aligned", false, "HLS: require the master's media playlists to number their segments alike, and check that variants are aligned and BANDWIDTH is honest")
 	mtu := fs.Int("mtu", 0, "largest RTP payload accepted from an RTSP stream (0: 1200)")
-	lang := fs.String("audio-language", "", "HLS and DASH: the BCP 47 language the master's audio renditions or the MPD's audio sets must carry")
+	lang := fs.String("audio-language", "", "HLS and DASH only (.m3u8, .mpd): the BCP 47 language the master's audio renditions or the MPD's audio sets must carry")
 	if err := fs.Parse(args); err != nil {
 		_, _ = fmt.Fprintf(stderr, "osconform: %v\n", err)
 		return 2
@@ -66,6 +66,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	opt := conform.ReadOptions{Duration: *dur, Once: *once, Timeout: *timeout, MTU: *mtu, AlignedSequences: *aligned, AudioLanguage: *lang}
 	var read func(context.Context, string, conform.ReadOptions) (conform.Capture, error)
+	langOK := false
 	switch p := strings.ToLower(pu.Path); {
 	case strings.EqualFold(pu.Scheme, "rtmp"):
 		read = conform.ReadRTMP
@@ -74,13 +75,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case strings.EqualFold(pu.Scheme, "srt"):
 		read = conform.ReadTS
 	case strings.HasSuffix(p, ".m3u8"):
-		read = conform.ReadHLS
+		read, langOK = conform.ReadHLS, true
 	case strings.HasSuffix(p, ".mpd"):
-		read = conform.ReadDASH
+		read, langOK = conform.ReadDASH, true
 	case strings.HasSuffix(p, ".ts"):
 		read = conform.ReadTS
 	default:
 		_, _ = fmt.Fprintln(stderr, "osconform: -url must end in .m3u8, .mpd or .ts, or be an rtmp://, rtsp:// or srt:// URL")
+		return 2
+	}
+	if *lang != "" && !langOK {
+		_, _ = fmt.Fprintln(stderr, "osconform: -audio-language applies to HLS and DASH only")
 		return 2
 	}
 	c, err := read(ctx, *u, opt)

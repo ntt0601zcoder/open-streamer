@@ -1974,11 +1974,27 @@ func TestReadHLSAudioLanguages(t *testing.T) {
 		assert.Equal(t, []string{"en"}, c.AudioLanguages)
 		vs := langViolations(c.Violations)
 		assert.Len(t, c.Violations, len(vs), "%v", c.Violations)
-		// (b) names both values; (c): no rendition carries "vi".
-		require.Len(t, vs, 2, "%v", vs)
+		// (b) names both values; (c) is not reported beside it.
+		require.Len(t, vs, 1, "%v", vs)
 		assert.Contains(t, vs[0].Detail, `"en"`)
 		assert.Contains(t, vs[0].Detail, `"vi"`)
-		assert.Contains(t, vs[1].Detail, `"vi"`)
+	})
+
+	t.Run("case-insensitively distinct", func(t *testing.T) {
+		// VI then vi is one language, listed as first spelled, and one (b).
+		mp := withURI("VI")
+		r := mp.Renditions[0]
+		r.URI, r.Default, r.Language, r.Name = "", false, "vi", "audio2"
+		mp.Renditions = append(mp.Renditions, r)
+		c := read(t, mp, "")
+		assert.Equal(t, []string{"VI"}, c.AudioLanguages)
+		assert.Empty(t, c.Violations)
+		c = read(t, mp, "en")
+		assert.Equal(t, []string{"VI"}, c.AudioLanguages)
+		vs := langViolations(c.Violations)
+		assert.Len(t, c.Violations, len(vs), "%v", c.Violations)
+		require.Len(t, vs, 1, "%v", vs)
+		assert.Contains(t, vs[0].Detail, `"VI"`)
 	})
 
 	t.Run("audio without a rendition", func(t *testing.T) {
@@ -2049,8 +2065,8 @@ func TestReadHLSAudioLanguages(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 2, n)
 		assert.Equal(t, []string{"vi", "e"}, c.AudioLanguages)
-		// "e": (a) bad syntax, (b) not "vi", (c) no rendition says "vi".
-		assert.Len(t, langViolations(c.Violations), 3, "%v", c.Violations)
+		// "e": (a) bad syntax and (b) not "vi"; no (c) beside (b).
+		assert.Len(t, langViolations(c.Violations), 2, "%v", c.Violations)
 	})
 }
 
@@ -2090,12 +2106,12 @@ func TestReadDASHAudioLanguages(t *testing.T) {
 		{"mimeType only", "vi", func(s []dash.AdaptationSet) {
 			oneAudio(s)
 			s[1].ContentType, s[1].Lang = "", "en"
-		}, []string{"en"}, 2},
+		}, []string{"en"}, 1},
 		{"representation mimeType", "vi", func(s []dash.AdaptationSet) {
 			oneAudio(s)
 			s[1].ContentType, s[1].MimeType, s[1].Lang = "", "", "en"
 			s[1].Representations[0].MimeType = "audio/mp4"
-		}, []string{"en"}, 2},
+		}, []string{"en"}, 1},
 		{"not audio", "vi", func(s []dash.AdaptationSet) {
 			// No contentType and no audio mimeType: not an audio set, so
 			// the MPD has no audio.
@@ -2167,10 +2183,10 @@ func TestReadDASHAudioLanguages(t *testing.T) {
 		assert.Equal(t, []string{"vi", "en"}, c.AudioLanguages)
 		vs := langViolations(c.Violations)
 		assert.Len(t, c.Violations, len(vs), "%v", c.Violations)
-		// (b) "en" is not "vi", and (c) the "en" versions carry "vi" on no
-		// set: each once, though two versions say "en".
-		require.Len(t, vs, 2, "%v", vs)
+		// (b) "en" is not "vi", once though two versions say "en"; no (c)
+		// beside it.
+		require.Len(t, vs, 1, "%v", vs)
 		assert.Contains(t, vs[0].Detail, `"en"`)
-		assert.NotEqual(t, vs[0].Detail, vs[1].Detail)
+		assert.Contains(t, vs[0].Detail, `"vi"`)
 	})
 }

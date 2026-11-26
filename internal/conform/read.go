@@ -765,7 +765,7 @@ func (c *hlsCapture) masterLanguages(u string, m hls.MultivariantPlaylist) {
 			hasAudio = true
 		}
 	}
-	c.b.checkAudioLanguages(u, c.opt.AudioLanguage, "renditions", labels, hasAudio)
+	c.b.checkAudioLanguages(u, c.opt.AudioLanguage, "rendition", labels, hasAudio)
 }
 
 // audioCodec reports whether a CODECS entry is an audio codec: mp4a, ac-3,
@@ -1319,7 +1319,7 @@ func (c *dashCapture) languages(m dash.MPD) {
 			}
 		}
 	}
-	c.b.checkAudioLanguages(c.url, c.lang, "adaptation sets", labels, hasAudio)
+	c.b.checkAudioLanguages(c.url, c.lang, "adaptation set", labels, hasAudio)
 }
 
 // audioSet reports whether an adaptation set is audio: its contentType is

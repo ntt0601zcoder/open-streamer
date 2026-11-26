@@ -62,9 +62,11 @@ const (
 	// RuleAudioLanguage: the audio language of an HLS master's TYPE=AUDIO
 	// renditions and of an MPD's audio adaptation sets (R-L6). A value must
 	// pass media.ValidLanguageSyntax. With ReadOptions.AudioLanguage set, no
-	// audio rendition or set carries another value, every master or MPD
-	// version that has audio carries it on one of them, and the URL read is
-	// not an HLS media playlist. Each violation is reported once per URL and
+	// audio rendition or set carries another value; a master or MPD version
+	// that has audio and carries no other value carries it on one of them
+	// (a version with another value is reported for that value only); and
+	// the URL read is not an HLS media playlist. Values compare
+	// case-insensitively, and each violation is reported once per URL and
 	// value.
 	RuleAudioLanguage = "audio-language"
 )
@@ -195,32 +197,37 @@ func (b *builder) once(key, rule string, track int, format string, args ...any) 
 
 // checkAudioLanguages applies RuleAudioLanguage to one version of a master
 // or MPD read from u: labels are the languages of its audio renditions or
-// sets ("" when unlabelled), of names them ("renditions" or "adaptation
-// sets"), hasAudio says whether the version has audio, and want is
-// ReadOptions.AudioLanguage. The languages join b.langs. Values compare
-// case-insensitively, as BCP 47 tags do (RFC 5646 section 2.1.1).
+// sets ("" when unlabelled), of names one ("rendition" or "adaptation
+// set"), hasAudio says whether the version has audio, and want is
+// ReadOptions.AudioLanguage. Values compare case-insensitively, as BCP 47
+// tags do (RFC 5646 section 2.1.1): the languages join b.langs by that
+// comparison, keeping the first spelling seen, and the violations are
+// keyed by it. A version that carries another value is reported for that
+// value only, not also for missing want.
 func (b *builder) checkAudioLanguages(u, want, of string, labels []string, hasAudio bool) {
-	found := false
+	found, other := false, false
 	for _, l := range labels {
 		if l == "" {
 			continue // an unlabelled extra rendition or set (R-L3)
 		}
-		if !slices.Contains(b.langs, l) {
+		if !slices.ContainsFunc(b.langs, func(x string) bool { return strings.EqualFold(x, l) }) {
 			b.langs = append(b.langs, l)
 		}
+		key := u + "|" + strings.ToLower(l)
 		if !media.ValidLanguageSyntax(l) {
-			b.once("lang-syntax:"+u+"|"+l, RuleAudioLanguage, -1, "%s: audio language %q is not a BCP 47 tag", u, l)
+			b.once("lang-syntax:"+key, RuleAudioLanguage, -1, "%s: audio language %q is not a BCP 47 tag", u, l)
 		}
 		switch {
 		case want == "":
 		case strings.EqualFold(l, want):
 			found = true
 		default:
-			b.once("lang-other:"+u+"|"+l, RuleAudioLanguage, -1, "%s: audio language %q, expected %q", u, l, want)
+			other = true
+			b.once("lang-other:"+key, RuleAudioLanguage, -1, "%s: audio language %q, expected %q", u, l, want)
 		}
 	}
-	if want != "" && hasAudio && !found {
-		b.once("lang-none:"+u, RuleAudioLanguage, -1, "%s: the audio carries language %q on none of its %s", u, want, of)
+	if want != "" && hasAudio && !found && !other {
+		b.once("lang-none:"+u, RuleAudioLanguage, -1, "%s: the audio has no %s with language %q", u, of, want)
 	}
 }
 
