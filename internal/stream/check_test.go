@@ -3,8 +3,11 @@ package stream
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -217,6 +220,43 @@ func TestCheckWatermarkFont(t *testing.T) {
 	opt, err := ladderOf(with("mono.ttf"), env)
 	require.NoError(t, err)
 	assert.Equal(t, font, opt.Watermark.Font)
+
+	// The causes of a font or an image that cannot be read name the asset,
+	// never the directory, and say "picture:" once.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "logo.png"), onePixelPNG, 0o600))
+	for _, link := range []string{"link.ttf", "link.png"} {
+		target := "mono.ttf"
+		if filepath.Ext(link) == ".png" {
+			target = "logo.png"
+		}
+		require.NoError(t, os.Symlink(filepath.Join(dir, target), filepath.Join(dir, link)))
+	}
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "sub.ttf"), 0o700))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "sub.png"), 0o700))
+	image := func(name string) spec.Stream {
+		return withWatermark(textSpec("x"), &spec.Watermark{Image: name})
+	}
+	for _, row := range []struct {
+		name, why string
+		sp        spec.Stream
+	}{
+		{"gone.ttf", "no such file or directory", with("gone.ttf")},
+		{"link.ttf", "is a symbolic link", with("link.ttf")},
+		{"sub.ttf", "is a directory, not a regular file", with("sub.ttf")},
+		{"gone.png", "no such file or directory", image("gone.png")},
+		{"link.png", "is a symbolic link", image("link.png")},
+		{"sub.png", "is a directory, not a regular file", image("sub.png")},
+	} {
+		err := Check(row.sp, env)
+		require.Error(t, err, row.name)
+		want := fmt.Sprintf("stream: check: transcode: watermark: picture: asset %q: %s", row.name, row.why)
+		assert.Equal(t, want, err.Error(), row.name)
+		assert.NotContains(t, err.Error(), dir, row.name)
+		if strings.HasPrefix(row.name, "gone.") {
+			assert.ErrorIs(t, err, fs.ErrNotExist, row.name)
+		}
+	}
+	require.NoError(t, Check(image("logo.png"), env), "the image itself is fine")
 
 	noDir := env
 	noDir.AssetsDir = ""

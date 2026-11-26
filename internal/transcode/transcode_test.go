@@ -1747,9 +1747,9 @@ func text(s string) *picture.Watermark { return &picture.Watermark{Text: s} }
 func TestWatermarkRejectsCopyRung(t *testing.T) {
 	src := hub.New(hub.Options{})
 	ladder := []Rendition{encode240, copySrc}
-	const want = `rendition "src" copies video and cannot carry the watermark`
+	const want = `rendition "src" copies video and cannot carry it`
 	_, err := New(src, Options{Binary: "x", Renditions: ladder, Watermark: text("live")})
-	require.EqualError(t, err, "transcode: new: "+want)
+	require.EqualError(t, err, "transcode: new: watermark: "+want)
 	tr, err := New(src, Options{Binary: "x", Renditions: ladder})
 	require.NoError(t, err)
 	require.EqualError(t, tr.SetWatermark(text("live")), "transcode: set watermark: "+want)
@@ -1761,7 +1761,7 @@ func TestWatermarkRejectsCopyRung(t *testing.T) {
 	require.EqualError(t, err, "transcode: new: watermark: neither text nor image")
 	tr, err = New(src, Options{Binary: "x", Renditions: []Rendition{encode240}, Watermark: text("kept")})
 	require.NoError(t, err)
-	require.EqualError(t, tr.SetWatermark(text("50%")), "transcode: set watermark: watermark: text ends in a lone %")
+	require.EqualError(t, tr.SetWatermark(text("50%")), "transcode: set watermark: text ends in a lone %")
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	assert.Equal(t, text("kept"), tr.watermark)

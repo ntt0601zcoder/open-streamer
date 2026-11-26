@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -111,16 +112,17 @@ func LoadFont(dir, name string) ([]byte, error) {
 }
 
 // readAsset reads the regular file name in dir, at most limit bytes. The
-// name has been checked against an asset rule.
+// name has been checked against an asset rule. Its errors name the asset,
+// never the directory (pathless): they reach HTTP clients.
 func readAsset(dir, name string, limit int64) ([]byte, error) {
 	f, err := OpenRegular(filepath.Join(dir, name))
 	if err != nil {
-		return nil, fmt.Errorf("picture: asset %q: %w", name, err)
+		return nil, fmt.Errorf("picture: asset %q: %w", name, pathless(err))
 	}
 	defer func() { _ = f.Close() }()
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("picture: asset %q: %w", name, err)
+		return nil, fmt.Errorf("picture: asset %q: %w", name, pathless(err))
 	}
 	if fi.Size() > limit {
 		return nil, fmt.Errorf("picture: asset %q is %d bytes, over %d", name, fi.Size(), limit)
@@ -139,13 +141,50 @@ func readAsset(dir, name string, limit int64) ([]byte, error) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("picture: read asset %q: %w", name, err)
+			return nil, fmt.Errorf("picture: read asset %q: %w", name, pathless(err))
 		}
 	}
 	if int64(len(b)) > limit {
 		return nil, fmt.Errorf("picture: asset %q is over %d bytes", name, limit)
 	}
 	return b[:len(b):len(b)], nil
+}
+
+// notRegularError is OpenRegular's error for an entry that is not a
+// regular file: what it is ("a symbolic link", "a directory", ...), and the
+// error of the open that found it, if any.
+type notRegularError struct {
+	path, what string
+	err        error
+}
+
+func (e *notRegularError) Error() string {
+	if e.what == symlink {
+		return fmt.Sprintf("picture: open: %s is %s", e.path, e.what)
+	}
+	return fmt.Sprintf("picture: open: %s is %s, not a regular file", e.path, e.what)
+}
+
+func (e *notRegularError) Unwrap() error { return e.err }
+
+// symlink is notRegularError.what for a symbolic link.
+const symlink = "a symbolic link"
+
+// pathless is err, from OpenRegular, Stat or a read, without the file's
+// path: what the entry is when it is not a regular file, else the
+// system's reason (fs.PathError's Err). errors.Is(err, fs.ErrNotExist)
+// still holds of what it returns.
+func pathless(err error) error {
+	if nr, ok := errors.AsType[*notRegularError](err); ok {
+		if nr.what == symlink {
+			return errors.New("is a symbolic link")
+		}
+		return fmt.Errorf("is %s, not a regular file", nr.what)
+	}
+	if pe, ok := errors.AsType[*fs.PathError](err); ok {
+		return pe.Err //nolint:wrapcheck // the caller wraps it with the asset's name
+	}
+	return err
 }
 
 // checkRegular returns f if the file it has open is a regular file, and
@@ -170,7 +209,7 @@ func checkRegular(f *os.File) (*os.File, error) {
 		case m&os.ModeSocket != 0:
 			what = "a socket"
 		}
-		return nil, fmt.Errorf("picture: open: %s is %s, not a regular file", f.Name(), what)
+		return nil, &notRegularError{path: f.Name(), what: what}
 	}
 	return f, nil
 }

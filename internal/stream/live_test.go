@@ -478,7 +478,9 @@ func TestSupervisorWatermarkAssetGone(t *testing.T) {
 
 	require.Equal(t, spec.ChangeLive, answer(t, s.Submit(next)))
 	st := s.Status()
-	assert.Regexp(t, `^watermark: .*logo\.png`, st.LastError)
+	// The asset's name and the cause, once each, never the directory.
+	assert.Equal(t, `watermark: picture: asset "logo.png": no such file or directory`, st.LastError)
+	assert.NotContains(t, st.LastError, r.env.AssetsDir)
 	assert.Equal(t, "running", st.State)
 	assert.Equal(t, uint64(1), st.Generation)
 	assert.Zero(t, st.Restarts)
@@ -488,6 +490,24 @@ func TestSupervisorWatermarkAssetGone(t *testing.T) {
 	waitLines(t, lines, "configure text:one", "set text:two")
 	assert.Empty(t, s.Status().LastError, "a watermark that was applied clears the watermark error")
 	assert.False(t, r.after.called())
+}
+
+// A watermark the transcoder refuses is reported as "watermark: <why>",
+// the word once, not with the transcoder's own "set watermark: " again.
+func TestSupervisorWatermarkRefusedOnce(t *testing.T) {
+	r := newRig(t)
+	lines := wmLog(t, r)
+	r.tune = func(s *Supervisor) {
+		s.setWatermark = func(tr *transcode.Transcoder, _ *picture.Watermark) error {
+			return tr.SetWatermark(&picture.Watermark{Text: "50%"})
+		}
+	}
+	sp := textSpec("one")
+	s := r.start(sp)
+	waitRunning(t, s)
+	waitLines(t, lines, "configure text:one")
+	require.Equal(t, spec.ChangeLive, answer(t, s.Submit(withWatermark(sp, &spec.Watermark{Text: "two"}))))
+	assert.Equal(t, "watermark: text ends in a lone %", s.Status().LastError)
 }
 
 // refreshed waits for a Refresh's answer.

@@ -50,68 +50,78 @@ type Watermark struct {
 }
 
 // Validate reports whether w can be built. An image is decoded in full, so
-// what the host accepts the child can build; a font passes CheckFont.
+// what the host accepts the child can build; a font passes CheckFont. Its
+// error reads "watermark: <why>", and errors.Unwrap of it is <why> alone,
+// for a caller whose own message already says "watermark".
 func (w Watermark) Validate() error {
+	if err := w.problem(); err != nil {
+		return fmt.Errorf("watermark: %w", err)
+	}
+	return nil
+}
+
+// problem is why w cannot be built, without the word "watermark".
+func (w Watermark) problem() error {
 	hasText, hasImage := w.Text != "", len(w.Image) > 0
 	switch {
 	case !hasText && !hasImage:
-		return errors.New("watermark: neither text nor image")
+		return errors.New("neither text nor image")
 	case hasText && hasImage:
-		return errors.New("watermark: text and image are exclusive")
+		return errors.New("text and image are exclusive")
 	case len(w.Font) > 0 && !hasText:
-		return errors.New("watermark: a font needs text")
+		return errors.New("a font needs text")
 	}
 	if w.Position > Center {
-		return fmt.Errorf("watermark: position %d out of range", w.Position)
+		return fmt.Errorf("position %d out of range", w.Position)
 	}
 	if w.OpacityPct < 0 || w.OpacityPct > 100 {
-		return fmt.Errorf("watermark: opacity %d out of range 0..100", w.OpacityPct)
+		return fmt.Errorf("opacity %d out of range 0..100", w.OpacityPct)
 	}
-	if _, err := w.Location(); err != nil {
+	if _, err := w.location(); err != nil {
 		return err
 	}
 	if hasText {
 		if w.SizePct < 0 || w.SizePct > 50 {
-			return fmt.Errorf("watermark: text size %d out of range 0..50", w.SizePct)
+			return fmt.Errorf("text size %d out of range 0..50", w.SizePct)
 		}
 		if len(w.Font) > 0 {
 			if err := CheckFont(w.Font); err != nil {
-				return fmt.Errorf("watermark: %w", err)
+				return err
 			}
 		}
 		return validateText(w.Text)
 	}
 	if w.SizePct < 0 || w.SizePct > 100 {
-		return fmt.Errorf("watermark: image size %d out of range 0..100", w.SizePct)
+		return fmt.Errorf("image size %d out of range 0..100", w.SizePct)
 	}
 	if _, err := DecodeImage(w.Image); err != nil {
-		return fmt.Errorf("watermark: %w", err)
+		return err
 	}
 	return nil
 }
 
 func validateText(s string) error {
 	if len(s) > MaxTextBytes {
-		return fmt.Errorf("watermark: text is %d bytes, over %d", len(s), MaxTextBytes)
+		return fmt.Errorf("text is %d bytes, over %d", len(s), MaxTextBytes)
 	}
 	if !utf8.ValidString(s) {
-		return errors.New("watermark: text is not valid UTF-8")
+		return errors.New("text is not valid UTF-8")
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c == '%' {
 			if i+1 >= len(s) {
-				return errors.New("watermark: text ends in a lone %")
+				return errors.New("text ends in a lone %")
 			}
 			i++
 			if !isDirective(s[i]) && s[i] != '%' {
-				return fmt.Errorf("watermark: unknown directive %%%c", s[i])
+				return fmt.Errorf("unknown directive %%%c", s[i])
 			}
 		}
 	}
 	for _, r := range s {
 		if unicode.IsControl(r) {
-			return errors.New("watermark: text has a control character")
+			return errors.New("text has a control character")
 		}
 	}
 	return nil
@@ -142,15 +152,24 @@ func (w Watermark) Resolved() Watermark {
 
 // Location returns the time zone of the text clock.
 func (w Watermark) Location() (*time.Location, error) {
+	loc, err := w.location()
+	if err != nil {
+		return nil, fmt.Errorf("watermark: %w", err)
+	}
+	return loc, nil
+}
+
+// location is Location without the word "watermark" in its error.
+func (w Watermark) location() (*time.Location, error) {
 	if w.TimeZone == "" {
 		return time.UTC, nil
 	}
 	if w.TimeZone == "Local" {
-		return nil, errors.New("watermark: time zone must be an IANA name, not Local")
+		return nil, errors.New("time zone must be an IANA name, not Local")
 	}
 	loc, err := time.LoadLocation(w.TimeZone)
 	if err != nil {
-		return nil, fmt.Errorf("watermark: time zone %q: %w", w.TimeZone, err)
+		return nil, fmt.Errorf("time zone %q: %w", w.TimeZone, err)
 	}
 	return loc, nil
 }

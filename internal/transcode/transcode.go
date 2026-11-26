@@ -427,7 +427,7 @@ func New(src *hub.Hub, opt Options) (*Transcoder, error) {
 		t.copyNames[j] = opt.Renditions[i].Name
 	}
 	if err := t.checkWatermark(opt.Watermark); err != nil {
-		return nil, fmt.Errorf("transcode: new: %w", err)
+		return nil, fmt.Errorf("transcode: new: watermark: %w", err)
 	}
 	t.watermark = cloneWatermark(opt.Watermark)
 	if th := opt.Thumbnail; th != nil {
@@ -501,18 +501,19 @@ func wireEncoder(v Video) (string, error) {
 	}
 }
 
-// checkWatermark reports why w cannot be the transcoder's watermark: it
-// does not validate, or a rendition copies its video (ruling R-C5). A nil w,
-// no watermark, always can.
+// checkWatermark reports why w cannot be the transcoder's watermark,
+// without the word "watermark" (the callers say it): it does not validate,
+// or a rendition copies its video (ruling R-C5). A nil w, no watermark,
+// always can.
 func (t *Transcoder) checkWatermark(w *picture.Watermark) error {
 	if w == nil {
 		return nil
 	}
 	if err := w.Validate(); err != nil {
-		return err // the callers wrap it
+		return errors.Unwrap(err) // Validate's reason, without "watermark: "
 	}
 	if len(t.copyNames) > 0 {
-		return fmt.Errorf("rendition %q copies video and cannot carry the watermark", t.copyNames[0])
+		return fmt.Errorf("rendition %q copies video and cannot carry it", t.copyNames[0])
 	}
 	return nil
 }
@@ -533,7 +534,9 @@ func cloneWatermark(w *picture.Watermark) *picture.Watermark {
 // running child is told in order with its frames, and a child spawned later
 // starts with it; calls that pile up collapse to the latest. It is safe
 // from any goroutine, also before Run and after Run has ended; a call made
-// as Run ends may not reach the child that Run is stopping.
+// as Run ends may not reach the child that Run is stopping. Its error is
+// "transcode: set watermark: <why>", wrapping <why> directly, so that a
+// caller whose own message says "watermark" can report errors.Unwrap of it.
 func (t *Transcoder) SetWatermark(w *picture.Watermark) error {
 	if err := t.checkWatermark(w); err != nil {
 		return fmt.Errorf("transcode: set watermark: %w", err)

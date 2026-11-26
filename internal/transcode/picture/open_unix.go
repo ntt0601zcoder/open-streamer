@@ -19,7 +19,7 @@ func OpenRegular(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
-			return nil, fmt.Errorf("picture: open: %s is a symbolic link: %w", path, err)
+			return nil, &notRegularError{path: path, what: symlink, err: err}
 		}
 		return nil, fmt.Errorf("picture: open: %w", err)
 	}

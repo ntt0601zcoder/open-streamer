@@ -20,7 +20,7 @@ func OpenRegular(path string) (*os.File, error) {
 		return nil, fmt.Errorf("picture: open: %w", err)
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("picture: open: %s is a symbolic link", path)
+		return nil, &notRegularError{path: path, what: symlink}
 	}
 	f, err := os.Open(path)
 	if err != nil {

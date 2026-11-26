@@ -145,7 +145,13 @@ func (s *Supervisor) applyWatermark(g *generation, sp spec.Stream) error {
 		if s.setWatermark != nil {
 			set = s.setWatermark
 		}
-		err = set(g.tr, w)
+		// SetWatermark's error is "transcode: set watermark: <why>": the
+		// last error says "watermark: <why>", the word once.
+		if err = set(g.tr, w); err != nil {
+			if why := errors.Unwrap(err); why != nil {
+				err = why
+			}
+		}
 	}
 	if err != nil {
 		s.fail(prefixWatermark, err)
