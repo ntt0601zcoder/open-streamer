@@ -28,6 +28,8 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/pipeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/segment"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
+	"github.com/ntt0601zcoder/open-streamer/pkg/dash"
+	"github.com/ntt0601zcoder/open-streamer/pkg/hls"
 )
 
 var t0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -1320,11 +1322,15 @@ func TestSetAudioLanguage(t *testing.T) {
 		}
 		require.Eventually(t, func() bool { return p.Snapshot().Listed > 0 }, 5*time.Second, time.Millisecond)
 		srv := serve(p)
-		assert.Equal(t, "vi", master(t, srv).Renditions[0].Language)
+		if m := master(t, srv); assert.Len(t, m.Renditions, 1) {
+			assert.Equal(t, "vi", m.Renditions[0].Language)
+		}
 
 		p.SetAudioLanguage("en")
 		assert.Equal(t, "en", p.Snapshot().AudioLanguage)
-		assert.Equal(t, "en", master(t, srv).Renditions[0].Language)
+		if m := master(t, srv); assert.Len(t, m.Renditions, 1) {
+			assert.Equal(t, "en", m.Renditions[0].Language)
+		}
 		_, audio := videoSets(t, mpdOf(t, srv))
 		require.Len(t, audio, 1)
 		assert.Equal(t, "en", audio[0].Lang)
@@ -1357,12 +1363,28 @@ func TestSetAudioLanguage(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				// Off the test goroutine: assert only, never require
+				// (t.FailNow must run on the test goroutine).
 				for range 50 {
-					m := master(t, srv)
-					assert.Contains(t, langs, m.Renditions[0].Language)
-					_, audio := videoSets(t, mpdOf(t, srv))
-					if assert.Len(t, audio, 1) {
-						assert.Contains(t, langs, audio[0].Lang)
+					code, body := get(t, srv, "/live/s/cmaf/master.m3u8")
+					assert.Equal(t, http.StatusOK, code)
+					m, err := hls.ParseMultivariant(body)
+					if assert.NoError(t, err, string(body)) && assert.Len(t, m.Renditions, 1) {
+						assert.Contains(t, langs, m.Renditions[0].Language)
+					}
+					code, body = get(t, srv, "/live/s/cmaf/index.mpd")
+					assert.Equal(t, http.StatusOK, code)
+					mpd, err := dash.Parse(body)
+					if assert.NoError(t, err, string(body)) && assert.Len(t, mpd.Periods, 1) {
+						var audio []dash.AdaptationSet
+						for _, as := range mpd.Periods[0].AdaptationSets {
+							if as.ContentType == "audio" {
+								audio = append(audio, as)
+							}
+						}
+						if assert.Len(t, audio, 1) {
+							assert.Contains(t, langs, audio[0].Lang)
+						}
 					}
 				}
 			}()
