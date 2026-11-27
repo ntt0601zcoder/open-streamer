@@ -30,11 +30,11 @@ Each ruling ends with what it costs if it is wrong.
   - **M5c2a's exit criterion:** ffmpeg 6.1 and 8 and our own client play an SRT output that requires a passphrase, and a caller without it or with a wrong one is refused; no secret, the credentials embedded in a URL path or query and the write-only field included, appears in any response to any role, in a log or in a metric; an editor's read, change and write of a stream and of the whole config keeps every stored secret without ever being shown one.
   - **M5c2b's exit criterion (proposed):** ffmpeg 6.1 and 8 play `rtsps://` with SRTP over UDP and over the interleaved channel against our server, and our client pulls the same from our server.
   - *If wrong:* SRTP waits one plan longer. Nothing here closes a door for it: this plan does not touch `pkg/rtsp`, `rtspplay` or `internal/ingest/rtsp.go`.
-- **R-T2 (what a credential in a URL is).** `redact.URL` hides, and `redact.Masked` recognises, exactly these, on every scheme. A *secret name* is a name that, percent-decoded and lower-cased, contains `pass`, `pwd`, `psw`, `secret`, `token`, `signature` or `credential`, or is `key`, `pw`, `sig`, `auth`, `hdnts`, `hdnea` or `wmsauthsign`, or ends in `key` (`redact.SecretName`).
+- **R-T2 (what a credential in a URL is).** `redact.URL` hides, and `redact.Masked` recognises, exactly these, on every scheme. A *secret name* is a name that, percent-decoded and lower-cased, contains `pass`, `pwd`, `psw`, `secret`, `token`, `signature`, `credential`, `hmac` or `jwt`, or is `key`, `pw`, `sig`, `auth`, `authbasic`, `loginpas`, `hash`, `md5`, `hdnts`, `hdnea` or `wmsauthsign`, or ends in `key` (`redact.SecretName`).
   1. **The userinfo:** the password, or a lone user (as today).
-  2. **A query pair** whose key is a secret name: its value, also when empty (as today, with the wider name rule).
-  3. **A pair inside a path segment, and inside the fragment.** A pair starts at the start of the segment or after one of `&`, `;`, `,` or `_`, with a name matching `[A-Za-z][A-Za-z0-9-]*` followed by `=`; its value runs to the separator before the next pair's start, or to the end of the segment. The value of a pair with a secret name is hidden. So `user=admin_password=a_b_channel=1` hides `a_b`, and `user=admin&password=x&channel=1` hides `x`. The path is taken percent-decoded, so `pass%77ord=x` is found.
-  4. **The value of a `streamid` query pair:** after an optional `#!::`, its comma-separated pairs by rule 3; and the fourth field of `read:<path>:<user>:<pass>` or `publish:<path>:<user>:<pass>` (MediaMTX's form).
+  2. **A query pair** whose key is a secret name: its value, also when empty (as today, with the wider name rule). The raw query is split at `&` and at `;` (so `?user=admin;password=x` hides `x`), never at `_` or `,`: a query value is often base64url, which holds `_` and ends in `=`, and splitting there would show a piece of a token.
+  3. **A pair inside a path segment, and inside the fragment.** A pair starts at the start of the segment or after one of `&`, `;`, `,` or `_`, with a name matching `[A-Za-z][A-Za-z0-9-]*` followed by `=`; its value runs to the separator before the next pair's start, or to the end of the segment. The value of a pair with a secret name is hidden. So `user=admin_password=a_b_channel=1` hides `a_b`, and `user=admin&password=x&channel=1` hides `x`. **The walk runs on the escaped path** (`EscapedPath`), segment by segment, and only a pair's name is percent-decoded before it is judged: `pass%77ord=x` is found, `password=p%2Fq` hides `p%2Fq` whole (the escaped slash ends no segment), and `password=x%26y=z` hides `x%26y=z` whole (the escaped `&` starts no pair).
+  4. **The value of a `streamid` query pair:** after an optional `#!::`, its comma-separated pairs by rule 3; and, for `read:<path>:<user>:<pass>` or `publish:<path>:<user>:<pass>` (MediaMTX's form), everything after the third colon, further colons included.
   5. **The stream key of the RTMP family:** the last path segment cut to 2 characters (as today).
   - A user name is never hidden: `user=admin` stays, as the userinfo's user does.
   - `logging.Scrub` needs no new rule: it passes every URL-shaped token through `redact.URL`, and `pkg/rtsp`'s errors never quote a URL or a request path (`StatusError`, `pkg/rtsp/client.go:141-150`). A slog attribute whose key is a secret name is masked, beside the keys `logging` lists today.
@@ -45,22 +45,25 @@ Each ruling ends with what it costs if it is wrong.
   - **A write that sends the mask keeps the stored secret** (R-T4). A write that sends a real value sets it. A write that leaves the secret out (a URL without it, no `srt_passphrase`) removes it: a stream is replaced whole by `PUT` (R-D7), so absence means absent.
   - **Why not separate fields.** (a) The data plane identifies an input and a push by its URL text (`Pipeline.SetInputs`, the pushers' map at `internal/stream/generation.go:227-231`, `pushID`): a secret outside the URL would need a second identity everywhere. (b) Credentials in a path (`/user=admin_password=x_channel=1`) cannot be lifted into a field at all, so URL redaction stays load-bearing whatever else is built, and separate fields would be a second scheme beside it. (c) A separate field lets an editor point the URL at another host and keep the password, which sends a secret nobody showed him to a server of his choice. Matching by the redacted form (R-T4) refuses that.
   - *If wrong:* a UI cannot offer one "password" box per input: it shows the URL with `xxxxx` in it and the operator retypes the whole URL to change any secret part. Adding fields later is additive (a field that composes into the URL before the pipeline sees it); removing them would not be.
+  - **What write-only does not stop.** An editor who can create streams can always test a guess against the device itself: a probe stream with the guessed password either connects or does not. No API design removes that oracle; what this plan removes are the oracles inside the server (R-T4's refusal of a real URL beside its own mask, the push id tagged per stream, the keyed config ETag of R-T12), so a guess costs a connection to the device, which the device can rate-limit and log.
 - **R-T4 (how the mask is resolved).** One rule, for a stream `PUT` and for every stream entry of a config `PUT`:
   - A sent input URL that `redact.Masked` is replaced by the stored input URL of **the stream of the same name** whose `redact.URL` form **equals the sent text**. A push URL likewise among the stored pushes. A sent `srt_passphrase` equal to the mask is replaced by the stored passphrase.
-  - **Exactly one** distinct stored value must match. None (a new stream, a renamed stream, a changed host, user, path or query, a URL where one secret was retyped and another left masked, no stored passphrase) and more than one (two stored keys that redact alike) are refused with 422 `invalid_config`, one text per field, naming the field and never a value: `inputs[0].url: holds the redaction mask and the stored stream has no one secret it stands for; send the real value`.
-  - Matching is by value, not by index: reordering inputs or pushes keeps their secrets.
+  - **One stored value of that form:** every sent mask of the form takes it. Matching is by value, not by index: reordering inputs or pushes keeps their secrets.
+  - **Several distinct stored values of one form** (two pushes to one platform whose keys start alike, `rtmp://a.rtmp.example/live2/abxxxxx` twice): when the sent list holds exactly as many masks of that form as the stored list holds distinct values of it, they are resolved **by order of occurrence**, the first mask to the first stored value. All of them share scheme, host, path and every shown character, so nothing is redirected; the worst a reordering does is swap two keys of one platform, which the operator sees as two pushes that fail. When the counts differ the masks of that form are refused.
+  - **Refused**, with 422 `invalid_config`, one text per field, naming the field and never a value, always the same text: `inputs[0].url: holds the redaction mask and the stored stream has no one secret it stands for; send the real value`. That is: no stored value of the form (a new stream, a renamed stream, a changed host, user, path or query, a URL where one secret was retyped and another left masked, no stored passphrase); counts that differ; a URL scalar that is the bare mask (R-T8's whole-scalar form); and **a list in which a sent real URL redacts to the same text as a sent mask**. The last is refused before anything is matched and with the same text whether or not the real URL equals the stored one: otherwise "repeated" or "unchanged" would tell an editor that his guess is the stored secret.
   - The resolution runs under the config lock, against the config in force, immediately before validation. `spec.Stream.Validate` still refuses the mask (`checkURL`), so a mask can never be stored whichever path forgot to resolve it.
   - *If wrong:* an editor who changes a camera's port must retype its password. That is the price of (c) above and it is the intended behaviour, not a gap.
 - **R-T5 (the one new field: `outputs.srt_passphrase`).** Per stream, not per server.
   - A server-wide passphrase would be a `server` key, so changing it would need a restart (R-D4), and every stream would share one secret. gosrt decides per connection request (`ConnRequest.SetPassphrase`), and the stream ID names the stream before the passphrase is needed, so per stream costs nothing.
   - It covers every served name of the stream, its rungs included.
-  - **Valid:** needs `outputs.srt: true`; 10 to 79 bytes (gosrt takes 10 to 80; libsrt before 1.5 stops at 79), each a printable ASCII character `0x21`–`0x7E`, so every player's URL and command line can carry it; never the mask. Errors name the field and the length, never the value.
+  - **Valid (controller ruling):** needs `outputs.srt: true`; 10 to 79 bytes (gosrt takes 10 to 80; libsrt before 1.5 stops at 79), each of `[A-Za-z0-9._~-]`, the characters a URL carries unescaped: ffmpeg mangles `+`, `&` and `#` in a player URL, and loosening the set later is additive. Errors name the field and the length, never the value.
+  - **In the YAML file an all-digit passphrase must be quoted:** unquoted, `0123456789` is a number with a leading zero, which the plain-decimal rule refuses (`internal/config/document.go:145`), and `1234567890` would be decoded as a number. The error names the line, not the value.
   - A change of it is an `outputs` edit (`spec.Diff` needs no change): applied in place, no rebuild.
   - **The key length is the caller's** (16, 24 or 32 bytes): gosrt takes what the caller's key material says. No config key.
   - *If wrong:* an operator who wants one passphrase for all streams writes it once per stream.
 - **R-T6 (the API).**
   - `GET /api/v1/streams`, `GET /api/v1/streams/{name}`, the `PUT` answer and the status documents are `Redacted()` for viewers and editors alike.
-  - **`?secrets=1` is answered 400 `bad_request` for every role**, after authentication, with a text that says secrets are write-only and that the mask keeps a stored one. It is not silently ignored: a script that relied on it must fail loudly, not start storing `xxxxx` somewhere else. The viewer's 403 for it goes away with the parameter.
+  - **A query that holds the key `secrets`, whatever its value and whatever else is in the query (`?secrets=1`, `?secrets=1&x=1`, `?x=1&secrets`), is answered 400 `bad_request` for every role**, after authentication, with a text that says secrets are write-only and that the mask keeps a stored one. It is not silently ignored: a script that relied on it must fail loudly, not start storing `xxxxx` somewhere else. The viewer's 403 for it goes away with the parameter.
   - **ETag and If-Match are those of the stored document** (the keyed tag of `spec.Stream.ETag`, unchanged). A `PUT` answers with the stored document redacted and its ETag, so a client can chain edits without ever holding a secret.
   - **Diff is taken after resolution.** A `PUT` of exactly what `GET` returned is `unchanged`: nothing is written and nothing is reopened.
   - `Backend.PutStream` takes the document as sent and returns the document as stored; the API no longer refuses masks itself (`maskedURLs`, `internal/api/streams.go:72-85`, is deleted).
@@ -71,21 +74,33 @@ Each ruling ends with what it costs if it is wrong.
   - **A reload reads real values.** A mask in the file is a validation error for that stream, as today.
   - `SetStream` writes the resolved document, so the file never holds a mask.
   - *If wrong:* whoever can read the file reads the secrets. Encryption at rest with an external key is a backlog item.
-- **R-T8 (the config editor).** `GET /api/v1/config` returns the text **masked**; `PUT /api/v1/config` takes masks and resolves them (R-T4), then stores the resolved bytes. The ETag stays `config.Hash` of the stored text, so `If-Match` works as today and two stored texts that differ only in a secret have different ETags and the same body.
-  - **What is masked (`config.Mask`):** under `streams`, every scalar value that holds `://` and whose `redact.URL` form carries a mask is replaced by that form, wherever it sits (a mistyped key included); every value of a key `srt_passphrase` is replaced by the mask; and in every comment of the document each URL-shaped token goes through `redact.URL`, as a log line does. A URL that holds no secret keeps its bytes, also when `redact.URL` would normalise it.
-  - **What is resolved (`config.Unmask`):** in each stream entry, `inputs[i].url`, `outputs.push[j].url` and `outputs.srt_passphrase` that hold the mask, against the stored text's entries of the same name. Nothing else. A comment is stored as sent.
-  - **Exact bytes.** Both work on the bytes: the scalar's own text is replaced in place and everything else is copied. So `Unmask(Mask(t), t)` is `t` byte for byte, and a `PUT` without any mask stores the client's exact bytes, as today. Each checks its own result by decoding it; when a scalar's text cannot be replaced in place (a double-quoted scalar with escapes, a folded or multi-line scalar), the whole document is re-encoded through the node tree instead, which loses layout exactly as `SetStream` does. Neither ever returns a text that still holds what it had to hide.
+- **R-T8 (the config editor).** `GET /api/v1/config` returns the text **masked**; `PUT /api/v1/config` takes masks and resolves them (R-T4), then stores the resolved bytes. The ETag is the keyed tag of the stored text (R-T12), so `If-Match` works as today and two stored texts that differ only in a secret have different ETags and the same body.
+  - **What is masked (`config.Mask`):**
+    - **In every scalar of the document, keys and values alike,** each URL-shaped token (`logging.Scrub`'s pattern: a scheme, `://`, then everything to the next white space) whose `redact.URL` form carries a mask is replaced by that form. So a URL after other text (`see rtsp://u:pw@h/s now`), one glued to a mistyped key (`url:rtsp://u:pw@h/s`, which YAML reads as one scalar) and one under any key are covered.
+    - **A token `redact.URL` cannot parse hides its whole scalar:** the scalar becomes the bare mask. `rtsp://admin:p%ss@cam/s` (a bad escape), `rtsp://admin:pa#ss@cam/s` and `rtsp://u:pw@h:port/s` (a bad port) do not parse, and `<invalid url>` in their place would not say that a secret is stored.
+    - Every non-empty value of a key `srt_passphrase` becomes the mask; an empty one stays empty.
+    - In every comment the parser reports, each URL-shaped token goes through `redact.URL`, as a log line does.
+    - A token that holds no secret keeps its bytes, also when `redact.URL` would normalise it.
+    - **The postcondition is on the bytes, not on the tree.** The parser drops some comments (`inputs: [ # old rtsp://u:s1@h/s`), so after masking the output's bytes are scanned for URL-shaped tokens that still hold something to hide: a token `redact.URL` cannot parse, or one whose `redact.URL` form carries a mask the token does not. If one is found the document is re-encoded through the node tree, which drops those comments; if one is still found, `Mask` returns an error and the API answers 500 without the text.
+    - **`Mask` does not fail on a text the server runs with:** whatever `ParseLenient` accepted is masked without an error, entries the start skipped included, and so is a text with anchors, aliases or merge keys, whether or not the parse would refuse it: `Mask` must not depend on that. An anchored scalar's column points at its `&name`, so it takes the re-encode path.
+  - **What is resolved (`config.Unmask`):** in each stream entry, `inputs[i].url`, `outputs.push[j].url` and `outputs.srt_passphrase` that hold the mask, against the stored text's entries of the same name, by R-T4 with its order rule. Nothing else. A comment is stored as sent. A URL scalar that is the bare mask, or that holds a masked token beside other text, is never resolved: it is refused with R-T4's 422 and the operator retypes it.
+  - **Exact bytes.** Both work on the bytes: the scalar's own text is replaced in place and everything else is copied. `Unmask(sent, stored)` returns `stored` itself when `sent` equals `Mask(stored)` byte for byte, so `Unmask(Mask(t), t)` is `t` for every `t`, whatever path `Mask` took and whatever its comments held. For an edited masked text the guarantee is on the edit: every byte outside the scalars `Unmask` resolved is the client's. A `PUT` without any mask stores the client's exact bytes, as today. Each checks its own result by decoding it; when a scalar's text cannot be replaced in place (a double-quoted scalar with escapes, a folded or multi-line scalar), the whole document is re-encoded through the node tree instead, which loses layout exactly as `SetStream` does. Neither ever returns a text that still holds what it had to hide.
   - **Users' password hashes are not masked.** They are one-way (PBKDF2, 600 000 iterations), the editor replaces the `users` section through this route, and this plan's spec is "spec fields".
-  - *If wrong:* (a) a commented-out input line comes back with its key masked, and a `PUT` of that text stores the masked comment: the secret in the comment is gone from the file. The alternative is that every editor reads every commented-out key. (b) A URL with a secret inside a watermark text is masked on `GET` and stays masked after a round trip. (c) An editor still reads the users' hashes and can attack them offline; masking them is a backlog item with this plan's mechanism.
+  - *If wrong:* (a) a commented-out input line comes back with its key masked, and a `PUT` of that text stores the masked comment: the secret in the comment is gone from the file. The alternative is that every editor reads every commented-out key. (b) A URL with a secret inside a watermark text, or under any key but the three `Unmask` knows, is masked on `GET` and stays masked after an edited round trip; an input URL the parser cannot read comes back as `xxxxx` and must be retyped. (c) An editor still reads the users' hashes and can attack them offline; masking them is a backlog item with this plan's mechanism.
 - **R-T9 (SRT output encryption).** In `srtout`, for a request that names a live stream:
   - **The stream has no passphrase:** exactly as today. An encrypted request is refused with `REJ_RESOURCE` and counted as `RejectedMode`, whether or not the name is known.
   - **The stream has a passphrase:** an unencrypted request is refused with `REJ_UNSECURE`; an encrypted one is checked with `SetPassphrase`, and a wrong passphrase is refused with `REJ_BADSECRET`. Both are counted in `RejectedSecret`. libsrt then tells the player "Password required or unexpected" or "Incorrect passphrase" (seen with ffmpeg 8), which is what a customer with a typo needs.
-  - **A flood of wrong passphrases.** Each check costs one PBKDF2 in the accept loop. A peer key (the IP; an IPv6 address by its /64, `peerKey`) with 5 wrong passphrases inside 10 s has its encrypted requests refused unchecked, with `REJ_RESOURCE`, counted in `RejectedLimited`, until 10 s after its first counted failure. The source address is real: gosrt yields a request only after its cookie exchange. At most 4096 keys are tracked; when the table is full, expired entries are dropped, and a failure that still finds no room is not tracked.
-  - **A changed passphrase ends the stream's SRT sessions** (set, changed or removed): they were admitted under the old rule. `reattach` refuses the hubs' `"srt "` subscribers once and relaxes again, the mechanism that ends a disabled output's sessions; the sessions end as `hub_closed`.
+  - **A flood of wrong passphrases.** Each check is one PBKDF2-SHA1 of 2048 iterations and an AES key unwrap in the accept loop: cheap, well under a millisecond, so this rule is about a flood stalling the accept loop for other callers, not about making a guess expensive. A passphrase's strength is its length. A peer key (the IP; an IPv6 address by its /64, `peerKey`) with 5 wrong passphrases inside 10 s has its encrypted requests refused unchecked, with `REJ_RESOURCE`, counted in `RejectedLimited`, until 10 s after its first counted failure. The source address is real: gosrt yields a request only after its cookie exchange. At most 4096 keys are tracked; when the table is full, expired entries are dropped, and a failure that still finds no room is not tracked.
+  - **A changed passphrase ends the stream's SRT sessions** (set, changed or removed): they were admitted under the old rule. Two mechanisms, because the first alone is not persistent:
+    - `reattach` publishes the View, refuses the hubs' `"srt "` subscribers once and relaxes again (the mechanism that ends a disabled output's sessions). That ends every session subscribed at that moment.
+    - A request answered just before the edit subscribes just after the relax. So `srtout` takes the hub and the passphrase from **one** View read, carries the passphrase it admitted under into the connection, and **asks again once the connection has subscribed**: a different passphrase, a different hub or no stream ends the connection before it writes a byte. Either way the session ends as `hub_closed`.
   - **Key refresh is gosrt's default** (every 2^24 packets, announced 2^12 before). `srtout.Options.KMRefresh` exists so a test can cross a refresh in seconds.
-  - *If wrong:* the two distinct refusals tell someone without the passphrase that a name is live. Stream names are not secrets, and `REJ_RESOURCE` for everything would send every customer with a typo to support.
-- **R-T10 (migration).** No file changes: a config that works at HEAD loads unchanged, and no key is renamed. What changes for clients is the API: `?secrets=1` is 400, `GET /api/v1/config` is masked, and a stream `PUT` with a mask is resolved instead of refused. The exceptions are listed under Global Constraints.
+  - *If wrong:* the two distinct refusals tell someone without the passphrase that a name is live. Stream names are not secrets, and `REJ_RESOURCE` for everything would send every customer with a typo to support. The limiter's key is the address alone: players behind one NAT share it, so five typos by one of them refuse the others' encrypted requests for up to 10 s.
+- **R-T10 (migration).** No file changes: a config that works at HEAD loads unchanged, and no key is renamed. What changes for clients is the API: `?secrets=1` is 400, `GET /api/v1/config` is masked, a stream `PUT` with a mask is resolved instead of refused, and a config ETag no longer survives a restart (R-T12). The exceptions are listed under Global Constraints.
 - **R-T11 (peers).** `srt-live-transmit` is on neither the host nor `osv2-ci-peers:m4a` (`which srt-live-transmit` finds nothing in both). It is libsrt's own tool and ffmpeg links the same libsrt, so ffmpeg's rows stand for it; no image is rebuilt for it. ffmpeg's rows alone carry the exit criterion; the VLC and GStreamer rows are marked † and follow M5c1's rule for a peer that provably cannot do a row.
+- **R-T12 (the config's ETag is keyed).** Today it is the bare SHA-256 of the stored text (`config.Hash`, `internal/config/document.go:200-204`), shown to viewers in the config status. Beside a masked body that is an offline oracle: whoever holds the masked text and the ETag substitutes guesses for one `xxxxx` and hashes until it matches, with no request to the server. The users' salted hashes no longer protect it, because the editor reads them in the same body.
+  - The ETag becomes `"` + the first 32 hex digits of `redact.Tag` of the stored text + `"` (`config.ETag`), everywhere it is produced or compared: `ConfigText`, `ConfigStatus.ETag`, `ApplyResult.ETag` and `PutConfig`'s If-Match (`internal/server/apply.go:49`, `:111`, `:152`). `config.Hash` is deleted. `config.File`'s own stale check keeps its private SHA-256, which is never shown.
+  - *If wrong:* a config ETag no longer survives a restart, as a stream's already does not: a client holding an old one gets one 412 and reads again. A client that computed the ETag itself from the file's bytes can no longer do so.
 
 ## Peers: what was checked when this plan was written
 
@@ -116,19 +131,22 @@ Run on 2026-11-27 against the host's ffmpeg 8.0.1 and `osv2-ci-peers:m4a` (ffmpe
 | An SRT input passphrase outside the URL | Not planned (R-T3): it stays `?passphrase=`, redacted and kept by the mask like every URL secret |
 | `srt-live-transmit` as a peer | Not planned (R-T11) |
 | Scrubbing bare `name=value` text outside URLs in logs | Backlog: nothing logs a bare request path today (R-T2) |
+| A passphrase for `cmd/osdev`'s SRT output (`cmd/osdev/main.go:938`) | Not planned: `osdev` passes no `Secure` and stays plain, as it stays without TLS |
 
 ## Global Constraints
 
 - **Libraries:** stdlib, plus the approved dependencies already in `go.mod`: mp4ff, pion/rtp, pion/sdp, datarhei/gosrt, testify, go-astiav, protowire, go.yaml.in/yaml/v3. No new module; `go mod tidy` changes nothing. pion/srtp is not approved. Never bluenviron or lal, and never another product's code.
 - **Frozen behaviour:** with no `srt_passphrase` and no credential of R-T2's new kinds in any URL, the server binds, serves, logs and reports exactly what it does at HEAD 6e8edb1, and plain RTSP and SRT are byte-identical on the wire. `pkg/rtsp`, `rtspplay` and `internal/ingest/rtsp.go` are not modified. Every existing test passes unchanged. The intended exceptions:
-  1. `?secrets=1` is 400 for every role (it was the unredacted document for an editor and 403 for a viewer), and the rows that used it;
+  1. a query holding the key `secrets` is 400 for every role (`?secrets=1` was the unredacted document for an editor and 403 for a viewer; `?secrets=1&x=1` was ignored), and the rows that used it;
   2. every stream response is redacted for an editor too;
   3. `GET /api/v1/config` returns masked text when the config holds a secret (byte-identical when it holds none), and the rows that compared it with the file;
   4. a stream or config `PUT` that carries a mask is resolved when R-T4 allows, and the 422 text of one that is not;
   5. `redact.URL`'s and `redact.Masked`'s results for URLs with R-T2's new credentials, R-T2's over-masked names included, wherever they are shown (statuses, logs, errors);
   6. `/metrics` gains `openstreamer_output_rejected_total{output="srt",reason="secret"}` and `reason="limited"`, at 0;
   7. `TestReattachCoversEveryOutput`'s list, the OpenAPI document and the tests that hold it equal to the spec;
-  8. `conform`'s SRT read errors quote the redacted URL (they quoted the URL).
+  8. `conform`'s SRT read errors quote the redacted URL (they quoted the URL);
+  9. the config's ETag is a keyed tag, not the SHA-256 of the text, and changes at a restart (R-T12); the rows that computed it;
+  10. a push's id is tagged over the stream's name and the URL, so its value differs from HEAD's (it already changed at every restart).
 - **House rules:**
   - the hub is the only data source and hub writes never block;
   - hot reload goes by diff: a passphrase change is an `outputs` edit, and no `server` key is added;
@@ -148,10 +166,10 @@ Run on 2026-11-27 against the host's ffmpeg 8.0.1 and `osv2-ci-peers:m4a` (ffmpe
 ## Review Focus
 
 1. **An editor's read, change and write.** `GET` a stream whose input has a password, whose push has a key and whose SRT output has a passphrase; change the audio language; `PUT` what came back. The stored secrets are kept, the file holds the real values, the input is not reopened, and the same holds for the whole config through `GET` and `PUT /api/v1/config`, byte for byte outside the edit. *Pinned by Task 2's `TestUnmask`, Task 4's `TestMaskUnmaskRoundTrip` and Task 6's `TestPutStreamKeepsSecrets` and `TestPutConfigKeepsSecrets`.*
-2. **A mask pointed somewhere else.** An editor keeps `xxxxx` and changes the host, the port, the user or the path; copies a masked URL into another stream or a new one; retypes one of a URL's two secrets; or two stored keys redact alike. Each is 422 naming the field, nothing is stored, and no connection is made to the new host. *Pinned by Task 2's `TestUnmaskRefuses`, Task 4's `TestUnmaskErrors` and Task 6's `TestPutStreamMaskMoved`.*
-3. **Camera URLs that do not look like the table.** A password that holds `_`, `&` or a percent-escape; an upper-case `PASSWORD=`; an empty password; a credential in a path segment that is not the last; the same in an input's failure text, a status and a log line. *Pinned by Task 1's `TestURLEmbeddedCredentials`, `TestMaskedEmbeddedCredentials` and `TestOpenErrorsHideEmbeddedCredentials`, and Task 8's `TestM5c2aNoSecretsLeak`.*
-4. **YAML that is not one URL per plain line.** A secret URL in single or double quotes, in a flow sequence with another URL on the same line, in a double-quoted scalar with an escape, in a folded scalar, in a comment, under a mistyped key, and in an entry the lenient start skipped: `GET /api/v1/config` never shows the secret, and a round trip stores it back. *Pinned by Task 4's `TestMaskOddYAML` and `TestMaskNeverLeaks`.*
-5. **An SRT player with the wrong passphrase, a thousand of them, and a passphrase changed under a player.** A wrong or missing passphrase is refused with its own reason and never served a byte; 1000 wrong requests from one address cost at most 5 checks per 10 s and a player from another address still connects at once; a changed passphrase ends the connected players within a second and the new one admits them; a session that crosses a key refresh loses no frame. *Pinned by Task 3's `TestPassphraseRefusals`, `TestPassphraseLimiter` and `TestKeyRefreshFFmpeg`, Task 5's `TestReattachPassphrase` and Task 8's `TestM5c2aSRTFFmpeg`.*
+2. **A mask pointed somewhere else.** An editor keeps `xxxxx` and changes the host, the port, the user or the path; copies a masked URL into another stream or a new one; retypes one of a URL's two secrets; sends a guess of the real URL beside its mask; or sends one mask where two stored keys redact alike. Each is 422 naming the field, with one constant text, nothing is stored, and no connection is made to the new host. Two pushes to one platform whose keys start alike are still editable: two masks resolve in order. *Pinned by Task 2's `TestKeepSecrets`, `TestUnmask` and `TestUnmaskRefuses`, Task 4's `TestUnmaskErrors` and Task 6's `TestPutStreamMaskMoved` and `TestConfigETagKeyed`.*
+3. **Camera URLs that do not look like the table.** A password that holds `_`, `&`, an escaped `/` or `&`, or another percent-escape; pairs split by `;` in a query; an upper-case `PASSWORD=`; an empty password; a credential in a path segment that is not the last; the same in an input's failure text, a status and a log line. *Pinned by Task 1's `TestURLEmbeddedCredentials`, `TestMaskedEmbeddedCredentials` and `TestOpenErrorsHideEmbeddedCredentials`, and Task 8's `TestM5c2aNoSecretsLeak`.*
+4. **YAML that is not one URL per plain line.** A secret URL in single or double quotes, in a flow sequence with another URL on the same line, in a double-quoted scalar with an escape, in a folded scalar, behind an anchor, in a comment the parser reports and in one it drops, after other text in a scalar, glued to a mistyped key, with a password `net/url` cannot parse, and in an entry the lenient start skipped: `GET /api/v1/config` never shows the secret and never fails, and an untouched round trip stores the file back byte for byte. *Pinned by Task 4's `TestMaskOddYAML` and `TestMaskNeverLeaks`.*
+5. **An SRT player with the wrong passphrase, a thousand of them, and a passphrase changed under a player.** A wrong or missing passphrase is refused with its own reason and never served a byte; 1000 wrong requests from one address cost at most 5 checks per 10 s and a player from another address still connects at once; a changed passphrase ends the connected players within a second, the new one admits them, and no player admitted under the old one survives the change, however the request and the edit interleave; a session that crosses a key refresh loses no frame. *Pinned by Task 3's `TestPassphraseRefusals`, `TestPassphraseLimiter`, `TestPassphraseChangedMidLookup` and `TestKeyRefreshFFmpeg`, Task 5's `TestReattachPassphrase` and Task 8's `TestM5c2aSRTFFmpeg`.*
 
 ---
 
@@ -160,9 +178,10 @@ Run on 2026-11-27 against the host's ffmpeg 8.0.1 and `osv2-ci-peers:m4a` (ffmpe
 | Wave | Tasks | Why |
 |---|---|---|
 | 1 | 1 (`redact`, `logging`), 2 (`spec`), 3 (`srtout`, `conform`) | Disjoint files. Task 2 uses only what `redact` exports at HEAD and keeps a private copy of the mask, which Task 4 replaces by `redact.Mask` |
-| 2 | 4 (`config`), 5 (`stream`) | Both need Task 2's field and `KeepSecret`; 4 needs Task 1's rule for its rows. Disjoint files |
-| 3 | 6 (`api`, `server/apply.go`), 7 (`server/server.go`, `server/collect.go`) | 6 needs 2 and 4; 7 needs 3 and 5. Disjoint files in `internal/server`, tests included (`apply_test.go` against `server_test.go`) |
-| 4 | 8 (e2e, docs, CI, the gate) | Needs all |
+| 2 | 4 (`config`), 5 (`stream`) | Both need Task 2's field and `KeepSecrets`; 4 needs Task 1's rule for its rows. Disjoint files |
+| 3 | 6 (`api`, `server/apply.go` and every caller of `Server.PutStream`) | Needs 2 and 4. It changes `Server.PutStream`'s results, whose callers are spread over `internal/server`'s test files, so nothing else in that package runs beside it |
+| 4 | 7 (`server/server.go`, `server/collect.go`) | Needs 3, 5 and 6 (its test edits streams through `PutStream`) |
+| 5 | 8 (e2e, docs, CI, the gate) | Needs all |
 
 Each task runs in its own worktree, branched from `rebuild` after the wave before it has merged. A fix to a merged task is a new commit, never an amend.
 
@@ -185,8 +204,8 @@ package redact
 const Mask = "xxxxx"
 
 // SecretName reports whether name, percent-decoded and lower-cased by the caller or not, names a credential (R-T2):
-// it contains pass, pwd, psw, secret, token, signature or credential; or is key, pw, sig, auth, hdnts, hdnea or
-// wmsauthsign; or ends in key.
+// it contains pass, pwd, psw, secret, token, signature, credential, hmac or jwt; or is key, pw, sig, auth, authbasic,
+// loginpas, hash, md5, hdnts, hdnea or wmsauthsign; or ends in key.
 func SecretName(name string) bool
 
 // URL and Masked keep their signatures. URL hides R-T2's five places; Masked reports whether rawURL carries the
@@ -201,9 +220,9 @@ func SecretName(name string) bool
 func TestSecretName(t *testing.T)
 // true: password, Password, PASSWD, pwd, psw, pw, pass, passphrase, secret, client_secret, token, access_token, hdnts, hdnea,
 //   wmsauthsign, sig, signature, X-Amz-Signature, X-Amz-Credential, X-Amz-Security-Token, auth, key, apikey, api_key, authkey,
-//   streamkey, stream_key, pass%77ord after the caller's unescape
+//   streamkey, stream_key, pass%77ord after the caller's unescape, loginpas, authbasic, jwt, id_jwt, hmac, hash, md5
 // false: user, username, usr, channel, stream, subtype, mode, transport, latency, streamid, iface, loop, pace, pkt_size,
-//   Policy, Key-Pair-Id, author, keyframe, design
+//   Policy, Key-Pair-Id, author, keyframe, design, loginuse, hashtag
 
 func TestURLEmbeddedCredentials(t *testing.T) // redact.URL, input → output; the camera table of R-T2
 //   rtsp://192.0.2.1:554/user=admin&password=s3cret&channel=1&stream=0.sdp?real_stream
@@ -213,7 +232,16 @@ func TestURLEmbeddedCredentials(t *testing.T) // redact.URL, input → output; t
 //   rtsp://192.0.2.1/user=admin_password=a_b_channel=1        → …/user=admin_password=xxxxx_channel=1 (a password with _)
 //   rtsp://192.0.2.1/user=admin&password=&channel=1           → …/user=admin&password=xxxxx&channel=1 (empty)
 //   rtsp://192.0.2.1/USER=admin&PASSWORD=x&channel=1          → …/USER=admin&PASSWORD=xxxxx&channel=1
-//   rtsp://192.0.2.1/user=admin&pass%77ord=x%26y&channel=1    → the value x&y is hidden whole; no "x" and no "y" pair is left
+//   rtsp://192.0.2.1/user=admin&pass%77ord=x%26y&channel=1    → …/user=admin&pass%77ord=xxxxx&channel=1 or its decoded-name spelling:
+//                                                                the value x%26y is hidden whole and channel=1 is kept
+//   rtsp://192.0.2.1/user=admin&password=p%2Fq&channel=1      → p%2Fq hidden whole: no "q" is left, channel=1 kept, one segment
+//   rtsp://192.0.2.1/user=admin&password=x%26y=z&channel=1    → x%26y=z hidden whole: the escaped & starts no pair "y"
+//   rtsp://cam/av_stream?user=admin;password=x;channel=1      → …?user=admin;password=xxxxx;channel=1  (; in a query)
+//   http://cam/videostream.cgi?loginuse=admin&loginpas=12345  → loginpas hidden, loginuse kept
+//   http://cam/snap?authbasic=YWRtaW46eA==                    → hidden
+//   https://cdn/x.m3u8?jwt=e30.e30.sig&md5=abc&hash=def       → all three hidden
+//   https://cdn/x.m3u8?token=ab_cd=                            → …?token=xxxxx: a query is not split at _ (base64url)
+//   srt://h:9000?streamid=publish:cam:user:pw:12:345          → …?streamid=publish:cam:user:xxxxx (all after the third colon)
 //   rtsp://192.0.2.1/live/user=admin&password=x/ch1           → …/live/user=admin&password=xxxxx/ch1  (not the last segment)
 //   rtsp://cam/av_stream?user=admin&password=x                → …?user=admin&password=xxxxx           (the M2c note)
 //   rtsp://cam/h264/ch1/main/av_stream?username=admin&passwd=x → passwd hidden, username kept
@@ -248,7 +276,7 @@ func TestOpenErrorsHideEmbeddedCredentials(t *testing.T) // ingest: Parse and Op
 ```
 
 - [ ] **Step 2: Run** `go test -count=1 ./internal/redact/ ./internal/logging/ ./internal/ingest/ -run 'SecretName|Embedded'`. Expect failures.
-- [ ] **Step 3: Implement.** One unexported function hides the pairs of a string by R-T2's rule 3 and is used for each path segment, the fragment and a `streamid` value; `Masked` uses the same walk to look for the mask. The path is rewritten through `u.Path` with `RawPath` cleared, as the RTMP branch does today.
+- [ ] **Step 3: Implement.** One unexported function hides the pairs of an escaped string by R-T2's rule 3, given its separators: `&;,_` for each segment of `EscapedPath`, for the fragment and for a `streamid` value; `&;` for the raw query. Only names are unescaped. `Masked` uses the same walk to look for the mask. A changed path is written back with `RawPath` set to the walked text and `Path` to its unescaped form, so `u.String()` keeps the escapes it was given.
 - [ ] **Step 4: Run** `go test -race -count=1 ./internal/redact/ ./internal/logging/ ./internal/ingest/ ./internal/spec/ ./internal/stream/ ./internal/output/rtmppush/`. Expect a pass: no existing row changes.
 - [ ] **Step 5: Commit** `feat(redact): credentials in URL paths, queries and stream IDs are hidden`
 
@@ -259,7 +287,7 @@ func TestOpenErrorsHideEmbeddedCredentials(t *testing.T) // ingest: Parse and Op
 **Files:**
 - Modify: `internal/spec/spec.go` (`Outputs` at 94–103, `Redacted` at 149–158), `internal/spec/validate.go` (`Outputs.validate` at 141–157, `checkURL` at 175–185), `internal/spec/doc.go`
 - Create: `internal/spec/unmask.go`
-- Modify, so that `rebuild` stays green between waves: `internal/api/openapi.json` (the `Outputs` schema gains `srt_passphrase` with its final description: "Required of SRT players of this stream, 10 to 79 printable ASCII bytes. Write-only: a response shows xxxxx when one is stored, and xxxxx written back keeps it"), `internal/stream/reattach_test.go` (the known list at line 23 gains `"SRTPassphrase"` with the comment `// its sessions end on a change: Task 5`)
+- Modify, so that `rebuild` stays green between waves: `internal/api/openapi.json` (the `Outputs` schema gains `srt_passphrase` with its final description: "Required of SRT players of this stream: 10 to 79 characters of A-Z, a-z, 0-9, '.', '_', '~' and '-'. Write-only: a response shows xxxxx when one is stored, and xxxxx written back keeps it"), `internal/stream/reattach_test.go` (the known list at line 23 gains `"SRTPassphrase"` with the comment `// its sessions end on a change: Task 5`)
 - Test: `internal/spec/spec_test.go`, `internal/spec/validate_test.go`, `internal/spec/diff_test.go`, `internal/spec/unmask_test.go`
 
 **Interfaces:**
@@ -272,15 +300,19 @@ func TestOpenErrorsHideEmbeddedCredentials(t *testing.T) // ingest: Parse and Op
 
 // Redacted also replaces a non-empty SRTPassphrase by the mask.
 
-// ErrNoSecret and ErrAmbiguousSecret are KeepSecret's errors.
-var ErrNoSecret, ErrAmbiguousSecret error
+// KeepSecrets resolves one list of URLs by R-T4: sent is a stream's input URLs or its push URLs as written, stored the
+// same list of the stored stream (nil when there is none). out is sent with every element that redact.Masked reports,
+// or that is the bare mask, replaced by a stored URL; bad holds the indexes of the elements that could not be replaced,
+// ascending, and out[i] is sent[i] for them. For each redacted form among sent's masks:
+//   - when a sent element that is not masked has that redact.URL form, every mask of the form is bad (decided first);
+//   - one distinct stored value of the form: every mask of the form takes it;
+//   - n > 1 distinct stored values and exactly n masks of the form: the i-th mask takes the i-th distinct stored value,
+//     both in order of occurrence;
+//   - otherwise every mask of the form is bad. The bare mask is always bad.
+func KeepSecrets(sent, stored []string) (out []string, bad []int)
 
-// KeepSecret returns the stored URL that the masked URL sent stands for (R-T4): the one distinct element of stored
-// whose redact.URL form equals sent. ErrNoSecret when none does, ErrAmbiguousSecret when several distinct ones do.
-func KeepSecret(sent string, stored []string) (string, error)
-
-// Unmask returns s with every input URL and push URL that redact.Masked reports, and an SRTPassphrase equal to the
-// mask, replaced by stored's (R-T4); stored is nil when no stream of s's name is stored. Fields that hold no mask are
+// Unmask returns s with its input URLs and its push URLs resolved by KeepSecrets, and an SRTPassphrase equal to the
+// mask replaced by stored's (R-T4); stored is nil when no stream of s's name is stored. Fields that hold no mask are
 // taken as sent. The error is an UnmaskError naming every field that could not be replaced; s is returned unchanged with it.
 func (s Stream) Unmask(stored *Stream) (Stream, error)
 
@@ -289,7 +321,8 @@ func (s Stream) Unmask(stored *Stream) (Stream, error)
 type UnmaskError []string
 func (e UnmaskError) Error() string // the texts joined with "; "
 ```
-  - `Validate` adds, in `Outputs.validate`: `outputs.srt_passphrase: needs outputs.srt`; `outputs.srt_passphrase: holds the redaction mask, not the secret; send the real value`; `outputs.srt_passphrase: %d bytes, want 10 to 79`; `outputs.srt_passphrase: holds a character that is not printable ASCII (0x21 to 0x7e)`. None quotes the value.
+  - `Validate` adds, in `Outputs.validate`: `outputs.srt_passphrase: needs outputs.srt`; `outputs.srt_passphrase: holds the redaction mask, not the secret; send the real value`; `outputs.srt_passphrase: %d bytes, want 10 to 79`; `outputs.srt_passphrase: holds a character outside A-Z, a-z, 0-9, '.', '_', '~' and '-'`. None quotes the value.
+  - `checkURL` also refuses a URL that is the bare mask, with its existing mask text: `redact.Masked` does not report a string without `://`.
   - `ETag`, `Diff`, `clone` and `normal` need no change: the field is a string inside `Outputs`.
 
 - [ ] **Step 1: Write the failing tests.**
@@ -298,9 +331,11 @@ func (e UnmaskError) Error() string // the texts joined with "; "
 func TestMaskIsRedacts(t *testing.T) // redact.URL("rtsp://u:p@h/s") is "rtsp://u:" + mask + "@h/s"
 
 func TestSRTPassphraseValidate(t *testing.T)
-// accepted: srt true with "0123456789" (10) and with 79 bytes of '!'..'~'; srt true and no passphrase; srt false and none
-// refused, text as above and never holding the value: a passphrase with srt false; 9 bytes; 80 bytes; "xxxxx";
-//   one with a space; one with a tab; one with "é"
+// accepted: srt true with "0123456789" (10), with "Aa0._~-Aa0._~-" and with 79 bytes cycling through the allowed set; srt true
+//   and no passphrase; srt false and none
+// refused, text as above and never holding the value: a passphrase with srt false; 9 bytes; 80 bytes; "xxxxx"; and 12 bytes
+//   holding, in turn, each of space, tab, '+', '&', '#', '=', '%', '/', '?', ':', '@', '!' and "é"
+// checkURL: an input URL "xxxxx" and a push URL "xxxxx" are refused with the mask text
 
 func TestRedactedPassphrase(t *testing.T) // Redacted().Outputs.SRTPassphrase is "xxxxx" for a set passphrase and "" for none;
 //   the receiver's own field is untouched; the JSON of Redacted() has "srt_passphrase":"xxxxx" and no byte run of the passphrase
@@ -308,11 +343,16 @@ func TestRedactedPassphrase(t *testing.T) // Redacted().Outputs.SRTPassphrase is
 func TestDiffPassphrase(t *testing.T) // set, changed and removed are each ChangeOutputs; equal documents are ChangeNone;
 //   the ETags of two documents that differ only in the passphrase differ
 
-func TestKeepSecret(t *testing.T)
-// stored {"rtsp://u:pw@cam/s", "rtmp://h/live/secretkey"}: "rtsp://u:xxxxx@cam/s" → the first; "rtmp://h/live/sexxxxx" → the second
-// stored holding the same URL twice: one distinct value, returned
-// ErrNoSecret: "rtsp://u:xxxxx@other/s"; "rtsp://v:xxxxx@cam/s"; "rtsp://u:xxxxx@cam:8554/s"; empty stored
-// ErrAmbiguousSecret: stored {"rtmp://h/live/secretkey", "rtmp://h/live/sesame"} with "rtmp://h/live/sexxxxx"
+func TestKeepSecrets(t *testing.T) // K1 = rtmp://h/live/secretkey, K2 = rtmp://h/live/sesame, M = rtmp://h/live/sexxxxx (both redact to M)
+// stored {rtsp://u:pw@cam/s, K1}, sent {rtsp://u:xxxxx@cam/s, M} → stored, no bad; sent reversed → resolved by value
+// stored holding the same URL twice, sent its mask once or twice → each mask takes the one value
+// the order rule: stored {K1, K2}, sent {M, M} → {K1, K2}; stored {K2, K1}, sent {M, M} → {K2, K1};
+//   stored {K1, udp://x:1, K2}, sent {M, rtmp://new/live/realkey, M} → {K1, the new URL, K2}
+// counts differ: stored {K1, K2}, sent {M} → bad {0}; stored {K1, K2}, sent {M, M, M} → bad {0, 1, 2}
+// no stored value: sent rtsp://u:xxxxx@other/s, rtsp://v:xxxxx@cam/s, rtsp://u:xxxxx@cam:8554/s; stored nil → bad
+// a guess beside its mask (finding 8): stored {K1}, sent {M, K1} → bad {0}; sent {M, rtmp://h/live/seXguess} → bad {0}, the
+//   same result whether the guess is K1 or not; sent {K1} alone (no mask) → {K1}, no bad
+// the bare mask: sent {"xxxxx"} → bad {0}, whatever stored holds
 
 func TestUnmask(t *testing.T) // the round trip of Review Focus 1
 // stored: inputs rtsp://u:pw@cam/s and srt://h:9000?passphrase=0123456789, push rtmp://h/live/secretkey, srt on with "srtpass-0123"
@@ -320,14 +360,18 @@ func TestUnmask(t *testing.T) // the round trip of Review Focus 1
 //   Diff(stored, result) is ChangeLive; result.Validate() is nil
 // sent := stored.Redacted(): Diff(stored, result) is ChangeNone and the ETags are equal
 // the two inputs swapped in sent: both resolved, by value
-// a real URL beside a masked one: the real one is taken as sent
+// a real URL of another redacted form beside a masked one: the real one is taken as sent
+// two pushes K1 and K2 that redact alike, sent as two masks with a third push added: both keys kept in order, ChangeOutputs
 // sent without srt_passphrase: the result has none (removed, R-T3); sent with a new real passphrase: taken
 
 func TestUnmaskRefuses(t *testing.T) // Review Focus 2; each returns an UnmaskError naming exactly the listed fields, and s unchanged
 // stored nil with a masked input → "inputs[0].url: …"
 // the host, the port, the user, the path or a query value changed around the mask → that field
 // a URL with a password and a ?token=: the token retyped, the password left masked → that field
-// two stored pushes that redact alike → "outputs.push[0].url: …"
+// two stored pushes that redact alike and one mask sent → "outputs.push[0].url: …"
+// a push sent as a mask and again as a real URL of the same redacted form → the mask's field, with the same text for a right
+//   and a wrong guess; no "repeated" error is reached
+// an input URL that is the bare mask → that field
 // srt_passphrase "xxxxx" with no stored passphrase → "outputs.srt_passphrase: …"
 // a masked input and a masked push both unresolvable → two texts, inputs first
 ```
@@ -342,7 +386,7 @@ func TestUnmaskRefuses(t *testing.T) // Review Focus 2; each returns an UnmaskEr
 ### Task 3: `srtout`, a passphrase per stream; `conform` reads an encrypted output
 
 **Files:**
-- Modify: `internal/output/srtout/srtout.go` (the package comment at 1–60, `Options` at 153–172, `Stats` at 175–197, `Server` at 201–220, `Listen` at 258–277, `refusal` at 343–350, `stream` at 412–433, `countRefusal` at 436–448)
+- Modify: `internal/output/srtout/srtout.go` (the package comment at 1–60, `Options` at 153–172, `Stats` at 175–197, `Server` at 201–220, `Listen` at 258–277, `refusal` at 343–350, `answer` at 353–397, `stream` at 412–433, `countRefusal` at 436–448, `serve` at 516–553, `classify` at 568–590)
 - Create: `internal/output/srtout/secret.go` (the failure table)
 - Modify: `internal/conform/srt.go` (`readSRT` at 49–80)
 - Test: `internal/output/srtout/srtout_test.go`, `internal/output/srtout/secret_test.go`, `internal/conform/srt_test.go`
@@ -352,9 +396,10 @@ func TestUnmaskRefuses(t *testing.T) // Review Focus 2; each returns an UnmaskEr
 
 ```go
 // In srtout.Options:
-// Passphrase, when set, returns the passphrase SRT callers of the stream served as name must present, or "" for none
-// (R-T9). It is called in the accept loop for each request that names a live stream, and must not block.
-Passphrase func(name string) string
+// Secure, when set, replaces New's lookup: it returns the hub of the stream served as name and the passphrase its SRT
+// callers must present ("" for none), both from one reading of the stream's state (R-T9). It is called in the accept
+// loop for each request, and once more by each connection after it subscribed; it must not block.
+Secure func(name string) (h *hub.Hub, passphrase string, ok bool)
 // KMRefresh is the number of packets after which a connection's key is replaced; 0 means gosrt's default (1<<24).
 // The new key is announced KMRefresh/4 packets before. Tests lower it.
 KMRefresh uint64
@@ -364,7 +409,8 @@ KMRefresh uint64
 // because their peer key had 5 wrong passphrases in the last 10 s.
 RejectedSecret, RejectedLimited uint64
 ```
-  - The order in `stream` (R-T9), which keeps today's counts when no passphrase is configured: the stream ID is parsed (a bad one is `refuseMode`); the name is looked up and, when it names a live stream, `Passphrase` is asked; an encrypted request with no passphrase to check against is `refuseMode`; an unknown or not-live name is `refuseUnknown`; then, with a passphrase: unencrypted is `REJ_UNSECURE`, a limited peer key is `REJ_RESOURCE`, a failed `SetPassphrase` is `REJ_BADSECRET` and one failure in the table. The caps of `answer` come after.
+  - The order in `stream` (R-T9), which keeps today's counts when no passphrase is configured: the stream ID is parsed (a bad one is `refuseMode`); the name is looked up, through `Secure` when it is set, which gives the hub and the passphrase together; an encrypted request with no passphrase to check against is `refuseMode`; an unknown or not-live name is `refuseUnknown`; then, with a passphrase: unencrypted is `REJ_UNSECURE`, a limited peer key is `REJ_RESOURCE`, a failed `SetPassphrase` is `REJ_BADSECRET` and one failure in the table. The caps of `answer` come after.
+  - **The admitted passphrase travels with the connection.** `stream` returns it, `answer` hands it to `serve`, and `serve` asks `Secure` again once `tsstream.Stream` has subscribed, before the first byte is written (the writer's first `Prebuffered`, `Frame` or `Write` comes after the subscription). A different passphrase, a different hub or `ok == false` cancels the connection with a cause that `classify` counts as `endHubClosed`. With `Secure` nil nothing is asked again.
   - The table: peer key → count and the time of its first counted failure; an entry expires 10 s after that time; at most 4096 entries (R-T9). A correct passphrase clears nothing.
   - `conform.readSRT` takes `passphrase` from the URL's query into `srt.Config.Passphrase`, and every error it returns quotes `redact.URL` of the URL instead of the URL.
 
@@ -373,7 +419,7 @@ RejectedSecret, RejectedLimited uint64
 ```go
 func TestPassphraseAccepted(t *testing.T) // hubs "open" (no passphrase) and "locked" ("srtpass-0123456789"): a caller with the
 //   passphrase reads TS from "locked" whose frames equal what a plain caller reads from "open" fed the same frames; callers with
-//   PBKeylen 16, 24 and 32 all read; the served name of a rung, "locked_720", needs the same passphrase when Passphrase says so
+//   PBKeylen 16, 24 and 32 all read; the served name of a rung, "locked_720", needs the same passphrase when Secure says so
 
 func TestPassphraseRefusals(t *testing.T) // Review Focus 5
 //   The reason given to ConnRequest.Reject is recorded through a seam of the test (a wrapped request), since a caller's
@@ -382,7 +428,7 @@ func TestPassphraseRefusals(t *testing.T) // Review Focus 5
 //   "locked" with "wrongwrong-0123": REJ_BADSECRET, RejectedSecret == 2
 //   "open" with a passphrase: REJ_RESOURCE, RejectedMode moves, RejectedSecret does not (frozen)
 //   an unknown name with a passphrase: REJ_RESOURCE and RejectedMode, as at HEAD; without: RejectedUnknown
-//   Passphrase nil: every row of the existing refusal table passes unchanged
+//   Secure nil: every row of the existing refusal table passes unchanged
 //   Stats.Rejected is the sum of the six counters after every row
 
 func TestPassphraseLimiter(t *testing.T) // Review Focus 5; the table's clock is injected
@@ -393,8 +439,16 @@ func TestPassphraseLimiter(t *testing.T) // Review Focus 5; the table's clock is
 //   the clock moved 10 s past the first failure: the first key with the right passphrase connects
 //   4097 keys each failing once: the table holds at most 4096; after 10 s it is empty on the next failure
 
-func TestPassphraseChangedMidLookup(t *testing.T) // -race: Passphrase flips between "" and a value while 50 callers dial:
-//   every accepted connection read TS, every refusal is one of the three reasons, no panic, Conns returns to 0
+func TestPassphraseChangedMidLookup(t *testing.T) // Review Focus 5; the stream's state is one value {hub, passphrase} that
+//   Secure reads, as a View is
+//   deterministic: a seam pauses a connection between Accept and its subscription; the state's passphrase is changed, the hub
+//   refuses "srt " and relaxes (what reattach does); the connection resumes: it subscribes, asks again, and ends as
+//   hub_closed having written no byte (its caller reads nothing but the shutdown). The same for a passphrase removed, for one
+//   set where there was none, and for a stream that stopped being served
+//   -race: the state flips between two passphrases 200 times, each flip followed by Refuse("srt ") and a relax, while 50 callers
+//   holding the first passphrase dial in a loop: at every moment after a flip to the second passphrase has returned and 200 ms
+//   have passed, no connection admitted under the first is open (each connection records what it was admitted under);
+//   every refusal is one of the three reasons; no panic; Conns returns to 0
 
 func TestKeyRefreshFFmpeg(t *testing.T) // peer: testpeer.Require(t, "ffmpeg", "srt"). KMRefresh 1024, a hub fed 25 fps video and
 //   audio for 12 s of stream time at a rate that sends more than 4096 packets; ffmpeg -i srt://…?streamid=live/locked&passphrase=…
@@ -406,7 +460,7 @@ func TestReadSRTPassphrase(t *testing.T) // conform: ReadTS of srt://<srtout>?st
 ```
 
 - [ ] **Step 2: Run** `go test -count=1 -run 'Passphrase|KeyRefresh|ReadSRT' ./internal/output/srtout/ ./internal/conform/`. Expect failures.
-- [ ] **Step 3: Implement.** `Listen` sets `cfg.KMRefreshRate` and `cfg.KMPreAnnounce` only when `KMRefresh` is not 0. The table is guarded by `Server.mu`, which `stream` already takes to count a refusal.
+- [ ] **Step 3: Implement.** `Listen` sets `cfg.KMRefreshRate` and `cfg.KMPreAnnounce` only when `KMRefresh` is not 0. The table is guarded by `Server.mu`, which `stream` already takes to count a refusal. The second question is asked from the connection's own goroutine, never under `Server.mu`.
 - [ ] **Step 4: Run** `go test -race -count=1 ./internal/output/srtout/ ./internal/conform/`, then `-count=10 -run 'Passphrase' ./internal/output/srtout/`, then `make test-ci-peers ARGS='-run TestKeyRefreshFFmpeg ./internal/output/srtout/'`. Expect all to pass.
 - [ ] **Step 5: Commit** `feat(srtout): a stream may require a passphrase` and `feat(conform): an SRT read takes a passphrase`
 
@@ -420,73 +474,114 @@ func TestReadSRTPassphrase(t *testing.T) // conform: ReadTS of srt://<srtout>?st
 - Modify: `internal/spec/unmask.go` (the private `mask` becomes `redact.Mask`; `TestMaskIsRedacts` goes)
 
 **Interfaces:**
-- Consumes: `spec.KeepSecret`, `spec.ErrNoSecret`, `spec.ErrAmbiguousSecret`, `Outputs.SRTPassphrase` (Task 2); `redact.URL`, `redact.Masked`, `redact.Mask` (Task 1); `decodeNode`, `streamsNode`, `entryName`, `entryRef`, `encode`, `Errors` of this package.
+- Consumes: `spec.KeepSecrets`, `Outputs.SRTPassphrase` (Task 2); `redact.URL`, `redact.Masked`, `redact.Mask`, `redact.Tag` (Task 1 and HEAD); `decodeNode`, `streamsNode`, `entryName`, `entryRef`, `encode`, `Errors` of this package.
 - Produces:
 
 ```go
-// Mask returns text as an API response shows it (R-T8): under streams every URL-shaped scalar value whose redact.URL
-// form carries a mask is replaced by that form, every srt_passphrase value by redact.Mask, and in every comment each
-// URL-shaped token goes through redact.URL. Everything else is copied byte for byte; a text that needs nothing hidden
-// is returned as it is. When a scalar's text cannot be replaced in place the document is re-encoded through the node
-// tree, as SetStream does. The result never holds a value that had to be hidden. A text that is not YAML is an error.
+// Mask returns text as an API response shows it (R-T8). In every scalar, keys and values, each URL-shaped token whose
+// redact.URL form carries a mask is replaced by that form, and a scalar holding a token redact.URL cannot parse becomes
+// redact.Mask whole; every non-empty srt_passphrase value becomes redact.Mask; in every comment each URL-shaped token
+// goes through redact.URL. Everything else is copied byte for byte, and a text that needs nothing hidden is returned as
+// it is, the same slice. When a scalar cannot be replaced in place, or the output's bytes still hold a URL-shaped token
+// with something to hide (a comment the parser dropped), the document is re-encoded through the node tree, as SetStream
+// does. It returns an error, and no text, when the text is not YAML or when the re-encoded bytes still hold such a token.
 func Mask(text []byte) ([]byte, error)
 
-// Unmask returns text with every inputs[i].url, outputs.push[j].url and outputs.srt_passphrase of a stream entry that
-// holds the mask replaced by the value the entries of the same name in stored hold for it (R-T4, spec.KeepSecret).
-// A text without a mask is returned as it is, the same slice. A text that is not YAML is returned as it is: Parse
+// Unmask returns sent with every inputs[i].url, outputs.push[j].url and outputs.srt_passphrase of a stream entry that
+// holds the mask replaced by the value the entries of the same name in stored hold for it (R-T4: spec.KeepSecrets per
+// list, its order rule included). When sent equals Mask(stored) byte for byte it returns stored, the same slice. A sent
+// text without a mask is returned as it is, the same slice. A sent text that is not YAML is returned as it is: Parse
 // reports it. A mask that cannot be replaced is an Errors, one per place, as
 // "streams[3] (cam): inputs[0].url: holds the redaction mask and the stored stream has no one secret it stands for; send the real value".
-func Unmask(text, stored []byte) ([]byte, error)
-```
-  - For every text `t` that `Parse` accepts and that holds no secret in a comment: `Unmask(Mask(t), t)` equals `t` byte for byte.
+func Unmask(sent, stored []byte) ([]byte, error)
 
-- [ ] **Step 1: Write the failing tests.** `secretText` is a config with three streams: `cam` (input `rtsp://admin:hunter2-pw@192.0.2.1/s`, push `rtmp://h/live/pushkey-0123456789`, `srt_passphrase: srtpass-0123456789`), `dvr` (input `rtsp://192.0.2.2/user=admin_password=tlJwpbo6_channel=1`) and `plain` (input `udp://239.0.0.1:1234`), with comments above entries, blank lines and a 4-space indent in one entry.
+// ETag is the config's entity tag (R-T12): `"` + the first 32 hex digits of redact.Tag(text) + `"`. It is the same for
+// the same text within one process and changes when the server restarts; no guess of the text can be tested against it.
+func ETag(text []byte) string
+```
+  - For every text `t` that `Mask` accepts: `Unmask(Mask(t), t)` is `t`, by `Unmask`'s first rule. For a masked text that was edited: every byte outside the scalars `Unmask` resolved is the sender's, when no scalar forced the re-encode path.
+  - `Hash` stays until Task 6 has moved its three callers.
+
+- [ ] **Step 1: Write the failing tests.** `secretText` is a config with three streams: `cam` (input `rtsp://admin:hunter2-pw@192.0.2.1/s`, push `rtmp://h/live/pushkey-0123456789`, `srt_passphrase: srtpass-0123456789`), `dvr` (input `rtsp://192.0.2.2/user=admin_password=tlJwpbo6_channel=1`) and `plain` (input `udp://239.0.0.1:1234`), with comments above entries, blank lines and a 4-space indent in one entry. `leak(out, secrets...)` fails when any secret is a substring of `out`.
 
 ```go
 func TestMask(t *testing.T) // Mask(secretText): none of hunter2-pw, pushkey-0123456789, srtpass-0123456789, tlJwpbo6 is in it;
 //   it differs from secretText only inside those four scalars (a line diff shows 4 changed lines, the same count of lines);
 //   it decodes to the same document but for those values, which are the redact.URL forms and "xxxxx"; the users section,
-//   hashes included, is untouched; Mask of a text with no secret returns the same slice
+//   hashes included, is untouched; Mask of a text with no secret returns the same slice; srt_passphrase: "" stays ""
 
-func TestMaskUnmaskRoundTrip(t *testing.T) // Review Focus 1: Unmask(Mask(secretText), secretText) == secretText, bytes.Equal;
-//   the same after an edit of the masked text that adds a fourth stream and changes plain's input: the result is secretText
-//   with exactly that edit; a text without masks comes back as the same slice
+func TestMaskUnmaskRoundTrip(t *testing.T) // Review Focus 1: Unmask(Mask(secretText), secretText) is secretText, the same slice;
+//   after an edit of the masked text that adds a fourth stream and changes plain's input, the result is secretText with
+//   exactly that edit, byte for byte; a text without masks comes back as the same slice
 
-func TestMaskOddYAML(t *testing.T) // Review Focus 4; for each form the masked text holds no secret and the round trip restores
-//   a document equal to the original (spec.Diff ChangeNone per stream); "in place" rows also restore the bytes
-//   in place: url: 'rtsp://u:pw@h/s'; url: "rtsp://u:pw@h/s"; inputs: [{url: rtsp://u:pw@h/a}, {url: rtsp://u:pw2@h/b}] on one
-//     line; a URL followed by a line comment; CRLF line ends; a non-ASCII watermark text on the line before
-//   re-encoded: url: "rtsp://u:pw@h/s"; url: >- folded over two lines; a URL split by a double-quoted line continuation
+func TestMaskOddYAML(t *testing.T) // Review Focus 4. For every row: Mask returns no error, its output holds no secret, and
+//   Unmask(Mask(t), t) is t. Rows marked "edit" also change another stream in the masked text and assert that the secret
+//   comes back (spec.Diff ChangeNone for the row's stream) and, for the "in place" rows, that only the edit's bytes differ.
+//   in place, edit: url: 'rtsp://u:pw@h/s'; url: "rtsp://u:pw@h/s" (double quotes, no escape); inputs: [{url: rtsp://u:pw@h/a},
+//     {url: rtsp://u:pw2@h/b}] on one line; a URL followed by a line comment; CRLF line ends; a non-ASCII watermark text on
+//     the line before
+//   re-encoded, edit: a double-quoted URL in which one letter of the password is written as a YAML hex escape; url: >- folded
+//     over two lines; a double-quoted URL split by a line continuation
+//   anchors (finding 9): url: &u rtsp://u:pw@h/s with a later *u; a whole input anchored and aliased; a merge key (<<: *base)
+//     that carries a url: no error, no secret, the re-encode path; such a text fails Parse, so there is no edit row
+//   tokens inside scalars (finding 2), each masked, each refused by Unmask when sent back edited, with R-T4's text:
+//     url: see rtsp://u:pw@h/s now          → url: see rtsp://u:xxxxx@h/s now
+//     - url:rtsp://u:pw@h/s (one scalar)    → url:rtsp://u:xxxxx@h/s
+//     rtsp://u:pw@h/s: x (a URL as a key)   → the key masked
+//   tokens redact.URL cannot parse (finding 2): the scalar becomes xxxxx whole, and an edited round trip is refused:
+//     url: rtsp://admin:p%ss@cam/s; url: "rtsp://admin:pa#ss@cam/s"; url: rtsp://u:pw@h:port/s
 //   a mistyped key (inptus: [{url: rtsp://u:pw@h/s}]): masked on the way out, not resolved on the way in
+//   an entry the lenient start skipped (a bad layout value) holding a secret URL: masked, and resolved on an edit
 
 func TestMaskComments(t *testing.T) // a head comment "# old: rtmp://h/live/oldkey-0123456789", a line comment and a foot comment
-//   each holding a URL with a secret: masked in Mask's output, the rest of each comment kept; Unmask leaves them as sent
+//   each holding a URL with a secret: masked in Mask's output, the rest of each comment kept, the layout kept; an edited
+//   round trip stores them as sent.
+//   Comments the parser drops (finding 3): "inputs: [ # old rtsp://u:s1@h/s" followed by the entries on the next lines, and a
+//   comment between a flow mapping's entries: no secret in the output (the re-encode path, the comment gone), no error.
+//   A comment holding a token that does not parse (# rtsp://admin:p%ss@cam/s): the token is gone from the output
 
-func TestMaskNeverLeaks(t *testing.T) // Review Focus 4: for every text of the package's existing Parse and edit test tables
-//   with a secret URL substituted in turn into each scalar under streams, and for 2000 texts made by a fixed-seed generator
-//   that picks a quoting, a flow or block style and an indentation for a stream with secrets: the secret is not in Mask's
-//   output, and Mask(Mask(t)) == Mask(t)
+func TestMaskNeverLeaks(t *testing.T) // Review Focus 4. The five strings of finding 2 (rtsp://admin:p%ss@cam/s,
+//   rtsp://admin:pa#ss@cam/s, rtsp://u:pw@h:port/s, "see rtsp://u:pw@h/s now", "url:rtsp://u:pw@h/s") and four parsable
+//   secret URLs are each substituted, in turn, into every scalar position (key and value) of every text of the package's
+//   existing Parse, ParseLenient and edit test tables, and into 2000 texts made by a fixed-seed generator that picks a
+//   quoting, a flow or block style, an anchor or none, a comment placement and an indentation. For each text t that decodes
+//   as YAML: Mask(t) returns no error; no password or key of the substituted string is in its output; the byte-level
+//   postcondition holds on the output (no URL-shaped token with something to hide); Mask(Mask(t)) == Mask(t)
+
+func TestMaskAcceptsWhatTheServerRuns(t *testing.T) // finding 9: for every text of the package's tables that ParseLenient
+//   accepts (skipped entries included): Mask returns no error
 
 func TestUnmaskErrors(t *testing.T) // Review Focus 2; each is an Errors with exactly the listed texts, and nothing is returned
 //   a masked URL in a stream stored has no entry for → "streams[0] (new): inputs[0].url: …"
 //   cam's masked input with its host changed; cam's masked push copied into dvr; srt_passphrase: xxxxx in plain
 //   two masks unresolvable in two streams → two texts, in the file's order
-//   an entry the lenient start skipped in stored (a bad layout value) whose masked URL is sent back unchanged: resolved,
-//     because the match is on stored's nodes, not on a decoded stream
+//   cam's push sent as its mask and again as a real URL of the same form → the mask's field, the same text for a right and
+//     a wrong guess
 //   stored holding two entries named cam: the candidates are both entries'
+
+func TestUnmaskOrder(t *testing.T) // finding 4: cam stores two pushes rtmp://h/live/secretkey and rtmp://h/live/sesame. The
+//   masked text with a third push added resolves both in order and stores all three; with one of the two masks deleted it
+//   is refused, naming the remaining mask's field
+
+func TestPassphraseQuoting(t *testing.T) // finding 14, with Parse: srt_passphrase: 0123456789 unquoted is refused by the
+//   plain-decimal rule with an error that names the line and not the value; "0123456789" quoted is accepted; unquoted
+//   1234567890 is refused by the same rule or as a number where a string is wanted, never accepted as a passphrase
+
+func TestETag(t *testing.T) // ETag(t) is 34 bytes, quoted hex; equal texts have equal tags; texts differing in one byte differ;
+//   it is not Hash(t), and it holds no 32-digit prefix of hex(sha256(t))
 ```
 
 - [ ] **Step 2: Run** `go test -count=1 -run 'Mask|Unmask' ./internal/config/`. Expect a compile failure.
-- [ ] **Step 3: Implement.** Both functions decode to nodes, compute the wanted tree (the nodes with their values or comments replaced), try the replacement on bytes at each scalar's `Line` and `Column`, decode the result and compare it with the wanted tree, and fall back to `encode` of the wanted tree when they differ. The comparison, not the replacement, is what the "never" in both doc comments rests on.
+- [ ] **Step 3: Implement.** Both functions decode to nodes, compute the wanted tree (the nodes with their values or comments replaced), try the replacement on bytes at each scalar's `Line` and `Column`, decode the result and compare it with the wanted tree, and fall back to `encode` of the wanted tree when they differ. `Mask` then runs the byte scan of R-T8 on whichever output it has, re-encodes once if the scan finds a token, and returns an error if the scan still finds one. The comparison and the scan, not the replacement, are what the guarantees rest on. The URL-token pattern is `logging`'s: export it there or copy it with a test that holds the two equal.
 - [ ] **Step 4: Run** `go test -race -count=1 ./internal/config/`. Expect a pass, the existing tables untouched.
-- [ ] **Step 5: Commit** `feat(config): the config text masked for a response and resolved on a write`
+- [ ] **Step 5: Commit** `feat(config): the config text masked for a response and resolved on a write` and `feat(config): a keyed ETag for the config text`
 
 ---
 
 ### Task 5: `stream`, the passphrase reaches the SRT server and a change ends its sessions
 
 **Files:**
-- Modify: `internal/stream/generation.go` (`reattach` at 330–375 and its comment at 325–329), `internal/stream/manager.go` (beside `Hub` at 605–626)
+- Modify: `internal/stream/generation.go` (`pushID` at 57–65 and its callers at 229, 353–354 and 450; `reattach` at 330–375 and its comment at 325–329), `internal/stream/manager.go` (beside `Hub` at 605–626)
 - Test: `internal/stream/reattach_test.go` (`TestReattachCoversEveryOutput` at 22–36), `internal/stream/manager_test.go`, `internal/stream/supervisor_test.go`
 
 **Interfaces:**
@@ -494,12 +589,16 @@ func TestUnmaskErrors(t *testing.T) // Review Focus 2; each is an Errors with ex
 - Produces:
 
 ```go
-// SRTPassphrase returns the passphrase SRT callers of a served name must present: the stream's outputs.srt_passphrase,
-// or "" when it has none, when its SRT output is off or when nothing is served under that name. It reads the View, as
-// Hub does, and never waits for an edit.
-func (m *Manager) SRTPassphrase(served string) string
+// SRT returns the hub of a served name for the SRT output and the passphrase its callers must present ("" for none),
+// both from one View; ok is false while the stream does not serve that name over SRT. It never waits for an edit.
+func (m *Manager) SRT(served string) (h *hub.Hub, passphrase string, ok bool)
+
+// pushID is the label of a push target: the first 8 hex digits of redact.Tag of the stream's name, a zero byte and the
+// URL. Two streams that push to the same URL have different labels, so a probe stream cannot test a guess of another
+// stream's key against its label.
+func pushID(stream, url string) string
 ```
-  - `reattach`: when `old.SRT && new.SRT && old.SRTPassphrase != new.SRTPassphrase`, after `publish` (step 4) every hub of the generation refuses `"srt "` once, on top of `off(new)`, and then relaxes to `off(new)` again: the sessions admitted under the old passphrase end, and a caller that arrives after the View was published is asked for the new one. No other output's subscriber is touched.
+  - `reattach`: when `old.SRT && new.SRT && old.SRTPassphrase != new.SRTPassphrase`, after `publish` (step 4) every hub of the generation refuses `"srt "` once, on top of `off(new)`, and then relaxes to `off(new)` again: the sessions subscribed at that moment end, and a caller that arrives after the View was published is asked for the new one. A connection that was answered before the publish and subscribes after the relax is `srtout`'s to end (Task 3: it asks `SRT` again after subscribing, and the View was published first). No other output's subscriber is touched.
   - `Status.Outputs` is taken from `Redacted()` (`status.go:143-155`) and so shows `xxxxx`; `View.Outputs` holds the real value.
 
 - [ ] **Step 1: Write the failing tests.**
@@ -516,17 +615,22 @@ func TestReattachPassphrase(t *testing.T) // Review Focus 5. A running stream wi
 //   srt turned off with the passphrase removed in one edit: the srt subscribers end once, by off(), and "srt e" is refused
 //   the View published by the edit holds the new passphrase before any subscriber is closed (the published seam)
 
-func TestManagerSRTPassphrase(t *testing.T) // "" for an unknown name, for a stream without one, for srt off; the value for the
-//   stream's name and for each rung's served name; after an outputs edit the new value, with no rebuild (Rebuilds unchanged)
+func TestManagerSRT(t *testing.T) // ok false for an unknown name and for srt off; the hub Hub(OutSRT, name) returns and "" for a
+//   stream without a passphrase; the hub and the value for the stream's name and for each rung's served name; after an
+//   outputs edit the new value, with no rebuild (Rebuilds unchanged); under -race, readers during 200 edits between two
+//   passphrases only ever see a pair that one View held
+
+func TestPushIDPerStream(t *testing.T) // pushID("a", u) != pushID("b", u); equal for equal arguments; the status of two streams
+//   pushing to one URL shows two different ids, and the metrics' target labels differ likewise
 
 func TestStatusHidesPassphrase(t *testing.T) // Supervisor.Status().Outputs.SRTPassphrase is "xxxxx"; the status JSON holds no
 //   byte run of the passphrase; Manager.Get returns the real value
 ```
 
-- [ ] **Step 2: Run** `go test -count=1 -run 'Reattach|SRTPassphrase|HidesPassphrase' ./internal/stream/`. Expect failures.
+- [ ] **Step 2: Run** `go test -count=1 -run 'Reattach|ManagerSRT|PushID|HidesPassphrase' ./internal/stream/`. Expect failures.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `go test -race -count=1 ./internal/stream/`, then `-count=20 -run TestReattachPassphrase ./internal/stream/`. Expect a pass.
-- [ ] **Step 5: Commit** `feat(stream): a changed SRT passphrase ends the stream's SRT sessions`
+- [ ] **Step 5: Commit** `feat(stream): a changed SRT passphrase ends the stream's SRT sessions` and `fix(stream): a push's id is tagged per stream`
 
 ---
 
@@ -534,26 +638,29 @@ func TestStatusHidesPassphrase(t *testing.T) // Supervisor.Status().Outputs.SRTP
 
 **Files:**
 - Modify: `internal/api/api.go` (`Backend` at 30–48, step 6 of the wrapper at 445–449, `asksSecrets` and `showSecrets` at 461–470), `internal/api/streams.go` (`view` at 20–25, `listStreams` at 45, `getStream` at 55, `maskedURLs` at 72–85, `putStream` at 94–157), `internal/api/config.go` (`getConfig` at 39–46), `internal/api/doc.go` (lines 29–36), `internal/api/openapi.json` (the `secrets` parameter at 1064–1068 and its three uses at 136, 195 and 255, the description at line 6, the 403's description at 1175, the URL description at 1388)
-- Modify: `internal/server/apply.go` (`state` at 38–41, `publish` at 45–58, the comment of `apply` at 60–68, `PutConfig` at 143–155, `PutStream` at 164–189, `ConfigText` at 249–252)
-- Test: `internal/api/streams_test.go`, `internal/api/config_test.go`, `internal/api/auth_test.go`, `internal/api/api_test.go`, `internal/api/openapi_test.go`, `internal/server/apply_test.go`
+- Modify: `internal/server/apply.go` (`state` at 38–41, `publish` at 45–58 with the ETag at 49, the comment of `apply` at 60–68 and its result's ETag at 111, `PutConfig` at 143–155 with the If-Match compare at 152, `PutStream` at 164–189, `ConfigText` at 249–252)
+- Modify: `internal/config/document.go` (`Hash` at 200–204 is deleted once its three callers use `config.ETag`), and whatever test of `internal/config` names `Hash`
+- Modify, for `Server.PutStream`'s third result: its callers in `internal/server/assets_test.go` (4) and `internal/server/tls_test.go` (1), and any other the compiler names
+- Test: `internal/api/streams_test.go`, `internal/api/config_test.go`, `internal/api/auth_test.go`, `internal/api/api_test.go`, `internal/api/openapi_test.go`, `internal/server/apply_test.go` (new rows, and the rows at 389, 402, 431, 696 and 914, which compute or compare the config ETag)
 
 **Interfaces:**
-- Consumes: `Stream.Unmask`, `UnmaskError`, `Stream.Redacted` (Task 2); `config.Mask`, `config.Unmask`, `config.Errors` (Task 4).
+- Consumes: `Stream.Unmask`, `UnmaskError`, `Stream.Redacted` (Task 2); `config.Mask`, `config.Unmask`, `config.ETag`, `config.Errors` (Task 4).
 - Produces:
 
 ```go
 // In api.Backend:
 // ConfigText is the text last loaded, reloaded or written as a response shows it, masked by config.Mask, and
-// config.Hash of the text itself. The text is nil when it could not be masked.
+// config.ETag of the text itself (R-T12). The text is nil when it could not be masked.
 ConfigText() (masked []byte, etag string)
 // PutStream creates or replaces one stream. sp is the document as sent: a mask in it stands for the stored secret
 // (R-T4). stored is the document as it is now stored.
 PutStream(ctx context.Context, sp spec.Stream, ifMatch string) (out stream.Outcome, stored spec.Stream, err error)
 ```
-  - `api`: every stream document in a response is `Redacted()`. `asksSecrets` stays as the test for the exact query; step 6 answers it 400 `bad_request` for every role with "?secrets=1 is gone: secrets are write-only. A response shows xxxxx where a secret is stored, and a write that sends xxxxx back keeps it". `putStream` sets the `ETag` header from `stored.ETag()` and answers `stored.Redacted()`. A nil text from `ConfigText` is 500 `internal`.
+  - `api`: every stream document in a response is `Redacted()`. `asksSecrets` becomes `r.URL.Query().Has("secrets")`, so `?secrets=1&x=1` and `?secrets` are caught as `?secrets=1` is; step 6 answers it 400 `bad_request` for every role with "?secrets=1 is gone: secrets are write-only. A response shows xxxxx where a secret is stored, and a write that sends xxxxx back keeps it". `putStream` sets the `ETag` header from `stored.ETag()` and answers `stored.Redacted()`. A nil text from `ConfigText` is 500 `internal`.
   - `server.PutStream`, under `s.cfg`, after the stale and If-Match checks: `sp.Unmask` against `Manager().Get(sp.Name)`; an `UnmaskError` becomes `config.Errors`, each text prefixed `spec: validate: `, which the API already answers 422 `invalid_config`. Everything after works on the resolved document.
   - `server.PutConfig`, after the If-Match check: `config.Unmask(text, s.applied)`, then `apply` as today. A text without masks reaches `apply` as the same bytes.
   - `publish` computes `config.Mask(s.applied)` once per applied text and keeps it in `state`; a failure is logged at error (scrubbed) and leaves it nil.
+  - **The config ETag (R-T12):** `publish` (`ConfigStatus.ETag`, which a viewer reads), `apply`'s `ApplyResult.ETag` and `PutConfig`'s If-Match compare all use `config.ETag`. Nothing in `internal/server` or `internal/api` calls `config.Hash` any more, and it is deleted.
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -561,8 +668,9 @@ PutStream(ctx context.Context, sp spec.Stream, ifMatch string) (out stream.Outco
 // internal/api, against the fake Backend of the existing tests
 func TestStreamsAlwaysRedacted(t *testing.T) // GET /streams, GET /streams/{name} and the PUT answer, as viewer and as editor:
 //   the URLs are redact.URL forms and srt_passphrase is "xxxxx"; none of the fake's secrets is in any body
-func TestSecretsQueryGone(t *testing.T) // ?secrets=1 on every authenticated GET route: 400 bad_request for the viewer and the
-//   editor, 401 without credentials; ?secrets=0 and ?x=1 are ignored as before
+func TestSecretsQueryGone(t *testing.T) // ?secrets=1, ?secrets=1&x=1, ?x=1&secrets=1, ?secrets=0 and ?secrets on every
+//   authenticated GET route: 400 bad_request for the viewer and the editor, 401 without credentials; ?x=1 and ?secret=1
+//   are ignored as before, and their bodies are redacted
 func TestPutStreamPassesMasks(t *testing.T) // a PUT body holding masks reaches Backend.PutStream as sent; the ETag header is the
 //   returned stored document's and differs from the sent one's; a Backend error config.Errors is 422 invalid_config with its texts
 func TestGetConfigMasked(t *testing.T) // the body is Backend.ConfigText's masked text and the ETag its etag; If-None-Match with
@@ -578,8 +686,15 @@ func TestPutStreamKeepsSecrets(t *testing.T) // Review Focus 1. cam is created w
 //   Status.Rebuilds is unchanged; the answer's ETag equals a following GET's and works as the next If-Match
 func TestPutStreamMaskMoved(t *testing.T) // Review Focus 2. PUT of b with the input's host changed to a listener the test owns:
 //   422 invalid_config naming inputs[0].url; the file is unchanged; the listener accepted no connection within 500 ms.
-//   PUT of b under another stream name: 422. PUT of b after the stored push was replaced by one that redacts alike plus the
-//   original: 422 naming outputs.push
+//   PUT of b under another stream name: 422.
+//   The order rule: the stored pushes become two keys that redact alike; PUT of the masked body with audio_language changed
+//   is 200 and the file holds both keys in order; with one of the two masks removed it is 422 naming outputs.push.
+//   The guess (finding 8): PUT of b with a second push that is a real URL of the mask's form: 422 with the same body for the
+//   right key and for a wrong one, and never "repeated"
+func TestConfigETagKeyed(t *testing.T) // finding 1. For a config holding a secret: the ETag header of GET /api/v1/config, the etag
+//   of /api/v1/config/status as the viewer and the etag of a PUT's ApplyResult are equal to each other and are not
+//   `"` + hex(sha256(file)) + `"`, nor do they hold a 32-digit prefix of it; the ETag works as If-Match; a stale one is 412;
+//   a second server on the same file gives a different ETag for the same text (the key is per process)
 func TestPutStreamMaskRace(t *testing.T) // -race: 20 goroutines PUT the masked document while 20 PUT a new real password in
 //   turn: every answer is 200 or 412, and after each the file's password is one of the real ones, never the mask
 func TestPutConfigKeepsSecrets(t *testing.T) // Review Focus 1. GET /api/v1/config: no secret in it. PUT it back with If-Match:
@@ -591,10 +706,10 @@ func TestReloadWithMask(t *testing.T) // the file edited by hand to hold "xxxxx"
 //   validation error, nothing changes, and the error text holds no stored secret
 ```
 
-- [ ] **Step 2: Run** `go test -count=1 ./internal/api/ ./internal/server/ -run 'Redacted|Secrets|Masks|Masked|OpenAPI|KeepsSecrets|MaskMoved|MaskRace|ExactBytes|ReloadWithMask'`. Expect failures.
-- [ ] **Step 3: Implement.** Rewrite the rows that used `?secrets=1` (`internal/api/streams_test.go`, `auth_test.go`, `api_test.go`, `config_test.go`) to the new contract; each rewritten row is listed in the task report with its old and new assertion.
-- [ ] **Step 4: Run** `go test -race -count=1 ./internal/api/ ./internal/server/ ./internal/config/ ./internal/spec/`. Expect a pass.
-- [ ] **Step 5: Commit** `feat(api): secrets are write-only: every response is masked and the mask keeps the stored secret`
+- [ ] **Step 2: Run** `go test -count=1 ./internal/api/ ./internal/server/ -run 'Redacted|Secrets|Masks|Masked|OpenAPI|KeepsSecrets|MaskMoved|MaskRace|ExactBytes|ReloadWithMask|ETagKeyed'`. Expect failures.
+- [ ] **Step 3: Implement.** Rewrite the rows that used `?secrets=1` (`internal/api/streams_test.go`, `auth_test.go`, `api_test.go`, `config_test.go`) to the new contract, and the `apply_test.go` rows at 389, 402, 431, 696 and 914 to take the ETag from the server or from `config.ETag` instead of hashing the text; each rewritten row is listed in the task report with its old and new assertion.
+- [ ] **Step 4: Run** `go test -race -count=1 ./internal/api/ ./internal/server/ ./internal/config/ ./internal/spec/ ./internal/e2e/ -run '^$'` (everything compiles, e2e included), then the four packages without `-run`. Expect a pass. The e2e rows that hashed the config text are Task 8's; if one fails to compile here, fix its call in this task and name it in the report.
+- [ ] **Step 5: Commit** `feat(api): secrets are write-only: every response is masked and the mask keeps the stored secret` and `fix(server): the config's ETag is a keyed tag`
 
 ---
 
@@ -605,8 +720,8 @@ func TestReloadWithMask(t *testing.T) // the file edited by hand to hold "xxxxx"
 - Test: `internal/server/server_test.go`
 
 **Interfaces:**
-- Consumes: `srtout.Options.Passphrase`, `Stats.RejectedSecret`, `Stats.RejectedLimited` (Task 3); `Manager.SRTPassphrase` (Task 5).
-- Produces: `startSRT` passes a `Passphrase` that asks the manager in force, returning "" while there is none, as `lookup` does (`server.go:383-391`). `/metrics` gains `openstreamer_output_rejected_total{output="srt",reason="secret"}` and `reason="limited"`.
+- Consumes: `srtout.Options.Secure`, `Stats.RejectedSecret`, `Stats.RejectedLimited` (Task 3); `Manager.SRT` (Task 5); `Server.PutStream` with its three results (Task 6: this task runs after it).
+- Produces: `startSRT` passes a `Secure` that asks the manager in force with `Manager.SRT`, answering `ok == false` while there is none, as `lookup` does (`server.go:383-391`). `/metrics` gains `openstreamer_output_rejected_total{output="srt",reason="secret"}` and `reason="limited"`.
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -614,7 +729,7 @@ func TestReloadWithMask(t *testing.T) // the file edited by hand to hold "xxxxx"
 func TestSRTPassphrase(t *testing.T) // a server with srt.listen 127.0.0.1:0 and two running streams, open and locked
 //   (srt_passphrase srtpass-0123456789), fed by the package's test source:
 //   a gosrt caller with the passphrase reads TS from live/locked; without it and with a wrong one it is refused, and
-//   /metrics shows reason="secret" at 2; live/open plays without one and refuses an encrypted caller as before
+//   /metrics shows reason="secret" at 2 or more (a caller that retransmits its request is counted again); live/open plays without one and refuses an encrypted caller as before
 //   PutStream changes locked's passphrase while a caller reads: its Read ends within 2 s, srt's ended{reason="hub_closed"}
 //   moved by 1, a caller with the new passphrase reads and one with the old is refused; Rebuilds did not move
 //   PutStream removes the passphrase: a plain caller reads
@@ -632,9 +747,9 @@ func TestSRTPassphrase(t *testing.T) // a server with srt.listen 127.0.0.1:0 and
 
 **Files:**
 - Create: `internal/e2e/m5c2a_test.go`
-- Modify: `internal/e2e/m5a_test.go`, `internal/e2e/m5c1_test.go` (the rows that used `?secrets=1` or compared `GET /api/v1/config` with the file)
+- Modify: `internal/e2e/m5a_test.go`, `internal/e2e/m5c1_test.go` (the rows that used `?secrets=1`, compared `GET /api/v1/config` with the file or computed the config's ETag), `internal/e2e/m4a_test.go` (the comment at 32–33, which says the arm64 job has no SRT peers)
 - Modify: `internal/testpeer/testpeer.go` (the comment of `FFmpegSRT` at 376–379, which says the image carries no ffmpeg)
-- Modify: `.github/workflows/ci.yml` (`E2E_TESTS` at 231), `docs/REBUILD_PLAN.md`, `README.md`, `SECURITY.md`, `cmd/openstreamer/openstreamer.example.yaml`, `CLAUDE.md`
+- Modify: `.github/workflows/ci.yml` (`E2E_TESTS` at 231, and the comment at 218–223, which says the SRT rows stay amd64-only), `docs/REBUILD_PLAN.md`, `README.md`, `SECURITY.md`, `cmd/openstreamer/openstreamer.example.yaml`, `CLAUDE.md`
 
 **Interfaces:**
 - Consumes: everything above, as an API client and a peer driver.
@@ -647,7 +762,9 @@ func TestSRTPassphrase(t *testing.T) // a server with srt.listen 127.0.0.1:0 and
 //   ffprobe of srt://<SRT>?streamid=live/cam&passphrase=outpass-0123456789 lists h264 and aac; ffmpeg -f null decodes 5 s of both
 //   with no "corrupt" in its log; the same with -pbkeylen 32.
 //   Without the passphrase ffmpeg fails, and its log holds "UNSECURE" or "Password required"; with a wrong one, "BADSECRET" or
-//   "Incorrect passphrase". Neither read a packet (srt's sessions gauge did not move), and reason="secret" moved by 2.
+//   "Incorrect passphrase". Neither decoded a frame (ffmpeg's own frame count is 0 and it wrote no output), and
+//   openstreamer_output_rejected_total{output="srt",reason="secret"} moved by at least 2: a caller that retransmits its request
+//   is counted again. The sessions gauge is not asserted: other rows of this test hold sessions.
 //   conform.ReadTS of the same URL with the passphrase: no violation (our own client).
 //   open plays without a passphrase, and ffmpeg with one is refused, as at HEAD.
 //   While ffmpeg plays cam, a PUT changes the passphrase: ffmpeg ends within 5 s; a new ffmpeg with the new passphrase plays;
@@ -657,13 +774,15 @@ func TestM5c2aSRTFFmpeg(t *testing.T)
 
 // TestM5c2aWriteOnly: Review Focus 1 and 2 over the real API, as the editor.
 //   cam is created with an RTSP input with a password (nothing listens), the M5a source as its second input, an RTMP push with a
-//   key and the SRT passphrase. GET shows masks for the editor and the viewer alike; GET ?secrets=1 is 400 for both.
+//   key and the SRT passphrase. GET shows masks for the editor and the viewer alike; GET ?secrets=1 and ?secrets=1&x=1 are 400 for both.
 //   The editor GETs cam, sets audio_language and PUTs the body with the ETag: 200 "live"; the config file holds the real
 //   secrets; cam's active input, generation and switches are what they were; the HTTP-TS reader was not interrupted.
 //   The editor GETs /api/v1/config (no secret in it), appends a stream to the text and PUTs it: the file is the old file plus
 //   the entry, byte for byte.
 //   A PUT of cam with the masked input's host changed to a listener of the test: 422, and the listener saw no connection.
 //   A PUT of the masked body under a new name: 422.
+//   The config ETag the viewer reads in /api/v1/config/status is not the SHA-256 of the file.
+//   Two streams pushing to the same URL show different push ids.
 // Budget 60 s.
 func TestM5c2aWriteOnly(t *testing.T)
 
@@ -689,18 +808,18 @@ func TestM5c2aPlayers(t *testing.T)
   - Then `-count=5` must pass 5 of 5.
   - Then `make test-ci-peers ARGS='-run ^TestM5c2a ./internal/e2e/'` must pass.
   - If anything fails, use superpowers:systematic-debugging. A code fix gets a test in the package that owns the code. A † row that a peer provably cannot do is dropped and recorded as a known limit, with the peer's own error or missing option; never weaken a row the peer can do.
-- [ ] **Step 3: CI.** Add `TestM5c2aSRTFFmpeg` to `E2E_TESTS` of `transcode-e2e-arm64`: that job installs Ubuntu 24.04's ffmpeg, which is the build the peers image carries and has libsrt. If its first run fails in `testpeer.Require(t, "ffmpeg", "srt")`, take the name out of the arm64 list again and record the runner's `ffmpeg -protocols` line as a known limit. The other M5c2a tests run in the amd64 `test` job with the rest of `./internal/e2e/`.
+- [ ] **Step 3: CI.** Rewrite the job's comment (218–223) and `m4a_test.go`'s (32–33): the arm64 job now has one SRT row, which needs only ffmpeg; `OS_TRANSCODE_E2E_ARM=1` still skips `TestM4aMatrix`'s srt and rtsp rows. Add `TestM5c2aSRTFFmpeg` to `E2E_TESTS` of `transcode-e2e-arm64`: that job installs Ubuntu 24.04's ffmpeg, which is the build the peers image carries and has libsrt. If its first run fails in `testpeer.Require(t, "ffmpeg", "srt")`, take the name out of the arm64 list again record the runner's `ffmpeg -protocols` line as a known limit, and put both comments back. The other M5c2a tests run in the amd64 `test` job with the rest of `./internal/e2e/`.
 - [ ] **Step 4: Docs.**
   - **`docs/REBUILD_PLAN.md`:**
     - §5: replace the M5c2 row with two. **M5c2a** "Secrets: credentials in URL paths, queries and stream IDs redacted; secrets write-only over the API (every response masked, the mask keeps the stored secret, the config editor included); SRT output encryption with a per-stream passphrase", depends on M5c1, with the plan link, "done", R-T1's exit criterion and "Proved by" the four tests plus the redact, logging, spec, config, srtout, conform, stream, api and server suites. **M5c2b** "SRTP for RTSP: `pkg/srtp`, `RTP/SAVP` with SDES keys inside RTSPS, server and pull client", depends on M5c1, not yet planned, with R-T1's proposed exit criterion.
-    - After the M5c1 paragraphs (near 1293–1384): R-T1's text, the rulings R-T2 to R-T11 by reference to this plan, the "Out of M5c2a" table, the peers table, and this plan's "Hand-over: M5c2b" facts in place of the paragraph at 1378–1384.
-    - §3.6: the Users bullet (633–647) loses `?secrets=1` from what an editor gets; the API bullet (710–725) says every response is redacted for every role, that a write carrying the mask keeps the stored secret by R-T4's rule, and that `GET /api/v1/config` is masked while `PUT` resolves masks and stores the resolved bytes. The SRT output bullet (near 314) gains the passphrase and its three refusals.
+    - After the M5c1 paragraphs (near 1293–1384): R-T1's text, the rulings R-T2 to R-T12 by reference to this plan, the "Out of M5c2a" table, the peers table, and this plan's "Hand-over: M5c2b" facts in place of the paragraph at 1378–1384.
+    - §3.6: the Users bullet (633–647) loses `?secrets=1` from what an editor gets; the API bullet (710–725) says every response is redacted for every role, that a write carrying the mask keeps the stored secret by R-T4's rule, and that `GET /api/v1/config` is masked while `PUT` resolves masks and stores the resolved bytes. The sentence near 1208 ("The config's `ETag` is the plain SHA-256 of its text…") becomes R-T12: a keyed tag that changes at a restart; a push's ID is tagged over the stream's name and the URL. The SRT output bullet (near 314) gains the passphrase and its three refusals.
     - The "Out of" rows near 936 (SRT encryption), 1234, 1367–1369 and 1476: done in M5c2a. The SRTP rows near 899, 1366 and 1472 now say M5c2b.
-    - Backlog: the backlog rows of "Out of M5c2a"; the cost lines of R-T2 (names the rule does not know), R-T8 (a secret in a comment is masked for good by a round trip; hashes are readable by editors) and R-T9 (the refusals tell that a name is live).
+    - Backlog: the backlog rows of "Out of M5c2a"; the cost lines of R-T2 (names the rule does not know), R-T3 (the device is always an oracle through a probe stream), R-T8 (a secret in a comment is masked for good by a round trip; hashes are readable by editors; a URL the parser cannot read is shown as `xxxxx` and retyped) and R-T9 (the refusals tell that a name is live; the limiter is per address, shared behind a NAT).
     - Add an "M5c2a deferred minors" list built from the task reviews, and any dropped † row under known limits of the peers.
-  - **README:** a "Secrets" section after "TLS": what is hidden in a URL (R-T2, with the two Xiongmai forms as examples and the note that the rule over-masks); that no API response shows a secret to anyone, `?secrets=1` is gone, and `xxxxx` sent back keeps the stored value while any change around it needs the secret again; that the config file holds the secrets in clear and is refused unless private; that a secret in a YAML comment is masked by the editor's round trip. In the SRT output's section: `outputs.srt_passphrase` (10 to 79 printable ASCII bytes), the player URLs for ffmpeg, GStreamer and VLC, the two refusal messages a player sees, and that changing it disconnects the stream's SRT players.
+  - **README:** a "Secrets" section after "TLS": what is hidden in a URL (R-T2, with the two Xiongmai forms as examples and the note that the rule over-masks); that no API response shows a secret to anyone, `?secrets=1` is gone, and `xxxxx` sent back keeps the stored value while any change around it needs the secret again; that two pushes whose keys look alike when masked are kept in their order; that a config ETag changes at a restart; that the config file holds the secrets in clear and is refused unless private; that a secret in a YAML comment is masked by the editor's round trip. In the SRT output's section: `outputs.srt_passphrase` (10 to 79 characters of `A-Z a-z 0-9 . _ ~ -`, and why: ffmpeg mangles `+`, `&` and `#` in a URL), that a passphrase of digits only must be quoted in the YAML file, the player URLs for ffmpeg, GStreamer and VLC, the two refusal messages a player sees, and that changing it disconnects the stream's SRT players.
   - **SECURITY.md:** one paragraph on where secrets are stored and who can read them (R-T7, R-T8's hashes).
-  - **Example config:** a commented `srt_passphrase` under an output, with one line of explanation.
+  - **Example config:** a commented `srt_passphrase` under an output, quoted, with one line of explanation and one saying that an all-digit value needs the quotes.
   - **CLAUDE.md:** the API note gains "every response is masked; the mask written back keeps the stored secret (`spec.Stream.Unmask`, `config.Unmask`)", and the note on adding a spec field gains "a secret field must be masked in `Redacted` and resolved in `Unmask` and `config.Unmask`". Keep the length within five lines of the current one.
 - [ ] **Step 5: The gate.**
   - `make check`, `make covercheck` on a fresh `make cover`, `make test-pinned`, `make test-ci-peers`, `make test-transcode`.
