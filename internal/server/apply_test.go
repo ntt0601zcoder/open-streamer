@@ -1201,13 +1201,16 @@ func TestConcurrentWriters(t *testing.T) {
 	var (
 		wg                     sync.WaitGroup
 		puts, configs, reloads atomic.Int64
+		turn                   sync.RWMutex // see the config writers
 		parseOpt               = config.Options{RequiredIterations: testIter}
 	)
 	for i := range 8 {
 		wg.Go(func() {
 			name := fmt.Sprintf("s%d", i)
 			for n := 0; running(); n++ {
+				turn.RLock()
 				_, _, err := s.PutStream(bg, specOf(name, spec.Outputs{HLS: true, DASH: n%2 == 0}), "")
+				turn.RUnlock()
 				if !assert.NoError(t, err) {
 					return
 				}
@@ -1219,6 +1222,20 @@ func TestConcurrentWriters(t *testing.T) {
 	for i := range 2 {
 		wg.Go(func() {
 			for n := 0; running(); n++ {
+				// Every fourth try the stream writers wait for this one:
+				// the config lock hands over in turn, and the text is
+				// masked when it is read (not at every apply), so a
+				// read and a write with eight stream writers queued
+				// between them would never match. The other tries stay
+				// in the race and are answered 412.
+				if n%4 == 3 {
+					turn.Lock()
+				}
+				unlock := func() {
+					if n%4 == 3 {
+						turn.Unlock()
+					}
+				}
 				text, etag := s.ConfigText()
 				// A comment at the end, replacing this writer's last one.
 				lines := strings.Split(strings.TrimRight(string(text), "\n"), "\n")
@@ -1228,6 +1245,7 @@ func TestConcurrentWriters(t *testing.T) {
 				}
 				next := strings.Join(lines, "\n") + fmt.Sprintf("\n%s edit %d\n", mark, n)
 				_, err := s.PutConfig(bg, []byte(next), etag)
+				unlock()
 				if errors.Is(err, api.ErrPrecondition) {
 					continue // another writer came first: read again
 				}
@@ -1582,12 +1600,32 @@ func TestPutStreamMaskRace(t *testing.T) {
 	}
 	const rounds = 3
 	var wg sync.WaitGroup
+	var written atomic.Int32
 	for i := range 20 {
 		wg.Go(func() {
 			for range rounds {
+				// A masked document with a change beside the mask: the
+				// write resolves the mask, rewrites the entry and writes
+				// the file, under contention with the real writers.
 				b, e := s.getCam()
-				res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", b, "If-Match", e)
+				sp := decodeStream(t, b)
+				if sp.AudioLanguage == "" {
+					sp.AudioLanguage = "vi"
+				} else {
+					sp.AudioLanguage = ""
+				}
+				// Half of them with If-Match, which a real write between
+				// the read and the write turns into 412; the others
+				// always reach the write.
+				args := []string{"If-Match", e}
+				if i%2 == 1 {
+					args = nil
+				}
+				res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, sp), args...)
 				assert.Contains(t, []int{http.StatusOK, http.StatusPreconditionFailed}, res.code, res.body)
+				if res.code == http.StatusOK {
+					written.Add(1)
+				}
 				checkFile()
 			}
 		})
@@ -1607,6 +1645,54 @@ func TestPutStreamMaskRace(t *testing.T) {
 	}
 	wg.Wait()
 	checkFile()
+	assert.Positive(t, written.Load(), "no masked write went through")
+}
+
+// Final review, finding 3: the text in force is masked when it is first
+// asked for, once per applied text, not under the config lock at every
+// apply; and PutConfig resolves against that masked form.
+func TestConfigMaskIsLazy(t *testing.T) {
+	s := testConfig(t, func(su *setup) { su.Text = baseText(woYAML) })
+	s.generation("cam")
+	first := s.state.Load().shown
+	assert.Nil(t, first.masked, "masked before anyone asked")
+
+	// A stream write publishes a new text and masks nothing.
+	b, e := s.getCam()
+	sp := decodeStream(t, b)
+	sp.AudioLanguage = "vi"
+	res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, sp), "If-Match", e)
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	second := s.state.Load().shown
+	require.NotSame(t, first, second)
+	assert.Nil(t, first.masked)
+	assert.Nil(t, second.masked, "masked by a stream write")
+
+	// The first read masks it; the next ones get the same text.
+	get := s.do(http.MethodGet, "/api/v1/config", "ops", "")
+	require.Equal(t, http.StatusOK, get.code)
+	require.NotNil(t, second.masked)
+	assert.Equal(t, string(second.masked), get.body)
+	for _, secret := range woSecrets {
+		assert.NotContains(t, get.body, secret)
+	}
+	again, etag := s.ConfigText()
+	assert.Equal(t, get.body, string(again))
+	assert.Equal(t, get.header.Get("ETag"), etag)
+
+	// The masked text written back is the text in force: the snapshot's
+	// masked form is kept, and the file's bytes.
+	file := s.fileText()
+	put := s.do(http.MethodPut, "/api/v1/config", "ops", get.body, "Content-Type", "application/yaml", "If-Match", etag)
+	require.Equal(t, http.StatusOK, put.code, put.body)
+	assert.Same(t, second, s.state.Load().shown)
+	assert.Equal(t, file, s.fileText())
+
+	// A reload that fails keeps it too.
+	require.NoError(t, os.WriteFile(s.path, []byte("version: [\n"), 0o600))
+	_, err := s.Reload(context.Background())
+	require.Error(t, err)
+	assert.Same(t, second, s.state.Load().shown)
 }
 
 func TestPutConfigKeepsSecrets(t *testing.T) {
@@ -1690,4 +1776,91 @@ func TestReloadWithMask(t *testing.T) {
 	again, etag2 := s.ConfigText()
 	assert.Equal(t, shown, again)
 	assert.Equal(t, etag, etag2)
+}
+
+// Final review, findings 1 and 9: a URL inside another, and a value of two
+// URLs, are shown the same by the stream API and by the config editor, to
+// every role, and the shown form written back through either route keeps
+// the stored value; in another stream it is 422 and nothing is stored.
+func TestNestedAndGluedURLsWriteBack(t *testing.T) {
+	const nestPW, gluePW = "nestpw-2718281828", "gluepw-3141592653"
+	for _, c := range []struct{ name, stored, shown string }{
+		{"nested", "http://127.0.0.1:1/fetch?url=rtsp://admin:" + nestPW + "@cam.example/s", "http://127.0.0.1:1/fetch?url=rtsp://admin:xxxxx@cam.example/s"},
+		{"nested encoded", "http://127.0.0.1:1/fetch?url=rtsp%3A%2F%2Fadmin%3A" + nestPW + "%40cam.example%2Fs", "http://127.0.0.1:1/fetch?url=xxxxx"},
+		{"two urls", "rtsp://127.0.0.1:1/b rtsp://u:" + gluePW + "@127.0.0.1:1/s", "rtsp://127.0.0.1:1/b rtsp://u:xxxxx@127.0.0.1:1/s"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := testConfig(t, func(su *setup) { su.Text = baseText(woYAML) })
+			s.generation("cam")
+			sp := woStream()
+			sp.Inputs[0].URL = c.stored
+			res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, sp))
+			require.Equal(t, http.StatusOK, res.code, res.body)
+			require.Contains(t, s.fileText(), c.stored)
+			secrets := []string{nestPW, gluePW}
+			clean := func(what, text string) {
+				t.Helper()
+				for _, secret := range secrets {
+					assert.NotContains(t, text, secret, what)
+				}
+			}
+			clean("the answer to the write", res.body)
+
+			// Both views, to both roles.
+			for _, user := range []string{"eye", "ops"} {
+				get := s.do(http.MethodGet, "/api/v1/streams/cam", user, "")
+				require.Equal(t, http.StatusOK, get.code)
+				assert.Equal(t, c.shown, decodeStream(t, get.body).Inputs[0].URL, user)
+				clean("the stream as "+user, get.body)
+				clean("the list as "+user, s.do(http.MethodGet, "/api/v1/streams", user, "").body)
+				clean("the status as "+user, s.do(http.MethodGet, "/api/v1/streams/cam/status", user, "").body)
+			}
+			cfg := s.do(http.MethodGet, "/api/v1/config", "ops", "")
+			require.Equal(t, http.StatusOK, cfg.code)
+			clean("the config", cfg.body)
+			assert.Contains(t, cfg.body, c.shown, "the config view is the stream view")
+
+			// The stream route: the shown form with a change beside it.
+			body, etag := s.getCam()
+			edit := decodeStream(t, body)
+			edit.AudioLanguage = "vi"
+			res = s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, edit), "If-Match", etag)
+			require.Equal(t, http.StatusOK, res.code, res.body)
+			clean("the answer to the masked write", res.body)
+			stored, ok := s.Get("cam")
+			require.True(t, ok)
+			assert.Equal(t, c.stored, stored.Inputs[0].URL)
+			assert.Equal(t, "vi", stored.AudioLanguage)
+
+			// The config route: the masked text with a stream added.
+			cfg = s.do(http.MethodGet, "/api/v1/config", "ops", "")
+			require.Equal(t, http.StatusOK, cfg.code)
+			added := streamYAML("other", "{hls: true}")
+			put := s.do(http.MethodPut, "/api/v1/config", "ops", cfg.body+added, "Content-Type", "application/yaml", "If-Match", cfg.header.Get("ETag"))
+			require.Equal(t, http.StatusOK, put.code, put.body)
+			assert.Equal(t, "unchanged", applied(t, decodeApply(t, put), "cam"))
+			stored, _ = s.Get("cam")
+			assert.Equal(t, c.stored, stored.Inputs[0].URL)
+			assert.Contains(t, s.fileText(), c.stored)
+			assert.NotContains(t, s.fileText(), c.shown)
+
+			// Moved to a stream that does not hold it: 422 by both
+			// routes, and the file is as it was.
+			file := s.fileText()
+			moved := spec.Stream{Name: "other", Inputs: []spec.Input{{URL: c.shown}}, Outputs: spec.Outputs{HLS: true}}
+			res = s.do(http.MethodPut, "/api/v1/streams/other", "ops", jsonOf(t, moved))
+			assert.Equal(t, http.StatusUnprocessableEntity, res.code, res.body)
+			assert.Contains(t, res.body, "holds the redaction mask")
+			clean("the 422", res.body)
+			cfg = s.do(http.MethodGet, "/api/v1/config", "ops", "")
+			text := strings.Replace(cfg.body, "rtmp://src.example/live/otxxxxx", c.shown, 1)
+			require.NotEqual(t, cfg.body, text)
+			put = s.do(http.MethodPut, "/api/v1/config", "ops", text, "Content-Type", "application/yaml", "If-Match", cfg.header.Get("ETag"))
+			assert.Equal(t, http.StatusUnprocessableEntity, put.code, put.body)
+			assert.Contains(t, put.body, "holds the redaction mask")
+			clean("the config's 422", put.body)
+			assert.Equal(t, file, s.fileText())
+			clean("the log", s.logs.String())
+		})
+	}
 }

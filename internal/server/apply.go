@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/api"
@@ -38,17 +40,44 @@ func bounded(s string) string {
 // published as one immutable value. status.Stale is never set here:
 // ConfigStatus asks the file.
 type state struct {
-	applied []byte // the text in force, which masked was made of
+	shown  *shown // the text in force and its masked form
+	status api.ConfigStatus
+}
+
+// shown is one applied text and, made the first time it is asked for,
+// what a response shows of it. Masking a large config takes a few hundred
+// milliseconds, and most applies (one stream written) are never read back
+// as text: so it is not made under s.cfg at every apply, but once per
+// applied text, by the first ConfigText or PutConfig that needs it.
+type shown struct {
+	applied []byte // the text in force; never changed
+	once    sync.Once
 	masked  []byte // config.Mask(applied); nil when it could not be masked
-	status  api.ConfigStatus
+}
+
+// text returns the masked text, making it on the first call; nil when the
+// text cannot be masked, which is logged once, scrubbed.
+func (m *shown) text(log *slog.Logger) []byte {
+	m.once.Do(func() {
+		masked, err := config.Mask(m.applied)
+		if err != nil {
+			log.Error("server: config: the text cannot be shown with its secrets masked", "error", logging.Scrub(err.Error()))
+			return
+		}
+		if m.masked = bytes.Clone(masked); m.masked == nil {
+			m.masked = []byte{}
+		}
+	})
+	return m.masked
 }
 
 // publish makes the fields cfg guards the snapshot the readers see. The
-// caller holds s.cfg, or is New. The text is masked once per applied
-// text: a reload that fails keeps the snapshot's mask.
+// caller holds s.cfg, or is New. The text is masked at most once per
+// applied text, when it is first asked for (shown): a reload that fails,
+// or an apply of the same text, keeps the snapshot's.
 func (s *Server) publish() {
 	st := &state{
-		applied: s.applied,
+		shown: &shown{applied: s.applied},
 		status: api.ConfigStatus{
 			ETag:            config.ETag(s.applied),
 			LoadedAt:        s.loadedAt,
@@ -58,15 +87,8 @@ func (s *Server) publish() {
 			RestartRequired: slices.Clone(s.restart),
 		},
 	}
-	if prev := s.state.Load(); prev != nil && bytes.Equal(prev.applied, s.applied) {
-		st.masked = prev.masked
-	} else if masked, err := config.Mask(s.applied); err != nil {
-		s.log.Error("server: config: the text cannot be shown with its secrets masked", "error", logging.Scrub(err.Error()))
-	} else {
-		st.masked = bytes.Clone(masked)
-		if st.masked == nil {
-			st.masked = []byte{}
-		}
+	if prev := s.state.Load(); prev != nil && bytes.Equal(prev.shown.applied, s.applied) {
+		st.shown = prev.shown
 	}
 	s.state.Store(st)
 }
@@ -169,7 +191,10 @@ func (s *Server) PutConfig(ctx context.Context, text []byte, ifMatch string) (ap
 	if ifMatch != config.ETag(s.applied) {
 		return api.ApplyResult{}, api.ErrPrecondition
 	}
-	text, err := config.Unmask(text, s.applied)
+	// The masked form of the text in force is the one a GET served (the
+	// snapshot is published under cfg, so it is s.applied's): it is not
+	// made a second time here.
+	text, err := config.UnmaskWith(text, s.applied, s.state.Load().shown.text(s.log))
 	if err != nil {
 		return api.ApplyResult{}, err // config.Errors: one per mask it could not resolve
 	}
@@ -298,10 +323,12 @@ func (s *Server) Reload(ctx context.Context) (api.ApplyResult, error) {
 
 // ConfigText returns the text in force as a response shows it, masked by
 // config.Mask, and the ETag of the text itself (R-T12). The text is nil
-// when it could not be masked. It never waits for an apply.
+// when it could not be masked. It never waits for an apply; the first
+// call for an applied text masks it, and the calls beside it wait for
+// that.
 func (s *Server) ConfigText() ([]byte, string) {
 	st := s.state.Load()
-	return bytes.Clone(st.masked), st.status.ETag
+	return bytes.Clone(st.shown.text(s.log)), st.status.ETag
 }
 
 // ConfigStatus returns the status of the config in force, with Stale asked
