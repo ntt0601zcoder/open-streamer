@@ -40,10 +40,12 @@ var leakPlaces = []string{
 	"%[1]s://u:%[3]s@h:9/x",
 }
 
-// leakSchemes are the schemes of FuzzNoSecretSurvives. Templates with an
-// escaped '=', '&' or '/' in the path hide the secret on the RTMP family
-// only, whose rule 5 decodes the path; elsewhere the escape stays and
-// separates nothing (R-T2), so they are run with an RTMP scheme.
+// leakSchemes are the schemes of FuzzNoSecretSurvives. An escaped '='
+// (%3D) after a secret name hides its value on every scheme. The templates
+// under /app/, where an escaped '&' or '/' stands before the pair, hide the
+// secret on the RTMP family only, whose rule 5 decodes the path; elsewhere
+// that escape stays and separates nothing (R-T2), so they are run with an
+// RTMP scheme.
 var leakSchemes = []string{"rtsp", "rtmp", "rtmps", "rtmp+insecure", "srt", "http"}
 
 // escapeAll escapes every byte of s but letters and digits.

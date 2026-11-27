@@ -105,19 +105,42 @@ func SecretName(name string) bool {
 // it is secret when, raw or percent-decoded, it is a SecretName or ends in
 // one of SecretName's whole names after a byte that is no letter or digit.
 // An escaped '=' (%3D) after a secret name hides its value too, on every
-// scheme. Rules 2
-// and 3 walk the escaped text, so an escaped separator separates nothing;
-// a name keeps its bytes. The grammar only decides where a value ends. A
-// user name is never hidden. Everything else keeps its bytes, but the
+// scheme. Rules 2 and 3 walk the escaped text, so an escaped separator
+// separates nothing; a name keeps its bytes. The grammar only decides
+// where a value ends.
+//
+// A URL inside the URL is a URL too (nested): in a query piece, in the
+// path or the opaque part and in the fragment, the text from a scheme and
+// "://" to the end of that part. Written as it is, it is redacted by these
+// rules where it stands (http://gw/fetch?url=rtsp://u:xxxxx@cam/s). When
+// its scheme or "://" shows only once the part is percent-decoded
+// (?url=rtsp%3A%2F%2Fu%3Apw%40cam%2Fs) and the decoded URL has something
+// to hide, the whole value is the mask (?url=xxxxx): the text after the
+// last '/' or '=' before it, to the end of the part. So is a nested URL
+// that parses neither as it is written nor decoded, and one nested deeper
+// than maxNest. The part's own rules run after it, on what it left.
+//
+// A user name is never hidden. Everything else keeps its bytes, but the
 // scheme comes back in lower case, as url.Parse leaves it. A string
-// without "://" is returned as is; one that does not parse is Invalid.
+// without "://" is returned as is; one that does not parse is Invalid; and
+// one that does not start with a scheme and "://" and whose only "://" was
+// in a value that is hidden whole is the bare Mask.
 func URL(rawURL string) string {
 	out, _ := redactURL(rawURL)
 	return out
 }
 
+// maxNest is how deep URLs inside URLs are read; one nested deeper is
+// hidden whole.
+const maxNest = 8
+
 // redactURL is URL, and reports whether it wrote the mask anywhere.
 func redactURL(rawURL string) (string, bool) {
+	return redactDepth(rawURL, 0)
+}
+
+// redactDepth is redactURL for a URL nested depth URLs deep.
+func redactDepth(rawURL string, depth int) (string, bool) {
 	if !strings.Contains(rawURL, "://") {
 		return rawURL, false
 	}
@@ -135,16 +158,16 @@ func redactURL(rawURL string) (string, bool) {
 			u.User, hid = url.User(Mask), true
 		}
 	}
-	if q, h := hide(u.RawQuery, querySpans(u.RawQuery)); h {
+	if q, h := hideQuery(u.RawQuery, depth); h {
 		u.RawQuery, hid = q, true
 	}
-	h, ok := hidePath(u)
+	h, ok := hidePath(u, depth)
 	if !ok {
 		return Invalid, false
 	}
 	hid = hid || h
 	if f := u.EscapedFragment(); f != "" {
-		if f, h := hide(f, spans(f, fragSeps, false, secretText)); h {
+		if f, h := hideNested(f, fragSpans, depth); h {
 			frag, err := url.PathUnescape(f)
 			if err != nil {
 				return Invalid, false
@@ -152,7 +175,13 @@ func redactURL(rawURL string) (string, bool) {
 			u.Fragment, u.RawFragment, hid = frag, f, true
 		}
 	}
-	if rtmpFamily(u.Scheme) {
+	// Twice: rule 3 on what rule 5 wrote may hide a whole value that ends
+	// the path (a nested URL that no longer parses), which rule 5 then
+	// cuts as it would on the next call.
+	for range 2 {
+		if !rtmpFamily(u.Scheme) {
+			break
+		}
 		changed := false
 		if p := strings.TrimRight(u.Path, "/"); p != "" {
 			u.Path, u.RawPath, changed = streamKey(p), "", true
@@ -163,36 +192,49 @@ func redactURL(rawURL string) (string, bool) {
 		// RTMPKey wrote the decoded path: an escaped '=', '&' or '/' is
 		// literal now, so rule 3 runs again on what it wrote.
 		if changed {
-			if _, ok := hidePath(u); !ok {
+			if _, ok := hidePath(u, depth); !ok {
 				return Invalid, false
 			}
 		}
 		hid = hid || changed
 	}
+	out := text(rawURL, u, hid)
+	if hid && !strings.Contains(out, "://") {
+		// A string that is no URL by its start (a path, "0#a://…") lost
+		// its only "://" to a hidden value: neither URL nor Masked would
+		// read the result again, so nothing of it is shown.
+		return Mask, true
+	}
+	return out, hid
+}
+
+// text is u, which rawURL parsed to, as URL returns it; hid says whether
+// the mask was written in it.
+func text(rawURL string, u *url.URL, hid bool) string {
 	out := u.String()
-	if hid && schemeURL(rawURL, u) && !strings.Contains(out, "://") {
+	if hid && schemeURL(rawURL, u) && !strings.HasPrefix(out, u.Scheme+"://") {
 		// String drops an empty authority before an empty path
 		// ("srt://?token=t" is "srt:?token=…"); put it back, so the
 		// result is still a URL that Masked and URL read.
 		out = u.Scheme + "://" + strings.TrimPrefix(out, u.Scheme+":")
 	}
-	return out, hid
+	return out
 }
 
-// hidePath applies rule 3 to the path of u (its escaped path, or its
-// opaque part), writes it back and reports whether it hid something. ok
+// hidePath applies rule 3 and the nested rule to the path of u (its
+// escaped path, or its opaque part), depth URLs deep, writes it back and reports whether it hid something. ok
 // is false only when the walked path does not unescape, which cannot
 // happen: the walk cuts only at literal bytes that are no hex digits, so
 // it never splits an escape; should it ever, the caller shows nothing.
-func hidePath(u *url.URL) (hid, ok bool) {
+func hidePath(u *url.URL, depth int) (hid, ok bool) {
 	rtmp := rtmpFamily(u.Scheme)
 	if u.Opaque != "" {
-		o, h := hide(u.Opaque, pathSpans(u.Opaque, rtmp))
+		o, h := hideNested(u.Opaque, func(p string) []span { return pathSpans(p, rtmp) }, depth)
 		u.Opaque = o
 		return h, true
 	}
 	p := u.EscapedPath()
-	np, h := hide(p, pathSpans(p, rtmp))
+	np, h := hideNested(p, func(p string) []span { return pathSpans(p, rtmp) }, depth)
 	if !h {
 		return false, true
 	}
@@ -205,10 +247,11 @@ func hidePath(u *url.URL) (hid, ok bool) {
 }
 
 // streamKey is RTMPKey, but a stream name that is the mask, which RTMPKey
-// writes for a name of up to 2 characters, stays as it is, so that URL of
-// its own result changes nothing.
+// writes for a name of up to 2 characters, stays as it is, and so does one
+// that is "=" and the mask, a whole value hidden after a pair without a
+// name, so that URL of its own result changes nothing.
 func streamKey(p string) string {
-	if p[strings.LastIndexByte(p, '/')+1:] == Mask {
+	if name := p[strings.LastIndexByte(p, '/')+1:]; name == Mask || name == "="+Mask {
 		return p
 	}
 	return RTMPKey(p)
@@ -261,6 +304,176 @@ func masked(s string, ss []span) bool {
 	return false
 }
 
+// nest is a URL found inside a part of another (findNested).
+type nest struct {
+	// start is where its scheme starts in the part and schemeEnd where
+	// its "://" ends; value is where the value that holds it starts: after
+	// the last '/' or '=' before it, or at 0.
+	start, schemeEnd, value int
+	// raw is set when the scheme and "://" are written as they are; when
+	// not, inner is the URL once percent-decoded.
+	raw   bool
+	inner string
+}
+
+// findNested finds the first URL inside s, a part of a URL (a query piece,
+// a path, a fragment): in s once percent-decoded, a run of scheme
+// characters from its first letter, "://" and everything to the end.
+func findNested(s string) (nest, bool) {
+	if !strings.Contains(s, "://") {
+		// Decoded, "://" needs an escaped ':' or '/'.
+		if strings.IndexByte(s, '%') < 0 || !containsFold(s, "%3a") && !containsFold(s, "%2f") {
+			return nest{}, false
+		}
+	}
+	d, at := decodeAt(s)
+	for from := 0; ; {
+		i := strings.Index(d[from:], "://")
+		if i < 0 {
+			return nest{}, false
+		}
+		i += from
+		a := i
+		for a > from && schemeByte(d[a-1]) {
+			a--
+		}
+		for a < i && !isLetter(d[a]) {
+			a++
+		}
+		if a < i {
+			v := strings.LastIndexAny(d[:a], "/=") + 1
+			return nest{
+				start: at[a], schemeEnd: at[i+3], value: at[v],
+				raw: at[i+3]-at[a] == i+3-a, inner: d[a:],
+			}, true
+		}
+		from = i + 1
+	}
+}
+
+// containsFold reports whether s holds sub, which is in lower case, in any
+// ASCII case.
+func containsFold(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if strings.EqualFold(s[i:i+len(sub)], sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// schemeByte reports whether c may be part of a scheme.
+func schemeByte(c byte) bool {
+	return isLetter(c) || '0' <= c && c <= '9' || c == '+' || c == '.' || c == '-'
+}
+
+// hideNested returns s, a part of a URL depth URLs deep whose spans f
+// finds, with the URL nested in it redacted (URL's nested rule) and then
+// the spans hidden, and whether it wrote the mask. The nested URL comes
+// first: a span may end inside it, and what follows that span is then no
+// longer read as a URL.
+func hideNested(s string, f func(string) []span, depth int) (string, bool) {
+	// Until nothing changes: a span hidden inside the nested URL may leave
+	// one that no longer parses, and URL of the result must change nothing.
+	hid := false
+	for range 4 {
+		out, h := hideOnce(s, f, depth)
+		hid = hid || h
+		if out == s {
+			break
+		}
+		s = out
+	}
+	return s, hid
+}
+
+// hideOnce is one round of hideNested.
+func hideOnce(s string, f func(string) []span, depth int) (string, bool) {
+	n, ok := findNested(s)
+	if !ok {
+		out, hid := hide(s, f(s))
+		return out, hid || wholeMasked(s)
+	}
+	// whole hides everything from the start of the value that holds the
+	// nested URL, and from the start of a span that reaches it, to the end
+	// of s.
+	whole := func() (string, bool) {
+		ss, cut, k := f(s), n.value, 0
+		for k < len(ss) && ss[k].b < cut {
+			k++
+		}
+		if k < len(ss) {
+			cut = min(cut, ss[k].a)
+		}
+		head, _ := hide(s[:cut], ss[:k])
+		return head + Mask, true
+	}
+	if depth >= maxNest {
+		return whole()
+	}
+	if n.raw {
+		if r, hidURL := redactDepth(s[n.start:], depth+1); r != Invalid {
+			if hidURL {
+				s = s[:n.start] + r
+			}
+			out, hid := hide(s, f(s))
+			return out, hid || hidURL
+		}
+		// As it is written it does not parse: the part's own escapes
+		// may be in its way (a '#' in a fragment is %23, and no host
+		// holds that). It is judged decoded, as an encoded one.
+	}
+	// The spans are hidden first: what they hide of the decoded URL (a
+	// streamid that is a URL with a signature) stays as it was shown, and
+	// only something more takes the whole value.
+	out, hid := hide(s, f(s))
+	if m, ok := findNested(out); ok && hidesMore(m.inner, depth+1) {
+		return whole()
+	}
+	return out, hid
+}
+
+// hidesMore reports whether redactDepth hides something in rawURL that is
+// not hidden yet, or cannot parse it: its form is not rawURL as net/url
+// alone writes it.
+func hidesMore(rawURL string, depth int) bool {
+	r, hid := redactDepth(rawURL, depth)
+	if r == Invalid {
+		return true
+	}
+	u, err := url.Parse(rawURL)
+	return err != nil || r != text(rawURL, u, hid)
+}
+
+// wholeMasked reports whether s, a part of a URL, ends in a whole value
+// that is the mask: the mask after a '/' or an '=', or alone.
+func wholeMasked(s string) bool {
+	pre, ok := strings.CutSuffix(s, Mask)
+	if !ok {
+		return false
+	}
+	pre = decode(pre)
+	return pre == "" || pre[len(pre)-1] == '/' || pre[len(pre)-1] == '='
+}
+
+// maskedNested reports whether s, a part of a URL depth URLs deep whose
+// spans are ss, carries the mask where hideNested writes it: in a span, as
+// a whole value (the mask at the end of s, after a '/' or an '=' or at the
+// start), or in the URL nested in it.
+func maskedNested(s string, ss []span, depth int) bool {
+	if masked(s, ss) {
+		return true
+	}
+	if wholeMasked(s) {
+		return true
+	}
+	n, ok := findNested(s)
+	return ok && n.raw && depth < maxNest && maskedDepth(s[n.start:], depth+1)
+}
+
+// fragSpans returns the spans of rule 3 in the escaped fragment f.
+func fragSpans(f string) []span { return spans(f, fragSeps, false, secretText) }
+
 // pieceSpans cuts s at every sep and returns the spans f finds in the
 // pieces, as offsets into s.
 func pieceSpans(s string, sep byte, f func(string) []span) []span {
@@ -296,19 +509,25 @@ func pathSpans(p string, decoded bool) []span {
 // decodedSpans decodes v once, gives it to f and returns f's spans as
 // offsets into v.
 func decodedSpans(v string, f func(d string) []span) []span {
-	var d []byte
+	d, at := decodeAt(v)
+	ss := f(d)
+	for k, sp := range ss {
+		ss[k] = span{at[sp.a], at[sp.b]}
+	}
+	return ss
+}
+
+// decodeAt decodes v once and returns, for each byte of the result and
+// for its end, where it is written in v.
+func decodeAt(v string) (string, []int) {
+	d := make([]byte, 0, len(v))
 	at := make([]int, 0, len(v)+1)
 	for i := 0; i < len(v); {
 		c, w := unit(v, i)
 		d, at = append(d, c), append(at, i)
 		i += w
 	}
-	at = append(at, len(v))
-	ss := f(string(d))
-	for k, sp := range ss {
-		ss[k] = span{at[sp.a], at[sp.b]}
-	}
-	return ss
+	return string(d), append(at, len(v))
 }
 
 // join returns the union of two sorted lists of spans, sorted, with spans
@@ -327,29 +546,60 @@ func join(x, y []span) []span {
 	return out
 }
 
-// querySpans returns the spans of rules 2 and 4 in each '&'-separated piece
-// of the raw query q.
-func querySpans(q string) []span {
-	return pieceSpans(q, '&', func(piece string) []span {
-		for e := 0; e < len(piece); e++ {
-			w := eqWidth(piece, e)
-			if w == 0 {
-				continue
-			}
-			n := nameBefore(piece, e)
-			switch {
-			case secretText(n):
-				return []span{{e + w, len(piece)}}
-			case strings.EqualFold(decode(n), "streamid"):
-				var out []span
-				for _, sp := range streamIDSpans(piece[e+w:]) {
-					out = append(out, span{e + w + sp.a, e + w + sp.b})
-				}
-				return out
-			}
+// hideQuery returns the raw query q, of a URL depth URLs deep, with rules
+// 2 and 4 and the nested rule applied to each of its '&'-separated pieces,
+// and whether it wrote the mask.
+func hideQuery(q string, depth int) (string, bool) {
+	if q == "" {
+		return q, false
+	}
+	pieces := strings.Split(q, "&")
+	hid := false
+	for i, piece := range pieces {
+		p, h := hideNested(piece, pieceQuerySpans, depth)
+		pieces[i], hid = p, hid || h
+	}
+	if !hid {
+		return q, false
+	}
+	return strings.Join(pieces, "&"), true
+}
+
+// maskedQuery reports whether a piece of the raw query q carries the mask
+// where hideQuery writes it.
+func maskedQuery(q string, depth int) bool {
+	if !strings.Contains(q, Mask) {
+		return false
+	}
+	for piece := range strings.SplitSeq(q, "&") {
+		if maskedNested(piece, pieceQuerySpans(piece), depth) {
+			return true
 		}
-		return nil
-	})
+	}
+	return false
+}
+
+// pieceQuerySpans returns the spans of rules 2 and 4 in one '&'-separated
+// piece of a raw query.
+func pieceQuerySpans(piece string) []span {
+	for e := 0; e < len(piece); e++ {
+		w := eqWidth(piece, e)
+		if w == 0 {
+			continue
+		}
+		n := nameBefore(piece, e)
+		switch {
+		case secretText(n):
+			return []span{{e + w, len(piece)}}
+		case strings.EqualFold(decode(n), "streamid"):
+			var out []span
+			for _, sp := range streamIDSpans(piece[e+w:]) {
+				out = append(out, span{e + w + sp.a, e + w + sp.b})
+			}
+			return out
+		}
+	}
+	return nil
 }
 
 // streamIDSpans returns the spans of rule 4 in the raw value v of a
@@ -583,10 +833,20 @@ func RTMPKey(path string) string {
 
 // Masked reports whether rawURL carries the mask in any place URL writes
 // it: as the password, as a lone user, as a value URL hides in the query,
-// a path segment, the fragment or a streamid, or, for a scheme of the RTMP
-// family (rtmpFamily), at the end of the stream name. Such a URL came back
-// from URL, so it no longer holds the secret and must not be stored.
+// a path segment, the fragment or a streamid, for a scheme of the RTMP
+// family (rtmpFamily) at the end of the stream name, in a URL nested in
+// it, or as a whole value: the mask at the end of a query piece, of the
+// path or of the fragment, after a '/' or an '=' or alone, which is what
+// URL leaves of an encoded nested URL. Such a URL came back from URL, so
+// it no longer holds the secret and must not be stored. The last form
+// cannot be told from a value that is the mask's five letters of its own
+// (http://h/x?mode=xxxxx): that is reported too.
 func Masked(rawURL string) bool {
+	return maskedDepth(rawURL, 0)
+}
+
+// maskedDepth is Masked for a URL nested depth URLs deep.
+func maskedDepth(rawURL string, depth int) bool {
 	if !strings.Contains(rawURL, "://") {
 		return false
 	}
@@ -608,8 +868,8 @@ func Masked(rawURL string) bool {
 		p = u.EscapedPath()
 	}
 	f := u.EscapedFragment()
-	if masked(u.RawQuery, querySpans(u.RawQuery)) || masked(p, pathSpans(p, rtmpFamily(u.Scheme))) ||
-		masked(f, spans(f, fragSeps, false, secretText)) {
+	if maskedQuery(u.RawQuery, depth) || maskedNested(p, pathSpans(p, rtmpFamily(u.Scheme)), depth) ||
+		maskedNested(f, fragSpans(f), depth) {
 		return true
 	}
 	if rtmpFamily(u.Scheme) {

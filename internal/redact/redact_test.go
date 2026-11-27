@@ -112,8 +112,14 @@ func TestMasked(t *testing.T) {
 		assert.False(t, Masked(URL(x)), "URL(%q) = %q", x, URL(x))
 	}
 	// The mask counts only where URL writes it.
-	assert.False(t, Masked("http://h/xxxxx"), "a path segment of another scheme")
-	assert.False(t, Masked("http://h/x?mode=xxxxx"), "a value of a key that is not secret")
+	assert.False(t, Masked("http://h/xxxxx/a"), "a path segment of another scheme")
+	assert.False(t, Masked("http://h/x?mode=axxxxx"), "a value of a key that is not secret")
+	assert.False(t, Masked("http://h/x?mode=xxxxx1&a=1"), "a value of a key that is not secret")
+	// A whole value that is the mask is what URL leaves of an encoded
+	// nested URL (final review, finding 1), whatever the key.
+	assert.True(t, Masked("http://h/xxxxx"), "the path's last segment")
+	assert.True(t, Masked("http://h/x?mode=xxxxx"), "a whole query value")
+	assert.True(t, Masked("http://h/x#xxxxx"), "the fragment")
 	assert.False(t, Masked("http://xxxxx.example/x"), "a host")
 	assert.True(t, Masked("rtsp://user:xxxxx@host/a"))
 	assert.True(t, Masked("rtmp://h/app/abxxxxx"))
@@ -420,6 +426,12 @@ func FuzzURL(f *testing.F) {
 	f.Add("srt://h:9000?streamid=publish%3Acam%3Auser%3Apw")
 	f.Add("srt://h:9000?streamid=%23!::token=abc,r=x")
 	f.Add("rtmp://h/token=abc/key")
+	for _, r := range nestedRows {
+		f.Add(r.in)
+	}
+	for _, x := range nestedPlain {
+		f.Add(x)
+	}
 	f.Fuzz(func(t *testing.T, u string) {
 		p, err := url.Parse(u)
 		if err != nil || !schemeURL(u, p) || Masked(u) {
@@ -454,4 +466,77 @@ func TestURLEmptyAuthorityKeepsScheme(t *testing.T) {
 		assert.Equal(t, got, URL(got))
 	}
 	assert.Equal(t, "srt:?mode=listener", URL("srt://?mode=listener"), "nothing hidden: as at HEAD")
+}
+
+// nestedRows are URLs that hold another URL (final review, finding 1): in
+// a query value, in the path, in the fragment or in an opaque part, raw or
+// percent-encoded. A raw one is redacted where it stands; an encoded one
+// that has something to hide takes its whole value.
+var nestedRows = []struct{ in, want string }{
+	{"http://gw/fetch?url=rtsp://admin:" + vSecret + "@cam/s", "http://gw/fetch?url=rtsp://admin:xxxxx@cam/s"},
+	{"http://gw/fetch?url=rtsp%3A%2F%2Fadmin%3A" + vSecret + "%40cam%2Fs", "http://gw/fetch?url=xxxxx"},
+	{"http://gw/fetch?url=rtsp%3a%2f%2fadmin%3a" + vSecret + "%40cam%2fs&x=1", "http://gw/fetch?url=xxxxx&x=1"},
+	{"http://gw/fetch?a=1&url=rtsp://admin:" + vSecret + "@cam/s&b=2", "http://gw/fetch?a=1&url=rtsp://admin:xxxxx@cam/s&b=2"},
+	{"http://gw/fetch?rtsp://admin:" + vSecret + "@cam/s", "http://gw/fetch?rtsp://admin:xxxxx@cam/s"},
+	{"http://gw/fetch?url=rtmp://h/live/" + vStreamKey, "http://gw/fetch?url=rtmp://h/live/skxxxxx"},
+	{"http://gw/fetch?url=https://c/x.m3u8?token=" + vSecret, "http://gw/fetch?url=https://c/x.m3u8?token=xxxxx"},
+	// What the escaped '=' rule hides of an encoded URL stays as it was shown.
+	{"http://gw/fetch?url=https%3A%2F%2Fc%2Fx.m3u8%3Ftoken%3D" + vSecret, "http://gw/fetch?url=https%3A%2F%2Fc%2Fx.m3u8%3Ftoken%3Dxxxxx"},
+	{"http://gw/fetch?url=https%3A%2F%2Fu%3A" + vSecret + "%40c%2Fx.m3u8%3Ftoken%3D" + vSecret, "http://gw/fetch?url=xxxxx"},
+	{"http://gw/proxy/rtsp://admin:" + vSecret + "@cam/s", "http://gw/proxy/rtsp://admin:xxxxx@cam/s"},
+	{"http://gw/proxy/rtsp%3A%2F%2Fadmin%3A" + vSecret + "%40cam%2Fs", "http://gw/proxy/xxxxx"},
+	{"http://gw/proxy/rtsp%3A//admin:" + vSecret + "@cam/s", "http://gw/proxy/xxxxx"},
+	{"http://gw/proxy/cam1-rtsp%3A%2F%2Fadmin%3A" + vSecret + "%40cam%2Fs", "http://gw/proxy/xxxxx"},
+	{"http://gw/x#rtsp://admin:" + vSecret + "@cam/s", "http://gw/x#rtsp://admin:xxxxx@cam/s"},
+	{"http://gw/x#u=rtsp%3A%2F%2Fadmin%3A" + vSecret + "%40cam%2Fs", "http://gw/x#u=xxxxx"},
+	{"rtsp://a/b%20rtsp://u:" + vSecret + "@h/s", "rtsp://a/b%20rtsp://u:xxxxx@h/s"},
+	{"rtsp://a/b?x=1%20rtsp://u:" + vSecret + "@h/s", "rtsp://a/b?x=1%20rtsp://u:xxxxx@h/s"},
+	{"http://gw/a/http://b/c/rtsp://u:" + vSecret + "@h/s", "http://gw/a/http://b/c/rtsp://u:xxxxx@h/s"},
+	{"http://gw/key=rtsp://u:" + vSecret + "@h/s", "http://gw/key=xxxxx//u:xxxxx@h/s"},
+	{"http://gw/fetch?token=rtsp://u:" + vSecret + "@h/s", "http://gw/fetch?token=xxxxx"},
+	{"http://gw/fetch?url=rtsp://admin:" + vSecret + "@cam:port/s", "http://gw/fetch?url=xxxxx"},
+	{"rtmp://h/app/rtsp://u:" + vSecret + "@c/stream", "rtmp://h/app/rtsp://u:xxxxx@c/stxxxxx"},
+	{"x:rtsp://u:" + vSecret + "@h/s", "x:rtsp://u:xxxxx@h/s"},
+}
+
+// nestedPlain are URLs that hold another URL with nothing to hide: they
+// keep their bytes.
+var nestedPlain = []string{
+	"http://gw/fetch?url=udp://239.0.0.1:1234",
+	"http://gw/fetch?url=http%3A%2F%2Fexample.com%2Flive.m3u8",
+	"http://gw/proxy/http://example.com/live.m3u8",
+	"http://gw/x#see=https://example.com/docs",
+	"http://gw/fetch?next=%2Fhome&url=HTTP://Example.com/a%20b",
+}
+
+// A name runs back to the previous '=', so base64 padding after a value
+// that ends in a secret name is over-masked (frozen exception 5).
+func TestURLOverMasksPadding(t *testing.T) {
+	assert.Equal(t, "http://h/x?data=abcKEY=xxxxx", URL("http://h/x?data=abcKEY=="))
+	assert.Equal(t, "http://h/x?data=abcKEY=xxxxx", URL("http://h/x?data=abcKEY="))
+	assert.Equal(t, "http://h/x?v=YWJjZGVmZ2hrZXk=", URL("http://h/x?v=YWJjZGVmZ2hrZXk="), "padding after no secret name")
+}
+
+func TestURLNested(t *testing.T) {
+	for _, r := range nestedRows {
+		got := URL(r.in)
+		assert.Equal(t, r.want, got, r.in)
+		assert.NotContains(t, got, vSecret, r.in)
+		assert.False(t, Masked(r.in), r.in)
+		assert.True(t, Masked(r.want), r.want)
+		assert.Equal(t, r.want, URL(r.want), "URL of %q", r.want)
+	}
+	for _, x := range nestedPlain {
+		assert.Equal(t, x, URL(x))
+		assert.False(t, Masked(x), x)
+	}
+	// URLs nested deeper than maxNest are not read: the value goes whole.
+	deep := "http://a/"
+	for range maxNest + 1 {
+		deep += "http://b/"
+	}
+	got := URL(deep + "rtsp://u:" + vSecret + "@h/s")
+	assert.NotContains(t, got, vSecret)
+	assert.True(t, Masked(got), got)
+	assert.Equal(t, got, URL(got))
 }
