@@ -153,6 +153,8 @@ Run on 2026-11-27 against the host's ffmpeg 8.0.1 and `osv2-ci-peers:m4a` (ffmpe
   9. the config's ETag is a keyed tag, not the SHA-256 of the text, and changes at a restart (R-T12); the rows that computed it;
   10. a push's id is tagged over the stream's name and the URL, so its value differs from HEAD's (it already changed at every restart);
   11. a stream whose input or push URL `net/url` cannot parse (it is stored and left stopped) showed `<invalid url>` in `GET /api/v1/streams`, in `GET /api/v1/streams/{name}` and in its status (`internal/stream/status.go:146`, `internal/stream/manager.go:492`), and now shows `xxxxx` there (`spec.Stream.Redacted`, R-T8). Logs and error texts keep `<invalid url>`.
+  12. to 14. are recorded in `docs/REBUILD_PLAN.md` ("Facts the code settled"): a config with an explicit `!!binary` tag is refused (12); `spec.Stream.Redacted` shows a URL with nothing hidden as it is stored (13); one URL with a space in or after it and a secret is shown differently by the stream API and the config view, and an edited config round trip of it is 422 (14);
+  15. a URL whose query value, last path segment or fragment is exactly `xxxxx` is read as the mask (controller ruling on the final fix wave: it is what an encoded URL inside a URL is shown as). A stream or config write that holds one is refused with 422 unless it resolves, and a config file that holds one is refused at a reload (at the start the stream's entry is skipped and reported). The operator must change such a literal value.
 - **House rules:**
   - the hub is the only data source and hub writes never block;
   - hot reload goes by diff: a passphrase change is an `outputs` edit, and no `server` key is added;

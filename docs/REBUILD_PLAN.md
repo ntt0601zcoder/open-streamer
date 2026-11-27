@@ -1496,6 +1496,16 @@ Facts the code settled while it ran, beyond the rulings:
   other text) is not under this exception: both views show it by one rule
   (`redact.Value`), each URL-shaped token judged and then the whole, and
   its shown form resolves through both routes (final review, finding 9).
+- **Frozen exception 15** (controller ruling on the final fix wave). A URL
+  whose query value, last path segment or fragment is exactly `xxxxx` is
+  read as the mask (`redact.Masked`): that is what an encoded URL inside a
+  URL is shown as (R-T2 above), and the two cannot be told apart. A stream
+  or config write that holds one is refused with 422 unless it resolves to
+  a stored URL shown as that text, and a config file that holds one is
+  refused at a reload; at the start the stream's entry is skipped and
+  reported, as any entry that fails validation is. So R-T10 has a second
+  exception: the operator must change such a literal value
+  (`http://h/x?mode=xxxxx`, `http://h/xxxxx`), which HEAD stored and ran.
 - **R-T8's residuals, all accepted** (each costs a rare tail of a secret
   shown to an editor, or text masked that held none):
   - a URL with white space inside it and a secret must be retyped after an

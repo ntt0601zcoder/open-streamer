@@ -320,7 +320,9 @@ stream has no one secret it stands for; send the real value"), so retype the
 whole URL with its secret. A URL the server cannot parse is shown as the bare
 `xxxxx` and must be retyped too. A URL may not hold `xxxxx` as a whole query
 value, as its last path segment or as its fragment (`?mode=xxxxx`): that is
-what a masked inner URL looks like, so it is taken for a mask. A value that
+what a masked inner URL looks like, so it is taken for a mask. A config file
+written by hand that holds such a URL is refused at a reload, and at the
+start that stream is skipped and reported: change the literal value. A value that
 holds two URLs (a second one after a space) is shown with each one masked,
 and is a mask as a whole. One URL with a space in it and a secret is the
 exception: the stream API shows the space as `%20` and the config editor
