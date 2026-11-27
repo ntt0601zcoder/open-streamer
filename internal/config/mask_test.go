@@ -2,8 +2,11 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math/rand/v2"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1308,6 +1311,35 @@ func TestPassphraseQuoting(t *testing.T) {
 		require.Len(t, es, 1)
 		assert.Equal(t, "streams[0] (cam): line 12: write the number as a plain decimal integer, or quote it if it is text", es[0].Error())
 		assert.NotContains(t, err.Error(), v)
+	}
+}
+
+func TestETag(t *testing.T) {
+	text := []byte(secretText())
+	tag := ETag(text)
+	require.Len(t, tag, 34)
+	assert.Regexp(t, regexp.MustCompile(`^"[0-9a-f]{32}"$`), tag)
+	assert.Equal(t, tag, ETag([]byte(secretText())))
+	assert.Equal(t, `"`+hex.EncodeToString(redact.Tag(text))[:32]+`"`, tag)
+
+	// One byte of a secret changed: another tag, though Mask shows the
+	// same text.
+	other := []byte(strings.Replace(secretText(), "hunter2-pw", "hunter2-pW", 1))
+	assert.NotEqual(t, tag, ETag(other))
+	a, err := Mask(text)
+	require.NoError(t, err)
+	b, err := Mask(other)
+	require.NoError(t, err)
+	assert.Equal(t, string(a), string(b))
+	assert.NotEqual(t, tag, ETag(append(bytes.Clone(text), '\n')))
+	assert.NotEqual(t, ETag(nil), tag)
+
+	// It is no hash of the text that a guess could be tested against.
+	sum := sha256.Sum256(text)
+	plain := hex.EncodeToString(sum[:])
+	assert.NotEqual(t, `"`+plain+`"`, tag)
+	for i := 0; i+32 <= len(plain); i++ {
+		assert.NotContains(t, tag, plain[i:i+32])
 	}
 }
 

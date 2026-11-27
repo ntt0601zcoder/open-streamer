@@ -85,6 +85,10 @@
 // text passing Parse: anchors, aliases, merge keys and entries the lenient
 // start skipped are masked like everything else.
 //
+// ETag is the config's entity tag: a tag keyed per process (redact.Tag),
+// not a hash of the text, which beside a masked text would let a guess of
+// a secret be tested offline. It changes when the server restarts.
+//
 // # The file
 //
 // File reads the file, refuses it on Unix when its mode has any group or

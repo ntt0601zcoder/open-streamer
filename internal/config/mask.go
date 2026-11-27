@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -25,6 +26,14 @@ const passphraseKey = "srt_passphrase"
 // judged (R-T8): in the text, the URL pattern's "everything to the next
 // white space" takes YAML's own closing punctuation with it.
 const tokenTail = "\"',]}"
+
+// ETag is the config's entity tag (R-T12): `"` + the first 32 hex digits
+// of redact.Tag(text) + `"`. It is the same for the same text within one
+// process and changes when the server restarts; no guess of the text can
+// be tested against it.
+func ETag(text []byte) string {
+	return `"` + hex.EncodeToString(redact.Tag(text))[:32] + `"`
+}
 
 // Mask returns text as an API response shows it (R-T8). In every scalar,
 // keys and values, each URL-shaped token whose redact.URL form carries a
