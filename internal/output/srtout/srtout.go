@@ -8,14 +8,37 @@
 // up by the Server's lookup. The decision is made from the connection
 // request, before the handshake completes: an empty stream ID (as a
 // version-4 handshake has), a mode other than request, an encrypted
-// request, an unknown name, a stream that is not live yet (hub.Live) and
-// every cap are refused with the same reason, srt.REJ_RESOURCE, and no
-// detail. A caller that retransmits its request after a refusal may be
-// counted twice in Stats. Stream IDs are taken literally, never
-// percent-decoded: ffmpeg 6.1 sends a URL's streamid value undecoded (ffmpeg
-// 8 decodes it), so ffmpeg callers pass the ID raw (?streamid=#!::r=live/name)
-// or with its -streamid option; URI parsers that treat # as a fragment need
-// their own stream ID setting.
+// request for a stream without a passphrase (or for no stream), an unknown
+// name, a stream that is not live yet (hub.Live) and every cap are refused
+// with the same reason, srt.REJ_RESOURCE, and no detail. A caller that
+// retransmits its request after a refusal may be counted twice in Stats.
+// Stream IDs are taken literally, never percent-decoded: ffmpeg 6.1 sends a
+// URL's streamid value undecoded (ffmpeg 8 decodes it), so ffmpeg callers
+// pass the ID raw (?streamid=#!::r=live/name) or with its -streamid option;
+// URI parsers that treat # as a fragment need their own stream ID setting.
+//
+// # Passphrases
+//
+// With Options.Secure, a stream may require a passphrase: Secure gives the
+// stream's hub and its passphrase from one reading of its state. A request
+// for a live stream with a passphrase is refused with srt.REJ_UNSECURE when
+// it is not encrypted and with srt.REJ_BADSECRET when its passphrase is
+// wrong (gosrt's SetPassphrase fails), so that a player can tell its
+// customer which; both count in Stats.RejectedSecret. The two reasons tell
+// someone without the passphrase that the name is live. A peer key (the
+// per-IP cap's) with 5 wrong passphrases inside 10 s has its encrypted
+// requests refused unchecked, with srt.REJ_RESOURCE (Stats.RejectedLimited),
+// until 10 s after its first counted failure; players behind one NAT share
+// that key. At most 4096 keys are tracked. gosrt yields a request only after
+// its cookie exchange, so the address is the peer's. An admitted connection
+// carries the passphrase it was admitted under and asks Secure again once
+// it has subscribed to the hub, before its first byte: a different
+// passphrase, a different hub or no stream ends it as a closed hub would,
+// so that no connection admitted under an old passphrase outlives a change
+// (the caller also ends the hub's "srt " subscribers once, for those
+// already subscribed). Keys are replaced every Options.KMRefresh packets
+// (gosrt's default 2^24). A stream without a passphrase is served exactly
+// as without Secure.
 //
 // Each accepted connection streams MPEG-TS through internal/output/tsstream
 // with a subscription that holds the hub's cached GOP
@@ -147,6 +170,10 @@ var (
 	errGone     = errors.New("srtout: receiver gone")
 	errShutdown = errors.New("srtout: server closed")
 	errDone     = errors.New("srtout: connection ended")
+	// errRevoked ends a connection whose stream, asked again after the
+	// subscription, no longer has the hub or the passphrase it was
+	// admitted under; it counts as the hub closing.
+	errRevoked = errors.New("srtout: admission revoked")
 )
 
 // Options tunes a Server. Zero values select the defaults.
@@ -169,19 +196,34 @@ type Options struct {
 	// stream, on the listener and per remote IP (an IPv6 address by its
 	// /64); 0 means 256, 1024 and 64.
 	MaxPerStream, MaxPerListener, MaxPerIP int
+	// Secure, when set, replaces New's lookup: it returns the hub of the
+	// stream served as name and the passphrase its SRT callers must present
+	// ("" for none), both from one reading of the stream's state (R-T9). It
+	// is called in the accept loop for each request, and once more by each
+	// connection after it subscribed; it must not block.
+	Secure func(name string) (h *hub.Hub, passphrase string, ok bool)
+	// KMRefresh is the number of packets after which a connection's key is
+	// replaced; 0 means gosrt's default (1<<24). The new key is announced
+	// KMRefresh/4 packets before. Tests lower it.
+	KMRefresh uint64
 }
 
 // Stats counts a Server's connections.
 type Stats struct {
 	// Conns is the number of connections being served.
 	Conns uint64
-	// Rejected counts refused connection requests: RejectedMode those with
-	// an empty stream ID, a mode other than request, a type other than
-	// stream or encryption; RejectedUnknown those naming no live stream of
+	// Rejected counts refused connection requests, the sum of the other
+	// Rejected counters: RejectedMode those with an empty stream ID, a mode
+	// other than request, a type other than stream or encryption with no
+	// passphrase to check; RejectedUnknown those naming no live stream of
 	// the app; RejectedCaps those over a cap; RejectedMSS those whose MSS
 	// leaves room for fewer than 4 TS packets per SRT packet (accepted,
 	// then closed at once).
 	Rejected, RejectedUnknown, RejectedMode, RejectedCaps, RejectedMSS uint64
+	// RejectedSecret counts requests refused for a missing or wrong
+	// passphrase; RejectedLimited those refused unchecked because their
+	// peer key had 5 wrong passphrases in the last 10 s.
+	RejectedSecret, RejectedLimited uint64
 	// Frames and Resyncs sum the frames written and the hub losses resynced
 	// by each connection, added when the connection ends: a connection
 	// being served is not counted yet.
@@ -212,14 +254,21 @@ type Server struct {
 	perStream map[string]int
 	perIP     map[string]int
 	total     int
-	stats     Stats // all but SendQueueFull
+	stats     Stats    // all but SendQueueFull
+	fails     failures // wrong passphrases by peer key
 
-	// wrap, when set (by tests, before Serve), stands between each
-	// connection's writer and gosrt.
-	wrap func(io.Writer) io.Writer
+	// Seams of the tests, set before Serve. wrap stands between each
+	// connection's writer and gosrt. request stands between the listener
+	// and answer. serving is called by each connection before it
+	// subscribes, with the passphrase it was admitted under; the func it
+	// returns, when not nil, is called when its stream has ended.
+	wrap    func(io.Writer) io.Writer
+	request func(srt.ConnRequest) srt.ConnRequest
+	serving func(passphrase string) func()
 }
 
-// New returns a Server for the hubs that lookup finds by stream name.
+// New returns a Server for the hubs that lookup finds by stream name;
+// Options.Secure, when set, replaces lookup, which may then be nil.
 func New(lookup func(name string) (*hub.Hub, bool), opt Options) *Server {
 	opt.App = strings.Trim(opt.App, "/")
 	if opt.App == "" {
@@ -249,7 +298,7 @@ func New(lookup func(name string) (*hub.Hub, bool), opt Options) *Server {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	return &Server{
 		lookup: lookup, opt: opt, ctx: ctx, cancel: cancel,
-		perStream: map[string]int{}, perIP: map[string]int{},
+		perStream: map[string]int{}, perIP: map[string]int{}, fails: newFailures(),
 	}
 }
 
@@ -268,6 +317,10 @@ func (s *Server) Listen(addr string) error {
 	cfg.Latency = s.opt.Latency
 	cfg.PayloadSize = payloadSize
 	cfg.PeerIdleTimeout = s.opt.PeerIdleTimeout
+	if s.opt.KMRefresh != 0 {
+		cfg.KMRefreshRate = s.opt.KMRefresh
+		cfg.KMPreAnnounce = s.opt.KMRefresh / 4
+	}
 	ln, err := srt.Listen("srt", addr, cfg)
 	if err != nil {
 		return fmt.Errorf("srtout: listen %s: %w", addr, err)
@@ -305,6 +358,9 @@ func (s *Server) Serve() error {
 				return ErrServerClosed
 			}
 			return fmt.Errorf("srtout: accept: %w", err)
+		}
+		if s.request != nil {
+			req = s.request(req)
 		}
 		s.answer(req)
 	}
@@ -347,11 +403,13 @@ const (
 	refuseUnknown
 	refuseCaps
 	refuseMSS
+	refuseSecret
+	refuseLimited
 )
 
 // answer accepts or refuses one connection request.
 func (s *Server) answer(req srt.ConnRequest) {
-	h, name, ok := s.stream(req)
+	h, name, pass, ok := s.stream(req)
 	if !ok {
 		return
 	}
@@ -390,7 +448,7 @@ func (s *Server) answer(req srt.ConnRequest) {
 		s.finish(name, key, nil, tsstream.Stats{})
 		return
 	}
-	go s.serve(conn, h, name, key, size)
+	go s.serve(conn, h, name, key, pass, size)
 }
 
 // chunkSize returns the bytes a connection's gosrt Write may carry so that
@@ -408,28 +466,70 @@ func chunkSize(mss uint64) int {
 	return n
 }
 
-// stream resolves the stream a request names, or refuses it.
-func (s *Server) stream(req srt.ConnRequest) (*hub.Hub, string, bool) {
-	refuse := func(why refusal) (*hub.Hub, string, bool) {
+// stream resolves the stream a request names and checks its passphrase, or
+// refuses it. It returns the passphrase the request was admitted under (""
+// for none). The order keeps the counts of a stream without a passphrase:
+// a bad stream ID, then encryption with no passphrase to check against, are
+// mode refusals; an unknown or not-live name is next; only then is a
+// passphrase asked for and checked.
+func (s *Server) stream(req srt.ConnRequest) (h *hub.Hub, name, pass string, ok bool) {
+	refuse := func(why refusal, reason srt.RejectionReason) (*hub.Hub, string, string, bool) {
 		s.mu.Lock()
 		s.countRefusal(why)
 		s.mu.Unlock()
-		req.Reject(srt.REJ_RESOURCE)
-		return nil, "", false
+		req.Reject(reason)
+		return nil, "", "", false
 	}
 	res, ok := parseStreamID(req.StreamId())
-	if !ok || req.IsEncrypted() {
-		return refuse(refuseMode)
+	if !ok {
+		return refuse(refuseMode, srt.REJ_RESOURCE)
 	}
-	name, ok := strings.CutPrefix(res, s.opt.App+"/")
-	if !ok || name == "" || strings.Contains(name, "/") {
-		return refuse(refuseUnknown)
+	name, named := strings.CutPrefix(res, s.opt.App+"/")
+	known := false
+	if named && name != "" && !strings.Contains(name, "/") {
+		h, pass, known = s.find(name)
+	}
+	if !known {
+		h, pass = nil, ""
+	}
+	encrypted := req.IsEncrypted()
+	if encrypted && pass == "" {
+		return refuse(refuseMode, srt.REJ_RESOURCE)
+	}
+	if h == nil || !h.Live() {
+		return refuse(refuseUnknown, srt.REJ_RESOURCE)
+	}
+	if pass == "" {
+		return h, name, "", true
+	}
+	if !encrypted {
+		return refuse(refuseSecret, srt.REJ_UNSECURE)
+	}
+	key := s.fails.key(req.RemoteAddr())
+	s.mu.Lock()
+	limited := s.fails.limited(key)
+	s.mu.Unlock()
+	if limited {
+		return refuse(refuseLimited, srt.REJ_RESOURCE)
+	}
+	// The check runs outside s.mu: one PBKDF2 and a key unwrap.
+	if req.SetPassphrase(pass) != nil {
+		s.mu.Lock()
+		s.fails.fail(key)
+		s.mu.Unlock()
+		return refuse(refuseSecret, srt.REJ_BADSECRET)
+	}
+	return h, name, pass, true
+}
+
+// find looks name up: through Options.Secure, which gives the passphrase
+// too, when it is set, else through New's lookup.
+func (s *Server) find(name string) (*hub.Hub, string, bool) {
+	if s.opt.Secure != nil {
+		return s.opt.Secure(name)
 	}
 	h, ok := s.lookup(name)
-	if !ok || h == nil || !h.Live() {
-		return refuse(refuseUnknown)
-	}
-	return h, name, true
+	return h, "", ok
 }
 
 // countRefusal counts a refused request; s.mu is held.
@@ -444,6 +544,10 @@ func (s *Server) countRefusal(why refusal) {
 		s.stats.RejectedCaps++
 	case refuseMSS:
 		s.stats.RejectedMSS++
+	case refuseSecret:
+		s.stats.RejectedSecret++
+	case refuseLimited:
+		s.stats.RejectedLimited++
 	}
 }
 
@@ -512,8 +616,12 @@ const (
 )
 
 // serve streams h to one accepted connection, in chunks of size bytes,
-// until it must end, then closes it and counts the end.
-func (s *Server) serve(conn srt.Conn, h *hub.Hub, name, key string, size int) {
+// until it must end, then closes it and counts the end. With
+// Options.Secure, the stream is asked again once the connection has
+// subscribed, before its first byte: a different hub, a passphrase other
+// than pass (the one it was admitted under) or no stream ends it with
+// errRevoked.
+func (s *Server) serve(conn srt.Conn, h *hub.Hub, name, key, pass string, size int) {
 	ctx, cancel := context.WithCancelCause(s.ctx)
 	defer cancel(errDone)
 	var bg sync.WaitGroup
@@ -535,7 +643,22 @@ func (s *Server) serve(conn srt.Conn, h *hub.Hub, name, key string, size int) {
 		out = s.wrap(conn)
 	}
 	w := newWriter(ctx, cancel, out, size, s.opt.StallTimeout, &s.full)
+	if secure := s.opt.Secure; secure != nil {
+		// Called by the writer from this connection's stream, never under
+		// s.mu: tsstream subscribes before its first Meter or Sink call.
+		w.admit = func() bool {
+			cur, p, ok := secure(name)
+			return ok && cur == h && p == pass
+		}
+	}
+	var ended func()
+	if s.serving != nil {
+		ended = s.serving(pass)
+	}
 	st, err := tsstream.Stream(ctx, h, "srt "+conn.RemoteAddr().String(), w, tsstream.Options{Queue: s.opt.Queue, Meter: w})
+	if ended != nil {
+		ended()
+	}
 	why := classify(ctx, st, err)
 	if why == endCodecChange || why == endHubClosed {
 		t := time.NewTimer(drainTime(conn, s.opt.Latency))
@@ -580,6 +703,8 @@ func classify(ctx context.Context, st tsstream.Stats, err error) end {
 			return endStalled
 		case errors.Is(cause, errGone):
 			return endGone
+		case errors.Is(cause, errRevoked):
+			return endHubClosed
 		}
 	}
 	if err != nil {
@@ -700,6 +825,11 @@ type writer struct {
 	winPackets int       // packets written in it
 	bucket     *bucket   // nil until the bitrate is known: only the ceiling applies
 	meter      rateMeter
+
+	// admit, when set, is asked once, at the first Prebuffered, Frame or
+	// Write, whether the connection may still be served; false cancels it
+	// with errRevoked before any byte is written.
+	admit func() bool
 }
 
 func newWriter(ctx context.Context, cancel context.CancelCauseFunc, w io.Writer, size int, stall time.Duration, full *atomic.Uint64) *writer {
@@ -709,7 +839,7 @@ func newWriter(ctx context.Context, cancel context.CancelCauseFunc, w io.Writer,
 // Write writes p in chunks of at most w.size bytes. It fails when the
 // connection ends or stalls; n is then the bytes queued before.
 func (w *writer) Write(p []byte) (int, error) {
-	if w.ctx.Err() != nil {
+	if !w.admitted() || w.ctx.Err() != nil {
 		return 0, fmt.Errorf("srtout: write: %w", context.Cause(w.ctx))
 	}
 	for off := 0; off < len(p); {
@@ -725,6 +855,21 @@ func (w *writer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// admitted asks w.admit, the first time only, and cancels the connection
+// with errRevoked when it says no; it reports false then, and true
+// otherwise.
+func (w *writer) admitted() bool {
+	if w.admit == nil {
+		return true
+	}
+	ok := w.admit()
+	w.admit = nil
+	if !ok {
+		w.cancel(errRevoked)
+	}
+	return ok
+}
+
 // SetWriteDeadline is a no-op: gosrt has no write deadline, and the stall
 // rule bounds a connection instead.
 func (w *writer) SetWriteDeadline(time.Time) error { return nil }
@@ -735,12 +880,18 @@ func (w *writer) Flush() error { return nil }
 // Prebuffered sets the bucket's rate from the payload buffered before the
 // stream's output starts; it implements tsstream.Meter.
 func (w *writer) Prebuffered(bytes int, span int64) {
+	if !w.admitted() {
+		return
+	}
 	w.setRate(w.meter.prebuffered(bytes, span))
 }
 
 // Frame follows the TS bytes written, and sets the bucket's rate once 2 s
 // of stream time have been seen; it implements tsstream.Meter.
 func (w *writer) Frame(dts int64, bytes int) {
+	if !w.admitted() {
+		return
+	}
 	if r, ok := w.meter.frame(dts, bytes); ok {
 		w.setRate(r)
 	}

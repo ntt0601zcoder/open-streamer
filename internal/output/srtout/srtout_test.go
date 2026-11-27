@@ -11,6 +11,9 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -160,6 +163,13 @@ func start(t *testing.T, opt Options) *env {
 // startWrapped is start with the Server's wrap hook set, before it serves.
 func startWrapped(t *testing.T, opt Options, wrap func(io.Writer) io.Writer) *env {
 	t.Helper()
+	return startWith(t, opt, func(s *Server) { s.wrap = wrap })
+}
+
+// startWith is start with the Server's seams set by setup, before it
+// serves.
+func startWith(t *testing.T, opt Options, setup func(*Server)) *env {
+	t.Helper()
 	h, q := hub.New(hub.Options{}), hub.New(hub.Options{})
 	srv := New(func(name string) (*hub.Hub, bool) {
 		switch name {
@@ -172,7 +182,7 @@ func startWrapped(t *testing.T, opt Options, wrap func(io.Writer) io.Writer) *en
 		}
 		return nil, false
 	}, opt)
-	srv.wrap = wrap
+	setup(srv)
 	require.NoError(t, srv.Listen("127.0.0.1:0"))
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve() }()
@@ -448,6 +458,26 @@ func TestParseStreamID(t *testing.T) {
 	}
 }
 
+// refusalCases are requests that an env refuses, whatever its Options.
+var refusalCases = []struct {
+	name, id string
+	mod      func(*srt.Config)
+	mode     bool // counted as a mode refusal, else an unknown stream
+}{
+	{"publish", "#!::r=live/s,m=publish", nil, true},
+	{"file", "#!::r=live/s,t=file", nil, true},
+	{"empty", "", nil, true},
+	{"encrypted", "live/s", func(c *srt.Config) { c.Passphrase = "0123456789abcdef" }, true},
+	{"unknown", "live/nope", nil, false},
+	{"unknown access control", "#!::r=live/nope,m=request", nil, false},
+	{"not live", "live/q", nil, false},
+	{"nil hub", "live/nil", nil, false},
+	{"other app", "tv/s", nil, false},
+	{"no resource", "#!::m=request", nil, false},
+	{"nested name", "live/s/x", nil, false},
+	{"no name", "live/", nil, false},
+}
+
 // Every refusal looks the same to the caller: "connection rejected" with
 // one reason, whatever the cause.
 func TestSRTRejects(t *testing.T) {
@@ -457,25 +487,7 @@ func TestSRTRejects(t *testing.T) {
 		e.h.Write(f)
 	}
 	require.True(t, e.h.Live())
-	encrypted := func(c *srt.Config) { c.Passphrase = "0123456789abcdef" }
-	cases := []struct {
-		name, id string
-		mod      func(*srt.Config)
-		mode     bool // counted as a mode refusal, else an unknown stream
-	}{
-		{"publish", "#!::r=live/s,m=publish", nil, true},
-		{"file", "#!::r=live/s,t=file", nil, true},
-		{"empty", "", nil, true},
-		{"encrypted", "live/s", encrypted, true},
-		{"unknown", "live/nope", nil, false},
-		{"unknown access control", "#!::r=live/nope,m=request", nil, false},
-		{"not live", "live/q", nil, false},
-		{"nil hub", "live/nil", nil, false},
-		{"other app", "tv/s", nil, false},
-		{"no resource", "#!::m=request", nil, false},
-		{"nested name", "live/s/x", nil, false},
-		{"no name", "live/", nil, false},
-	}
+	cases := refusalCases
 	var first string
 	for _, tc := range cases {
 		_, err := dial(e.addr, tc.id, tc.mod)
@@ -1366,4 +1378,566 @@ func TestWriterRateAfterResync(t *testing.T) {
 		w.Frame(int64(t0*media.ClockRate), 30_000)
 		require.InDelta(t, want, w.bucket.rate, want*0.01, "frame %d after the resync", i)
 	}
+}
+
+// Passphrases of the tests: literals that appear nowhere else.
+const (
+	lockedPass = "srtpass-0123456789"
+	otherPass  = "srtpass-9876543210"
+	wrongPass  = "wrongwrong-0123"
+)
+
+// view is one stream's state as a test's Secure reads it: one value, as a
+// stream's View is.
+type view struct {
+	h    *hub.Hub
+	pass string
+}
+
+// views is the state behind a test's Secure; calls counts Secure's calls.
+type views struct {
+	mu    sync.Mutex
+	m     map[string]view
+	calls atomic.Int64
+}
+
+func newViews() *views { return &views{m: map[string]view{}} }
+
+func (v *views) set(name string, h *hub.Hub, pass string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.m[name] = view{h: h, pass: pass}
+}
+
+func (v *views) remove(name string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	delete(v.m, name)
+}
+
+func (v *views) Secure(name string) (*hub.Hub, string, bool) {
+	v.calls.Add(1)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	w, ok := v.m[name]
+	return w.h, w.pass, ok
+}
+
+// rejections records the reason given to each refused request, by stream
+// ID: a caller's error need not carry it.
+type rejections struct {
+	mu sync.Mutex
+	by map[string][]srt.RejectionReason
+}
+
+func newRejections() *rejections { return &rejections{by: map[string][]srt.RejectionReason{}} }
+
+// wrap is a Server's request seam.
+func (r *rejections) wrap(req srt.ConnRequest) srt.ConnRequest { return recordingReq{req, r} }
+
+func (r *rejections) add(id string, reason srt.RejectionReason) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.by[id] = append(r.by[id], reason)
+}
+
+// of returns the reasons the requests with stream ID id were given.
+func (r *rejections) of(id string) []srt.RejectionReason {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.by[id])
+}
+
+// all returns every reason given.
+func (r *rejections) all() []srt.RejectionReason {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []srt.RejectionReason
+	for _, v := range r.by {
+		out = append(out, v...)
+	}
+	return out
+}
+
+// recordingReq records the reason a request is rejected with.
+type recordingReq struct {
+	srt.ConnRequest
+	rec *rejections
+}
+
+func (q recordingReq) Reject(reason srt.RejectionReason) {
+	q.rec.add(q.StreamId(), reason)
+	q.ConnRequest.Reject(reason)
+}
+
+// serveSecure starts a Server without New's lookup on 127.0.0.1, after
+// setup (when set) set its seams; it closes with the test.
+func serveSecure(t *testing.T, opt Options, setup func(*Server)) (*Server, string) {
+	t.Helper()
+	srv := New(nil, opt)
+	if setup != nil {
+		setup(srv)
+	}
+	require.NoError(t, srv.Listen("127.0.0.1:0"))
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve() }()
+	t.Cleanup(func() {
+		require.NoError(t, srv.Close())
+		select {
+		case err := <-served:
+			assert.ErrorIs(t, err, ErrServerClosed)
+		case <-time.After(waitFor):
+			t.Error("Serve did not return after Close")
+		}
+	})
+	return srv, srv.Addr().String()
+}
+
+// liveHub returns a hub that closes with the test, holding the first GOP of
+// h264_aac.ts, and the frames after it.
+func liveHub(t *testing.T, loops int) (*hub.Hub, []media.Frame) {
+	t.Helper()
+	h := hub.New(hub.Options{})
+	t.Cleanup(h.Close)
+	gop, rest := splitAtKey(looped(t, "h264_aac.ts", loops), 2)
+	for _, f := range gop {
+		h.Write(f)
+	}
+	require.True(t, h.Live())
+	return h, rest
+}
+
+// audioHub returns a live audio-only hub that closes with the test, whose
+// cache holds 3 s of audio: a subscriber's prebuffer is filled from the
+// cache at once, so its first write follows its subscription without
+// waiting for the feed.
+func audioHub(t *testing.T) *hub.Hub {
+	t.Helper()
+	h := hub.New(hub.Options{AudioCacheTicks: 3 * media.ClockRate})
+	t.Cleanup(h.Close)
+	for _, f := range looped(t, "h264_aac.ts", 1) {
+		if f.Kind() == media.KindAudio {
+			h.Write(f)
+		}
+	}
+	require.True(t, h.Live())
+	return h
+}
+
+// withPass sets a caller's passphrase, then applies more.
+func withPass(pass string, more ...func(*srt.Config)) func(*srt.Config) {
+	return func(c *srt.Config) {
+		c.Passphrase = pass
+		for _, m := range more {
+			if m != nil {
+				m(c)
+			}
+		}
+	}
+}
+
+// rejectedSum is the sum of the six Rejected counters, which Rejected must
+// equal.
+func rejectedSum(st Stats) uint64 {
+	return st.RejectedUnknown + st.RejectedMode + st.RejectedCaps + st.RejectedMSS + st.RejectedSecret + st.RejectedLimited
+}
+
+// readSome dials id with mod and reads at least 20 TS packets.
+func readSome(t *testing.T, addr, id string, mod func(*srt.Config)) {
+	t.Helper()
+	c, err := dial(addr, id, mod)
+	require.NoError(t, err, id)
+	defer c.Close()
+	got := waitCapture(t, receive(c, nil, atLeast(20*mpegts.PacketSize)))
+	require.NoError(t, got.err, id)
+	assert.Equal(t, byte(0x47), got.data[0], id)
+}
+
+// A caller with the passphrase reads what a plain caller reads from a
+// stream without one, with every key length; a rung's served name takes the
+// passphrase Secure gives it.
+func TestPassphraseAccepted(t *testing.T) {
+	t.Run("same frames", func(t *testing.T) {
+		open, rest := liveHub(t, 2)
+		locked, _ := liveHub(t, 2)
+		v := newViews()
+		v.set("open", open, "")
+		v.set("locked", locked, lockedPass)
+		srv, addr := serveSecure(t, Options{Secure: v.Secure}, nil)
+		lat := raceLatency(time.Second)
+		plain, err := dial(addr, "live/open", lat)
+		require.NoError(t, err)
+		defer plain.Close()
+		secret, err := dial(addr, "live/locked", withPass(lockedPass, lat))
+		require.NoError(t, err)
+		defer secret.Close()
+		require.Eventually(t, func() bool { return len(open.Stats()) == 1 && len(locked.Stats()) == 1 }, waitFor, time.Millisecond, "subscribed")
+		chPlain, chSecret := receive(plain, nil, nil), receive(secret, nil, nil)
+		donePlain, doneSecret := feed(context.Background(), open, rest, 4), feed(context.Background(), locked, rest, 4)
+		<-donePlain
+		<-doneSecret
+		open.Close()
+		locked.Close()
+		gotPlain, gotSecret := waitCapture(t, chPlain), waitCapture(t, chSecret)
+		framesPlain, framesSecret := readBack(t, gotPlain.data), readBack(t, gotSecret.data)
+		require.NotEmpty(t, framesSecret)
+		assert.Equal(t, framesPlain, framesSecret)
+		assert.Nil(t, conform.CheckFrames(framesSecret, conform.FrameOptions{}))
+		waitStats(t, srv, func(s Stats) bool { return s.EndedHubClosed == 2 }, "both ended by their hubs")
+		assert.Zero(t, srv.Stats().Rejected)
+	})
+	t.Run("key lengths and rungs", func(t *testing.T) {
+		locked, rest := liveHub(t, 8)
+		v := newViews()
+		v.set("locked", locked, lockedPass)
+		v.set("locked_720", locked, lockedPass)
+		rej := newRejections()
+		srv, addr := serveSecure(t, Options{Secure: v.Secure}, func(s *Server) { s.request = rej.wrap })
+		ctx, cancel := context.WithCancel(context.Background())
+		done := feed(ctx, locked, rest, 4)
+		defer func() { cancel(); <-done }()
+		for _, n := range []int{16, 24, 32} {
+			readSome(t, addr, "live/locked", withPass(lockedPass, func(c *srt.Config) { c.PBKeylen = n }))
+		}
+		readSome(t, addr, "live/locked_720", withPass(lockedPass))
+		_, err := dial(addr, "live/locked_720", nil)
+		require.Error(t, err)
+		assert.Equal(t, []srt.RejectionReason{srt.REJ_UNSECURE}, slices.Compact(rej.of("live/locked_720")))
+		st := srv.Stats()
+		assert.Positive(t, st.RejectedSecret)
+		assert.Equal(t, st.Rejected, rejectedSum(st))
+	})
+}
+
+// Each refusal of a stream with a passphrase has its own reason and counter;
+// a stream without one, and an unknown name, are refused as at HEAD.
+func TestPassphraseRefusals(t *testing.T) {
+	t.Run("secure", func(t *testing.T) {
+		open, _ := liveHub(t, 1)
+		locked, _ := liveHub(t, 1)
+		v := newViews()
+		v.set("open", open, "")
+		v.set("locked", locked, lockedPass)
+		rej := newRejections()
+		var written atomic.Int64
+		srv, addr := serveSecure(t, Options{Secure: v.Secure}, func(s *Server) {
+			s.request = rej.wrap
+			s.wrap = func(w io.Writer) io.Writer {
+				return writerFunc(func(b []byte) (int, error) { written.Add(int64(len(b))); return w.Write(b) })
+			}
+		})
+		// Each row's stream ID is its own (an unknown key is ignored), so
+		// that a retransmitted request is recorded under its row.
+		for _, row := range []struct {
+			name, id string
+			mod      func(*srt.Config)
+			reason   srt.RejectionReason
+			moved    func(before, after Stats) bool
+		}{
+			{"no passphrase", "#!::r=live/locked,x=1", nil, srt.REJ_UNSECURE, func(b, a Stats) bool {
+				return a.RejectedSecret >= 1 && a.RejectedMode == b.RejectedMode
+			}},
+			{"wrong passphrase", "#!::r=live/locked,x=2", withPass(wrongPass), srt.REJ_BADSECRET, func(b, a Stats) bool {
+				return a.RejectedSecret >= 2 && a.RejectedMode == b.RejectedMode
+			}},
+			{"passphrase to open", "#!::r=live/open,x=3", withPass(lockedPass), srt.REJ_RESOURCE, func(b, a Stats) bool {
+				return a.RejectedMode > b.RejectedMode && a.RejectedSecret == b.RejectedSecret
+			}},
+			{"passphrase to unknown", "#!::r=live/nope,x=4", withPass(lockedPass), srt.REJ_RESOURCE, func(b, a Stats) bool {
+				return a.RejectedMode > b.RejectedMode && a.RejectedSecret == b.RejectedSecret
+			}},
+			{"unknown", "#!::r=live/nope,x=5", nil, srt.REJ_RESOURCE, func(b, a Stats) bool {
+				return a.RejectedUnknown > b.RejectedUnknown && a.RejectedSecret == b.RejectedSecret
+			}},
+		} {
+			before := srv.Stats()
+			_, err := dial(addr, row.id, row.mod)
+			require.Error(t, err, row.name)
+			assert.Contains(t, err.Error(), "connection rejected", row.name)
+			got := rej.of(row.id)
+			require.NotEmpty(t, got, row.name)
+			assert.Equal(t, []srt.RejectionReason{row.reason}, slices.Compact(got), row.name)
+			after := srv.Stats()
+			assert.True(t, row.moved(before, after), "%s: %+v then %+v", row.name, before, after)
+			assert.Equal(t, after.Rejected, rejectedSum(after), row.name)
+			assert.Zero(t, after.RejectedLimited, row.name)
+			assert.Zero(t, after.Conns, row.name)
+		}
+		assert.Zero(t, written.Load(), "no byte was served")
+		assert.Empty(t, open.Stats())
+		assert.Empty(t, locked.Stats())
+	})
+	t.Run("secure nil", func(t *testing.T) {
+		rej := newRejections()
+		e := startWith(t, Options{}, func(s *Server) { s.request = rej.wrap })
+		gop, _ := splitAtKey(looped(t, "h264_aac.ts", 1), 2)
+		for _, f := range gop {
+			e.h.Write(f)
+		}
+		for _, tc := range refusalCases {
+			_, err := dial(e.addr, tc.id, tc.mod)
+			require.Error(t, err, tc.name)
+			assert.Contains(t, err.Error(), "connection rejected", tc.name)
+			st := e.srv.Stats()
+			assert.Equal(t, st.Rejected, rejectedSum(st), tc.name)
+		}
+		for _, r := range rej.all() {
+			assert.Equal(t, srt.REJ_RESOURCE, r)
+		}
+		st := e.srv.Stats()
+		assert.GreaterOrEqual(t, st.RejectedMode, uint64(4))
+		assert.GreaterOrEqual(t, st.RejectedUnknown, uint64(len(refusalCases)-4))
+		assert.Zero(t, st.RejectedSecret)
+		assert.Zero(t, st.RejectedLimited)
+		assert.Zero(t, st.RejectedCaps)
+		assert.Zero(t, st.Conns)
+	})
+}
+
+// No connection admitted under a passphrase outlives a change of it,
+// however the request and the change interleave.
+func TestPassphraseChangedMidLookup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		before string // the stream's passphrase when the caller is admitted, and the caller's
+		after  func(v *views, h, other *hub.Hub)
+	}{
+		{"changed", lockedPass, func(v *views, h, _ *hub.Hub) { v.set("s", h, otherPass) }},
+		{"removed", lockedPass, func(v *views, h, _ *hub.Hub) { v.set("s", h, "") }},
+		{"set", "", func(v *views, h, _ *hub.Hub) { v.set("s", h, otherPass) }},
+		{"not served", lockedPass, func(v *views, _, _ *hub.Hub) { v.remove("s") }},
+		{"other hub", lockedPass, func(v *views, _, other *hub.Hub) { v.set("s", other, lockedPass) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, other := audioHub(t), audioHub(t)
+			v := newViews()
+			v.set("s", h, tc.before)
+			paused, release := make(chan struct{}, 1), make(chan struct{})
+			var written atomic.Int64
+			srv, addr := serveSecure(t, Options{Secure: v.Secure}, func(s *Server) {
+				s.serving = func(string) func() {
+					paused <- struct{}{}
+					<-release
+					return nil
+				}
+				s.wrap = func(w io.Writer) io.Writer {
+					return writerFunc(func(b []byte) (int, error) { written.Add(int64(len(b))); return w.Write(b) })
+				}
+			})
+			var mod func(*srt.Config)
+			if tc.before != "" {
+				mod = withPass(tc.before)
+			}
+			c, err := dial(addr, "live/s", mod)
+			require.NoError(t, err)
+			defer c.Close()
+			select {
+			case <-paused:
+			case <-time.After(waitFor):
+				t.Fatal("the connection did not reach its subscription")
+			}
+			// What reattach does: the View, then the hub's "srt "
+			// subscribers ended once, and relaxed.
+			tc.after(v, h, other)
+			h.Refuse("srt ")
+			h.Refuse()
+			calls := v.calls.Load()
+			close(release)
+			got := waitCapture(t, receive(c, nil, nil))
+			require.Error(t, got.err, "the server ended the connection")
+			assert.Empty(t, got.data, "nothing but the shutdown")
+			waitStats(t, srv, func(s Stats) bool { return s.EndedHubClosed == 1 && s.Conns == 0 }, "ended as hub_closed")
+			assert.Zero(t, written.Load())
+			assert.Equal(t, calls+1, v.calls.Load(), "asked once more, after subscribing")
+		})
+	}
+
+	t.Run("flips", func(t *testing.T) {
+		h := audioHub(t)
+		v := newViews()
+		v.set("s", h, lockedPass)
+		rej := newRejections()
+		var open, admitted atomic.Int64 // connections admitted under lockedPass: being served, and in all
+		srv, addr := serveSecure(t, Options{Secure: v.Secure}, func(s *Server) {
+			s.request = rej.wrap
+			// A key per caller address, so that the limiter leaves the
+			// callers' wrong passphrases to the check.
+			s.fails.key = func(a net.Addr) string { return a.String() }
+			s.serving = func(pass string) func() {
+				if pass != lockedPass {
+					return nil
+				}
+				open.Add(1)
+				admitted.Add(1)
+				return func() { open.Add(-1) }
+			}
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		var callers sync.WaitGroup
+		for i := range 50 {
+			callers.Go(func() {
+				// A check costs about 8 ms under the race detector: the
+				// callers back off so that the accept loop keeps up.
+				backoff := time.Duration(200+10*i) * time.Millisecond
+				for ctx.Err() == nil {
+					c, err := dial(addr, "live/s", withPass(lockedPass, func(c *srt.Config) { c.ConnectionTimeout = time.Second }))
+					if err != nil {
+						select {
+						case <-ctx.Done():
+						case <-time.After(backoff):
+						}
+						continue
+					}
+					stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+					<-receive(c, nil, nil)
+					stop()
+					_ = c.Close()
+				}
+			})
+		}
+		var secondAdmitted int64
+		for i := range 20 {
+			pass := otherPass
+			if i%2 == 1 {
+				pass = lockedPass
+			}
+			v.set("s", h, pass)
+			h.Refuse("srt ")
+			h.Refuse()
+			flipped := time.Now()
+			if i == 1 {
+				secondAdmitted = admitted.Load()
+			}
+			if pass == otherPass {
+				time.Sleep(time.Until(flipped.Add(200 * time.Millisecond)))
+				for time.Since(flipped) < 300*time.Millisecond {
+					require.Zero(t, open.Load(), "flip %d: a connection admitted under the old passphrase is served", i)
+					time.Sleep(5 * time.Millisecond)
+				}
+				continue
+			}
+			time.Sleep(time.Until(flipped.Add(300 * time.Millisecond)))
+		}
+		cancel()
+		callers.Wait()
+		waitStats(t, srv, func(s Stats) bool { return s.Conns == 0 }, "every connection ended")
+		assert.Greater(t, admitted.Load(), secondAdmitted, "callers were admitted again after a flip back")
+		for _, r := range rej.all() {
+			assert.Contains(t, []srt.RejectionReason{srt.REJ_UNSECURE, srt.REJ_BADSECRET, srt.REJ_RESOURCE}, r)
+		}
+		st := srv.Stats()
+		assert.Positive(t, st.RejectedSecret)
+		assert.Equal(t, st.Rejected, rejectedSum(st))
+	})
+}
+
+// fillerFrames returns 12 s of h264_aac.ts in stream time whose video
+// frames carry a filler NAL unit of 20 kB, which decoders skip: at 25 fps
+// that is more than 4096 SRT packets.
+func fillerFrames(t *testing.T) []media.Frame {
+	t.Helper()
+	filler := make([]byte, 20_000)
+	filler[0] = 0x0C // nal_unit_type 12, filler data
+	for i := 1; i < len(filler)-1; i++ {
+		filler[i] = 0xFF
+	}
+	filler[len(filler)-1] = 0x80 // rbsp_trailing_bits
+	frames := looped(t, "h264_aac.ts", 2)
+	for i, f := range frames {
+		if f.Kind() == media.KindVideo {
+			frames[i].Data = append(slices.Clone(f.Data), filler)
+		}
+	}
+	return frames
+}
+
+// lastProgress returns the last frame= value of ffmpeg's -progress output.
+func lastProgress(out string) (int, bool) {
+	n, ok := 0, false
+	for line := range strings.Lines(out) {
+		if v, found := strings.CutPrefix(strings.TrimSpace(line), "frame="); found {
+			if k, err := strconv.Atoi(v); err == nil {
+				n, ok = k, true
+			}
+		}
+	}
+	return n, ok
+}
+
+// A session that crosses key refreshes loses no frame: ffmpeg decodes
+// every video frame through four refreshes of a 1024-packet key, and a
+// gosrt caller, which logs each key announcement it receives, reads a
+// conformant stream with unbroken continuity counters.
+func TestKeyRefreshFFmpeg(t *testing.T) {
+	ffmpeg := testpeer.Require(t, "ffmpeg", "srt")
+	frames := fillerFrames(t)
+	gop, rest := splitAtKey(frames, 2)
+	h := hub.New(hub.Options{})
+	t.Cleanup(h.Close)
+	for _, f := range gop {
+		h.Write(f)
+	}
+	v := newViews()
+	v.set("locked", h, lockedPass)
+	var written atomic.Int64
+	srv, addr := serveSecure(t, Options{Secure: v.Secure, KMRefresh: 1024}, func(s *Server) {
+		s.wrap = func(w io.Writer) io.Writer {
+			return writerFunc(func(b []byte) (int, error) { written.Add(int64(len(b))); return w.Write(b) })
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	u := fmt.Sprintf("srt://%s?streamid=live/locked&passphrase=%s&latency=500000", addr, lockedPass)
+	cmd := exec.CommandContext(ctx, ffmpeg, "-hide_banner", "-nostdin", "-v", "warning", "-progress", "pipe:1",
+		"-i", u, "-map", "0:v", "-f", "null", "-")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	require.NoError(t, cmd.Start())
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	require.Eventually(t, func() bool { return len(h.Stats()) == 1 }, waitFor, 5*time.Millisecond, "ffmpeg subscribed")
+	logger := srt.NewLogger([]string{"control:recv:KMReq"})
+	defer logger.Close()
+	c, err := dial(addr, "live/locked", withPass(lockedPass, func(c *srt.Config) { c.Logger = logger }, raceLatency(time.Second)))
+	require.NoError(t, err)
+	defer c.Close()
+	require.Eventually(t, func() bool { return len(h.Stats()) == 2 }, waitFor, 5*time.Millisecond, "gosrt subscribed")
+	ch := receive(c, nil, nil)
+	<-feed(ctx, h, rest, 2)
+	h.Close()
+	select {
+	case <-exited:
+	case <-ctx.Done():
+		t.Fatalf("ffmpeg did not end; stderr %q", stderr.String())
+	}
+	capt := waitCapture(t, ch)
+	read := readBack(t, capt.data)
+	assert.Nil(t, conform.CheckFrames(read, conform.FrameOptions{}))
+	assert.Zero(t, ccErrors(t, capt.data))
+	assert.Equal(t, countKind(frames, media.KindVideo), countKind(read, media.KindVideo))
+	announced, failed := 0, 0
+	for len(logger.Listen()) > 0 {
+		m := <-logger.Listen()
+		switch {
+		case strings.HasSuffix(m.Topic, ":error") && strings.Contains(m.Message, "already in use"):
+			// A resent announcement of a key already installed: the
+			// sender resends until the response arrives (slow under the
+			// race detector), and gosrt's receiver refuses the copy.
+		case strings.HasSuffix(m.Topic, ":error"):
+			failed++
+		case strings.HasSuffix(m.Topic, ":cif"):
+			announced++
+		}
+	}
+	assert.GreaterOrEqual(t, announced, 4, "a key announced for each refresh")
+	assert.Zero(t, failed, "no key failed to install")
+	got, ok := lastProgress(stdout.String())
+	require.True(t, ok, "ffmpeg progress %q stderr %q", stdout.String(), stderr.String())
+	want := countKind(frames, media.KindVideo)
+	assert.InDelta(t, want, got, 25, "video frames decoded; stderr %q", stderr.String())
+	log := strings.ToLower(stderr.String())
+	assert.NotContains(t, log, "corrupt")
+	assert.NotContains(t, log, "decrypt")
+	assert.Greater(t, written.Load(), int64(2*4*1024*payloadSize), "more than 4096 packets sent to each")
+	waitStats(t, srv, func(s Stats) bool { return s.EndedHubClosed == 2 }, "both ended by the hub")
 }
