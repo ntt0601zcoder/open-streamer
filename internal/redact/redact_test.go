@@ -545,23 +545,45 @@ func TestURLNested(t *testing.T) {
 
 // The work on a URL grows with its length: a long name of bytes that are
 // no letters, and a long run of '=', were once read again for each byte
-// (found by FuzzRedactedURL: 2.8 s for a 4 KiB URL).
+// (found by FuzzRedactedURL: 2.8 s for a 4 KiB URL). The check is on
+// growth, not on a time: a URL 8 times as long takes about 8 times as
+// long (64 times, were the work quadratic; the bound is 32), whatever the race detector,
+// coverage or a busy machine make of the time itself. Each size is timed
+// a few times and the best counts; a shape is tried again before it
+// fails. URLs after '#' cost a few times more per byte than the other
+// shapes (each of the 8 levels read parses what is left), and grow the
+// same way.
 func TestURLIsLinear(t *testing.T) {
-	const n = 256 << 10
-	for name, u := range map[string]string{
-		"a long name of other bytes": "a://h/?\x90!!" + strings.Repeat("\xc9", n) + "!!=a://% a://0",
-		"a run of pairs":             "a://h/?" + strings.Repeat("a=b=", n/4),
-		"nested URLs":                "a://h/" + strings.Repeat("a://b/", n/6) + "rtsp://u:" + vSecret + "@h/s",
-		"escaped nested URLs":        "a://h/" + strings.Repeat("x%3A//y/", n/8),
-		"URLs after '#'":             "a://h/#" + strings.Repeat("a://b#", n/6),
+	const n, times, bound = 4 << 10, 8, 32.0
+	for name, shape := range map[string]func(n int) string{
+		"a long name of other bytes": func(n int) string { return "a://h/?\x90!!" + strings.Repeat("\xc9", n) + "!!=a://% a://0" },
+		"a run of pairs":             func(n int) string { return "a://h/?" + strings.Repeat("a=b=", n/4) },
+		"nested URLs":                func(n int) string { return "a://h/" + strings.Repeat("a://b/", n/6) + "rtsp://u:" + vSecret + "@h/s" },
+		"escaped nested URLs":        func(n int) string { return "a://h/" + strings.Repeat("x%3A//y/", n/8) },
+		"URLs after '#'":             func(n int) string { return "a://h/#" + strings.Repeat("a://b#", n/6) },
 	} {
-		start := time.Now()
-		out := URL(u)
-		Masked(out)
-		Masked(u)
-		took := time.Since(start)
-		t.Logf("%s: %d bytes in %s", name, len(u), took)
-		assert.Less(t, took, 5*time.Second, name)
-		assert.NotContains(t, out, vSecret, name)
+		best := func(u string) time.Duration {
+			d := time.Duration(1 << 62)
+			for range 5 {
+				start := time.Now()
+				out := URL(u)
+				Masked(out)
+				Masked(u)
+				d = min(d, time.Since(start))
+				assert.NotContains(t, out, vSecret, name)
+			}
+			return d
+		}
+		small, large := shape(n), shape(times*n)
+		ratio := 0.0
+		for range 4 {
+			a, b := best(small), best(large)
+			ratio = float64(b) / float64(a)
+			t.Logf("%s: %d bytes in %s, %d bytes in %s: %.1f times", name, len(small), a, len(large), b, ratio)
+			if ratio < bound {
+				break
+			}
+		}
+		assert.Less(t, ratio, bound, "%s: the work grows faster than the URL", name)
 	}
 }
