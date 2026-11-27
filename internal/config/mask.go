@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,7 +38,8 @@ func ETag(text []byte) string {
 
 // Mask returns text as an API response shows it (R-T8). In every scalar,
 // keys and values, each URL-shaped token whose redact.URL form carries a
-// mask is replaced by that form, and a scalar holding a token redact.URL
+// mask is replaced by that form, a value that starts with a URL is also
+// judged whole (maskValue), and a scalar holding a token redact.URL
 // cannot parse becomes redact.Mask whole; every non-empty scalar under an
 // srt_passphrase key, in any case, becomes redact.Mask, and so does every
 // !!binary scalar; in every comment each URL-shaped token goes through
@@ -234,46 +236,34 @@ func replaceTokens(s string, f func(tok string) string) string {
 // passRests finds the passphrase key in the lines of s, in any ASCII case,
 // with an optional closing quote and a ':' or '=' after it, and returns
 // what follows each on its line: the first on a line, since what follows
-// it runs to the line's end. With afterHash only a key that has a '#'
-// before it on its line is found: one inside what may be a comment. A
-// line ends at any of YAML's line breaks.
-func passRests(s string, afterHash bool) []span {
+// it runs to the line's end. A line ends at any of YAML's line breaks.
+func passRests(s string) []span {
 	var out []span
-	hash := false
 	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == '\n' || c == '\r':
-			hash = false
-		case c == '#':
-			hash = true
-		case c >= utf8.RuneSelf:
-			if n := wideBreak(s[i:]); n > 0 {
-				hash = false
-				i += n - 1
-			}
-		case c == '_' && (hash || !afterHash):
-			const before, after = "srt", "passphrase"
-			if i < len(before) || len(s)-i-1 < len(after) ||
-				!strings.EqualFold(s[i-len(before):i], before) || !strings.EqualFold(s[i+1:i+1+len(after)], after) {
-				continue
-			}
-			j := i + 1 + len(after)
-			if j < len(s) && (s[j] == '"' || s[j] == '\'') {
-				j++
-			}
-			for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
-				j++
-			}
-			if j == len(s) || s[j] != ':' && s[j] != '=' {
-				continue
-			}
-			end := j + 1
-			for end < len(s) && s[end] != '\n' && s[end] != '\r' && wideBreak(s[end:]) == 0 {
-				end++
-			}
-			out = append(out, span{j + 1, end})
-			i = end - 1
+		if s[i] != '_' {
+			continue
 		}
+		const before, after = "srt", "passphrase"
+		if i < len(before) || len(s)-i-1 < len(after) ||
+			!strings.EqualFold(s[i-len(before):i], before) || !strings.EqualFold(s[i+1:i+1+len(after)], after) {
+			continue
+		}
+		j := i + 1 + len(after)
+		if j < len(s) && (s[j] == '"' || s[j] == '\'') {
+			j++
+		}
+		for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+			j++
+		}
+		if j == len(s) || s[j] != ':' && s[j] != '=' {
+			continue
+		}
+		end := j + 1
+		for end < len(s) && s[end] != '\n' && s[end] != '\r' && wideBreak(s[end:]) == 0 {
+			end++
+		}
+		out = append(out, span{j + 1, end})
+		i = end - 1
 	}
 	return out
 }
@@ -314,16 +304,14 @@ type commentChange struct {
 // masker hides the secrets of a node tree and records what it changed.
 type masker struct {
 	changes []change
-	// tokens maps each comment token that was redacted to its redacted
-	// form.
-	tokens map[string]string
+	// comments is set when a comment's text was changed (commentLine).
+	comments bool
 	// lines are the line comments that were hidden whole.
 	lines []commentChange
-	// passText is set when a comment's text after the passphrase key was
-	// hidden.
-	passText bool
 	// scan remembers the tokens of the text being masked; it may be nil.
 	scan *scan
+	// url is the value of the url key being walked.
+	url *yaml.Node
 	// aliased are the alias targets already hidden under a passphrase
 	// key.
 	aliased map[*yaml.Node]bool
@@ -334,7 +322,7 @@ type masker struct {
 }
 
 func (m *masker) changed() bool {
-	return len(m.changes) > 0 || len(m.tokens) > 0 || len(m.lines) > 0 || m.passText || m.recoded
+	return len(m.changes) > 0 || len(m.lines) > 0 || m.comments || m.recoded
 }
 
 // node hides the secrets under n.
@@ -356,7 +344,7 @@ func (m *masker) node(n *yaml.Node) {
 			}
 			return
 		}
-		m.set(n, maskValue(n.Value))
+		m.set(n, maskScalar(n.Value, n == m.url))
 	case yaml.MappingNode:
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			k, v := n.Content[i], n.Content[i+1]
@@ -365,6 +353,9 @@ func (m *masker) node(n *yaml.Node) {
 				m.under(v)
 			}
 			m.node(k)
+			if k.Kind == yaml.ScalarNode && k.Value == "url" {
+				m.url = v
+			}
 			m.node(v)
 		}
 	case yaml.DocumentNode, yaml.SequenceNode:
@@ -479,25 +470,99 @@ func scalarText(n *yaml.Node) string {
 	return n.Value
 }
 
-// comment returns the comment c with each URL-shaped token redacted and
-// with what follows the passphrase key on a line hidden.
+// comment returns the comment c as a response shows it, line by line
+// (commentLine).
 func (m *masker) comment(c string) string {
-	if strings.Contains(c, "://") {
-		c = replaceTokens(c, func(tok string) string {
-			r := m.scan.commentToken(tok)
-			if r != tok {
-				if m.tokens == nil {
-					m.tokens = make(map[string]string)
-				}
-				m.tokens[tok] = r
-			}
-			return r
-		})
+	if !strings.Contains(c, "://") && !strings.Contains(c, "_") {
+		return c
 	}
-	if r := maskPassText(c); r != c {
-		c, m.passText = r, true
+	lines := strings.Split(c, "\n")
+	for i, line := range lines {
+		lines[i] = m.scan.commentLine(line)
+	}
+	if r := strings.Join(lines, "\n"); r != c {
+		c, m.comments = r, true
 	}
 	return c
+}
+
+// commentLine is one line of a comment as a response shows it. Each
+// URL-shaped token is redacted (commentToken); then, as a scalar's value
+// is judged whole, what runs from a token to the end of the line is
+// (restOfLine): a commented-out URL whose secret holds a space; then
+// whatever follows the passphrase key is hidden (maskPassText). That is
+// repeated until nothing changes, and a line that does not settle is
+// hidden whole: what a comment shows is what the scan accepts of a line.
+func (s *scan) commentLine(line string) string {
+	if !strings.Contains(line, "://") && !strings.Contains(line, "_") {
+		return line
+	}
+	if s != nil {
+		if r, ok := s.lines[line]; ok {
+			return r
+		}
+	}
+	out := line
+	settled := false
+	for range 4 {
+		was := out
+		out = maskPassText(restOfLine(replaceTokens(out, s.commentToken)))
+		if settled = out == was; settled {
+			break
+		}
+	}
+	if !settled {
+		out = "# " + redact.Invalid
+	}
+	if s != nil {
+		s.lines[line] = out
+	}
+	return out
+}
+
+// maxRests is how many URL-shaped tokens of a comment's line are judged
+// together with the rest of the line.
+const maxRests = 4
+
+// restOfLine judges a comment's line as a scalar's whole value is judged:
+// from each of its URL-shaped tokens, the first maxRests, to the end of
+// the line. When redact.URL hides something in that (hidesNew) which it
+// did not hide in the token alone, the rest of the line is replaced by
+// redact.URL's form. So "# - url: https://c/x?token=AA BB" loses BB, as
+// the scalar it was does. The cost is prose: the words after an RTMP URL
+// or a query secret go with it. A line longer than maxToken, or with more
+// tokens, is judged token by token only.
+func restOfLine(line string) string {
+	if len(line) > maxToken {
+		return line
+	}
+	ts := tokens(line)
+	if len(ts) > maxRests {
+		return line
+	}
+	for _, t := range ts {
+		rest := strings.TrimRight(line[t.at:], " \t\r")
+		if len(rest) == t.end-t.at {
+			continue
+		}
+		if r, hid := hidesNew(rest); hid {
+			return line[:t.at] + r
+		}
+	}
+	return line
+}
+
+// hidesNew returns redact.URL of v and whether it hid something there that
+// was not hidden yet: its form differs from v as net/url alone writes it.
+// (Comparing with v itself would take every escaped space for a secret.)
+// A v that does not parse hides nothing here.
+func hidesNew(v string) (r string, hid bool) {
+	u, err := url.Parse(v)
+	if err != nil {
+		return v, false
+	}
+	r = redact.URL(v)
+	return r, r != redact.Invalid && r != u.String()
 }
 
 // maskPassText returns the comment c with whatever follows the passphrase
@@ -509,7 +574,7 @@ func maskPassText(c string) string {
 	}
 	var b strings.Builder
 	at := 0
-	for _, rest := range passRests(c, false) {
+	for _, rest := range passRests(c) {
 		if passTextShown(c[rest.at:rest.end]) {
 			continue
 		}
@@ -539,24 +604,54 @@ func cleanURL(p string) bool {
 	return r != redact.Invalid && (r == p || !strings.Contains(r, redact.Mask))
 }
 
-// maskValue is a scalar's value as a response shows it: each URL-shaped
-// token with something to hide replaced by its redacted form (maskToken),
-// the other tokens with the bytes they have, and the bare mask when one
-// of them cannot be read.
-func maskValue(v string) string {
+// maskValue is a scalar's value as a response shows it, judged both ways.
+// Each URL-shaped token with something to hide is replaced by its
+// redacted form (maskToken) and the other tokens keep their bytes. Then a
+// value that starts with a URL and runs on past that token's white space
+// is judged whole, as the stream API shows it (spec.Stream.Redacted) and
+// as spec.KeepSecrets compares it: when redact.URL hides something in the
+// whole that the tokens did not (a secret that holds a space), the value
+// is redact.URL's form of it, so its mask comes back on an edit. That is
+// repeated until nothing changes. The value is the bare mask when a token
+// cannot be read or when it does not settle.
+func maskValue(v string) string { return maskScalar(v, false) }
+
+// maskScalar is maskValue; with url, v is the value of a url key, and one
+// that starts with a URL and does not parse as a whole is the bare mask,
+// as the stream API shows it. Anywhere else such a value is text, judged
+// by its tokens: a watermark text is not lost for beginning with a URL.
+func maskScalar(v string, url bool) string {
 	if !strings.Contains(v, "://") {
 		return v
 	}
-	whole := false
-	out := replaceTokens(v, func(tok string) string {
-		r, ok := maskToken(tok)
-		whole = whole || !ok
-		return r
-	})
-	if whole {
-		return redact.Mask
+	for range 4 {
+		was := v
+		whole := false
+		v = replaceTokens(v, func(tok string) string {
+			r, ok := maskToken(tok)
+			whole = whole || !ok
+			return r
+		})
+		if whole {
+			return redact.Mask
+		}
+		// The whole value, when it starts with a URL and is more than
+		// that one token: the server and the stream API read it as one
+		// URL, white space and all.
+		if w := strings.TrimSpace(v); w != "" {
+			if t, ok := nextToken(w, 0, false); ok && t.at == 0 && t.end < len(w) {
+				if r, hid := hidesNew(w); hid {
+					v = r
+				} else if url && r == w && redact.URL(w) == redact.Invalid {
+					return redact.Mask
+				}
+			}
+		}
+		if v == was {
+			return v
+		}
 	}
-	return out
+	return redact.Mask
 }
 
 // hides reports whether r, redact.URL of tok, hid something in it. Hiding
@@ -778,10 +873,11 @@ func redactNested(tok string) (out string, ok bool) {
 type scan struct {
 	clean    map[string]bool
 	redacted map[string]string
+	lines    map[string]string
 }
 
 func newScan() *scan {
-	return &scan{clean: make(map[string]bool), redacted: make(map[string]string)}
+	return &scan{clean: make(map[string]bool), redacted: make(map[string]string), lines: make(map[string]string)}
 }
 
 // cleanRaw is cleanRaw, remembered.
@@ -877,13 +973,33 @@ func (s *scan) rawClean(text []byte, root *yaml.Node) bool {
 		}
 	}
 	if hash {
-		for _, rest := range passRests(str, true) {
-			if !passTextShown(str[rest.at:rest.end]) {
-				return false
-			}
-		}
+		// What follows a '#' on its line is, or may be, a comment: it
+		// must read as a comment's line is shown.
+		clean := true
+		commentRegions(str, func(r span) {
+			clean = clean && s.commentLine(str[r.at:r.end]) == str[r.at:r.end]
+		})
+		return clean
 	}
 	return true
+}
+
+// commentRegions calls f with each part of s that runs from the first
+// '#' of a line to the line's end.
+func commentRegions(s string, f func(span)) {
+	for at := 0; at < len(s); {
+		i := strings.IndexByte(s[at:], '#')
+		if i < 0 {
+			return
+		}
+		at += i
+		end := at
+		for end < len(s) && s[end] != '\n' && s[end] != '\r' {
+			end++
+		}
+		f(span{at, end})
+		at = end
+	}
 }
 
 // span is the bytes [at, end) of a text.
@@ -1049,11 +1165,11 @@ type patch struct {
 
 // patch returns text with every change written in place: each changed
 // scalar at its position, each line comment that was hidden whole on its
-// node's line, the text after a passphrase key in a comment, and each
-// redacted comment token wherever the bytes hold it. ok is false when
-// one of the first two cannot be written in place. Where two overlap the
-// earlier kind stands. The caller decodes the result and compares it with
-// the tree: that, not the replacement, is what the result rests on.
+// node's line, and, when a comment's text changed, what follows the first
+// '#' of each line as a comment's line is shown (commentLine). ok is false
+// when one of the first two cannot be written in place. Where two overlap
+// the earlier kind stands. The caller decodes the result and compares it
+// with the tree: that, not the replacement, is what the result rests on.
 func (m *masker) patch(text []byte) (out []byte, ok bool) {
 	if m.recoded {
 		return nil, false
@@ -1085,20 +1201,13 @@ func (m *masker) patch(text []byte) (out []byte, ok bool) {
 			add(1, patch{span{at + i, at + i + len(c.old)}, maskedComment})
 		}
 	}
-	str := string(text)
-	if m.passText {
-		for _, rest := range passRests(str, true) {
-			if !passTextShown(str[rest.at:rest.end]) {
-				add(2, patch{rest, " " + redact.Mask})
+	if m.comments {
+		str := string(text)
+		commentRegions(str, func(r span) {
+			if shown := m.scan.commentLine(str[r.at:r.end]); shown != str[r.at:r.end] {
+				add(2, patch{r, shown})
 			}
-		}
-	}
-	if len(m.tokens) > 0 {
-		for _, t := range tokens(str) {
-			if r, ok := m.tokens[str[t.at:t.end]]; ok {
-				add(3, patch{t, r})
-			}
-		}
+		})
 	}
 	if len(patches) > len(m.changes) {
 		order := make([]int, len(patches))

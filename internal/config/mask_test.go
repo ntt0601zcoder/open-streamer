@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/rand/v2"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -541,13 +542,16 @@ func TestMaskComments(t *testing.T) {
 # the end: srt://h:9000?passphrase=endpass-0123456789
 `
 	want := head() + `streams:
-  # old: rtmp://h/live/olxxxxx (the first platform)
+  # old: rtmp://h/live/olxxxxx
   - name: cam
     inputs:
       - url: udp://239.0.0.1:1234   # was rtsp://admin:xxxxx@192.0.2.1/s, see https://wiki.example/cam
     # and "rtsp://admin:xxxxx@192.0.2.1/s%22, in quotes
 # the end: srt://h:9000?passphrase=xxxxx
 `
+	// The words after the RTMP URL go with its key: a stream name may hold
+	// a space, and the rest of a comment's line is read as a scalar's
+	// whole value is.
 	// A token is redacted as a log line's is: the quote and the comma
 	// after the third are part of it, and redact.URL escapes the quote.
 	out := checkMask(t, text, "oldkey-0123456789", "linepw-1", "footpw-1", "endpass-0123456789")
@@ -1382,6 +1386,8 @@ var fuzzURLs = []string{
 	"rtsp://192.0.2.2/user=admin_password=AA\u00a0" + fuzzSecret + "_channel=1",
 	"https://cdn/x.m3u8?token=AA\u3000" + fuzzSecret,
 	"a://b/\u2003rtsp://admin:" + fuzzSecret + "@192.0.2.1/s",
+	"https://cdn/x.m3u8?token=AA " + fuzzSecret,
+	"rtmp://h/live/AAAA " + fuzzSecret,
 }
 
 // FuzzMask plants a secret URL, between white space, somewhere in a text.
@@ -1453,7 +1459,17 @@ func FuzzMask(f *testing.F) {
 			if err != nil {
 				t.Fatalf("the output does not decode: %v\n%q", err, out)
 			}
-			if bytes.Contains(out, []byte(fuzzSecret)) && !bytes.Contains(text, []byte(fuzzSecret)) {
+			if strings.Contains(secret, " ") {
+				// A secret that holds a space: hidden where a scalar's
+				// value starts with the URL and reads as one whole. As
+				// words after other text it is text.
+				for _, n := range scalarNodes(root) {
+					w := strings.TrimSpace(n.Value)
+					if _, err := url.Parse(w); err == nil && strings.HasPrefix(w, secret) {
+						t.Fatalf("the secret is in a value that starts with its URL\n--- text\n%q\n--- output\n%q", in, out)
+					}
+				}
+			} else if bytes.Contains(out, []byte(fuzzSecret)) && !bytes.Contains(text, []byte(fuzzSecret)) {
 				// In a scalar's value the planted URL may also follow a
 				// '#' as the fragment of a URL the bytes do not show (an
 				// escape in double quotes): the value tells.

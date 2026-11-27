@@ -67,8 +67,13 @@
 // ASCII white space, as in a log line, and is judged both as that and cut
 // at white space that is not ASCII: a secret that holds such white space
 // is hidden whole, and so is a URL glued to another by it. A token longer
-// than 4 KiB is not read and is hidden whole. The users' password hashes
-// are not hidden.
+// than 4 KiB is not read and is hidden whole. A value that starts with a
+// URL is then judged whole as well, spaces and all, as the server and the
+// stream API read it: a secret that holds a space is hidden to its end,
+// and the value shown is what the stream API shows, so its mask comes
+// back on a write. A comment's line is judged the same way from each URL
+// to its end, which takes the words after an RTMP URL or a query secret
+// with it. The users' password hashes are not hidden.
 // Unmask is the way back for a write: in each stream entry, an
 // inputs[i].url, an outputs.push[j].url or an outputs.srt_passphrase that
 // holds the mask takes the value the stored entry of the same name holds

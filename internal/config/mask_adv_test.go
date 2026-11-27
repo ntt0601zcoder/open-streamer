@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/logging"
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 )
 
@@ -582,7 +583,7 @@ func TestMaskPassphraseText(t *testing.T) {
 		{"with '=', in upper case", entry("      # SRT_PASSPHRASE = " + pass + " (old)"), entry("      # SRT_PASSPHRASE = xxxxx")},
 		{"quoted, as JSON has it", entry(`      # "srt_passphrase": "` + pass + `",`), entry(`      # "srt_passphrase": xxxxx`)},
 		{"twice on a line", entry("      hls: true # srt_passphrase: " + pass + " srt_passphrase: " + pass), entry("      hls: true # srt_passphrase: xxxxx")},
-		{"after a URL", entry("      # rtsp://u:" + pass + "@h/s srt_passphrase=" + pass), entry("      # rtsp://u:xxxxx@h/s srt_passphrase= xxxxx")},
+		{"after a URL", entry("      # rtsp://u:" + pass + "@h/s srt_passphrase=" + pass), entry("      # rtsp://u:xxxxx@h/s%20srt_passphrase=xxxxx")},
 		{"nothing after it", entry("      # set srt_passphrase: ", "      # srt_passphrase= xxxxx"), entry("      # set srt_passphrase: ", "      # srt_passphrase= xxxxx")},
 		{"a foot comment", entry("      hls: true") + "# srt_passphrase: " + pass + "\n", entry("      hls: true") + "# srt_passphrase: xxxxx\n"},
 		{"a list", entry("      srt_passphrase: [" + pass + ", '" + pass + "']"), entry("      srt_passphrase: [xxxxx, 'xxxxx']")},
@@ -700,6 +701,105 @@ func TestMaskUnicodeSpace(t *testing.T) {
 	assert.True(t, cleanRaw(strings.Repeat("a://b/\u00a0", maxPieces-1)+"c://d"))
 }
 
+// Review round 3: a secret that holds an ASCII space. The server and the
+// stream API read the whole scalar as one URL; so does Mask, after it has
+// read its tokens.
+func TestMaskWholeValue(t *testing.T) {
+	for _, c := range []struct{ name, stored, shown string }{
+		{"a query secret", "https://c/x.m3u8?token=AA " + advSecret, "https://c/x.m3u8?token=xxxxx"},
+		{"a pair in the path", "rtsp://h/user=a_password=AA " + advSecret + "_channel=1", "rtsp://h/user=a_password=xxxxx_channel=1"},
+		{"an RTMP key", "rtmp://h/live/AAAA " + advSecret, "rtmp://h/live/AAxxxxx"},
+		{"an SRT passphrase", "srt://h:9000?passphrase=AA " + advSecret + "0123", "srt://h:9000?passphrase=xxxxx"},
+		{"two spaces and a second token", "https://c/x.m3u8?token=AA  " + advSecret + " b://c", "https://c/x.m3u8?token=xxxxx"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			// What the stream API shows of it.
+			require.Equal(t, c.shown, redact.URL(c.stored))
+			for _, q := range []string{`"`, `'`, ``} {
+				if q != `"` && strings.Contains(c.stored, "\t") {
+					continue
+				}
+				value := strings.ReplaceAll(c.stored, "\t", `\t`)
+				text := camDoc("    inputs:", "      - url: udp://239.0.0.1:1234", "    outputs:", "      push:", "        - url: "+q+value+q)
+				want := stream(t, []byte(text), "cam")
+				require.Equal(t, c.stored, want.Outputs.Push[0].URL, "the row is a live stream")
+				assert.Equal(t, c.shown, want.Redacted().Outputs.Push[0].URL)
+
+				out := checkMask(t, text, advSecret, "AA ")
+				assert.Contains(t, string(out), "        - url: "+q+c.shown+q+"\n")
+
+				// An edit elsewhere: the mask takes the stored value back,
+				// through spec.KeepSecrets.
+				got, err := Unmask([]byte(oddEdit(string(out), "\n")), []byte(text))
+				require.NoError(t, err)
+				assert.Equal(t, spec.ChangeNone, spec.Diff(want, stream(t, got, "cam")))
+				if !strings.Contains(c.stored, "\t") {
+					assert.Equal(t, oddEdit(text, "\n"), string(got), "byte for byte")
+				}
+			}
+
+			// The line commented out, and the URL in a comment's prose.
+			if strings.Contains(c.stored, "\t") {
+				return
+			}
+			for _, line := range []string{"#       - url: \"%s\"", "      # - url: %s", "# was %s"} {
+				text := head() + fmt.Sprintf(line, c.stored) + "\nstreams: []\n"
+				out := checkMask(t, text, advSecret)
+				assert.Contains(t, string(out), c.shown)
+				assert.NotContains(t, string(out), "AA ")
+			}
+			// Where the parser drops the comment, the scan finds it.
+			checkMask(t, head()+"x: [ # was "+c.stored+"\n  1]\n", advSecret)
+		})
+	}
+
+	// Both ways: a second URL after the space is hidden by the tokens,
+	// the first one's secret by the whole.
+	both := "rtsp://h/password=AA " + advSecret + "/x rtsp://u:" + advSecret + "@h/b"
+	out := checkMask(t, head()+"note: "+both+"\n# "+both+"\n", advSecret)
+	assert.Equal(t, head()+"note: rtsp://h/password=xxxxx/x%20rtsp://u:xxxxx@h/b\n# rtsp://h/password=xxxxx/x%20rtsp://u:xxxxx@h/b\n", string(out))
+
+	// A value with nothing to hide keeps its bytes, spaces and all, and
+	// so does a comment.
+	for _, v := range []string{"udp://239.0.0.1:1234 and more", "http://example.com/live now", "HTTP://h/a b", "see rtsp://h/s now"} {
+		in := []byte(head() + "note: " + v + "\n# " + v + "\n")
+		out, err := Mask(in)
+		require.NoError(t, err)
+		assert.True(t, sameSlice(in, out), v)
+	}
+	// A value that starts with a URL and does not parse as one whole is
+	// the bare mask, as the stream API shows it.
+	assert.Equal(t, "xxxxx", maskScalar("udp://h:1 udp://h:2", true))
+	assert.Equal(t, "xxxxx", maskScalar("https://c/x?token=AA\tBB", true), "a tab is no part of a URL")
+	out = checkMask(t, camDoc("    inputs:", "      - url: udp://h:1 udp://h:2", "    note: udp://h:1 udp://h:2"))
+	assert.Contains(t, string(out), "      - url: xxxxx\n    note: udp://h:1 udp://h:2\n", "under another key it is text")
+	assert.Equal(t, "xxxxx", spec.Stream{Inputs: []spec.Input{{URL: "udp://h:1 udp://h:2"}}}.Redacted().Inputs[0].URL)
+	// White space around one URL is not more than the URL.
+	assert.Equal(t, "udp://h:1234\t", maskValue("udp://h:1234\t"))
+	assert.Equal(t, " rtsp://u:xxxxx@h/s \n", maskValue(" rtsp://u:pw@h/s \n"))
+	// A value that does not start with a URL is judged by its tokens.
+	assert.Equal(t, "see https://c/x?token=xxxxx BB now", maskValue("see https://c/x?token=AA BB now"))
+
+	// hidesNew: an escaped space is not a secret.
+	for v, want := range map[string]bool{
+		"http://h/a b":               false,
+		"rtsp://u:xxxxx@h/a b":       false,
+		"https://c/x?token=xxxxx":    false,
+		"https://c/x?token=xxxxx BB": true,
+		"rtmp://h/live/abxxxxx":      false,
+		"rtmp://h/live/abxxxxx tail": true,
+		"rtsp://u:pw@h/s":            true,
+		"udp://h:1 udp://h:2":        false,
+	} {
+		_, hid := hidesNew(v)
+		assert.Equal(t, want, hid, v)
+	}
+	// More tokens on a comment's line than are judged with its rest, or a
+	// longer line: token by token.
+	assert.Equal(t, "# a://b c://d e://f g://h https://c/x?token=xxxxx BB", restOfLine("# a://b c://d e://f g://h https://c/x?token=xxxxx BB"))
+	assert.Equal(t, "# a://b c://d e://f https://c/x?token=xxxxx", restOfLine("# a://b c://d e://f https://c/x?token=xxxxx BB"))
+}
+
 // The token finder is written out by hand: it finds what the pattern it
 // stands for finds. On ASCII white space that is the log scrub's pattern.
 func TestTokens(t *testing.T) {
@@ -775,29 +875,23 @@ func TestTokens(t *testing.T) {
 // find, in ASCII case.
 func TestPassRests(t *testing.T) {
 	for _, c := range []struct {
-		s           string
-		all, hashed []string
+		s    string
+		want []string
 	}{
-		{"srt_passphrase: a", []string{" a"}, nil},
-		{"# srt_passphrase: a", []string{" a"}, []string{" a"}},
-		{"x # y SRT_Passphrase = a b # c", []string{" a b # c"}, []string{" a b # c"}},
-		{"srt_passphrase: a # srt_passphrase: b", []string{" a # srt_passphrase: b"}, []string{" b"}},
-		{"#\nsrt_passphrase: a\n# \"srt_passphrase\":\"b\",\r\n#srt_passphrase='c'", []string{" a", "\"b\",", "'c'"}, []string{"\"b\",", "'c'"}},
-		{"# srt_passphrase a, srt_passphras: b, rt_passphrase: c, srt-passphrase: d, srt_passphrase", nil, nil},
-		{"# srt_passphrase:", []string{""}, []string{""}},
-		{"# x\u2028srt_passphrase: a\u0085# srt_passphrase= b\u2029c", []string{" a", " b"}, []string{" b"}},
-		{"# \u017frt_passphrase: a", nil, nil},
-		{"_passphrase: a # srt_", nil, nil},
+		{"srt_passphrase: a", []string{" a"}},
+		{"x # y SRT_Passphrase = a b # c", []string{" a b # c"}},
+		{"#\nsrt_passphrase: a\n# \"srt_passphrase\":\"b\",\r\n#srt_passphrase='c'", []string{" a", "\"b\",", "'c'"}},
+		{"# srt_passphrase a, srt_passphras: b, rt_passphrase: c, srt-passphrase: d, srt_passphrase", nil},
+		{"# srt_passphrase:", []string{""}},
+		{"# x\u2028srt_passphrase: a\u0085# srt_passphrase= b\u2029c", []string{" a", " b"}},
+		{"# \u017frt_passphrase: a", nil},
+		{"_passphrase: a # srt_", nil},
 	} {
-		var all, hashed []string
-		for _, r := range passRests(c.s, false) {
-			all = append(all, c.s[r.at:r.end])
+		var got []string
+		for _, r := range passRests(c.s) {
+			got = append(got, c.s[r.at:r.end])
 		}
-		for _, r := range passRests(c.s, true) {
-			hashed = append(hashed, c.s[r.at:r.end])
-		}
-		assert.Equal(t, c.all, all, "%q", c.s)
-		assert.Equal(t, c.hashed, hashed, "%q after a '#'", c.s)
+		assert.Equal(t, c.want, got, "%q", c.s)
 	}
 }
 
