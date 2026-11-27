@@ -852,7 +852,31 @@ failed every run on 1.26.11.
 | M5c2a ([plan](superpowers/plans/2026-11-27-m5c2-secrets-srtp.md), done) | Secrets: credentials in URL paths, queries and stream IDs redacted; secrets write-only over the API (every response masked, the mask keeps the stored secret, the config editor included); SRT output encryption with a per-stream passphrase | M5c1 | ffmpeg 6.1 and 8 and our own client play an SRT output that requires a passphrase, and a caller without it or with a wrong one is refused; no secret, the credentials embedded in a URL path or query and the write-only field included, appears in any response to any role, in a log or in a metric; an editor's read, change and write of a stream and of the whole config keeps every stored secret without ever being shown one (R-T1). Proved by `TestM5c2aSRTFFmpeg`, `TestM5c2aWriteOnly`, `TestM5c2aNoSecretsLeak` and `TestM5c2aPlayers`, with the redact, logging, spec, config, srtout, conform, stream, api and server suites |
 | M5c2b | SRTP for RTSP: `pkg/srtp`, `RTP/SAVP` with SDES keys inside RTSPS, server and pull client | M5c1 | Not yet planned. Proposed (R-T1 of the M5c2a plan): ffmpeg 6.1 and 8 play `rtsps://` with SRTP over UDP and over the interleaved channel against our server, and our client pulls the same from our server |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5a | Feature tests; DVR playback passes `osconform` |
-| M7 | Cutover | M1–M6 | A soak plan and tooling written for v2 in M7 (the v1 plan and `bench/soak` were removed on 2026-11-27, with v1 itself) run v2 for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
+| M6b | Console: a web UI for v2, written from scratch against the v2 API (not a port of `open-streamer-console`, which targets v1), built to static files and embedded in `openstreamer` with `go:embed`, served by the server itself (no nginx, no separate container) | M5a, M6 | Not yet planned. Proposed: an operator manages streams, outputs, assets, users' sessions and the whole config, and watches status and players, from the console alone, as the viewer and as the editor; secrets show as `xxxxx` and the mask written back keeps them (M5c2a); `make build` still works without Node. See "Console (M6b)" below |
+| M7 | Cutover | M1–M6b | A soak plan and tooling written for v2 in M7 (the v1 plan and `bench/soak` were removed on 2026-11-27, with v1 itself) run v2 for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
+
+### Console (M6b)
+
+Added on 2026-11-27 at the user's request. v1's console
+(`ntt0601zcoder/open-streamer-console`: React 19, Vite, Radix, TanStack
+Query, about 20k lines) speaks v1's API, which v2 replaces (`/api/v1/*`,
+Basic auth with viewer and editor roles, write-only secrets, the whole-config
+editor). Decided with the user:
+
+- **Written from scratch** against the v2 API and its OpenAPI document. v1's
+  console is a reference for what operators use, not code to port.
+- **Embedded in the server binary** (`go:embed`) and served by `openstreamer`
+  on its own listener, so a deployment stays one binary.
+- **Before M7**, so the cutover soak runs v2 with its console.
+
+Left to M6b's plan: the listener and path it is served on (the API listener,
+same origin, is the natural choice); how the embedded build is produced so
+that a pure-Go `make build` still works (a committed build, or a placeholder
+page when the UI was not built); the frontend stack and its dependency rules
+(players such as hls.js and dash.js are allowed; the independent-libraries
+rule of §2 is about the media server's Go code); CI (Node version, lint,
+typecheck, unit tests, a browser smoke test against a real server); and the
+console's own auth flow on Basic auth.
 
 M3 starts after M1, in parallel with M2, with `pkg/hls` (parser and writer,
 which both `osconform` and M2's HLS pull need) and `pkg/dash`, then the
