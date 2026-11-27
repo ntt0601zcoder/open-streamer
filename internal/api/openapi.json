@@ -1,0 +1,2235 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Open Streamer API",
+    "version": "1",
+    "description": "The REST API of Open Streamer: the streams, the assets (watermark images and fonts), the config editor, the reload and the status documents. Every route but /healthz needs HTTP Basic credentials of a user in the config file; a viewer reads, an editor reads and writes (x-role on each operation). Secrets are write-only, for every role: a response shows xxxxx wherever a stream secret is stored (an input's or a push's credentials, an SRT passphrase), in the stream documents and in the config text alike, and a write that sends xxxxx back keeps the stored secret. A query that holds the key secrets is a 400 on every authenticated route. Every response has Cache-Control: no-store (the thumbnail and an asset's file: no-cache) and X-Content-Type-Options: nosniff. A request no route answers gets a plain-text 404 or 405, without authentication. The editor also has net/http/pprof under /debug/pprof/. The API has no TLS before M5c: keep it on loopback or behind a TLS reverse proxy. Run the server under a service manager that restarts it: there is no per-stream panic recovery, so a panic ends the process and the restart restores every stream from the config file."
+  },
+  "security": [
+    {
+      "basicAuth": []
+    }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "health",
+        "summary": "Whether the server answers.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The server answers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "const": "ok",
+                      "description": "Always ok."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/version": {
+      "get": {
+        "operationId": "version",
+        "summary": "The server's version.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The version.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "string",
+                      "description": "The version of the build."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "operationId": "openapi",
+        "summary": "This document.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The OpenAPI document.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/streams": {
+      "get": {
+        "operationId": "listStreams",
+        "summary": "Every stream's document, sorted by name.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The streams.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "streams"
+                  ],
+                  "properties": {
+                    "streams": {
+                      "type": "array",
+                      "description": "The streams, sorted by name.",
+                      "items": {
+                        "$ref": "#/components/schemas/Stream"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/streams/{name}": {
+      "get": {
+        "operationId": "getStream",
+        "summary": "One stream's document.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stream.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stream"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "put": {
+        "operationId": "putStream",
+        "summary": "Create or replace one stream.",
+        "x-role": "editor",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "description": "The edit is written to the config file and applied: only what differs is touched. The whole resulting config is judged.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "$ref": "#/components/parameters/requestedBy"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatchOptional"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "The stream's document, at most 1048576 bytes; unknown fields are refused. A URL or srt_passphrase that holds xxxxx keeps the secret this stream has stored for it, and is refused (422) when there is none.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Stream"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stream was replaced, or nothing differed.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PutStreamResult"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The stream was created.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PutStreamResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/TooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteStream",
+        "summary": "Delete one stream.",
+        "x-role": "editor",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "$ref": "#/components/parameters/requestedBy"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatchOptional"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The stream is gone."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/streams/{name}/status": {
+      "get": {
+        "operationId": "streamStatus",
+        "summary": "One stream's state.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/streams/{name}/thumbnail.jpg": {
+      "get": {
+        "operationId": "streamThumbnail",
+        "summary": "The stream's latest thumbnail.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The JPEG. Cache-Control is no-cache; the ETag is \"<epoch>-<pts>\".",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match holds the shot's ETag."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/assets": {
+      "get": {
+        "operationId": "listAssets",
+        "summary": "Every asset, sorted by name.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The assets.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "assets"
+                  ],
+                  "properties": {
+                    "assets": {
+                      "type": "array",
+                      "description": "The assets, sorted by name. A file that is not a regular file, has no asset name, or is over its kind's limit is not listed.",
+                      "items": {
+                        "$ref": "#/components/schemas/Asset"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/assets/{name}": {
+      "get": {
+        "operationId": "getAsset",
+        "summary": "One asset's file.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/assetName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bytes, streamed. Content-Type is the asset's type, Content-Disposition is attachment, Cache-Control is no-cache; Range requests are served.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "font/ttf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "font/otf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match holds the asset's ETag."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/TooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "put": {
+        "operationId": "putAsset",
+        "summary": "Create or replace one asset.",
+        "x-role": "editor",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "description": "The body is checked (an image must decode as the format its name says, a font must be a single sfnt face that the font probe accepts) and stored whole: a reader sees the old bytes or the new ones. Every stream with a supervisor that names the asset is given the new bytes, and every stream left stopped that names it is tried again. At most 2 uploads run at once: an upload waits up to 30 s for a slot. Once it has one, its body must arrive within 30 s plus 1 s per 256 KiB of its kind's limit (34 s for an image, 126 s for a font).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/assetName"
+          },
+          {
+            "$ref": "#/components/parameters/requestedBy"
+          },
+          {
+            "$ref": "#/components/parameters/assetIfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ifNoneMatchStar"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "The file's bytes: at most 1048576 for an image, 25165824 for a font. A larger Content-Length is refused before the body is read.",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The asset was replaced.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetPut"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The asset was created.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetPut"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/TooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteAsset",
+        "summary": "Delete one asset.",
+        "x-role": "editor",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "description": "Refused while a stream names the asset (asset_in_use) or while the config holds entries the start skipped (config_invalid_entries).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/assetName"
+          },
+          {
+            "$ref": "#/components/parameters/requestedBy"
+          },
+          {
+            "$ref": "#/components/parameters/assetIfMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The asset is gone."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/config": {
+      "get": {
+        "operationId": "getConfig",
+        "summary": "The whole config file, masked.",
+        "x-role": "editor",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The YAML text as last loaded, reloaded or written, with every stream secret masked as xxxxx (a URL's credentials, an SRT passphrase, and the URLs in comments); a PUT that sends it back keeps the stored secrets. It still holds the users' password hashes. The ETag is a keyed tag of the stored text, which changes when the server restarts.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/yaml": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 4194304
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match holds the config's ETag."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "put": {
+        "operationId": "putConfig",
+        "summary": "Replace the whole config file.",
+        "x-role": "editor",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/requestedBy"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatchRequired"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "The YAML text, at most 4194304 bytes. A stream's input URL, push URL or srt_passphrase that holds xxxxx keeps the secret the stored entry of the same name holds for it, and is refused (422) when there is none; a text without a mask is written byte for byte as sent.",
+          "content": {
+            "application/yaml": {
+              "schema": {
+                "type": "string",
+                "maxLength": 4194304
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The config was written, its masks resolved, and applied.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/TooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/config/status": {
+      "get": {
+        "operationId": "configStatus",
+        "summary": "The state of the config and of the file.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/reload": {
+      "post": {
+        "operationId": "reload",
+        "summary": "Reload the config file, as SIGHUP does.",
+        "x-role": "editor",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "description": "No body.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/requestedBy"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file was read and applied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "metrics",
+        "summary": "The Prometheus exposition.",
+        "x-role": "viewer",
+        "security": [
+          {
+            "basicAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The metrics, in the text format 0.0.4.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyAttempts"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "basicAuth": {
+        "type": "http",
+        "scheme": "basic"
+      }
+    },
+    "parameters": {
+      "name": {
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "description": "The stream's name. A name no stream can have is a 404.",
+        "schema": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+        }
+      },
+      "ifMatchOptional": {
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "description": "One tag, exactly as an ETag header gave it, or *: the write is refused with 412 when the stream has another tag, and also when the stream does not exist (a DELETE of a missing name with If-Match is 412, not 404). A list of tags and a weak tag (W/) never match.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "ifMatchRequired": {
+        "name": "If-Match",
+        "in": "header",
+        "required": true,
+        "description": "The config's ETag, one tag exactly as GET /api/v1/config returned it; 428 without it, 412 when the config has another. A list of tags, a weak tag (W/) and * never match.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "requestedBy": {
+        "name": "X-Requested-By",
+        "in": "header",
+        "required": true,
+        "description": "Any non-empty value. Every PUT, DELETE and POST needs it: a cross-site form cannot set it. Checked before the credentials.",
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "assetName": {
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "description": "The asset's name: an image (.png, .jpg, .jpeg) or a font (.ttf, .otf), lower case. A name no asset can have is a 404, and the server is not asked.",
+        "schema": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}\\.(png|jpg|jpeg|ttf|otf)$"
+        }
+      },
+      "assetIfMatch": {
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "description": "One tag, exactly as an ETag header gave it, or *: the write is refused with 412 when the asset has another tag, and also when it does not exist. The header is compared as one exact strong tag, so a list of tags or a weak tag (W/\"…\") answers 412, even when it names the asset's tag. The tag is cached by the file's identity, size and modification time: a file edited in place by hand, at the same size within one tick of the file system's clock, can keep its old tag, and a write with that tag is then accepted (hand edits are outside the API's contract).",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "ifNoneMatchStar": {
+        "name": "If-None-Match",
+        "in": "header",
+        "required": false,
+        "description": "Only *: the upload is refused with 412 when the asset exists. Any other value is a 400.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "*"
+          ]
+        }
+      }
+    },
+    "headers": {
+      "ETag": {
+        "description": "The entity tag of the document, for If-Match and If-None-Match. A stream's tag is keyed per process: it changes when the server restarts.",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "bad_request: a body that is not one document of the expected shape or could not be read, a name other than the path's, an asset upload's If-None-Match other than *, a write without X-Requested-By, or a query that holds the key secrets: ?secrets=1 is gone, since secrets are write-only.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "unauthorized: no, malformed or wrong credentials.",
+        "headers": {
+          "WWW-Authenticate": {
+            "schema": {
+              "type": "string",
+              "const": "Basic realm=\"openstreamer\""
+            },
+            "description": "The challenge."
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "forbidden: a viewer on an editor's route.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "not_found: no such stream or asset, an invalid name in the path, or no thumbnail yet.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "conflict: a listen address or a copy:// cycle conflicts with another stream or the server (errors lists each). config_changed: the config file was edited by hand; reload first. config_unreadable (a reload only): the config file cannot be read, or on Unix is not mode 0600; message says why, and nothing changed. assets_off (the asset routes): server.assets_dir is not set. asset_in_use (an asset DELETE): streams name the asset; errors lists them. config_invalid_entries (an asset DELETE): the config holds entries the start skipped, which could name the asset; fix or remove them first.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "PreconditionFailed": {
+        "description": "precondition_failed: the If-Match header does not match; for an asset upload, also If-None-Match: * on an asset that exists.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooLarge": {
+        "description": "too_large: the body is over the limit (an asset: 1048576 bytes for an image, 25165824 for a font).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "UnsupportedMediaType": {
+        "description": "unsupported_media_type: the Content-Type is not the one the route takes.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "invalid_config: the config that would result is invalid. invalid_spec: the stream cannot run on this server (for one, it turns on rtmp, rtsp or srt while that server.*.listen is empty); it takes precedence over conflict. errors lists every one. invalid_asset (an asset upload): the bytes are not what the name says; message says why.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "InsufficientStorage": {
+        "description": "assets_full: the assets directory would hold more than 256 files or 536870912 bytes.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "PreconditionRequired": {
+        "description": "precondition_required: the If-Match header is required.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooManyAttempts": {
+        "description": "too_many_attempts: this address and user name are in a backoff after failed logins, or have 5 logins counted or in flight, or this address has 4 logins being verified, whatever their user names. No address is blocked for failed logins. The address is the connection's: behind a reverse proxy every client shares the proxy's address and so the per-name limits and the one cap of 4.",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Seconds to wait."
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Internal": {
+        "description": "config_write_failed (a write only): the edit was valid but the config file could not be written (a read-only directory, a full disk); message says why, and nothing was applied. asset_write_failed (an asset write): the asset could not be written or removed; the cause is in the server's log. internal: anything else; the cause is in the server's log.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "unavailable: the server is stopping, too many logins are waiting (then with Retry-After: 1), an asset upload waited 30 s for one of the 2 upload slots (then with Retry-After: 1), or the request was cancelled. probe_failed (a font upload): the font could not be checked; try again.",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Seconds to wait, when logins are waiting."
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Stream": {
+        "type": "object",
+        "description": "One stream's document.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The stream's name; in a PUT body it may be empty and must otherwise equal the path's. Not a Windows device name.",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+          },
+          "disabled": {
+            "type": "boolean",
+            "description": "The stream is kept in the config and does not run."
+          },
+          "inputs": {
+            "type": "array",
+            "description": "The sources by priority, first highest.",
+            "items": {
+              "$ref": "#/components/schemas/Input"
+            },
+            "minItems": 1,
+            "maxItems": 8
+          },
+          "layout": {
+            "type": "array",
+            "description": "The track kinds to carry; empty means both.",
+            "items": {
+              "type": "string",
+              "enum": [
+                "video",
+                "audio"
+              ]
+            },
+            "uniqueItems": true,
+            "maxItems": 2
+          },
+          "audio_language": {
+            "type": "string",
+            "description": "BCP 47 tag of the stream's audio, written to the HLS masters and the MPD; empty: not declared.",
+            "maxLength": 35
+          },
+          "transcode": {
+            "description": "The ladder; absent for a passthrough stream.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Transcode"
+              }
+            ]
+          },
+          "thumbnail": {
+            "description": "The operator preview of the source; absent for none.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Thumbnail"
+              }
+            ]
+          },
+          "outputs": {
+            "description": "The outputs the stream is served on, and where it is pushed.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Outputs"
+              }
+            ]
+          }
+        },
+        "required": [
+          "inputs"
+        ]
+      },
+      "Input": {
+        "type": "object",
+        "description": "One source of a stream.",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The ingest URL. Its password, the credentials in its path and query and an RTMP stream key are write-only: a response shows xxxxx in their place, and the URL written back as shown keeps the stored secret while nothing else in it changed; a mask that stands for no stored secret of this stream is refused.",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        },
+        "required": [
+          "url"
+        ]
+      },
+      "Transcode": {
+        "type": "object",
+        "description": "A stream's ladder.",
+        "properties": {
+          "renditions": {
+            "type": "array",
+            "description": "The rungs, each served as <name>_<label>; labels are distinct.",
+            "items": {
+              "$ref": "#/components/schemas/Rendition"
+            },
+            "minItems": 1,
+            "maxItems": 8
+          },
+          "audio": {
+            "description": "The audio of every rung.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Audio"
+              }
+            ]
+          },
+          "watermark": {
+            "description": "A text or an image drawn on every encoded rung.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Watermark"
+              }
+            ]
+          }
+        },
+        "required": [
+          "renditions"
+        ]
+      },
+      "Rendition": {
+        "type": "object",
+        "description": "One rung of a ladder: a copy of the source, or an encode.",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "The rung's label, distinct within the ladder.",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+          },
+          "copy": {
+            "type": "boolean",
+            "description": "The rung is the source, not encoded; a copy rung sets nothing but its label."
+          },
+          "height": {
+            "type": "integer",
+            "description": "The encoded height in pixels, even.",
+            "minimum": 2,
+            "maximum": 4320,
+            "multipleOf": 2
+          },
+          "bitrate_kbps": {
+            "type": "integer",
+            "description": "The video bitrate in kbit/s.",
+            "exclusiveMinimum": 0
+          },
+          "max_bitrate_kbps": {
+            "type": "integer",
+            "description": "The peak video bitrate in kbit/s; 0 means the encoder's default."
+          },
+          "b_frames": {
+            "type": "integer",
+            "description": "The number of B-frames; 0 means none."
+          },
+          "preset": {
+            "type": "string",
+            "description": "The encoder's preset; empty means its default."
+          },
+          "encoder": {
+            "type": "string",
+            "description": "The encoder; empty means the server's choice.",
+            "enum": [
+              "",
+              "x264",
+              "nvenc"
+            ]
+          },
+          "no_fallback": {
+            "type": "boolean",
+            "description": "Fail the ladder when NVENC cannot be opened for this rendition, instead of encoding it with libx264; needs encoder nvenc."
+          }
+        },
+        "required": [
+          "label"
+        ]
+      },
+      "Audio": {
+        "type": "object",
+        "description": "The audio of every rung of a ladder.",
+        "properties": {
+          "copy": {
+            "type": "boolean",
+            "description": "The source's audio is carried as it is."
+          },
+          "bitrate_kbps": {
+            "type": "integer",
+            "description": "The AAC bitrate in kbit/s; 0 means the default."
+          },
+          "sample_rate": {
+            "type": "integer",
+            "description": "The sample rate in Hz; 0 means the source's."
+          },
+          "channels": {
+            "type": "integer",
+            "description": "The channel count; 0 means the source's."
+          }
+        }
+      },
+      "Watermark": {
+        "type": "object",
+        "description": "A text or an image drawn on every encoded rung; exactly one of text and image is set.",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The text to draw."
+          },
+          "image": {
+            "type": "string",
+            "description": "The name of a PNG or JPEG file in the assets directory.",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}\\.(png|jpg|jpeg)$"
+          },
+          "position": {
+            "type": "string",
+            "description": "The corner, or c for the centre; empty means tl.",
+            "enum": [
+              "",
+              "tl",
+              "tr",
+              "bl",
+              "br",
+              "c"
+            ]
+          },
+          "opacity_pct": {
+            "type": "integer",
+            "description": "The opacity in percent; 0 means the default."
+          },
+          "size_pct": {
+            "type": "integer",
+            "description": "The size in percent of the picture's height; 0 means the default."
+          },
+          "time_zone": {
+            "type": "string",
+            "description": "An IANA time zone for a clock in the text; empty means none."
+          },
+          "font": {
+            "type": "string",
+            "description": "The name of a TTF or OTF file in the assets directory, for a text watermark; the built-in DejaVu Sans when empty.",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}\\.(ttf|otf)$"
+          }
+        }
+      },
+      "Thumbnail": {
+        "type": "object",
+        "description": "The operator preview of the source.",
+        "properties": {
+          "interval_sec": {
+            "type": "integer",
+            "description": "The seconds between shots; 0 means the default."
+          },
+          "height": {
+            "type": "integer",
+            "description": "The shot's height in pixels; 0 means the default."
+          },
+          "quality": {
+            "type": "integer",
+            "description": "The JPEG quality; 0 means the default."
+          }
+        }
+      },
+      "Outputs": {
+        "type": "object",
+        "description": "The outputs a stream is served on, and where it is pushed.",
+        "properties": {
+          "hls": {
+            "type": "boolean",
+            "description": "HLS: hls/* and cmaf/*.m3u8."
+          },
+          "dash": {
+            "type": "boolean",
+            "description": "DASH: cmaf/*.mpd."
+          },
+          "httpts": {
+            "type": "boolean",
+            "description": "MPEG-TS over HTTP."
+          },
+          "rtmp": {
+            "type": "boolean",
+            "description": "RTMP play."
+          },
+          "rtsp": {
+            "type": "boolean",
+            "description": "RTSP play."
+          },
+          "srt": {
+            "type": "boolean",
+            "description": "SRT play."
+          },
+          "srt_passphrase": {
+            "type": "string",
+            "description": "Required of SRT players of this stream: 10 to 79 characters of A-Z, a-z, 0-9, '.', '_', '~' and '-'. Write-only: a response shows xxxxx when one is stored, and xxxxx written back keeps it"
+          },
+          "push": {
+            "type": "array",
+            "description": "The targets the stream is pushed to; URLs are distinct.",
+            "items": {
+              "$ref": "#/components/schemas/Push"
+            },
+            "maxItems": 8
+          }
+        }
+      },
+      "Push": {
+        "type": "object",
+        "description": "One target the stream is pushed to.",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The target URL; write-only like an input URL.",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        },
+        "required": [
+          "url"
+        ]
+      },
+      "Status": {
+        "type": "object",
+        "description": "A stream's state.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The stream's name."
+          },
+          "state": {
+            "type": "string",
+            "description": "The state of the stream.",
+            "enum": [
+              "stopped",
+              "starting",
+              "running",
+              "no_input",
+              "backoff"
+            ]
+          },
+          "generation": {
+            "type": "integer",
+            "description": "The number of the running generation; it grows with every rebuild."
+          },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the generation started; null between generations."
+          },
+          "restarts": {
+            "type": "integer",
+            "description": "Rebuilds after a failure."
+          },
+          "rebuilds": {
+            "type": "integer",
+            "description": "Rebuilds for an edit."
+          },
+          "last_error": {
+            "type": "string",
+            "description": "The last error, with URLs redacted; prefixed with the part it came from."
+          },
+          "last_error_at": {
+            "type": "string",
+            "description": "When last_error was recorded.",
+            "format": "date-time"
+          },
+          "served": {
+            "type": "array",
+            "description": "The names the stream is served under.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "outputs": {
+            "description": "The outputs that are on, push URLs redacted.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Outputs"
+              }
+            ]
+          },
+          "inputs": {
+            "type": "array",
+            "description": "The input URLs, redacted.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "active_input": {
+            "type": "integer",
+            "description": "The index of the input in use; -1 when none.",
+            "minimum": -1
+          },
+          "input_switches": {
+            "type": "integer",
+            "description": "How often the active input changed."
+          },
+          "tracks": {
+            "type": "array",
+            "description": "The live tracks of the source.",
+            "items": {
+              "$ref": "#/components/schemas/StatusTrack"
+            }
+          },
+          "transcoder": {
+            "description": "The transcoder or thumbnailer, when the stream has one.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StatusTranscoder"
+              }
+            ]
+          },
+          "pushes": {
+            "type": "array",
+            "description": "The state of each push.",
+            "items": {
+              "$ref": "#/components/schemas/StatusPush"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "state",
+          "generation",
+          "since",
+          "restarts",
+          "rebuilds",
+          "served",
+          "outputs",
+          "inputs",
+          "active_input",
+          "input_switches",
+          "tracks"
+        ]
+      },
+      "StatusTrack": {
+        "type": "object",
+        "description": "One live track of the source.",
+        "properties": {
+          "track": {
+            "type": "integer",
+            "description": "The track's index."
+          },
+          "kind": {
+            "type": "string",
+            "description": "video or audio."
+          },
+          "codec": {
+            "type": "string",
+            "description": "The codec's name."
+          }
+        },
+        "required": [
+          "track",
+          "kind",
+          "codec"
+        ]
+      },
+      "StatusTranscoder": {
+        "type": "object",
+        "description": "The state of a stream's transcoder or thumbnailer.",
+        "properties": {
+          "pid": {
+            "type": "integer",
+            "description": "The process ID of the child; 0 while none runs."
+          },
+          "spawns": {
+            "type": "integer",
+            "description": "How often the child was started."
+          },
+          "exits": {
+            "type": "integer",
+            "description": "How often the child exited."
+          },
+          "encoder_fallbacks": {
+            "type": "integer",
+            "description": "How often an encoder fell back to another."
+          },
+          "encoder_refusals": {
+            "type": "integer",
+            "description": "Transcoder children that ended because a no_fallback rendition could not open its encoder."
+          },
+          "thumbnails": {
+            "type": "integer",
+            "description": "The shots made."
+          }
+        },
+        "required": [
+          "pid",
+          "spawns",
+          "exits",
+          "encoder_fallbacks",
+          "encoder_refusals",
+          "thumbnails"
+        ]
+      },
+      "StatusPush": {
+        "type": "object",
+        "description": "The state of one push.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The first 8 hex digits of a keyed tag of the stream's name and the URL, which changes when the server restarts: the target label of the metrics. It shows nothing of the URL, which is write-only, and two streams that push to one URL have different ids."
+          },
+          "target": {
+            "type": "string",
+            "description": "The target URL, redacted."
+          },
+          "state": {
+            "type": "string",
+            "description": "The state of the push."
+          },
+          "connects": {
+            "type": "integer",
+            "description": "Successful connections."
+          },
+          "failures": {
+            "type": "integer",
+            "description": "Failed connections and broken sessions."
+          },
+          "last_error": {
+            "type": "string",
+            "description": "The last error, redacted."
+          }
+        },
+        "required": [
+          "id",
+          "target",
+          "state",
+          "connects",
+          "failures"
+        ]
+      },
+      "Outcome": {
+        "type": "object",
+        "description": "What an edit did to one stream.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The stream's name."
+          },
+          "applied": {
+            "type": "string",
+            "description": "created: a new stream. started: it was disabled or stopped and now runs; also a stream that did not differ but had been left stopped because it could not run (a listen address in use, a missing asset), which every edit and reload tries again. stopped: the stream has no supervisor after the edit (it is disabled). unchanged: nothing differed; a stream left stopped that still cannot run stays so, with its last_error refreshed. outputs: only the outputs differed, applied in place. live: the inputs, the watermark or the audio language of a running stream were changed in place; no session ended. rebuild: the stream was rebuilt. deleted: the stream is gone.",
+            "enum": [
+              "created",
+              "started",
+              "stopped",
+              "unchanged",
+              "outputs",
+              "live",
+              "rebuild",
+              "deleted"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "applied"
+        ]
+      },
+      "PutStreamResult": {
+        "type": "object",
+        "description": "The answer to a stream PUT.",
+        "properties": {
+          "stream": {
+            "description": "The document as stored, redacted like every response.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Stream"
+              }
+            ]
+          },
+          "applied": {
+            "type": "string",
+            "description": "What the edit did; see Outcome.applied.",
+            "enum": [
+              "created",
+              "started",
+              "stopped",
+              "unchanged",
+              "outputs",
+              "live",
+              "rebuild",
+              "deleted"
+            ]
+          }
+        },
+        "required": [
+          "stream",
+          "applied"
+        ]
+      },
+      "ApplyResult": {
+        "type": "object",
+        "description": "What a whole-config write or a reload did.",
+        "properties": {
+          "streams": {
+            "type": "array",
+            "description": "One outcome per stream of the old and the new config, by name.",
+            "items": {
+              "$ref": "#/components/schemas/Outcome"
+            }
+          },
+          "restart_required": {
+            "type": "array",
+            "description": "The server keys that differ from the running ones and need a restart; empty when none.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "etag": {
+            "type": "string",
+            "description": "The ETag of the config now in force."
+          }
+        },
+        "required": [
+          "streams",
+          "restart_required",
+          "etag"
+        ]
+      },
+      "ConfigStatus": {
+        "type": "object",
+        "description": "The state of the config in force and of the file.",
+        "properties": {
+          "etag": {
+            "type": "string",
+            "description": "The ETag of the config in force."
+          },
+          "loaded_at": {
+            "type": "string",
+            "description": "When the config in force was loaded, reloaded or written.",
+            "format": "date-time"
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "The file on disk differs: a reload is pending, and API writes are refused until then."
+          },
+          "load_errors": {
+            "type": "array",
+            "description": "The entries the start skipped, until an edit or a reload is applied, and the streams that cannot run and are left stopped, each with the reason of the last edit or reload, which tried it again.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "last_reload_at": {
+            "type": "string",
+            "description": "When the last reload was tried.",
+            "format": "date-time"
+          },
+          "last_reload_error": {
+            "type": "string",
+            "description": "Why the last reload failed; absent when it did not."
+          },
+          "restart_required": {
+            "type": "array",
+            "description": "The server keys that differ from the running ones.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "certificate": {
+            "description": "The certificate of the TLS listeners, read at the time of the request; absent without server.tls.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CertStatus"
+              }
+            ]
+          }
+        },
+        "required": [
+          "etag",
+          "loaded_at",
+          "stale",
+          "load_errors",
+          "restart_required"
+        ]
+      },
+      "CertStatus": {
+        "type": "object",
+        "description": "The certificate pair in force. Its files are read again every 30 s when they changed, and at every reload; the paths themselves need a restart.",
+        "properties": {
+          "not_after": {
+            "type": "string",
+            "description": "When the leaf in force expires.",
+            "format": "date-time"
+          },
+          "names": {
+            "type": "array",
+            "description": "The leaf's subject alternative names: DNS names and IP addresses.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "loaded_at": {
+            "type": "string",
+            "description": "When the leaf in force was first read.",
+            "format": "date-time"
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Why the latest read of the pair failed; the certificate in force is the one before it. Absent when it did not fail."
+          }
+        },
+        "required": [
+          "not_after",
+          "names",
+          "loaded_at"
+        ]
+      },
+      "Asset": {
+        "type": "object",
+        "description": "One asset: a watermark image or a font in server.assets_dir.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The asset's name."
+          },
+          "kind": {
+            "type": "string",
+            "description": "What the asset is, by its name.",
+            "enum": [
+              "image",
+              "font"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "description": "The media type, by the content: image/png, image/jpeg, font/ttf or font/otf."
+          },
+          "size": {
+            "type": "integer",
+            "description": "The size in bytes."
+          },
+          "modified": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The file's modification time."
+          },
+          "etag": {
+            "type": "string",
+            "description": "The entity tag: a hash of the bytes, the same value as the ETag header."
+          },
+          "used_by": {
+            "type": "array",
+            "description": "The streams whose spec names the asset, sorted; [] when none.",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "type",
+          "size",
+          "modified",
+          "etag",
+          "used_by"
+        ]
+      },
+      "AssetPut": {
+        "type": "object",
+        "description": "The answer to an asset upload: the asset, and what each stream that names it did with the new bytes.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The asset's name."
+          },
+          "kind": {
+            "type": "string",
+            "description": "What the asset is, by its name.",
+            "enum": [
+              "image",
+              "font"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "description": "The media type, by the content: image/png, image/jpeg, font/ttf or font/otf."
+          },
+          "size": {
+            "type": "integer",
+            "description": "The size in bytes."
+          },
+          "modified": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The file's modification time."
+          },
+          "etag": {
+            "type": "string",
+            "description": "The entity tag: a hash of the bytes, the same value as the ETag header."
+          },
+          "used_by": {
+            "type": "array",
+            "description": "The streams whose spec names the asset, sorted; [] when none.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "refreshed": {
+            "type": "array",
+            "description": "One per stream with a supervisor that names the asset; [] when none.",
+            "items": {
+              "type": "object",
+              "required": [
+                "stream",
+                "ok"
+              ],
+              "properties": {
+                "stream": {
+                  "type": "string",
+                  "description": "The stream's name."
+                },
+                "ok": {
+                  "type": "boolean",
+                  "description": "The transcoder took the new bytes; the child may not have drawn them yet."
+                },
+                "error": {
+                  "type": "string",
+                  "description": "Why it did not; absent when ok. Between two generations, the next build takes the new bytes."
+                }
+              }
+            }
+          },
+          "retried": {
+            "type": "array",
+            "description": "The streams left stopped that name the asset (one could not run for a missing or bad asset), tried again; [] when none.",
+            "items": {
+              "$ref": "#/components/schemas/Outcome"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "type",
+          "size",
+          "modified",
+          "etag",
+          "used_by",
+          "refreshed",
+          "retried"
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "description": "The error document.",
+        "properties": {
+          "error": {
+            "description": "The error.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ErrorDetail"
+              }
+            ]
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "description": "One error.",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The machine-readable code.",
+            "enum": [
+              "bad_request",
+              "unauthorized",
+              "forbidden",
+              "not_found",
+              "conflict",
+              "config_changed",
+              "config_unreadable",
+              "precondition_failed",
+              "too_large",
+              "unsupported_media_type",
+              "invalid_config",
+              "invalid_spec",
+              "precondition_required",
+              "too_many_attempts",
+              "config_write_failed",
+              "internal",
+              "unavailable",
+              "invalid_asset",
+              "assets_full",
+              "assets_off",
+              "asset_in_use",
+              "asset_write_failed",
+              "probe_failed",
+              "config_invalid_entries"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "description": "A sentence for a person."
+          },
+          "errors": {
+            "type": "array",
+            "description": "Every single error, for the codes that have several: conflict, invalid_config, invalid_spec; for asset_in_use, the names of the streams.",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ]
+      }
+    }
+  }
+}

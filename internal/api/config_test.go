@@ -1,0 +1,252 @@
+package api
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/config"
+	"github.com/ntt0601zcoder/open-streamer/internal/stream"
+)
+
+const configText = "# the config\r\nversion: 1 # one\n\nusers:\n  - name: ops\n    role: editor\n" +
+	"    password_hash: pbkdf2-sha256$600000$c2FsdHNhbHRzYWx0c2FsdA$a2V5\nstreams:\n  - name: cam\n" +
+	"    inputs:\n      - url: rtmp://h/live/secretkey\n\n"
+
+func yamlBody(s string) reqOpt { return body("application/yaml", []byte(s)) }
+
+func TestConfigGet(t *testing.T) {
+	e := newEnv(t)
+	// ConfigText is the text as a response shows it: masked.
+	masked, err := config.Mask([]byte(configText))
+	require.NoError(t, err)
+	require.NotContains(t, string(masked), "secretkey")
+	e.be.text, e.be.etag = masked, config.ETag([]byte(configText))
+
+	rec := e.do(http.MethodGet, "/api/v1/config", editor...)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, string(masked), rec.Body.String(), "the backend's text, verbatim")
+	assert.Equal(t, "application/yaml", rec.Header().Get("Content-Type"))
+	assert.Equal(t, e.be.etag, rec.Header().Get("ETag"))
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+
+	rec = e.do(http.MethodGet, "/api/v1/config", with(editor, hdr("If-None-Match", e.be.etag))...)
+	assert.Equal(t, http.StatusNotModified, rec.Code)
+	assert.Empty(t, rec.Body.String())
+
+	// The viewer gets no byte of it, on any spelling of the path.
+	e.be.reset()
+	for _, target := range []string{"/api/v1/config", "/api/v1//config", "/api/v1/config/../config"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			rec = e.do(method, target, viewer...)
+			assert.Equal(t, http.StatusForbidden, rec.Code, target)
+			for _, s := range []string{"secretkey", "pbkdf2", "version"} {
+				assert.NotContains(t, rec.Body.String(), s)
+			}
+			assert.Empty(t, rec.Header().Get("ETag"))
+		}
+	}
+	// ?secrets=1 is a 400 for the viewer too, before the role's 403.
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		rec = e.do(method, "/api/v1/config?secrets=1", viewer...)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		for _, s := range []string{"secretkey", "pbkdf2", "version"} {
+			assert.NotContains(t, rec.Body.String(), s)
+		}
+		assert.Empty(t, rec.Header().Get("ETag"))
+	}
+	assert.Empty(t, e.be.callList())
+	assert.NotContains(t, e.logs.String(), "secretkey")
+	assert.NotContains(t, e.logs.String(), "pbkdf2")
+}
+
+func TestConfigPut(t *testing.T) {
+	e := newEnv(t)
+	e.be.result = ApplyResult{
+		Streams:         []stream.Outcome{{Name: "cam", Applied: "rebuild"}},
+		RestartRequired: []string{"server.rtmp.listen"},
+		ETag:            `"new"`,
+	}
+	rec := e.do(http.MethodPut, "/api/v1/config", with(editor, yamlBody(configText), hdr("If-Match", `"old"`))...)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, configText, string(e.be.gotConfig), "byte for byte")
+	assert.Equal(t, []string{`"old"`}, e.be.ifMatch)
+	assert.Equal(t, `"new"`, rec.Header().Get("ETag"))
+	var got ApplyResult
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, e.be.result, got)
+
+	// Empty lists are [], never null.
+	e.be.result = ApplyResult{ETag: `"new"`}
+	rec = e.do(http.MethodPut, "/api/v1/config", with(editor, yamlBody(configText), hdr("If-Match", `"old"`))...)
+	assert.JSONEq(t, `{"streams":[],"restart_required":[],"etag":"\"new\""}`, rec.Body.String())
+
+	e.be.reset()
+	refused := func(status int, code string, opts ...reqOpt) {
+		t.Helper()
+		rec := e.do(http.MethodPut, "/api/v1/config", opts...)
+		require.Equal(t, status, rec.Code, rec.Body.String())
+		assert.Equal(t, code, errOf(t, rec).Code)
+		assert.Empty(t, e.be.callList(), "the backend is not called")
+	}
+	ifMatch := hdr("If-Match", `"old"`)
+	refused(http.StatusPreconditionRequired, codePrecondReq, with(editor, yamlBody(configText))...)
+	refused(http.StatusUnsupportedMediaType, codeMediaType, with(editor, body("text/plain", []byte(configText)), ifMatch)...)
+	refused(http.StatusUnsupportedMediaType, codeMediaType, with(editor, body("application/json", []byte(configText)), ifMatch)...)
+	refused(http.StatusUnsupportedMediaType, codeMediaType, with(editor, body("", []byte(configText)), ifMatch)...)
+	big := strings.Repeat("#", config.MaxBytes+1)
+	refused(http.StatusRequestEntityTooLarge, codeTooLarge, with(editor, yamlBody(big), ifMatch)...)
+	refused(http.StatusRequestEntityTooLarge, codeTooLarge,
+		with(editor, yamlBody(big), ifMatch, func(r *http.Request) { r.ContentLength = -1 })...)
+	refused(http.StatusForbidden, codeForbidden, with(viewer, yamlBody(configText), ifMatch)...)
+
+	// Exactly MaxBytes is accepted.
+	rec = e.do(http.MethodPut, "/api/v1/config", with(editor, yamlBody(big[1:]), ifMatch)...)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Len(t, e.be.gotConfig, config.MaxBytes)
+
+	// The backend's refusals.
+	for _, c := range []struct {
+		err    error
+		status int
+		code   string
+		n      int
+	}{
+		{ErrPrecondition, http.StatusPreconditionFailed, codePrecondition, 0},
+		{config.ErrStale, http.StatusConflict, codeChanged, 0},
+		{&config.SyntaxError{Err: errors.New("yaml: cannot unmarshal !!str `hunter2` into int")}, http.StatusBadRequest, codeBadRequest, 0},
+		{config.Errors{errors.New("a"), errors.New("b"), errors.New("c")}, http.StatusUnprocessableEntity, codeInvalidConf, 3},
+		{errors.New("rename: disk full"), http.StatusInternalServerError, codeInternal, 0},
+		{fmt.Errorf("server: %w", errors.Join(config.ErrWrite, errors.New("config: write: open /srv/os/.c.tmp: read-only file system, rtsp://u:hunter2@h/a"))), http.StatusInternalServerError, codeWriteFailed, 0},
+	} {
+		e.be.configErr = c.err
+		rec = e.do(http.MethodPut, "/api/v1/config", with(editor, yamlBody(configText), ifMatch)...)
+		require.Equal(t, c.status, rec.Code)
+		doc := errOf(t, rec)
+		assert.Equal(t, c.code, doc.Code)
+		assert.Len(t, doc.Errors, c.n)
+		assert.Empty(t, rec.Header().Get("ETag"), "an error has no ETag")
+		assert.NotContains(t, rec.Body.String(), "hunter2")
+	}
+	// The last row: the reason is in the message, scrubbed, and logged once.
+	assert.Contains(t, errOf(t, rec).Message, "the config file could not be written: ")
+	assert.Contains(t, errOf(t, rec).Message, "read-only file system")
+	assert.Equal(t, 1, strings.Count(e.logs.String(), "the config file was not written"))
+	assert.NotContains(t, e.logs.String(), "hunter2")
+	// The body is never logged.
+	assert.NotContains(t, e.logs.String(), "secretkey")
+	assert.NotContains(t, e.logs.String(), "pbkdf2")
+}
+
+func TestReloadAndStatus(t *testing.T) {
+	e := newEnv(t)
+	e.be.result = ApplyResult{Streams: []stream.Outcome{{Name: "cam", Applied: "stopped"}}, RestartRequired: []string{}, ETag: `"e"`}
+	rec := e.do(http.MethodPost, "/api/v1/reload", editor...)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got ApplyResult
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, e.be.result, got)
+	assert.Equal(t, http.StatusForbidden, e.do(http.MethodPost, "/api/v1/reload", viewer...).Code)
+	assert.Equal(t, []string{"Reload"}, e.be.callList())
+
+	e.be.reloadErr = &config.SyntaxError{Err: errors.New("yaml: line 1: did not find expected key")}
+	rec = e.do(http.MethodPost, "/api/v1/reload", editor...)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, errOf(t, rec).Message, "did not find expected key")
+
+	// A file that cannot be read is its own code, with the reason scrubbed,
+	// and the API logs nothing: the reload did.
+	cause := errors.New("config: /srv/os/config.yaml must be mode 0600, rtsp://u:hunter2@h/a")
+	e.be.reloadErr = fmt.Errorf("server: %w", errors.Join(config.ErrUnreadable, cause))
+	rec = e.do(http.MethodPost, "/api/v1/reload", editor...)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	doc := errOf(t, rec)
+	assert.Equal(t, codeUnreadable, doc.Code)
+	assert.Contains(t, doc.Message, "the config file cannot be read: ")
+	assert.Contains(t, doc.Message, "/srv/os/config.yaml must be mode 0600")
+	assert.NotContains(t, rec.Body.String(), "hunter2")
+	assert.NotContains(t, e.logs.String(), `"level":"ERROR"`, "the API logged the reload's error again")
+
+	at := time.Date(2026, 11, 26, 10, 0, 0, 0, time.UTC)
+	e.be.cstatus = ConfigStatus{
+		ETag: `"e"`, LoadedAt: at, Stale: true,
+		LoadErrors:   []string{`streams[2] (door): cannot open rtsp://u:hunter2@h/a`},
+		LastReloadAt: &at, LastReloadError: "config: yaml: line 3",
+		RestartRequired: []string{"server.api.listen"},
+	}
+	for _, who := range [][]reqOpt{viewer, editor} {
+		rec = e.do(http.MethodGet, "/api/v1/config/status", who...)
+		require.Equal(t, http.StatusOK, rec.Code)
+		var st ConfigStatus
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &st))
+		want := e.be.cstatus
+		want.LoadErrors = []string{`streams[2] (door): cannot open rtsp://u:xxxxx@h/a`}
+		want.LoadErrors[0] = st.LoadErrors[0]
+		assert.Equal(t, want, st)
+		assert.NotContains(t, rec.Body.String(), "hunter2", "scrubbed for the viewer")
+		assert.Contains(t, st.LoadErrors[0], "streams[2] (door)")
+	}
+	assert.Equal(t, `streams[2] (door): cannot open rtsp://u:hunter2@h/a`, e.be.cstatus.LoadErrors[0], "the backend's slice is not written to")
+
+	e.be.cstatus = ConfigStatus{ETag: `"e"`, LoadedAt: at}
+	rec = e.do(http.MethodGet, "/api/v1/config/status", viewer...)
+	assert.JSONEq(t, `{"etag":"\"e\"","loaded_at":"2026-11-26T10:00:00Z","stale":false,"load_errors":[],"restart_required":[]}`,
+		rec.Body.String())
+
+	// With server.tls: the certificate in force, and the latest read's
+	// error when it failed.
+	notAfter := time.Date(2027, 2, 24, 10, 0, 0, 0, time.UTC)
+	e.be.cstatus = ConfigStatus{ETag: `"e"`, LoadedAt: at, Certificate: &CertStatus{
+		NotAfter: notAfter, Names: []string{"media.example", "192.0.2.7"}, LoadedAt: at,
+	}}
+	rec = e.do(http.MethodGet, "/api/v1/config/status", viewer...)
+	assert.JSONEq(t, `{"etag":"\"e\"","loaded_at":"2026-11-26T10:00:00Z","stale":false,"load_errors":[],"restart_required":[],`+
+		`"certificate":{"not_after":"2027-02-24T10:00:00Z","names":["media.example","192.0.2.7"],"loaded_at":"2026-11-26T10:00:00Z"}}`,
+		rec.Body.String())
+	e.be.cstatus.Certificate = &CertStatus{
+		NotAfter: notAfter, LoadedAt: at, LastError: "certs: reload: /etc/os/key.pem: tls: private key does not match public key",
+	}
+	rec = e.do(http.MethodGet, "/api/v1/config/status", viewer...)
+	assert.JSONEq(t, `{"etag":"\"e\"","loaded_at":"2026-11-26T10:00:00Z","stale":false,"load_errors":[],"restart_required":[],`+
+		`"certificate":{"not_after":"2027-02-24T10:00:00Z","names":[],"loaded_at":"2026-11-26T10:00:00Z",`+
+		`"last_error":"certs: reload: /etc/os/key.pem: tls: private key does not match public key"}}`,
+		rec.Body.String())
+}
+
+func TestGetConfigMasked(t *testing.T) {
+	e := newEnv(t)
+	const real = "version: 1\nstreams:\n  - name: cam\n    inputs:\n      - url: rtsp://u:wo-cfg-pw-2718@cam.example/s\n" +
+		"    outputs: {srt: true, srt_passphrase: wocfgpass-31415}\n"
+	masked, err := config.Mask([]byte(real))
+	require.NoError(t, err)
+	e.be.text, e.be.etag = masked, config.ETag([]byte(real))
+
+	rec := e.do(http.MethodGet, "/api/v1/config", editor...)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, string(masked), rec.Body.String())
+	assert.Equal(t, e.be.etag, rec.Header().Get("ETag"))
+	for _, secret := range []string{"wo-cfg-pw-2718", "wocfgpass-31415"} {
+		assert.NotContains(t, rec.Body.String(), secret)
+	}
+	rec = e.do(http.MethodGet, "/api/v1/config", with(editor, hdr("If-None-Match", e.be.etag))...)
+	assert.Equal(t, http.StatusNotModified, rec.Code)
+	assert.Empty(t, rec.Body.String())
+
+	// A text that could not be masked is never served.
+	e.be.text = nil
+	rec = e.do(http.MethodGet, "/api/v1/config", editor...)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Equal(t, codeInternal, errOf(t, rec).Code)
+	assert.Empty(t, rec.Header().Get("ETag"))
+	for _, secret := range []string{"wo-cfg-pw-2718", "wocfgpass-31415"} {
+		assert.NotContains(t, rec.Body.String(), secret)
+		assert.NotContains(t, e.logs.String(), secret)
+	}
+}

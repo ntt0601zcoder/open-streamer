@@ -1,0 +1,397 @@
+package live
+
+import (
+	"slices"
+	"time"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/mux/fmp4"
+)
+
+// Snapshot is a consistent, read-only view of a packager's window, taken by
+// Packager.Snapshot. It is the contract between the packager and the HLS and
+// DASH builders:
+//
+//   - Segments is the window, oldest first, at most Window entries. Seq
+//     increases by one between neighbours.
+//   - Segments[:Listed] are listed: Listed is the longest prefix whose every
+//     segment satisfies IsListed at Now. Playlists and the MPD list exactly
+//     these and nothing after them; segments past Listed are served by URL
+//     but not advertised yet.
+//   - Epochs holds every epoch that has a segment in the window, ascending.
+//     Each epoch's Start and Wall were computed once, when its first segment
+//     was packaged, and never change.
+//   - Two discontinuity views, each with an eviction counter for the
+//     playlist's DISCONTINUITY-SEQUENCE. SegmentInfo.Discontinuity is the
+//     segmenter's flag (epoch change or lost frames); EvictedDiscontinuities
+//     counts it on segments that left the window. The CMAF track playlists
+//     list one entry per segment and follow this flag, so they all share
+//     EvictedDiscontinuities. SegmentInfo.TSDiscontinuity is the HLS-TS
+//     flag: set on a segment with TS bytes, other than the first one ever,
+//     when it is Discontinuity or a TS segment was dropped (TS == nil) since
+//     the previous segment with TS bytes; it is always false when TS is nil,
+//     and EvictedTSDiscontinuities counts it on segments that left the
+//     window. CMAFPart.Discontinuity is the per-track flag (see CMAFPart),
+//     kept for inspection; no playlist uses it.
+//   - Tracks is the known-tracks set: every track that has had a part since
+//     the stream started, ascending Track, each with its EpochTrack from the
+//     latest epoch it had a part in. It outlives the window, so a rendition
+//     whose window holds no part keeps its codec string and resolution.
+//   - HLS-TS numbering: a segment with TS == nil has no TS entry. Segments
+//     with TS bytes carry TSSeq, which counts them from 0 with no holes, so
+//     the TS playlist's MEDIA-SEQUENCE is the TSSeq of its first entry.
+//   - ABR HLS-TS (ABR set): TS is nil and SegmentInfo.VariantTS holds the
+//     variants. Their playlists list one entry per listed segment, like the
+//     CMAF track playlists, so they follow SegmentInfo.Discontinuity and
+//     EvictedDiscontinuities, with MEDIA-SEQUENCE the first segment's Seq.
+//
+// Byte slices (SegmentInfo.TS, VariantTS.Data, CMAFPart.Data,
+// EpochTrack.Init), configs and SegmentInfo.GapMap are shared with the
+// packager and must never be modified. Segments and Epochs are the
+// snapshot's own; Tracks, SegmentInfo.Parts, SegmentInfo.VariantTS and
+// EpochInfo.Tracks share immutable backing arrays clipped to their length,
+// so appending to them never touches the packager's data.
+type Snapshot struct {
+	Target                   int64     // segment target, 90 kHz ticks
+	Window                   int       // window length in segments
+	ABR                      bool      // the packager's Options.ABR
+	Now                      time.Time // the packager's clock when the snapshot was taken
+	AST                      time.Time // wall of the first anchor ever packaged; zero before the first segment
+	Segments                 []SegmentInfo
+	Listed                   int
+	Ended                    bool // the stream ended (Packager.End); Segments is final
+	Epochs                   []EpochInfo
+	Tracks                   []EpochTrack
+	EvictedDiscontinuities   uint64
+	EvictedTSDiscontinuities uint64
+	// AudioLanguage is the packager's declared audio language when the
+	// snapshot was taken (Packager.SetAudioLanguage); "" when none.
+	AudioLanguage string
+}
+
+// audioLanguage returns the snapshot's declared audio language, or "" when
+// it fails media.ValidLanguage: the playlist encoders write it unescaped, so
+// only a valid tag may reach them (R-L2).
+func (s Snapshot) audioLanguage() string {
+	if !media.ValidLanguage(s.AudioLanguage) {
+		return ""
+	}
+	return s.AudioLanguage
+}
+
+// SegmentInfo is one packaged segment. The timing fields are the segmenter's
+// (90 kHz stream time).
+type SegmentInfo struct {
+	Seq           uint64
+	Epoch         uint32
+	Discontinuity bool  // first segment after an epoch change or lost frames
+	Start         int64 // PTS of the anchor track's first frame
+	Duration      int64 // anchor track span, ticks
+	End           int64 // end of the latest-ending frame over all tracks
+	// Forced marks a segment cut by the segmenter's duration cap: its first
+	// video frame need not be a keyframe, so no HLS playlist listing it
+	// claims EXT-X-INDEPENDENT-SEGMENTS. It is not a discontinuity.
+	Forced bool
+	// TS is the muxed TS segment, served as hls/{Seq}.ts; nil when muxing
+	// failed, and then the segment has no HLS-TS entry. Always nil in ABR
+	// mode, which muxes VariantTS instead.
+	TS []byte
+	// TSSeq numbers the segments with TS bytes from 0, consecutively and
+	// never reused: the HLS-TS media sequence number. Valid only when TS is
+	// non-nil.
+	TSSeq uint64
+	// TSDiscontinuity is the HLS-TS discontinuity flag: TS is non-nil, this
+	// is not the first segment with TS bytes, and the segment is
+	// Discontinuity or follows dropped TS segments.
+	TSDiscontinuity bool
+	Parts           []CMAFPart // one per track that has frames and muxed cleanly, ascending Track
+	// VariantTS holds, in ABR mode (Snapshot.ABR), one TS per video track
+	// that has frames in the segment and muxed cleanly, ascending Track,
+	// served as hls/{Track}-{Seq}.ts (ruling R-B4). nil when not ABR; in
+	// ABR mode TS is nil and TSSeq and TSDiscontinuity are unused.
+	VariantTS []VariantTS
+	// GapMap maps each known track without a part in this segment to the
+	// epoch of its latest part before it: its gap entry's EXT-X-MAP is that
+	// epoch's init, served while the entry is in the window. A track that
+	// never had a part before the segment has no entry. Fixed when the
+	// segment is added and never modified; nil when every known track has a
+	// part.
+	GapMap map[int]uint32
+}
+
+// VariantTS is one ABR variant's TS segment: video track Track at track
+// index 0 (PID 0x100) and every audio track at 1 + its rank among the known
+// audio tracks. Duration is the variant's video span in the segment, in
+// ticks: the segment's Duration, unless the segment closed without a cut
+// and that video ended elsewhere (segment.Segment.VideoDurations), as the
+// anchor rung does when it stops before the others at a respawn. It is the
+// variant's EXTINF and the divisor of its BANDWIDTH.
+type VariantTS struct {
+	Track    int
+	Data     []byte
+	Duration int64
+}
+
+// CMAFPart is one track's CMAF media segment, served as cmaf/{Track}-{N}.m4s.
+type CMAFPart struct {
+	Track int
+	// N numbers the track's parts from 0 with no holes, across epochs.
+	N uint64
+	// Discontinuity is set when the track has a previous part and, since
+	// that part, any segment (inclusive of this one) was discontinuous or a
+	// part of the track failed to mux. A track's first part never has it.
+	Discontinuity bool
+	Timing        fmp4.Timing // in the track's timescale (fmp4.Timescale)
+	Data          []byte
+}
+
+// EpochInfo is one epoch's placement on the wallclock and its tracks.
+type EpochInfo struct {
+	Epoch  uint32
+	Anchor media.Anchor  // the hub's anchor when the epoch's first segment was packaged
+	Start  time.Duration // start_n: period start relative to AST, a whole number of milliseconds
+	Wall   time.Time     // W_n = AST + Start, the effective epoch wall
+	Tracks []EpochTrack  // tracks that had frames with a config in the epoch, ascending Track
+}
+
+// EpochTrack is one track's codec config and init segment in one epoch.
+type EpochTrack struct {
+	Track  int
+	Config *media.TrackConfig // the track's first config in the epoch
+	Codec  string             // RFC 6381 codec string of Config; "" when it cannot be built (Packager.CodecErrors)
+	Init   []byte             // served as cmaf/init-{Track}-{Epoch}.mp4; nil until fmp4.Init succeeds
+}
+
+// WallAt returns the wallclock time of stream time pts in the epoch:
+// W_n + (pts − Anchor.Start)/90000 s.
+func (e EpochInfo) WallAt(pts int64) time.Time {
+	return e.Wall.Add(media.ToDuration(pts - e.Anchor.Start))
+}
+
+// Track returns the epoch's entry for a track.
+func (e EpochInfo) Track(track int) (EpochTrack, bool) {
+	for _, t := range e.Tracks {
+		if t.Track == track {
+			return t, true
+		}
+	}
+	return EpochTrack{}, false
+}
+
+// Track returns a known track's latest epoch track.
+func (s Snapshot) Track(track int) (EpochTrack, bool) {
+	for _, t := range s.Tracks {
+		if t.Track == track {
+			return t, true
+		}
+	}
+	return EpochTrack{}, false
+}
+
+// Epoch returns the snapshot's entry for an epoch.
+func (s Snapshot) Epoch(id uint32) (EpochInfo, bool) {
+	for _, e := range s.Epochs {
+		if e.Epoch == id {
+			return e, true
+		}
+	}
+	return EpochInfo{}, false
+}
+
+// IsListed applies the single listing rule: a segment is listed once
+// W_n + (End − anchor_n.Start)/90000 s ≤ Now, so no listed media of any
+// track lies in the future.
+func (s Snapshot) IsListed(seg SegmentInfo) bool {
+	e, ok := s.Epoch(seg.Epoch)
+	return ok && !e.WallAt(seg.End).After(s.Now)
+}
+
+// store is the shared state of a packager. The packager's writer mutates it
+// under Packager.mu; readers copy it under the same lock. Values it hands
+// out are never modified afterwards: a changed epoch is replaced whole.
+type store struct {
+	ast        time.Time
+	segs       []SegmentInfo
+	epochs     []EpochInfo    // ascending Epoch, only epochs with a segment in segs
+	known      []EpochTrack   // ascending Track: Snapshot.Tracks
+	knownEpoch map[int]uint32 // per known track: the epoch of known's entry
+	retained   []retainedInit // inits a GapMap in segs references
+	evicted    uint64
+	evictedTS  uint64
+	ended      bool
+}
+
+// retainedInit is a track's init in an epoch, kept while a segment's GapMap
+// references it, even after the epoch left the window. It is not an epoch
+// of the window, so the DASH MPD has no period for it.
+type retainedInit struct {
+	track int
+	epoch uint32
+	init  []byte
+}
+
+// add sets the segment's GapMap from the known tracks, appends it and the
+// current state of its epoch, records the epoch tracks of its parts as
+// known, then evicts segments beyond window, and epochs and retained inits
+// nothing in the window needs.
+func (s *store) add(seg SegmentInfo, ep EpochInfo, window int) {
+	seg.GapMap = nil
+	for _, kt := range s.known {
+		if slices.ContainsFunc(seg.Parts, func(p CMAFPart) bool { return p.Track == kt.Track }) {
+			continue
+		}
+		if seg.GapMap == nil {
+			seg.GapMap = map[int]uint32{}
+		}
+		epoch := s.knownEpoch[kt.Track]
+		seg.GapMap[kt.Track] = epoch
+		s.retain(kt.Track, epoch, kt.Init)
+	}
+	s.segs = append(s.segs, seg)
+	for _, part := range seg.Parts {
+		if et, ok := ep.Track(part.Track); ok {
+			s.learn(et, ep.Epoch)
+		}
+	}
+	i, found := slices.BinarySearchFunc(s.epochs, ep.Epoch, func(e EpochInfo, id uint32) int {
+		switch {
+		case e.Epoch < id:
+			return -1
+		case e.Epoch > id:
+			return 1
+		default:
+			return 0
+		}
+	})
+	if found {
+		s.epochs[i] = ep
+	} else {
+		s.epochs = slices.Insert(s.epochs, i, ep)
+	}
+
+	n := len(s.segs) - window
+	if n <= 0 {
+		return
+	}
+	for _, old := range s.segs[:n] {
+		if old.Discontinuity {
+			s.evicted++
+		}
+		if old.TSDiscontinuity {
+			s.evictedTS++
+		}
+	}
+	m := copy(s.segs, s.segs[n:])
+	clear(s.segs[m:])
+	s.segs = s.segs[:m]
+	s.epochs = slices.DeleteFunc(s.epochs, func(e EpochInfo) bool {
+		return !slices.ContainsFunc(s.segs, func(seg SegmentInfo) bool { return seg.Epoch == e.Epoch })
+	})
+	s.retained = slices.DeleteFunc(s.retained, func(r retainedInit) bool {
+		return !slices.ContainsFunc(s.segs, func(seg SegmentInfo) bool {
+			e, ok := seg.GapMap[r.track]
+			return ok && e == r.epoch
+		})
+	})
+}
+
+// retain keeps a track's init in an epoch until no GapMap references it.
+func (s *store) retain(track int, epoch uint32, init []byte) {
+	if init == nil || slices.ContainsFunc(s.retained, func(r retainedInit) bool { return r.track == track && r.epoch == epoch }) {
+		return
+	}
+	s.retained = append(s.retained, retainedInit{track, epoch, init})
+}
+
+// learn records et, the track's epoch track in epoch, as its latest known
+// epoch track. The slice is replaced, never changed in place, since
+// snapshots share it; an epoch track already recorded for that epoch is
+// left as it is (it does not change within an epoch once it has a part).
+func (s *store) learn(et EpochTrack, epoch uint32) {
+	if e, ok := s.knownEpoch[et.Track]; ok && e == epoch {
+		return
+	}
+	if s.knownEpoch == nil {
+		s.knownEpoch = map[int]uint32{}
+	}
+	s.knownEpoch[et.Track] = epoch
+	i, found := slices.BinarySearchFunc(s.known, et.Track, func(k EpochTrack, track int) int { return k.Track - track })
+	known := make([]EpochTrack, len(s.known), len(s.known)+1)
+	copy(known, s.known)
+	if found {
+		known[i] = et
+	} else {
+		known = slices.Insert(known, i, et)
+	}
+	s.known = slices.Clip(known)
+}
+
+// snapshot copies the store. Listed is left for the caller.
+func (s *store) snapshot() Snapshot {
+	return Snapshot{
+		AST:                      s.ast,
+		Ended:                    s.ended,
+		Segments:                 slices.Clone(s.segs),
+		Epochs:                   slices.Clone(s.epochs),
+		Tracks:                   s.known,
+		EvictedDiscontinuities:   s.evicted,
+		EvictedTSDiscontinuities: s.evictedTS,
+	}
+}
+
+// segmentTS returns the TS bytes of a segment in the window.
+func (s *store) segmentTS(seq uint64) []byte {
+	for _, seg := range s.segs {
+		if seg.Seq == seq {
+			return seg.TS
+		}
+	}
+	return nil
+}
+
+// variantTS returns the TS bytes of a video track's ABR variant in a segment
+// in the window.
+func (s *store) variantTS(track int, seq uint64) []byte {
+	for _, seg := range s.segs {
+		if seg.Seq != seq {
+			continue
+		}
+		for _, v := range seg.VariantTS {
+			if v.Track == track {
+				return v.Data
+			}
+		}
+	}
+	return nil
+}
+
+// part returns the bytes of a track's CMAF part in the window.
+func (s *store) part(track int, n uint64) []byte {
+	for _, seg := range s.segs {
+		for _, p := range seg.Parts {
+			if p.Track == track && p.N == n {
+				return p.Data
+			}
+		}
+	}
+	return nil
+}
+
+// init returns the init segment of a track in an epoch in the window, or
+// one retained for a gap entry.
+func (s *store) init(track int, epoch uint32) []byte {
+	for _, e := range s.epochs {
+		if e.Epoch == epoch {
+			if t, _ := e.Track(track); t.Init != nil {
+				return t.Init
+			}
+			break
+		}
+	}
+	for _, r := range s.retained {
+		if r.track == track && r.epoch == epoch {
+			return r.init
+		}
+	}
+	return nil
+}

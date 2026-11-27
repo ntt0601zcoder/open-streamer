@@ -1,258 +1,530 @@
-# Open Streamer
+# Open Streamer v2
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/ntt0601zcoder/open-streamer.svg)](https://pkg.go.dev/github.com/ntt0601zcoder/open-streamer)
-[![CI](https://github.com/ntt0601zcoder/open-streamer/actions/workflows/ci.yml/badge.svg)](https://github.com/ntt0601zcoder/open-streamer/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ntt0601zcoder/open-streamer)](https://goreportcard.com/report/github.com/ntt0601zcoder/open-streamer)
-[![Coverage](https://codecov.io/gh/ntt0601zcoder/open-streamer/branch/main/graph/badge.svg)](https://codecov.io/gh/ntt0601zcoder/open-streamer)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+This branch is the v2 rebuild of Open Streamer, started from a clean tree.
+The design and milestones are in [docs/REBUILD_PLAN.md](docs/REBUILD_PLAN.md).
 
-> [!IMPORTANT]
-> **This is the primary, actively maintained repository.** The latest
-> code, features and fixes always land here first.
+## Running the server
 
-A high-availability live media server in Go. Ingests from any
-common protocol, normalises through an internal MPEG-TS pipeline,
-optionally transcodes in-process via libavcodec, and publishes over HLS, DASH, RTMP,
-RTSP, and SRT — all from one binary, one process per host.
-
-```mermaid
-flowchart LR
-    subgraph Ingest
-        S1["RTMP / RTSP / SRT"]
-        S2["HLS / HTTP / UDP"]
-        S3["File / S3"]
-        S4["copy:// / mixer://"]
-    end
-
-    subgraph Pipeline
-        Hub(("Buffer Hub")):::data
-        Tx["Transcoder<br/>libavcodec subprocess"]
-        DVR["DVR + events"]
-        Hub --> Tx
-        Tx --> Hub
-        Hub --> DVR
-    end
-
-    subgraph Deliver
-        D1["HLS / DASH"]
-        D2["RTMP / RTSP / SRT"]
-        D3["Push out — RTMP / RTMPS"]
-        D4["Webhooks (HMAC)<br/>or file sink"]
-    end
-
-    S1 --> Hub
-    S2 --> Hub
-    S3 --> Hub
-    S4 --> Hub
-
-    Hub --> D1
-    Hub --> D2
-    Hub --> D3
-    DVR -.->|"events"| D4
-
-    Mgr["Stream Manager<br/>failover — no transcoder restart"]
-    Mgr -.->|"health"| Ingest
-
-    classDef data fill:#5a3a1f,stroke:#e0a060,color:#fff
+```sh
+make openstreamer        # bin/openstreamer, pure Go
+make ostranscoder        # dist/ostranscoder-<arch>/: the transcoder and its libraries (Linux)
+bin/openstreamer -config /srv/openstreamer/openstreamer.yaml
 ```
 
----
+The server prints the address of each listener it bound (`http 0.0.0.0:8080`,
+`api 127.0.0.1:8081`, …) and runs until SIGINT or SIGTERM, which stop it in
+order; a second one ends it at once. Streams with a
+ladder or a thumbnail need the transcoder: set `server.transcoder.binary` to
+the bundle's `ostranscoder` (keep its `lib/` beside it), or put `ostranscoder`
+next to `openstreamer`. Passthrough streams need no transcoder.
 
-## Why Open Streamer
+### The config file
 
-- **No process-per-stream.** One Go process handles N streams across N
-  goroutines. Transcoding runs in-process (libavcodec) in a per-stream
-  subprocess; ingest is pure Go.
-- **Failover at the Go level.** When an input degrades, the Stream
-  Manager swaps to the next-priority source in ~150ms without
-  restarting the transcoder. Buffer continuity → players see one
-  `#EXT-X-DISCONTINUITY` and resume.
-- **Hot-reload by diff.** `PUT /streams/{code}` restarts only what
-  changed — adding a push destination doesn't disturb HLS viewers,
-  toggling DASH doesn't drop RTMP push sessions.
-- **Write never blocks.** The Buffer Hub fan-out is non-blocking —
-  slow consumers drop packets, the writer is shielded. One stuck DVR
-  cannot freeze every viewer.
-- **Self-healing.** Transcoder-subprocess crashes restart with exponential
-  backoff forever; the pipeline never tears down. Health detection flips
-  status to `degraded` after sustained failure so ops sees it.
+All configuration is one YAML file. Start from
+[cmd/openstreamer/openstreamer.example.yaml](cmd/openstreamer/openstreamer.example.yaml),
+which documents every key. Besides `version: 1` it has three sections:
 
----
+- `server`: the listeners (`http`, `api`, `rtmp`, `rtsp`, `srt`), their TLS
+  siblings and the certificate ([TLS](#tls)), their apps, the transcoder
+  binary, the assets directory and logging. A change here needs a restart:
+  until then it is reported as `restart_required`.
+- `users`: the API's users, each a `name`, a `role` and a password hash.
+- `streams`: one document per stream (inputs by priority, an optional
+  transcode ladder and thumbnail, the outputs and the push targets).
 
-## Quick start
+**Users and roles.** A `viewer` reads streams, status, thumbnails and
+`/metrics`. An `editor` also writes, reads and writes the config file through
+the API, and reaches pprof. Neither is ever shown a secret ([Secrets](#secrets)).
+The config needs at least one editor. The `password` field holds a hash, never the password:
 
-```bash
-# 1. Install via the systemd installer (Linux)
-sudo bash <(curl -sL https://raw.githubusercontent.com/ntt0601zcoder/open-streamer/main/build/install.sh) v4.0.0
-
-# 2. Or build from source
-git clone https://github.com/ntt0601zcoder/open-streamer.git
-cd open-streamer
-make build && ./bin/open-streamer
+```sh
+bin/openstreamer hash-password       # asks twice on a terminal, echo off
+bin/openstreamer hash-password < password.txt          # or reads a file or a pipe
 ```
 
-Then create a stream:
+It prints `pbkdf2-sha256$600000$…`, which goes into the file as the user's
+`password`. Passwords are at least 12 bytes and never go on the command line.
 
-```bash
-curl -XPOST http://localhost:8080/streams/news -d '{
-  "inputs":   [{ "url": "https://upstream/playlist.m3u8", "priority": 0 }],
-  "protocols": { "hls": true }
-}'
+**File and directory.** The file holds every stream secret in clear (URL
+passwords, stream keys, SRT passphrases) and the password hashes, so on
+Unix it must be mode 0600 or the server does not start. The server rewrites it
+when the API edits the config (a temp file in the same directory, then a
+rename), so the service user must own the file **and its directory**: keep it
+in a directory such as `/srv/openstreamer`, not a root-owned `/etc`. In a
+container, mount that directory, not the single file: a bind-mounted file
+cannot be renamed over. When the file cannot be written, an API edit answers 500
+`config_write_failed` with the reason, and nothing is applied.
+
+**YAML rules.** Anchors, aliases and merge keys (`&a`, `*a`, `<<:`) are not
+supported. Numbers are plain decimal integers (`720`, not `0720`, `720.0` or
+`7_20`). Text that looks like a number must be quoted: a stream named `007`
+is `name: "007"`, a watermark text `24.7` is `text: "24.7"`. Unknown keys are
+errors, and every error is reported with its place.
+
+### The API
+
+The API has two listeners. `server.api.listen` is plain HTTP and is
+`127.0.0.1:8081` by default: Basic credentials are only base64-encoded, so
+anyone who can see the traffic can read them, and configuring a certificate
+does not move this listener. `server.api.tls_listen` is the same API over
+HTTPS (see [TLS](#tls)): it has no default, and it is the listener to reach
+the API from the network. A plain `server.api.listen` beyond loopback is
+allowed, for a reverse proxy or a container network, and the server logs a
+warning at start that names `server.api.tls_listen` as the fix. Every request
+but `/healthz` uses HTTP Basic auth (`curl -u ops` asks for the password), and
+every `PUT`, `DELETE` and `POST` must carry an `X-Requested-By` header (any
+value). The OpenAPI document is at `/api/v1/openapi.json`.
+
+Logins are limited in two ways:
+
+- **Per client address and user name.** After 5 failures that pair waits (1 s,
+  doubling to 5 min) and gets 429 with `Retry-After`. A wrong password for a
+  name whose login the server remembers is refused at once, without being
+  verified, and counts as a failure; so guessing at such a name is bounded by
+  this backoff alone, and a fast 401 reveals that the name is remembered.
+- **Per client address.** At most 4 logins are being verified at a time for
+  one address (an IPv6 address counts by its /64); a fifth gets 429 with
+  `Retry-After: 1`. No address is ever blocked for its failures, so nobody
+  can lock other users out by failing on purpose. Requests of a user who is
+  already logged in are not verified again and take no place.
+
+Behind a reverse proxy every client has the proxy's address: they share the
+per-name limits, so one client's failures can make a user name wait for
+everyone, and they share the one cap of 4, so a burst of first logins sees
+429s with `Retry-After: 1`. There is no setting yet that reads the forwarded
+client address (it is in the backlog).
+
+Create or replace a stream, served on every output:
+
+```sh
+curl -u ops -X PUT http://127.0.0.1:8081/api/v1/streams/cam1 \
+  -H 'X-Requested-By: curl' -H 'Content-Type: application/json' \
+  -d '{"inputs":[{"url":"rtsp://camera.example/stream1"}],
+       "outputs":{"hls":true,"dash":true,"httpts":true,"rtmp":true,"rtsp":true,"srt":true}}'
 ```
 
-Stream is live at `http://localhost:8080/news/index.m3u8`. Full setup
-walkthrough in [USER_GUIDE.md](./docs/USER_GUIDE.md).
+It answers 201 for a new stream and 200 for a replaced one, with the stream
+(its secrets masked, [Secrets](#secrets)) and how the edit was applied. A `PUT` of the document the
+stream already has is `unchanged` and does not rewrite the file. An output
+whose listener is off (`rtmp`, `rtsp` or `srt` while that `server.*.listen`
+is empty) is refused with 422 `invalid_spec`: turn the output off, or set the
+listener and restart. `GET /api/v1/streams/cam1/status` shows its state;
+`DELETE /api/v1/streams/cam1` removes it.
 
----
+Listeners are fixed at start:
 
-## Documentation
+- Removing a server listener (`server.rtmp.listen`, `rtsp` or `srt`) and
+  restarting leaves every stream that has that output `stopped`, with a load
+  error that names the output, until the output is turned off or the listener
+  is back.
+- Adding a listener and turning on its output takes two steps: set the
+  listener and restart, then turn the output on. One whole-config `PUT` that
+  does both is refused with 422, because the output is judged against the
+  listeners the server started with.
 
-| Doc | Audience | What's in it |
+`If-Match` makes a write conditional. It takes one tag exactly as an `ETag`
+header gave it (or `*`, for "the stream exists"): a list of tags and weak
+tags (`W/"…"`) do not match. It is optional on a stream's `PUT` and `DELETE`
+and required on the config's `PUT`. A `DELETE` with `If-Match` on a name
+that does not exist is 412, not 404: the condition is checked first.
+
+Edit the whole config in one round trip. `GET` returns the file, comments
+included, with every secret masked ([Secrets](#secrets)) and an `ETag`; `PUT`
+takes the whole file back with that `ETag` in `If-Match`, puts the stored
+secret back wherever the text still holds its mask, applies it and writes
+the bytes as sent, with those masks resolved:
+
+```sh
+curl -u ops -D headers.txt -o openstreamer.yaml http://127.0.0.1:8081/api/v1/config
+etag=$(sed -n 's/^[Ee][Tt]ag: *//p' headers.txt | tr -d '\r')
+"$EDITOR" openstreamer.yaml
+curl -u ops -X PUT http://127.0.0.1:8081/api/v1/config \
+  -H 'X-Requested-By: curl' -H 'Content-Type: application/yaml' \
+  -H "If-Match: $etag" --data-binary @openstreamer.yaml
+```
+
+The answer lists each stream's outcome (`unchanged`, `outputs`, `live`,
+`rebuild`, `created`, `started`, `stopped`, `deleted`) and any
+`restart_required` keys. An invalid document is 422 with every error and
+changes nothing; a stale `If-Match` is 412. Streams that did not change are not
+touched. A running stream that changed is edited in one of three ways:
+
+- `outputs`: only its outputs changed. They are edited in place, and the
+  other outputs keep their viewers.
+- `live`: its inputs, its watermark or its `audio_language` changed (and
+  maybe its outputs, and nothing else). They are applied while it runs: no
+  output session ends and the transcoder is not restarted. Replacing the
+  input in use is one discontinuity for the players (HLS shows one
+  `EXT-X-DISCONTINUITY`). To switch inputs without a gap, add the new input
+  first, above the old one, wait for the fail-back hold of 10 s so that it
+  takes over, then remove the old one.
+- `rebuild`: anything else (the ladder's renditions, `no_fallback`, adding or
+  removing the whole `transcode`, `layout`, `thumbnail`): the stream is
+  rebuilt, and its viewers reconnect.
+
+A stream that could not run when the server started (its listen address was
+taken by another stream, an asset was missing) is left `stopped`, with the
+reason as its `last_error` and in `load_errors` of
+`GET /api/v1/config/status`. Every later edit and reload tries it again, even
+when its own document did not change: it answers `started` once nothing stands
+in its way, and until then it stays stopped with the reason refreshed, which
+never fails the edit. So after removing what was in the way, a `PUT` of the
+same document or a reload is enough.
+
+**Editing the file by hand.** Save the file, then reload it:
+
+```sh
+kill -HUP "$(pidof openstreamer)"
+curl -u ops -X POST -H 'X-Requested-By: curl' http://127.0.0.1:8081/api/v1/reload   # the same, also on Windows
+```
+
+Until the reload, every API write is refused with 409 `config_changed` ("the
+config file changed on disk; reload first"), so neither side overwrites the
+other. An invalid file at reload keeps the running config; the error is in the
+log and in `GET /api/v1/config/status`. A file that cannot be read at reload,
+or whose mode is no longer 0600, is 409 `config_unreadable` with the reason.
+
+### TLS
+
+One certificate secures every TLS listener. Name its PEM files in
+`server.tls` and give each listener that should have TLS a `tls_listen`
+beside its `listen`:
+
+```yaml
+server:
+  tls:
+    cert_file: /etc/openstreamer/tls/fullchain.pem   # the certificate, then its chain
+    key_file: /etc/openstreamer/tls/privkey.pem
+  http: {listen: ":8080", tls_listen: ":8443"}             # HLS, DASH and HTTP-TS over HTTPS
+  api: {listen: "127.0.0.1:8081", tls_listen: ":8444"}     # the API over HTTPS
+  rtmp: {listen: ":19350", tls_listen: ":19351", app: live}   # RTMPS, publish and play
+  rtsp: {listen: ":5554", tls_listen: ":5555", app: live}     # RTSPS, play
+```
+
+- **The plain listeners stay.** A `tls_listen` opens a second listener that
+  serves exactly what its plain sibling serves; plain HTTP is not redirected
+  and gets no HSTS header. `rtmp` and `rtsp` may have either listener, or
+  both: an `rtmp` or `rtsp` output needs at least one of the two. No
+  `tls_listen` has a default. A `tls_listen` without `server.tls`, or one of
+  the two files without the other, is a config error.
+- **One certificate.** Every TLS listener presents the same pair; a
+  certificate for several names carries them as SANs. The minimum version is
+  TLS 1.2, HTTPS is HTTP/1.1, and no client certificate is asked for.
+- **The key file's mode.** On Unix, a key file that its group or others can
+  read gets one warning at start (`server: tls: key_file can be read by its group or
+  by others`), and the server still starts: a Kubernetes secret mount is
+  0444.
+- **RTSPS is TCP only.** RTP is interleaved on the TLS connection; a player
+  that offers only UDP gets 461, whatever `server.rtsp.udp` says.
+
+**Rotation.** Replace the two files (certbot's `live/` symlinks work) and the
+server takes the new pair without a restart: it looks at the files every
+30 s, and `SIGHUP` and `POST /api/v1/reload` read them at once, before
+anything else they do. New handshakes get the new certificate; sessions in
+progress are not touched. A pair that does not load (a rotation half done, an
+unreadable file) keeps the certificate in force, is logged once (`server:
+tls: reload failed`) and is tried again at every look. `GET
+/api/v1/config/status` shows the certificate in force as `certificate`:
+`not_after`, `names`, `loaded_at`, and `last_error` while the latest read
+failed. `/metrics` has `openstreamer_tls_certificate_not_after_seconds` and
+`openstreamer_tls_certificate_reloads_total{result="ok"|"unchanged"|"error"}`.
+Only the files' content is live: changing `cert_file`, `key_file` or a
+`tls_listen` needs a restart, like every `server` key.
+
+**Streams over TLS.** The URL's scheme says it:
+
+| Use | URL |
+|---|---|
+| Publish to the server over RTMPS | an input `rtmps://<the server's RTMPS address>/<app>/<key>?mode=listen`, with an app other than the play app (`ingest/cam1`, not `live/cam1`) |
+| Pull over RTMPS or RTSPS | an input `rtmps://host/app/name` (default port 443) or `rtsps://host/path` (default port 322, TCP only) |
+| Push over RTMPS | a push `rtmps://host/app/key` |
+| Play | `rtmps://host:19351/live/cam1`, `rtsps://host:5555/live/cam1`, `https://host:8443/live/cam1/hls/index.m3u8` |
+
+An RTMPS listen input must name the server's own RTMPS listener, since the
+certificate is the server's; an `rtmp://` listen input on that address is
+refused ("listen address tcp :19351 conflicts with the RTMPS listener tcp
+:19351 of the server"). A pull or a push verifies the peer's certificate
+against the system's roots, with the URL's host as its name, and a failure
+is an ordinary input or push failure whose error gives the x509 reason. For
+a peer with a private CA, add the CA to the system's store; on Linux and the
+BSDs `SSL_CERT_FILE=/path/ca.pem` in the server's environment also works (Go
+ignores it on macOS and Windows, where it uses the platform's store).
+
+`rtmps+insecure://` and `rtsps+insecure://` turn the verification off for
+that one URL, for a camera with a self-signed certificate. **`+insecure`
+gives up the peer's identity:** the stream is still encrypted, but anyone
+who can get between the server and the peer can read and replace it. There
+is no global switch, and `+insecure` on any other scheme or on a listen
+input is refused.
+
+**Failed handshakes.** A TLS handshake that fails is one line at debug level
+(`server: tls: handshake failed`, with `listener`: `https`, `api`, `rtmps`
+or `rtsps`, the remote address and the reason) and one count in
+`openstreamer_tls_handshake_failures_total{listener}`. The counter counts
+every connection that did not complete a handshake: a TCP probe that
+connects and sends nothing, such as a load balancer's health check, plain
+HTTP sent to the HTTPS port, and a client that goes silent, as well as real
+TLS errors. So do not alert on its raw rate. Anything else `net/http`
+reports (a handler's panic, an accept error) is logged at error level as
+`server: media: …` or `server: api: …`.
+
+### Secrets
+
+A secret is stored in the config file and never shown again, to any role:
+no API response, log line, metric or error text holds one. The secrets are
+the credentials inside input and push URLs and each stream's
+`outputs.srt_passphrase`.
+
+**What is hidden in a URL.** Everywhere a URL is shown, these parts become
+`xxxxx`:
+
+- the password of `user:password@` (or a lone user);
+- the value of a query pair whose name is a secret name, also when the
+  value is empty: `?password=xxxxx`, `?token=xxxxx`, `?api_key=xxxxx`;
+- the value of such a pair inside a path segment or the fragment, which is
+  how many cameras take their credentials. Two Xiongmai forms:
+  `rtsp://cam/user=admin_password=S3cret_channel=1_stream=0.sdp?real_stream`
+  shows `rtsp://cam/user=admin_password=xxxxx_channel=1_stream=0.sdp?real_stream`,
+  and `rtsp://cam/x?user=admin&password=S3cret` shows
+  `rtsp://cam/x?user=admin&password=xxxxx`;
+- in an SRT `streamid`, the same pairs, and the password of MediaMTX's
+  `publish:<path>:<user>:<pass>` and `read:…`;
+- the stream key of an RTMP URL, cut to its first two characters
+  (`rtmp://host/live/abxxxxx`);
+- the same parts of a URL inside the URL, in its query, path or fragment:
+  `http://gw/fetch?url=rtsp://admin:S3cret@cam/s` shows
+  `http://gw/fetch?url=rtsp://admin:xxxxx@cam/s`. When the inner URL is
+  percent-encoded (`?url=rtsp%3A%2F%2Fadmin%3AS3cret%40cam%2Fs`) its whole
+  value becomes `xxxxx` (`?url=xxxxx`).
+
+A secret name is one that contains `pass`, `pwd`, `psw`, `secret`, `token`,
+`signature`, `credential`, `hmac`, `jwt`, `authorization`, `sessionid` or
+`accesskeyid`, or is `key`, `pw`, `sig`, `auth`, `authbasic`, `loginpas`,
+`hash`, `md5`, `hdnts`, `hdnea`, `wmsauthsign`, `cred` or `sid`, or ends in
+`key`, in any case. A user name is never hidden. The rule over-masks on
+purpose: `?passthrough=1` and a path `/media/pass=1/x.ts` show `xxxxx` too,
+and so does base64 padding after a value that ends in such a name
+(`?data=abcKEY==` shows `?data=abcKEY=xxxxx`).
+Only what is shown changes; the server uses the URL as written. A credential
+under a name the rule does not know (`?p=`, `?k=`) is shown: report it, it is
+one line to add.
+
+**Writing with the mask.** `?secrets=1` is gone: any query with a `secrets`
+key is 400, for every role. Instead, a write that sends `xxxxx` back keeps the
+stored value, so a client edits a stream or the whole config without ever
+holding a secret: `GET`, change what you need, `PUT` it back. The mask is
+matched by the whole URL around it, in the same stream: change the host, the
+port, the user, the path or the query of a masked URL, or copy it into
+another stream, and the write is 422 ("holds the redaction mask and the stored
+stream has no one secret it stands for; send the real value"), so retype the
+whole URL with its secret. A URL the server cannot parse is shown as the bare
+`xxxxx` and must be retyped too. A URL may not hold `xxxxx` as a whole query
+value, as its last path segment or as its fragment (`?mode=xxxxx`): that is
+what a masked inner URL looks like, so it is taken for a mask. A config file
+written by hand that holds such a URL is refused at a reload, and at the
+start that stream is skipped and reported: change the literal value. A value that
+holds two URLs (a second one after a space) is shown with each one masked,
+and is a mask as a whole. One URL with a space in it and a secret is the
+exception: the stream API shows the space as `%20` and the config editor
+keeps it, so after editing the config such a URL must be retyped. Two pushes to one platform whose keys look
+alike when masked (`rtmp://a.example/live/abxxxxx` twice) are resolved in
+their order, the first mask to the first stored key; a third push with a new
+key can be added beside them. Sending no secret where one was stored (a URL
+without its password, no `srt_passphrase`) removes it.
+
+**The config editor.** `GET /api/v1/config` masks the same URLs in every
+value and every comment, and every `srt_passphrase`. A secret in a comment is
+masked too, so after a round trip through the editor the comment holds
+`xxxxx` for good: the secret it held is gone from the file. The users'
+password hashes are not masked: an editor can read them. The config's `ETag`
+is a keyed tag, not a hash of the file: compute nothing from the file, and
+expect a new one after every restart (an old one gets 412; read again).
+
+**The file.** The config file holds the secrets in clear: whoever can read it
+reads them. On Unix the server refuses a file on which its group or others
+have any permission, and writes it 0600.
+
+### Assets
+
+Watermark images and fonts are assets: regular files directly in
+`server.assets_dir`, which the API manages. A watermark names them
+(`watermark.image`, `watermark.font`).
+
+| Route | Role | |
 |---|---|---|
-| [USER_GUIDE.md](./docs/USER_GUIDE.md) | Operator | Install, create streams, hot-reload, hooks, troubleshooting |
-| [CONFIG.md](./docs/CONFIG.md) | Operator | Every config field with examples + defaults reference |
-| [ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Contributor | Subsystem design, invariants, data flow |
-| [APP_FLOW.md](./docs/APP_FLOW.md) | Contributor / Ops | Step-by-step traces (boot, failover, transcoder crash, hot-reload) + full events reference |
-| [EVENTS.md](./docs/EVENTS.md) | Operator / Integrator | Catalogue of every domain event, payload shape, hook recipes |
-| [METRICS.md](./docs/METRICS.md) | Operator / SRE | Prometheus metrics reference + dashboard / alert PromQL examples |
-| [FEATURES_CHECKLIST.md](./docs/FEATURES_CHECKLIST.md) | Everyone | What's implemented today, what's planned, what's locked-out |
+| `GET /api/v1/assets` | viewer | every asset: `name`, `kind`, `type`, `size`, `modified`, `etag`, and `used_by`, the streams that name it |
+| `GET /api/v1/assets/{name}` | viewer | the bytes, with an `ETag` |
+| `PUT /api/v1/assets/{name}` | editor | creates (201) or replaces (200) it |
+| `DELETE /api/v1/assets/{name}` | editor | removes it (204) |
 
-API spec auto-generated at `/swagger/` (run `make swagger` to
-regenerate from annotations).
+A name is lower case: a letter or digit, then up to 63 letters, digits, `_` or
+`-`, then `.png`, `.jpg` or `.jpeg` for an image, `.ttf` or `.otf` for a font.
+Any other name is 404. An image is at most 1 MiB and 2048 pixels a side and
+must be what its extension says; a font is at most 24 MiB. The directory holds
+at most 256 assets and 512 MiB in all (507 `assets_full` beyond). Without
+`server.assets_dir` every route answers 409 `assets_off`.
 
----
+Upload the raw bytes:
 
-## Highlights
-
-- **URL-driven ingest** — protocol + push/pull mode detected from
-  scheme/host. Supports RTMP, RTSP, SRT, UDP/multicast, HLS, raw
-  HTTP-TS, file (with loop), S3, plus `copy://` (in-process re-stream)
-  and `mixer://` (combine video + audio from two streams).
-- **Multi-input failover** — N inputs per stream, prioritised. Manager
-  monitors health, switches transparently. Last 20 switches recorded
-  with reason (`error` / `timeout` / `manual` / `failback` / `recovery`
-  / `input_added` / `input_removed`).
-- **ABR transcoding** — in-process libavcodec with NVENC / VAAPI / QSV /
-  VideoToolbox. Per-rung profiles (resolution, bitrate, codec, preset,
-  GOP, B-frames, refs, SAR, resize mode). Full-GPU pipeline
-  (NVDEC → scale_cuda → NVENC, no hwdownload round-trip) on NVENC hosts.
-- **Single decode, N renditions** — one `open-streamer-transcoder`
-  subprocess per stream decodes once and fans out to every rung, so an
-  N-rung ladder costs 1×decode + N×encode.
-- **Seamless input switch** — on failover the subprocess swaps only its
-  decoder; the encoders stay alive, so players don't re-initialise.
-- **HLS + DASH ABR** — master playlist + per-track variants;
-  `#EXT-X-DISCONTINUITY` per failover.
-- **RTSP / RTMP / SRT play** — shared listeners (one port per
-  protocol). Single-segment codes use the `live/` prefix:
-  `rtmp://host/live/news`. Multi-segment codes are addressed at their
-  raw path: `rtmp://host/region/north/news`. The server strips a
-  leading `live/` when present, so either form reaches multi-segment
-  streams.
-- **Templates** — reusable bundle of stream config (transcoder,
-  protocols, push, DVR, watermark, thumbnail, inputs, tags,
-  stream-key). Reference one from a stream via the `template` field
-  and the stream inherits every config-like field it leaves at the
-  zero value. Updating the template hot-reloads every running stream
-  that inherits from it.
-- **Auto-publish** — a template can declare URL-path prefixes. When
-  an encoder pushes to a path matching one of the prefixes and the
-  template carries a `publish://` input, the server materialises a
-  **runtime stream** on the fly. Runtime streams are RAM-only, appear
-  in `GET /streams` with `source: "runtime"`, and disappear 30 s
-  after the last packet.
-- **Push out** — RTMP/RTMPS to platforms (popular live platforms,
-  CDN). Per-destination state visible at
-  `runtime.publisher.pushes[]`.
-- **DVR + Timeshift** — persistent recording per stream; resume across
-  restarts; absolute / relative timeshift VOD endpoints; size + time
-  retention.
-- **Watermarks** — text (drawtext + strftime) or image (overlay) per
-  stream. Position presets + raw libavfilter expressions for full
-  flexibility (animated, time-aware). Image asset library with REST
-  upload (`POST /watermarks`). Pure-GPU pipeline auto-bridges via
-  hwdownload/hwupload_cuda for portability.
-- **Play sessions** — track every viewer across HLS / DASH / RTMP /
-  SRT / RTSP. Fingerprint dedup for pull protocols, UUID for
-  connection-bound. Idle reaper, kick API, hot-reload config,
-  `session.opened`/`closed` events on the bus.
-- **Webhooks + file sink** — domain events delivered via HTTP (HMAC
-  signed) or appended as JSON-lines to a local log file (drop-in for
-  Filebeat / Vector / Promtail). Per-hook retries, event/stream filters,
-  metadata injection.
-- **Transcoder capability probe** — boot + on-demand check for
-  required/optional encoders; UI sees a checklist before saving.
-- **Pluggable storage** — JSON flat-file (default) or YAML single-document.
-- **Prometheus metrics** + structured slog logging.
-
-Full feature matrix in [FEATURES_CHECKLIST.md](./docs/FEATURES_CHECKLIST.md).
-
----
-
-## Development
-
-```bash
-make build          # → bin/open-streamer
-make run            # run without persisting binary
-make test           # go test -race -shuffle=on -count=1 -timeout=5m ./...
-make lint           # golangci-lint run ./...
-make check          # tidy + vet + lint + test (full local CI)
-make swagger        # regenerate api/docs from swag annotations
-make hooks-install  # install pre-commit hook (auto-regen swagger)
+```sh
+curl -u ops -X PUT http://127.0.0.1:8081/api/v1/assets/logo.png \
+  -H 'X-Requested-By: curl' -H 'Content-Type: application/octet-stream' \
+  --data-binary @logo.png
 ```
 
-Single test: `go test -run TestName ./internal/<pkg>/...`
+`If-Match` (a tag, or `*`) makes it a replacement of that version, and
+`If-None-Match: *` a creation only; a failed condition is 412. Content the
+name does not allow is 422 `invalid_asset` with the reason, and a body over
+the limit is 413; a refused upload stores nothing. The answer is the asset
+with two lists:
 
-Requires Go 1.26.10+. Transcoding links libavcodec (FFmpeg's libraries) into
-the `open-streamer-transcoder` binary — the builder image and release
-bundles provide them; the boot probe catches missing required encoders.
+- `refreshed`: one entry per running stream that names the asset, with `ok`
+  when its picture took the new bytes (and `error` when not). The upload
+  reaches those streams without an edit or a restart.
+- `retried`: the streams that were left stopped because the asset was missing
+  are tried again, and start with the upload (`started`; `unchanged` when
+  something else still stands in their way).
+  Nothing is tried again while the config holds an entry that was skipped at
+  start: fix or remove that entry, and the edit tries them.
 
-Repository layout:
+A `DELETE` of an asset that a stream names, running or disabled, is 409
+`asset_in_use` with the stream names: take it out of their watermarks first.
+While the config holds an entry that was skipped at start it is 409
+`config_invalid_entries`, since nobody can tell what that entry names.
 
+An upload has 30 s plus 1 s per 256 KiB of its kind's limit to arrive (34 s
+for an image, 126 s for a font), so a link slower than about 2 Mbit/s cannot
+upload the largest font. At most two uploads are read at once; a third waits
+up to 30 s, then gets 503.
+
+Files copied into the directory by hand are assets too, but a running stream
+takes them only at its next rebuild or edit; upload through the API to reach
+it at once. An asset must be a regular file: a symbolic link is not one, so a
+Kubernetes ConfigMap or Secret mount, which is made of links, does not work as
+an assets directory; copy the files in instead. A hand edit is outside the
+API's contract: a file replaced by hand with one of the same size within the
+same timestamp tick may keep its old `ETag`, so an `If-Match` taken before the
+hand edit can still pass.
+
+**Fonts.** `watermark.font` names a font asset for a text watermark; without
+it the text is drawn in DejaVu Sans. A font is a TTF or OTF file with one face:
+collections (`.ttc`) and WOFF are refused, so extract the face you need. When
+the server has a transcoder, an upload is also checked by it
+(`ostranscoder -probe font`, at most 10 s), which loads the font and draws
+with it: a font it cannot use is 422 `invalid_asset` with its reason. A check
+that cannot run (an old transcoder bundle, a timeout) says nothing about the
+font: it is 503 `probe_failed`, logged, and nothing is stored.
+
+**`no_fallback`.** A rendition with `encoder: nvenc` falls back to the software
+encoder (libx264) when NVENC cannot be opened, and counts it in
+`openstreamer_transcoder_encoder_fallbacks_total`. With `no_fallback: true` it
+does not: the transcoder fails instead, and since a ladder opens all its
+renditions or none, **the stream's other renditions go down with it**, the
+software ones included. The stream keeps reading its source, its ladder
+outputs carry nothing, and the transcoder is retried (250 ms, doubling to
+5 s) until NVENC opens. Each refusal counts in
+`openstreamer_transcoder_encoder_refusals_total{stream}` and in
+`transcoder.encoder_refusals` of the stream's status, with the reason in its
+`last_error`.
+
+### Running it as a service
+
+Run `openstreamer` under a service manager that restarts it (systemd with
+`Restart=always`, a container with a restart policy). There is no per-stream
+panic recovery: a panic in one stream's code ends the whole process, and the
+restart brings every stream back from the config file. SIGTERM stops it in
+order; a second SIGTERM, or the manager's kill after its timeout, ends it at
+once.
+
+### Playing a stream
+
+With the example config's listeners, stream `cam1` plays at:
+
+| Output | URL |
+|---|---|
+| HLS (TS) | `http://host:8080/live/cam1/hls/index.m3u8` |
+| HLS (fMP4) | `http://host:8080/live/cam1/cmaf/master.m3u8` |
+| DASH | `http://host:8080/live/cam1/cmaf/index.mpd` |
+| HTTP-TS | `http://host:8080/live/cam1/stream.ts` |
+| RTMP | `rtmp://host:19350/live/cam1` |
+| RTSP | `rtsp://host:5554/live/cam1` |
+| SRT | `srt://host:9999?streamid=live/cam1` |
+
+A stream with a ladder is served as `cam1` (the ABR presentation over HLS and
+DASH, the first rendition elsewhere), and each rendition also as
+`cam1_<label>`. The thumbnail is an operator preview behind the API:
+`/api/v1/streams/cam1/thumbnail.jpg`. Playback needs no credentials. With TLS
+listeners the same paths play over `https://`, `rtmps://` and `rtsps://`
+([TLS](#tls)); SRT has no TLS, but a stream's SRT output can require a
+passphrase, and is then encrypted ([The SRT passphrase](#the-srt-passphrase)).
+
+`audio_language` declares the language of a stream's audio. It is a BCP 47
+tag such as `vi` or `en-US` (a primary subtag of 2 or 3 letters, then
+subtags of 1 to 8 letters or digits, 35 bytes at most), checked for its
+form only and written as given. It appears as `LANGUAGE` in the HLS masters
+(`cmaf/master.m3u8`, and the `<name>/hls/index.m3u8` of a stream with a
+ladder, whose per-rendition `<name>_<label>/hls/index.m3u8` are media
+playlists and carry none, though their CMAF master and MPD do) and as
+`lang` in the DASH MPD. HLS (TS) of a stream without a ladder is a single
+media playlist with no master, so it carries no language. A stream whose
+`layout` has no audio refuses the field. Changing it is a `live` edit: the
+next master or MPD a player fetches has the new value.
+
+### The SRT passphrase
+
+`outputs.srt_passphrase` makes a stream's SRT output encrypted: a player must
+give the passphrase, and it covers every name the stream is served under, its
+renditions included. It needs `srt: true` and is 10 to 79 characters, each one
+of `A-Z a-z 0-9 . _ ~ -`: players pass it in a URL, and ffmpeg mangles `+`,
+`&` and `#` there. In the YAML file, quote a value with a leading zero or a
+dot (`"0123456789"`, `"1234567890.5"`), which YAML reads as a number
+otherwise; quoting is always safe. The key length (16, 24 or 32 bytes) is
+the player's choice.
+
+```yaml
+    outputs:
+      srt: true
+      srt_passphrase: "replace-with-a-long-passphrase"
 ```
-cmd/server/           # main entrypoint
-internal/
-  api/                # chi router + handlers
-  api/handler/        # HTTP handlers (incl. /templates CRUD)
-  autopublish/        # template-prefix matcher + runtime stream registry + idle reaper
-  buffer/             # ring buffer + fan-out
-  coordinator/        # pipeline lifecycle + diff engine
-  ingestor/           # pull workers (RTMP/RTSP/SRT/HLS/...) + push servers
-  manager/            # input failover state machine
-  transcoder/         # libavcodec subprocess supervisor + native pipeline + watermarks
-  publisher/          # HLS/DASH segmenters + serve listeners + push out
-  dvr/                # recording + retention + timeshift
-  events/             # in-process event bus
-  hooks/              # webhook (HTTP) + file sink delivery
-  sessions/           # play-session tracker (HLS/DASH/RTMP/SRT/RTSP viewers)
-  watermarks/         # asset library backing /watermarks REST API
-  domain/             # types + defaults + resolvers (incl. Template / ResolveStream)
-  store/              # repository pattern (json / yaml backends; Stream + Template repos)
-  runtime/            # service lifecycle wrapper
-config/               # bootstrap config (storage backend selection)
-build/                # systemd unit + installer
-bench/                # capacity sweep tooling (sample.sh / run-all.sh / aggregate.sh)
-docs/                 # → see Documentation table above
+
+Players:
+
+| Player | How |
+|---|---|
+| ffmpeg, ffplay | `ffplay 'srt://host:9999?streamid=live/cam1&passphrase=replace-with-a-long-passphrase'` (add `-pbkeylen 32` for AES-256) |
+| GStreamer | `gst-launch-1.0 srtsrc uri='srt://host:9999?streamid=live/cam1' passphrase=replace-with-a-long-passphrase ! tsdemux ! …` |
+| VLC 3 | `vlc --passphrase=replace-with-a-long-passphrase 'srt://host:9999?streamid=live/cam1'` (VLC 3's option is `--passphrase`, not `--srt-passphrase`) |
+
+A player without the passphrase is refused, and libsrt tells it "Password
+required or unexpected" (`ERROR:UNSECURE`); one with a wrong passphrase hears
+"Incorrect passphrase" (`ERROR:BADSECRET`). Both count in
+`openstreamer_output_rejected_total{output="srt",reason="secret"}`. An address
+that sends 5 wrong passphrases inside 10 s has its encrypted requests refused
+unchecked until 10 s after its first failure
+(`openstreamer_output_rejected_total{output="srt",reason="limited"}`); players
+behind one NAT share that limit. A stream without a passphrase refuses an
+encrypted request, as before. Setting, changing or removing the passphrase is
+an `outputs` edit: the stream's SRT players are disconnected and must
+reconnect with the new one, and nothing else is touched.
+
+### Metrics and logs
+
+`/metrics` on the API listener is in the Prometheus text format and needs a
+viewer. Scrape it with `basic_auth`:
+
+```yaml
+scrape_configs:
+  - job_name: openstreamer
+    basic_auth:
+      username: grafana
+      password_file: /etc/prometheus/openstreamer-password
+    static_configs:
+      - targets: ["127.0.0.1:8081"]
 ```
 
----
-
-## Contributing
-
-PRs welcome. Before submitting:
-
-1. `make hooks-install` — installs the pre-commit hook that
-   auto-regenerates swagger when Go files change
-2. `make check` — runs full local CI (tidy + vet + lint + tests)
-3. Match the project's design invariants documented in
-   [ARCHITECTURE.md § Design mindset](./docs/ARCHITECTURE.md#1-design-mindset)
-
-Tests are required for new features. The native transcoder's libavcodec
-stages (decoder / encoder / scaler / pipeline) have table tests that link
-against libav — exercised in the builder image (`Dockerfile.builder`).
-
----
-
-## License
-
-MIT — see [LICENSE](./LICENSE).
+Logs go to stderr as JSON, one object per line with `time`, `level`, `msg`
+and attributes such as `stream`, `input` and the error;
+`server.log.format: text` gives `key=value` lines for a terminal. The API
+logs one line per request (`api: request`: method, route pattern, status,
+duration, remote address and user), never a header, a query or a body.
+URLs are redacted, and attributes named like a secret are masked.

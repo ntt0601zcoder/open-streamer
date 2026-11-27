@@ -1,0 +1,45 @@
+// Package auth holds the API's users, their PBKDF2-SHA-256 password hashes
+// and the failed-login limiter.
+//
+// A user is a name, a role (viewer reads, editor reads and writes) and a
+// hash in the form pbkdf2-sha256$<iterations>$<salt>$<key>, salt and key
+// in unpadded standard base64. The package starts no goroutine.
+//
+// A caller checking HTTP Basic credentials follows this order:
+//
+//  1. Limiter.Blocked(key): refuse before anything is compared, so a
+//     blocked client never learns whether a guess equals a remembered
+//     password.
+//  2. Users.Recall, which answers one of three:
+//     Match: success with no PBKDF2 and no reservation. It touches no
+//     limiter state: only a real verification (Attempt.Succeed) zeroes a
+//     key's failures.
+//     Mismatch: the name has a remembered login and the password is
+//     another one, so it is wrong, with no PBKDF2. Limiter.Charge(key)
+//     counts it as a failure, and the request is refused here, before
+//     step 3. Otherwise a client that fills its address's places (step 3)
+//     would have every further guess refused there, uncounted and for
+//     free, while the right guess answered at once: an oracle.
+//     What this costs, and is accepted:
+//     a client can tell this refusal from a verified one by its speed, so
+//     it learns that the name has logged in since the users were loaded;
+//     five requests, with no PBKDF2, block the pair of address and name,
+//     and because Blocked (step 1) comes before Recall, the block also
+//     refuses the right, remembered password to everyone behind that
+//     address;
+//     guesses at a remembered name are bounded by the name's backoff
+//     alone, not by PBKDF2;
+//     when Charge reports false (the pair was blocked meanwhile, or the
+//     table has no room) the caller answers 429 as for a refused Reserve,
+//     not 401.
+//     Unknown: go on to step 3.
+//  3. Limiter.Reserve(key, remoteAddr): refuse when it is false; otherwise
+//     defer attempt.Abandon() at once, so every exit resolves the attempt.
+//     Besides the key's place it takes one of the 4 places of the client
+//     address, held until the attempt is resolved, so across Users.Verify
+//     and its queue: one address inventing names has at most 4
+//     verifications in flight. An address is never blocked for failures.
+//  4. Users.Verify, then Attempt.Succeed, or Attempt.Fail on
+//     ErrBadCredentials; the deferred Abandon covers ErrBusy, a ctx error
+//     and a panic, and does nothing after Succeed or Fail.
+package auth

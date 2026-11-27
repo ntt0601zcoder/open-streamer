@@ -1,0 +1,16 @@
+# The VLC-class test peers of internal/e2e (TestM3VLCClass), for hosts
+# without them: VLC 3 and GStreamer 1.24 from Ubuntu 24.04, the packages
+# CI's ubuntu-24.04 installs. testpeer runs it, when OS_PEER_IMAGE names
+# it, as a throwaway container on the host network with a non-root user
+# (VLC refuses to run as root):
+#
+#   docker build -t osv2-peers:m3b3 -f testdata/peers/Dockerfile.vlc testdata/peers
+FROM ubuntu:24.04
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      vlc-bin vlc-plugin-base vlc-plugin-access-extra \
+      gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home --uid 1001 peer
+USER peer
+WORKDIR /home/peer

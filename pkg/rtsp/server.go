@@ -1,0 +1,1139 @@
+package rtsp
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/netip"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Server defaults applied when a ServerConfig field is zero.
+const (
+	defaultServerReadTimeout    = 10 * time.Second
+	defaultServerWriteTimeout   = 10 * time.Second
+	defaultServerSessionTimeout = 60 * time.Second
+	defaultServerBodyBytes      = 64 << 10
+	defaultMaxPending           = 64
+	defaultMaxPendingPerIP      = 4
+	defaultMaxSessions          = 1024
+	defaultMaxSessionsPerIP     = 64
+	defaultMaxSessionsPerPath   = 256
+	defaultPendingLifetime      = 30 * time.Second
+)
+
+const (
+	// maxSessionTracks bounds the tracks one session may set up.
+	maxSessionTracks = 8
+	// byeWait bounds the BYE write of ServerSession.Close.
+	byeWait = 500 * time.Millisecond
+	// requestLinePeek is how far a line is examined to tell a request with
+	// an unknown method from garbage on the interleaved stream.
+	requestLinePeek  = 1024
+	acceptBackoffMax = time.Second
+	serverName       = "open-streamer"
+	publicMethods    = "OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN"
+	reasonNotFound   = "Stream Not Found"
+)
+
+// ErrServerClosed is returned by Serve after Close.
+var ErrServerClosed = errors.New("rtsp: server closed")
+
+// ErrSessionClosed is the Err of a session ended by ServerSession.Close or
+// Server.Close.
+var ErrSessionClosed = errors.New("rtsp: session closed")
+
+// ErrTeardown is the Err of a session ended by the client's TEARDOWN.
+var ErrTeardown = errors.New("rtsp: session torn down")
+
+// errStop ends a connection after its last response without an error.
+var errStop = errors.New("rtsp: connection done")
+
+// ServerConfig tunes a Server. A zero field means its default.
+type ServerConfig struct {
+	// ReadTimeout bounds each request read until PLAY, and the TLS
+	// handshake of a connection of ServeTLS (default 10 s).
+	ReadTimeout time.Duration
+	// WriteTimeout bounds every response and every WritePackets or
+	// WriteRTCP call; a session that misses it ends (default 10 s).
+	WriteTimeout time.Duration
+	// SessionTimeout is announced in the Session header and ends a UDP
+	// session that sends neither a request nor RTCP for that long; a TCP
+	// session lives while its connection is open (default 60 s).
+	SessionTimeout time.Duration
+	// Limits bounds requests (default 64 KiB header, 64 KiB body).
+	Limits Limits
+	// MaxPending and MaxPendingPerIP cap the connections without a playing
+	// session per listener and per IP (IPv6 by /64) (default 64 and 4).
+	MaxPending, MaxPendingPerIP int
+	// MaxSessions, MaxSessionsPerIP and MaxSessionsPerPath cap the playing
+	// sessions per listener, per IP and per stream path, checked at PLAY
+	// (default 1024, 64 and 256).
+	MaxSessions, MaxSessionsPerIP, MaxSessionsPerPath int
+	// PendingLifetime is how long a connection may live without a playing
+	// session (default 30 s).
+	PendingLifetime time.Duration
+	// UDPHost, when non-empty, is where the server binds and owns one
+	// even/odd RTP/RTCP port pair for UDP sessions: bound by the first
+	// Serve, closed by Close. Without it UDP SETUP is answered 461.
+	UDPHost string
+	// ConnHook, when set, is called on every accepted connection before it
+	// is served. For a connection of ServeTLS it is given the raw
+	// connection, before the handshake.
+	ConnHook func(net.Conn)
+	// TLSError, when set, is called for each connection of ServeTLS whose handshake failed, in that connection's goroutine.
+	TLSError func(remote net.Addr, err error)
+	// Now is the clock of session liveness (default time.Now).
+	Now func() time.Time
+}
+
+func (c ServerConfig) withDefaults() ServerConfig {
+	dur := func(v *time.Duration, d time.Duration) {
+		if *v <= 0 {
+			*v = d
+		}
+	}
+	num := func(v *int, d int) {
+		if *v <= 0 {
+			*v = d
+		}
+	}
+	dur(&c.ReadTimeout, defaultServerReadTimeout)
+	dur(&c.WriteTimeout, defaultServerWriteTimeout)
+	dur(&c.SessionTimeout, defaultServerSessionTimeout)
+	dur(&c.PendingLifetime, defaultPendingLifetime)
+	num(&c.Limits.BodyBytes, defaultServerBodyBytes)
+	num(&c.MaxPending, defaultMaxPending)
+	num(&c.MaxPendingPerIP, defaultMaxPendingPerIP)
+	num(&c.MaxSessions, defaultMaxSessions)
+	num(&c.MaxSessionsPerIP, defaultMaxSessionsPerIP)
+	num(&c.MaxSessionsPerPath, defaultMaxSessionsPerPath)
+	if c.Now == nil {
+		c.Now = time.Now
+	}
+	return c
+}
+
+// Handler serves the streams of a Server.
+type Handler interface {
+	// Describe returns the tracks of the stream at path (normalised: no
+	// leading or trailing slash, no query, no trackID suffix), or ok=false
+	// (answered 404). It is called for DESCRIBE. A session's first SETUP
+	// freezes the tracks of the connection's last DESCRIBE answer when it
+	// was for the same path, so the session carries the SDP its client
+	// received; only a connection that did not DESCRIBE the path (or whose
+	// last DESCRIBE failed) has Describe called at its first SETUP. The
+	// returned descriptors are copied; the handler may reuse them.
+	Describe(path string) (tracks []TrackDesc, ok bool)
+	// Play is called in its own goroutine once PLAY is answered. It runs
+	// until ctx ends (the session ended) and sends with s.WritePackets and
+	// s.WriteRTCP. When it returns the server closes the session.
+	Play(ctx context.Context, s *ServerSession)
+}
+
+// ServerStats counts what a Server has seen.
+type ServerStats struct {
+	// Connections and Sessions are the open RTSP connections and the
+	// playing sessions.
+	Connections, Sessions int
+	// Rejected counts connections refused by a pending cap and requests
+	// answered 404 (unknown stream or track, or a session cap).
+	Rejected uint64
+	// ProtocolErrors counts malformed or oversized requests, bad CSeq
+	// headers, garbage skipped on the interleaved stream and RTCP from a
+	// session's client that is no client report (an RTCP compound led by
+	// an SR or RR).
+	ProtocolErrors uint64
+	// Timeouts counts connections ended by the read timeout or the pending
+	// lifetime and sessions ended by the write or session timeout. A TLS
+	// handshake that did not finish in time is not counted here but in
+	// TLSHandshakeFailures.
+	Timeouts uint64
+	// UDPStrangers counts datagrams on the RTCP socket of the UDP pair from
+	// an address that is no session's client RTCP port.
+	UDPStrangers uint64
+	// TLSHandshakeFailures counts connections of ServeTLS whose TLS
+	// handshake failed or did not finish within the ReadTimeout. A
+	// handshake cut short by Close is not counted.
+	TLSHandshakeFailures uint64
+}
+
+// listenerState counts one listener's connections; guarded by Server.mu.
+type listenerState struct{ pending, sessions int }
+
+// Server is an RTSP 1.0 server for playing clients (RFC 2326): one
+// goroutine per connection, one session per connection.
+type Server struct {
+	h   Handler
+	cfg ServerConfig
+
+	mu        sync.Mutex
+	closed    bool
+	listeners map[net.Listener]struct{}
+	conns     map[*serverConn]struct{}
+	pendingIP map[string]int
+	sessIP    map[string]int
+	sessPath  map[string]int
+	udp       *udpPair
+	udpPeers  map[netip.AddrPort]*ServerSession // client RTCP address → session
+	wg        sync.WaitGroup
+
+	nRejected, nProtocol, nTimeouts, nStrangers, nTLSFailures atomic.Uint64
+}
+
+// NewServer returns a server for h; Serve starts it.
+func NewServer(h Handler, cfg ServerConfig) *Server {
+	return &Server{
+		h: h, cfg: cfg.withDefaults(),
+		listeners: map[net.Listener]struct{}{}, conns: map[*serverConn]struct{}{},
+		pendingIP: map[string]int{}, sessIP: map[string]int{}, sessPath: map[string]int{},
+		udpPeers: map[netip.AddrPort]*ServerSession{},
+	}
+}
+
+// Serve accepts connections on l until Close, then returns ErrServerClosed.
+// The first Serve binds the UDP pair when UDPHost is set and fails when it
+// cannot. Transient accept errors are retried with a backoff; a listener
+// closed by someone else ends Serve with its error.
+func (s *Server) Serve(l net.Listener) error { return s.serve(l, nil) }
+
+// ServeTLS is Serve for RTSPS: every connection of l is wrapped with c. Its sessions carry RTP interleaved only: a SETUP
+// whose offers are all UDP is answered 461, whatever UDPHost is. It may run beside Serve on the same Server.
+//
+// The handshake runs in the connection's own goroutine, never in the accept
+// loop, bounded by the ReadTimeout, and the connection counts against the
+// pending caps from the moment it is accepted. A failed handshake is counted
+// in ServerStats.TLSHandshakeFailures and reported to ServerConfig.TLSError,
+// unless Close is what cut it short.
+func (s *Server) ServeTLS(l net.Listener, c *tls.Config) error {
+	if c == nil {
+		return errors.New("rtsp: serve tls: no tls config")
+	}
+	return s.serve(l, c)
+}
+
+// serve is Serve, or ServeTLS when tc is set.
+func (s *Server) serve(l net.Listener, tc *tls.Config) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrServerClosed
+	}
+	if s.cfg.UDPHost != "" && s.udp == nil {
+		if err := s.bindUDP(); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+	}
+	s.listeners[l] = struct{}{}
+	s.mu.Unlock()
+	ls := &listenerState{}
+	var backoff time.Duration
+	for {
+		nc, err := l.Accept()
+		if err == nil {
+			backoff = 0
+			s.accept(nc, ls, tc)
+			continue
+		}
+		s.mu.Lock()
+		closed := s.closed
+		s.mu.Unlock()
+		switch {
+		case closed:
+			return ErrServerClosed
+		case errors.Is(err, net.ErrClosed):
+			s.mu.Lock()
+			delete(s.listeners, l)
+			s.mu.Unlock()
+			return fmt.Errorf("rtsp: serve: %w", err)
+		}
+		backoff = min(max(2*backoff, 5*time.Millisecond), acceptBackoffMax)
+		time.Sleep(backoff)
+	}
+}
+
+// accept admits a connection as pending, or refuses it at a pending cap.
+// With tc the connection is served over TLS; its handshake is left to the
+// connection's goroutine.
+func (s *Server) accept(nc net.Conn, ls *listenerState, tc *tls.Config) {
+	if s.cfg.ConnHook != nil {
+		s.cfg.ConnHook(nc)
+	}
+	peer, key := peerKey(nc.RemoteAddr())
+	s.mu.Lock()
+	if s.closed || ls.pending >= s.cfg.MaxPending || s.pendingIP[key] >= s.cfg.MaxPendingPerIP {
+		if !s.closed {
+			s.nRejected.Add(1)
+		}
+		s.mu.Unlock()
+		_ = nc.Close()
+		return
+	}
+	ls.pending++
+	s.pendingIP[key]++
+	c := &serverConn{srv: s, ls: ls, nc: nc, peer: peer, ipKey: key, since: time.Now()}
+	if tc != nil {
+		c.tls = tls.Server(nc, tc)
+		c.nc = c.tls
+	}
+	c.br = bufio.NewReaderSize(c.nc, 64<<10)
+	s.conns[c] = struct{}{}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go c.serve()
+}
+
+// peerKey returns the peer IP and the key its caps are counted under: the
+// address for IPv4, the /64 prefix for IPv6.
+func peerKey(a net.Addr) (net.IP, string) {
+	var ip net.IP
+	if ta, ok := a.(*net.TCPAddr); ok {
+		ip = ta.IP
+	} else if host, _, err := net.SplitHostPort(a.String()); err == nil {
+		ip = net.ParseIP(host)
+	}
+	if ip == nil {
+		return nil, a.String()
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4, v4.String()
+	}
+	return ip, ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// Close stops every listener, closes every session (playing sessions with
+// BYE, best effort), waits for every connection's goroutines and then
+// closes the UDP pair and waits for its readers. The connections are closed
+// concurrently: a TLS connection whose peer stopped reading takes 100 ms to
+// close (closeConn), and many of them must not add up. It is idempotent.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.wg.Wait()
+		return nil
+	}
+	s.closed = true
+	var ls []net.Listener
+	for l := range s.listeners {
+		ls = append(ls, l)
+	}
+	var playing []*ServerSession
+	var idle []*serverConn
+	for c := range s.conns {
+		if c.playing {
+			playing = append(playing, c.sess)
+		} else {
+			idle = append(idle, c)
+		}
+	}
+	s.mu.Unlock()
+	for _, l := range ls {
+		_ = l.Close()
+	}
+	var wg sync.WaitGroup
+	for _, c := range idle {
+		wg.Go(c.closeIdle)
+	}
+	for _, ss := range playing {
+		wg.Go(ss.Close)
+	}
+	wg.Wait()
+	s.wg.Wait()
+	s.closeUDP()
+	return nil
+}
+
+// Stats returns the counters.
+func (s *Server) Stats() ServerStats {
+	s.mu.Lock()
+	st := ServerStats{Connections: len(s.conns)}
+	for c := range s.conns {
+		if c.playing {
+			st.Sessions++
+		}
+	}
+	s.mu.Unlock()
+	st.Rejected = s.nRejected.Load()
+	st.ProtocolErrors = s.nProtocol.Load()
+	st.Timeouts = s.nTimeouts.Load()
+	st.UDPStrangers = s.nStrangers.Load()
+	st.TLSHandshakeFailures = s.nTLSFailures.Load()
+	return st
+}
+
+// startPlaying moves c from pending to playing unless a session cap is
+// reached or the server is closing.
+func (s *Server) startPlaying(c *serverConn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := c.sess.path
+	if s.closed || c.ls.sessions >= s.cfg.MaxSessions || s.sessIP[c.ipKey] >= s.cfg.MaxSessionsPerIP ||
+		s.sessPath[path] >= s.cfg.MaxSessionsPerPath {
+		return false
+	}
+	dec(s.pendingIP, c.ipKey)
+	c.ls.pending--
+	c.ls.sessions++
+	s.sessIP[c.ipKey]++
+	s.sessPath[path]++
+	c.playing = true
+	return true
+}
+
+// playingReaderBytes is the request buffer of a connection that plays, and
+// the limit of its request header bytes. A request header over it after
+// PLAY ending the connection is deliberate: a playing client sends only
+// short keep-alive and teardown requests.
+const playingReaderBytes = 4 << 10
+
+// requestLimits returns the limits of the next request: once the connection
+// plays, request headers are held to the playing buffer.
+func (c *serverConn) requestLimits() Limits {
+	lim := c.srv.cfg.Limits
+	if c.playing && (lim.HeaderBytes <= 0 || lim.HeaderBytes > playingReaderBytes) {
+		lim.HeaderBytes = playingReaderBytes
+	}
+	return lim
+}
+
+// shrinkReader replaces the connection's request reader by a small one that
+// first yields what the old one had buffered; it runs on the connection's
+// goroutine. Interleaved frames are read through it with io.ReadFull or
+// Discard, so their length is not bound by the buffer.
+func (c *serverConn) shrinkReader() {
+	if c.br.Size() <= playingReaderBytes {
+		return
+	}
+	n := c.br.Buffered()
+	pending, _ := c.br.Peek(n)
+	c.br = bufio.NewReaderSize(io.MultiReader(bytes.NewReader(bytes.Clone(pending)), c.nc), playingReaderBytes)
+}
+
+// release forgets a finished connection.
+func (s *Server) release(c *serverConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.conns, c)
+	s.unclaimUDPLocked(c.sess)
+	if c.playing {
+		c.ls.sessions--
+		dec(s.sessIP, c.ipKey)
+		dec(s.sessPath, c.sess.path)
+		return
+	}
+	c.ls.pending--
+	dec(s.pendingIP, c.ipKey)
+}
+
+func dec(m map[string]int, k string) {
+	if m[k] <= 1 {
+		delete(m, k)
+		return
+	}
+	m[k]--
+}
+
+// serverConn is one RTSP connection. sess and playing are written by the
+// connection's goroutine under Server.mu and read by it without the lock.
+type serverConn struct {
+	srv *Server
+	ls  *listenerState
+	// nc is what the connection reads and writes: the accepted connection,
+	// or tls (a connection of ServeTLS) around it. It is closed with
+	// closeConn only.
+	nc    net.Conn
+	tls   *tls.Conn
+	br    *bufio.Reader
+	peer  net.IP
+	ipKey string
+	since time.Time
+
+	wmu sync.Mutex // serialises writes to nc
+
+	sess     *ServerSession
+	playing  bool
+	playDone chan struct{} // closed when Play returns; nil before PLAY
+
+	// described is the connection's last successful DESCRIBE answer, kept
+	// for its first SETUP; used only by the connection's goroutine.
+	described *describedSDP
+}
+
+// describedSDP is a DESCRIBE answer: the normalised path and a deep copy
+// of the descriptors its SDP was built from.
+type describedSDP struct {
+	path  string
+	descs []TrackDesc
+}
+
+func (c *serverConn) serve() {
+	defer c.srv.wg.Done()
+	if c.tls != nil && !c.handshake() {
+		c.srv.release(c)
+		return
+	}
+	err := c.loop()
+	if c.sess != nil {
+		switch {
+		case c.sess.closing.Load():
+			// ServerSession.Close cut the connection: let it finish its
+			// BYE and end the session with ErrSessionClosed.
+			<-c.sess.done
+		case errors.Is(err, errStop):
+			// Closed without the write mutex: on a TLS connection a write
+			// in flight suppresses the close_notify. Accepted: the peer
+			// asked for the end.
+			c.sess.end(ErrTeardown)
+		default:
+			// Without the write mutex too: the peer or an error ended it.
+			c.sess.end(fmt.Errorf("rtsp: session: connection ended: %w", err))
+		}
+	}
+	_ = closeConn(c.nc)
+	if c.playDone != nil {
+		<-c.playDone
+	}
+	c.srv.release(c)
+}
+
+// closeIdle closes a connection without a playing session for Server.Close.
+// A TLS connection is closed under the write mutex, taken within the close
+// grace: closed while a response write is still in flight it would send no
+// close_notify. A response writer stuck that long is cut by the close.
+func (c *serverConn) closeIdle() {
+	if c.tls == nil {
+		_ = closeConn(c.nc)
+		return
+	}
+	giveUp := time.Now().Add(closeGrace)
+	locked := c.lockWriteBy(giveUp, giveUp)
+	_ = closeConn(c.nc)
+	if locked {
+		c.wmu.Unlock()
+	}
+}
+
+// handshake runs the TLS handshake of a connection of ServeTLS, first thing
+// in its goroutine, within the deadline of a first request. A failure closes
+// the raw connection, is counted and is reported to TLSError, unless the
+// server is closing: a handshake Close cut short is no failure of the peer.
+func (c *serverConn) handshake() bool {
+	ctx, cancel := context.WithDeadline(context.Background(), c.readDeadline())
+	err := c.tls.HandshakeContext(ctx)
+	cancel()
+	if err == nil {
+		return true
+	}
+	raw := c.tls.NetConn()
+	_ = raw.Close()
+	c.srv.mu.Lock()
+	closing := c.srv.closed
+	c.srv.mu.Unlock()
+	if closing {
+		return false
+	}
+	c.srv.nTLSFailures.Add(1)
+	if report := c.srv.cfg.TLSError; report != nil {
+		report(raw.RemoteAddr(), fmt.Errorf("rtsp: tls handshake: %w", err))
+	}
+	return false
+}
+
+// loop reads requests and interleaved frames until the connection ends.
+func (c *serverConn) loop() error {
+	for {
+		_ = c.nc.SetReadDeadline(c.readDeadline())
+		err := c.readOne()
+		if err == nil {
+			continue
+		}
+		// A write cut by ServerSession.Close is not a timeout.
+		if isTimeout(err) && (c.sess == nil || !c.sess.closing.Load()) {
+			if c.liveUDP() {
+				continue
+			}
+			c.srv.nTimeouts.Add(1)
+		}
+		return err
+	}
+}
+
+// readDeadline is the read timeout and the pending lifetime until PLAY,
+// none for a playing TCP session (the write deadline catches dead peers),
+// and the session timeout from the last sign of life for a UDP session.
+func (c *serverConn) readDeadline() time.Time {
+	cfg := c.srv.cfg
+	now := time.Now()
+	if !c.playing {
+		d := now.Add(cfg.ReadTimeout)
+		if end := c.since.Add(cfg.PendingLifetime); end.Before(d) {
+			d = end
+		}
+		return d
+	}
+	if c.sess.kind == transportUDP {
+		return now.Add(c.sess.idleLeft())
+	}
+	return time.Time{}
+}
+
+// liveUDP reports whether a read timeout only means the UDP session's
+// liveness came from its RTCP since the deadline was set.
+func (c *serverConn) liveUDP() bool {
+	return c.playing && c.sess.kind == transportUDP && c.sess.idleLeft() > 0
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// readOne reads one unit: an interleaved frame, a stray line end, a
+// request, or a run of garbage.
+func (c *serverConn) readOne() error {
+	b, err := c.br.Peek(1)
+	if err != nil {
+		return fmt.Errorf("rtsp: read: %w", err)
+	}
+	switch b[0] {
+	case '$':
+		return c.readFrame()
+	case '\r', '\n':
+		// RFC 2326 section 10: stray line ends between messages are ignored.
+		_, _ = c.br.Discard(1)
+		return nil
+	}
+	isReq, err := c.requestAhead()
+	if err != nil {
+		return fmt.Errorf("rtsp: read: %w", err)
+	}
+	if !isReq {
+		c.srv.nProtocol.Add(1)
+		return c.resync()
+	}
+	req, err := ReadRequest(c.br, c.requestLimits())
+	if err != nil {
+		if !isTimeout(err) && !errors.Is(err, io.EOF) {
+			c.srv.nProtocol.Add(1)
+		}
+		return err
+	}
+	if c.sess != nil {
+		c.sess.touch()
+	}
+	return c.handle(req)
+}
+
+// requestAhead reports whether the next line is a request line: a known
+// method, or any "<token> <url> RTSP/1.0" within the first 1024 bytes.
+func (c *serverConn) requestAhead() (bool, error) {
+	// A short peek ends in an error the next Peek reports again.
+	head, _ := c.br.Peek(maxStartPeek)
+	if isRequestStart(head) {
+		return true, nil
+	}
+	line, err := c.peekLine()
+	if err != nil {
+		return false, err
+	}
+	f := strings.Fields(string(line))
+	return len(f) == 3 && f[2] == protoVersion && validToken(f[0]), nil
+}
+
+// peekLine returns the next line without consuming it, or the first 1024
+// bytes when no line end comes before.
+func (c *serverConn) peekLine() ([]byte, error) {
+	n := 1
+	for {
+		b, err := c.br.Peek(n)
+		if i := bytes.IndexByte(b, '\n'); i >= 0 {
+			return b[:i], nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if n >= requestLinePeek {
+			return b, nil
+		}
+		// Scan what is buffered; block for one more byte only when the
+		// whole buffer has been seen.
+		n = min(max(n+1, c.br.Buffered()), requestLinePeek)
+	}
+}
+
+// resync skips to the next '$' or past the next line end.
+func (c *serverConn) resync() error {
+	for {
+		b, err := c.br.Peek(1)
+		if err != nil {
+			return fmt.Errorf("rtsp: read: %w", err)
+		}
+		v := b[0]
+		if v == '$' {
+			return nil
+		}
+		_, _ = c.br.Discard(1)
+		if v == '\n' {
+			return nil
+		}
+	}
+}
+
+// readFrame reads one interleaved frame from the client. A client report
+// (an RTCP compound led by an SR or RR) on one of the session's RTCP
+// channels proves the client alive, which only informs: a TCP session lives
+// while its connection is open. Anything else on an RTCP channel is
+// counted as a protocol error; frames on other channels are dropped.
+func (c *serverConn) readFrame() error {
+	var h [4]byte
+	if _, err := io.ReadFull(c.br, h[:]); err != nil {
+		return fmt.Errorf("rtsp: read frame: %w", err)
+	}
+	n := int(binary.BigEndian.Uint16(h[2:]))
+	if c.sess == nil || !c.sess.rtcpChannel(int(h[1])) {
+		if _, err := c.br.Discard(n); err != nil {
+			return fmt.Errorf("rtsp: read frame: %w", err)
+		}
+		return nil
+	}
+	b := make([]byte, n)
+	if _, err := io.ReadFull(c.br, b); err != nil {
+		return fmt.Errorf("rtsp: read frame: %w", err)
+	}
+	if isClientReport(b) {
+		c.sess.touch()
+	} else {
+		c.srv.nProtocol.Add(1)
+	}
+	return nil
+}
+
+// writeResponse writes a response under the write mutex.
+func (c *serverConn) writeResponse(r *Response) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	_ = c.nc.SetWriteDeadline(time.Now().Add(c.srv.cfg.WriteTimeout))
+	return r.Write(c.nc)
+}
+
+// lockWriteBy takes the write mutex, giving up at giveUp. While it waits
+// it keeps cutting the current writer's deadline to cut, which ends a
+// write stuck on a full send buffer.
+func (c *serverConn) lockWriteBy(cut, giveUp time.Time) bool {
+	for !c.wmu.TryLock() {
+		if !time.Now().Before(giveUp) {
+			return false
+		}
+		_ = c.nc.SetWriteDeadline(cut)
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
+func reasonFor(code int) string {
+	switch code {
+	case 200:
+		return "OK"
+	case 400:
+		return "Bad Request"
+	case 404:
+		return reasonNotFound
+	case 405:
+		return "Method Not Allowed"
+	case 454:
+		return "Session Not Found"
+	case 455:
+		return "Method Not Valid in This State"
+	case 459:
+		return "Aggregate Operation Not Allowed"
+	case 461:
+		return "Unsupported Transport"
+	case 500:
+		return "Internal Server Error"
+	default:
+		return "Not Implemented"
+	}
+}
+
+func setStatus(r *Response, code int) {
+	r.StatusCode, r.Reason = code, reasonFor(code)
+}
+
+// handle answers one request; after runs once the response is written.
+func (c *serverConn) handle(req *Request) error {
+	resp := &Response{Header: Header{}}
+	var after func()
+	stop := false
+	cseq := strings.TrimSpace(req.Header.Get("CSeq"))
+	if _, err := strconv.ParseUint(cseq, 10, 31); err != nil || len(req.Header["CSeq"]) != 1 {
+		c.srv.nProtocol.Add(1)
+		setStatus(resp, 400)
+	} else {
+		resp.Header.Set("CSeq", cseq)
+		switch req.Method {
+		case "OPTIONS":
+			setStatus(resp, 200)
+			resp.Header.Set("Public", publicMethods)
+		case "DESCRIBE":
+			c.describe(req, resp)
+		case "SETUP":
+			c.setup(req, resp)
+		case "PLAY":
+			after = c.play(req, resp)
+		case "GET_PARAMETER":
+			c.getParameter(req, resp)
+		case "TEARDOWN":
+			after = c.teardown(req, resp)
+			stop = after != nil
+		case "PAUSE":
+			setStatus(resp, 455)
+		case "RECORD", "ANNOUNCE":
+			setStatus(resp, 405)
+			resp.Header.Set("Allow", publicMethods)
+		default:
+			setStatus(resp, 501)
+		}
+	}
+	resp.Header.Set("Server", serverName)
+	if resp.StatusCode == 404 {
+		c.srv.nRejected.Add(1)
+	}
+	if err := c.writeResponse(resp); err != nil {
+		return err
+	}
+	if after != nil {
+		after()
+	}
+	if stop {
+		return errStop
+	}
+	return nil
+}
+
+func (c *serverConn) describe(req *Request, resp *Response) {
+	// A failed DESCRIBE leaves no answer for a later SETUP.
+	c.described = nil
+	tg, err := parseTarget(req.URL)
+	if err != nil {
+		setStatus(resp, 400)
+		return
+	}
+	tracks, ok := c.srv.h.Describe(tg.path)
+	if !ok || len(tracks) == 0 {
+		setStatus(resp, 404)
+		return
+	}
+	sdp, err := BuildSDP(originHost(c.nc.LocalAddr()), tracks)
+	if err != nil {
+		setStatus(resp, 500)
+		return
+	}
+	c.described = &describedSDP{path: tg.path, descs: copyDescs(tracks)}
+	setStatus(resp, 200)
+	resp.Header.Set("Content-Base", tg.contentBase)
+	resp.Header.Set("Content-Type", "application/sdp")
+	resp.Body = sdp
+}
+
+// originHost is the SDP o= address: the local IP of the connection, or
+// 0.0.0.0 when it has none.
+func originHost(a net.Addr) string {
+	if ip, _ := peerKey(a); ip != nil {
+		return ip.String()
+	}
+	return "0.0.0.0"
+}
+
+// sessionOK reports whether the request's Session header names this
+// connection's session.
+func (c *serverConn) sessionOK(req *Request) bool {
+	return c.sess != nil && c.sess.matches(req.Header.Get("Session"))
+}
+
+func (c *serverConn) setup(req *Request, resp *Response) {
+	if req.Header.Get("Session") != "" {
+		if !c.sessionOK(req) {
+			setStatus(resp, 454)
+			return
+		}
+	} else if c.sess != nil {
+		// One session per connection.
+		setStatus(resp, 455)
+		return
+	}
+	if c.playing {
+		setStatus(resp, 455)
+		return
+	}
+	tg, err := parseTarget(req.URL)
+	switch {
+	case err != nil:
+		setStatus(resp, 400)
+		return
+	case tg.track < 0 && !tg.badTrack:
+		setStatus(resp, 459)
+		return
+	}
+	sess := c.sess
+	var descs []TrackDesc
+	switch {
+	case sess != nil:
+		if tg.path == sess.path {
+			descs = sess.descs
+		}
+	case c.described != nil && c.described.path == tg.path:
+		// Freeze the SDP the client received, not the stream's tracks now.
+		descs = c.described.descs
+	default:
+		if d, ok := c.srv.h.Describe(tg.path); ok {
+			descs = d
+		}
+	}
+	if tg.track < 0 || tg.track >= len(descs) || tg.track >= maxSessionTracks {
+		setStatus(resp, 404)
+		return
+	}
+	if sess != nil && sess.tracks[tg.track] != nil {
+		setStatus(resp, 455)
+		return
+	}
+	current := transportNone
+	if sess != nil {
+		current = sess.kind
+	}
+	offers, err := ParseTransports(req.Header.Get("Transport"))
+	if err != nil {
+		setStatus(resp, 461)
+		return
+	}
+	// UDP is offered only when the server owns a pair that reaches the peer,
+	// and never to a TLS session: its RTP would leave the TLS connection in
+	// clear.
+	pair := c.srv.udpFor(c.peer)
+	offer, kind, ok := selectTransport(offers, c.peer, pair != nil && c.tls == nil, current)
+	if !ok {
+		setStatus(resp, 461)
+		return
+	}
+	fresh := sess == nil
+	if fresh {
+		sess = newServerSession(c, tg.path, descs)
+	}
+	var serverPorts [2]int
+	if kind == transportUDP {
+		// Inbound RTCP is matched to sessions by the client's RTCP address.
+		if !c.srv.claimUDP(udpAddr(c.peer, offer.ClientPort[1]), sess) {
+			if fresh {
+				sess.cancel()
+			}
+			setStatus(resp, 461)
+			return
+		}
+		sess.pair, serverPorts = pair, pair.ports
+	}
+	t := sess.addTrack(tg.track, req.URL, kind, offer)
+	if c.sess == nil {
+		c.srv.mu.Lock()
+		c.sess = sess
+		c.srv.mu.Unlock()
+	}
+	setStatus(resp, 200)
+	resp.Header.Set("Transport", transportReply(kind, offer, t.ch, serverPorts, t.ssrc))
+	resp.Header.Set("Session", sess.header())
+}
+
+// play answers PLAY; the returned func starts the handler once the
+// response is out.
+func (c *serverConn) play(req *Request, resp *Response) func() {
+	if c.sess == nil {
+		setStatus(resp, 455)
+		return nil
+	}
+	if !c.sessionOK(req) {
+		setStatus(resp, 454)
+		return nil
+	}
+	if tg, err := parseTarget(req.URL); err != nil || tg.path != c.sess.path {
+		setStatus(resp, 404)
+		return nil
+	}
+	first := !c.playing
+	if first && !c.srv.startPlaying(c) {
+		setStatus(resp, 404)
+		return nil
+	}
+	if first {
+		c.shrinkReader()
+	}
+	setStatus(resp, 200)
+	resp.Header.Set("Session", c.sess.header())
+	resp.Header.Set("Range", "npt=now-")
+	if !first {
+		// The origins are those of the first packets, long sent: a
+		// repeated PLAY changes nothing and carries no RTP-Info.
+		return nil
+	}
+	resp.Header.Set("RTP-Info", c.sess.rtpInfo())
+	return c.startPlay
+}
+
+// startPlay runs the handler's Play in its own goroutine; the session is
+// closed when Play returns, and the connection's goroutine waits for it.
+func (c *serverConn) startPlay() {
+	c.playDone = make(chan struct{})
+	sess := c.sess
+	go func() {
+		defer close(c.playDone)
+		c.srv.h.Play(sess.ctx, sess)
+		sess.Close()
+	}()
+}
+
+func (c *serverConn) getParameter(req *Request, resp *Response) {
+	if req.Header.Get("Session") == "" {
+		setStatus(resp, 200)
+		return
+	}
+	if !c.sessionOK(req) {
+		setStatus(resp, 454)
+		return
+	}
+	setStatus(resp, 200)
+	resp.Header.Set("Session", c.sess.header())
+}
+
+// teardown answers TEARDOWN; the returned func ends the session once the
+// response is out, and the connection ends with it.
+func (c *serverConn) teardown(req *Request, resp *Response) func() {
+	if !c.sessionOK(req) {
+		setStatus(resp, 454)
+		return nil
+	}
+	setStatus(resp, 200)
+	sess := c.sess
+	return func() { sess.end(ErrTeardown) }
+}
+
+// reqTarget is a request URL split for lookup.
+type reqTarget struct {
+	// path is normalised: no leading or trailing slash, no query, no
+	// trackID suffix.
+	path string
+	// track is the trackID suffix, or -1 when there is none or it is
+	// invalid (badTrack).
+	track    int
+	badTrack bool
+	// contentBase is scheme://host[:port] as sent, without userinfo, plus
+	// "/" + path + "/".
+	contentBase string
+}
+
+const trackPrefix = "trackid="
+
+// parseTarget normalises a request URL: the query is dropped, then a
+// trailing slash, then a /trackID=<n> suffix is split off.
+func parseTarget(raw string) (reqTarget, error) {
+	u, err := url.Parse(raw)
+	i := strings.Index(raw, "://")
+	if err != nil || u.Host == "" || i <= 0 {
+		return reqTarget{}, errors.New("rtsp: parse url: invalid")
+	}
+	rest := raw[i+3:]
+	end := strings.IndexAny(rest, "/?#")
+	if end < 0 {
+		end = len(rest)
+	}
+	authority := rest[:end]
+	authority = authority[strings.LastIndex(authority, "@")+1:]
+
+	tg := reqTarget{track: -1}
+	p := strings.TrimRight(u.Path, "/")
+	seg := p[strings.LastIndex(p, "/")+1:]
+	if len(seg) >= len(trackPrefix) && strings.EqualFold(seg[:len(trackPrefix)], trackPrefix) {
+		n, err := strconv.ParseUint(seg[len(trackPrefix):], 10, 16)
+		if err != nil {
+			tg.badTrack = true
+		} else {
+			tg.track = int(n)
+		}
+		p = strings.TrimRight(p[:len(p)-len(seg)], "/")
+	}
+	tg.path = strings.TrimLeft(p, "/")
+	base := "/"
+	if tg.path != "" {
+		base = (&url.URL{Path: "/" + tg.path + "/"}).EscapedPath()
+	}
+	tg.contentBase = raw[:i+3] + authority + base
+	return tg, nil
+}
+
+// transportKind is a session's transport.
+type transportKind int
+
+const (
+	transportNone transportKind = iota
+	transportTCP
+	transportUDP
+)
+
+// profileKind classifies a transport profile, case-insensitively.
+func profileKind(protocol string) transportKind {
+	switch strings.ToUpper(protocol) {
+	case "RTP/AVP/TCP":
+		return transportTCP
+	case "RTP/AVP", "RTP/AVP/UDP":
+		return transportUDP
+	}
+	return transportNone
+}
+
+// selectTransport returns the first offer the server supports: a unicast
+// RTP/AVP over TCP, or over UDP with client ports when udpOK, in mode PLAY,
+// with no destination but the peer, and of the session's transport once
+// it has one.
+func selectTransport(offers []Transport, peer net.IP, udpOK bool, current transportKind) (Transport, transportKind, bool) {
+	for _, o := range offers {
+		kind := profileKind(o.Protocol)
+		switch {
+		case kind == transportNone, o.Multicast:
+			continue
+		case o.Mode != "" && !strings.EqualFold(o.Mode, "PLAY"):
+			continue
+		case o.Destination != "" && !net.ParseIP(o.Destination).Equal(peer):
+			continue
+		case current != transportNone && kind != current:
+			continue
+		case kind == transportUDP && (!udpOK || o.ClientPort[0] == 0):
+			continue
+		}
+		return o, kind, true
+	}
+	return Transport{}, transportNone, false
+}
+
+// transportReply renders the SETUP reply's Transport: the interleaved
+// channels for TCP; the client's ports echoed with the server's pair for
+// UDP; ssrc= for both.
+func transportReply(kind transportKind, offer Transport, ch, serverPorts [2]int, ssrc uint32) string {
+	r := Transport{Unicast: true, SSRC: ssrc, HasSSRC: true}
+	switch kind {
+	case transportTCP:
+		r.Protocol, r.Interleaved = "RTP/AVP/TCP", ch
+	case transportUDP, transportNone:
+		r.Protocol, r.ClientPort, r.ServerPort = strings.ToUpper(offer.Protocol), offer.ClientPort, serverPorts
+	}
+	return r.String()
+}

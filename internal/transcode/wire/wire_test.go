@@ -1,0 +1,801 @@
+package wire
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"io"
+	"math"
+	"os"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protowire"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcode/picture"
+)
+
+// Parameter sets from internal/media's fixtures.
+const (
+	h264SPSHex = "674d400deca0a0fd80880000030008000003019078a14cb0"
+	h264PPSHex = "68ebe3cb20"
+	h265VPSHex = "40010c01ffff01600000030090000003000003003c959009"
+	h265SPSHex = "42010101600000030090000003000003003ca00a080f16595924932bc05a020000030002000003003210"
+	h265PPSHex = "4401c172b46240"
+)
+
+func unhex(t testing.TB, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	require.NoError(t, err)
+	return b
+}
+
+func h264Config(t testing.TB) *media.TrackConfig {
+	t.Helper()
+	c, err := media.NewH264Config([][]byte{unhex(t, h264SPSHex)}, [][]byte{unhex(t, h264PPSHex)})
+	require.NoError(t, err)
+	return c
+}
+
+func h265Config(t testing.TB) *media.TrackConfig {
+	t.Helper()
+	c, err := media.NewH265Config([][]byte{unhex(t, h265VPSHex)}, [][]byte{unhex(t, h265SPSHex)}, [][]byte{unhex(t, h265PPSHex)})
+	require.NoError(t, err)
+	return c
+}
+
+func aacConfig(t testing.TB) *media.TrackConfig {
+	t.Helper()
+	c, err := media.NewAACConfig([]byte{0x11, 0x90})
+	require.NoError(t, err)
+	return c
+}
+
+func roundTrip(t *testing.T, msgs ...Message) []Message {
+	t.Helper()
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	for _, m := range msgs {
+		require.NoError(t, w.Write(m))
+	}
+	r := NewReader(&buf)
+	out := make([]Message, 0, len(msgs))
+	for range msgs {
+		m, err := r.Read()
+		require.NoError(t, err)
+		out = append(out, m)
+	}
+	_, err := r.Read()
+	require.ErrorIs(t, err, io.EOF)
+	return out
+}
+
+func assertFrameEqual(t *testing.T, want, got Frame) {
+	t.Helper()
+	assert.Equal(t, want.Rung, got.Rung)
+	assert.Equal(t, want.F.Track, got.F.Track)
+	assert.Equal(t, want.F.Epoch, got.F.Epoch)
+	assert.Equal(t, want.F.PTS, got.F.PTS)
+	assert.Equal(t, want.F.DTS, got.F.DTS)
+	assert.Equal(t, want.F.Key, got.F.Key)
+	assert.Equal(t, want.F.RASL, got.F.RASL)
+	require.Len(t, got.F.Data, len(want.F.Data))
+	for i := range want.F.Data {
+		assert.True(t, bytes.Equal(want.F.Data[i], got.F.Data[i]), "data[%d]", i)
+	}
+	assert.True(t, want.F.Config.Equal(got.F.Config), "config")
+}
+
+func TestRoundTripEveryMessage(t *testing.T) {
+	h264, h265, aac := h264Config(t), h265Config(t), aacConfig(t)
+	frames := []Frame{
+		{Rung: -1, F: media.Frame{
+			Track: 0, Config: h264, PTS: 90000, DTS: 86400, Key: true, Epoch: 3,
+			Data: [][]byte{{0x65, 1, 2, 3}, {0x41, 9}, {}},
+		}},
+		{Rung: 2, F: media.Frame{
+			Track: 7, Config: h265, PTS: -45000, DTS: -48600, Key: false, RASL: true, Epoch: 4000000000,
+			Data: [][]byte{{0x02, 0x01, 0xaa}},
+		}},
+		{Rung: -1, F: media.Frame{
+			Track: 1, Config: aac, PTS: 1 << 40, DTS: 1 << 40, Key: true,
+			Data: [][]byte{bytes.Repeat([]byte{0x5a}, 300)},
+		}},
+		{Rung: 0, F: media.Frame{Track: 2, PTS: 1, DTS: 1}}, // no config, no data
+	}
+	msgs := make([]Message, 0, 16)
+	msgs = append(msgs,
+		Hello{Version: Version, PID: 4242},
+		Configure{
+			Rungs: []Rung{
+				{Height: 1080, BitrateKbps: 5000, MaxBitrateKbps: 6000, BFrames: 2, Preset: "veryfast"},
+				{Height: 360, BitrateKbps: 600, MaxBitrateKbps: 0, BFrames: -1, Preset: ""},
+			},
+			Audio: &AudioEncode{BitrateKbps: 128, SampleRate: 48000, Channels: 2},
+		},
+		Configure{},
+		Discontinuity{},
+		Stats{In: 1 << 50, Out: []uint64{10, 20, 0}, EncodeNanos: []int64{5, -6, 7000000000}},
+		Stats{},
+		Stats{
+			In: 7, Out: []uint64{3}, EncodeNanos: []int64{9},
+			DroppedTracks: 1, Reanchors: 2, AudioDropped: 3 << 40, AudioCorrupt: 4, VideoCorrupt: 5,
+		},
+		Stats{In: 1, VideoCorrupt: 1},
+		Error{Rung: -1, Message: "boom ✓", Fatal: true},
+		Error{Rung: 3},
+		Stop{},
+	)
+	for _, f := range frames {
+		msgs = append(msgs, f)
+	}
+	got := roundTrip(t, msgs...)
+	require.Len(t, got, len(msgs))
+	for i, want := range msgs {
+		if wf, ok := want.(Frame); ok {
+			gf, ok := got[i].(Frame)
+			require.True(t, ok, "message %d is %T", i, got[i])
+			assertFrameEqual(t, wf, gf)
+			continue
+		}
+		if wc, ok := want.(Configure); ok && wc.Rungs == nil {
+			assert.Equal(t, Configure{}, got[i])
+			continue
+		}
+		if ws, ok := want.(Stats); ok && ws.Out == nil {
+			gs, ok := got[i].(Stats)
+			require.True(t, ok, "message %d is %T", i, got[i])
+			assert.Empty(t, gs.Out, "message %d", i)
+			assert.Empty(t, gs.EncodeNanos, "message %d", i)
+			gs.Out, gs.EncodeNanos = nil, nil
+			assert.Equal(t, ws, gs, "message %d", i)
+			continue
+		}
+		assert.Equal(t, want, got[i], "message %d", i)
+	}
+}
+
+func TestEnvelopeFieldNumbers(t *testing.T) {
+	want := map[string]Message{
+		"\x0a": Hello{}, "\x12": Configure{}, "\x1a": Frame{}, "\x22": Discontinuity{},
+		"\x2a": Stats{}, "\x32": Error{}, "\x3a": Stop{},
+	}
+	for tag, m := range want {
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).Write(m))
+		assert.Equal(t, tag[0], buf.Bytes()[4], "%T", m)
+	}
+}
+
+// The media counters (ruling R-T6a) were appended as Stats fields 4 to 8, so
+// a reader that predates them skips them, and they are absent when zero.
+func TestStatsCounterFieldNumbers(t *testing.T) {
+	body := func(s Stats) map[protowire.Number]uint64 {
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).Write(s))
+		env := buf.Bytes()[4:]
+		num, typ, n := protowire.ConsumeTag(env)
+		require.Positive(t, n)
+		require.Equal(t, protowire.Number(fStats), num)
+		require.Equal(t, protowire.BytesType, typ)
+		b, m := protowire.ConsumeBytes(env[n:])
+		require.Positive(t, m)
+		got := map[protowire.Number]uint64{}
+		for len(b) > 0 {
+			num, typ, n := protowire.ConsumeTag(b)
+			require.Positive(t, n)
+			require.Equal(t, protowire.VarintType, typ)
+			v, m := protowire.ConsumeVarint(b[n:])
+			require.Positive(t, m)
+			got[num] = v
+			b = b[n+m:]
+		}
+		return got
+	}
+	assert.Equal(t, map[protowire.Number]uint64{1: 0}, body(Stats{}))
+	assert.Equal(t, map[protowire.Number]uint64{1: 9, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5}, body(Stats{
+		In: 9, DroppedTracks: 1, Reanchors: 2, AudioDropped: 3, AudioCorrupt: 4, VideoCorrupt: 5,
+	}))
+}
+
+// A Stats from a newer child, with fields this reader does not know, still
+// decodes: the unknown fields are skipped.
+func TestStatsUnknownFieldSkipped(t *testing.T) {
+	body := appendUint(nil, 1, 7)
+	body = appendUint(body, 12, 42)
+	body = appendBytes(body, 13, []byte("future"))
+	body = appendUint(body, 5, 3) // a known field after the unknown ones
+	env := appendEnvelope(nil, fStats, body)
+	msg := binary.BigEndian.AppendUint32(nil, uint32(len(env)))
+	msg = append(msg, env...)
+	m, err := NewReader(bytes.NewReader(msg)).Read()
+	require.NoError(t, err)
+	assert.Equal(t, Stats{In: 7, Reanchors: 3}, m)
+}
+
+func TestConfigSentOnce(t *testing.T) {
+	cfg := h264Config(t)
+	f := Frame{Rung: -1, F: media.Frame{Config: cfg, PTS: 1, DTS: 1, Key: true, Data: [][]byte{{0x65, 1}}}}
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	require.NoError(t, w.Write(f))
+	first := buf.Len()
+	require.NoError(t, w.Write(f))
+	second := buf.Len() - first
+
+	assert.GreaterOrEqual(t, first-second, len(cfg.SPS[0])+len(cfg.PPS[0]))
+
+	r := NewReader(&buf)
+	m1, err := r.Read()
+	require.NoError(t, err)
+	m2, err := r.Read()
+	require.NoError(t, err)
+	c1, c2 := m1.(Frame).F.Config, m2.(Frame).F.Config
+	require.NotNil(t, c1)
+	assert.Same(t, c1, c2)
+	assert.True(t, cfg.Equal(c1))
+}
+
+func TestConfigChangeNewPointer(t *testing.T) {
+	a := h264Config(t)
+	// A second, different SPS: same codec, different bytes.
+	spsB := bytes.Clone(unhex(t, h264SPSHex))
+	spsB[len(spsB)-1] ^= 0x01
+	b, err := media.NewH264Config([][]byte{spsB}, [][]byte{unhex(t, h264PPSHex)})
+	if err != nil {
+		t.Skipf("variant SPS rejected by media: %v", err)
+	}
+	require.False(t, a.Equal(b))
+
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	for _, c := range []*media.TrackConfig{a, b, a} {
+		require.NoError(t, w.Write(Frame{Rung: -1, F: media.Frame{Config: c, Key: true, Data: [][]byte{{1}}}}))
+	}
+	r := NewReader(&buf)
+	var got [3]*media.TrackConfig
+	for i := range got {
+		m, err := r.Read()
+		require.NoError(t, err)
+		got[i] = m.(Frame).F.Config
+	}
+	assert.NotSame(t, got[0], got[1])
+	assert.False(t, got[0].Equal(got[1]))
+	assert.True(t, b.Equal(got[1]))
+	assert.Same(t, got[0], got[2], "an earlier ID keeps resolving to its pointer")
+}
+
+func TestEqualButDistinctPointersGetDistinctIDs(t *testing.T) {
+	a, b := h264Config(t), h264Config(t)
+	require.True(t, a.Equal(b))
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	require.NoError(t, w.Write(Frame{F: media.Frame{Config: a, Data: [][]byte{{1}}}}))
+	require.NoError(t, w.Write(Frame{F: media.Frame{Config: b, Data: [][]byte{{1}}}}))
+	r := NewReader(&buf)
+	m1, _ := r.Read()
+	m2, _ := r.Read()
+	assert.NotSame(t, m1.(Frame).F.Config, m2.(Frame).F.Config)
+}
+
+func TestTooLarge(t *testing.T) {
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], MaxMessage+1)
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err := NewReader(bytes.NewReader(hdr[:])).Read()
+	runtime.ReadMemStats(&after)
+	require.ErrorIs(t, err, ErrTooLarge)
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(1<<20), "no large allocation")
+
+	allocs := testing.AllocsPerRun(10, func() {
+		_, _ = NewReader(bytes.NewReader(hdr[:])).Read()
+	})
+	assert.Less(t, allocs, 20.0)
+
+	// A liar: MaxMessage announced, 5 bytes sent. Must not preallocate 32 MiB.
+	binary.BigEndian.PutUint32(hdr[:], MaxMessage)
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err = NewReader(io.MultiReader(bytes.NewReader(hdr[:]), bytes.NewReader([]byte{1, 2, 3, 4, 5}))).Read()
+	runtime.ReadMemStats(&after)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(8<<20))
+
+	// The Writer refuses an oversized message and writes nothing.
+	var buf bytes.Buffer
+	err = NewWriter(&buf).Write(Frame{F: media.Frame{Data: [][]byte{make([]byte, MaxMessage)}}})
+	require.ErrorIs(t, err, ErrTooLarge)
+	assert.Zero(t, buf.Len())
+}
+
+func TestTruncated(t *testing.T) {
+	var buf bytes.Buffer
+	require.NoError(t, NewWriter(&buf).Write(Hello{Version: Version, PID: 1}))
+	full := buf.Bytes()
+	for _, n := range []int{1, 3, 4, len(full) - 1} {
+		_, err := NewReader(bytes.NewReader(full[:n])).Read()
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF, "cut at %d", n)
+	}
+	_, err := NewReader(bytes.NewReader(nil)).Read()
+	require.ErrorIs(t, err, io.EOF)
+	assert.NotErrorIs(t, err, io.ErrUnexpectedEOF)
+}
+
+func record(body []byte) []byte {
+	out := binary.BigEndian.AppendUint32(nil, uint32(len(body)))
+	return append(out, body...)
+}
+
+func TestMalformed(t *testing.T) {
+	cases := map[string][]byte{
+		"empty envelope":     record(nil),
+		"unknown type":       record([]byte{0x7a, 0x00}),
+		"wrong wire type":    record([]byte{0x08, 0x01}),
+		"trailing bytes":     record([]byte{0x22, 0x00, 0x22, 0x00}),
+		"bad inner varint":   record([]byte{0x0a, 0x02, 0x08, 0x80}),
+		"unknown config id":  record([]byte{0x1a, 0x02, 0x48, 0x05}),
+		"config without id":  record([]byte{0x1a, 0x04, 0x52, 0x02, 0x08, 0x03}),
+		"bad bool":           record([]byte{0x1a, 0x02, 0x30, 0x02}),
+		"config bad payload": record([]byte{0x1a, 0x08, 0x48, 0x01, 0x52, 0x04, 0x08, 0x01, 0x1a, 0x00}),
+	}
+	for name, b := range cases {
+		_, err := NewReader(bytes.NewReader(b)).Read()
+		require.ErrorIs(t, err, ErrMalformed, name)
+	}
+}
+
+func TestWriteUnsupported(t *testing.T) {
+	assert.Error(t, NewWriter(io.Discard).Write(nil))
+	assert.Error(t, NewWriter(io.Discard).Write(Frame{F: media.Frame{Track: -1}}))
+	assert.Error(t, NewWriter(io.Discard).Write(Configure{Rungs: []Rung{{Height: -1}}}))
+}
+
+func TestWriteFailureDoesNotRegisterConfig(t *testing.T) {
+	cfg := h264Config(t)
+	f := Frame{F: media.Frame{Config: cfg, Data: [][]byte{{1}}}}
+	w := NewWriter(failWriter{})
+	require.Error(t, w.Write(f))
+	var buf bytes.Buffer
+	w.w = &buf
+	require.NoError(t, w.Write(f))
+	m, err := NewReader(&buf).Read()
+	require.NoError(t, err, "the retry carries the full config")
+	assert.True(t, cfg.Equal(m.(Frame).F.Config))
+}
+
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+// The Writer refuses, with ErrLimit and without writing anything, every
+// message the Reader would reject for a limit, and accepts each one at the
+// limit, which the Reader then reads.
+func TestWriterLimits(t *testing.T) {
+	const big, small = math.MaxInt32 + 1, math.MinInt32 - 1
+	nals := func(n int) [][]byte { return make([][]byte, n) }
+	sets := func(n int) [][]byte {
+		out := make([][]byte, n)
+		for i := range out {
+			out[i] = unhex(t, h264SPSHex)
+		}
+		return out
+	}
+	rungs := func(n int) []Rung { return make([]Rung, n) }
+	over := map[string]Message{
+		"nals":           Frame{F: media.Frame{Data: nals(maxNALs + 1)}},
+		"frame rung hi":  Frame{Rung: big},
+		"frame rung lo":  Frame{Rung: small},
+		"track hi":       Frame{F: media.Frame{Track: big}},
+		"track negative": Frame{F: media.Frame{Track: -1}},
+		"sps":            Frame{F: media.Frame{Config: &media.TrackConfig{Codec: media.CodecH264, SPS: sets(maxParamSets + 1)}}},
+		"pps":            Frame{F: media.Frame{Config: &media.TrackConfig{Codec: media.CodecH264, PPS: sets(maxParamSets + 1)}}},
+		"vps":            Frame{F: media.Frame{Config: &media.TrackConfig{Codec: media.CodecH265, VPS: sets(maxParamSets + 1)}}},
+		"size":           Frame{F: media.Frame{Data: [][]byte{make([]byte, MaxMessage)}}},
+		"rungs":          Configure{Rungs: rungs(MaxRungs + 1)},
+		"height":         Configure{Rungs: []Rung{{Height: big}}},
+		"height neg":     Configure{Rungs: []Rung{{Height: -1}}},
+		"bframes hi":     Configure{Rungs: []Rung{{BFrames: big}}},
+		"bframes lo":     Configure{Rungs: []Rung{{BFrames: small}}},
+		"audio":          Configure{Audio: &AudioEncode{SampleRate: big}},
+		"hello pid hi":   Hello{PID: big},
+		"hello pid lo":   Hello{PID: small},
+		"stats out":      Stats{Out: make([]uint64, maxStatsLen+1)},
+		"stats nanos":    Stats{EncodeNanos: make([]int64, maxStatsLen+1)},
+		"error rung hi":  Error{Rung: big},
+		"error rung lo":  Error{Rung: small},
+	}
+	for name, m := range over {
+		var buf bytes.Buffer
+		err := NewWriter(&buf).Write(m)
+		require.ErrorIs(t, err, ErrLimit, name)
+		assert.Zero(t, buf.Len(), name)
+	}
+	var tooLarge bytes.Buffer
+	require.ErrorIs(t, NewWriter(&tooLarge).Write(over["size"]), ErrTooLarge)
+
+	at := []Message{
+		Frame{Rung: math.MaxInt32, F: media.Frame{Track: math.MaxInt32, Data: nals(maxNALs)}},
+		Frame{Rung: math.MinInt32},
+		Frame{F: media.Frame{Data: [][]byte{make([]byte, MaxMessage-64)}}},
+		Configure{Rungs: rungs(MaxRungs)},
+		Configure{Rungs: []Rung{{Height: math.MaxInt32, BFrames: math.MinInt32}, {BFrames: math.MaxInt32}}},
+		Hello{PID: math.MinInt32},
+		Hello{PID: math.MaxInt32},
+		Stats{Out: make([]uint64, maxStatsLen), EncodeNanos: make([]int64, maxStatsLen)},
+		Error{Rung: math.MinInt32},
+		Error{Rung: math.MaxInt32},
+	}
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	for i, m := range at {
+		require.NoError(t, w.Write(m), "message %d", i)
+	}
+	r := NewReader(&buf)
+	for i := range at {
+		_, err := r.Read()
+		require.NoError(t, err, "message %d", i)
+	}
+
+	// A config at the parameter-set limit is written.
+	cfg := &media.TrackConfig{Codec: media.CodecH264, SPS: sets(maxParamSets), PPS: sets(maxParamSets)}
+	require.NoError(t, NewWriter(io.Discard).Write(Frame{F: media.Frame{Config: cfg}}))
+}
+
+// A Writer whose config table is full refuses a frame with a new config
+// with ErrConfigTable, not ErrLimit: the stream needs a fresh Writer and
+// Reader, not a dropped frame. Frames with known configs still go out.
+func TestWriterConfigTableFull(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.configCap = 2
+	a, b := h264Config(t), h264Config(t)
+	require.NoError(t, w.Write(Frame{F: media.Frame{Config: a}}))
+	require.NoError(t, w.Write(Frame{F: media.Frame{Config: b}}))
+	n := buf.Len()
+	err := w.Write(Frame{F: media.Frame{Config: aacConfig(t)}})
+	require.ErrorIs(t, err, ErrConfigTable)
+	assert.NotErrorIs(t, err, ErrLimit)
+	assert.Equal(t, n, buf.Len(), "nothing written")
+	require.NoError(t, w.Write(Frame{F: media.Frame{Config: a}}))
+	assert.Equal(t, maxConfigs, NewWriter(io.Discard).configCap)
+}
+
+func TestVersionIsThree(t *testing.T) {
+	got := roundTrip(t, Hello{Version: Version})
+	assert.Equal(t, Hello{Version: 3}, got[0])
+}
+
+func TestConfigureV2RoundTrip(t *testing.T) {
+	text := Configure{
+		Rungs: []Rung{
+			{Height: 720, BitrateKbps: 2500, BFrames: 2, Preset: "p4", Encoder: "nvenc"},
+			{Height: 360, BitrateKbps: 600, Preset: "veryfast", Encoder: ""},
+		},
+		Audio: &AudioEncode{BitrateKbps: 128, SampleRate: 48000, Channels: 2},
+		Watermark: &picture.Watermark{
+			Text: "LIVE %H:%M:%S ✓", Position: picture.BottomRight, OpacityPct: 60, SizePct: 7,
+			TimeZone: "Asia/Ho_Chi_Minh",
+		},
+		Thumbnail: &picture.Thumbnail{IntervalSec: 5, Height: 240, Quality: 70},
+	}
+	image := Configure{
+		Rungs: []Rung{{Height: 480, BitrateKbps: 1200}},
+		Watermark: &picture.Watermark{
+			Image: bytes.Repeat([]byte{0xa5}, picture.MaxImageBytes), Position: picture.Center, SizePct: 100,
+		},
+	}
+	plain := Configure{Rungs: []Rung{{Height: 240, BitrateKbps: 600}}}
+	thumbOnly := Configure{Thumbnail: &picture.Thumbnail{}}
+	got := roundTrip(t, text, image, plain, thumbOnly)
+	assert.Equal(t, text, got[0])
+	assert.Equal(t, image, got[1])
+	assert.Equal(t, plain, got[2])
+	pc := got[2].(Configure)
+	assert.Nil(t, pc.Watermark)
+	assert.Nil(t, pc.Thumbnail)
+	assert.Equal(t, thumbOnly, got[3])
+}
+
+// A Configure without M4c features has exactly M4b's bytes: an empty
+// Encoder, a nil Watermark and a nil Thumbnail write no field at all.
+func TestConfigureBytesUnchanged(t *testing.T) {
+	var buf bytes.Buffer
+	require.NoError(t, NewWriter(&buf).Write(Configure{
+		Rungs: []Rung{
+			{Height: 240, BitrateKbps: 600},
+			{Height: 180, BitrateKbps: 300, BFrames: -1, Preset: "fast"},
+		},
+		Audio: &AudioEncode{BitrateKbps: 96},
+	}))
+	const m4b = "0000002a12280a0c08f00110d804180020002a000a1008b40110ac02180020012a04666173741206086010001800"
+	assert.Equal(t, m4b, hex.EncodeToString(buf.Bytes()))
+}
+
+func TestSetWatermarkRoundTrip(t *testing.T) {
+	set := SetWatermark{W: &picture.Watermark{Text: "%Y-%m-%d", Position: picture.TopRight, OpacityPct: 1, SizePct: 50}}
+	got := roundTrip(t, set, SetWatermark{})
+	assert.Equal(t, set, got[0])
+	assert.Equal(t, SetWatermark{}, got[1])
+	assert.Nil(t, got[1].(SetWatermark).W, "absent means remove")
+}
+
+func TestShotRoundTrip(t *testing.T) {
+	shot := Shot{S: picture.Shot{PTS: -1, Epoch: 7, Width: 240, Height: 180, JPEG: []byte{0xff, 0xd8, 0xff}}}
+	got := roundTrip(t, shot)
+	assert.Equal(t, shot, got[0])
+}
+
+func TestStatsV2RoundTrip(t *testing.T) {
+	s := Stats{In: 1, Out: []uint64{2}, EncodeNanos: []int64{3}, EncoderFallbacks: 2, Thumbnails: 9, ThumbnailsFailed: 4}
+	got := roundTrip(t, s)
+	assert.Equal(t, s, got[0])
+
+	// The new counters take the next free Stats fields, 9 to 11, written
+	// only when non-zero.
+	var buf bytes.Buffer
+	require.NoError(t, NewWriter(&buf).Write(Stats{EncoderFallbacks: 2, Thumbnails: 9, ThumbnailsFailed: 4}))
+	assert.Equal(t, record(appendEnvelope(nil, fStats, []byte{0x08, 0, 0x48, 2, 0x50, 9, 0x58, 4})), buf.Bytes())
+}
+
+func TestEnvelopeFieldNumbersV2(t *testing.T) {
+	for tag, m := range map[byte]Message{0x42: SetWatermark{}, 0x4a: Shot{}} {
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).Write(m))
+		assert.Equal(t, tag, buf.Bytes()[4], "%T", m)
+	}
+}
+
+// The new limits: the Writer refuses with ErrLimit and writes nothing, and
+// the Reader rejects the same bytes, hand-encoded, as ErrMalformed.
+func TestV2Limits(t *testing.T) {
+	text := strings.Repeat("a", picture.MaxTextBytes+1)
+	img := make([]byte, picture.MaxImageBytes+1)
+	jpg := make([]byte, picture.MaxShotBytes+1)
+	enc := strings.Repeat("e", maxEncoder+1)
+	over := map[string]Message{
+		"configure text":  Configure{Watermark: &picture.Watermark{Text: text}},
+		"configure image": Configure{Watermark: &picture.Watermark{Image: img}},
+		"set text":        SetWatermark{W: &picture.Watermark{Text: text}},
+		"set image":       SetWatermark{W: &picture.Watermark{Image: img}},
+		"jpeg":            Shot{S: picture.Shot{JPEG: jpg}},
+		"encoder":         Configure{Rungs: []Rung{{Encoder: enc}}},
+		"shot width":      Shot{S: picture.Shot{Width: -1}},
+		"opacity":         Configure{Watermark: &picture.Watermark{Text: "x", OpacityPct: math.MaxInt32 + 1}},
+		"thumbnail":       Configure{Thumbnail: &picture.Thumbnail{Height: math.MinInt32 - 1}},
+	}
+	for name, m := range over {
+		var buf bytes.Buffer
+		err := NewWriter(&buf).Write(m)
+		require.ErrorIs(t, err, ErrLimit, name)
+		assert.Zero(t, buf.Len(), name)
+	}
+
+	wm := func(field protowire.Number, b []byte) []byte { return appendBytes(nil, field, b) }
+	hand := map[string][]byte{
+		"configure text":  appendEnvelope(nil, fConfigure, appendBytes(nil, 3, wm(1, []byte(text)))),
+		"configure image": appendEnvelope(nil, fConfigure, appendBytes(nil, 3, wm(2, img))),
+		"set text":        appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, wm(1, []byte(text)))),
+		"set image":       appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, wm(2, img))),
+		"jpeg":            appendEnvelope(nil, fShot, appendBytes(nil, 5, jpg)),
+		"encoder":         appendEnvelope(nil, fConfigure, appendBytes(nil, 1, appendBytes(nil, 6, []byte(enc)))),
+		"position":        appendEnvelope(nil, fConfigure, appendBytes(nil, 3, appendUint(nil, 3, 256))),
+		"shot epoch":      appendEnvelope(nil, fShot, appendUint(nil, 2, math.MaxUint32+1)),
+		"shot width":      appendEnvelope(nil, fShot, appendUint(nil, 3, math.MaxInt32+1)),
+		"opacity":         appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, appendSint(nil, 4, math.MaxInt32+1))),
+		"thumbnail":       appendEnvelope(nil, fConfigure, appendBytes(nil, 4, appendSint(nil, 2, math.MinInt32-1))),
+		"set wire type":   appendEnvelope(nil, fSetWatermark, appendUint(nil, 1, 1)),
+	}
+	for name, b := range hand {
+		_, err := NewReader(bytes.NewReader(record(b))).Read()
+		require.ErrorIs(t, err, ErrMalformed, name)
+	}
+
+	// At the limits, everything is written and read back.
+	at := []Message{
+		Configure{
+			Rungs:     []Rung{{Encoder: strings.Repeat("e", maxEncoder)}},
+			Watermark: &picture.Watermark{Text: strings.Repeat("a", picture.MaxTextBytes), OpacityPct: -1, SizePct: math.MinInt32},
+			Thumbnail: &picture.Thumbnail{IntervalSec: math.MaxInt32, Height: -2, Quality: math.MinInt32},
+		},
+		SetWatermark{W: &picture.Watermark{Image: make([]byte, picture.MaxImageBytes), Position: math.MaxUint8}},
+		Shot{S: picture.Shot{PTS: math.MinInt64, Epoch: math.MaxUint32, Width: math.MaxInt32, JPEG: make([]byte, picture.MaxShotBytes)}},
+	}
+	got := roundTrip(t, at...)
+	for i := range at {
+		assert.Equal(t, at[i], got[i], "message %d", i)
+	}
+}
+
+func fixtureFont(t testing.TB) []byte {
+	t.Helper()
+	b, err := os.ReadFile("../../../testdata/fixtures/fonts/DejaVuSansMono.ttf")
+	require.NoError(t, err)
+	return b
+}
+
+// A font of any size: the wire checks only the size, not the content.
+func fakeFont(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i * 7)
+	}
+	return b
+}
+
+func TestWatermarkFontRoundTrip(t *testing.T) {
+	font := fakeFont(300_000)
+	conf := Configure{
+		Rungs:     []Rung{{Height: 240, BitrateKbps: 600}},
+		Watermark: &picture.Watermark{Text: "LIVE %H", Position: picture.TopRight, Font: font, TimeZone: "UTC"},
+		Thumbnail: &picture.Thumbnail{IntervalSec: 5},
+	}
+	set := SetWatermark{W: &picture.Watermark{Text: "x", Font: fixtureFont(t)}}
+	got := roundTrip(t, conf, set)
+	assert.Equal(t, conf, got[0])
+	assert.Equal(t, set, got[1])
+	assert.True(t, bytes.Equal(font, got[0].(Configure).Watermark.Font), "byte for byte")
+
+	// Over the limit: the writer refuses, and the reader rejects the same
+	// bytes encoded by hand.
+	big := make([]byte, picture.MaxFontBytes+1)
+	for name, m := range map[string]Message{
+		"configure": Configure{Watermark: &picture.Watermark{Text: "x", Font: big}},
+		"set":       SetWatermark{W: &picture.Watermark{Text: "x", Font: big}},
+	} {
+		var buf bytes.Buffer
+		err := NewWriter(&buf).Write(m)
+		require.ErrorIs(t, err, ErrLimit, name)
+		assert.NotErrorIs(t, err, ErrTooLarge, name)
+		assert.Zero(t, buf.Len(), name)
+	}
+	wm := appendBytes(appendString(nil, 1, "x"), 7, big)
+	for name, b := range map[string][]byte{
+		"configure": appendEnvelope(nil, fConfigure, appendBytes(nil, 3, wm)),
+		"set":       appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, wm)),
+	} {
+		_, err := NewReader(bytes.NewReader(record(b))).Read()
+		require.ErrorIs(t, err, ErrMalformed, name)
+	}
+
+	// At the limit, with every other field, it fits a message.
+	at := Configure{
+		Rungs:     make([]Rung, MaxRungs),
+		Audio:     &AudioEncode{BitrateKbps: 128, SampleRate: 48000, Channels: 2},
+		Watermark: &picture.Watermark{Text: strings.Repeat("a", picture.MaxTextBytes), Font: make([]byte, picture.MaxFontBytes)},
+		Thumbnail: &picture.Thumbnail{IntervalSec: 5, Height: 240, Quality: 70},
+	}
+	got = roundTrip(t, at)
+	assert.Equal(t, at, got[0])
+
+	// Without a font, a watermark has its version 2 bytes.
+	for _, tc := range []struct {
+		m    Message
+		want string
+	}{
+		{Configure{
+			Rungs:     []Rung{{Height: 240, BitrateKbps: 600, Encoder: "nvenc"}},
+			Watermark: &picture.Watermark{Text: "LIVE %H", Position: picture.BottomRight, OpacityPct: 60, SizePct: 7, TimeZone: "UTC"},
+			Thumbnail: &picture.Thumbnail{IntervalSec: 5},
+		}, "00000031122f0a1308f00110d804180020002a0032056e76656e631a140a074c49564520254818032078280e32035554432202080a"},
+		{
+			SetWatermark{W: &picture.Watermark{Image: []byte{0x89, 'P', 'N', 'G'}, Position: picture.Center, SizePct: 100}},
+			"0000000f420d0a0b120489504e47180428c801",
+		},
+		{SetWatermark{W: &picture.Watermark{Text: "x", Font: []byte{}}}, "0000000742050a030a0178"},
+	} {
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).Write(tc.m))
+		assert.Equal(t, tc.want, hex.EncodeToString(buf.Bytes()), "%T", tc.m)
+	}
+}
+
+// nestedWatermark encodes w the way version 2 did, one nested buffer per
+// message, with the font as field 7.
+func nestedWatermark(w picture.Watermark) []byte {
+	b := appendString(nil, 1, w.Text)
+	if len(w.Image) > 0 {
+		b = appendBytes(b, 2, w.Image)
+	}
+	if w.Position != 0 {
+		b = appendUint(b, 3, uint64(w.Position))
+	}
+	b = appendNonZero(b, 4, w.OpacityPct)
+	b = appendNonZero(b, 5, w.SizePct)
+	b = appendString(b, 6, w.TimeZone)
+	if len(w.Font) > 0 {
+		b = appendBytes(b, 7, w.Font)
+	}
+	return b
+}
+
+// The writer appends a font once, straight into the envelope: writing a
+// Configure with a 4 MiB font allocates less than 6 MiB in all, and the
+// bytes are those of the nested encoding.
+func TestWatermarkFontOneCopy(t *testing.T) {
+	font := fakeFont(4 << 20)
+	wm := &picture.Watermark{Text: "LIVE %H:%M", Position: picture.BottomLeft, OpacityPct: 80, SizePct: 6, TimeZone: "UTC", Font: font}
+	c := Configure{
+		Rungs:     []Rung{{Height: 720, BitrateKbps: 2500, Preset: "fast"}, {Height: 360, BitrateKbps: 600}},
+		Audio:     &AudioEncode{BitrateKbps: 128, SampleRate: 48000, Channels: 2},
+		Watermark: wm,
+		Thumbnail: &picture.Thumbnail{IntervalSec: 5},
+	}
+
+	var buf bytes.Buffer
+	require.NoError(t, NewWriter(&buf).Write(c))
+	// The rungs and the audio as a Configure without the rest writes them.
+	var plain bytes.Buffer
+	require.NoError(t, NewWriter(&plain).Write(Configure{Rungs: c.Rungs, Audio: c.Audio}))
+	head, n := protowire.ConsumeBytes(plain.Bytes()[5:])
+	require.Positive(t, n)
+	body := append(bytes.Clone(head), appendBytes(nil, 3, nestedWatermark(*wm))...)
+	body = appendBytes(body, 4, appendThumbnail(nil, *c.Thumbnail))
+	assert.True(t, bytes.Equal(record(appendEnvelope(nil, fConfigure, body)), buf.Bytes()), "configure bytes")
+
+	buf.Reset()
+	require.NoError(t, NewWriter(&buf).Write(SetWatermark{W: wm}))
+	want := record(appendEnvelope(nil, fSetWatermark, appendBytes(nil, 1, nestedWatermark(*wm))))
+	assert.True(t, bytes.Equal(want, buf.Bytes()), "set watermark bytes")
+
+	for name, m := range map[string]Message{"configure": c, "set watermark": SetWatermark{W: wm}} {
+		w := NewWriter(io.Discard)
+		require.NoError(t, w.Write(m)) // warm up: the writer's small buffer
+		alloc := uint64(math.MaxUint64)
+		for range 3 {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			require.NoError(t, w.Write(m))
+			runtime.ReadMemStats(&after)
+			alloc = min(alloc, after.TotalAlloc-before.TotalAlloc)
+		}
+		assert.Less(t, alloc, uint64(6<<20), "%s: bytes allocated", name)
+		assert.Greater(t, alloc, uint64(4<<20), "%s: the envelope holds the font", name)
+	}
+}
+
+func TestRungNoFallbackRoundTrip(t *testing.T) {
+	c := Configure{Rungs: []Rung{{Height: 720, BitrateKbps: 2500, Encoder: "nvenc", NoFallback: true}, {Height: 360}}}
+	got := roundTrip(t, c)
+	assert.Equal(t, c, got[0])
+
+	// The flag is rung field 7, written only when true.
+	enc := func(r Rung) string {
+		var buf bytes.Buffer
+		require.NoError(t, NewWriter(&buf).Write(Configure{Rungs: []Rung{r}}))
+		return hex.EncodeToString(buf.Bytes())
+	}
+	assert.Equal(t, "0000000f120d0a0b08f0011000180020002a00", enc(Rung{Height: 240}))
+	assert.Equal(t, "00000011120f0a0d08f0011000180020002a003801", enc(Rung{Height: 240, NoFallback: true}))
+}
+
+func TestErrorCodeRoundTrip(t *testing.T) {
+	e := Error{Rung: 1, Message: "nvenc refused", Fatal: true, Code: ErrorEncoderRefused}
+	got := roundTrip(t, e, Error{Rung: 2})
+	assert.Equal(t, e, got[0])
+	assert.Equal(t, Error{Rung: 2}, got[1])
+
+	// An unknown code reads as ErrorOther.
+	body := appendSint(nil, 1, 1)
+	body = appendUint(body, 4, 99)
+	m, err := NewReader(bytes.NewReader(record(appendEnvelope(nil, fError, body)))).Read()
+	require.NoError(t, err)
+	assert.Equal(t, Error{Rung: 1, Code: ErrorOther}, m)
+
+	// Code 0 writes no field: version 2's bytes. The code is field 4.
+	var buf bytes.Buffer
+	require.NoError(t, NewWriter(&buf).Write(Error{Rung: 1, Message: "x", Fatal: true}))
+	assert.Equal(t, "00000009320708021201781801", hex.EncodeToString(buf.Bytes()))
+	buf.Reset()
+	require.NoError(t, NewWriter(&buf).Write(Error{Rung: 1, Message: "x", Fatal: true, Code: ErrorEncoderRefused}))
+	assert.Equal(t, "0000000b3209080212017818012001", hex.EncodeToString(buf.Bytes()))
+}

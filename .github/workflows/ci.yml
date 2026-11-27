@@ -1,168 +1,590 @@
-# Continuous integration: build, test, lint, vulnerability scan.
-#
-# The native transcoder (internal/transcoder/native, cmd/open-streamer-transcoder)
-# is cgo against go-astiav → libav 8. FFmpeg 8 is not in any runner's apt, so
-# every job that COMPILES Go runs inside the prebuilt builder image
-# (ghcr.io/<owner>/open-streamer-builder:v1, published by builder-image.yml).
-# `go mod tidy` doesn't compile cgo, so it stays on a plain runner.
-#
-# Bootstrap note: the builder image must exist in GHCR before these jobs can
-# pull it — run the "Builder image" workflow once (it auto-runs when
-# Dockerfile.builder changes).
 name: CI
 
 on:
-  # PR-only: correctness is gated on pull requests into main/master.
-  # Pushes to main don't re-run CI (the PR already validated the commit);
-  # main is reserved for tag-triggered Release builds.
   pull_request:
-    branches: [main, master]
+    branches: [main, rebuild]
 
 permissions:
   contents: read
-  packages: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
-  mod-tidy:
+  tidy:
     name: go mod tidy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
-
-      - name: Ensure go.mod / go.sum are tidy
+      - name: go mod tidy drift check
         run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
+          go mod tidy && git diff --exit-code -- go.mod go.sum
+
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+
+  # The transcoder child (cmd/ostranscoder, -tags libav) on amd64: built
+  # with cgo against the pinned FFmpeg 8.1 shared build (scripts/
+  # ffmpeg-dev.sh) on Ubuntu 24.04, so that the bundle needs only glibc
+  # 2.39 or later from the system. The tagged packages are vetted and tested
+  # with LD_LIBRARY_PATH on the prefix's lib/ (a test binary has no rpath);
+  # the bundle (scripts/bundle-ostranscoder.sh: the binary with DT_RPATH
+  # $ORIGIN/lib, lib/ and LICENSE-ffmpeg/) must then run -version from
+  # another directory without it. It is uploaded as a tar, which keeps the
+  # exec bit.
+  transcoder-amd64:
+    runs-on: ubuntu-24.04
+    env:
+      OSTX_ARCH: amd64
+      OSTX_PKGS: ./internal/transcode/native/... ./cmd/ostranscoder/...
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The EC2 regional mirror is dropped as in the test job.
+      - name: Install pkg-config
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config
+      - name: Fetch the pinned FFmpeg 8.1
+        run: |
+          prefix=$(sh scripts/ffmpeg-dev.sh "$OSTX_ARCH")
+          echo "OSTX_PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      # go vet and go test only warn, and pass, when a pattern matches no
+      # packages: a moved or mistagged package would go unchecked.
+      - name: Check the libav packages exist
+        run: |
+          for p in $OSTX_PKGS; do
+            if [ -z "$(go list -tags libav "$p")" ]; then
+              echo "$p matches no packages with -tags libav" >&2
+              exit 1
+            fi
+          done
+      - name: go vet -tags libav
+        run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go vet -tags libav $OSTX_PKGS
+      # The lint job builds without the tag, so it never sees the libav
+      # packages: lint them here with the lint job's version.
+      - name: golangci-lint --build-tags libav
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0
+          args: --build-tags libav ${{ env.OSTX_PKGS }}
+      - name: go test -race -tags libav
+        run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go test -race -count=1 -tags libav $OSTX_PKGS
+      - name: Bundle ostranscoder
+        run: sh scripts/bundle-ostranscoder.sh "$OSTX_ARCH" "dist/ostranscoder-$OSTX_ARCH"
+      - name: Run the bundle
+        run: |
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-$OSTX_ARCH/ostranscoder"
+          out=$(cd / && env -u LD_LIBRARY_PATH "$ostx" -version)
+          echo "$out"
+          echo "$out" | grep -Eqx 'ostranscoder wire [0-9]+ libavcodec 62\.[0-9]+\.[0-9]+'
+          ls -l "$(dirname "$ostx")/lib" "$(dirname "$ostx")/LICENSE-ffmpeg"
+      # The runner has no NVIDIA device (and on arm64 the build may lack
+      # h264_nvenc): -probe nvenc must report that cleanly, as exit 3 and
+      # one line "nvenc: <error>", never crash. The NVENC device tests skip
+      # here with their reason; the GPU proof is make test-nvenc (R-C12).
+      - name: Probe NVENC (no device)
+        run: |
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-$OSTX_ARCH/ostranscoder"
+          set +e
+          out=$(cd / && env -u LD_LIBRARY_PATH "$ostx" -probe nvenc)
+          code=$?
+          set -e
+          echo "exit $code: $out"
+          if [ "$code" -ne 3 ]; then
+            echo "-probe nvenc exited $code, want 3" >&2
+            exit 1
+          fi
+          echo "$out" | grep -q '^nvenc: '
+      - name: Tar the bundle
+        run: tar -C dist -cf "ostranscoder-$OSTX_ARCH.tar" "ostranscoder-$OSTX_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ostranscoder-${{ env.OSTX_ARCH }}
+          path: ostranscoder-${{ env.OSTX_ARCH }}.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  # The transcoder child (cmd/ostranscoder, -tags libav) on arm64: built
+  # with cgo against the pinned FFmpeg 8.1 shared build (scripts/
+  # ffmpeg-dev.sh) on Ubuntu 24.04, so that the bundle needs only glibc
+  # 2.39 or later from the system. The tagged packages are vetted and tested
+  # with LD_LIBRARY_PATH on the prefix's lib/ (a test binary has no rpath);
+  # the bundle (scripts/bundle-ostranscoder.sh: the binary with DT_RPATH
+  # $ORIGIN/lib, lib/ and LICENSE-ffmpeg/) must then run -version from
+  # another directory without it. It is uploaded as a tar, which keeps the
+  # exec bit.
+  transcoder-arm64:
+    runs-on: ubuntu-24.04-arm
+    env:
+      OSTX_ARCH: arm64
+      OSTX_PKGS: ./internal/transcode/native/... ./cmd/ostranscoder/...
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The EC2 regional mirror is dropped as in the test job.
+      - name: Install pkg-config
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config
+      - name: Fetch the pinned FFmpeg 8.1
+        run: |
+          prefix=$(sh scripts/ffmpeg-dev.sh "$OSTX_ARCH")
+          echo "OSTX_PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      # go vet and go test only warn, and pass, when a pattern matches no
+      # packages: a moved or mistagged package would go unchecked.
+      - name: Check the libav packages exist
+        run: |
+          for p in $OSTX_PKGS; do
+            if [ -z "$(go list -tags libav "$p")" ]; then
+              echo "$p matches no packages with -tags libav" >&2
+              exit 1
+            fi
+          done
+      - name: go vet -tags libav
+        run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go vet -tags libav $OSTX_PKGS
+      - name: go test -race -tags libav
+        run: LD_LIBRARY_PATH="$OSTX_PREFIX/lib" go test -race -count=1 -tags libav $OSTX_PKGS
+      - name: Bundle ostranscoder
+        run: sh scripts/bundle-ostranscoder.sh "$OSTX_ARCH" "dist/ostranscoder-$OSTX_ARCH"
+      - name: Run the bundle
+        run: |
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-$OSTX_ARCH/ostranscoder"
+          out=$(cd / && env -u LD_LIBRARY_PATH "$ostx" -version)
+          echo "$out"
+          echo "$out" | grep -Eqx 'ostranscoder wire [0-9]+ libavcodec 62\.[0-9]+\.[0-9]+'
+          ls -l "$(dirname "$ostx")/lib" "$(dirname "$ostx")/LICENSE-ffmpeg"
+      # The runner has no NVIDIA device (and on arm64 the build may lack
+      # h264_nvenc): -probe nvenc must report that cleanly, as exit 3 and
+      # one line "nvenc: <error>", never crash. The NVENC device tests skip
+      # here with their reason; the GPU proof is make test-nvenc (R-C12).
+      - name: Probe NVENC (no device)
+        run: |
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-$OSTX_ARCH/ostranscoder"
+          set +e
+          out=$(cd / && env -u LD_LIBRARY_PATH "$ostx" -probe nvenc)
+          code=$?
+          set -e
+          echo "exit $code: $out"
+          if [ "$code" -ne 3 ]; then
+            echo "-probe nvenc exited $code, want 3" >&2
+            exit 1
+          fi
+          echo "$out" | grep -q '^nvenc: '
+      - name: Tar the bundle
+        run: tar -C dist -cf "ostranscoder-$OSTX_ARCH.tar" "ostranscoder-$OSTX_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ostranscoder-${{ env.OSTX_ARCH }}
+          path: ostranscoder-${{ env.OSTX_ARCH }}.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  # The real transcoder child on linux/arm64: the arm64 bundle of
+  # transcoder-arm64 behind the supervisor (TestSupervisorRealChild), the
+  # M4a scenarios (TestM4aMatrix, TestM4aKeyframesAligned, TestM4aRespawn)
+  # the M4b ABR scenarios (TestM4bMatrix, TestM4bRespawn, TestM4bSwitchTS,
+  # TestM4bRungGap) and the M4c software-encoder scenarios
+  # (TestM4cWatermarkEveryRung, TestM4cWatermarkABR,
+  # TestM4cThumbnailsTranscoded, TestM4cThumbnailsPassthrough,
+  # TestM4cThumbnailsCopyVideo, TestM4cFrozen; the live-update and respawn
+  # ones run in the test job, the NVENC ones skip without a device) and the
+  # M5a ladder served by the openstreamer server (TestM5aLadder; the other
+  # M5a scenarios need no transcoder and run in the test job), and the M5b1
+  # scenarios that need the child (TestM5b1ReplaceInputsLadder,
+  # TestM5b1Assets, TestM5b1NoFallback, each about 10 s; TestM5b1ReplaceInputs
+  # is passthrough and runs in the test job), and M5c1's ffmpeg scenario
+  # over TLS (TestM5c1FFmpeg, about 13 s: it needs no transcoder, and runs
+  # here so that apt's ffmpeg on arm64 publishes and plays over RTMPS, RTSPS
+  # and HTTPS too; the other M5c1 scenarios run in the test job), and
+  # M5c2a's SRT scenario (TestM5c2aSRTFFmpeg, about 15 s: it needs no
+  # transcoder, and runs here so that apt's ffmpeg on arm64, Ubuntu
+  # 24.04's 6.1 with libsrt, the build the peers image carries, plays an
+  # SRT output that requires a passphrase and is refused without it; the
+  # other M5c2a scenarios run in the test job). After M5c1 the whole set
+  # took about 90 s with -race on an amd64 workstation, and
+  # TestM5c2aSRTFFmpeg adds about 15 s: well inside the 10 min timeout of
+  # this job's step. Their only peers are the bundle and apt's ffmpeg and
+  # ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a failure. The
+  # VLC and GStreamer rows stay amd64-only, and so do the SRT and RTSP rows
+  # that need more than ffmpeg: TestM4aVLC, TestM4bPlayers and
+  # TestM5c2aPlayers are not in the pattern (they run in the test job), and
+  # OS_TRANSCODE_E2E_ARM=1 still skips TestM4aMatrix's t180/srt-steady and
+  # t180/rtsp-steady. TestM5c2aSRTFFmpeg is the one SRT row here, and it
+  # needs only ffmpeg.
+  transcode-e2e-arm64:
+    needs: transcoder-arm64
+    runs-on: ubuntu-24.04-arm
+    env:
+      OS_REQUIRE_PEERS: "1"
+      OS_TRANSCODE_E2E_ARM: "1"
+      E2E_PKGS: ./internal/e2e/ ./internal/transcode/
+      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cWatermarkABR TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen TestM5aLadder TestM5b1ReplaceInputsLadder TestM5b1Assets TestM5b1NoFallback TestM5b2AudioLanguageLadder TestM5c1FFmpeg TestM5c2aSRTFFmpeg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@v4
+        with:
+          name: ostranscoder-arm64
+          path: ${{ runner.temp }}/ostranscoder
+      - name: Unpack the transcoder bundle (OS_TRANSCODER)
+        run: |
+          mkdir -p dist
+          tar -C dist -xf "$RUNNER_TEMP/ostranscoder/ostranscoder-arm64.tar"
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-arm64/ostranscoder"
+          "$ostx" -version
+          echo "OS_TRANSCODER=$ostx" >> "$GITHUB_ENV"
+      # ffprobe for the b-frames rows, ffmpeg for the slow-consumer rows,
+      # and for the SRT row (TestM5c2aSRTFFmpeg) apt's ffmpeg in particular:
+      # Ubuntu 24.04's build is linked with libsrt, which a static ffmpeg
+      # download usually is not. The EC2 regional mirror is dropped as in
+      # the test job.
+      - name: Install ffmpeg
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          ffprobe -hide_banner -version | head -1
+      # go test -run passes when the pattern matches no test: a renamed test
+      # would go unrun.
+      - name: Check the tests exist
+        run: |
+          listed=$(go test -race -list '.*' $E2E_PKGS)
+          for name in $E2E_TESTS; do
+            if ! echo "$listed" | grep -qx "$name"; then
+              echo "$name is not a test in $E2E_PKGS" >&2
+              exit 1
+            fi
+          done
+      - name: go test -race (real child, arm64)
+        run: go test -race -count=1 -timeout=10m -run "^($(echo $E2E_TESTS | tr ' ' '|'))\$" $E2E_PKGS
 
   test:
-    name: test
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/open-streamer-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    needs: transcoder-amd64
+    runs-on: ubuntu-24.04
+    services:
+      # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
+      # 1.21.3, which reads and writes H.265 over enhanced RTMP (FourCC hvc1,
+      # sent to clients that announce it in connect's fourCcList), so that a
+      # new release cannot change the peer under the tests. Host port 19350
+      # keeps 1935 free for internal/ingest's default-port check.
+      mediamtx:
+        image: bluenviron/mediamtx:1.21.3
+        ports:
+          - 19350:1935
     steps:
-      - uses: actions/checkout@v6
-
-      # The job runs as root inside the builder container while the workspace
-      # was checked out by the runner user → git reports "dubious ownership"
-      # and `go build`'s VCS stamping dies with "error obtaining VCS status:
-      # exit status 128". Trust the workspace so stamping (and any git use)
-      # works.
-      - name: Trust workspace for git
-        run: git config --global --add safe.directory '*'
-
-      - name: Cache Go build + module cache
-        uses: actions/cache@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          path: |
-            /root/.cache/go-build
-            /root/go/pkg/mod
-          key: ${{ runner.os }}-gocgo-${{ hashFiles('go.sum') }}
-          restore-keys: ${{ runner.os }}-gocgo-
-
-      - name: Toolchain stamp
+          go-version-file: go.mod
+      # The server is pure Go and builds for any system (§2 Platforms).
+      - name: Build openstreamer for Linux, Windows and macOS
         run: |
-          go version
-          pkg-config --modversion libavcodec libavformat libavfilter libswscale libavutil
-
-      - name: Download modules
-        run: go mod download
-
-      - name: Verify modules
-        run: go mod verify
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Build
-        run: go build -o /dev/null ./...
-
-      - name: Test
-        run: go test -race -shuffle=on -count=1 -timeout=5m -coverprofile=coverage.out -covermode=atomic ./...
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+          for goos in linux windows darwin; do
+            GOOS=$goos go build -o /dev/null ./cmd/openstreamer
+          done
+      # The transcoder bundle of transcoder-amd64, for the tests that spawn
+      # the real child (testpeer.OSTranscoder).
+      - uses: actions/download-artifact@v4
         with:
-          files: coverage.out
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          name: ostranscoder-amd64
+          path: ${{ runner.temp }}/ostranscoder
+      - name: Unpack the transcoder bundle (OS_TRANSCODER)
+        run: |
+          mkdir -p dist
+          tar -C dist -xf "$RUNNER_TEMP/ostranscoder/ostranscoder-amd64.tar"
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-amd64/ostranscoder"
+          "$ostx" -version
+          echo "OS_TRANSCODER=$ostx" >> "$GITHUB_ENV"
+      # ffmpeg (with libsrt), and the VLC-class peers of TestM3VLCClass:
+      # VLC 3 (its SRT access is in vlc-plugin-access-extra) and GStreamer
+      # 1.24 with the libav decoders. The runner's user is not root, which
+      # VLC requires. Runners whose mirror list puts an EC2 regional mirror
+      # first spent 23 min here: that mirror timed out on most packages
+      # (Ign, then a fallback to archive.ubuntu.com after each timeout).
+      # Dropping it leaves archive.ubuntu.com and security.ubuntu.com.
+      - name: Install ffmpeg, VLC and GStreamer
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg \
+            vlc-bin vlc-plugin-base vlc-plugin-access-extra \
+            gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+          cvlc --version | head -1
+          gst-launch-1.0 --version | head -1
+      - name: Check ffmpeg has SRT
+        run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
+      # An ffmpeg 8 for the rows apt's 6.1 cannot prove (testpeer.FFmpeg8,
+      # TestHLSFFmpegAcrossGap): the static linux64 gpl 8.0.1 build of
+      # BtbN's FFmpeg-Builds (now github.com/FFmpeg-Builds) from the
+      # month-end auto-build autobuild-2026-02-28-12-59 (month-end builds are
+      # kept, daily ones pruned), checked against the sha256 GitHub records
+      # for the asset, unpacked off PATH and named by OS_FFMPEG8. Apt's
+      # ffmpeg stays the one on PATH.
+      - name: Install a pinned ffmpeg 8 (OS_FFMPEG8)
+        env:
+          FF8_URL: https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-02-28-12-59/ffmpeg-n8.0.1-66-g27b8d1a017-linux64-gpl-8.0.tar.xz
+          FF8_SHA256: 26d2ecd0cefba99f9d1ea92252a3a4f743a58df4c1c3cf9f8bbaaa40b1fca5b0
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/ffmpeg8.tar.xz" "$FF8_URL"
+          echo "$FF8_SHA256  $RUNNER_TEMP/ffmpeg8.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ffmpeg8"
+          tar -xJf "$RUNNER_TEMP/ffmpeg8.tar.xz" -C "$RUNNER_TEMP/ffmpeg8" --strip-components=1
+          ff8="$RUNNER_TEMP/ffmpeg8/bin/ffmpeg"
+          "$ff8" -hide_banner -version | head -1
+          "$ff8" -hide_banner -version | head -1 | grep -q '^ffmpeg version n\?8\.'
+          "$ff8" -hide_banner -protocols | grep -qx '  srt'
+          "$ff8" -hide_banner -demuxers | awk '$1 ~ /D/ && $2 == "hls" { found = 1 } END { exit !found }'
+          echo "OS_FFMPEG8=$ff8" >> "$GITHUB_ENV"
+      # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
+      # network, so that RTSP over UDP works, on private ports (RTSP 18554,
+      # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
+      # TestM3b1MediaMTXPull (OS_MEDIAMTX_PULL) has it pull our RTMP play
+      # output, on demand, from the fixed port 19361 into the paths m3b1pull
+      # (H.264+AAC) and m3b1pullhevc (H.265+AAC); TestM3b2MediaMTXPull has it
+      # pull our RTSP play output, on demand and over TCP, from the fixed
+      # port 19362 into the paths m3b2pull and m3b2pullhevc;
+      # TestM3b3MediaMTXPull has it pull our HLS fMP4 and HLS TS outputs
+      # from the fixed HTTP port 19364 (paths m3b3hls and m3b3hlsts) and
+      # our SRT output from the fixed port 19363 (m3b3srt), on demand; and
+      # TestM3VLCClass/push-out has it pull, on demand, the push-out's
+      # target live/m3b3push from the RTMP MediaMTX above (path m3b3push).
+      - name: Start MediaMTX for RTSP
+        run: |
+          docker run -d --rm --name osv2-mtx-m2c --network host \
+            -e MTX_RTSPADDRESS=:18554 -e MTX_RTPADDRESS=:18000 -e MTX_RTCPADDRESS=:18001 \
+            -e MTX_RTMP=no -e MTX_HLS=no -e MTX_WEBRTC=no -e MTX_SRT=no -e MTX_API=no \
+            -e MTX_METRICS=no -e MTX_PPROF=no -e MTX_PLAYBACK=no -e MTX_MOQ=no \
+            -e MTX_PATHS_M3B1PULL_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pull \
+            -e MTX_PATHS_M3B1PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pullhevc \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULL_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pull \
+            -e MTX_PATHS_M3B2PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULL_RTSPTRANSPORT=tcp \
+            -e MTX_PATHS_M3B2PULLHEVC_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pullhevc \
+            -e MTX_PATHS_M3B2PULLHEVC_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULLHEVC_RTSPTRANSPORT=tcp \
+            -e MTX_PATHS_M3B3HLS_SOURCE=http://127.0.0.1:19364/live/m3b3/cmaf/master.m3u8 \
+            -e MTX_PATHS_M3B3HLS_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B3HLSTS_SOURCE=http://127.0.0.1:19364/live/m3b3/hls/index.m3u8 \
+            -e MTX_PATHS_M3B3HLSTS_SOURCEONDEMAND=yes \
+            -e 'MTX_PATHS_M3B3SRT_SOURCE=srt://127.0.0.1:19363?streamid=live/m3b3srt' \
+            -e MTX_PATHS_M3B3SRT_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B3PUSH_SOURCE=rtmp://127.0.0.1:19350/live/m3b3push \
+            -e MTX_PATHS_M3B3PUSH_SOURCEONDEMAND=yes \
+            bluenviron/mediamtx:1.21.3
+          for _ in $(seq 50); do
+            nc -z 127.0.0.1 18554 && exit 0
+            sleep 0.2
+          done
+          docker logs osv2-mtx-m2c
+          exit 1
+      - run: make test
+        env:
+          # Only CI may bind 127.0.0.1:1935 (internal/ingest's default-port
+          # check); the tests skip it elsewhere.
+          OS_TEST_BIND_1935: "1"
+          OS_REQUIRE_PEERS: "1"
+          OS_MEDIAMTX_RTMP: 127.0.0.1:19350
+          OS_MEDIAMTX_RTSP: 127.0.0.1:18554
+          OS_MEDIAMTX_PULL: "1"
+          OS_REQUIRE_MEDIAMTX: "1"
+      - name: Stop MediaMTX for RTSP
+        if: always()
+        run: docker stop osv2-mtx-m2c || true
+
+  coverage:
+    needs: transcoder-amd64
+    runs-on: ubuntu-24.04
+    services:
+      # The RTMP peer of TestRTMPMediaMTX and TestRTMPMediaMTXHEVC. Pinned to
+      # 1.21.3, which reads and writes H.265 over enhanced RTMP (FourCC hvc1,
+      # sent to clients that announce it in connect's fourCcList), so that a
+      # new release cannot change the peer under the tests. Host port 19350
+      # keeps 1935 free for internal/ingest's default-port check.
+      mediamtx:
+        image: bluenviron/mediamtx:1.21.3
+        ports:
+          - 19350:1935
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The transcoder bundle of transcoder-amd64, for the tests that spawn
+      # the real child (testpeer.OSTranscoder).
+      - uses: actions/download-artifact@v4
+        with:
+          name: ostranscoder-amd64
+          path: ${{ runner.temp }}/ostranscoder
+      - name: Unpack the transcoder bundle (OS_TRANSCODER)
+        run: |
+          mkdir -p dist
+          tar -C dist -xf "$RUNNER_TEMP/ostranscoder/ostranscoder-amd64.tar"
+          ostx="$GITHUB_WORKSPACE/dist/ostranscoder-amd64/ostranscoder"
+          "$ostx" -version
+          echo "OS_TRANSCODER=$ostx" >> "$GITHUB_ENV"
+      # ffmpeg (with libsrt), and the VLC-class peers of TestM3VLCClass:
+      # VLC 3 (its SRT access is in vlc-plugin-access-extra) and GStreamer
+      # 1.24 with the libav decoders. The runner's user is not root, which
+      # VLC requires. Runners whose mirror list puts an EC2 regional mirror
+      # first spent 23 min here: that mirror timed out on most packages
+      # (Ign, then a fallback to archive.ubuntu.com after each timeout).
+      # Dropping it leaves archive.ubuntu.com and security.ubuntu.com.
+      - name: Install ffmpeg, VLC and GStreamer
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg \
+            vlc-bin vlc-plugin-base vlc-plugin-access-extra \
+            gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+          cvlc --version | head -1
+          gst-launch-1.0 --version | head -1
+      - name: Check ffmpeg has SRT
+        run: ffmpeg -hide_banner -protocols | grep -qx '  srt'
+      # An ffmpeg 8 for the rows apt's 6.1 cannot prove (testpeer.FFmpeg8,
+      # TestHLSFFmpegAcrossGap): the static linux64 gpl 8.0.1 build of
+      # BtbN's FFmpeg-Builds (now github.com/FFmpeg-Builds) from the
+      # month-end auto-build autobuild-2026-02-28-12-59 (month-end builds are
+      # kept, daily ones pruned), checked against the sha256 GitHub records
+      # for the asset, unpacked off PATH and named by OS_FFMPEG8. Apt's
+      # ffmpeg stays the one on PATH.
+      - name: Install a pinned ffmpeg 8 (OS_FFMPEG8)
+        env:
+          FF8_URL: https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-02-28-12-59/ffmpeg-n8.0.1-66-g27b8d1a017-linux64-gpl-8.0.tar.xz
+          FF8_SHA256: 26d2ecd0cefba99f9d1ea92252a3a4f743a58df4c1c3cf9f8bbaaa40b1fca5b0
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/ffmpeg8.tar.xz" "$FF8_URL"
+          echo "$FF8_SHA256  $RUNNER_TEMP/ffmpeg8.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ffmpeg8"
+          tar -xJf "$RUNNER_TEMP/ffmpeg8.tar.xz" -C "$RUNNER_TEMP/ffmpeg8" --strip-components=1
+          ff8="$RUNNER_TEMP/ffmpeg8/bin/ffmpeg"
+          "$ff8" -hide_banner -version | head -1
+          "$ff8" -hide_banner -version | head -1 | grep -q '^ffmpeg version n\?8\.'
+          "$ff8" -hide_banner -protocols | grep -qx '  srt'
+          "$ff8" -hide_banner -demuxers | awk '$1 ~ /D/ && $2 == "hls" { found = 1 } END { exit !found }'
+          echo "OS_FFMPEG8=$ff8" >> "$GITHUB_ENV"
+      # The RTSP peer of the TestM2c scenarios: MediaMTX 1.21.3 on the host
+      # network, so that RTSP over UDP works, on private ports (RTSP 18554,
+      # RTP 18000, RTCP 18001); the other servers, MoQ included, are off.
+      # TestM3b1MediaMTXPull (OS_MEDIAMTX_PULL) has it pull our RTMP play
+      # output, on demand, from the fixed port 19361 into the paths m3b1pull
+      # (H.264+AAC) and m3b1pullhevc (H.265+AAC); TestM3b2MediaMTXPull has it
+      # pull our RTSP play output, on demand and over TCP, from the fixed
+      # port 19362 into the paths m3b2pull and m3b2pullhevc;
+      # TestM3b3MediaMTXPull has it pull our HLS fMP4 and HLS TS outputs
+      # from the fixed HTTP port 19364 (paths m3b3hls and m3b3hlsts) and
+      # our SRT output from the fixed port 19363 (m3b3srt), on demand; and
+      # TestM3VLCClass/push-out has it pull, on demand, the push-out's
+      # target live/m3b3push from the RTMP MediaMTX above (path m3b3push).
+      - name: Start MediaMTX for RTSP
+        run: |
+          docker run -d --rm --name osv2-mtx-m2c --network host \
+            -e MTX_RTSPADDRESS=:18554 -e MTX_RTPADDRESS=:18000 -e MTX_RTCPADDRESS=:18001 \
+            -e MTX_RTMP=no -e MTX_HLS=no -e MTX_WEBRTC=no -e MTX_SRT=no -e MTX_API=no \
+            -e MTX_METRICS=no -e MTX_PPROF=no -e MTX_PLAYBACK=no -e MTX_MOQ=no \
+            -e MTX_PATHS_M3B1PULL_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pull \
+            -e MTX_PATHS_M3B1PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCE=rtmp://127.0.0.1:19361/live/m3b1pullhevc \
+            -e MTX_PATHS_M3B1PULLHEVC_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULL_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pull \
+            -e MTX_PATHS_M3B2PULL_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULL_RTSPTRANSPORT=tcp \
+            -e MTX_PATHS_M3B2PULLHEVC_SOURCE=rtsp://127.0.0.1:19362/live/m3b2pullhevc \
+            -e MTX_PATHS_M3B2PULLHEVC_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B2PULLHEVC_RTSPTRANSPORT=tcp \
+            -e MTX_PATHS_M3B3HLS_SOURCE=http://127.0.0.1:19364/live/m3b3/cmaf/master.m3u8 \
+            -e MTX_PATHS_M3B3HLS_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B3HLSTS_SOURCE=http://127.0.0.1:19364/live/m3b3/hls/index.m3u8 \
+            -e MTX_PATHS_M3B3HLSTS_SOURCEONDEMAND=yes \
+            -e 'MTX_PATHS_M3B3SRT_SOURCE=srt://127.0.0.1:19363?streamid=live/m3b3srt' \
+            -e MTX_PATHS_M3B3SRT_SOURCEONDEMAND=yes \
+            -e MTX_PATHS_M3B3PUSH_SOURCE=rtmp://127.0.0.1:19350/live/m3b3push \
+            -e MTX_PATHS_M3B3PUSH_SOURCEONDEMAND=yes \
+            bluenviron/mediamtx:1.21.3
+          for _ in $(seq 50); do
+            nc -z 127.0.0.1 18554 && exit 0
+            sleep 0.2
+          done
+          docker logs osv2-mtx-m2c
+          exit 1
+      - run: make cover covercheck
+        env:
+          # Only CI may bind 127.0.0.1:1935 (internal/ingest's default-port
+          # check); the tests skip it elsewhere.
+          OS_TEST_BIND_1935: "1"
+          OS_REQUIRE_PEERS: "1"
+          OS_MEDIAMTX_RTMP: 127.0.0.1:19350
+          OS_MEDIAMTX_RTSP: 127.0.0.1:18554
+          OS_MEDIAMTX_PULL: "1"
+          OS_REQUIRE_MEDIAMTX: "1"
+      - name: Stop MediaMTX for RTSP
+        if: always()
+        run: docker stop osv2-mtx-m2c || true
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  # govulncheck on the libav-tagged build, which the govulncheck job (no
+  # tag) never sees. The pinned FFmpeg and pkg-config let the cgo packages
+  # type-check. Ruling R-F1: no job depends on this one, so a newly
+  # published vulnerability cannot hold back the bundle or the tests.
+  govulncheck-libav:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The EC2 regional mirror is dropped as in the test job.
+      - name: Install pkg-config
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/\.ec2\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config
+      - name: Fetch the pinned FFmpeg 8.1
+        run: |
+          prefix=$(sh scripts/ffmpeg-dev.sh amd64)
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -tags libav ./...
 
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
-    continue-on-error: true
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/open-streamer-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-
-      # The job runs as root inside the builder container while the workspace
-      # was checked out by the runner user → git reports "dubious ownership"
-      # and `go build`'s VCS stamping dies with "error obtaining VCS status:
-      # exit status 128". Trust the workspace so stamping (and any git use)
-      # works.
-      - name: Trust workspace for git
-        run: git config --global --add safe.directory '*'
-
-      - name: Cache Go build + module cache
-        uses: actions/cache@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          path: |
-            /root/.cache/go-build
-            /root/go/pkg/mod
-          key: ${{ runner.os }}-gocgo-${{ hashFiles('go.sum') }}
-          restore-keys: ${{ runner.os }}-gocgo-
-
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
-
-      - name: golangci-lint
-        run: golangci-lint run --timeout=5m ./...
-
-  govulncheck:
-    name: govulncheck
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/open-streamer-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v6
-
-      # The job runs as root inside the builder container while the workspace
-      # was checked out by the runner user → git reports "dubious ownership"
-      # and `go build`'s VCS stamping dies with "error obtaining VCS status:
-      # exit status 128". Trust the workspace so stamping (and any git use)
-      # works.
-      - name: Trust workspace for git
-        run: git config --global --add safe.directory '*'
-
-      - name: Cache Go build + module cache
-        uses: actions/cache@v5
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
         with:
-          path: |
-            /root/.cache/go-build
-            /root/go/pkg/mod
-          key: ${{ runner.os }}-gocgo-${{ hashFiles('go.sum') }}
-          restore-keys: ${{ runner.os }}-gocgo-
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
-      - name: Run govulncheck
-        run: govulncheck ./...
+          version: v2.14.0

@@ -1,0 +1,59 @@
+// Package api is the server's REST API: the streams, the assets, the config
+// editor, the reload, the status documents, the metrics and pprof, behind
+// HTTP Basic authentication with two roles (a viewer reads, an editor reads
+// and writes).
+//
+// # The order of one request
+//
+// The outer wrapper, API.ServeHTTP, fixes the order, and nothing of ours
+// runs before its turn:
+//
+//  1. The route, from the pattern http.ServeMux.Handler returns and nothing
+//     else. A path the mux redirects (a doubled slash, a "..", a missing
+//     trailing slash) resolves to its target's route.
+//  2. An unmatched request gets the mux's own 404 or 405 without
+//     authentication; an open route (/healthz) is dispatched.
+//  3. A PUT, DELETE or POST without X-Requested-By is refused, before any
+//     credential is looked at: a cross-site form cannot set the header.
+//  4. The Basic credentials; none is a 401 that counts against nobody.
+//  5. The limiter and the users, in the order internal/auth documents:
+//     Blocked, Recall, Reserve, Verify. A remembered login is let in with
+//     no verification. A password that differs from the one remembered for
+//     its name is wrong: it is counted as a failed login and answered 401
+//     with no verification, before Reserve; when it cannot be counted,
+//     because the pair is blocked by then, it is a 429 with Retry-After 1
+//     instead. Reserve holds the pair to its
+//     attempts and the client address to 4 verifications in flight,
+//     whatever names it presents; a fifth is a 429 with Retry-After 1.
+//     Neither remembered case takes a place.
+//  6. A query that holds the key secrets (?secrets=1, ?secrets,
+//     ?x=1;secrets=0) is a 400 for every role, before the route's role is
+//     looked at; then the route's role.
+//  7. The dispatch through the mux, which fills the path values. A handler
+//     of ours refuses a request the wrapper did not pass for its own route.
+//
+// # Secrets
+//
+// Secrets are write-only (R-T3). Stream documents are redacted in every
+// response, for every role, and so is the config text, which the Backend
+// masks; a write that sends the mask back keeps the stored secret, which
+// the Backend resolves. The config text still holds the users' password
+// hashes and is an editor's. Nothing here logs a header, a query, a body,
+// a spec or a password; every error text goes through logging.Scrub.
+//
+// # Assets
+//
+// The asset routes take a name asset.KindOf accepts, or answer 404 without
+// asking the Backend. An upload is application/octet-stream; a
+// Content-Length over its kind's asset.MaxBytes is a 413 before a byte is
+// read, and the body is read through http.MaxBytesReader. At most two
+// uploads run at once (R-E6): an upload waits up to 30 s for a slot, and only
+// once it holds one are its deadlines set, through http.ResponseController:
+// the body must arrive within 30 s plus 1 s per 256 KiB of its kind's limit,
+// and the answer within 60 s more. A GET streams the Backend's open file with
+// http.ServeContent under a write deadline of the same formula for the file's
+// size, and closes it. The asset errors that carry a path (a write, an open,
+// the font probe) are logged and answered with a fixed message.
+//
+// The package starts no goroutine.
+package api

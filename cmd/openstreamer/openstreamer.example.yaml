@@ -1,0 +1,136 @@
+# An example config for openstreamer. The whole configuration is this one
+# file: the server's listeners, the API's users and the streams.
+#
+#   openstreamer -config /etc/openstreamer/openstreamer.yaml
+#
+# The file holds password hashes and stream keys: it must be private to its
+# owner (chmod 600), or the server does not start. The server rewrites it
+# when the API edits the config, so in a container mount its directory, not
+# the single file.
+#
+# After an edit by hand, apply it with SIGHUP or POST /api/v1/reload. An
+# edit through the API is refused while a hand edit is waiting for that.
+#
+# Numbers are plain decimal integers (720, not 0720 or 720.0), text that
+# looks like a number is quoted, and anchors, aliases and merge keys
+# (&a, *a, <<:) are not supported.
+version: 1
+
+# A change in this section is not applied while the server runs: it is
+# reported as restart_required until the process is restarted.
+server:
+  # The certificate of every TLS listener: one pair of PEM files (the
+  # certificate file may hold its chain). A new pair on disk is taken
+  # without a restart, within 30 s or at once on SIGHUP or POST
+  # /api/v1/reload. Each tls_listen below needs it.
+  # tls:
+  #   cert_file: /etc/openstreamer/tls/fullchain.pem
+  #   key_file: /etc/openstreamer/tls/privkey.pem
+  # HLS, DASH and HTTP-TS, under /live/<stream>/. Default ":8080".
+  http:
+    listen: ":8080"
+    # The same over HTTPS, beside the plain listener. No default: off.
+    # tls_listen: ":8443"
+  # The API, the metrics and pprof. Default "127.0.0.1:8081": this listener
+  # has no TLS, so keep it on loopback.
+  api:
+    listen: "127.0.0.1:8081"
+    # The API over HTTPS: the listener to reach it from the network.
+    # tls_listen: ":8444"
+  # The shared RTMP listener: players of rtmp://host:19350/live/<stream>,
+  # and the streams' RTMP listen inputs on the same address. Leave listen
+  # out to turn it off; the same goes for rtsp and srt. A stream may turn
+  # on an output (rtmp, rtsp, srt) only while its listener is on.
+  rtmp:
+    listen: ":19350"
+    # RTMPS, with the same app: players of rtmps://host:19351/live/<stream>,
+    # and the streams' rtmps:// listen inputs, which must name this address.
+    # tls_listen: ":19351"
+    app: live
+  # RTSP players: rtsp://host:5554/live/<stream>. udp also offers RTP over
+  # UDP; without it RTP is interleaved on the TCP connection.
+  rtsp:
+    listen: ":5554"
+    # RTSPS players: rtsps://host:5555/live/<stream>, RTP interleaved on the
+    # TLS connection only (udp does not apply to it).
+    # tls_listen: ":5555"
+    app: live
+    udp: false
+  # SRT receivers: srt://host:9999?streamid=live/<stream>.
+  srt:
+    listen: ":9999"
+    app: live
+    latency_ms: 120
+  # The transcoder, for streams with a ladder or a thumbnail. Without this
+  # key the server looks for ostranscoder next to its own executable.
+  # transcoder:
+  #   binary: /usr/local/bin/ostranscoder
+  # The directory of watermark images and fonts, which /api/v1/assets
+  # manages: regular files only, not symbolic links.
+  # assets_dir: /srv/openstreamer/assets
+  log:
+    level: info   # debug, info, warn, error
+    format: json  # json, text
+
+# The API's users. A viewer reads; an editor reads and writes. Nobody is
+# shown a secret: the API masks every one as xxxxx, and xxxxx sent back
+# keeps the stored value. At least one editor is needed. Make each hash with
+#
+#   openstreamer hash-password
+#
+# which asks for the password on the terminal (or reads it from a pipe) and
+# prints the hash. The placeholders below are not hashes, so this example
+# does not load until they are replaced.
+users:
+  - name: ops
+    role: editor
+    password: "REPLACE-WITH-OUTPUT-OF-openstreamer-hash-password"
+  - name: grafana
+    role: viewer
+    password: "REPLACE-WITH-OUTPUT-OF-openstreamer-hash-password"
+
+# The streams. Each is served as /live/<name>/... over HTTP and under
+# <app>/<name> on the other outputs that are on.
+streams:
+  - name: cam1
+    # By priority: the first input that works is used, the next ones are
+    # fallbacks.
+    inputs:
+      - url: rtsp://camera.example/stream1
+    # The language of the audio (BCP 47), written in the HLS masters and the MPD.
+    # audio_language: vi
+    outputs:
+      hls: true
+      dash: true
+      rtmp: true
+      rtsp: true
+      srt: true
+      # The passphrase SRT players must give (10 to 79 of A-Z a-z 0-9 . _ ~ -).
+      # Quote a value with a leading zero or a dot; quoting is always safe.
+      # srt_passphrase: "replace-with-a-long-passphrase"
+
+  # A stream with a ladder and a watermark needs the transcoder, and its
+  # assets in assets_dir.
+  # - name: cam2
+  #   inputs:
+  #     - url: rtsp://camera.example/stream2
+  #   transcode:
+  #     renditions:
+  #       - label: "1080"
+  #         height: 1080
+  #         bitrate_kbps: 5000
+  #         encoder: nvenc
+  #         # Fail, and retry, when NVENC cannot be opened, instead of
+  #         # encoding in software; it takes the other renditions down too.
+  #         # no_fallback: true
+  #       - label: "720"
+  #         height: 720
+  #         bitrate_kbps: 2500
+  #     watermark:
+  #       text: LIVE
+  #       position: br
+  #       # A TTF or OTF asset to draw the text with; without it, DejaVu Sans.
+  #       # font: brand.ttf
+  #   outputs:
+  #     hls: true
+  #     dash: true

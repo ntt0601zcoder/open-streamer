@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte(" \"A:\\x2f/00\"")
+uint16(217)
+byte('v')
+byte('v')

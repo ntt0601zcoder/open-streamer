@@ -1,194 +1,87 @@
-# Open Streamer — local development shortcuts.
-# Requires: Go (see go.mod), optional: golangci-lint, govulncheck, gofumpt.
-# Production deploy: build/install.sh (Linux + systemd).
+.PHONY: test test-pinned lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers ostranscoder test-transcode test-nvenc openstreamer
 
-SHELL       := /usr/bin/env bash
-.SHELLFLAGS := -eu -o pipefail -c
+test:
+	go test -race -shuffle=on -count=1 -timeout=20m ./...
 
-# --- paths ---
-MAIN_PKG    := ./cmd/server
-BIN_DIR     := bin
-BIN_NAME    := open-streamer
-INSTALL_SH  := build/install.sh
+# test-pinned is make test under go.mod's Go, the version CI installs: run it
+# before pushing when the host's Go is newer.
+GO_PINNED := $(shell awk '$$1 == "go" { print $$2; exit }' go.mod)
+test-pinned:
+	GOTOOLCHAIN=go$(GO_PINNED) go test -race -shuffle=on -count=1 -timeout=20m ./...
 
-# Per-stream transcoder subprocess (in-process libavcodec pipeline).
-# Built as a separate binary so the supervisor in internal/transcoder/
-# service.go can crash-recover one stream without taking down the whole
-# server. The native package needs cgo + libav-dev headers — install:
-#   apt install libavcodec-dev libavfilter-dev libavformat-dev \
-#               libswscale-dev libavutil-dev pkg-config
-TRANSCODER_PKG  := ./cmd/open-streamer-transcoder
-TRANSCODER_NAME := open-streamer-transcoder
-
-# --- go ---
-GO          ?= go
-GOFLAGS     ?=
-TESTFLAGS   ?= -race -shuffle=on -count=1 -timeout=5m
-COVER_OUT   := coverage.out
-
-.DEFAULT_GOAL := help
-
-.PHONY: help
-help: ## Show this help
-	@grep -E '^[a-zA-Z0-9_.-]+:.*?##' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
-
-.PHONY: all
-all: tidy vet build test ## tidy, vet, build, test (race)
-
-# --- build & run ---
-
-# --- version stamping ---
-# Injected into pkg/version at build time. CI workflows can override
-# VERSION (e.g. VERSION=v0.0.7 make build) to stamp release tags;
-# local builds default to `git describe` + short SHA fallback.
-#
-# VERSION_PKG is the ldflags -X target, which MUST equal the Go module
-# import path (NOT the repo URL) + /pkg/version. Derived from go.mod so a
-# fork keeps version stamping working without edits — go list -m, with a
-# dependency-free go.mod parse fallback.
-MODULE      := $(shell go list -m 2>/dev/null || awk 'NR==1{print $$2}' go.mod)
-VERSION_PKG := $(MODULE)/pkg/version
-VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-BUILT_AT    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS     ?= -s -w \
-               -X $(VERSION_PKG).Version=$(VERSION) \
-               -X $(VERSION_PKG).Commit=$(COMMIT) \
-               -X $(VERSION_PKG).BuiltAt=$(BUILT_AT)
-
-.PHONY: build
-build: ## Compile server binary to $(BIN_DIR)/$(BIN_NAME) with version stamping
-	@mkdir -p $(BIN_DIR)
-	$(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(BIN_NAME) $(MAIN_PKG)
-
-.PHONY: build-transcoder
-build-transcoder: ## Compile per-stream transcoder subprocess (cgo + libav-dev required)
-	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(TRANSCODER_NAME) $(TRANSCODER_PKG)
-
-.PHONY: build-all
-build-all: build build-transcoder ## Build both server + transcoder binaries
-
-BUILDER_IMAGE_TAG ?= open-streamer-builder:v1
-
-.PHONY: builder-image
-builder-image: ## Build the reproducible cgo + libav 8 builder image (run once; rebuild when go.mod toolchain bumps or libav major version changes)
-	docker buildx build -f Dockerfile.builder \
-		--platform linux/amd64 \
-		--load \
-		-t $(BUILDER_IMAGE_TAG) .
-
-.PHONY: build-transcoder-linux
-build-transcoder-linux: ## Cross-build transcoder for linux/amd64 + bundle libav .so files. Requires builder-image first.
-	@docker image inspect $(BUILDER_IMAGE_TAG) >/dev/null 2>&1 || \
-		(echo "→ builder image missing; running `make builder-image` first..."; $(MAKE) builder-image)
-	@mkdir -p dist/transcoder-linux-amd64
-	docker buildx build -f Dockerfile.transcoder \
-		--build-arg BUILDER_IMAGE=$(BUILDER_IMAGE_TAG) \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg COMMIT=$(COMMIT) \
-		--platform linux/amd64 \
-		-o type=local,dest=./dist/transcoder-linux-amd64 .
-	@echo ""
-	@echo "→ binary: dist/transcoder-linux-amd64/open-streamer-transcoder"
-	@echo "→ libs:   dist/transcoder-linux-amd64/lib/ ($$(ls dist/transcoder-linux-amd64/lib/ 2>/dev/null | wc -l | tr -d ' ') files)"
-	@echo ""
-	@echo "deploy: scp -r dist/transcoder-linux-amd64/* target:/opt/native-test/"
-	@echo "run:    LD_LIBRARY_PATH=/opt/native-test/lib /opt/native-test/open-streamer-transcoder --socket /tmp/test.sock"
-
-.PHONY: run
-run: ## Run server without building a persistent binary
-	$(GO) run $(GOFLAGS) $(MAIN_PKG)
-
-.PHONY: install
-install: ## Install server binary to $$GOBIN or $$GOPATH/bin (with version stamping)
-	$(GO) install $(GOFLAGS) -ldflags="$(LDFLAGS)" $(MAIN_PKG)
-
-.PHONY: build-dev
-build-dev: ## Cross-compile a release-style tarball for a Go-less server (default linux/amd64, version=dev)
-	./scripts/build-dev.sh
-
-# --- quality ---
-
-.PHONY: generate
-generate: ## Run go generate (e.g. Swagger from swag annotations)
-	$(GO) generate ./cmd/server/...
-
-.PHONY: swagger
-swagger: ## Regenerate api/docs (OpenAPI 2) via swag; run from repo root
-	cd cmd/server && $(GO) run github.com/swaggo/swag/cmd/swag@latest init -g doc_swagger.go -o ../../api/docs --parseGoList=false -d .,../../internal/api,../../internal/api/handler,../../internal/api/apidocs,../../internal/domain,../../internal/manager,../../internal/publisher,../../internal/transcoder,../../internal/vod,../../config,../../pkg/version
-
-.PHONY: hooks-install
-hooks-install: ## Install repo git hooks (pre-commit auto-regenerates swagger)
-	@hook_dst="$$(git rev-parse --git-path hooks)/pre-commit"; \
-	hook_src="$$(git rev-parse --show-toplevel)/scripts/git-hooks/pre-commit"; \
-	rm -f "$$hook_dst"; \
-	ln -s "$$hook_src" "$$hook_dst"; \
-	echo "linked $$hook_dst → $$hook_src"
-
-.PHONY: tidy
-tidy: ## go mod tidy
-	$(GO) mod tidy
-
-.PHONY: verify
-verify: ## go mod verify
-	$(GO) mod verify
-
-.PHONY: vet
-vet: ## go vet ./...
-	$(GO) vet ./...
-
-.PHONY: fmt
-fmt: ## Format with gofmt (use gofumpt if installed)
-	@command -v gofumpt >/dev/null 2>&1 && gofumpt -w . || $(GO) fmt ./...
-
-.PHONY: lint
-lint: ## golangci-lint run ./... (install: https://golangci-lint.run/)
+lint:
 	golangci-lint run ./...
 
-.PHONY: vulncheck
-vulncheck: ## govulncheck ./... (install: go install golang.org/x/vuln/cmd/govulncheck@latest)
-	govulncheck ./...
+tools:
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
-.PHONY: check
-check: tidy vet lint test ## Full local check (tidy, vet, lint, test)
+fmt:
+	@if command -v gofumpt >/dev/null 2>&1; then gofumpt -l -w .; else gofmt -l -w .; fi
 
-# --- test ---
+tidy:
+	go mod tidy
 
-.PHONY: test
-test: ## go test with race + shuffle
-	$(GO) test $(TESTFLAGS) ./...
+vet:
+	go vet ./...
 
-.PHONY: test-norace
-test-norace: ## go test without -race (faster / constrained envs)
-	$(GO) test -shuffle=on -count=1 -timeout=5m ./...
+check: tidy vet lint test
 
-.PHONY: test-integration
-test-integration: ## Spawn real ffmpeg to validate generated args (auto-skips on missing ffmpeg / CUDA)
-	$(GO) test -tags integration -count=1 -timeout=3m -v ./internal/transcoder/...
+cover:
+	go test -race -shuffle=on -count=1 -timeout=20m -coverprofile=coverage.out ./...
 
-.PHONY: cover
-cover: ## Generate coverage.out and print total %
-	$(GO) test -race -shuffle=on -count=1 -timeout=5m -coverprofile=$(COVER_OUT) ./...
-	$(GO) tool cover -func=$(COVER_OUT) | tail -1
+covercheck:
+	go run github.com/vladopajic/go-test-coverage/v2@v2.22.0 -c .testcoverage.yml
 
-.PHONY: cover-html
-cover-html: cover ## Open HTML coverage (macOS: open; else print path)
-	$(GO) tool cover -html=$(COVER_OUT) -o coverage.html
-	@echo "Wrote coverage.html"
+fixtures:
+	sh testdata/fixtures/gen.sh
 
-# --- cleanup ---
+# The server, pure Go, at bin/openstreamer. The version is the tag, or the
+# commit when there is none.
+openstreamer:
+	go build -ldflags "-X main.version=$(shell git describe --tags --always --dirty)" -o bin/openstreamer ./cmd/openstreamer
 
-.PHONY: clean
-clean: ## Remove bin/, coverage artifacts
-	rm -rf $(BIN_DIR) $(COVER_OUT) coverage.html
+# The packages whose tests use ffmpeg, ffprobe, VLC or GStreamer, run in a
+# throwaway container of testdata/peers/Dockerfile.ci (CI's Ubuntu 24.04
+# peers: ffmpeg 6.1, VLC 3, GStreamer 1.24). See scripts/test-ci-peers.sh;
+# ARGS takes go test flags and packages, split on spaces and passed as
+# written: $(value ARGS) keeps make from expanding the $ of a pattern (it
+# read "$ " as a variable and swallowed the package after it), and the
+# shell neither globs nor interprets | or ; in it. Quotes are not removed,
+# so write no inner quotes: ARGS='-run ^TestX$ ./pkg/rtsp/'.
+test-ci-peers: export TEST_CI_PEERS_ARGS := $(value ARGS)
+test-ci-peers:
+	@set -f; sh scripts/test-ci-peers.sh $$TEST_CI_PEERS_ARGS
 
-# --- deploy (Linux systemd) ---
+# The transcoder (M4a). Both targets fetch the pinned FFmpeg 8.1 on the host
+# first (scripts/ffmpeg-dev.sh, cached in ~/.cache/osv2-ffmpeg), then run in
+# osv2-ci-peers:m4a through scripts/test-ci-peers.sh --exec, with its mounts:
+# Ubuntu 24.04's glibc, and PKG_CONFIG_PATH and LD_LIBRARY_PATH on the
+# prefix. The arch is the host's: there is no cross build.
+OSTX_ARCH := $(shell uname -m | sed 's/^x86_64$$/amd64/; s/^aarch64$$/arm64/')
 
-.PHONY: install-service
-install-service: build ## Install binary + systemd unit (requires sudo, Linux only)
-	sudo $(INSTALL_SH) install
+# Builds and bundles cmd/ostranscoder into dist/ostranscoder-<arch>/: the
+# binary, with DT_RPATH $$ORIGIN/lib, and lib/ with the FFmpeg libraries it
+# links. See scripts/bundle-ostranscoder.sh.
+ostranscoder:
+	@sh scripts/ffmpeg-dev.sh $(OSTX_ARCH) >/dev/null
+	@sh scripts/test-ci-peers.sh --name osv2-ostx-build-$$$$ --exec \
+		sh scripts/bundle-ostranscoder.sh $(OSTX_ARCH) dist/ostranscoder-$(OSTX_ARCH)
 
-.PHONY: uninstall-service
-uninstall-service: ## Stop service, remove binary + unit + user (data dir kept)
-	sudo $(INSTALL_SH) uninstall
+# go test -race -tags libav $(ARGS) in the same container. ARGS is quoted as
+# for test-ci-peers, and defaults to the cgo packages that exist.
+TRANSCODE_PKGS := $(patsubst %,./%/...,$(wildcard internal/transcode/native cmd/ostranscoder))
+test-transcode: export TEST_TRANSCODE_ARGS := $(value ARGS)
+test-transcode:
+	@sh scripts/ffmpeg-dev.sh $(OSTX_ARCH) >/dev/null
+	@set -f; sh scripts/test-ci-peers.sh --name osv2-ostx-test-$$$$ --exec \
+		go test -race -tags libav $${TEST_TRANSCODE_ARGS:-$(TRANSCODE_PKGS)}
+
+# The GPU proof (ruling R-C12), on this host only: refuses to start while
+# another process holds NVENC sessions or GPU compute (OS_NVENC_SHARED=1
+# warns instead), runs the NVENC scenarios on the host against the bundle
+# with OS_NVENC=1 and OS_REQUIRE_NVENC=1 (the device tests are opt-in: a
+# plain make test opens no NVENC session), plays the recorded presentation in VLC in
+# osv2-ci-peers:m4a, and writes dist/nvenc-report/report.md. See
+# scripts/test-nvenc.sh.
+test-nvenc:
+	@sh scripts/test-nvenc.sh
