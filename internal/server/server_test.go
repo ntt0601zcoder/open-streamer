@@ -907,8 +907,11 @@ func srtRead(c srt.Conn) bool {
 
 func TestSRTPassphrase(t *testing.T) {
 	locked := streamYAML("locked", `{srt: true, srt_passphrase: "`+srtPassA+`"}`)
+	// At debug level: the scan at the end reads every line the server can
+	// write.
 	s := testConfig(t, func(su *setup) {
-		su.Text = baseText(streamYAML("open", "{srt: true}"), locked)
+		su.Text = strings.Replace(baseText(streamYAML("open", "{srt: true}"), locked),
+			"server:\n", "server:\n  log: {level: debug, format: json}\n", 1)
 	})
 	addr := s.Addrs().SRT
 	rejected := func(reason string) float64 {
@@ -940,15 +943,29 @@ func TestSRTPassphrase(t *testing.T) {
 	t.Cleanup(func() { _ = reader.Close() })
 	assert.True(t, srtRead(reader))
 
-	// Refusals.
-	before := rejected("secret")
+	// Refusals, each counted under its own reason: a caller without the
+	// passphrase and one with a wrong one by "secret", an encrypted
+	// caller to a stream without a passphrase by "mode" and not by
+	// "secret"; none of them is limited.
+	moved := func(reason string, from float64) {
+		t.Helper()
+		require.Eventually(t, func() bool { return rejected(reason)-from >= 1 }, waitFor, 20*time.Millisecond,
+			"rejected{reason=%q} did not move", reason)
+	}
+	secret, mode := rejected("secret"), rejected("mode")
 	_, err := srtCaller(addr, "locked", "")
 	require.Error(t, err)
+	moved("secret", secret)
+	secret = rejected("secret")
 	_, err = srtCaller(addr, "locked", "wrongwrong-0123")
 	require.Error(t, err)
-	assert.GreaterOrEqual(t, rejected("secret")-before, 2.0)
+	moved("secret", secret)
+	secret = rejected("secret")
 	_, err = srtCaller(addr, "open", srtPassA)
 	require.Error(t, err)
+	moved("mode", mode)
+	assert.InDelta(t, secret, rejected("secret"), 0, "an encrypted caller to open is refused by mode, not by secret")
+	assert.Zero(t, rejected("limited"))
 
 	// A changed passphrase ends the session within 2 s.
 	ended := func() float64 {
@@ -1016,11 +1033,15 @@ func TestSRTPassphrase(t *testing.T) {
 	assert.True(t, srtRead(plain))
 	require.NoError(t, plain.Close())
 
-	// Neither passphrase is in a log line or in /metrics.
+	assert.Zero(t, rejected("limited"), "no refusal of this test was limited")
+
+	// Neither passphrase, nor the wrong one a caller sent, is in a log
+	// line, debug lines included, or in /metrics.
 	res := s.do(http.MethodGet, "/metrics", "ops", "")
 	require.Equal(t, http.StatusOK, res.code)
-	for _, p := range []string{srtPassA, srtPassB} {
+	logs := s.logs.String()
+	for _, p := range []string{srtPassA, srtPassB, "wrongwrong-0123"} {
 		assert.NotContains(t, res.body, p)
-		assert.NotContains(t, s.logs.String(), p)
+		assert.NotContains(t, logs, p)
 	}
 }

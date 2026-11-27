@@ -54,6 +54,29 @@ const (
 	m5c2aSpan = 5 * time.Second
 )
 
+// m5c2aMaskText is what a 422 says of a mask that could not be resolved
+// (spec.MaskRefusal).
+const m5c2aMaskText = "holds the redaction mask"
+
+// m5c2aDebugServer is m5aServer without streams, logging at debug level:
+// a leak scan must read every line the server can write.
+func m5c2aDebugServer(t *testing.T) *m5a {
+	t.Helper()
+	text := m5aConfig("", "")
+	require.Contains(t, text, "log: {level: info,")
+	path := filepath.Join(t.TempDir(), "openstreamer.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Replace(text, "log: {level: info,", "log: {level: debug,", 1)), 0o600))
+	return m5aStart(t, path)
+}
+
+// m5c2aPut writes sp over the API and returns the whole answer.
+func (m *m5a) m5c2aPut(t *testing.T, sp spec.Stream) m5aResp {
+	t.Helper()
+	body, err := json.Marshal(sp)
+	require.NoError(t, err)
+	return m.do(t, http.MethodPut, "/api/v1/streams/"+sp.Name, body, "Content-Type", "application/json")
+}
+
 // m5c2aSecrets are every literal the scans look for: the M5a stream
 // secrets, the SRT output's passphrase, and the credentials embedded in a
 // path, a query and a stream ID (R-T2).
@@ -331,10 +354,15 @@ func TestM5c2aSRTFFmpeg(t *testing.T) {
 	time.Sleep(time.Second)
 	edited := cam
 	edited.Outputs.SRTPassphrase = m5c2aNewPass
-	code, applied := m.put(t, edited)
+	answer := m.m5c2aPut(t, edited)
 	row.edited()
-	require.Equal(t, http.StatusOK, code)
-	assert.Equal(t, "outputs", applied)
+	require.Equal(t, http.StatusOK, answer.code, "%s", answer.body)
+	var outcome stream.Outcome
+	require.NoError(t, json.Unmarshal(answer.body, &outcome), "%s", answer.body)
+	assert.Equal(t, "outputs", outcome.Applied)
+	// The answer to the write that set it does not show it.
+	assert.NotContains(t, string(answer.body), m5c2aNewPass)
+	assert.NotContains(t, string(answer.body), m5c2aPass)
 	r = m5c2aWait(t, "the player admitted under the old passphrase", playing, 5*time.Second)
 	t.Logf("the old player ended %v after the edit: %v; %s", time.Since(row.edits[0]).Round(time.Millisecond), r.err,
 		m5c2aLast(r.stderr, 2))
@@ -346,6 +374,14 @@ func TestM5c2aSRTFFmpeg(t *testing.T) {
 	row.end(t)
 	assertUninterrupted(t, row)
 	assert.Zero(t, row.last["rebuilds"], "cam's rebuilds")
+
+	// No passphrase of this scenario is in a log line: the two the stream
+	// had, and the wrong one a player sent.
+	logs := m.logs.String()
+	require.NotEmpty(t, logs)
+	for _, p := range []string{m5c2aPass, m5c2aNewPass, m5c2aWrongPass} {
+		assert.NotContains(t, logs, p, "the log")
+	}
 }
 
 // m5c2aDial is one gosrt caller of a stream ID with a passphrase ("" for
@@ -508,12 +544,14 @@ func TestM5c2aWriteOnly(t *testing.T) {
 	moved.Inputs[0].URL = strings.Replace(moved.Inputs[0].URL, "127.0.0.1:1", ln.Addr().String(), 1)
 	require.Contains(t, moved.Inputs[0].URL, "xxxxx")
 	stored := m.fileText(t)
-	code, _ = m.put(t, moved)
-	assert.Equal(t, http.StatusUnprocessableEntity, code, "the mask with another host")
+	refused := m.m5c2aPut(t, moved)
+	assert.Equal(t, http.StatusUnprocessableEntity, refused.code, "the mask with another host")
+	assert.Contains(t, string(refused.body), m5c2aMaskText, "the mask with another host")
 	renamed := masked
 	renamed.Name = "cam2"
-	code, _ = m.put(t, renamed)
-	assert.Equal(t, http.StatusUnprocessableEntity, code, "the masked body under a new name")
+	refused = m.m5c2aPut(t, renamed)
+	assert.Equal(t, http.StatusUnprocessableEntity, refused.code, "the masked body under a new name")
+	assert.Contains(t, string(refused.body), m5c2aMaskText, "the masked body under a new name")
 	assert.Equal(t, stored, m.fileText(t), "nothing was stored")
 	time.Sleep(time.Second)
 	assert.Zero(t, dialed.Load(), "the listener saw no connection")
@@ -570,7 +608,7 @@ func TestM5c2aNoSecretsLeak(t *testing.T) {
 	t.Parallel()
 	start := time.Now()
 	defer m5c2aBudget(t, start, 60*time.Second)
-	m := m5aServer(t, "")
+	m := m5c2aDebugServer(t)
 	src := m5aSource(t)
 	listenInput := "rtmp://" + m.addrs.RTMP + "/in/listenkey-0123456789?mode=listen"
 	failing := []struct{ name, url string }{
@@ -684,12 +722,15 @@ func TestM5c2aNoSecretsLeak(t *testing.T) {
 			}
 			assert.Equal(t, want, r.code, "the PUT of %s as %s: %s", c.name, who.user, r.body)
 			clean("the answer to the PUT of "+c.name+" as "+who.user, string(r.body), all)
+			if c.name == "ghost" && who == m {
+				assert.Contains(t, string(r.body), m5c2aMaskText, "the 422 says why")
+			}
 		}
 	}
 
 	logs := m.logs.String()
 	require.NotEmpty(t, logs)
-	clean("the log", logs, all)
+	clean("the log", logs, slices.Concat(all, []string{m5c2aWrongPass}))
 	// The failures are in the log, redacted: the scan above looked at
 	// lines that were written.
 	assert.Contains(t, logs, "password=xxxxx")
