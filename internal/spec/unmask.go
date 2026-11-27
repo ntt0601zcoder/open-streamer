@@ -12,17 +12,22 @@ import (
 const maskNotSecret = "holds the redaction mask, not the secret; send the real value"
 
 // isMask reports whether u is a URL as a response shows it with a secret
-// hidden: one that redact.Masked reports, or the bare mask, which Redacted
-// shows for a URL that does not parse.
+// hidden: one that redact.Masked reports; the bare mask, which Redacted
+// shows for a URL that does not parse; or a value that holds a URL-shaped
+// token redact.Masked reports, after other text or white space of any
+// kind (redact.HoldsMask), as Redacted and config.Mask show a value that
+// holds more than one URL. Whatever either view shows with something
+// hidden is a mask here, so it is resolved or refused and never stored.
 func isMask(u string) bool {
-	return u == redact.Mask || redact.Masked(u)
+	return u == redact.Mask || redact.Masked(u) || redact.HoldsMask(u)
 }
 
 // KeepSecrets resolves one list of URLs by R-T4: sent is a stream's input
 // URLs or its push URLs as written, stored the same list of the stored
-// stream (nil when there is none). out is sent with every element that
-// redact.Masked reports, or that is the bare mask, replaced by a stored
-// URL; bad holds the indexes of the elements that could not be replaced,
+// stream (nil when there is none). out is sent with every element that is
+// a mask (isMask: one redact.Masked reports, one that holds such a token,
+// or the bare mask) replaced by the stored URL that Redacted shows as it;
+// bad holds the indexes of the elements that could not be replaced,
 // ascending, and out[i] is sent[i] for them. For each redacted form among
 // sent's masks:
 //   - one distinct stored value of the form: every mask of the form takes
@@ -33,7 +38,7 @@ func isMask(u string) bool {
 //   - otherwise every mask of the form is bad. The bare mask is always
 //     bad.
 //
-// An element that is not masked is taken as sent, also when its redact.URL
+// An element that is not masked is taken as sent, also when its shown
 // form is a sent mask's (R-T4).
 func KeepSecrets(sent, stored []string) (out []string, bad []int) {
 	out = slices.Clone(sent)
@@ -49,7 +54,7 @@ func KeepSecrets(sent, stored []string) (out []string, bad []int) {
 		var values []string // the distinct stored values of the form, in order
 		if form != redact.Mask {
 			for _, v := range stored {
-				if redact.URL(v) == form && !slices.Contains(values, v) {
+				if redactedURL(v) == form && !slices.Contains(values, v) {
 					values = append(values, v)
 				}
 			}

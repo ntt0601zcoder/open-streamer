@@ -2,6 +2,7 @@ package spec
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -426,4 +427,126 @@ func TestRedactedKeepsUnmaskedText(t *testing.T) {
 	// nothing, is shown as redact.URL writes it: never less redacted.
 	s := Stream{Inputs: []Input{{URL: "UDP://xxxxx:5000"}}}
 	assert.Equal(t, "udp://xxxxx:5000", s.Redacted().Inputs[0].URL)
+}
+
+// gluedRows are URL values that hold a second URL after white space
+// (final review, finding 9), a URL inside another (finding 1), and what a
+// response shows of each: the stream API and the config view by one rule
+// (redact.Value).
+var gluedRows = []struct{ stored, shown string }{
+	{"rtsp://a/b rtsp://u:S3CR3Tzz@h/s", "rtsp://a/b rtsp://u:xxxxx@h/s"},
+	{"rtsp://a/b?x=1 rtsp://u:S3CR3Tzz@h/s", "rtsp://a/b?x=1 rtsp://u:xxxxx@h/s"},
+	{"a://b/\u00a0rtsp://u:S3CR3Tzz@h/s", "a://b/%C2%A0rtsp://u:xxxxx@h/s"},
+	{"rtsp://a/b rtmp://h/live/S3CR3Tzz", "rtsp://a/b rtmp://h/live/S3xxxxx"},
+	{"rtsp://h/password=AA S3CR3Tzz/x rtsp://u:S3CR3Tzz@h/b", "rtsp://h/password=xxxxx/x%20rtsp://u:xxxxx@h/b"},
+	{"http://gw/fetch?url=rtsp://admin:S3CR3Tzz@cam/s", "http://gw/fetch?url=rtsp://admin:xxxxx@cam/s"},
+	{"http://gw/fetch?url=rtsp%3A%2F%2Fadmin%3AS3CR3Tzz%40cam%2Fs", "http://gw/fetch?url=xxxxx"},
+	{"http://gw/proxy/rtsp%3A%2F%2Fadmin%3AS3CR3Tzz%40cam%2Fs", "http://gw/proxy/xxxxx"},
+}
+
+func TestRedactedGluedURLs(t *testing.T) {
+	for _, c := range gluedRows {
+		stored := unmaskStored()
+		stored.Inputs = []Input{{URL: c.stored}}
+		stored.Outputs.Push = []Push{{URL: c.stored}}
+		stored.Outputs.SRTPassphrase = ""
+		require.NoError(t, stored.Validate(), c.stored)
+
+		red := stored.Redacted()
+		assert.Equal(t, c.shown, red.Inputs[0].URL)
+		assert.Equal(t, c.shown, red.Outputs.Push[0].URL)
+		assert.Equal(t, c.shown, redact.Value(c.stored, true), "the config view")
+		assert.NotContains(t, red.Inputs[0].URL, "S3CR3Tzz")
+		assert.NotContains(t, red.Inputs[0].URL, "AA ")
+		assert.Equal(t, red, red.Redacted(), "shown again")
+
+		// The shown form is a mask: it cannot be stored.
+		assert.True(t, isMask(c.shown), c.shown)
+		err := red.Validate()
+		require.Error(t, err, c.shown)
+		assert.Contains(t, err.Error(), "inputs[0].url: "+maskNotSecret)
+		red.Inputs[0].URL = "udp://239.0.0.1:1234"
+		err = red.Validate()
+		require.Error(t, err, c.shown)
+		assert.Contains(t, err.Error(), "outputs.push[0].url: "+maskNotSecret)
+		red.Inputs[0].URL = c.shown
+
+		// Written back, it keeps the stored value.
+		got, err := red.Unmask(&stored)
+		require.NoError(t, err, c.shown)
+		assert.Equal(t, stored, got, c.shown)
+
+		// Moved to a stream that does not hold it, it is refused.
+		_, err = red.Unmask(nil)
+		var refused UnmaskError
+		require.ErrorAs(t, err, &refused, c.shown)
+		assert.Equal(t, UnmaskError{MaskRefusal("inputs[0].url"), MaskRefusal("outputs.push[0].url")}, refused)
+		other := unmaskStored()
+		_, err = red.Unmask(&other)
+		require.ErrorAs(t, err, &refused, c.shown)
+		assert.NotContains(t, err.Error(), "S3CR3Tzz")
+	}
+
+	// A masked token beside other text is a mask wherever it stands, also
+	// where the whole is no URL redact.Masked reads.
+	for _, u := range []string{
+		"see rtsp://u:xxxxx@h/s now",
+		" rtsp://u:xxxxx@h/s",
+		"rtsp://a/b rtsp://u:xxxxx@h/s",
+		"a://b/\u00a0rtsp://u:xxxxx@h/s",
+		"udp://h:1 rtmp://h/live/abxxxxx",
+	} {
+		assert.True(t, isMask(u), u)
+		out, bad := KeepSecrets([]string{u}, []string{"rtsp://u:pw@h/s"})
+		assert.Equal(t, []string{u}, out)
+		assert.Equal(t, []int{0}, bad, u)
+	}
+	for _, u := range []string{"see rtsp://h/s now", "udp://h:1 udp://h:2", "rtsp://a/b rtsp://u:pw@h/s", "xxxxx rtsp://h/s"} {
+		assert.False(t, isMask(u), u)
+	}
+}
+
+// FuzzRedactedURL checks what a response shows of a URL field. Hiding
+// always writes the mask: a shown text that holds it more often than the
+// stored one has something hidden, and then it is a mask (Validate refuses
+// it, so it is never stored in the secret's place) and it resolves back to
+// the stored text. And it is shown the same again.
+func FuzzRedactedURL(f *testing.F) {
+	for _, c := range gluedRows {
+		f.Add(c.stored)
+	}
+	for _, u := range []string{
+		"rtsp://u:pw@h/s", "rtsp://u:pw@h/s ", " rtsp://u:pw@h/s", "see rtsp://u:pw@h/s now", "udp://h:1 udp://h:2",
+		"rtmp://h/live/key", "RTSP://cam/s", "http://[::1", "https://c/x?token=AA BB", "a://b#rtsp://u:pw@h/s",
+		"rtsp://a/b\u2028rtsp://u:pw@h/s", "rtsp://a/b \"rtsp://u:pw@h/s\"",
+	} {
+		f.Add(u)
+	}
+	f.Fuzz(func(t *testing.T, u string) {
+		shown := redactedURL(u)
+		// A value of several URLs is shown token by token, one URL as
+		// redact.URL reads it; where escaping the white space made one
+		// URL of several, the form is not shown the same again. It is
+		// still a mask.
+		if again := redactedURL(shown); again != shown && glued(u) == glued(shown) {
+			t.Errorf("redactedURL(%q) = %q, of that = %q", u, shown, again)
+		}
+		masks := func(v string) int { return strings.Count(strings.ToLower(v), redact.Mask) }
+		if isMask(u) || masks(shown) <= masks(u) {
+			return
+		}
+		if !isMask(shown) {
+			t.Fatalf("redactedURL(%q) = %q is no mask", u, shown)
+		}
+		out, bad := KeepSecrets([]string{shown}, []string{u})
+		if shown == redact.Mask {
+			if len(bad) != 1 {
+				t.Errorf("the bare mask resolved: %q", out)
+			}
+			return
+		}
+		if len(bad) != 0 || out[0] != u {
+			t.Errorf("KeepSecrets(%q, %q) = %q, %v", shown, u, out, bad)
+		}
+	})
 }

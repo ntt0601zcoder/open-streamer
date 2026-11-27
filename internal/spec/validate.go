@@ -215,8 +215,9 @@ func Quote(v string) string {
 }
 
 // checkURL checks an input or push URL. Its errors never quote the URL,
-// which may hold a secret. The bare mask is refused beside what
-// redact.Masked reports, which is no string without "://".
+// which may hold a secret. Every mask is refused (isMask): the bare mask
+// beside what redact.Masked reports, which is no string without "://", and
+// a value that holds a masked token.
 func checkURL(u string) error {
 	switch {
 	case u == "":

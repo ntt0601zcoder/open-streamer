@@ -173,7 +173,17 @@ func (s Stream) Redacted() Stream {
 // writes the mask, so a redacted form without the mask's text hides
 // nothing; a URL that holds that text of its own is shown as redact.URL
 // wrote it.
+//
+// A value that is more than one URL from its start, a second URL after
+// white space of any kind or a URL after other text, is shown by
+// redact.Value, the rule config.Mask shows a url key by: each URL-shaped
+// token is judged, then the whole. So the stream API and the config view
+// of such a value are the same text. Whatever either view shows with
+// something hidden is a mask to isMask.
 func redactedURL(u string) string {
+	if glued(u) {
+		return redact.Value(u, true)
+	}
 	r := redact.URL(u)
 	switch {
 	case r == redact.Invalid && u != redact.Invalid:
@@ -182,6 +192,21 @@ func redactedURL(u string) string {
 		return u
 	}
 	return r
+}
+
+// glued reports whether u holds a URL-shaped token that it does not start
+// with: one after other text, or a second one after white space of any
+// kind.
+func glued(u string) bool {
+	first, ok := redact.NextToken(u, 0, true)
+	if !ok {
+		return false
+	}
+	if first.At != 0 {
+		return true
+	}
+	_, ok = redact.NextToken(u, first.End, true)
+	return ok
 }
 
 // ETag is the document's entity tag: `"` + the first 16 hex digits of
