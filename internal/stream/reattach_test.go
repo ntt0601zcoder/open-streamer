@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,11 +22,7 @@ import (
 // not know would be accepted by the API, stored, and silently never served
 // or never stopped.
 func TestReattachCoversEveryOutput(t *testing.T) {
-	known := []string{
-		"HLS", "DASH", "HTTPTS", "RTMP", "RTSP", "SRT",
-		"SRTPassphrase", // its sessions end on a change: Task 5
-		"Push",
-	}
+	known := []string{"HLS", "DASH", "HTTPTS", "RTMP", "RTSP", "SRT", "SRTPassphrase", "Push"}
 	typ := reflect.TypeFor[spec.Outputs]()
 	got := make([]string, 0, typ.NumField())
 	for i := range typ.NumField() {
@@ -190,4 +188,108 @@ func TestSupervisorPushEdit(t *testing.T) {
 	}
 	assert.Equal(t, 2, pushes)
 	assert.Equal(t, uint64(1), s.View().Gen)
+}
+
+// A changed SRT passphrase (set, changed or removed) ends the stream's SRT
+// sessions, which were admitted under the old one, and no other session: the
+// View that holds the new passphrase is published first, so a player that
+// subscribes after the edit is asked for the new one. An edit that keeps the
+// passphrase ends none.
+func TestReattachPassphrase(t *testing.T) {
+	r := newRig(t)
+	// At each publish: the passphrase the View holds, and the SRT sessions
+	// still subscribed at that moment.
+	type seen struct {
+		passphrase string
+		srt        []string
+	}
+	var (
+		mu  sync.Mutex
+		pub []seen
+		hb  atomic.Pointer[hub.Hub]
+	)
+	r.published = func(v *View) {
+		var srt []string
+		if h := hb.Load(); h != nil {
+			for _, name := range subscribers(h) {
+				if strings.HasPrefix(name, "srt ") {
+					srt = append(srt, name)
+				}
+			}
+		}
+		mu.Lock()
+		pub = append(pub, seen{v.Outputs.SRTPassphrase, srt})
+		mu.Unlock()
+	}
+	lastPublished := func() seen {
+		mu.Lock()
+		defer mu.Unlock()
+		require.NotEmpty(t, pub)
+		return pub[len(pub)-1]
+	}
+	sink := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{})
+	sp := camSpec()
+	s := r.start(sp)
+	waitRunning(t, s)
+	h := s.View().Single["cam"]
+	hb.Store(h)
+	others := []*tapper{tap(t, h, "rtsp c"), tap(t, h, "httpts d")}
+	srts := []*tapper{tap(t, h, "srt a"), tap(t, h, "srt b")}
+
+	for _, passphrase := range []string{"p1-0123456789", "p2-0123456789", ""} {
+		next := sp
+		next.Outputs.SRTPassphrase = passphrase
+		require.Equal(t, spec.ChangeOutputs, answer(t, s.Submit(next)), "to %q", passphrase)
+		at := lastPublished()
+		assert.Equal(t, passphrase, at.passphrase)
+		assert.Len(t, at.srt, len(srts), "to %q: an SRT session ended before the View was published", passphrase)
+		assert.Equal(t, passphrase, s.View().Outputs.SRTPassphrase)
+		for _, tp := range srts {
+			require.Eventually(t, tp.closed, waitFor, time.Millisecond, "to %q: an SRT session survived", passphrase)
+		}
+		for _, tp := range others {
+			tp.more(t, 20)
+			assert.False(t, tp.closed(), "to %q: another output's session ended", passphrase)
+		}
+		e := tap(t, h, "srt e")
+		e.more(t, 10)
+		assert.False(t, e.closed(), "to %q: a new SRT session was refused", passphrase)
+		srts = []*tapper{e, tap(t, h, "srt a"), tap(t, h, "srt b")}
+		sp = next
+	}
+
+	// The passphrase is kept and only a push changes: no session ends.
+	keep := sp
+	keep.Outputs.SRTPassphrase = "p3-0123456789"
+	require.Equal(t, spec.ChangeOutputs, answer(t, s.Submit(keep)))
+	for _, tp := range srts {
+		require.Eventually(t, tp.closed, waitFor, time.Millisecond)
+	}
+	srts = []*tapper{tap(t, h, "srt a"), tap(t, h, "srt b")}
+	push := keep
+	push.Outputs.Push = []spec.Push{{URL: sink.URL("live/" + vKey + "p")}}
+	require.Equal(t, spec.ChangeOutputs, answer(t, s.Submit(push)))
+	require.Eventually(t, func() bool { return len(sink.Requests()) == 1 }, waitFor, time.Millisecond, "the push did not start")
+	for _, tp := range append(slices.Clone(srts), others...) {
+		tp.more(t, 20)
+		assert.False(t, tp.closed(), "a session ended over a push edit")
+	}
+
+	// SRT turned off with the passphrase removed: off() ends the SRT
+	// sessions, and a new one is refused.
+	srtOff := push
+	srtOff.Outputs.SRT, srtOff.Outputs.SRTPassphrase = false, ""
+	require.Equal(t, spec.ChangeOutputs, answer(t, s.Submit(srtOff)))
+	for _, tp := range srts {
+		require.Eventually(t, tp.closed, waitFor, time.Millisecond, "an SRT session survived srt off")
+	}
+	refused := h.Subscribe("srt e", 8)
+	_, open := <-refused.C()
+	assert.False(t, open, "a new SRT session was accepted while srt is off")
+	for _, tp := range others {
+		tp.more(t, 20)
+		assert.False(t, tp.closed())
+	}
+	assert.Equal(t, uint64(1), s.View().Gen)
+	assert.Zero(t, s.Status().Rebuilds)
 }

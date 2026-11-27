@@ -1115,6 +1115,33 @@ func TestStatusRedacts(t *testing.T) {
 	assert.NotContains(t, back, "transcoder")
 }
 
+// The SRT passphrase is write-only: a status shows the mask, in its struct
+// and in its JSON, while the spec the manager holds and the View keep it.
+func TestStatusHidesPassphrase(t *testing.T) {
+	const passphrase = "Hq7.Zr2~Lw9-Tb4"
+	r := newMrig(t)
+	sp := camSpec()
+	sp.Outputs.SRTPassphrase = passphrase
+	r.replace(sp)
+	r.waitRunning("cam")
+
+	statuses := map[string]Status{"supervisor": r.sup("cam").Status(), "manager": r.status("cam")}
+	for from, st := range statuses {
+		assert.Equal(t, "xxxxx", st.Outputs.SRTPassphrase, from)
+		body, err := json.Marshal(st)
+		require.NoError(t, err)
+		for _, text := range []string{string(body), fmt.Sprint(st)} {
+			for i := 0; i+4 <= len(passphrase); i++ {
+				assert.NotContains(t, text, passphrase[i:i+4], "%s: a run of the passphrase", from)
+			}
+		}
+	}
+	got, ok := r.m.Get("cam")
+	require.True(t, ok)
+	assert.Equal(t, passphrase, got.Outputs.SRTPassphrase)
+	assert.Equal(t, passphrase, r.sup("cam").View().Outputs.SRTPassphrase)
+}
+
 // A stream with a thumbnail serves its latest shot: from a thumbnailer of
 // its own when no child encodes, else from the transcoder's child. It has
 // none between generations.

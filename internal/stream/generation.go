@@ -325,6 +325,12 @@ func hasPush(o spec.Outputs, url string) bool {
 // reattach takes g's outputs from old to new with the smallest set of calls
 // (R-D6), and publishes the View. The order matters; see each step.
 //
+// A changed SRT passphrase (set, changed or removed while srt stays on) ends
+// the SRT sessions subscribed when the View is published, which were
+// admitted under the old one (R-T9). A session answered before the publish
+// that subscribes after step 5 is srtout's to end: it asks Manager.SRT again
+// once subscribed, and finds the new passphrase.
+//
 // A field added to spec.Outputs must be handled here (and in off, when it is
 // a session output): TestReattachCoversEveryOutput fails until it is.
 func (s *Supervisor) reattach(g *generation, old, new spec.Outputs) {
@@ -364,10 +370,21 @@ func (s *Supervisor) reattach(g *generation, old, new spec.Outputs) {
 		h.Refuse(relaxed...)
 	}
 	// 4. Publish: the sessions of a re-enabled output are now found, and new
-	// sessions of a disabled one find nothing.
+	// sessions of a disabled one find nothing. A caller of Manager.SRT from
+	// here on is asked for the new passphrase.
 	s.publish(g, new)
-	// 5. End the sessions of the outputs just disabled, and only those.
-	if len(now) != len(relaxed) {
+	// 5. End the sessions of the outputs just disabled, and only those. On a
+	// passphrase change, the SRT sessions too: "srt " is refused once on top
+	// of off(new), then relaxed to off(new), so a new SRT session is
+	// accepted again at once.
+	switch {
+	case old.SRT && new.SRT && old.SRTPassphrase != new.SRTPassphrase:
+		rekey := append(slices.Clone(now), "srt ")
+		for _, h := range g.hubs {
+			h.Refuse(rekey...)
+			h.Refuse(now...)
+		}
+	case len(now) != len(relaxed):
 		for _, h := range g.hubs {
 			h.Refuse(now...)
 		}

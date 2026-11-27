@@ -625,6 +625,21 @@ func (m *Manager) Hub(out Output, served string) (*hub.Hub, bool) {
 	return nil, false
 }
 
+// SRT returns the hub of a served name for the SRT output and the passphrase
+// its callers must present ("" for none), both from one View; ok is false
+// while the stream does not serve that name over SRT. It never waits for an
+// edit.
+func (m *Manager) SRT(served string) (h *hub.Hub, passphrase string, ok bool) {
+	v, found := m.view(served)
+	if !found || !v.Outputs.SRT {
+		return nil, "", false
+	}
+	if h = v.Single[served]; h == nil {
+		return nil, "", false
+	}
+	return h, v.Outputs.SRTPassphrase, true
+}
+
 // Packager returns the packager of a served name for the output out, which
 // is hls or dash; ok is false while the stream does not serve that name on
 // that output.

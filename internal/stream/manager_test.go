@@ -1989,3 +1989,100 @@ func TestManagerReplaceTLSInput(t *testing.T) {
 	assert.Equal(t, gen, r.status("cam").Generation)
 	assert.Equal(t, []string{"rtmps+insecure://h/a/xxxxx"}, r.status("cam").Inputs, "redacted, the scheme kept")
 }
+
+// SRT finds a served name only while srt is on, with the passphrase of the
+// same View: the stream's name and each rung's, applied in place by an
+// outputs edit.
+func TestManagerSRT(t *testing.T) {
+	r := newMrig(t, func(env *Env) { fakeChild(t, env) })
+	cam := ladderSpec("720", "360")
+	r.replace(cam)
+	r.waitRunning("cam")
+	served := []string{"cam", "cam_720", "cam_360"}
+	v := r.sup("cam").View()
+
+	for _, name := range []string{"nope", "cam_x", "", "_", "nope_720"} {
+		_, _, ok := r.m.SRT(name)
+		assert.False(t, ok, "SRT %q", name)
+	}
+	for _, name := range served {
+		h, passphrase, ok := r.m.SRT(name)
+		require.True(t, ok, name)
+		want, _ := r.m.Hub(OutSRT, name)
+		assert.Same(t, want, h, name)
+		assert.Same(t, v.Single[name], h, name)
+		assert.Empty(t, passphrase, name)
+	}
+
+	const p1, p2 = "mgr-srt-7Kq2.Lw", "mgr-srt-9Zt4~Vx"
+	set := func(passphrase string) {
+		t.Helper()
+		next := cam
+		next.Outputs.SRTPassphrase = passphrase
+		assert.Equal(t, outcomes("cam", "outputs"), r.replace(next))
+	}
+	rebuilds := r.status("cam").Rebuilds
+	set(p1)
+	for _, name := range served {
+		h, passphrase, ok := r.m.SRT(name)
+		require.True(t, ok, name)
+		assert.Same(t, v.Single[name], h, name)
+		assert.Equal(t, p1, passphrase, name)
+	}
+	set(p2)
+	for _, name := range served {
+		_, passphrase, ok := r.m.SRT(name)
+		require.True(t, ok, name)
+		assert.Equal(t, p2, passphrase, name)
+	}
+	assert.Equal(t, rebuilds, r.status("cam").Rebuilds, "a passphrase edit rebuilt the stream")
+	assert.Equal(t, v.Gen, r.sup("cam").View().Gen)
+
+	// Every answer a reader sees is one a View held: the stream's hub with
+	// one of the two passphrases, or nothing while srt is off. Every third
+	// edit turns srt off, so an answer whose hub and passphrase come from
+	// two Views shows as the hub with no passphrase.
+	off := cam
+	off.Outputs.SRT = false
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	var reads, bad atomic.Int64
+	for _, name := range served {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				h, passphrase, ok := r.m.SRT(name)
+				reads.Add(1)
+				if ok && (h != v.Single[name] || (passphrase != p1 && passphrase != p2)) || !ok && (h != nil || passphrase != "") {
+					bad.Add(1)
+				}
+			}
+		}()
+	}
+	for i := range 200 {
+		switch i % 3 {
+		case 0:
+			set(p1)
+		case 1:
+			set(p2)
+		default:
+			assert.Equal(t, outcomes("cam", "outputs"), r.replace(off))
+		}
+	}
+	cancel()
+	wg.Wait()
+	assert.Zero(t, bad.Load(), "of %d reads", reads.Load())
+	assert.Positive(t, reads.Load())
+	assert.Equal(t, rebuilds, r.status("cam").Rebuilds)
+	assert.Equal(t, v.Gen, r.sup("cam").View().Gen)
+
+	// With srt off the name is not served, whatever the other outputs do.
+	r.replace(off)
+	for _, name := range served {
+		_, _, ok := r.m.SRT(name)
+		assert.False(t, ok, "srt is off: %s", name)
+		_, ok = r.m.Hub(OutRTMP, name)
+		assert.True(t, ok, name)
+	}
+}
