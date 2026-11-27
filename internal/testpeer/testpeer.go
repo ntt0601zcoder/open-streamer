@@ -373,10 +373,12 @@ func GStreamer(t testing.TB, elements ...string) Peer {
 	return Peer{}
 }
 
-// FFmpegSRT returns the host's ffmpeg when it reads srt:// (libsrt), which
-// makes it an SRT receiver independent of gosrt. The peer image carries no
-// ffmpeg: when the host's has no SRT the test is skipped, or failed when
-// OS_REQUIRE_PEERS=1.
+// FFmpegSRT returns the ffmpeg on $PATH when it reads srt:// (libsrt),
+// which makes it an SRT receiver independent of gosrt. It is Require: a
+// test that runs in osv2-ci-peers:m4a (make test-ci-peers) finds the
+// image's ffmpeg 6.1, which has libsrt, and so does the arm64 CI job with
+// apt's; OS_PEER_IMAGE is not consulted. When the ffmpeg found has no SRT
+// the test is skipped, or failed when OS_REQUIRE_PEERS=1.
 func FFmpegSRT(t testing.TB) string {
 	t.Helper()
 	return Require(t, "ffmpeg", "srt")

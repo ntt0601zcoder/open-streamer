@@ -29,8 +29,9 @@ import (
 // run over a fixture is recorded per rendition hub as steps, which are then
 // replayed into the M3 machinery like any source.
 
-// envTranscodeArm is set to 1 by the arm64 CI job, which has no SRT or RTSP
-// peers: the srt and rtsp rows skip there.
+// envTranscodeArm is set to 1 by the arm64 CI job, whose only peers are
+// apt's ffmpeg and ffprobe: the srt and rtsp rows skip there. The job's one
+// SRT row is TestM5c2aSRTFFmpeg, which needs only ffmpeg.
 const envTranscodeArm = "OS_TRANSCODE_E2E_ARM"
 
 // m4aLadder is the ladder of every M4a scenario: three encoded rungs and a

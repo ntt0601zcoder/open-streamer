@@ -212,15 +212,21 @@ jobs:
   # is passthrough and runs in the test job), and M5c1's ffmpeg scenario
   # over TLS (TestM5c1FFmpeg, about 13 s: it needs no transcoder, and runs
   # here so that apt's ffmpeg on arm64 publishes and plays over RTMPS, RTSPS
-  # and HTTPS too; the other M5c1 scenarios run in the test job). After
-  # M5c1 the whole set took about 90 s with -race on an amd64 workstation
-  # (the e2e package as a whole about 357 s), well inside the 10 min
-  # timeout of this job's step. Their only peers are the bundle and apt's
-  # ffmpeg and ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a
-  # failure. The VLC, GStreamer, SRT and RTSP rows stay amd64-only:
-  # TestM4aVLC and TestM4bPlayers are not in the pattern (they run in the
-  # test job), and OS_TRANSCODE_E2E_ARM=1 skips TestM4aMatrix's
-  # t180/srt-steady and t180/rtsp-steady.
+  # and HTTPS too; the other M5c1 scenarios run in the test job), and
+  # M5c2a's SRT scenario (TestM5c2aSRTFFmpeg, about 15 s: it needs no
+  # transcoder, and runs here so that apt's ffmpeg on arm64, Ubuntu
+  # 24.04's 6.1 with libsrt, the build the peers image carries, plays an
+  # SRT output that requires a passphrase and is refused without it; the
+  # other M5c2a scenarios run in the test job). After M5c1 the whole set
+  # took about 90 s with -race on an amd64 workstation, and
+  # TestM5c2aSRTFFmpeg adds about 15 s: well inside the 10 min timeout of
+  # this job's step. Their only peers are the bundle and apt's ffmpeg and
+  # ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a failure. The VLC and GStreamer rows stay amd64-only, and so do
+  # the SRT and RTSP rows that need more than ffmpeg: TestM4aVLC,
+  # TestM4bPlayers and TestM5c2aPlayers are not in the pattern (they run in
+  # the test job), and OS_TRANSCODE_E2E_ARM=1 still skips TestM4aMatrix's
+  # t180/srt-steady and t180/rtsp-steady. TestM5c2aSRTFFmpeg is the one
+  # SRT row here, and it needs only ffmpeg.
   transcode-e2e-arm64:
     needs: transcoder-arm64
     runs-on: ubuntu-24.04-arm
@@ -228,7 +234,7 @@ jobs:
       OS_REQUIRE_PEERS: "1"
       OS_TRANSCODE_E2E_ARM: "1"
       E2E_PKGS: ./internal/e2e/ ./internal/transcode/
-      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cWatermarkABR TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen TestM5aLadder TestM5b1ReplaceInputsLadder TestM5b1Assets TestM5b1NoFallback TestM5b2AudioLanguageLadder TestM5c1FFmpeg
+      E2E_TESTS: TestM4aMatrix TestM4aKeyframesAligned TestM4aRespawn TestM4bMatrix TestM4bRespawn TestM4bSwitchTS TestM4bRungGap TestSupervisorRealChild TestM4cWatermarkEveryRung TestM4cWatermarkABR TestM4cThumbnailsTranscoded TestM4cThumbnailsPassthrough TestM4cThumbnailsCopyVideo TestM4cFrozen TestM5aLadder TestM5b1ReplaceInputsLadder TestM5b1Assets TestM5b1NoFallback TestM5b2AudioLanguageLadder TestM5c1FFmpeg TestM5c2aSRTFFmpeg
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
