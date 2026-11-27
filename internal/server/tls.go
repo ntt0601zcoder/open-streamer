@@ -11,11 +11,16 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/certs"
 )
 
-// certLoaded writes the start's line of the pair in force (F-18).
+// certLoaded writes the start's line of the pair in force (F-18), unless a
+// reload before Run (a SIGHUP) already logged that pair.
 func (s *Server) certLoaded() {
 	s.certMu.Lock()
 	defer s.certMu.Unlock()
-	s.certLine(s.store.Info())
+	info := s.store.Info()
+	if info.Changed == s.certShown {
+		return
+	}
+	s.certLine(info)
 }
 
 // certLine writes the line of one loaded pair: "server: tls: certificate

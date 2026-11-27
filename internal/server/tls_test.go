@@ -1118,6 +1118,24 @@ const (
 	certFailed = "server: tls: reload failed"
 )
 
+// A reload before Run (a SIGHUP between New and Run) that took a new pair
+// logs it, and Run's start line does not log the same pair again.
+func TestCertLoadedOnceAfterEarlyReload(t *testing.T) {
+	ca, cert, key := tlsPair(t)
+	path := writeConfig(t, tlsText(tlsServerYAML(cert, key)))
+	logs := &lockedBuffer{}
+	srv, err := New(path, tlsOptions(t, ca, logs))
+	require.NoError(t, err)
+	newPair(t, ca, cert)
+	srv.certReload()
+	s := start(t, srv, path, logs)
+	assert.Equal(t, http.StatusOK, s.do(http.MethodGet, "/healthz", "", "").code)
+	s.stop()
+	lines := logLines(t, logs.String(), certLoaded)
+	require.Len(t, lines, 1, "one line for the one pair")
+	assert.Equal(t, leafOf(t, cert).NotAfter.UTC().Format(time.RFC3339), lines[0]["not_after"], "the new pair's")
+}
+
 // replaceFile writes data to a temporary name beside path and renames it
 // over path, as a rotation tool does: no reader sees half a file.
 func replaceFile(t *testing.T, path string, data []byte) {
