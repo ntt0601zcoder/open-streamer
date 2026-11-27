@@ -10,10 +10,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 	"unicode/utf16"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/logging"
 	"github.com/ntt0601zcoder/open-streamer/internal/redact"
@@ -53,10 +55,8 @@ func cfg(streams string) string { return head() + "\nstreams:\n" + streams }
 // advVisible are the rows whose secret Mask shows, by the rules: it is no
 // credential R-T2 knows, where it stands.
 var advVisible = map[string]string{
-	"glue outer":                 "a URL inside another URL's query value (u=) is that URL's text",
 	"no slash":                   "rtsp:admin:… has no \"://\": it is no URL-shaped token",
 	"pass elsewhere":             "a passphrase under a key that is not srt_passphrase is not known to be one",
-	"plain url glued hash":       "in a scalar, a URL after '#' is the fragment of the URL before it (R-T8)",
 	"comment rtmp glued":         "old.rtmp:// is no RTMP scheme, as in a log line",
 	"comment rtmp dropped glued": "old.rtmp:// is no RTMP scheme, as in a log line",
 	"pass old after flow":        "an old passphrase in a comment that does not repeat the key, after a flow mapping: nothing says what it is",
@@ -974,9 +974,11 @@ func TestUnresolved(t *testing.T) {
 }
 
 // Review round 5: a comment's token that reads, followed by text that does
-// not read as the URL's rest. The line ends with the token when what
-// follows holds an '@' or the token had something hidden in it; otherwise
-// the words stay.
+// not read as the URL's rest. When what follows holds an '@' the token may
+// be the start of a password (rtsp://admin:1234 reads as a host and a
+// port): the line ends with redact.Invalid in its place (final review,
+// finding 2). When the token had something hidden in it the line ends with
+// the token; otherwise the words stay.
 func TestMaskUnreadableRest(t *testing.T) {
 	for _, c := range []struct {
 		name, line, want string
@@ -984,13 +986,18 @@ func TestMaskUnreadableRest(t *testing.T) {
 	}{
 		{
 			"a space in a numeric password", "# - url: rtsp://admin:1234 5678@cam/s",
-			"# - url: rtsp://admin:1234",
-			[]string{"5678"},
+			"# - url: <invalid url>",
+			[]string{"1234", "5678"},
 		},
 		{
 			"a space in a password that starts as a port", "# - url: rtsp://admin:8554 R3Tzz@192.0.2.1:554/s",
-			"# - url: rtsp://admin:8554",
-			[]string{"R3Tzz"},
+			"# - url: <invalid url>",
+			[]string{"8554", "R3Tzz"},
+		},
+		{
+			"a space after a colon in the password", "# rtsp://u:S3C: R3Tzz@h/s",
+			"# <invalid url>",
+			[]string{"S3C", "R3Tzz"},
 		},
 		{
 			"a path secret with a space, then words", "# rtsp://h/user=a_password=AA R3Tzz_channel=1 at 50% zoom",
@@ -1004,13 +1011,20 @@ func TestMaskUnreadableRest(t *testing.T) {
 		},
 		{
 			"a tab in a numeric password", "# - url: rtsp://admin:1234\t5678@cam/s",
-			"# - url: rtsp://admin:1234",
-			[]string{"5678"},
+			"# - url: <invalid url>",
+			[]string{"1234", "5678"},
 		},
 		{
+			// The first token's rest reads as one URL that holds the
+			// second (redact.URL's nested rule).
 			"a second token, its rest with an '@'", "# see http://h/x or rtsp://admin:1234 5678@cam/s",
-			"# see http://h/x or rtsp://admin:1234",
-			[]string{"5678"},
+			"# see http://h/x%20or%20rtsp://admin:xxxxx@cam/s",
+			[]string{"1234", "5678"},
+		},
+		{
+			"a second token after an unreadable first rest", "# see http://h:1/x%zz or rtsp://admin:1234 5678@cam/s",
+			"# see <invalid url>",
+			[]string{"1234", "5678"},
 		},
 		{
 			"an already masked token, then words", "# rtmp://h/live/AAxxxxx R3Tzz 100%",
@@ -1053,4 +1067,165 @@ func TestMaskUnreadableRest(t *testing.T) {
 	assert.Equal(t, many, restOfLine(many))
 	long := "# rtmp://h/live/AAxxxxx tail 100% " + strings.Repeat("y", maxToken)
 	assert.Equal(t, long, restOfLine(long))
+}
+
+// viewRows are url values that hold a URL inside another (final review,
+// finding 1) or a second URL after white space (finding 9), and what both
+// views show of each.
+var viewRows = []struct{ stored, shown string }{
+	{"http://gw/fetch?url=rtsp://admin:" + advSecret + "@cam/s", "http://gw/fetch?url=rtsp://admin:xxxxx@cam/s"},
+	{"http://gw/fetch?url=rtsp%3A%2F%2Fadmin%3A" + advSecret + "%40cam%2Fs", "http://gw/fetch?url=xxxxx"},
+	{"http://gw/proxy/rtsp://admin:" + advSecret + "@cam/s", "http://gw/proxy/rtsp://admin:xxxxx@cam/s"},
+	{"http://gw/proxy/rtsp%3A%2F%2Fadmin%3A" + advSecret + "%40cam%2Fs", "http://gw/proxy/xxxxx"},
+	{"rtsp://a/b rtsp://u:" + advSecret + "@h/s", "rtsp://a/b rtsp://u:xxxxx@h/s"},
+	{"rtsp://a/b?x=1 rtsp://u:" + advSecret + "@h/s", "rtsp://a/b?x=1 rtsp://u:xxxxx@h/s"},
+	{"a://b/\u00a0rtsp://u:" + advSecret + "@h/s", "a://b/%C2%A0rtsp://u:xxxxx@h/s"},
+	{"rtsp://a/b rtmp://h/live/" + advSecret, "rtsp://a/b rtmp://h/live/S3xxxxx"},
+	{"rtsp://h/password=AA " + advSecret + "/x rtsp://u:" + advSecret + "@h/b", "rtsp://h/password=xxxxx/x%20rtsp://u:xxxxx@h/b"},
+}
+
+// The stream API and the config view show such a value as the same text,
+// and that text, written back through either, keeps the stored value; in
+// a stream that does not hold it, it is refused.
+func TestViewsAgree(t *testing.T) {
+	for _, c := range viewRows {
+		for _, q := range []string{`"`, `'`} {
+			text := camDoc("    inputs:", "      - url: "+q+c.stored+q, "    outputs:", "      push:", "        - url: "+q+c.stored+q)
+			want := stream(t, []byte(text), "cam")
+			require.Equal(t, c.stored, want.Inputs[0].URL, "the row is a live stream")
+
+			// The stream view.
+			red := want.Redacted()
+			assert.Equal(t, c.shown, red.Inputs[0].URL)
+			assert.Equal(t, c.shown, red.Outputs.Push[0].URL)
+
+			// The config view.
+			out := checkMask(t, text, advSecret, "AA ")
+			assert.Contains(t, string(out), "      - url: "+q+c.shown+q+"\n")
+			assert.Contains(t, string(out), "        - url: "+q+c.shown+q+"\n")
+			shown := stream0(t, out, "cam")
+			assert.Equal(t, red.Inputs, shown.Inputs, "config view == stream view")
+			assert.Equal(t, red.Outputs.Push, shown.Outputs.Push, "config view == stream view")
+
+			// Written back through the stream API (spec.Stream.Unmask).
+			got, err := red.Unmask(&want)
+			require.NoError(t, err)
+			assert.Equal(t, spec.ChangeNone, spec.Diff(want, got))
+			// Written back through the config, with an edit elsewhere.
+			back, err := Unmask([]byte(oddEdit(string(out), "\n")), []byte(text))
+			require.NoError(t, err)
+			assert.Equal(t, spec.ChangeNone, spec.Diff(want, stream(t, back, "cam")))
+			assert.Equal(t, oddEdit(text, "\n"), string(back), "byte for byte")
+
+			// Moved to another stream: refused, by both.
+			_, err = red.Unmask(nil)
+			require.ErrorAs(t, err, new(spec.UnmaskError))
+			moved := strings.Replace(string(out), "  - name: cam\n", "  - name: cam2\n", 1)
+			_, err = Unmask([]byte(moved), []byte(text))
+			var errs Errors
+			require.ErrorAs(t, err, &errs)
+			require.Len(t, errs, 2)
+			assert.Equal(t, "streams[0] (cam2): "+spec.MaskRefusal("inputs[0].url"), errs[0].Error())
+			assert.Equal(t, "streams[0] (cam2): "+spec.MaskRefusal("outputs.push[0].url"), errs[1].Error())
+			assert.NotContains(t, err.Error(), advSecret)
+			// And the shown form is never valid as a stored value.
+			require.Error(t, red.Validate())
+		}
+	}
+}
+
+// stream0 is the stream named name of a masked text, which Parse refuses
+// for its masks: decoded only.
+func stream0(t *testing.T, text []byte, name string) spec.Stream {
+	t.Helper()
+	var doc Document
+	require.NoError(t, yaml.Unmarshal(text, &doc))
+	for _, s := range doc.Streams {
+		if s.Name == name {
+			return s
+		}
+	}
+	t.Fatalf("no stream %q", name)
+	return spec.Stream{}
+}
+
+// FuzzViewsAgree compares what the config view (a url key's scalar) and
+// the stream API show of one value. They are the same text, but for a
+// value that is one URL from its start with white space in or after it,
+// which the stream API shows as redact.URL reads it (frozen exception 14),
+// a value without a URL-shaped token, and a token longer than is read. Either way, a view that holds the mask more often than the value
+// does is a mask to spec.KeepSecrets: it is resolved or refused, never
+// stored.
+func FuzzViewsAgree(f *testing.F) {
+	for _, c := range viewRows {
+		f.Add(c.stored)
+	}
+	for _, u := range fuzzURLs {
+		f.Add(u)
+		f.Add("udp://h:1 " + u)
+		f.Add(u + " tail")
+		f.Add("a://b/\u00a0" + u)
+		f.Add("http://gw/x?u=" + u)
+		f.Add("http://gw/x#" + u)
+	}
+	f.Fuzz(func(t *testing.T, v string) {
+		if len(v) > maxToken {
+			return
+		}
+		cfgView := maskScalar(v, true)
+		apiView := spec.Stream{Inputs: []spec.Input{{URL: v}}}.Redacted().Inputs[0].URL
+		first, ok := redact.NextToken(v, 0, true)
+		_, more := redact.NextToken(v, first.End, true)
+		space := strings.ContainsFunc(v, func(r rune) bool { return r == 0x85 || unicode.IsSpace(r) || unicode.Is(unicode.Z, r) })
+		if cfgView != apiView && ok && (more || first.At != 0 || !space) {
+			t.Errorf("%q: the config shows %q, the stream API %q", v, cfgView, apiView)
+		}
+		masks := func(s string) int { return strings.Count(strings.ToLower(s), redact.Mask) }
+		for _, view := range []string{cfgView, apiView} {
+			if masks(view) <= masks(v) {
+				continue
+			}
+			if _, bad := spec.KeepSecrets([]string{view}, nil); len(bad) != 1 {
+				t.Errorf("%q is shown as %q, which is no mask", v, view)
+			}
+		}
+	})
+}
+
+// Final review, finding 3: UnmaskWith is Unmask with the masked form of
+// the stored text handed in, which the server keeps: the same answers, and
+// no second Mask of the stored text.
+func TestUnmaskWith(t *testing.T) {
+	stored := []byte(camDoc("    inputs:", "      - url: "+advURL, "    outputs:", "      srt: true", "      srt_passphrase: "+advSecret+"0123"))
+	shown, err := Mask(stored)
+	require.NoError(t, err)
+	for name, sent := range map[string][]byte{
+		"the masked text":        shown,
+		"an edit elsewhere":      []byte(oddEdit(string(shown), "\n")),
+		"no mask":                []byte(camDoc("    inputs:", "      - url: udp://239.0.0.1:1234")),
+		"a mask it cannot place": []byte(strings.Replace(string(shown), "192.0.2.1", "192.0.2.9", 1)),
+		"not YAML":               []byte("a: [\n"),
+		"empty":                  {},
+	} {
+		want, wantErr := Unmask(sent, stored)
+		got, gotErr := UnmaskWith(sent, stored, shown)
+		assert.Equal(t, string(want), string(got), name)
+		assert.Equal(t, wantErr, gotErr, name)
+		if wantErr != nil {
+			assert.NotContains(t, gotErr.Error(), advSecret, name)
+		}
+		// Without the masked form (the stored text cannot be masked)
+		// nothing is taken for the stored text, and masks still resolve.
+		got, gotErr = UnmaskWith(sent, stored, nil)
+		if name == "the masked text" {
+			require.NoError(t, gotErr)
+			assert.Equal(t, string(stored), string(got), "resolved mask by mask")
+			continue
+		}
+		assert.Equal(t, string(want), string(got), name)
+		assert.Equal(t, wantErr, gotErr, name)
+	}
+	back, err := UnmaskWith(shown, stored, shown)
+	require.NoError(t, err)
+	assert.True(t, sameSlice(back, stored), "the stored text itself")
 }

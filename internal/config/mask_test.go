@@ -705,7 +705,9 @@ func TestMaskPunctuation(t *testing.T) {
 		`k://h/'#x#rtsp://u:pw@h/s`:      false,
 		`k://h/'#a://b#rtsp://u:pw@c/`:   false,
 	} {
-		assert.True(t, cleanToken(tok), tok)
+		// A URL after the '#' is a URL nested in the fragment (redact.URL's
+		// nested rule), so the token's own rule finds it too.
+		assert.Equal(t, want, cleanToken(tok), tok)
 		assert.Equal(t, want, cleanRaw(tok), tok)
 	}
 }

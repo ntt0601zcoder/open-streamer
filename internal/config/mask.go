@@ -6,11 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"go.yaml.in/yaml/v3"
@@ -114,125 +112,6 @@ type change struct {
 	old string
 }
 
-// nextToken finds the first URL-shaped token of s at or after from: what
-// logging.URLPattern matches in a log line, a scheme, "://" and everything
-// to the next white space. With wide false that is ASCII's white space,
-// as in a log line and as redact.URL and the stream API see a URL; with
-// wide true the token also ends at white space that is not ASCII (NEL, a
-// no-break space, U+3000, LS, PS and the other separators). A token is
-// judged both ways (pieces). It is written out, not a regular expression,
-// because it runs over the whole text several times.
-func nextToken(s string, from int, wide bool) (span, bool) {
-	for from < len(s) {
-		i := strings.Index(s[from:], "://")
-		if i < 0 {
-			break
-		}
-		i += from
-		// The scheme: the run of scheme bytes before "://", from its
-		// first letter.
-		at := i
-		for at > from && schemeByte(s[at-1]) {
-			at--
-		}
-		for at < i && !letter(s[at]) {
-			at++
-		}
-		end := i + 3
-		for end < len(s) {
-			r, w := rune(s[end]), 1
-			if r >= utf8.RuneSelf {
-				if !wide {
-					end++
-					continue
-				}
-				r, w = utf8.DecodeRuneInString(s[end:])
-			}
-			if tokenSpace(r) {
-				break
-			}
-			end += w
-		}
-		if at < i && end > i+3 {
-			return span{at, end}, true
-		}
-		from = i + 1
-	}
-	return span{}, false
-}
-
-func letter(c byte) bool { return 'a' <= c|0x20 && c|0x20 <= 'z' }
-
-func schemeByte(c byte) bool {
-	return letter(c) || '0' <= c && c <= '9' || c == '+' || c == '.' || c == '-'
-}
-
-// tokenSpace reports whether r ends a token: the white space of a regular
-// expression's \s and, beyond ASCII, NEL and every Unicode separator.
-func tokenSpace(r rune) bool {
-	switch r {
-	case ' ', '\t', '\n', '\f', '\r':
-		return true
-	}
-	return r >= utf8.RuneSelf && (r == 0x85 || unicode.Is(unicode.Z, r))
-}
-
-// pieces returns the URL-shaped tokens inside tok, a token of nextToken,
-// when it is cut at white space that is not ASCII too, and whether it
-// holds any such white space. The one URL that redact.URL reads in
-// "a://b/<NBSP>rtsp://u:pw@h/s" has nothing to hide; the second of the
-// two a reader sees has. ok is false when there are more than maxPieces.
-func pieces(tok string) (ps []span, cut, ok bool) {
-	for i := 0; i < len(tok) && !cut; i++ {
-		if tok[i] >= utf8.RuneSelf {
-			r, w := utf8.DecodeRuneInString(tok[i:])
-			cut = tokenSpace(r)
-			i += w - 1
-		}
-	}
-	if !cut {
-		return nil, false, true
-	}
-	for at := 0; ; {
-		t, found := nextToken(tok, at, true)
-		if !found {
-			return ps, true, true
-		}
-		if len(ps) == maxPieces {
-			return nil, true, false
-		}
-		ps, at = append(ps, t), t.end
-	}
-}
-
-// tokens returns where the URL-shaped tokens of s are.
-func tokens(s string) []span {
-	var out []span
-	for at := 0; ; {
-		t, ok := nextToken(s, at, false)
-		if !ok {
-			return out
-		}
-		out, at = append(out, t), t.end
-	}
-}
-
-// replaceTokens returns s with each URL-shaped token replaced by f of it.
-func replaceTokens(s string, f func(tok string) string) string {
-	var b strings.Builder
-	at := 0
-	for _, t := range tokens(s) {
-		b.WriteString(s[at:t.at])
-		b.WriteString(f(s[t.at:t.end]))
-		at = t.end
-	}
-	if at == 0 {
-		return s
-	}
-	b.WriteString(s[at:])
-	return b.String()
-}
-
 // passRests finds the passphrase key in the lines of s, in any ASCII case,
 // with an optional closing quote and a ':' or '=' after it, and returns
 // what follows each on its line: the first on a line, since what follows
@@ -285,12 +164,59 @@ func wideBreak(s string) int {
 // after a '#' inside the one before, are judged in one token, and at most
 // maxPieces URLs between white space that is not ASCII.
 const (
-	maxToken  = 4 << 10
+	maxToken  = redact.MaxToken
 	maxTail   = 12
 	tailTries = 4
 	maxNested = 8
-	maxPieces = 8
+	maxPieces = redact.MaxPieces
 )
+
+// The rules for a value that may hold URLs are redact's, which the stream
+// API shows a URL by too (spec.Stream.Redacted): one implementation, so
+// the config view and the stream view of a value agree. These give them
+// this file's span.
+
+// nextToken is redact.NextToken.
+func nextToken(s string, from int, wide bool) (span, bool) {
+	t, ok := redact.NextToken(s, from, wide)
+	return span{t.At, t.End}, ok
+}
+
+// pieces is redact.Pieces.
+func pieces(tok string) (ps []span, cut, ok bool) {
+	rs, cut, ok := redact.Pieces(tok)
+	for _, r := range rs {
+		ps = append(ps, span{r.At, r.End})
+	}
+	return ps, cut, ok
+}
+
+// tokens returns where the URL-shaped tokens of s are (redact.Tokens).
+func tokens(s string) []span {
+	var out []span
+	for at := 0; ; {
+		t, ok := nextToken(s, at, false)
+		if !ok {
+			return out
+		}
+		out, at = append(out, t), t.end
+	}
+}
+
+// bothWays is redact.BothWays.
+func bothWays(tok string, f func(string) (string, bool)) (out string, ok bool) {
+	return redact.BothWays(tok, f)
+}
+
+// hidesNew is redact.HidesNew.
+func hidesNew(v string) (r string, hid, read bool) { return redact.HidesNew(v) }
+
+// maskValue is a scalar's value as a response shows it (redact.Value).
+func maskValue(v string) string { return maskScalar(v, false) }
+
+// maskScalar is maskValue; with url, v is the value of a url key, which
+// the stream API shows by the same rule.
+func maskScalar(v string, url bool) string { return redact.Value(v, url) }
 
 // maskedComment is what a comment that is hidden whole reads.
 const maskedComment = "# " + redact.Mask
@@ -553,12 +479,14 @@ const maxRests = 4
 // the line. When redact.URL hides something in that (hidesNew) which it
 // did not hide in the token alone, the rest of the line is replaced by
 // redact.URL's form. So "# - url: https://c/x?token=AA BB" loses BB, as
-// the scalar it was does. When that text cannot be read as a URL, the line
-// ends with the token if what follows it may be the rest of a secret: it
-// holds an '@' ("rtsp://admin:12 34@cam/s", whose token reads as a host and
-// a port), or the token had something hidden in it (it carries the mask),
-// as an unreadable token ends its line (commentTokens). The cost is prose:
-// the words after an RTMP URL or a query secret go with it. A line longer
+// the scalar it was does. When that text cannot be read as a URL and what
+// follows the token holds an '@', the token may itself be the start of a
+// password ("rtsp://admin:12 34@cam/s", whose token reads as a host and a
+// port): the line ends with redact.Invalid in the token's place, as an
+// unreadable token ends its line (commentTokens). When the token had
+// something hidden in it (it carries the mask), the line ends with the
+// token. The cost is prose: the words after an RTMP URL or a query secret
+// go with it, and a URL before a mail address is not shown. A line longer
 // than maxToken, or with more tokens, is judged token by token only.
 func restOfLine(line string) string {
 	if len(line) > maxToken {
@@ -579,27 +507,14 @@ func restOfLine(line string) string {
 		switch {
 		case hid:
 			return line[:t.at] + r
-		case !read && (strings.Contains(line[t.end:], "@") || strings.Contains(line[t.at:t.end], redact.Mask)):
+		case !read && strings.Contains(line[t.end:], "@"):
+			// The token itself may be the start of a password.
+			return line[:t.at] + redact.Invalid
+		case !read && strings.Contains(line[t.at:t.end], redact.Mask):
 			return line[:t.end]
 		}
 	}
 	return line
-}
-
-// hidesNew returns redact.URL of v, whether it hid something there that
-// was not hidden yet (its form differs from v as net/url alone writes it;
-// comparing with v itself would take every escaped space for a secret),
-// and whether v could be read as a URL at all. A v that cannot be read
-// hides nothing here.
-func hidesNew(v string) (r string, hid, read bool) {
-	u, err := url.Parse(v)
-	if err != nil {
-		return v, false, false
-	}
-	if r = redact.URL(v); r == redact.Invalid {
-		return v, false, false
-	}
-	return r, r != u.String(), true
 }
 
 // maskPassText returns the comment c with whatever follows the passphrase
@@ -639,127 +554,6 @@ func passTextShown(rest string) bool {
 func cleanURL(p string) bool {
 	r := redact.URL(p)
 	return r != redact.Invalid && (r == p || !strings.Contains(r, redact.Mask))
-}
-
-// maskValue is a scalar's value as a response shows it, judged both ways.
-// Each URL-shaped token with something to hide is replaced by its
-// redacted form (maskToken) and the other tokens keep their bytes. Then a
-// value that starts with a URL and runs on past that token's white space
-// is judged whole, as the stream API shows it (spec.Stream.Redacted) and
-// as spec.KeepSecrets compares it: when redact.URL hides something in the
-// whole that the tokens did not (a secret that holds a space), the value
-// is redact.URL's form of it, so its mask comes back on an edit. That is
-// repeated until nothing changes. The value is the bare mask when a token
-// cannot be read or when it does not settle.
-func maskValue(v string) string { return maskScalar(v, false) }
-
-// maskScalar is maskValue; with url, v is the value of a url key, and one
-// that does not parse as a whole is the bare mask, whatever it starts
-// with, as the stream API shows it. Anywhere else such a value is text,
-// judged by its tokens: a watermark text is not lost for holding a URL.
-func maskScalar(v string, url bool) string {
-	if !strings.Contains(v, "://") {
-		return v
-	}
-	if url && redact.URL(strings.TrimSpace(v)) == redact.Invalid {
-		return redact.Mask
-	}
-	for range 4 {
-		was := v
-		whole := false
-		v = replaceTokens(v, func(tok string) string {
-			r, ok := maskToken(tok)
-			whole = whole || !ok
-			return r
-		})
-		if whole {
-			return redact.Mask
-		}
-		// The whole value, when it starts with a URL and is more than
-		// that one token: the server and the stream API read it as one
-		// URL, white space and all.
-		if w := strings.TrimSpace(v); w != "" {
-			if t, ok := nextToken(w, 0, false); ok && t.at == 0 && t.end < len(w) {
-				if r, hid, _ := hidesNew(w); hid {
-					v = r
-				}
-			}
-		}
-		if v == was {
-			return v
-		}
-	}
-	return redact.Mask
-}
-
-// hides reports whether r, redact.URL of tok, hid something in it. Hiding
-// always writes the mask, so a form without the mask's text hid nothing,
-// and a form equal to tok is redact.URL's own.
-func hides(r, tok string) bool {
-	return r != tok && strings.Contains(r, redact.Mask)
-}
-
-// maskToken is a scalar's URL-shaped token as a response shows it, judged
-// both ways (bothWays): each URL between white space that is not ASCII
-// goes through redact.URL (pieces), so a URL glued to another by such
-// white space is hidden; and the whole token does, as the stream API shows
-// the URL and as spec.KeepSecrets compares it, so a secret that holds such
-// white space is hidden whole and not up to it. That is repeated until
-// nothing changes: redact.URL escapes that white space in a URL it
-// changed. ok is false when the token is longer than maxToken, when
-// redact.URL cannot parse it or one of its pieces, when it has more than
-// maxPieces, or when it does not settle.
-func maskToken(tok string) (out string, ok bool) {
-	if len(tok) > maxToken {
-		return tok, false
-	}
-	strict := func(t string) (string, bool) {
-		r := redact.URL(t)
-		if r == redact.Invalid {
-			return "", false
-		}
-		if !hides(r, t) {
-			r = t
-		}
-		return r, true
-	}
-	for range 4 {
-		was := tok
-		if tok, ok = bothWays(tok, strict); !ok {
-			return was, false
-		}
-		if tok == was {
-			return tok, true
-		}
-	}
-	return tok, false
-}
-
-// bothWays redacts tok by f in each of its pieces, then as a whole. The
-// pieces come first: redacting the whole escapes the white space between
-// them, and what was a URL of its own after it would no longer be seen as
-// one. ok is false when f fails or there are more than maxPieces.
-func bothWays(tok string, f func(string) (string, bool)) (out string, ok bool) {
-	ps, cut, ok := pieces(tok)
-	if !ok {
-		return "", false
-	}
-	if cut {
-		var b strings.Builder
-		at := 0
-		for _, p := range ps {
-			r, ok := f(tok[p.at:p.end])
-			if !ok {
-				return "", false
-			}
-			b.WriteString(tok[at:p.at])
-			b.WriteString(r)
-			at = p.end
-		}
-		b.WriteString(tok[at:])
-		tok = b.String()
-	}
-	return f(tok)
 }
 
 // nested returns where the URL-shaped tokens of tok start that the scan
@@ -826,7 +620,7 @@ func redactTail(tok string) (out string, ok bool) {
 
 // maskCommentToken is a comment's URL-shaped token as a response shows it.
 // A token the scan finds clean (cleanRaw) keeps its bytes. Otherwise it
-// is redacted both ways, as a scalar's token is (maskToken): as it is,
+// is redacted both ways, as a scalar's token is (redact.Value): as it is,
 // and in each URL between white space that is not ASCII, each time by
 // redactNested, until nothing changes. It is redact.Invalid when the
 // token is longer than maxToken, holds more than maxNested URLs or
@@ -1432,17 +1226,31 @@ func quoteHidable(root *yaml.Node) {
 // "streams[3] (cam): inputs[0].url: holds the redaction mask and the
 // stored stream has no one secret it stands for; send the real value".
 //
-// A URL that holds a masked token beside other text is refused in the
-// same words, and so is an entry of inputs or of outputs.push that holds
-// a masked token anywhere but in its url, named "inputs[0]" (R-T8).
+// A URL that holds a masked token beside other text is a mask too
+// (spec.KeepSecrets): it takes the stored value that is shown as it, a
+// value of several URLs, and is refused in the same words when there is
+// none. So is an entry of inputs or of outputs.push that holds a masked
+// token anywhere but in its url, named "inputs[0]" (R-T8).
 // Nothing else is looked at: a mask under any other key is stored as
 // sent. The values are written in place, and the result is decoded and
 // compared; when one cannot be written in place the document is
 // re-encoded through the node tree, as SetStream does.
 func Unmask(sent, stored []byte) ([]byte, error) {
+	shown, err := Mask(stored)
+	if err != nil {
+		shown = nil
+	}
+	return UnmaskWith(sent, stored, shown)
+}
+
+// UnmaskWith is Unmask for a caller that already holds shown, Mask(stored):
+// the server keeps the masked form of the text in force, and masking a
+// large config a second time on every write is work for nothing. shown is
+// nil when stored cannot be masked.
+func UnmaskWith(sent, stored, shown []byte) ([]byte, error) {
 	// First, and also for a text without a mask: Mask may have dropped a
 	// comment from a text that holds no other secret.
-	if shownStored, err := Mask(stored); err == nil && bytes.Equal(shownStored, sent) {
+	if shown != nil && bytes.Equal(shown, sent) {
 		return stored, nil
 	}
 	if !bytes.Contains(sent, []byte(redact.Mask)) {
@@ -1545,7 +1353,7 @@ func resolve(seq, stored *yaml.Node) (changes []change, refused []error) {
 					switch {
 					case it.stray:
 						refuse(field)
-					case it.url == redact.Mask || redact.Masked(it.url):
+					case it.url == redact.Mask || redact.Masked(it.url) || redact.HoldsMask(it.url):
 						refuse(field + ".url")
 					}
 				}
@@ -1602,7 +1410,7 @@ const maxList = 64
 // takes it.
 type item struct {
 	n   *yaml.Node // the url scalar, or nil
-	url string     // its value; the bare mask when it holds a masked token beside other text
+	url string     // its value
 	// stray is set when the entry holds a mask KeepSecrets never sees: a
 	// masked token outside its url, or an entry that is a scalar.
 	stray bool
@@ -1656,9 +1464,6 @@ func items(seq *yaml.Node) []item {
 		it := &out[i]
 		if u := child(e, "url"); u != nil && u.Kind == yaml.ScalarNode && u.ShortTag() != binaryTag {
 			it.n, it.url = u, u.Value
-			if it.url != redact.Mask && !redact.Masked(it.url) && holdsMask(it.url) {
-				it.url = redact.Mask
-			}
 		}
 		it.stray = strayMask(e, it.n)
 	}
@@ -1666,13 +1471,8 @@ func items(seq *yaml.Node) []item {
 }
 
 // holdsMask reports whether v holds a URL-shaped token that redact.Masked
-// reports.
-func holdsMask(v string) bool {
-	if !strings.Contains(v, redact.Mask) {
-		return false
-	}
-	return slices.ContainsFunc(tokens(v), func(t span) bool { return redact.Masked(v[t.at:t.end]) })
-}
+// reports (redact.HoldsMask).
+func holdsMask(v string) bool { return redact.HoldsMask(v) }
 
 // strayMask reports whether the list entry e holds a mask outside its url
 // scalar: a scalar entry that is the bare mask, or any scalar under it
