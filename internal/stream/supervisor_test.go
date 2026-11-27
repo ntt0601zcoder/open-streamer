@@ -148,7 +148,7 @@ func outputEdit(sp spec.Stream, out Output, on bool) spec.Stream {
 // pushStats returns the status of the push to url.
 func pushStats(t testing.TB, s *Supervisor, url string) Push {
 	t.Helper()
-	id := pushID(url)
+	id := pushID(s.name, url)
 	for _, p := range s.Status().Pushes {
 		if p.ID == id {
 			return p
@@ -951,7 +951,7 @@ func TestCollect(t *testing.T) {
 	waitState(t, s, "running")
 	up := func(url string) bool {
 		samples, _ := scrape(t, s)
-		v, ok := metricstest.Find(samples, "openstreamer_push_up", "target", pushID(url))
+		v, ok := metricstest.Find(samples, "openstreamer_push_up", "target", pushID("cam", url))
 		return ok && v == 1
 	}
 	require.Eventually(t, func() bool { return up(urlA) && up(urlB) }, waitFor, 5*time.Millisecond)
@@ -961,11 +961,11 @@ func TestCollect(t *testing.T) {
 	next.Outputs.Push = []spec.Push{{URL: urlB}}
 	require.Equal(t, spec.ChangeOutputs, answer(t, s.Submit(next)))
 	samples, text := scrape(t, s)
-	_, ok := metricstest.Find(samples, "openstreamer_push_up", "target", pushID(urlA))
+	_, ok := metricstest.Find(samples, "openstreamer_push_up", "target", pushID("cam", urlA))
 	assert.False(t, ok, "the removed push still has a series")
 	assert.True(t, up(urlB))
-	assert.Equal(t, float64(1), metric(t, s, "openstreamer_push_connects_total", "target", pushID(urlB)))
-	assert.Equal(t, pushID(urlB), pushStats(t, s, urlB).ID)
+	assert.Equal(t, float64(1), metric(t, s, "openstreamer_push_connects_total", "target", pushID("cam", urlB)))
+	assert.Equal(t, pushID("cam", urlB), pushStats(t, s, urlB).ID)
 
 	// Every family of the table, once the ABR packager has cut a segment.
 	families := []string{
@@ -1082,7 +1082,7 @@ func TestStatusRedacts(t *testing.T) {
 	require.Len(t, st.Outputs.Push, 1)
 	// The ID is keyed per process: compared with this process's, and not
 	// the plain hash of the URL.
-	assert.Equal(t, pushID(pushURL), st.Pushes[0].ID)
+	assert.Equal(t, pushID("cam", pushURL), st.Pushes[0].ID)
 	sum := sha256.Sum256([]byte(pushURL))
 	assert.NotEqual(t, hex.EncodeToString(sum[:])[:8], st.Pushes[0].ID)
 	assert.Regexp(t, `^[0-9a-f]{8}$`, st.Pushes[0].ID)
@@ -1199,18 +1199,18 @@ func TestSupervisorShot(t *testing.T) {
 	}
 }
 
-// TestPushIDIsKeyed: the label is the same for the same URL within the
-// process, differs between URLs, and is not the plain hash of the URL,
-// which holds a stream key.
+// TestPushIDIsKeyed: the label is the same for the same stream and URL
+// within the process, differs between URLs, and is not the plain hash of
+// the URL, which holds a stream key.
 func TestPushIDIsKeyed(t *testing.T) {
 	const url = "rtmp://h/live/secretkey"
-	id := pushID(url)
+	id := pushID("cam", url)
 	assert.Regexp(t, `^[0-9a-f]{8}$`, id)
-	assert.Equal(t, id, pushID(url))
-	assert.NotEqual(t, id, pushID(url+"2"))
+	assert.Equal(t, id, pushID("cam", url))
+	assert.NotEqual(t, id, pushID("cam", url+"2"))
 	sum := sha256.Sum256([]byte(url))
 	assert.NotEqual(t, hex.EncodeToString(sum[:4]), id, "unkeyed")
-	assert.Equal(t, hex.EncodeToString(redact.Tag([]byte(url))[:4]), id)
+	assert.Equal(t, hex.EncodeToString(redact.Tag([]byte("cam\x00" + url))[:4]), id)
 }
 
 // Env.RootCAs are the roots of the streams' TLS clients: a stream pulls

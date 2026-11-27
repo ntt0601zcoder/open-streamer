@@ -165,14 +165,14 @@ func TestSupervisorPushEdit(t *testing.T) {
 	require.Eventually(t, func() bool { return len(sinks["c"].Requests()) == 1 }, waitFor, time.Millisecond, "C got no publish")
 	st := s.Status()
 	require.Len(t, st.Pushes, 2)
-	assert.Equal(t, []string{pushID(urls["b"]), pushID(urls["c"])}, []string{st.Pushes[0].ID, st.Pushes[1].ID})
+	assert.Equal(t, []string{pushID("cam", urls["b"]), pushID("cam", urls["c"])}, []string{st.Pushes[0].ID, st.Pushes[1].ID})
 	require.Eventually(t, func() bool { return pushStats(t, s, urls["c"]).State == "publishing" }, waitFor, time.Millisecond)
 
 	// A reordering is an outputs edit that touches no push.
 	reordered := next
 	reordered.Outputs.Push = []spec.Push{{URL: urls["c"]}, {URL: urls["b"]}}
 	require.Equal(t, spec.ChangeOutputs, answer(t, s.Submit(reordered)))
-	assert.Equal(t, pushID(urls["c"]), s.Status().Pushes[0].ID)
+	assert.Equal(t, pushID("cam", urls["c"]), s.Status().Pushes[0].ID)
 
 	time.Sleep(50 * time.Millisecond)
 	assert.Len(t, sinks["b"].Requests(), 1, "B was reconnected")

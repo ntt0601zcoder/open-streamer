@@ -48,20 +48,23 @@ type packRun struct {
 
 // pushRun is a running pusher.
 type pushRun struct {
-	id     string // pushID of its URL
+	id     string // pushID of its stream and URL
 	p      *rtmppush.Pusher
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
 // pushID is the label of a push target: the first 8 hex digits of
-// redact.Tag of its URL. The tag is keyed with a key that is random per
-// process, since the URL holds a stream key and the label is in the
-// metrics and the status: it shows nothing of the URL and no guess can be
-// tested against it. It is the same for the same URL within one process,
-// and changes when the server restarts.
-func pushID(url string) string {
-	return hex.EncodeToString(redact.Tag([]byte(url))[:4])
+// redact.Tag of the stream's name, a zero byte and the URL. Two streams that
+// push to the same URL have different labels, so a probe stream cannot test
+// a guess of another stream's key against its label.
+//
+// The tag is keyed with a key that is random per process, since the URL
+// holds a stream key and the label is in the metrics and the status: it
+// shows nothing of the URL. It is the same for the same stream and URL
+// within one process, and changes when the server restarts.
+func pushID(stream, url string) string {
+	return hex.EncodeToString(redact.Tag([]byte(stream + "\x00" + url))[:4])
 }
 
 // generation is one build of a stream: the source hub, the pipeline, the
@@ -226,7 +229,7 @@ func (s *Supervisor) build(ctx context.Context) (*generation, error) {
 	for _, p := range sp.Outputs.Push {
 		pusher, err := rtmppush.New(g.single[sp.Name], p.URL, s.env.pushOptions())
 		if err != nil {
-			return abandon(fmt.Errorf("push %s: %w", pushID(p.URL), err))
+			return abandon(fmt.Errorf("push %s: %w", pushID(sp.Name, p.URL), err))
 		}
 		g.ready[p.URL] = pusher
 	}
@@ -353,11 +356,11 @@ func (s *Supervisor) reattach(g *generation, old, new spec.Outputs) {
 		if hasPush(old, p.URL) {
 			continue
 		}
-		if err := g.startPush(p.URL, g.single[s.name], s.env.pushOptions()); err != nil {
+		if err := g.startPush(s.name, p.URL, g.single[s.name], s.env.pushOptions()); err != nil {
 			// Check and build accepted this URL, so this does not happen;
 			// it is reported rather than assumed away.
-			s.fail("build: ", fmt.Errorf("push %s: %w", pushID(p.URL), err))
-			s.log.Error("stream: push not started", "push", pushID(p.URL), "err", err)
+			s.fail("build: ", fmt.Errorf("push %s: %w", pushID(s.name, p.URL), err))
+			s.log.Error("stream: push not started", "push", pushID(s.name, p.URL), "err", err)
 		}
 	}
 	// 3. Relax only: what was refused and still is. An output being
@@ -453,8 +456,8 @@ func (g *generation) stopPackagers() {
 }
 
 // startPush starts the pusher of url on h, built with opt unless the
-// generation built it.
-func (g *generation) startPush(url string, h *hub.Hub, opt rtmppush.Options) error {
+// generation built it; stream is the stream's name, for its id.
+func (g *generation) startPush(stream, url string, h *hub.Hub, opt rtmppush.Options) error {
 	p := g.ready[url]
 	delete(g.ready, url)
 	if p == nil {
@@ -464,7 +467,7 @@ func (g *generation) startPush(url string, h *hub.Hub, opt rtmppush.Options) err
 		}
 	}
 	ctx, cancel := context.WithCancel(g.ctx)
-	r := &pushRun{id: pushID(url), p: p, cancel: cancel, done: make(chan struct{})}
+	r := &pushRun{id: pushID(stream, url), p: p, cancel: cancel, done: make(chan struct{})}
 	g.pushes[url] = r
 	go func() {
 		defer close(r.done)

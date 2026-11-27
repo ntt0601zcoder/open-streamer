@@ -30,6 +30,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics/metricstest"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcode/transcodetest"
+	"github.com/ntt0601zcoder/open-streamer/pkg/rtmp/rtmptest"
 )
 
 // mrig is a manager under test, running, with a scripted world.
@@ -2084,5 +2085,41 @@ func TestManagerSRT(t *testing.T) {
 		assert.False(t, ok, "srt is off: %s", name)
 		_, ok = r.m.Hub(OutRTMP, name)
 		assert.True(t, ok, name)
+	}
+}
+
+// A push's id is tagged over the stream's name and its URL: two streams
+// that push to one URL show two ids, in their status and in the metrics'
+// target labels alike.
+func TestPushIDPerStream(t *testing.T) {
+	const u = "rtmp://push.test/live/perstream-key"
+	assert.NotEqual(t, pushID("a", u), pushID("b", u))
+	assert.Equal(t, pushID("a", u), pushID("a", u))
+	// The zero byte keeps the name and the URL apart.
+	assert.NotEqual(t, pushID("a", "b"+u), pushID("ab", u))
+
+	sink := rtmptest.NewPublishServer(t, rtmptest.PublishServerOptions{})
+	url := sink.URL("live/" + vKey + "shared")
+	r := newMrig(t)
+	a, b := named("a"), named("b")
+	a.Outputs.Push = []spec.Push{{URL: url}}
+	b.Outputs.Push = []spec.Push{{URL: url}}
+	r.replace(a, b)
+	r.waitRunning("a", "b")
+	ids := map[string]string{}
+	for _, name := range []string{"a", "b"} {
+		require.Eventually(t, func() bool { return len(r.status(name).Pushes) == 1 }, waitFor, time.Millisecond, name)
+		ids[name] = r.status(name).Pushes[0].ID
+		assert.Equal(t, pushID(name, url), ids[name], name)
+	}
+	assert.NotEqual(t, ids["a"], ids["b"])
+
+	samples := scrapeManager(t, r.m)
+	for _, name := range []string{"a", "b"} {
+		_, ok := metricstest.Find(samples, "openstreamer_push_up", "stream", name, "target", ids[name])
+		assert.True(t, ok, "no push series of %s under its id", name)
+		other := map[string]string{"a": "b", "b": "a"}[name]
+		_, ok = metricstest.Find(samples, "openstreamer_push_up", "stream", name, "target", ids[other])
+		assert.False(t, ok, "%s's push series is under %s's id", name, other)
 	}
 }
