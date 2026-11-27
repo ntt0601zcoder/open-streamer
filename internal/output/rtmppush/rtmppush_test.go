@@ -3,6 +3,7 @@ package rtmppush
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -958,6 +959,24 @@ var (
 	tlsKey   = "s3cret" + "key"
 	tlsToken = "tok-" + "opensesame"
 )
+
+// insecureTarget's config: a clone of the caller's, or, with none, the same
+// TLS 1.2 floor as ingest's twin; verification off either way.
+func TestInsecureTargetConfig(t *testing.T) {
+	dial, c := insecureTarget("rtmps+insecure://h/live/k", nil)
+	assert.Equal(t, "rtmps://h/live/k", dial)
+	require.NotNil(t, c)
+	assert.True(t, c.InsecureSkipVerify)
+	assert.EqualValues(t, tls.VersionTLS12, c.MinVersion)
+
+	base := &tls.Config{ServerName: "cam", MinVersion: tls.VersionTLS13}
+	_, c = insecureTarget("rtmps+insecure://h/live/k", base)
+	assert.NotSame(t, base, c)
+	assert.True(t, c.InsecureSkipVerify)
+	assert.Equal(t, "cam", c.ServerName)
+	assert.EqualValues(t, tls.VersionTLS13, c.MinVersion)
+	assert.False(t, base.InsecureSkipVerify, "the base config is never modified")
+}
 
 func TestCheckTargetTLS(t *testing.T) {
 	for _, ok := range []string{

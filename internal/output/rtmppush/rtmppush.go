@@ -243,7 +243,7 @@ func insecureTarget(target string, cfg *tls.Config) (string, *tls.Config) {
 	dial := "rtmps" + target[strings.IndexByte(target, ':'):]
 	c := cfg.Clone()
 	if c == nil {
-		c = &tls.Config{}
+		c = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
 	c.InsecureSkipVerify = true
 	return dial, c
