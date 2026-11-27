@@ -207,8 +207,8 @@ server:
 - **One certificate.** Every TLS listener presents the same pair; a
   certificate for several names carries them as SANs. The minimum version is
   TLS 1.2, HTTPS is HTTP/1.1, and no client certificate is asked for.
-- **The key file's mode.** A key file that its group or others can read gets
-  one warning at start (`server: tls: key_file can be read by its group or
+- **The key file's mode.** On Unix, a key file that its group or others can
+  read gets one warning at start (`server: tls: key_file can be read by its group or
   by others`), and the server still starts: a Kubernetes secret mount is
   0444.
 - **RTSPS is TCP only.** RTP is interleaved on the TLS connection; a player
@@ -232,7 +232,7 @@ Only the files' content is live: changing `cert_file`, `key_file` or a
 
 | Use | URL |
 |---|---|
-| Publish to the server over RTMPS | an input `rtmps://<the server's RTMPS address>/<app>/<key>?mode=listen` |
+| Publish to the server over RTMPS | an input `rtmps://<the server's RTMPS address>/<app>/<key>?mode=listen`, with an app other than the play app (`ingest/cam1`, not `live/cam1`) |
 | Pull over RTMPS or RTSPS | an input `rtmps://host/app/name` (default port 443) or `rtsps://host/path` (default port 322, TCP only) |
 | Push over RTMPS | a push `rtmps://host/app/key` |
 | Play | `rtmps://host:19351/live/cam1`, `rtsps://host:5555/live/cam1`, `https://host:8443/live/cam1/hls/index.m3u8` |

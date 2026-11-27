@@ -61,7 +61,11 @@ var (
 type TLSOptions struct {
 	Config *tls.Config // must not be nil
 	// OnError, when set, is called for each connection whose TLS handshake
-	// failed, in the session's goroutine.
+	// failed, in the session's goroutine. That goroutine is inside the
+	// listener's WaitGroup, so OnError must not block, and must not
+	// unregister its own listener: the unregister would wait for it.
+	//
+	// Neither Config nor OnError may be modified after the registration.
 	OnError func(remote net.Addr, err error)
 }
 

@@ -1215,9 +1215,9 @@ viewer's `?secrets=1` is 403 on every route; and a handler's panic after a
 part of the answer is written aborts the connection instead of ending it as
 a whole answer. `server.New` binds every listener and starts the streams
 through `Manager.Load`, so a server it returns must be run. The e2e
-scenarios run in `make test` and the amd64 `test` job, inside a 240 s
-budget on the package's time (`make test` and `make cover` allow 20 min per
-package: CI's 2-core runners are slower than a local machine and the
+scenarios run in `make test` and the amd64 `test` job; after M5c1 the
+package takes about 357 s on the host (`make test` and `make cover` allow
+20 min per package: CI's 2-core runners are slower than a local machine and the
 transcode scenarios contend for CPU, which overran the earlier 10 min); `transcode-e2e-arm64` runs `TestM5aLadder` against the arm64
 bundle; the `test` job builds `cmd/openstreamer` for Linux, Windows and
 macOS.
@@ -1319,8 +1319,10 @@ Facts the code settled while it ran, beyond the rulings:
   write is in flight (`closeConn` in `pkg/rtmp` and `pkg/rtsp`, which
   returns nil for a TLS connection). A close that races a write may skip
   `close_notify`, which is accepted: each protocol has its own end of
-  stream. `pkg/rtsp` closes under its write mutex; whether `pkg/rtmp`
-  needs the same is left to the final review.
+  stream. pkg/rtmp closes without its write mutex: a close that lands
+  inside a write sends no close_notify (measured: none in 300 closes of a
+  live-paced writer). Accepted; pkg/rtsp differs because it already had a
+  timed write lock for its BYE.
 - **The handshake-failure counter** counts every connection that did not
   complete a handshake: TCP probes, plain HTTP to the HTTPS port and silent
   clients, as well as TLS errors. `https`, `api`, `rtmps` and `rtsps` are
@@ -1483,7 +1485,8 @@ Items accepted for later, not yet placed in a milestone:
   the package took 672 s in the `test` job of CI run 45822908337, and the
   `transcode-e2e-arm64` job's e2e step took 123 s, under its 10 min
   timeout, so that job needs no change; R-E10 splits it before a merge
-  when CI reads above 17 min.
+  when CI reads above 17 min. After M5c1 the package took about 357 s on
+  the host.
 
 - **Per-input RTSP sync mode** (`?sync=sr|initial`): `sr` (the default) keeps
   M2c's confirmed sender-report rule; `initial` uses sender reports only for

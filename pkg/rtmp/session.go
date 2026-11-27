@@ -345,6 +345,11 @@ func (s *session) Close() error {
 // this function closed itself, and the connection is closed either way, as a
 // plain one is when its peer has gone.
 //
+// pkg/rtmp closes without its write mutex: a close that lands inside a write
+// sends no close_notify (measured: none in 300 closes of a live-paced
+// writer). Accepted; pkg/rtsp differs because it already had a timed write
+// lock for its BYE.
+//
 // pkg/rtsp's closeConn is the twin of this function, kept apart because the
 // two packages do not import each other: change the two together.
 func closeConn(c net.Conn) error {

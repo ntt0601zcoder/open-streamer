@@ -212,9 +212,10 @@ jobs:
   # is passthrough and runs in the test job), and M5c1's ffmpeg scenario
   # over TLS (TestM5c1FFmpeg, about 13 s: it needs no transcoder, and runs
   # here so that apt's ffmpeg on arm64 publishes and plays over RTMPS, RTSPS
-  # and HTTPS too; the other M5c1 scenarios run in the test job). The
-  # whole set took about 85 s with -race on an amd64 workstation, well
-  # inside the 10 min timeout of this job's step. Their only peers are the bundle and apt's
+  # and HTTPS too; the other M5c1 scenarios run in the test job). After
+  # M5c1 the whole set took about 90 s with -race on an amd64 workstation
+  # (the e2e package as a whole about 357 s), well inside the 10 min
+  # timeout of this job's step. Their only peers are the bundle and apt's
   # ffmpeg and ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a
   # failure. The VLC, GStreamer, SRT and RTSP rows stay amd64-only:
   # TestM4aVLC and TestM4bPlayers are not in the pattern (they run in the
