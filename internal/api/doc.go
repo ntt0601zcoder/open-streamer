@@ -26,17 +26,20 @@
 //     attempts and the client address to 4 verifications in flight,
 //     whatever names it presents; a fifth is a 429 with Retry-After 1.
 //     Neither remembered case takes a place.
-//  6. The route's role, and an editor for ?secrets=1.
+//  6. A query that holds the key secrets (?secrets=1, ?secrets,
+//     ?x=1;secrets=0) is a 400 for every role, before the route's role is
+//     looked at; then the route's role.
 //  7. The dispatch through the mux, which fills the path values. A handler
 //     of ours refuses a request the wrapper did not pass for its own route.
 //
 // # Secrets
 //
-// Stream documents are redacted in every response unless the query is
-// exactly secrets=1 from an editor. The config text holds stream keys and
-// password hashes and is an editor's. Nothing here logs a header, a query,
-// a body, a spec or a password; every error text goes through
-// logging.Scrub.
+// Secrets are write-only (R-T3). Stream documents are redacted in every
+// response, for every role, and so is the config text, which the Backend
+// masks; a write that sends the mask back keeps the stored secret, which
+// the Backend resolves. The config text still holds the users' password
+// hashes and is an editor's. Nothing here logs a header, a query, a body,
+// a spec or a password; every error text goes through logging.Scrub.
 //
 // # Assets
 //

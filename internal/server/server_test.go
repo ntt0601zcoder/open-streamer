@@ -867,7 +867,8 @@ func TestStatusAndShotThroughTheAPI(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, s.do(http.MethodGet, "/api/v1/config", "eye", "").code)
 	res = s.do(http.MethodGet, "/api/v1/config", "ops", "")
 	require.Equal(t, http.StatusOK, res.code)
-	assert.Equal(t, s.fileText(), res.body)
+	assert.Equal(t, shownText(t, s.fileText()), res.body, "the file, masked")
+	assert.NotContains(t, res.body, "rtmp://src.example/live/cam")
 	_, etag := s.ConfigText()
 	assert.Equal(t, etag, res.header.Get("ETag"))
 }

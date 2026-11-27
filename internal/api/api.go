@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -33,12 +34,18 @@ type Backend interface {
 	List() []spec.Stream
 	Status(name string) (stream.Status, bool)
 	Shot(name string) (picture.Shot, time.Time, bool)
-	// ConfigText is the text last loaded, reloaded or written, and
-	// config.Hash of it.
-	ConfigText() (text []byte, etag string)
+	// ConfigText is the text last loaded, reloaded or written as a
+	// response shows it, masked by config.Mask, and config.ETag of the
+	// text itself (R-T12). The text is nil when it could not be masked.
+	ConfigText() (masked []byte, etag string)
 	ConfigStatus() ConfigStatus
+	// PutConfig makes text the config in force: a mask in it stands for
+	// the stored secret (R-T4).
 	PutConfig(ctx context.Context, text []byte, ifMatch string) (ApplyResult, error)
-	PutStream(ctx context.Context, sp spec.Stream, ifMatch string) (out stream.Outcome, err error)
+	// PutStream creates or replaces one stream. sp is the document as
+	// sent: a mask in it stands for the stored secret (R-T4). stored is
+	// the document as it is now stored.
+	PutStream(ctx context.Context, sp spec.Stream, ifMatch string) (out stream.Outcome, stored spec.Stream, err error)
 	DeleteStream(ctx context.Context, name, ifMatch string) error
 	Reload(ctx context.Context) (ApplyResult, error)
 	Assets() ([]Asset, error)
@@ -442,8 +449,14 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	info.user, info.role = name, role
-	// 6. The route's role, and an editor for ?secrets=1.
-	if !role.Allows(rt.Role) || (asksSecrets(r) && !role.Allows(auth.Editor)) {
+	// 6. A query that holds the key secrets, for every role and before the
+	// route's role: a script that relied on ?secrets=1 fails loudly. Then
+	// the route's role.
+	if asksSecrets(r) {
+		writeError(rec, http.StatusBadRequest, codeBadRequest, msgSecretsGone, nil)
+		return
+	}
+	if !role.Allows(rt.Role) {
 		writeError(rec, http.StatusForbidden, codeForbidden, "the "+string(auth.Editor)+" role is required", nil)
 		return
 	}
@@ -458,14 +471,23 @@ func needsRequestedBy(method string) bool {
 	return method == http.MethodPut || method == http.MethodDelete || method == http.MethodPost
 }
 
-// asksSecrets reports whether the query is exactly secrets=1.
-func asksSecrets(r *http.Request) bool { return r.URL.RawQuery == "secrets=1" }
+// msgSecretsGone is the answer to a query that holds the key secrets.
+const msgSecretsGone = "?secrets=1 is gone: secrets are write-only. " +
+	"A response shows xxxxx where a secret is stored, and a write that sends xxxxx back keeps it"
 
-// showSecrets reports whether the response may hold stream secrets: the
-// query is exactly secrets=1 and the wrapper found an editor.
-func showSecrets(r *http.Request) bool {
-	s := sessionOf(r)
-	return asksSecrets(r) && s != nil && s.role == auth.Editor
+// asksSecrets reports whether the raw query, cut at every '&' and ';', has
+// a piece whose key, the part before '=' unescaped, is secrets, whatever
+// its value: ?secrets, ?secrets=0 and ?x=1;secrets=1 included.
+// url.Values.Has would miss the last, since url.ParseQuery drops a pair
+// that holds ';'.
+func asksSecrets(r *http.Request) bool {
+	for piece := range strings.FieldsFuncSeq(r.URL.RawQuery, func(c rune) bool { return c == '&' || c == ';' }) {
+		key, _, _ := strings.Cut(piece, "=")
+		if k, err := url.QueryUnescape(key); err == nil && k == "secrets" {
+			return true
+		}
+	}
+	return false
 }
 
 func unauthorized(w http.ResponseWriter) {

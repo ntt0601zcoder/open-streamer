@@ -1174,20 +1174,22 @@ func TestM5c1NoSecretsLeak(t *testing.T) {
 		"the rtsps pull's x509 failure is in the log, its password redacted")
 	assert.Contains(t, logs, "server: tls: reload failed", "the failed reload is in the log")
 
-	// The deliberate exceptions, for the editor only: the stream secrets.
-	for name, own := range map[string][]string{
-		"lis": {listenKey}, "cam2": {pullKey, pullPW, pullToken, pushKey, pushToken}, "cam3": {rtspPW},
-	} {
-		code, body := ops.get(t, "/api/v1/streams/"+name+"?secrets=1")
-		require.Equal(t, http.StatusOK, code)
-		for _, s := range own {
-			assert.Contains(t, string(body), s, "GET %s?secrets=1 as the editor", name)
+	// There is no exception any more (R-T6): ?secrets=1 is a 400 for the
+	// editor too, and its config text is masked (R-T8).
+	for _, name := range []string{"lis", "cam2", "cam3"} {
+		for _, who := range []*m5a{ops, eye} {
+			code, body := who.get(t, "/api/v1/streams/"+name+"?secrets=1")
+			assert.Equal(t, http.StatusBadRequest, code, "GET %s?secrets=1 as %s", name, who.user)
+			clean("GET "+name+"?secrets=1 as "+who.user, string(body), all)
 		}
-		clean("GET "+name+"?secrets=1", string(body), slices.Concat(userSecrets, secrets[7:]))
-		assert.Equal(t, http.StatusForbidden, eye.do(t, http.MethodGet, "/api/v1/streams/"+name+"?secrets=1", nil).code)
 	}
-	// The config's text holds the key file's path, never what it holds.
+	// The config's text holds the key file's path, never what it holds,
+	// and no stream secret: the file holds them.
 	text, _ := ops.configText(t)
 	assert.Contains(t, text, m.key)
-	clean("GET /api/v1/config", text, secrets[7:])
+	clean("GET /api/v1/config", text, secrets)
+	file := ops.fileText(t)
+	for _, s := range secrets[:7] {
+		assert.Contains(t, file, s, "the file holds the stream secrets")
+	}
 }

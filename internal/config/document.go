@@ -2,8 +2,6 @@ package config
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -196,12 +194,6 @@ func ParseLenient(text []byte, opt Options) (p Parsed, skipped []error, err erro
 		return Parsed{}, nil, err
 	}
 	return p, cappedErrors(skipped), nil
-}
-
-// Hash is the config's ETag: `"` + hex(sha256(text)) + `"`.
-func Hash(text []byte) string {
-	sum := sha256.Sum256(text)
-	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
 // parse does the work of Parse and ParseLenient. err is a *SyntaxError or

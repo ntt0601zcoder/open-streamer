@@ -10,19 +10,9 @@ import (
 	"slices"
 	"time"
 
-	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 	"github.com/ntt0601zcoder/open-streamer/internal/stream"
 )
-
-// view is sp as a response shows it: redacted, unless an editor asked for
-// the secrets.
-func view(r *http.Request, sp spec.Stream) spec.Stream {
-	if showSecrets(r) {
-		return sp
-	}
-	return sp.Redacted()
-}
 
 // streamName returns the path's stream name; a name no stream can have is
 // answered 404, and the Backend is not asked.
@@ -42,11 +32,11 @@ func isMedia(r *http.Request, want string) bool {
 	return err == nil && got == want
 }
 
-func (a *API) listStreams(w http.ResponseWriter, r *http.Request) {
+func (a *API) listStreams(w http.ResponseWriter, _ *http.Request) {
 	list := a.opt.Backend.List()
 	out := make([]spec.Stream, len(list))
 	for i, sp := range list {
-		out[i] = view(r, sp)
+		out[i] = sp.Redacted() // for every role: secrets are write-only (R-T6)
 	}
 	slices.SortFunc(out, func(x, y spec.Stream) int { return cmp.Compare(x.Name, y.Name) })
 	writeJSON(w, http.StatusOK, map[string][]spec.Stream{"streams": out})
@@ -63,26 +53,7 @@ func (a *API) getStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("ETag", sp.ETag())
-	writeJSON(w, http.StatusOK, view(r, sp))
-}
-
-// maskedURLs returns one error text per input or push URL of sp that holds
-// the redaction mask, in the words of spec.Stream.Validate, which stops at
-// the first.
-func maskedURLs(sp spec.Stream) []string {
-	const text = "spec: validate: %s[%d].url: holds the redaction mask, not the secret; send the real value"
-	var out []string
-	for i, in := range sp.Inputs {
-		if redact.Masked(in.URL) {
-			out = append(out, fmt.Sprintf(text, "inputs", i))
-		}
-	}
-	for i, p := range sp.Outputs.Push {
-		if redact.Masked(p.URL) {
-			out = append(out, fmt.Sprintf(text, "outputs.push", i))
-		}
-	}
-	return out
+	writeJSON(w, http.StatusOK, sp.Redacted())
 }
 
 // putResult is the answer to a stream PUT.
@@ -132,14 +103,9 @@ func (a *API) putStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A document that came back from a redacted response holds the mask
-	// where the secret was. The Backend's Validate refuses it too; it is
-	// refused here as well, so that no Backend can store the mask over the
-	// secret.
-	if masked := maskedURLs(sp); len(masked) > 0 {
-		writeError(w, http.StatusUnprocessableEntity, codeInvalidConf, "the config is invalid", masked)
-		return
-	}
-	out, err := a.opt.Backend.PutStream(r.Context(), sp, r.Header.Get("If-Match"))
+	// where a secret is stored: the Backend resolves it against the stored
+	// stream (R-T4), or refuses it with config.Errors.
+	out, stored, err := a.opt.Backend.PutStream(r.Context(), sp, r.Header.Get("If-Match"))
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -148,8 +114,8 @@ func (a *API) putStream(w http.ResponseWriter, r *http.Request) {
 	if out.Applied == "created" {
 		status = http.StatusCreated
 	}
-	w.Header().Set("ETag", sp.ETag())
-	writeJSON(w, status, putResult{Stream: view(r, sp), Applied: out.Applied})
+	w.Header().Set("ETag", stored.ETag())
+	writeJSON(w, status, putResult{Stream: stored.Redacted(), Applied: out.Applied})
 }
 
 func (a *API) deleteStream(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -33,26 +34,39 @@ func bounded(s string) string {
 	return strings.ToValidUTF8(s[:maxReloadError], "") + "… (cut)"
 }
 
-// state is the text in force and its status, published as one immutable
-// value. status.Stale is never set here: ConfigStatus asks the file.
+// state is the text in force as a response shows it and its status,
+// published as one immutable value. status.Stale is never set here:
+// ConfigStatus asks the file.
 type state struct {
-	text   []byte
-	status api.ConfigStatus
+	applied []byte // the text in force, which masked was made of
+	masked  []byte // config.Mask(applied); nil when it could not be masked
+	status  api.ConfigStatus
 }
 
 // publish makes the fields cfg guards the snapshot the readers see. The
-// caller holds s.cfg, or is New.
+// caller holds s.cfg, or is New. The text is masked once per applied
+// text: a reload that fails keeps the snapshot's mask.
 func (s *Server) publish() {
 	st := &state{
-		text: s.applied,
+		applied: s.applied,
 		status: api.ConfigStatus{
-			ETag:            config.Hash(s.applied),
+			ETag:            config.ETag(s.applied),
 			LoadedAt:        s.loadedAt,
 			LoadErrors:      slices.Clone(s.loadErrs),
 			LastReloadAt:    s.lastReloadAt,
 			LastReloadError: s.lastReloadErr,
 			RestartRequired: slices.Clone(s.restart),
 		},
+	}
+	if prev := s.state.Load(); prev != nil && bytes.Equal(prev.applied, s.applied) {
+		st.masked = prev.masked
+	} else if masked, err := config.Mask(s.applied); err != nil {
+		s.log.Error("server: config: the text cannot be shown with its secrets masked", "error", logging.Scrub(err.Error()))
+	} else {
+		st.masked = bytes.Clone(masked)
+		if st.masked == nil {
+			st.masked = []byte{}
+		}
 	}
 	s.state.Store(st)
 }
@@ -63,9 +77,10 @@ func (s *Server) publish() {
 //
 // The parse is strict, so a text that still holds an entry the start
 // skipped is refused with that entry's errors, whichever way it came; and
-// it runs every stream's Validate, which is where a whole-config PUT of a
-// document that came back redacted (the mask where a stream key was) is
-// refused: nothing before this sees that text.
+// it runs every stream's Validate, which refuses the mask wherever it is
+// left: PutConfig and PutStream resolve every mask they can before this
+// (R-T4), so a mask that reaches it is one they could not resolve or one
+// written into the file by hand, and it is never stored.
 func (s *Server) apply(ctx context.Context, text []byte, write bool) (api.ApplyResult, error) {
 	p, err := config.Parse(text, s.parseOpt)
 	if err != nil {
@@ -108,7 +123,7 @@ func (s *Server) apply(ctx context.Context, text []byte, write bool) (api.ApplyR
 	}
 	s.restart = restart
 	s.publish()
-	return api.ApplyResult{Streams: out, RestartRequired: slices.Clone(restart), ETag: config.Hash(text)}, nil
+	return api.ApplyResult{Streams: out, RestartRequired: slices.Clone(restart), ETag: config.ETag(text)}, nil
 }
 
 // stale refuses a write while the file on disk is not the text in force: a
@@ -137,9 +152,11 @@ func (s *Server) matchStream(name, ifMatch string) error {
 	return nil
 }
 
-// PutConfig makes text, the client's exact bytes, the config in force and
-// the file's content. The stale check comes before If-Match: a client
-// whose ETag is current still must not overwrite a hand edit.
+// PutConfig makes text the config in force and the file's content. A
+// mask in it stands for the stored secret and is resolved against the
+// text in force (config.Unmask, R-T4); a text without masks is stored as
+// the client's exact bytes. The stale check comes before If-Match: a
+// client whose ETag is current still must not overwrite a hand edit.
 func (s *Server) PutConfig(ctx context.Context, text []byte, ifMatch string) (api.ApplyResult, error) {
 	s.cfg.Lock()
 	defer s.cfg.Unlock()
@@ -149,44 +166,79 @@ func (s *Server) PutConfig(ctx context.Context, text []byte, ifMatch string) (ap
 	if err := s.stale(); err != nil {
 		return api.ApplyResult{}, err
 	}
-	if ifMatch != config.Hash(s.applied) {
+	if ifMatch != config.ETag(s.applied) {
 		return api.ApplyResult{}, api.ErrPrecondition
+	}
+	text, err := config.Unmask(text, s.applied)
+	if err != nil {
+		return api.ApplyResult{}, err // config.Errors: one per mask it could not resolve
 	}
 	return s.apply(ctx, text, true)
 }
 
 // PutStream creates or replaces one stream: the entry of its name in the
-// text in force, also one the start skipped. A document equal to the one
-// the stream has rewrites nothing: the text in force is applied as it is
-// (which still tries a stream left stopped again), so the file keeps its
-// layout, blank lines included. Not while the text still holds entries the
-// start skipped: one of them may repeat this name, and the edit removes it.
-func (s *Server) PutStream(ctx context.Context, sp spec.Stream, ifMatch string) (stream.Outcome, error) {
+// text in force, also one the start skipped. sp is the document as sent: a
+// mask in it stands for the secret the stored stream of its name holds
+// (spec.Stream.Unmask, R-T4), and everything after works on the resolved
+// document. A document equal to the one the stream has rewrites nothing:
+// the text in force is applied as it is (which still tries a stream left
+// stopped again), so the file keeps its layout, blank lines included. Not
+// while the text still holds entries the start skipped: one of them may
+// repeat this name, and the edit removes it. stored is the document as it
+// is stored afterwards.
+func (s *Server) PutStream(ctx context.Context, sp spec.Stream, ifMatch string) (stream.Outcome, spec.Stream, error) {
 	s.cfg.Lock()
 	defer s.cfg.Unlock()
 	if err := s.stale(); err != nil {
-		return stream.Outcome{}, err
+		return stream.Outcome{}, spec.Stream{}, err
 	}
 	if err := s.matchStream(sp.Name, ifMatch); err != nil {
-		return stream.Outcome{}, err
+		return stream.Outcome{}, spec.Stream{}, err
+	}
+	cur, ok := s.Manager().Get(sp.Name)
+	var old *spec.Stream
+	if ok {
+		old = &cur
+	}
+	sp, err := sp.Unmask(old)
+	if err != nil {
+		return stream.Outcome{}, spec.Stream{}, unmaskErrors(err)
 	}
 	text := s.applied
-	if cur, ok := s.Manager().Get(sp.Name); !ok || s.skipped || spec.Diff(cur, sp) != spec.ChangeNone {
-		var err error
+	if !ok || s.skipped || spec.Diff(cur, sp) != spec.ChangeNone {
 		if text, err = config.SetStream(s.applied, sp); err != nil {
-			return stream.Outcome{}, err
+			return stream.Outcome{}, spec.Stream{}, err
 		}
 	}
 	res, err := s.apply(ctx, text, true)
 	if err != nil {
-		return stream.Outcome{}, err
+		return stream.Outcome{}, spec.Stream{}, err
+	}
+	stored, ok := s.Manager().Get(sp.Name)
+	if !ok {
+		stored = sp
 	}
 	for _, o := range res.Streams {
 		if o.Name == sp.Name {
-			return o, nil
+			return o, stored, nil
 		}
 	}
-	return stream.Outcome{Name: sp.Name, Applied: "unchanged"}, nil
+	return stream.Outcome{Name: sp.Name, Applied: "unchanged"}, stored, nil
+}
+
+// unmaskErrors turns the fields spec.Stream.Unmask could not resolve into
+// config.Errors, each in the words of spec.Stream.Validate, which the API
+// answers 422 invalid_config.
+func unmaskErrors(err error) error {
+	var refused spec.UnmaskError
+	if !errors.As(err, &refused) {
+		return fmt.Errorf("server: put stream: %w", err)
+	}
+	out := make(config.Errors, len(refused))
+	for i, text := range refused {
+		out[i] = errors.New("spec: validate: " + text)
+	}
+	return out
 }
 
 // DeleteStream removes one stream: the entries of its name in the text in
@@ -244,11 +296,12 @@ func (s *Server) Reload(ctx context.Context) (api.ApplyResult, error) {
 	return res, nil
 }
 
-// ConfigText returns the text in force and its ETag. It never waits for an
-// apply.
+// ConfigText returns the text in force as a response shows it, masked by
+// config.Mask, and the ETag of the text itself (R-T12). The text is nil
+// when it could not be masked. It never waits for an apply.
 func (s *Server) ConfigText() ([]byte, string) {
 	st := s.state.Load()
-	return bytes.Clone(st.text), st.status.ETag
+	return bytes.Clone(st.masked), st.status.ETag
 }
 
 // ConfigStatus returns the status of the config in force, with Stale asked

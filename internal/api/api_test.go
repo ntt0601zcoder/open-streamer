@@ -124,9 +124,10 @@ type fakeBackend struct {
 	validate                             bool // PutStream runs Validate, as the real apply path does
 	panics                               bool
 
-	calls     []string // "Get cam", "PutStream cam", ...
-	ifMatch   []string
-	gotConfig []byte
+	calls      []string // "Get cam", "PutStream cam", ...
+	ifMatch    []string
+	gotConfig  []byte
+	gotStreams []spec.Stream // the documents PutStream got, as sent
 
 	// The assets: a real store in a temp dir.
 	assets    *asset.Store
@@ -143,7 +144,7 @@ func newFakeBackend() *fakeBackend {
 		statuses: map[string]stream.Status{},
 		shots:    map[string]shotAt{},
 		text:     []byte("version: 1\n"),
-		etag:     config.Hash([]byte("version: 1\n")),
+		etag:     config.ETag([]byte("version: 1\n")),
 	}
 }
 
@@ -163,7 +164,7 @@ func (f *fakeBackend) callList() []string {
 func (f *fakeBackend) reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls, f.ifMatch, f.gotConfig = nil, nil, nil
+	f.calls, f.ifMatch, f.gotConfig, f.gotStreams = nil, nil, nil, nil
 }
 
 func (f *fakeBackend) Get(name string) (spec.Stream, bool) {
@@ -224,28 +225,43 @@ func (f *fakeBackend) PutConfig(_ context.Context, text []byte, ifMatch string) 
 	return f.result, f.configErr
 }
 
-func (f *fakeBackend) PutStream(_ context.Context, sp spec.Stream, ifMatch string) (stream.Outcome, error) {
+func (f *fakeBackend) PutStream(_ context.Context, sp spec.Stream, ifMatch string) (stream.Outcome, spec.Stream, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.call("PutStream " + sp.Name)
 	f.ifMatch = append(f.ifMatch, ifMatch)
+	f.gotStreams = append(f.gotStreams, sp)
 	if f.putErr != nil {
-		return stream.Outcome{}, f.putErr
+		return stream.Outcome{}, spec.Stream{}, f.putErr
+	}
+	// The mask resolved as the real apply path does (R-T4).
+	var stored *spec.Stream
+	if old, ok := f.streams[sp.Name]; ok {
+		stored = &old
+	}
+	sp, err := sp.Unmask(stored)
+	var refused spec.UnmaskError
+	if errors.As(err, &refused) {
+		var list config.Errors
+		for _, text := range refused {
+			list = append(list, errors.New("spec: validate: "+text))
+		}
+		return stream.Outcome{}, spec.Stream{}, list
 	}
 	if f.validate {
 		if err := sp.Validate(); err != nil {
-			return stream.Outcome{}, config.Errors{err}
+			return stream.Outcome{}, spec.Stream{}, config.Errors{err}
 		}
 	}
 	applied := "created"
-	if old, ok := f.streams[sp.Name]; ok {
+	if stored != nil {
 		applied = "rebuild"
-		if old.ETag() == sp.ETag() {
+		if stored.ETag() == sp.ETag() {
 			applied = "unchanged"
 		}
 	}
 	f.streams[sp.Name] = sp
-	return stream.Outcome{Name: sp.Name, Applied: applied}, nil
+	return stream.Outcome{Name: sp.Name, Applied: applied}, sp, nil
 }
 
 func (f *fakeBackend) DeleteStream(_ context.Context, name, ifMatch string) error {
@@ -722,7 +738,7 @@ func TestAccessLog(t *testing.T) {
 	e.seedCam()
 	e.clock.Advance(0)
 	rec := e.do(http.MethodGet, "/api/v1/streams/cam?secrets=1", with(editor, from("203.0.113.9:4000"))...)
-	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
 	rec = e.do(http.MethodGet, "/api/v1/streams/cam", from("203.0.113.9:4001"))
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
 
@@ -732,7 +748,7 @@ func TestAccessLog(t *testing.T) {
 	assert.Equal(t, "INFO", first["level"])
 	assert.Equal(t, "GET", first["method"])
 	assert.Equal(t, pathStream, first["route"])
-	assert.InDelta(t, 200, first["status"], 0)
+	assert.InDelta(t, 400, first["status"], 0)
 	assert.Contains(t, first, "duration")
 	assert.Equal(t, "203.0.113.9:4000", first["remote"])
 	assert.Equal(t, "ops", first["user"])

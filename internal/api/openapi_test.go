@@ -216,4 +216,31 @@ func TestOpenAPIMatchesSpec(t *testing.T) {
 	plain, _ := jsonFields(reflect.TypeFor[stream.Status]())
 	wrapped, _ := jsonFields(reflect.TypeFor[statusDoc]())
 	assert.Equal(t, plain, wrapped)
+
+	// ?secrets=1 is gone (R-T6): no operation takes it, and every
+	// authenticated GET documents the 400 it is answered.
+	for name, raw := range doc.Components.Parameters {
+		var p struct {
+			Name string `json:"name"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &p))
+		assert.NotEqual(t, "secrets", p.Name, name)
+		assert.NotEqual(t, "secrets", name)
+	}
+	for path, ops := range doc.Paths {
+		for method, op := range ops {
+			for _, p := range op.Parameters {
+				assert.NotContains(t, p.Ref, "secrets", "%s %s", method, path)
+			}
+			if method == "get" && path != "/healthz" {
+				assert.Contains(t, op.Responses, "400", "%s %s", method, path)
+			}
+		}
+	}
+	var bad struct {
+		Description string `json:"description"`
+	}
+	require.NoError(t, json.Unmarshal(doc.Components.Responses["BadRequest"], &bad))
+	assert.Contains(t, bad.Description, "secrets=1")
+	assert.Equal(t, 1, strings.Count(string(openAPIDoc), "secrets=1"), "only in the description of the 400")
 }

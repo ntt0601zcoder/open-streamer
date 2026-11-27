@@ -282,11 +282,11 @@ func TestDeleteAssetInUse(t *testing.T) {
 
 	disabled := camSpec(&spec.Watermark{Image: "logo.png"})
 	disabled.Disabled = true
-	_, err := s.PutStream(bg, disabled, "")
+	_, _, err := s.PutStream(bg, disabled, "")
 	require.NoError(t, err)
 	inUse()
 
-	_, err = s.PutStream(bg, camSpec(nil), "")
+	_, _, err = s.PutStream(bg, camSpec(nil), "")
 	require.NoError(t, err)
 	require.NoError(t, s.DeleteAsset(bg, "logo.png", ""))
 	assert.NoFileExists(t, filepath.Join(dir, "logo.png"))
@@ -658,7 +658,7 @@ func TestConcurrentAssetAndStreamWrites(t *testing.T) {
 			for n := 0; running(); n++ {
 				switch i % 4 {
 				case 0:
-					_, err := s.PutStream(bg, variants[(i/4+n)%len(variants)], "")
+					_, _, err := s.PutStream(bg, variants[(i/4+n)%len(variants)], "")
 					check(err)
 					edits.Add(1)
 				case 1:
@@ -727,7 +727,7 @@ func TestLiveEditOverTheApplyPath(t *testing.T) {
 	gen := s.generation("cam")
 	sp := specOf("cam", spec.Outputs{HLS: true})
 	sp.Inputs = append(sp.Inputs, spec.Input{URL: "rtmp://backup.example/live/cam"})
-	out, err := s.PutStream(bg, sp, "")
+	out, _, err := s.PutStream(bg, sp, "")
 	require.NoError(t, err)
 	assert.Equal(t, stream.Outcome{Name: "cam", Applied: "live"}, out)
 	assert.Contains(t, s.fileText(), "rtmp://backup.example/live/cam")

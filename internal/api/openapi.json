@@ -3,7 +3,7 @@
   "info": {
     "title": "Open Streamer API",
     "version": "1",
-    "description": "The REST API of Open Streamer: the streams, the assets (watermark images and fonts), the config editor, the reload and the status documents. Every route but /healthz needs HTTP Basic credentials of a user in the config file; a viewer reads, an editor reads and writes (x-role on each operation). A viewer's ?secrets=1 is 403 on every authenticated route, not only on the stream routes. Every response has Cache-Control: no-store (the thumbnail and an asset's file: no-cache) and X-Content-Type-Options: nosniff. A request no route answers gets a plain-text 404 or 405, without authentication. The editor also has net/http/pprof under /debug/pprof/. The API has no TLS before M5c: keep it on loopback or behind a TLS reverse proxy. Run the server under a service manager that restarts it: there is no per-stream panic recovery, so a panic ends the process and the restart restores every stream from the config file."
+    "description": "The REST API of Open Streamer: the streams, the assets (watermark images and fonts), the config editor, the reload and the status documents. Every route but /healthz needs HTTP Basic credentials of a user in the config file; a viewer reads, an editor reads and writes (x-role on each operation). Secrets are write-only, for every role: a response shows xxxxx wherever a stream secret is stored (an input's or a push's credentials, an SRT passphrase), in the stream documents and in the config text alike, and a write that sends xxxxx back keeps the stored secret. A query that holds the key secrets is a 400 on every authenticated route. Every response has Cache-Control: no-store (the thumbnail and an asset's file: no-cache) and X-Content-Type-Options: nosniff. A request no route answers gets a plain-text 404 or 405, without authentication. The editor also has net/http/pprof under /debug/pprof/. The API has no TLS before M5c: keep it on loopback or behind a TLS reverse proxy. Run the server under a service manager that restarts it: there is no per-stream panic recovery, so a panic ends the process and the restart restores every stream from the config file."
   },
   "security": [
     {
@@ -70,6 +70,10 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -106,6 +110,10 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -131,11 +139,6 @@
             "basicAuth": []
           }
         ],
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/secrets"
-          }
-        ],
         "responses": {
           "200": {
             "description": "The streams.",
@@ -159,11 +162,12 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
           },
           "429": {
             "$ref": "#/components/responses/TooManyAttempts"
@@ -190,9 +194,6 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/name"
-          },
-          {
-            "$ref": "#/components/parameters/secrets"
           }
         ],
         "responses": {
@@ -211,11 +212,12 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -250,14 +252,11 @@
           },
           {
             "$ref": "#/components/parameters/ifMatchOptional"
-          },
-          {
-            "$ref": "#/components/parameters/secrets"
           }
         ],
         "requestBody": {
           "required": true,
-          "description": "The stream's document, at most 1048576 bytes; unknown fields are refused.",
+          "description": "The stream's document, at most 1048576 bytes; unknown fields are refused. A URL or srt_passphrase that holds xxxxx keeps the secret this stream has stored for it, and is refused (422) when there is none.",
           "content": {
             "application/json": {
               "schema": {
@@ -418,6 +417,10 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -471,6 +474,10 @@
           "304": {
             "description": "If-None-Match holds the shot's ETag."
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -522,11 +529,12 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
@@ -596,11 +604,12 @@
           "304": {
             "description": "If-None-Match holds the asset's ETag."
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -788,7 +797,7 @@
     "/api/v1/config": {
       "get": {
         "operationId": "getConfig",
-        "summary": "The whole config file, verbatim.",
+        "summary": "The whole config file, masked.",
         "x-role": "editor",
         "security": [
           {
@@ -797,7 +806,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The YAML text as last loaded, reloaded or written. It holds stream keys and password hashes.",
+            "description": "The YAML text as last loaded, reloaded or written, with every stream secret masked as xxxxx (a URL's credentials, an SRT passphrase, and the URLs in comments); a PUT that sends it back keeps the stored secrets. It still holds the users' password hashes. The ETag is a keyed tag of the stored text, which changes when the server restarts.",
             "headers": {
               "ETag": {
                 "$ref": "#/components/headers/ETag"
@@ -814,6 +823,10 @@
           },
           "304": {
             "description": "If-None-Match holds the config's ETag."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -851,7 +864,7 @@
         ],
         "requestBody": {
           "required": true,
-          "description": "The YAML text, at most 4194304 bytes; the bytes are written as sent.",
+          "description": "The YAML text, at most 4194304 bytes. A stream's input URL, push URL or srt_passphrase that holds xxxxx keeps the secret the stored entry of the same name holds for it, and is refused (422) when there is none; a text without a mask is written byte for byte as sent.",
           "content": {
             "application/yaml": {
               "schema": {
@@ -863,7 +876,7 @@
         },
         "responses": {
           "200": {
-            "description": "The config was written as sent and applied.",
+            "description": "The config was written, its masks resolved, and applied.",
             "headers": {
               "ETag": {
                 "$ref": "#/components/headers/ETag"
@@ -936,6 +949,10 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -1027,6 +1044,10 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest",
+            "description": "bad_request: a query that holds the key secrets."
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -1059,18 +1080,6 @@
         "schema": {
           "type": "string",
           "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
-        }
-      },
-      "secrets": {
-        "name": "secrets",
-        "in": "query",
-        "required": false,
-        "description": "With the query exactly ?secrets=1, from an editor, stream URLs are not redacted. A viewer gets 403. Any other query redacts.",
-        "schema": {
-          "type": "string",
-          "enum": [
-            "1"
-          ]
         }
       },
       "ifMatchOptional": {
@@ -1143,7 +1152,7 @@
     },
     "responses": {
       "BadRequest": {
-        "description": "bad_request: a body that is not one document of the expected shape or could not be read, a name other than the path's, an asset upload's If-None-Match other than *, or a write without X-Requested-By.",
+        "description": "bad_request: a body that is not one document of the expected shape or could not be read, a name other than the path's, an asset upload's If-None-Match other than *, a write without X-Requested-By, or a query that holds the key secrets: ?secrets=1 is gone, since secrets are write-only.",
         "content": {
           "application/json": {
             "schema": {
@@ -1172,7 +1181,7 @@
         }
       },
       "Forbidden": {
-        "description": "forbidden: a viewer on an editor's route, or with ?secrets=1.",
+        "description": "forbidden: a viewer on an editor's route.",
         "content": {
           "application/json": {
             "schema": {
@@ -1385,7 +1394,7 @@
         "properties": {
           "url": {
             "type": "string",
-            "description": "The ingest URL. Its password, secret query values and RTMP stream key are masked in responses unless an editor asks with ?secrets=1; a masked URL is refused when written back.",
+            "description": "The ingest URL. Its password, the credentials in its path and query and an RTMP stream key are write-only: a response shows xxxxx in their place, and the URL written back as shown keeps the stored secret while nothing else in it changed; a mask that stands for no stored secret of this stream is refused.",
             "minLength": 1,
             "maxLength": 2048
           }
@@ -1615,7 +1624,7 @@
         "properties": {
           "url": {
             "type": "string",
-            "description": "The target URL; masked in responses like an input URL.",
+            "description": "The target URL; write-only like an input URL.",
             "minLength": 1,
             "maxLength": 2048
           }
@@ -1808,7 +1817,7 @@
         "properties": {
           "id": {
             "type": "string",
-            "description": "The first 8 hex digits of a keyed tag of the URL, which changes when the server restarts: the target label of the metrics."
+            "description": "The first 8 hex digits of a keyed tag of the stream's name and the URL, which changes when the server restarts: the target label of the metrics. It shows nothing of the URL, which is write-only, and two streams that push to one URL have different ids."
           },
           "target": {
             "type": "string",

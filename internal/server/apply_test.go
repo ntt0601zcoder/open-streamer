@@ -3,11 +3,15 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
 	"image/png"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,6 +29,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/api"
 	"github.com/ntt0601zcoder/open-streamer/internal/auth"
 	"github.com/ntt0601zcoder/open-streamer/internal/config"
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 	"github.com/ntt0601zcoder/open-streamer/internal/stream"
 )
@@ -42,6 +47,14 @@ func testParse(t *testing.T, text string) config.Parsed {
 // specOf is the spec of streamYAML(name, …) with the outputs out.
 func specOf(name string, out spec.Outputs) spec.Stream {
 	return spec.Stream{Name: name, Inputs: []spec.Input{{URL: "rtmp://src.example/live/" + name}}, Outputs: out}
+}
+
+// shownText is text as the API shows it: config.Mask of it.
+func shownText(t *testing.T, text string) string {
+	t.Helper()
+	b, err := config.Mask([]byte(text))
+	require.NoError(t, err)
+	return string(b)
 }
 
 // freeUDP is a UDP port that was free a moment ago.
@@ -183,11 +196,11 @@ func TestStartIsLenient(t *testing.T) {
 		s := testConfig(t, func(su *setup) { su.Text = baseText(pair("u1"), pair("u2")) })
 		require.Len(t, s.status().LoadErrors, 1)
 		// An edit of another stream leaves the record.
-		_, err := s.PutStream(bg, specOf("good", spec.Outputs{HLS: true}), "")
+		_, _, err := s.PutStream(bg, specOf("good", spec.Outputs{HLS: true}), "")
 		require.NoError(t, err)
 		require.Len(t, s.status().LoadErrors, 1)
 		u2 := specOf("u2", spec.Outputs{HLS: true})
-		out, err := s.PutStream(bg, u2, "")
+		out, _, err := s.PutStream(bg, u2, "")
 		require.NoError(t, err)
 		assert.Equal(t, "started", out.Applied)
 		assert.Empty(t, s.status().LoadErrors)
@@ -358,7 +371,7 @@ func TestBinaryGoneLaterBlocksNoEdit(t *testing.T) {
 	})
 	require.NoError(t, os.Remove(bin))
 
-	_, err := s.PutStream(bg, specOf("two", spec.Outputs{HLS: true}), "")
+	_, _, err := s.PutStream(bg, specOf("two", spec.Outputs{HLS: true}), "")
 	require.NoError(t, err)
 	_, etag := s.ConfigText()
 	res, err := s.PutConfig(bg, []byte(s.fileText()+"# a comment\n"), etag)
@@ -385,8 +398,8 @@ func TestApplyPathsAgree(t *testing.T) {
 		require.True(t, ok)
 		assert.False(t, got.Outputs.RTSP)
 		text, etag := s.ConfigText()
-		assert.Equal(t, s.fileText(), string(text))
-		assert.Equal(t, config.Hash(text), etag)
+		assert.Equal(t, shownText(t, s.fileText()), string(text), "the file as the API shows it")
+		assert.Equal(t, config.ETag([]byte(s.fileText())), etag)
 		assert.False(t, s.ConfigStatus().Stale)
 	}
 	begin := func(t *testing.T) (*testServer, uint64) {
@@ -399,11 +412,11 @@ func TestApplyPathsAgree(t *testing.T) {
 		res, err := s.PutConfig(bg, []byte(after), etag)
 		require.NoError(t, err)
 		check(t, s, gen, applied(t, res, "cam"), applied(t, res, "other"))
-		assert.Equal(t, config.Hash([]byte(after)), res.ETag)
+		assert.Equal(t, config.ETag([]byte(after)), res.ETag)
 	})
 	t.Run("stream PUT", func(t *testing.T) {
 		s, gen := begin(t)
-		out, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true}), "")
+		out, _, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true}), "")
 		require.NoError(t, err)
 		assert.Equal(t, "cam", out.Name)
 		check(t, s, gen, out.Applied, "unchanged")
@@ -427,8 +440,8 @@ func TestPutConfigWritesExactBytes(t *testing.T) {
 	assert.Equal(t, "unchanged", applied(t, res, "cam"))
 	assert.Equal(t, text, s.fileText())
 	got, etag := s.ConfigText()
-	assert.Equal(t, text, string(got))
-	assert.Equal(t, config.Hash([]byte(text)), etag)
+	assert.Equal(t, shownText(t, text), string(got))
+	assert.Equal(t, config.ETag([]byte(text)), etag)
 	assert.Equal(t, res.ETag, etag)
 
 	// The same bytes again are not written again.
@@ -446,28 +459,37 @@ func TestPutConfigWritesExactBytes(t *testing.T) {
 	_, err = s.PutConfig(bg, b, etag)
 	require.NoError(t, err)
 	b[0] = 'X'
+	assert.Equal(t, text+"# more\n", s.fileText())
 	got, _ = s.ConfigText()
-	assert.Equal(t, text+"# more\n", string(got))
+	assert.Equal(t, shownText(t, text+"# more\n"), string(got))
 	got[0] = 'X'
 	again, _ := s.ConfigText()
-	assert.Equal(t, text+"# more\n", string(again))
+	assert.Equal(t, shownText(t, text+"# more\n"), string(again))
 }
 
 func TestPutConfigRefusesTheMask(t *testing.T) {
 	// A document that came back redacted holds the mask where the stream
-	// key was. The whole-config PUT is the one way such a text gets in
-	// without the API looking at its streams, so apply refuses it.
+	// key was. The whole-config PUT resolves it against the entry of the
+	// same name (R-T4) and refuses a mask that stands for nothing stored.
 	s := testConfig(t, func(su *setup) { su.Text = baseText(streamYAML("cam", "{hls: true}")) })
 	before := s.fileText()
-	for _, masked := range []string{
-		"rtmp://src.example/live/caxxxxx",
-		"srt://src.example:9000?passphrase=xxxxx",
+	for _, row := range []struct {
+		masked string
+		code   int
+	}{
+		{"rtmp://src.example/live/caxxxxx", http.StatusOK},                    // the key, resolved
+		{"rtmp://other.example/live/caxxxxx", http.StatusUnprocessableEntity}, // the mask kept, the host changed
+		{"srt://src.example:9000?passphrase=xxxxx", http.StatusUnprocessableEntity},
 	} {
-		text := strings.Replace(before, "rtmp://src.example/live/cam", masked, 1)
-		require.Equal(t, masked, spec.Stream{Inputs: []spec.Input{{URL: masked}}}.Redacted().Inputs[0].URL, "not a masked URL")
+		text := strings.Replace(before, "rtmp://src.example/live/cam", row.masked, 1)
+		require.Equal(t, row.masked, spec.Stream{Inputs: []spec.Input{{URL: row.masked}}}.Redacted().Inputs[0].URL, "not a masked URL")
 		res := s.putConfig(text)
-		require.Equal(t, http.StatusUnprocessableEntity, res.code, res.body)
-		assert.Contains(t, res.body, "redaction mask")
+		require.Equal(t, row.code, res.code, res.body)
+		if row.code == http.StatusOK {
+			assert.Contains(t, res.body, `{"name":"cam","applied":"unchanged"}`)
+		} else {
+			assert.Contains(t, res.body, "redaction mask")
+		}
 		assert.Equal(t, before, s.fileText())
 	}
 	got, _ := s.Get("cam")
@@ -479,7 +501,7 @@ func TestPutStreamKeepsComments(t *testing.T) {
 		"  # the operator\n  - name: ops\n    role: editor\n    password: \"" + hashOf(editorPW) + "\"\n" +
 		"streams:\n" + streamYAML("cam", "{hls: true}") + "  # the other camera\n" + streamYAML("other", "{hls: true}")
 	s := testConfig(t, func(su *setup) { su.Text = text })
-	out, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), "")
+	out, _, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), "")
 	require.NoError(t, err)
 	assert.Equal(t, "outputs", out.Applied)
 	got := s.fileText()
@@ -557,7 +579,7 @@ func TestPutConfigPreconditions(t *testing.T) {
 		assert.Equal(t, gen, s.generation("cam"))
 	}
 	_, etag := s.ConfigText()
-	old := config.Hash([]byte("something else"))
+	old := config.ETag([]byte("something else"))
 
 	_, err := s.PutConfig(bg, []byte(next), "")
 	require.ErrorIs(t, err, api.ErrPreconditionRequired)
@@ -588,17 +610,17 @@ func TestPutConfigPreconditions(t *testing.T) {
 	// The per-stream preconditions.
 	s.handEdit(text)
 	cam, _ := s.Get("cam")
-	_, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), `"0000000000000000"`)
+	_, _, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), `"0000000000000000"`)
 	require.ErrorIs(t, err, api.ErrPrecondition)
-	_, err = s.PutStream(bg, specOf("new", spec.Outputs{HLS: true}), "*")
+	_, _, err = s.PutStream(bg, specOf("new", spec.Outputs{HLS: true}), "*")
 	require.ErrorIs(t, err, api.ErrPrecondition)
 	require.ErrorIs(t, s.DeleteStream(bg, "cam", `"0000000000000000"`), api.ErrPrecondition)
 	require.ErrorIs(t, s.DeleteStream(bg, "new", "*"), api.ErrPrecondition)
 	require.ErrorIs(t, s.DeleteStream(bg, "new", ""), config.ErrNoStream)
 	untouched(text)
-	_, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, RTSP: true}), cam.ETag())
+	_, _, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, RTSP: true}), cam.ETag())
 	require.NoError(t, err)
-	_, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true}), "*")
+	_, _, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true}), "*")
 	require.NoError(t, err)
 	cam, _ = s.Get("cam")
 	require.NoError(t, s.DeleteStream(bg, "cam", cam.ETag()))
@@ -669,7 +691,7 @@ func heldRebuild(t *testing.T) (s *testServer, sc *script, release, hangUp func(
 	ctx, hangUp := context.WithCancel(context.Background())
 	t.Cleanup(hangUp)
 	go func() {
-		_, err := s.PutStream(ctx, edit, "")
+		_, _, err := s.PutStream(ctx, edit, "")
 		done <- err
 	}()
 	require.Eventually(t, func() bool { return strings.Contains(s.fileText(), "layout") }, waitFor, time.Millisecond)
@@ -692,8 +714,8 @@ func TestClientGoneDuringRebuild(t *testing.T) {
 	}
 	file := s.fileText()
 	text, etag := s.ConfigText()
-	assert.Equal(t, file, string(text))
-	assert.Equal(t, config.Hash([]byte(file)), etag)
+	assert.Equal(t, shownText(t, file), string(text))
+	assert.Equal(t, config.ETag([]byte(file)), etag)
 	assert.False(t, s.ConfigStatus().Stale)
 	cam := func(streams []spec.Stream) []string {
 		for _, sp := range streams {
@@ -708,7 +730,7 @@ func TestClientGoneDuringRebuild(t *testing.T) {
 	assert.Equal(t, heldLayout, got.Layout)
 
 	// A later edit of another stream keeps the first: nothing is reverted.
-	out, err := s.PutStream(bg, specOf("other", spec.Outputs{HLS: true, DASH: true}), "")
+	out, _, err := s.PutStream(bg, specOf("other", spec.Outputs{HLS: true, DASH: true}), "")
 	require.NoError(t, err)
 	assert.Equal(t, "outputs", out.Applied)
 	assert.Equal(t, heldLayout, cam(testParse(t, s.fileText()).Doc.Streams))
@@ -767,7 +789,7 @@ func TestStaleIsLive(t *testing.T) {
 		assert.True(t, s.ConfigStatus().Stale)
 	}
 	assert.Equal(t, 1, strings.Count(s.logs.String(), "the file cannot be read"))
-	_, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), "")
+	_, _, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), "")
 	require.ErrorIs(t, err, config.ErrStale)
 	s.handEdit(text)
 	assert.False(t, s.ConfigStatus().Stale)
@@ -795,9 +817,9 @@ func TestDirSyncFails(t *testing.T) {
 	got, _ := s.Get("cam")
 	assert.False(t, got.Outputs.DASH)
 	applied, _ := s.ConfigText()
-	assert.Equal(t, text, string(applied))
+	assert.Equal(t, shownText(t, text), string(applied))
 	assert.True(t, s.status().Stale)
-	_, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, RTSP: true}), "")
+	_, _, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, RTSP: true}), "")
 	require.ErrorIs(t, err, config.ErrStale)
 	_, etag := s.ConfigText()
 	_, err = s.PutConfig(bg, []byte(text), etag)
@@ -811,7 +833,7 @@ func TestDirSyncFails(t *testing.T) {
 	assert.True(t, got.Outputs.DASH)
 	assert.Equal(t, gen, s.generation("cam"))
 	assert.False(t, s.status().Stale)
-	_, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true}), "")
+	_, _, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true}), "")
 	require.NoError(t, err)
 }
 
@@ -859,7 +881,7 @@ func TestHandEditThenWrite(t *testing.T) {
 	s.handEdit(edited)
 	_, etag := s.ConfigText()
 
-	_, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), "")
+	_, _, err := s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), "")
 	require.ErrorIs(t, err, config.ErrStale)
 	require.ErrorIs(t, s.DeleteStream(bg, "other", ""), config.ErrStale)
 	_, err = s.PutConfig(bg, []byte(text), etag)
@@ -871,7 +893,7 @@ func TestHandEditThenWrite(t *testing.T) {
 	_, err = s.Reload(bg)
 	require.NoError(t, err)
 	assert.False(t, s.status().Stale)
-	_, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), "")
+	_, _, err = s.PutStream(bg, specOf("cam", spec.Outputs{HLS: true, DASH: true}), "")
 	require.NoError(t, err)
 	assert.Contains(t, s.fileText(), "# added by hand")
 	require.NoError(t, s.DeleteStream(bg, "other", ""))
@@ -911,7 +933,7 @@ func TestReloadAppliesDiff(t *testing.T) {
 	assert.Equal(t, []stream.Outcome{{Name: "a", Applied: "unchanged"}, {Name: "b", Applied: "outputs"}, {Name: "c", Applied: "deleted"}, {Name: "d", Applied: "created"}}, res.Streams)
 	assert.Empty(t, res.RestartRequired)
 	assert.NotNil(t, res.RestartRequired)
-	assert.Equal(t, config.Hash([]byte(edited)), res.ETag)
+	assert.Equal(t, config.ETag([]byte(edited)), res.ETag)
 
 	assert.Equal(t, gen, s.generation("a"))
 	again, ok := s.Manager().CopyHub("a")
@@ -990,7 +1012,7 @@ func TestReloadInvalidKeepsState(t *testing.T) {
 			assert.Equal(t, gen, s.generation("cam"))
 			assert.Len(t, s.List(), 1)
 			applied, _ := s.ConfigText()
-			assert.Equal(t, text, string(applied))
+			assert.Equal(t, shownText(t, text), string(applied))
 			require.Equal(t, http.StatusOK, s.do(http.MethodGet, "/api/v1/streams", "ops", "").code, "the old users still log in")
 			status := s.status()
 			require.NotEmpty(t, status.LastReloadError)
@@ -1035,7 +1057,7 @@ func TestReloadUnreadable(t *testing.T) {
 		assert.NotContains(t, s.logs.String(), "internal error")
 		assert.Equal(t, gen, s.generation("cam"))
 		applied, _ := s.ConfigText()
-		assert.Equal(t, text, string(applied))
+		assert.Equal(t, shownText(t, text), string(applied))
 	}
 	restored := func(t *testing.T) {
 		t.Helper()
@@ -1155,7 +1177,7 @@ func TestRestartRequired(t *testing.T) {
 		require.NoError(t, err)
 		check(t, s, addrs, res)
 		// A stream edit while it lasts does not say it again.
-		_, err = s.PutStream(bg, specOf("two", spec.Outputs{HLS: true}), "")
+		_, _, err = s.PutStream(bg, specOf("two", spec.Outputs{HLS: true}), "")
 		require.NoError(t, err)
 		assert.Equal(t, 1, strings.Count(s.logs.String(), "restart required"))
 		assert.Equal(t, want, s.status().RestartRequired)
@@ -1185,7 +1207,7 @@ func TestConcurrentWriters(t *testing.T) {
 		wg.Go(func() {
 			name := fmt.Sprintf("s%d", i)
 			for n := 0; running(); n++ {
-				_, err := s.PutStream(bg, specOf(name, spec.Outputs{HLS: true, DASH: n%2 == 0}), "")
+				_, _, err := s.PutStream(bg, specOf(name, spec.Outputs{HLS: true, DASH: n%2 == 0}), "")
 				if !assert.NoError(t, err) {
 					return
 				}
@@ -1261,9 +1283,411 @@ func TestConcurrentWriters(t *testing.T) {
 		assert.Equal(t, spec.ChangeNone, spec.Diff(byName[sp.Name], sp), sp.Name)
 	}
 	text, _ := s.ConfigText()
-	assert.Equal(t, s.fileText(), string(text))
+	assert.Equal(t, shownText(t, s.fileText()), string(text))
 	assert.False(t, s.ConfigStatus().Stale)
 	left, err := filepath.Glob(filepath.Join(filepath.Dir(s.path), ".*.tmp"))
 	require.NoError(t, err)
 	assert.Empty(t, left)
+}
+
+// The secrets of the write-only rows: literals found nowhere else.
+const (
+	woInput   = "rtsp://u:hunter2-pw@127.0.0.1:1/s"
+	woPush    = "rtmp://127.0.0.1:1/live/pushkey-0123456789"
+	woPushTwo = "rtmp://127.0.0.1:1/live/pushkey-9876543210" // redacts as woPush does
+	woPushNew = "rtmp://127.0.0.1:1/live/pushkey-5555555555" // redacts as woPush does
+	woSRT     = "srtpass-0123456789"
+)
+
+// woSecrets are the stored secrets of woStream.
+var woSecrets = []string{"hunter2-pw", "pushkey-0123456789", woSRT}
+
+// woStream is cam with an input password, a second input, a push key and
+// an SRT passphrase.
+func woStream() spec.Stream {
+	return spec.Stream{
+		Name:   "cam",
+		Inputs: []spec.Input{{URL: woInput}, {URL: "rtmp://src.example/live/cam"}},
+		Outputs: spec.Outputs{
+			HLS: true, SRT: true, SRTPassphrase: woSRT,
+			Push: []spec.Push{{URL: woPush}},
+		},
+	}
+}
+
+// woYAML is woStream's entry in a config.
+const woYAML = "  - name: cam\n    inputs:\n      - url: " + woInput + "\n      - url: rtmp://src.example/live/cam\n" +
+	"    outputs: {hls: true, srt: true, srt_passphrase: " + woSRT + ", push: [{url: " + woPush + "}]}\n"
+
+func jsonOf(t *testing.T, sp spec.Stream) string {
+	t.Helper()
+	b, err := json.Marshal(sp)
+	require.NoError(t, err)
+	return string(b)
+}
+
+// getCam is GET /api/v1/streams/cam as the editor: the body and its ETag,
+// the body holding none of the stored secrets.
+func (s *testServer) getCam() (string, string) {
+	s.t.Helper()
+	res := s.do(http.MethodGet, "/api/v1/streams/cam", "ops", "")
+	require.Equal(s.t, http.StatusOK, res.code, res.body)
+	for _, secret := range append(woSecrets, "pushkey-9876543210", "pushkey-5555555555") {
+		require.NotContains(s.t, res.body, secret)
+	}
+	return res.body, res.header.Get("ETag")
+}
+
+// decodeStream decodes a stream document of a response.
+func decodeStream(t *testing.T, body string) spec.Stream {
+	t.Helper()
+	var sp spec.Stream
+	require.NoError(t, json.Unmarshal([]byte(body), &sp))
+	return sp
+}
+
+// putAnswer decodes a stream PUT's answer.
+func putAnswer(t *testing.T, res response) (applied string, sp spec.Stream) {
+	t.Helper()
+	var out struct {
+		Stream  spec.Stream `json:"stream"`
+		Applied string      `json:"applied"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(res.body), &out), res.body)
+	return out.Applied, out.Stream
+}
+
+func TestPutStreamKeepsSecrets(t *testing.T) {
+	s := testConfig(t, nil)
+	res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, woStream()))
+	require.Equal(t, http.StatusCreated, res.code, res.body)
+	gen := s.generation("cam")
+
+	b, e := s.getCam()
+	got := decodeStream(t, b)
+	assert.Equal(t, redact.Mask, got.Outputs.SRTPassphrase)
+	assert.Equal(t, "rtsp://u:xxxxx@127.0.0.1:1/s", got.Inputs[0].URL)
+
+	// What came back, sent back: nothing changes, nothing is written.
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(s.path, old, old))
+	file := s.fileText()
+	res = s.do(http.MethodPut, "/api/v1/streams/cam", "ops", b, "If-Match", e)
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	applied, _ := putAnswer(t, res)
+	assert.Equal(t, "unchanged", applied)
+	assert.Equal(t, file, s.fileText())
+	fi, err := os.Stat(s.path)
+	require.NoError(t, err)
+	assert.True(t, fi.ModTime().Equal(old), "the file was rewritten")
+	assert.Equal(t, e, res.header.Get("ETag"))
+
+	// One field changed: the secrets are kept, the input is not reopened.
+	st, ok := s.Status("cam")
+	require.True(t, ok)
+	rebuilds := st.Rebuilds
+	got.AudioLanguage = "vi"
+	res = s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, got), "If-Match", e)
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	applied, shown := putAnswer(t, res)
+	assert.Equal(t, "live", applied)
+	assert.Equal(t, redact.Mask, shown.Outputs.SRTPassphrase)
+	file = s.fileText()
+	for _, secret := range woSecrets {
+		assert.Contains(t, file, secret)
+		assert.NotContains(t, res.body, secret)
+	}
+	assert.NotContains(t, file, redact.Mask)
+	assert.Contains(t, file, "audio_language: vi")
+	st, _ = s.Status("cam")
+	assert.Equal(t, rebuilds, st.Rebuilds)
+	assert.Equal(t, gen, s.generation("cam"))
+	stored, _ := s.Get("cam")
+	want := woStream()
+	want.AudioLanguage = "vi"
+	assert.Equal(t, spec.ChangeNone, spec.Diff(want, stored))
+
+	// The answer's ETag is the next GET's, and the next If-Match.
+	b2, e2 := s.getCam()
+	assert.Equal(t, e2, res.header.Get("ETag"))
+	assert.NotEqual(t, e, e2)
+	next := decodeStream(t, b2)
+	next.AudioLanguage = "en"
+	res = s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, next), "If-Match", res.header.Get("ETag"))
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	res = s.do(http.MethodPut, "/api/v1/streams/cam", "ops", b2, "If-Match", e2)
+	assert.Equal(t, http.StatusPreconditionFailed, res.code, "the old ETag is stale")
+	assert.NotContains(t, s.logs.String(), "hunter2-pw")
+}
+
+func TestPutStreamMaskMoved(t *testing.T) {
+	begin := func(t *testing.T) (*testServer, string) {
+		t.Helper()
+		s := testConfig(t, func(su *setup) { su.Text = baseText(woYAML) })
+		s.generation("cam")
+		b, _ := s.getCam()
+		return s, b
+	}
+	refused := func(t *testing.T, s *testServer, res response, field string) {
+		t.Helper()
+		require.Equal(t, http.StatusUnprocessableEntity, res.code, res.body)
+		assert.Contains(t, res.body, `"code":"invalid_config"`)
+		assert.Contains(t, res.body, field+": holds the redaction mask")
+		for _, secret := range woSecrets {
+			assert.NotContains(t, res.body, secret)
+		}
+		assert.Equal(t, baseText(woYAML), s.fileText(), "nothing is stored")
+	}
+
+	t.Run("another host", func(t *testing.T) {
+		s, b := begin(t)
+		ln, err := (&net.ListenConfig{}).Listen(bg, "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer ln.Close()
+		var accepted atomic.Int32
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				accepted.Add(1)
+				c.Close()
+			}
+		}()
+		sp := decodeStream(t, b)
+		sp.Inputs[0].URL = strings.Replace(sp.Inputs[0].URL, "127.0.0.1:1", ln.Addr().String(), 1)
+		require.True(t, redact.Masked(sp.Inputs[0].URL))
+		res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, sp))
+		refused(t, s, res, "inputs[0].url")
+		time.Sleep(500 * time.Millisecond)
+		assert.Zero(t, accepted.Load(), "no connection to the new host")
+	})
+	t.Run("another stream", func(t *testing.T) {
+		s, b := begin(t)
+		sp := decodeStream(t, b)
+		sp.Name = "copy"
+		res := s.do(http.MethodPut, "/api/v1/streams/copy", "ops", jsonOf(t, sp))
+		refused(t, s, res, "inputs[0].url")
+		// The body's name must be the path's, as before.
+		res = s.do(http.MethodPut, "/api/v1/streams/copy", "ops", b)
+		require.Equal(t, http.StatusBadRequest, res.code, res.body)
+		assert.Contains(t, res.body, "the body's name is not the path's")
+	})
+	t.Run("two keys alike", func(t *testing.T) {
+		s, _ := begin(t)
+		two := woStream()
+		two.Outputs.Push = []spec.Push{{URL: woPush}, {URL: woPushTwo}}
+		res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, two))
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		b, _ := s.getCam()
+		sp := decodeStream(t, b)
+		require.Len(t, sp.Outputs.Push, 2)
+		require.Equal(t, sp.Outputs.Push[0].URL, sp.Outputs.Push[1].URL, "the two redact alike")
+
+		sp.AudioLanguage = "vi"
+		res = s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, sp))
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		file := s.fileText()
+		first, second := strings.Index(file, woPush), strings.Index(file, woPushTwo)
+		require.Positive(t, first)
+		assert.Greater(t, second, first, "both keys, in order")
+
+		before := s.fileText()
+		sp.Outputs.Push = sp.Outputs.Push[:1]
+		res = s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, sp))
+		require.Equal(t, http.StatusUnprocessableEntity, res.code, res.body)
+		assert.Contains(t, res.body, "outputs.push[0].url: holds the redaction mask")
+		assert.Equal(t, before, s.fileText())
+	})
+	t.Run("a real key beside the mask", func(t *testing.T) {
+		s, b := begin(t)
+		// The stored key itself beside its mask is "repeated" (conceded,
+		// R-T3).
+		sp := decodeStream(t, b)
+		sp.Outputs.Push = append(sp.Outputs.Push, spec.Push{URL: woPush})
+		res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, sp))
+		require.Equal(t, http.StatusUnprocessableEntity, res.code, res.body)
+		assert.Contains(t, res.body, "outputs.push[1].url: repeated")
+		assert.NotContains(t, res.body, "pushkey-0123456789")
+		assert.Equal(t, baseText(woYAML), s.fileText())
+
+		// A new key of the mask's form beside it is added.
+		sp = decodeStream(t, b)
+		sp.Outputs.Push = append(sp.Outputs.Push, spec.Push{URL: woPushNew})
+		require.Equal(t, redact.URL(woPushNew), sp.Outputs.Push[0].URL, "of the mask's form")
+		res = s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, sp))
+		require.Equal(t, http.StatusOK, res.code, res.body)
+		file := s.fileText()
+		first, second := strings.Index(file, woPush), strings.Index(file, woPushNew)
+		require.Positive(t, first)
+		assert.Greater(t, second, first, "both keys, in order")
+	})
+}
+
+func TestConfigETagKeyed(t *testing.T) {
+	s := testConfig(t, func(su *setup) { su.Text = baseText(woYAML) })
+	file := s.fileText()
+	sum := sha256.Sum256([]byte(file))
+	bare := hex.EncodeToString(sum[:])
+
+	res := s.do(http.MethodGet, "/api/v1/config", "ops", "")
+	require.Equal(t, http.StatusOK, res.code)
+	etag := res.header.Get("ETag")
+	require.NotEmpty(t, etag)
+	st := s.do(http.MethodGet, "/api/v1/config/status", "eye", "")
+	require.Equal(t, http.StatusOK, st.code)
+	var status api.ConfigStatus
+	require.NoError(t, json.Unmarshal([]byte(st.body), &status))
+	assert.Equal(t, etag, status.ETag)
+
+	put := s.do(http.MethodPut, "/api/v1/config", "ops", res.body, "Content-Type", "application/yaml", "If-Match", etag)
+	require.Equal(t, http.StatusOK, put.code, put.body)
+	var ar api.ApplyResult
+	require.NoError(t, json.Unmarshal([]byte(put.body), &ar))
+	assert.Equal(t, etag, ar.ETag)
+	assert.Equal(t, etag, put.header.Get("ETag"))
+	assert.Equal(t, file, s.fileText())
+
+	for _, tag := range []string{etag, status.ETag, ar.ETag} {
+		assert.NotEqual(t, `"`+bare+`"`, tag)
+		assert.NotContains(t, tag, bare[:32])
+	}
+	// A stale one is 412.
+	res = s.do(http.MethodPut, "/api/v1/config", "ops", res.body+"# an edit\n", "Content-Type", "application/yaml", "If-Match", etag)
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	res = s.do(http.MethodPut, "/api/v1/config", "ops", file, "Content-Type", "application/yaml", "If-Match", etag)
+	assert.Equal(t, http.StatusPreconditionFailed, res.code, res.body)
+	res = s.do(http.MethodPut, "/api/v1/config", "ops", file, "Content-Type", "application/yaml", "If-Match", `"`+bare+`"`)
+	assert.Equal(t, http.StatusPreconditionFailed, res.code, res.body)
+}
+
+func TestPutStreamMaskRace(t *testing.T) {
+	s := testConfig(t, func(su *setup) { su.Text = baseText(woYAML) })
+	s.generation("cam")
+	s.getCam() // the login is remembered: no verification races the limiter
+	var mu sync.Mutex
+	real := map[string]bool{"hunter2-pw": true}
+	pwRE := regexp.MustCompile(`rtsp://u:([^@]*)@127\.0\.0\.1:1/s`)
+	checkFile := func() {
+		file := s.fileText()
+		m := pwRE.FindStringSubmatch(file)
+		if !assert.NotNil(t, m, file) {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		assert.True(t, real[m[1]], "the file's password %q is not one that was sent", m[1])
+		assert.NotContains(t, file, redact.Mask)
+	}
+	const rounds = 3
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Go(func() {
+			for range rounds {
+				b, e := s.getCam()
+				res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", b, "If-Match", e)
+				assert.Contains(t, []int{http.StatusOK, http.StatusPreconditionFailed}, res.code, res.body)
+				checkFile()
+			}
+		})
+		wg.Go(func() {
+			for n := range rounds {
+				pw := fmt.Sprintf("racepw-%d-%d", i, n)
+				mu.Lock()
+				real[pw] = true
+				mu.Unlock()
+				sp := woStream()
+				sp.Inputs[0].URL = "rtsp://u:" + pw + "@127.0.0.1:1/s"
+				res := s.do(http.MethodPut, "/api/v1/streams/cam", "ops", jsonOf(t, sp))
+				assert.Contains(t, []int{http.StatusOK, http.StatusPreconditionFailed}, res.code, res.body)
+				checkFile()
+			}
+		})
+	}
+	wg.Wait()
+	checkFile()
+}
+
+func TestPutConfigKeepsSecrets(t *testing.T) {
+	s := testConfig(t, func(su *setup) { su.Text = baseText(woYAML) })
+	s.generation("cam")
+	file := s.fileText()
+	res := s.do(http.MethodGet, "/api/v1/config", "ops", "")
+	require.Equal(t, http.StatusOK, res.code)
+	for _, secret := range woSecrets {
+		assert.NotContains(t, res.body, secret)
+	}
+	masked, etag := res.body, res.header.Get("ETag")
+
+	// Sent back as it came: every stream unchanged, the file's bytes kept.
+	put := s.do(http.MethodPut, "/api/v1/config", "ops", masked, "Content-Type", "application/yaml", "If-Match", etag)
+	require.Equal(t, http.StatusOK, put.code, put.body)
+	var ar api.ApplyResult
+	require.NoError(t, json.Unmarshal([]byte(put.body), &ar))
+	for _, o := range ar.Streams {
+		assert.Equal(t, "unchanged", o.Applied, o.Name)
+	}
+	assert.Equal(t, file, s.fileText())
+
+	// A stream added: the file is the old text plus the entry, secrets real.
+	added := streamYAML("other", "{hls: true}")
+	put = s.do(http.MethodPut, "/api/v1/config", "ops", masked+added, "Content-Type", "application/yaml", "If-Match", etag)
+	require.Equal(t, http.StatusOK, put.code, put.body)
+	assert.Equal(t, file+added, s.fileText())
+	assert.Equal(t, "created", applied(t, decodeApply(t, put), "other"))
+	assert.Equal(t, "unchanged", applied(t, decodeApply(t, put), "cam"))
+
+	// cam's masked URL moved to another host: 422, nothing stored.
+	file = s.fileText()
+	res = s.do(http.MethodGet, "/api/v1/config", "ops", "")
+	moved := strings.Replace(res.body, "rtsp://u:xxxxx@127.0.0.1:1/s", "rtsp://u:xxxxx@127.0.0.2:1/s", 1)
+	require.NotEqual(t, res.body, moved)
+	put = s.do(http.MethodPut, "/api/v1/config", "ops", moved, "Content-Type", "application/yaml", "If-Match", res.header.Get("ETag"))
+	require.Equal(t, http.StatusUnprocessableEntity, put.code, put.body)
+	assert.Contains(t, put.body, "inputs[0].url: holds the redaction mask")
+	assert.Equal(t, file, s.fileText())
+}
+
+func decodeApply(t *testing.T, res response) api.ApplyResult {
+	t.Helper()
+	var ar api.ApplyResult
+	require.NoError(t, json.Unmarshal([]byte(res.body), &ar), res.body)
+	return ar
+}
+
+func TestPutConfigExactBytes(t *testing.T) {
+	s := testConfig(t, func(su *setup) { su.Text = baseText(woYAML) })
+	// Real secrets and no mask, odd indentation and blank lines.
+	text := "# the header\n\n\nversion:    1\n" + serverYAML + "\n\n" + usersYAML() + "streams:\n\n" +
+		"   - name: cam     # with secrets\n\n     inputs:\n         - url: " + woInput + "\n\n" +
+		"         - url: rtmp://src.example/live/cam\n     outputs: {hls: true,   srt: true, srt_passphrase: " + woSRT +
+		", push: [{url: " + woPush + "}]}\n\n\n"
+	res := s.putConfig(text)
+	require.Equal(t, http.StatusOK, res.code, res.body)
+	assert.Equal(t, text, s.fileText(), "the client's exact bytes")
+}
+
+func TestReloadWithMask(t *testing.T) {
+	s := testConfig(t, func(su *setup) { su.Text = baseText(woYAML) })
+	gen := s.generation("cam")
+	file := s.fileText()
+	shown, etag := s.ConfigText()
+	s.handEdit(strings.Replace(file, woInput, "rtsp://u:xxxxx@127.0.0.1:1/s", 1))
+	_, err := s.Reload(bg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cam")
+	assert.Contains(t, err.Error(), "inputs[0].url: holds the redaction mask")
+	for _, secret := range woSecrets {
+		assert.NotContains(t, err.Error(), secret)
+		assert.NotContains(t, s.ConfigStatus().LastReloadError, secret)
+		assert.NotContains(t, s.logs.String(), secret)
+	}
+	// Nothing changed.
+	got, _ := s.Get("cam")
+	assert.Equal(t, woInput, got.Inputs[0].URL)
+	assert.Equal(t, gen, s.generation("cam"))
+	again, etag2 := s.ConfigText()
+	assert.Equal(t, shown, again)
+	assert.Equal(t, etag, etag2)
 }

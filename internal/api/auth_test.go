@@ -214,14 +214,15 @@ func TestRoles(t *testing.T) {
 		assert.Less(t, rec.Code, 300, "%s %s: %s", rt.Method, target, rec.Body.String())
 	}
 
-	// ?secrets=1 is an editor's, on any route.
+	// ?secrets=1 is gone, on any route: a 400 for every role.
 	e.seedCam()
 	e.be.reset()
 	for _, target := range []string{"/api/v1/streams?secrets=1", "/api/v1/streams/cam?secrets=1", "/api/v1/version?secrets=1"} {
 		rec := e.do(http.MethodGet, target, viewer...)
-		assert.Equal(t, http.StatusForbidden, rec.Code, target)
-		assert.Equal(t, http.StatusOK, e.do(http.MethodGet, target, editor...).Code, target)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, target)
+		assert.Equal(t, http.StatusBadRequest, e.do(http.MethodGet, target, editor...).Code, target)
 	}
+	assert.Empty(t, e.be.callList())
 }
 
 func TestUsersReload(t *testing.T) {

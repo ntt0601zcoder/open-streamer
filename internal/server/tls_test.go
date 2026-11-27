@@ -1489,7 +1489,7 @@ func TestCertificateReloadOnSIGHUPPath(t *testing.T) {
 	edit.Layout = heldLayout
 	put := make(chan error, 1)
 	go func() {
-		_, err := s.PutStream(bg, edit, "")
+		_, _, err := s.PutStream(bg, edit, "")
 		put <- err
 	}()
 	require.Eventually(t, func() bool { return strings.Contains(s.fileText(), "layout") }, waitFor, time.Millisecond)

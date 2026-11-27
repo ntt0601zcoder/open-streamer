@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/config"
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 	"github.com/ntt0601zcoder/open-streamer/internal/stream"
 )
@@ -376,8 +377,7 @@ func TestResponsesRedact(t *testing.T) {
 	for _, who := range [][]reqOpt{viewer, editor} {
 		for _, target := range []string{
 			"/api/v1/streams/cam", "/api/v1/streams",
-			"/api/v1/streams/cam?secrets=0", "/api/v1/streams?secrets=0",
-			"/api/v1/streams/cam?x=1", "/api/v1/streams/cam?secrets=true", "/api/v1/streams/cam?Secrets=1",
+			"/api/v1/streams/cam?x=1", "/api/v1/streams/cam?Secrets=1", "/api/v1/streams/cam?secret=1",
 		} {
 			rec := e.do(http.MethodGet, target, who...)
 			require.Equal(t, http.StatusOK, rec.Code, target)
@@ -385,42 +385,40 @@ func TestResponsesRedact(t *testing.T) {
 			assert.Contains(t, rec.Body.String(), "rtsp://u:")
 		}
 	}
-	// Only the query that is exactly secrets=1, from an editor.
+	// A query that holds the key secrets, whatever its value and whatever
+	// else is in it, is a 400 for every role: there is no unredacted view.
+	e.be.reset()
 	for _, target := range []string{
+		"/api/v1/streams/cam?secrets=1", "/api/v1/streams?secrets=1",
+		"/api/v1/streams/cam?secrets=0", "/api/v1/streams?secrets=0", "/api/v1/streams/cam?secrets=true",
 		"/api/v1/streams/cam?secrets=1&x=1", "/api/v1/streams?secrets=1&x=1", "/api/v1/streams?x=1&secrets=1",
 		"/api/v1/streams/cam?secrets=1&secrets=1", "/api/v1/streams/cam?secrets=1&", "/api/v1/streams/cam?secrets=%31",
 	} {
-		rec := e.do(http.MethodGet, target, editor...)
-		require.Equal(t, http.StatusOK, rec.Code, target)
-		assert.False(t, holds(rec.Body.String()), target)
-		rec = e.do(http.MethodGet, target, viewer...)
-		assert.False(t, holds(rec.Body.String()), target)
+		for _, who := range [][]reqOpt{viewer, editor} {
+			rec := e.do(http.MethodGet, target, who...)
+			require.Equal(t, http.StatusBadRequest, rec.Code, target)
+			assert.Equal(t, codeBadRequest, errOf(t, rec).Code)
+			assert.False(t, holds(rec.Body.String()), target)
+		}
 	}
-	for _, target := range []string{"/api/v1/streams/cam?secrets=1", "/api/v1/streams?secrets=1"} {
-		rec := e.do(http.MethodGet, target, editor...)
-		require.Equal(t, http.StatusOK, rec.Code)
-		assert.Contains(t, rec.Body.String(), "hunter2")
-		assert.Contains(t, rec.Body.String(), "secretkey")
-
-		rec = e.do(http.MethodGet, target, viewer...)
-		assert.Equal(t, http.StatusForbidden, rec.Code)
-		assert.False(t, holds(rec.Body.String()))
-	}
-	// The PUT answer follows the same rule.
+	// The PUT too: the backend is not asked.
 	rec := e.do(http.MethodPut, "/api/v1/streams/cam?secrets=1", with(editor, jsonBody(secretSpec))...)
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.True(t, holds(rec.Body.String()))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.False(t, holds(rec.Body.String()))
+	assert.Empty(t, e.be.callList())
 
-	// The ETag is the stored document's, redacted or not.
-	plain := e.do(http.MethodGet, "/api/v1/streams/cam", viewer...)
-	secret := e.do(http.MethodGet, "/api/v1/streams/cam?secrets=1", editor...)
-	assert.Equal(t, stored.ETag(), plain.Header().Get("ETag"))
-	assert.Equal(t, stored.ETag(), secret.Header().Get("ETag"))
+	// The ETag is the stored document's, for every role.
+	for _, who := range [][]reqOpt{viewer, editor} {
+		rec := e.do(http.MethodGet, "/api/v1/streams/cam", who...)
+		assert.Equal(t, stored.ETag(), rec.Header().Get("ETag"))
+	}
 
 	assert.False(t, holds(e.logs.String()), "nothing of a spec is logged")
 }
 
-func TestPutRejectsMaskedSecrets(t *testing.T) {
+// TestPutResolvesMaskedSecrets: a redacted document written back as it
+// came keeps the stored secrets (R-T4); it was refused before.
+func TestPutResolvesMaskedSecrets(t *testing.T) {
 	e := newEnv(t)
 	e.be.validate = true
 	rec := e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, jsonBody(secretSpec))...)
@@ -433,18 +431,15 @@ func TestPutRejectsMaskedSecrets(t *testing.T) {
 
 	// The redacted document, written back as it came.
 	rec = e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, body("application/json", redacted))...)
-	require.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
-	doc := errOf(t, rec)
-	assert.Equal(t, codeInvalidConf, doc.Code)
-	// The API refuses it before the Backend's Validate would: one error
-	// per masked URL.
-	require.Len(t, doc.Errors, 2)
-	assert.Contains(t, doc.Errors[0], "redaction mask")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var put putResult
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &put))
+	assert.Equal(t, "unchanged", put.Applied)
+	assert.NotContains(t, rec.Body.String(), "hunter2")
 
-	rec = e.do(http.MethodGet, "/api/v1/streams/cam?secrets=1", editor...)
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Contains(t, rec.Body.String(), "rtsp://u:hunter2@h/a")
-	assert.Contains(t, rec.Body.String(), "rtmp://h/live/secretkey")
+	stored := e.be.streams["cam"]
+	assert.Equal(t, "rtsp://u:hunter2@h/a", stored.Inputs[0].URL)
+	assert.Equal(t, "rtmp://h/live/secretkey", stored.Outputs.Push[0].URL)
 }
 
 func TestStatusAndThumbnail(t *testing.T) {
@@ -500,41 +495,178 @@ func TestStatusAndThumbnail(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, e.do(http.MethodGet, "/api/v1/streams/nope/thumbnail.jpg", viewer...).Code)
 }
 
-// TestAPIRefusesMaskedSecrets: the API refuses a masked document itself,
-// with a Backend that would store anything.
-func TestAPIRefusesMaskedSecrets(t *testing.T) {
+// The secrets of the write-only tests: literals found nowhere else.
+const (
+	woPass  = "wo-api-pw-4815"
+	woKey   = "wokey-api-162342"
+	woSRT   = "wosrtpass-api-0815"
+	woInput = "rtsp://u:" + woPass + "@cam.example/s"
+	woPush  = "rtmp://push.example/live/" + woKey
+)
+
+// seedSecrets stores the stream cam with an input password, a push key and
+// an SRT passphrase.
+func (e *env) seedSecrets() spec.Stream {
+	e.t.Helper()
+	sp := spec.Stream{
+		Name:   "cam",
+		Inputs: []spec.Input{{URL: woInput}, {URL: "udp://239.0.0.1:5000"}},
+		Outputs: spec.Outputs{
+			HLS: true, SRT: true, SRTPassphrase: woSRT,
+			Push: []spec.Push{{URL: woPush}},
+		},
+	}
+	e.be.mu.Lock()
+	e.be.streams["cam"] = sp
+	e.be.mu.Unlock()
+	return sp
+}
+
+func holdsWO(s string) bool {
+	return strings.Contains(s, woPass) || strings.Contains(s, woKey) || strings.Contains(s, woSRT)
+}
+
+func TestStreamsAlwaysRedacted(t *testing.T) {
 	e := newEnv(t)
-	rec := e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, jsonBody(secretSpec))...)
-	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
-	rec = e.do(http.MethodGet, "/api/v1/streams/cam", editor...)
-	require.Equal(t, http.StatusOK, rec.Code)
-	redacted := bytes.Clone(rec.Body.Bytes())
-	var doc spec.Stream
-	require.NoError(t, json.Unmarshal(redacted, &doc))
+	sp := e.seedSecrets()
+	check := func(got spec.Stream) {
+		t.Helper()
+		require.Len(t, got.Inputs, 2)
+		assert.Equal(t, redact.URL(woInput), got.Inputs[0].URL)
+		assert.Equal(t, "udp://239.0.0.1:5000", got.Inputs[1].URL)
+		require.Len(t, got.Outputs.Push, 1)
+		assert.Equal(t, redact.URL(woPush), got.Outputs.Push[0].URL)
+		assert.Equal(t, redact.Mask, got.Outputs.SRTPassphrase)
+	}
+	for _, who := range [][]reqOpt{viewer, editor} {
+		rec := e.do(http.MethodGet, "/api/v1/streams", who...)
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.False(t, holdsWO(rec.Body.String()), rec.Body.String())
+		var list struct {
+			Streams []spec.Stream `json:"streams"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
+		require.Len(t, list.Streams, 1)
+		check(list.Streams[0])
+
+		rec = e.do(http.MethodGet, "/api/v1/streams/cam", who...)
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.False(t, holdsWO(rec.Body.String()), rec.Body.String())
+		assert.Equal(t, sp.ETag(), rec.Header().Get("ETag"))
+		var got spec.Stream
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+		check(got)
+	}
+
+	// The PUT answer, of a document that holds the real values.
+	doc, err := json.Marshal(sp)
+	require.NoError(t, err)
+	rec := e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, body("application/json", doc))...)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.False(t, holdsWO(rec.Body.String()), rec.Body.String())
+	var put putResult
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &put))
+	check(put.Stream)
+	assert.Equal(t, sp.ETag(), rec.Header().Get("ETag"))
+	// The viewer cannot PUT, and is not answered a document.
+	rec = e.do(http.MethodPut, "/api/v1/streams/cam", with(viewer, body("application/json", doc))...)
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.False(t, holdsWO(rec.Body.String()))
+	assert.False(t, holdsWO(e.logs.String()))
+}
+
+func TestSecretsQueryGone(t *testing.T) {
+	e := newEnv(t)
+	e.seedCam()
+	e.seedSecrets()
+	var gets []string
+	for _, rt := range Routes() {
+		if rt.Method == http.MethodGet && rt.Role != "" {
+			gets = append(gets, strings.ReplaceAll(strings.ReplaceAll(rt.Path, "{name}", "cam"), "assets/cam", "assets/logo.png"))
+		}
+	}
+	require.Contains(t, gets, pathConfig)
+	require.Contains(t, gets, pathPprof)
 
 	e.be.reset()
-	rec = e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, body("application/json", redacted))...)
+	for _, path := range gets {
+		for _, query := range []string{"secrets=1", "secrets=1&x=1", "x=1&secrets=1", "secrets=0", "secrets", "secrets=1;x=1", "x=1;secrets", "%73ecrets=1"} {
+			target := path + "?" + query
+			for _, who := range [][]reqOpt{viewer, editor} {
+				rec := e.do(http.MethodGet, target, who...)
+				require.Equal(t, http.StatusBadRequest, rec.Code, target)
+				doc := errOf(t, rec)
+				assert.Equal(t, codeBadRequest, doc.Code)
+				assert.Equal(t, "?secrets=1 is gone: secrets are write-only. "+
+					"A response shows xxxxx where a secret is stored, and a write that sends xxxxx back keeps it", doc.Message)
+			}
+			rec := e.do(http.MethodGet, target)
+			assert.Equal(t, http.StatusUnauthorized, rec.Code, target)
+		}
+	}
+	// A write that asks is refused alike.
+	rec := e.do(http.MethodPut, "/api/v1/streams/cam?secrets=1", with(editor, jsonBody(camSpec))...)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Empty(t, e.be.callList(), "the backend is never asked")
+
+	// Other keys are ignored, as before, and the bodies are redacted.
+	for _, query := range []string{"x=1", "secret=1", "Secrets=1", "secretsx=1"} {
+		for _, path := range []string{pathStreams, "/api/v1/streams/cam", "/api/v1/version"} {
+			for _, who := range [][]reqOpt{viewer, editor} {
+				rec := e.do(http.MethodGet, path+"?"+query, who...)
+				require.Equal(t, http.StatusOK, rec.Code, path+"?"+query)
+				assert.False(t, holdsWO(rec.Body.String()), rec.Body.String())
+			}
+		}
+		rec := e.do(http.MethodGet, pathConfig+"?"+query, viewer...)
+		assert.Equal(t, http.StatusForbidden, rec.Code, "the role's 403, as before")
+		rec = e.do(http.MethodGet, pathPprof+"?"+query, viewer...)
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+	}
+}
+
+func TestPutStreamPassesMasks(t *testing.T) {
+	e := newEnv(t)
+	sp := e.seedSecrets()
+	rec := e.do(http.MethodGet, "/api/v1/streams/cam", editor...)
+	require.Equal(t, http.StatusOK, rec.Code)
+	masked := bytes.Clone(rec.Body.Bytes())
+	var sent spec.Stream
+	require.NoError(t, json.Unmarshal(masked, &sent))
+	sent.Name = "cam"
+
+	e.be.reset()
+	rec = e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, body("application/json", masked))...)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Len(t, e.be.gotStreams, 1)
+	assert.Equal(t, sent, e.be.gotStreams[0], "the document reaches the backend as sent, masks and all")
+	assert.Equal(t, sp.ETag(), rec.Header().Get("ETag"), "the stored document's")
+	assert.NotEqual(t, sent.ETag(), rec.Header().Get("ETag"), "not the sent one's")
+	assert.False(t, holdsWO(rec.Body.String()))
+	assert.Equal(t, sp, e.be.streams["cam"], "the secrets are kept")
+
+	// Only the push masked, the input changed: the push resolves.
+	doc := `{"inputs":[{"url":"udp://239.0.0.1:5000"}],"outputs":{"push":[{"url":"` + redact.URL(woPush) + `"}]}}`
+	rec = e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, jsonBody(doc))...)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, woPush, e.be.streams["cam"].Outputs.Push[0].URL)
+
+	// Under another name there is nothing the mask stands for: the
+	// backend's config.Errors is 422 invalid_config with its texts.
+	e.be.reset()
+	rec = e.do(http.MethodPut, "/api/v1/streams/new", with(editor, jsonBody(doc))...)
 	require.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
 	got := errOf(t, rec)
 	assert.Equal(t, codeInvalidConf, got.Code)
-	// spec.Validate's own words for the first, and one per masked URL.
-	assert.Equal(t, doc.Validate().Error(), got.Errors[0])
-	assert.Equal(t, []string{
-		"spec: validate: inputs[0].url: holds the redaction mask, not the secret; send the real value",
-		"spec: validate: outputs.push[0].url: holds the redaction mask, not the secret; send the real value",
-	}, got.Errors)
-	assert.Empty(t, e.be.callList(), "the backend is not asked")
+	assert.Equal(t, []string{"spec: validate: " + spec.MaskRefusal("outputs.push[0].url")}, got.Errors)
 	assert.Empty(t, rec.Header().Get("ETag"))
+	assert.Equal(t, []string{"PutStream new"}, e.be.callList())
 
-	// Only the push masked: still refused. With ?secrets=1 too.
-	for _, target := range []string{"/api/v1/streams/cam", "/api/v1/streams/cam?secrets=1", "/api/v1/streams/new"} {
-		rec = e.do(http.MethodPut, target, with(editor, jsonBody(
-			`{"inputs":[{"url":"udp://239.0.0.1:5000"}],"outputs":{"push":[{"url":"`+doc.Outputs.Push[0].URL+`"}]}}`))...)
-		require.Equal(t, http.StatusUnprocessableEntity, rec.Code, target)
-		assert.Len(t, errOf(t, rec).Errors, 1)
-	}
-	assert.Empty(t, e.be.callList())
-	stored, _ := e.be.Get("cam")
-	assert.Equal(t, "rtsp://u:hunter2@h/a", stored.Inputs[0].URL)
-	assert.Equal(t, "rtmp://h/live/secretkey", stored.Outputs.Push[0].URL)
+	e.be.putErr = config.Errors{errors.New("spec: validate: inputs[0].url: a"), errors.New("spec: validate: inputs[1].url: b")}
+	rec = e.do(http.MethodPut, "/api/v1/streams/cam", with(editor, body("application/json", masked))...)
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+	got = errOf(t, rec)
+	assert.Equal(t, codeInvalidConf, got.Code)
+	assert.Equal(t, []string{"spec: validate: inputs[0].url: a", "spec: validate: inputs[1].url: b"}, got.Errors)
+	assert.False(t, holdsWO(e.logs.String()))
 }

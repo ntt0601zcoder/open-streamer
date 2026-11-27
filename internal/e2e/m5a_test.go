@@ -1693,16 +1693,23 @@ func m5aOnce(t *testing.T, text, old, new string) string {
 // TestM5aConfigPut is the done criterion through the config editor: one
 // line of the YAML that GET /api/v1/config returned is changed (cam's
 // rtsp) and the text is PUT back. Only cam's RTSP ends; cam's other
-// outputs, and the other streams, are not interrupted; and the file is the
-// text that was sent, every comment included.
+// outputs, and the other streams, are not interrupted. The text the GET
+// returns is masked (R-T8): the stream keys in it are xxxxx, and the PUT
+// resolves them, so the file is the text that was first written with the
+// one line changed, every comment and every real key included.
 func TestM5aConfigPut(t *testing.T) {
 	m, sent := m5aEditorSetup(t)
 	other := m5aOpenOther(t, m)
 	r := m5aOpen(t, m, "cam", m5aRowOpt{otherRTMP: 1, watch: stream.OutHLS})
 
 	text, etag := m.configText(t)
-	assert.Equal(t, m.fileText(t), text, "GET /api/v1/config returns the file's bytes")
-	assert.Equal(t, sent, text)
+	require.Equal(t, sent, m.fileText(t), "the file holds the text that was sent, keys and all")
+	require.Contains(t, sent, m5aSinkKey)
+	shown, err := config.Mask([]byte(sent))
+	require.NoError(t, err)
+	assert.Equal(t, string(shown), text, "GET /api/v1/config returns the file masked")
+	assert.NotContains(t, text, m5aSinkKey)
+	assert.Contains(t, text, "xxxxx")
 	for _, comment := range []string{
 		"# The config of an M5a scenario.", "# cam: every output, and a push to sink.",
 		"# The players of rtsp://host/live/cam.", "# sink: takes cam's push.", "# other: no edit touches it.",
@@ -1710,6 +1717,7 @@ func TestM5aConfigPut(t *testing.T) {
 		require.Contains(t, text, comment)
 	}
 	edited := m5aOnce(t, text, "      rtsp: true\n", "      rtsp: false\n")
+	editedFile := m5aOnce(t, sent, "      rtsp: true\n", "      rtsp: false\n")
 	m5aSleepUntil(r.start.Add(m5aEdit))
 	resp := m.putConfigRaw(t, edited, etag)
 	r.edited()
@@ -1723,7 +1731,8 @@ func TestM5aConfigPut(t *testing.T) {
 	assert.Contains(t, string(resp.body), `"restart_required":[]`)
 	r.ownEnds(t, stream.OutRTSP)
 	m.refused(t, stream.OutRTSP, "cam")
-	assert.Equal(t, edited, m.fileText(t), "the file is the text sent, byte for byte")
+	assert.Equal(t, editedFile, m.fileText(t), "the file is the text sent with its masks resolved, byte for byte")
+	assert.NotContains(t, m.fileText(t), "xxxxx")
 
 	// The writes that are refused change nothing: the old ETag, no
 	// If-Match, and a text with an unknown key.
@@ -1735,7 +1744,7 @@ func TestM5aConfigPut(t *testing.T) {
 	resp = m.putConfigRaw(t, bad, res.ETag)
 	assert.Equal(t, http.StatusUnprocessableEntity, resp.code, "%s", resp.body)
 	assert.Contains(t, string(resp.body), "rtsps", "the unknown key is listed")
-	assert.Equal(t, edited, m.fileText(t), "the file is untouched")
+	assert.Equal(t, editedFile, m.fileText(t), "the file is untouched")
 	now, nowTag := m.configText(t)
 	assert.Equal(t, edited, now)
 	assert.Equal(t, res.ETag, nowTag)
@@ -1916,15 +1925,23 @@ func TestM5aRestartRestores(t *testing.T) {
 		require.Equal(t, http.StatusCreated, code)
 	}
 	m.running(t, "cam")
-	code, before := m.get(t, "/api/v1/streams?secrets=1")
+	// Secrets are write-only: ?secrets=1 is a 400, the documents are
+	// redacted, and the secret is read from the file.
+	code, _ := m.get(t, "/api/v1/streams?secrets=1")
+	require.Equal(t, http.StatusBadRequest, code)
+	code, before := m.get(t, "/api/v1/streams")
 	require.Equal(t, http.StatusOK, code)
-	require.Contains(t, string(before), "restart-secret")
+	require.NotContains(t, string(before), "restart-secret")
+	require.Contains(t, string(before), "rtsp://user:xxxxx@127.0.0.1:1/x")
+	file := m.fileText(t)
+	require.Contains(t, file, "rtsp://user:restart-secret@127.0.0.1:1/x")
 	m.stop()
 
 	m2 := m5aStart(t, m.path)
-	code, after := m2.get(t, "/api/v1/streams?secrets=1")
+	code, after := m2.get(t, "/api/v1/streams")
 	require.Equal(t, http.StatusOK, code)
 	assert.Equal(t, string(before), string(after), "the streams after the restart")
+	assert.Equal(t, file, m2.fileText(t), "the secret is still in the file")
 	m2.running(t, "cam")
 	m2.running(t, "third")
 	m2.listed(t, "cam", 1)
@@ -1941,7 +1958,7 @@ func TestM5aRestartRestores(t *testing.T) {
 	m3.running(t, "cam")
 	m3.running(t, "third")
 	assert.Equal(t, "stopped", m3.status(t, "off").State)
-	code, after = m3.get(t, "/api/v1/streams?secrets=1")
+	code, after = m3.get(t, "/api/v1/streams")
 	require.Equal(t, http.StatusOK, code)
 	assert.Equal(t, string(before), string(after), "the three good streams")
 	st := m3.configStatus(t)
@@ -2174,23 +2191,23 @@ func TestM5aNoSecretsLeak(t *testing.T) {
 		}
 	}
 
-	// The deliberate exceptions, for the editor only.
-	for name, own := range map[string][]string{
-		"cam2": {"hunter2-pw", "pushkey-0123456789"}, "cam5": {"srtpass-0123456789"}, "cam6": {"listenkey-0123456789"},
-	} {
-		code, body := m.get(t, "/api/v1/streams/"+name+"?secrets=1")
-		require.Equal(t, http.StatusOK, code)
-		for _, s := range own {
-			assert.Contains(t, string(body), s, "GET %s?secrets=1 as the editor", name)
+	// There is no exception any more: ?secrets=1 is a 400 for every role,
+	// and the editor's config text is masked (R-T6, R-T8).
+	for _, name := range []string{"cam2", "cam5", "cam6"} {
+		for _, who := range []*m5a{eye, m} {
+			code, body := who.get(t, "/api/v1/streams/"+name+"?secrets=1")
+			assert.Equal(t, http.StatusBadRequest, code, "GET %s?secrets=1 as %s", name, who.user)
+			clean("GET "+name+"?secrets=1 as "+who.user, string(body), all)
 		}
-		clean("GET "+name+"?secrets=1", string(body), userSecrets)
-		assert.Equal(t, http.StatusForbidden, eye.do(t, http.MethodGet, "/api/v1/streams/"+name+"?secrets=1", nil).code)
 	}
 	text, _ := m.configText(t)
-	for _, s := range slices.Concat(streamSecrets, []string{m5aHash(m5aEditorPW), m5aHash(m5aViewerPW)}) {
-		assert.Contains(t, text, s, "GET /api/v1/config as the editor")
+	shown, err := config.Mask([]byte(m.fileText(t)))
+	require.NoError(t, err)
+	assert.Equal(t, string(shown), text, "GET /api/v1/config is the file masked")
+	clean("GET /api/v1/config", text, slices.Concat(streamSecrets, []string{m5aEditorPW, m5aViewerPW}))
+	for _, s := range []string{m5aHash(m5aEditorPW), m5aHash(m5aViewerPW)} {
+		assert.Contains(t, text, s, "the users' hashes are not masked")
 	}
-	clean("GET /api/v1/config", text, []string{m5aEditorPW, m5aViewerPW})
 	assert.Equal(t, http.StatusForbidden, eye.do(t, http.MethodGet, "/api/v1/config", nil).code)
 
 	// On disk the file holds the stream secrets verbatim, which is what
@@ -2251,8 +2268,6 @@ func TestM5aRoles(t *testing.T) {
 		{http.MethodDelete, "/api/v1/streams/new", nil, nil, http.StatusNoContent},
 		{http.MethodGet, "/api/v1/config", nil, nil, http.StatusOK},
 		{http.MethodPost, "/api/v1/reload", nil, nil, http.StatusOK},
-		{http.MethodGet, "/api/v1/streams/cam?secrets=1", nil, nil, http.StatusOK},
-		{http.MethodGet, "/api/v1/streams?secrets=1", nil, nil, http.StatusOK},
 		{http.MethodGet, "/debug/pprof/", nil, nil, http.StatusOK},
 		{http.MethodGet, "/debug/pprof/cmdline", nil, nil, http.StatusOK},
 		{http.MethodGet, "/debug/pprof/profile?seconds=1", nil, nil, http.StatusOK},
@@ -2263,6 +2278,12 @@ func TestM5aRoles(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, eye.do(t, c.method, c.path, c.body, c.hdr...).code, "the viewer: %s %s", c.method, c.path)
 		resp := m.do(t, c.method, c.path, c.body, c.hdr...)
 		assert.Equal(t, c.want, resp.code, "the editor: %s %s: %.200s", c.method, c.path, resp.body)
+	}
+	// ?secrets=1 is gone: a 400 for both.
+	for _, path := range []string{"/api/v1/streams/cam?secrets=1", "/api/v1/streams?secrets=1"} {
+		for _, who := range []*m5a{eye, m} {
+			assert.Equal(t, http.StatusBadRequest, who.do(t, http.MethodGet, path, nil).code, "%s: GET %s", who.user, path)
+		}
 	}
 	assert.Equal(t, http.StatusForbidden, eye.putConfigRaw(t, text, etag).code, "the viewer: PUT config")
 	text, etag = m.configText(t)

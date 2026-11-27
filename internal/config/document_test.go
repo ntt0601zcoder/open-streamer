@@ -560,14 +560,6 @@ func TestParseLenientSkipsBadStreams(t *testing.T) {
 	})
 }
 
-func TestHash(t *testing.T) {
-	text := []byte(head())
-	h := Hash(text)
-	assert.Regexp(t, `^"[0-9a-f]{64}"$`, h)
-	assert.Equal(t, h, Hash([]byte(head())))
-	assert.NotEqual(t, h, Hash(append([]byte("#\n"), text...)))
-}
-
 // A hostile document costs bounded work and gets a bounded answer.
 func TestParseIsBounded(t *testing.T) {
 	long := strings.Repeat("x", 100_000)

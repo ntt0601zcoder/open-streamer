@@ -34,10 +34,16 @@ func tooLarge(w http.ResponseWriter, limit int64) {
 		fmt.Sprintf("the body is larger than %d bytes", limit), nil)
 }
 
-// getConfig serves the config text verbatim. It holds stream keys and
-// password hashes, which is why the route is an editor's.
+// getConfig serves the config text masked (R-T8): every stream secret is
+// xxxxx, and a PUT that sends it back keeps the stored one. It still holds
+// the users' password hashes, which is why the route is an editor's. A
+// text that could not be masked is never served: the Backend logged why.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 	text, etag := a.opt.Backend.ConfigText()
+	if text == nil {
+		writeError(w, http.StatusInternalServerError, codeInternal, msgInternal, nil)
+		return
+	}
 	h := w.Header()
 	h.Set("Content-Type", "application/yaml")
 	h.Set("ETag", etag)

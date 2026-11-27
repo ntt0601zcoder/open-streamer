@@ -24,11 +24,15 @@ func yamlBody(s string) reqOpt { return body("application/yaml", []byte(s)) }
 
 func TestConfigGet(t *testing.T) {
 	e := newEnv(t)
-	e.be.text, e.be.etag = []byte(configText), config.Hash([]byte(configText))
+	// ConfigText is the text as a response shows it: masked.
+	masked, err := config.Mask([]byte(configText))
+	require.NoError(t, err)
+	require.NotContains(t, string(masked), "secretkey")
+	e.be.text, e.be.etag = masked, config.ETag([]byte(configText))
 
 	rec := e.do(http.MethodGet, "/api/v1/config", editor...)
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, configText, rec.Body.String(), "verbatim")
+	assert.Equal(t, string(masked), rec.Body.String(), "the backend's text, verbatim")
 	assert.Equal(t, "application/yaml", rec.Header().Get("Content-Type"))
 	assert.Equal(t, e.be.etag, rec.Header().Get("ETag"))
 	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
@@ -39,7 +43,7 @@ func TestConfigGet(t *testing.T) {
 
 	// The viewer gets no byte of it, on any spelling of the path.
 	e.be.reset()
-	for _, target := range []string{"/api/v1/config", "/api/v1/config?secrets=1", "/api/v1//config", "/api/v1/config/../config"} {
+	for _, target := range []string{"/api/v1/config", "/api/v1//config", "/api/v1/config/../config"} {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			rec = e.do(method, target, viewer...)
 			assert.Equal(t, http.StatusForbidden, rec.Code, target)
@@ -48,6 +52,15 @@ func TestConfigGet(t *testing.T) {
 			}
 			assert.Empty(t, rec.Header().Get("ETag"))
 		}
+	}
+	// ?secrets=1 is a 400 for the viewer too, before the role's 403.
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		rec = e.do(method, "/api/v1/config?secrets=1", viewer...)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		for _, s := range []string{"secretkey", "pbkdf2", "version"} {
+			assert.NotContains(t, rec.Body.String(), s)
+		}
+		assert.Empty(t, rec.Header().Get("ETag"))
 	}
 	assert.Empty(t, e.be.callList())
 	assert.NotContains(t, e.logs.String(), "secretkey")
@@ -205,4 +218,35 @@ func TestReloadAndStatus(t *testing.T) {
 		`"certificate":{"not_after":"2027-02-24T10:00:00Z","names":[],"loaded_at":"2026-11-26T10:00:00Z",`+
 		`"last_error":"certs: reload: /etc/os/key.pem: tls: private key does not match public key"}}`,
 		rec.Body.String())
+}
+
+func TestGetConfigMasked(t *testing.T) {
+	e := newEnv(t)
+	const real = "version: 1\nstreams:\n  - name: cam\n    inputs:\n      - url: rtsp://u:wo-cfg-pw-2718@cam.example/s\n" +
+		"    outputs: {srt: true, srt_passphrase: wocfgpass-31415}\n"
+	masked, err := config.Mask([]byte(real))
+	require.NoError(t, err)
+	e.be.text, e.be.etag = masked, config.ETag([]byte(real))
+
+	rec := e.do(http.MethodGet, "/api/v1/config", editor...)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, string(masked), rec.Body.String())
+	assert.Equal(t, e.be.etag, rec.Header().Get("ETag"))
+	for _, secret := range []string{"wo-cfg-pw-2718", "wocfgpass-31415"} {
+		assert.NotContains(t, rec.Body.String(), secret)
+	}
+	rec = e.do(http.MethodGet, "/api/v1/config", with(editor, hdr("If-None-Match", e.be.etag))...)
+	assert.Equal(t, http.StatusNotModified, rec.Code)
+	assert.Empty(t, rec.Body.String())
+
+	// A text that could not be masked is never served.
+	e.be.text = nil
+	rec = e.do(http.MethodGet, "/api/v1/config", editor...)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Equal(t, codeInternal, errOf(t, rec).Code)
+	assert.Empty(t, rec.Header().Get("ETag"))
+	for _, secret := range []string{"wo-cfg-pw-2718", "wocfgpass-31415"} {
+		assert.NotContains(t, rec.Body.String(), secret)
+		assert.NotContains(t, e.logs.String(), secret)
+	}
 }
