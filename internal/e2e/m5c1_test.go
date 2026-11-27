@@ -1075,10 +1075,14 @@ func TestM5c1NoSecretsLeak(t *testing.T) {
 	)
 	m := m5c1Server(t, "")
 	src := m5aSource(t)
-	badFront := testpeer.TLSFront(t, m.addrs.RTMP, tlstest.NewCA(t).Server(t))
+	// Fronts that present a leaf of another CA: the push and the rtsps pull
+	// reach TLS and fail verification, with their secrets in the URL.
+	other := tlstest.NewCA(t)
+	badFront := testpeer.TLSFront(t, m.addrs.RTMP, other.Server(t))
+	badRTSPS := testpeer.TLSFront(t, m.addrs.RTSP, other.Server(t))
 	listenInput := "rtmps://" + m.addrs.RTMPS + "/in/" + listenKey + "?mode=listen"
 	pull := "rtmps+insecure://user:" + pullPW + "@127.0.0.1:1/live/" + pullKey + "?token=" + pullToken
-	rtspPull := "rtsps://user:" + rtspPW + "@127.0.0.1:1/x"
+	rtspPull := "rtsps://user:" + rtspPW + "@" + badRTSPS + "/live/cam3"
 	push := "rtmps://" + badFront + "/live/" + pushKey + "?token=" + pushToken
 
 	m.create(t, m5aSpec("lis", listenInput))
@@ -1096,6 +1100,8 @@ func TestM5c1NoSecretsLeak(t *testing.T) {
 			st3.LastError != "" && st3.ActiveInput == 1
 	}, "cam2 and cam3 run on their second inputs, with their failures as last errors: %+v %+v", &st2, &st3)
 	assert.Contains(t, st2.Pushes[0].LastError, "x509", "the push failed on the front's certificate")
+	assert.Contains(t, st3.LastError, "x509", "the rtsps pull failed on the front's certificate")
+	assert.NotContains(t, st3.LastError, rtspPW)
 
 	// Half a rotation: a new certificate whose key is not there.
 	oldKey, err := os.ReadFile(m.key)
@@ -1164,6 +1170,8 @@ func TestM5c1NoSecretsLeak(t *testing.T) {
 
 	logs := m.logs.String()
 	clean("the log", logs, all)
+	assert.Contains(t, logs, "rtsps://user:xxxxx@"+badRTSPS+"/live/cam3: rtsp: dial: tls: tls: failed to verify certificate: x509:",
+		"the rtsps pull's x509 failure is in the log, its password redacted")
 	assert.Contains(t, logs, "server: tls: reload failed", "the failed reload is in the log")
 
 	// The deliberate exceptions, for the editor only: the stream secrets.
