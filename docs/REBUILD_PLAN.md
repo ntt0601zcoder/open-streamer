@@ -325,6 +325,19 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   URL-decode a URL's `streamid` (ffmpeg 8 does), so with ffmpeg pass the ID
   raw (`?streamid=#!::r=live/name`) or with `-streamid` (clients whose URI
   parser treats `#` as a fragment need their own stream ID setting).
+  Since M5c2a a stream may require a passphrase of its SRT players
+  (`outputs.srt_passphrase`, R-T5 of the M5c2a plan), asked per connection
+  request from the stream ID's stream (gosrt's `ConnRequest.SetPassphrase`,
+  the caller's key length taken). Three refusals (R-T9): an unencrypted
+  request to a stream with a passphrase is `REJ_UNSECURE` and a wrong
+  passphrase `REJ_BADSECRET`, both counted as `reason="secret"`; an address
+  (an IPv6 one by its /64) with 5 wrong passphrases inside 10 s has its
+  encrypted requests refused unchecked with `REJ_RESOURCE` for 10 s from its
+  first failure (`reason="limited"`, at most 4096 addresses tracked). An
+  encrypted request to a stream without one is refused as before
+  (`reason="mode"`). A changed passphrase ends the stream's SRT sessions
+  (the reattach refusal, and a second View read once a connection has
+  subscribed).
 - DASH maps stream time to wallclock through the epoch anchors, with one fixed
   `availabilityStartTime` for the life of the stream. A period starts at
   `max(anchor, previous period end)`.
@@ -632,8 +645,9 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   while running and is reported as `restart_required`.
 - **Users** (R-D8, `internal/auth`): HTTP Basic auth against the file's
   `users`, each a name, a role and a password hash. `viewer` reads; `editor`
-  also writes and gets what holds stored secrets or process internals
-  (`GET /api/v1/config`, `?secrets=1`, pprof). A hash is
+  also writes, edits the whole config (`GET` and `PUT /api/v1/config`) and
+  gets process internals (pprof); since M5c2a nobody is shown a stored
+  secret, an editor included (R-T3 of the M5c2a plan). A hash is
   `pbkdf2-sha256$600000$<salt>$<key>` (PBKDF2-HMAC-SHA-256, a salt of at
   least 16 bytes, a 32-byte key, unpadded standard base64, in canonical
   form), made by `openstreamer hash-password`; any other iteration count, a
@@ -713,11 +727,20 @@ Shared by every output, in `internal/ts` (TS muxer), `internal/mux` (fMP4 writer
   limits and the request counter are hand-written wrappers. The config
   editor is `GET` and `PUT /api/v1/config` (YAML, `If-Match` required);
   `PUT` and `DELETE /api/v1/streams/{name}` (JSON) are thin wrappers over
-  the same apply path. Stream URLs are redacted in every response unless an
-  editor asks with `?secrets=1`, and a stream `PUT` that carries the mask is
-  refused. A stream's `ETag` and a push's ID are HMAC-SHA-256 tags under a
-  per-process random key, so a viewer cannot test guesses of a secret
-  against them; they change when the server restarts. The OpenAPI 3.1
+  the same apply path. Since M5c2a every response is redacted for every role
+  (R-T6 of the M5c2a plan): a query holding the key `secrets` is 400, and
+  `GET /api/v1/config` returns the text masked (`config.Mask`). A write that
+  carries the mask keeps the stored secret by R-T4's rule: a masked input or
+  push URL is replaced by the stored URL of the same stream whose redacted
+  form equals the sent text (several stored values of one form by order of
+  occurrence when the counts match), a masked `srt_passphrase` by the stored
+  one, and anything else is 422 with one constant text per field;
+  `PUT /api/v1/config` resolves the masks of its stream entries
+  (`config.Unmask`) and stores the resolved bytes. A stream's `ETag`, a
+  push's ID (tagged over the stream's name and the URL) and the config's
+  `ETag` are HMAC-SHA-256 tags under a per-process random key, so a client
+  cannot test guesses of a secret against them offline; they change when
+  the server restarts. The OpenAPI 3.1
   document is written by hand as JSON, embedded and served at
   `/api/v1/openapi.json`; `TestOpenAPIMatchesRoutes` and
   `TestOpenAPIMatchesSpec` keep it equal to the registered routes and the
@@ -826,7 +849,8 @@ failed every run on 1.26.11.
 | M5b2 ([plan](superpowers/plans/2026-11-26-m5b2-audio-language.md), done) | Audio language: the spec field, the HLS masters' `LANGUAGE`, the MPD's `lang` | M5a | `osconform` reads the languages. Proved by `TestM5b2AudioLanguage`, `TestM5b2AudioLanguageLadder` and `TestM5b2Players`, with the media, hls, dash, ingest, spec, live, stream and conform suites |
 | Multi-audio | Several audio tracks chosen and labelled by language, languages from the source, the TS language descriptor, M4b's multi-audio minors | M5b2 | Not yet planned |
 | M5c1 ([plan](superpowers/plans/2026-11-26-m5c1-tls.md), done) | TLS: one certificate in the config file, reloaded without a restart; HTTPS for the API and the media listener; RTMPS listen, pull and push; RTSPS listen (interleaved) and pull | M5a | ffmpeg publishes over RTMPS and plays over RTMPS, RTSPS and HTTPS (HLS, DASH, HTTP-TS) against our server; our server pulls from and pushes to a peer over RTMPS and pulls RTSPS (R-S1). Proved by `TestM5c1FFmpeg`, `TestM5c1PullPush`, `TestM5c1Rotate`, `TestM5c1API`, `TestM5c1Players` and `TestM5c1NoSecretsLeak`, with the certs, config, redact, rtmp, rtsp, rtmpsrv, rtmppush, ingest, stream, server and auth suites |
-| M5c2 | SRTP for RTSP over UDP; SRT output encryption; credentials in URL paths redacted; secrets as write-only spec fields | M5c1 | Not yet planned |
+| M5c2a ([plan](superpowers/plans/2026-11-27-m5c2-secrets-srtp.md), done) | Secrets: credentials in URL paths, queries and stream IDs redacted; secrets write-only over the API (every response masked, the mask keeps the stored secret, the config editor included); SRT output encryption with a per-stream passphrase | M5c1 | ffmpeg 6.1 and 8 and our own client play an SRT output that requires a passphrase, and a caller without it or with a wrong one is refused; no secret, the credentials embedded in a URL path or query and the write-only field included, appears in any response to any role, in a log or in a metric; an editor's read, change and write of a stream and of the whole config keeps every stored secret without ever being shown one (R-T1). Proved by `TestM5c2aSRTFFmpeg`, `TestM5c2aWriteOnly`, `TestM5c2aNoSecretsLeak` and `TestM5c2aPlayers`, with the redact, logging, spec, config, srtout, conform, stream, api and server suites |
+| M5c2b | SRTP for RTSP: `pkg/srtp`, `RTP/SAVP` with SDES keys inside RTSPS, server and pull client | M5c1 | Not yet planned. Proposed (R-T1 of the M5c2a plan): ffmpeg 6.1 and 8 play `rtsps://` with SRTP over UDP and over the interleaved channel against our server, and our client pulls the same from our server |
 | M6 | DVR and timeshift, auto-publish, templates, sessions, webhooks | M5a | Feature tests; DVR playback passes `osconform` |
 | M7 | Cutover | M1–M6 | The [soak plan](SOAK_TEST_PLAN.md) runs for 7 days with no S1 or S2 finding; then v2 is merged to `main` |
 
@@ -896,7 +920,7 @@ Out of M3b2:
 
 | Item | Reason |
 |---|---|
-| RTSPS and SRTP | RTSPS is done in M5c1 (`server.rtsp.tls_listen`, interleaved only; R-S6); SRTP is M5c2 |
+| RTSPS and SRTP | RTSPS is done in M5c1 (`server.rtsp.tls_listen`, interleaved only; R-S6); SRTP is M5c2b |
 | Play authentication and tokens | M6 sessions and tokens, as for RTMP play |
 | Multicast; RTSP over HTTP tunnelling | Rare for players; added on demand |
 | PAUSE, seek, `Scale` and `Speed` | Live only: PAUSE is answered 455 |
@@ -933,7 +957,7 @@ Out of M3b3:
 | Item | Reason |
 |---|---|
 | SRT caller push-out | Add on demand; the RTMP push-out covers pushing today |
-| SRT encryption | Needs credentials: M5c2; encrypted requests are refused |
+| SRT encryption | Done in M5c2a (`outputs.srt_passphrase`); until then encrypted requests were refused |
 | Publishing into the SRT output listener | The SRT inputs own publishing |
 | DASH placeholders | Periods carry their adaptation sets; there is nothing to align |
 | Silent AAC placeholder parts instead of gaps | Backlog: silent AAC placeholder parts |
@@ -1188,10 +1212,11 @@ one declared audio language in the spec, the HLS masters and the MPD (done).
 M5c, transport security, is two plans (ruling R-S1 of the M5c1 plan). M5c1,
 TLS (done): the certificate in the config file, HTTPS for the API and the
 media listener, an RTMPS listener (publish and play), RTMPS pull and push,
-an RTSPS listener (play only, TCP only) and RTSPS pull. M5c2 (not yet
-planned): SRTP for RTSP over UDP, SRT output encryption, redaction of
-credentials in URL paths (the M2c note), and secrets as write-only spec
-fields. M6 and the M7 soak need only M5a; M5b2 and M5c may run beside M6.
+an RTSPS listener (play only, TCP only) and RTSPS pull. M5c2 is two plans
+too (R-T1 of the M5c2a plan). M5c2a, secrets (done): credentials in URL
+paths, queries and stream IDs redacted (the M2c note), secrets write-only
+over the API, and SRT output encryption with a per-stream passphrase.
+M5c2b (not yet planned): SRTP for RTSP. M6 and the M7 soak need only M5a; M5b2 and M5c may run beside M6.
 Until M5b1 an input edit rebuilt the stream (R-D6), and assets were files
 the operator copied into a directory; until M5c1 the Basic credentials and
 every stream key crossed the network in clear. The API's plain listener
@@ -1206,15 +1231,18 @@ R-D12 (the proof) and R-D13 (RTMP on an ephemeral port); the design is
 §3.6. Facts the code settled while it ran, beyond §3.6: a stream's `ETag`
 and a push's ID (the metrics' `target` label) are HMAC-SHA-256 tags under a
 per-process key (`redact.Tag`), so they change at a restart and a client
-holding an old `ETag` gets one 412 and reads again. The config's `ETag`
-is the plain SHA-256 of its text, which viewers see in the config status;
-the text includes every user's randomly salted hash, so it cannot be
-guessed. Only a real verification that succeeds clears a limiter entry,
+holding an old `ETag` gets one 412 and reads again. Since M5c2a (R-T12)
+the config's `ETag` is a keyed tag too, `"` + the first 32 hex digits of
+`redact.Tag` of the stored text + `"` (`config.ETag`), so it changes at a
+restart and no longer serves as an offline oracle beside the masked text;
+a push's ID is tagged over the stream's name and the URL. (Until M5c2a the
+config's `ETag` was the plain SHA-256 of its text.) Only a real verification that succeeds clears a limiter entry,
 and room among the 4096 tracked pairs is made only when a new pair is
 inserted: pairs under 5 failures first, oldest first, a blocked pair
 only when nothing else can go, never one with a login in flight. The API
-itself refuses a stream document that carries the redaction mask; a
-viewer's `?secrets=1` is 403 on every route; and a handler's panic after a
+itself refused a stream document that carried the redaction mask and a
+viewer's `?secrets=1` was 403 on every route, until M5c2a resolved the mask
+and made `?secrets=1` a 400 for every role (R-T4, R-T6); and a handler's panic after a
 part of the answer is written aborts the connection instead of ending it as
 a whole answer. `server.New` binds every listener and starts the streams
 through `Manager.Load`, so a server it returns must be run. The e2e
@@ -1231,7 +1259,7 @@ Out of M5a:
 |---|---|
 | Inputs edited in place, the live watermark edit, the asset API, operator fonts, refusing the x264 fallback | Done in M5b1; until then an input edit rebuilt the stream (R-D6) and assets were files in `server.assets_dir` |
 | Audio language | Done in M5b2 (`audio_language`) |
-| HTTPS, RTMPS, RTSPS and SRTP, SRT encryption, credentials in URL paths or queries, write-only secrets | HTTPS, RTMPS and RTSPS are done in M5c1; SRTP, SRT output encryption, credentials in URL paths and write-only secrets are M5c2. The plain API still listens on loopback by default (R-D8, R-S5) |
+| HTTPS, RTMPS, RTSPS and SRTP, SRT encryption, credentials in URL paths or queries, write-only secrets | HTTPS, RTMPS and RTSPS are done in M5c1; SRT output encryption, credentials in URL paths and queries and write-only secrets are done in M5c2a; SRTP is M5c2b. The plain API still listens on loopback by default (R-D8, R-S5) |
 | `PATCH` and per-field edits | R-D7: a stream is replaced whole by `PUT`, or the whole config |
 | Histograms and per-stream session counts | R-D9; per-stream sessions are M6's |
 | Applying a `server` change without a restart | R-D4: reported as `restart_required` |
@@ -1305,7 +1333,8 @@ RTSPS pull. M5c2 is SRTP for RTSP over UDP, SRT output encryption,
 credentials in URL paths, and secrets as write-only spec fields. M5c1's
 exit criterion: ffmpeg publishes over RTMPS and plays over RTMPS, RTSPS and
 HTTPS (HLS, DASH, HTTP-TS) against our server; our server pulls from and
-pushes to a peer over RTMPS and pulls RTSPS.
+pushes to a peer over RTMPS and pulls RTSPS. (M5c2 was split again into
+M5c2a and M5c2b: R-T1 of the M5c2a plan, below.)
 
 Facts the code settled while it ran, beyond the rulings:
 
@@ -1363,10 +1392,10 @@ Out of M5c1:
 
 | Item | Where |
 |---|---|
-| SRTP for RTSP over UDP (`RTP/SAVP`, SDES keys, inside RTSPS only) | M5c2 |
-| SRT output encryption (the input passphrase exists since M2a) | M5c2 |
-| Credentials embedded in URL paths redacted | M5c2 |
-| Secrets as write-only spec fields | M5c2 |
+| SRTP for RTSP over UDP (`RTP/SAVP`, SDES keys, inside RTSPS only) | M5c2b |
+| SRT output encryption (the input passphrase exists since M2a) | Done in M5c2a |
+| Credentials embedded in URL paths redacted | Done in M5c2a |
+| Secrets as write-only spec fields | Done in M5c2a, as write-only over the API (R-T3 of the M5c2a plan) |
 | A certificate per listener or per SNI name; client certificates; an encrypted key file; built-in ACME | Backlog (R-S2) |
 | HTTP/2 on the TLS listeners | Backlog (R-S4) |
 | `https+insecure://` inputs; a config key for extra roots | Backlog (R-S7: the system store or `SSL_CERT_FILE`) |
@@ -1375,13 +1404,142 @@ Out of M5c1:
 | A trusted-proxy setting for the login limiter | Backlog (R-S10) |
 | TLS flags for `cmd/osdev` | Not planned: `osdev` stays plain |
 
-M5c2 starts from these facts: an RTSPS session refuses UDP with 461
-(`pkg/rtsp` `ServeTLS`), which is the branch SRTP's `RTP/SAVP` offers go
-into; SRT output encryption is a passphrase, as the input's is, not the
-certificate; `redact` treats the three RTMP schemes alike
-(`redact.RTMPScheme`) and has no rule yet for credentials in other URL
-paths; and the config status and every stream document still return stored
-secrets to an editor (`?secrets=1`, `GET /api/v1/config`).
+M5c2a's rulings are in its plan: R-T1 (the split of M5c2 and both exit
+criteria), R-T2 (what a credential in a URL is), R-T3 (write-only, and where
+a secret lives), R-T4 (how the mask is resolved), R-T5 (the one new field,
+`outputs.srt_passphrase`), R-T6 (the API), R-T7 (the file), R-T8 (the config
+editor), R-T9 (SRT output encryption), R-T10 (migration), R-T11 (peers) and
+R-T12 (the config's ETag is keyed). Each states what it costs if it is wrong.
+
+R-T1, in full: M5c2 is two plans, as M5b and M5c were; its four items are
+two independent subsystems with no shared file but the docs. M5c2a, secrets:
+credentials in URL paths and queries redacted; secrets write-only over the
+API; SRT output encryption, which needs the first write-only field. M5c2b,
+SRTP: `pkg/srtp` (SRTP and SRTCP on the standard library, RFC 3711 Appendix
+B vectors), `RTP/SAVP` with SDES keys inside RTSPS for the RTSP server and
+the pull client. M5c2a's exit criterion: ffmpeg 6.1 and 8 and our own client
+play an SRT output that requires a passphrase, and a caller without it or
+with a wrong one is refused; no secret, the credentials embedded in a URL
+path or query and the write-only field included, appears in any response to
+any role, in a log or in a metric; an editor's read, change and write of a
+stream and of the whole config keeps every stored secret without ever being
+shown one. M5c2b's exit criterion (proposed): ffmpeg 6.1 and 8 play
+`rtsps://` with SRTP over UDP and over the interleaved channel against our
+server, and our client pulls the same from our server. M5c2a did not touch
+`pkg/rtsp`, `rtspplay` or `internal/ingest/rtsp.go`, so nothing in it closes
+a door for SRTP.
+
+Facts the code settled while it ran, beyond the rulings:
+
+- **R-T2's costs, as built.** The rule hides more names than R-T2 first
+  listed: `authorization`, `cred`, `credential(s)`, `sessionid`, `sid`,
+  `accesskeyid` and `signature`. An escaped `=` (`%3D`) after a secret name
+  hides the value for every scheme, so `sid=` and `signature=` values are
+  hidden in non-secret uses too. A `streamid` secret that holds an escaped
+  `,name=` or `/name=` shows its tail, as a camera password that holds
+  `_name=` does.
+- **R-T3's residual oracles, corrected.** (a) The input count rule is an
+  oracle beside `repeated`: a `PUT` of {mask, guess} and then of {mask}
+  resolves exactly when the guess is the stored URL. Conceded, as
+  `repeated` is: the camera is an oracle anyway. (b) R-T3's bullet "A stream
+  left stopped" is corrected: for a stream left stopped at load, a `PUT`
+  with a guessed real URL in place of the mask answers 200 `unchanged` when
+  the guess is the stored URL and 422 (nothing stored) when it is not, so
+  an editor can confirm a guess of the stored secret without a trace in the
+  config. Editor-only and online; accepted.
+- **Frozen exception 12.** A config that uses an explicit `!!binary` tag
+  anywhere is refused at start and at reload ("!!binary is not supported"),
+  since `config.Mask` cannot judge the bytes of a binary scalar. So R-T10
+  has one exception: a config that works at HEAD loads unchanged unless it
+  holds `!!binary`.
+- **R-T8's residuals, all accepted** (each costs a rare tail of a secret
+  shown to an editor, or text masked that held none):
+  - a URL with white space inside it and a secret must be retyped after an
+    edit;
+  - a value that does not start with a URL keeps the token view (prose), so
+    under a key other than `url` a secret that holds a space can show its
+    tail;
+  - a comment line with more than 4 URLs or over 4 KiB is judged token by
+    token;
+  - a secret that holds a space, followed by a second secret URL, must be
+    retyped;
+  - in comments, a token that redacts to `<invalid url>` drops the rest of
+    its line, and when a URL is followed by a rest that does not parse and
+    holds `@`, or the URL itself hid something, the rest of the line is
+    dropped: `# http://h/x is 100% up, ask ops@example.org` becomes
+    `# http://h/x`. A comment URL that holds `xxxxx` is taken as masked;
+  - tokens glued by a ZWSP or a U+FEFF, and the visible rows of
+    `TestMaskAdversarial` (`advVisible`: a URL nested in another's query, an
+    `rtsp:` without `//`, a passphrase under another key or in a comment
+    that does not repeat the key, a URL after `#` in a scalar, `old.rtmp://`
+    in comments), are pinned as shown;
+  - the users' password hashes stay readable to editors (salted PBKDF2,
+    600 000 iterations); masking them is backlog.
+- **R-T9's known limit.** gosrt marks the retransmissions around a key
+  refresh so that, on a lossy link, a rare retransmission near a refresh
+  cannot be decrypted. Backlog: report it upstream, or patch it in our
+  wrapper.
+- **VLC 3.0.20's SRT options** are `--passphrase` and `--streamid` (`vlc -p
+  access_srt`); it refuses `--srt-passphrase` as an unknown option and
+  exits. `TestM5c2aPlayers` passes `--passphrase` and the stream ID in the
+  URL, as M3b3's VLC row does.
+- `TestM5c2aSRTFFmpeg` runs in the `transcode-e2e-arm64` job too (it needs
+  only ffmpeg); the other M5c2a scenarios run in the amd64 `test` job.
+
+Peers: what the M5c2a plan checked (2026-11-27, the host's ffmpeg 8.0.1 and
+`osv2-ci-peers:m4a`: ffmpeg 6.1, GStreamer 1.24.2, VLC 3.0.20, with a
+scratch gosrt listener that requires a passphrase and sends a 40 s TS clip
+of 1000 frames), and what its scenarios proved against the server:
+
+| Peer | Checked | Result |
+|---|---|---|
+| ffmpeg 8 | `srt://…?passphrase=<13 bytes>` | 1000 of 1000 frames |
+| ffmpeg 8 and 6.1 | the same with the listener's `KMRefreshRate` 1024 (five refreshes in 5123 packets) | 1000 of 1000 frames |
+| ffmpeg 8 | `-pbkeylen 32` | 1000 frames: the caller's key length is taken |
+| ffmpeg 8 | a wrong passphrase, with `REJ_BADSECRET` | "ERROR:BADSECRET … Incorrect passphrase", exit 251 |
+| ffmpeg 8 | no passphrase, with `REJ_UNSECURE` | "ERROR:UNSECURE … Password required or unexpected", exit 251 |
+| ffmpeg 8 | passphrases of 79 and 80 bytes | both play |
+| ffmpeg 6.1 and 8 against the server (`TestM5c2aSRTFFmpeg`) | ffprobe, 5 s decoded with and without `-pbkeylen 32`, no passphrase, a wrong one, a changed one | h264 and aac; 117 to 125 frames and audio, no "corrupt"; "ERROR:UNSECURE" and "ERROR:BADSECRET" with exit 251 and no frame; the player of the old passphrase ends within 0.4 s of the edit |
+| GStreamer 1.24 | `srtsrc uri=… passphrase=…` | Connects encrypted and takes every packet; decoding was not asserted (†) |
+| GStreamer 1.24 against the server (`TestM5c2aPlayers`) | `srtsrc … passphrase=… ! tsdemux`, gstPlays' rule | Plays: both sinks get buffers within 1.2 s |
+| VLC 3.0.20 against the server (`TestM5c2aPlayers`) | `--passphrase`, vlcPlays' rule | Plays: video and audio decoded, a dump of 10 s of each |
+| host and image | `which srt-live-transmit` | Absent in both (R-T11) |
+
+No † row was dropped.
+
+Out of M5c2a:
+
+| Item | Where |
+|---|---|
+| SRTP for RTSP over UDP and interleaved (`pkg/srtp`, SDES `a=crypto`, `AES_CM_128_HMAC_SHA1_80`), server and pull client | M5c2b (R-T1) |
+| MIKEY key management for SRTP (what GStreamer and MediaMTX speak) | Backlog, judged in M5c2b |
+| Separate secret fields for inputs and pushes (`password`, `key`) | Not planned (R-T3) |
+| Masking the users' password hashes in `GET /api/v1/config` | Backlog (R-T8) |
+| Secrets encrypted at rest; a secrets file or environment references | Backlog (R-T7) |
+| A server-wide SRT passphrase; a configured key length | Not planned (R-T5) |
+| An SRT input passphrase outside the URL | Not planned (R-T3): it stays `?passphrase=`, redacted and kept by the mask like every URL secret |
+| `srt-live-transmit` as a peer | Not planned (R-T11) |
+| Scrubbing bare `name=value` text outside URLs in logs | Backlog: nothing logs a bare request path today (R-T2) |
+| A passphrase for `cmd/osdev`'s SRT output (`cmd/osdev/main.go:938`) | Not planned: `osdev` passes no `Secure` and stays plain, as it stays without TLS |
+
+M5c2b starts from these facts, the hand-over of the M5c2a plan. The first group was measured on 2026-11-27 with a scripted RTSP server that answers `DESCRIBE` with an SDP carrying `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<key>` and relays SRTP made by `ffmpeg -f rtp -srtp_out_suite AES_CM_128_HMAC_SHA1_80 -srtp_out_params <key> srtp://…`.
+
+| Peer | Checked | Result |
+|---|---|---|
+| ffmpeg 8 and 6.1 | `m=video … RTP/SAVP` with `a=crypto`, `-rtsp_transport udp` | Plays (51 frames in 2 s). Its `SETUP` still offers `RTP/AVP/UDP;unicast;client_port=…`, never `RTP/SAVP` |
+| ffmpeg 8 and 6.1 | the same, `-rtsp_transport tcp` | Plays: it decrypts SRTP on the interleaved channel too, offering `RTP/AVP/TCP` |
+| ffmpeg 8 | `m=video … RTP/AVP` with `a=crypto` | Plays: the `a=crypto` line alone turns decryption on. ffmpeg's own SDP writer puts `a=crypto` under `RTP/AVP` |
+| ffmpeg 8 | `RTP/SAVP` without `a=crypto`, the packets still SRTP | No frame decodes: the rows above are real decryption |
+| ffmpeg 6.1 and 8 | `-h protocol=srtp` | `srtp_in_suite`, `srtp_in_params`, `srtp_out_suite`, `srtp_out_params`: ffmpeg is an SRTP packet source and sink for `pkg/srtp`'s own interop rows, without RTSP |
+| GStreamer 1.24 | `RTP/SAVP` with `a=crypto` | Sends `SETUP` with `Transport: RTP/SAVP;…` and a `KeyMgmt: prot=mikey;…` header, ignores the SDES key, and never delivers a buffer. It speaks MIKEY only |
+
+What follows from them, as proposals for M5c2b's own rulings:
+- **The server must accept `RTP/AVP` and `RTP/AVP/TCP` in `SETUP` for a session whose SDP said `RTP/SAVP`**, or ffmpeg cannot play. The profile in `SETUP` cannot be what selects SRTP; the SDP the session was described with is.
+- **An SDP with `a=crypto` makes ffmpeg decrypt on TCP too**, so one RTSPS listener cannot serve SRTP to UDP players and plain RTP to interleaved ones from the same SDP. Either every session of an SRTP-enabled RTSPS listener carries SRTP (interleaved included), or SRTP is chosen per request.
+- **GStreamer cannot play an SDES SDP at all**, so turning SRTP on for the RTSPS listener takes M5c1's GStreamer RTSPS row away. That argues for an opt-in (`server.rtsp.srtp`, off by default, so M5c1's behaviour stays frozen) and for MIKEY as a named backlog item.
+- **No peer serves SDES over RTSP** (ffmpeg has no RTSP server with it; MediaMTX and GStreamer use MIKEY), so the pull client is proved against our own server, `rtsptest`, and ffmpeg's `srtp://` output as a packet source.
+- ffmpeg's receiver reports were not inspected. Whether an SRTP session must accept plain RTCP from its player is M5c2b's to measure; RTSP keep-alives hold an ffmpeg session open either way.
+- From M5c1, unchanged: an RTSPS session refuses UDP with 461 (`pkg/rtsp/server.go:922-930`), which is the branch SRTP opens; `rtsps://` with `transport=udp` is refused at parse in the pull client.
 
 M2 is split in three parts:
 
@@ -1469,11 +1627,11 @@ Out of M2c:
 
 | Item | Reason |
 |---|---|
-| RTSP 2.0; RTSPS and SRTP | RTSPS pull is done in M5c1 (`rtsps://`, TCP only; R-S7); SRTP is M5c2; RTSP 2.0 is not planned |
+| RTSP 2.0; RTSPS and SRTP | RTSPS pull is done in M5c1 (`rtsps://`, TCP only; R-S7); SRTP is M5c2b; RTSP 2.0 is not planned |
 | UDP multicast transport; RTSP over HTTP tunnelling | Rare for pull |
 | MP4A-LATM, G.711, Opus, PCM | Outside §2's codec scope; such tracks are skipped with a reason |
 | H.264 packetization-mode 2; H.265 with `sprop-max-don-diff` above 0 | Interleaved, DON reordering; skipped with a reason |
-| Credentials in the URL path or query (`?user=&password=`) | M5c2's redaction work |
+| Credentials in the URL path or query (`?user=&password=`) | Done in M5c2a (R-T2 of its plan) |
 | The RTSP server | M3b |
 | ONVIF | Outside M2c |
 
@@ -1882,6 +2040,38 @@ Items accepted for later, not yet placed in a milestone:
   its refusal check, so a plain `go test` or `make test` on the GPU host no
   longer bypasses the refusal.
 
+- **M5c2a's backlog** (the plan's "Out of M5c2a", and the costs its rulings
+  accept):
+  - MIKEY key management for SRTP, which GStreamer and MediaMTX speak;
+    judged in M5c2b, whose SRTP would be SDES only.
+  - Masking the users' password hashes in `GET /api/v1/config` with R-T8's
+    mechanism: today an editor reads them and can attack them offline.
+  - Secrets encrypted at rest with an external key, a secrets file, or
+    environment references (R-T7): whoever reads the config file reads
+    every stream secret.
+  - Scrubbing bare `name=value` text outside URLs in logs (R-T2): nothing
+    logs a bare request path today.
+  - R-T2: a credential under a name the rule does not know (`?p=`, `?k=`) is
+    shown until the name is added to `redact.SecretName` (one line and one
+    table row each).
+  - R-T3: the device is always an oracle: an editor who can create streams
+    tests a guessed password through a probe stream against the camera or
+    the platform; no API design removes that.
+  - R-T8: a secret in a YAML comment is masked for good by a round trip
+    through the editor; the users' hashes are readable by editors; a URL the
+    parser cannot read is shown as `xxxxx` and must be retyped.
+  - R-T9: the two distinct refusals tell someone without the passphrase
+    that a stream name is live, and the limiter is per address, so players
+    behind one NAT share it (five typos by one refuse the others' encrypted
+    requests for up to 10 s).
+  - gosrt's key-refresh retransmissions: a rare retransmission around a key
+    refresh cannot be decrypted on a lossy link. Report it upstream or patch
+    it in our wrapper.
+  - `srtout`'s limiter scans the whole table on each untracked failure once
+    it holds 4096 keys.
+  - `conform`'s SRT read quotes the raw URL when an `srt://` URL does not
+    parse (before M5c2a too).
+
 #### M3b3 deferred minors
 
 - `tsstream.Stream`'s doc comment has a stray line break.
@@ -2156,6 +2346,33 @@ branches. That is a repository setting, which no commit can change.
     offered UDP first: the 461 branch is pinned by `pkg/rtsp`'s tests;
   - a push's failure is in its status and is not logged at info, so
     `TestM5c1NoSecretsLeak` finds its x509 reason in the status only.
+
+#### M5c2a deferred minors
+
+- config (Task 4):
+  - prose after a clean URL in a comment is lost when an `@` follows on a
+    rest that does not parse;
+  - a comment URL that holds `xxxxx` is taken as masked;
+  - the UTF-16 re-encode is documented, not changed.
+- api and server (Task 6):
+  - `PutConfig` computes `Mask(stored)` again though the snapshot caches it
+    (one extra pass under the config lock);
+  - `TestPutStreamMaskRace`'s masked writers do not write: they should
+    toggle `audio_language`, so that they go through resolution and
+    `SetStream` under contention.
+- server (Task 7): `TestSRTPassphrase`'s log scan sees the default level
+  only.
+- config and spec (pre-flight F7): `config.Unmask` re-implements the
+  `srt_passphrase` mask rule and R-T4's refusal text beside
+  `spec.Stream.Unmask` (the duplication is accepted).
+- e2e (Task 8):
+  - in a scrubbed text the `:` right after a URL whose last query value is
+    hidden is swallowed (`…?user=admin&password=xxxxx rtsp: dial`), since
+    the URL token runs to the next white space; cosmetic, and so before
+    M5c2a for `?password=`;
+  - `TestM5c2aWriteOnly`'s two push ids come from two streams pushing to
+    one unreachable URL, not from cam's push: sink's listen path takes one
+    publisher.
 
 ### Carried from M1
 

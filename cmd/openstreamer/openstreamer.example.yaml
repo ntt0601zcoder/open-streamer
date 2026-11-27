@@ -72,8 +72,9 @@ server:
     level: info   # debug, info, warn, error
     format: json  # json, text
 
-# The API's users. A viewer reads; an editor reads and writes, and sees the
-# stream keys. At least one editor is needed. Make each hash with
+# The API's users. A viewer reads; an editor reads and writes. Nobody is
+# shown a secret: the API masks every one as xxxxx, and xxxxx sent back
+# keeps the stored value. At least one editor is needed. Make each hash with
 #
 #   openstreamer hash-password
 #
@@ -104,6 +105,9 @@ streams:
       rtmp: true
       rtsp: true
       srt: true
+      # The passphrase SRT players must give (10 to 79 of A-Z a-z 0-9 . _ ~ -).
+      # Quote a value with a leading zero or a dot; quoting is always safe.
+      # srt_passphrase: "replace-with-a-long-passphrase"
 
   # A stream with a ladder and a watermark needs the transcoder, and its
   # assets in assets_dir.

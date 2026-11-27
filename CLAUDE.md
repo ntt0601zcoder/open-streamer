@@ -23,7 +23,7 @@ make fixtures     # sh testdata/fixtures/gen.sh
 make tools        # install golangci-lint v2.14.0
 ```
 
-## The server (M5a, M5b1, M5c1)
+## The server (M5a, M5b1, M5c1, M5c2a)
 
 `cmd/openstreamer` is the server binary; `cmd/osdev` stays the development harness. `openstreamer -config FILE` runs it, `openstreamer hash-password` reads a password from stdin and prints its hash, `openstreamer -version` prints the version.
 
@@ -31,18 +31,18 @@ All configuration is **one YAML file** (`internal/config`; documented example: `
 
 - `version: 1`.
 - `server`: `http.listen` (default `:8080`, `/live/`), `api.listen` (default `127.0.0.1:8081`, plain: the API, `/metrics`, pprof), `rtmp.listen`/`app`, `rtsp.listen`/`app`/`udp`, `srt.listen`/`app`/`latency_ms` (empty `listen` turns a server off; `app` defaults to `live`, `latency_ms` to 120), `tls.cert_file`/`key_file` (one PEM pair for every TLS listener) and a `tls_listen` beside the `listen` of `http`, `api`, `rtmp` and `rtsp` (HTTPS, the API over HTTPS, RTMPS, RTSPS interleaved only; no default), `transcoder.binary` (default: `ostranscoder` next to the executable), `assets_dir`, `log.level` (`debug`, `info`, `warn`, `error`) and `log.format` (`json`, `text`). Never applied while running: reported as `restart_required`. The one live `server` change is the **content** of the certificate files: read again every 30 s, on SIGHUP and on `POST /api/v1/reload` (`internal/certs`; a pair that does not load keeps the one in force).
-- `users`: `name`, `role` (`viewer` reads; `editor` reads, writes, sees secrets and pprof), `password` (`pbkdf2-sha256$600000$<salt>$<key>`, exactly 600000 iterations). At least one editor, at most 64 users.
-- `streams`: `spec.Stream` documents (`name`, `disabled`, `inputs`, `layout`, `transcode`, `thumbnail`, `outputs` with `hls`, `dash`, `httpts`, `rtmp`, `rtsp`, `srt`, `push`). The `yaml` and `json` tags are equal. Over TLS: `rtmps://` (listen input on the server's RTMPS address, pull, push) and `rtsps://` (pull, TCP only) verify the peer against the system roots; `rtmps+insecure://` and `rtsps+insecure://` skip that for one URL.
+- `users`: `name`, `role` (`viewer` reads; `editor` reads, writes and gets pprof; nobody is shown a secret), `password` (`pbkdf2-sha256$600000$<salt>$<key>`, exactly 600000 iterations). At least one editor, at most 64 users.
+- `streams`: `spec.Stream` documents (`name`, `disabled`, `inputs`, `layout`, `transcode`, `thumbnail`, `outputs` with `hls`, `dash`, `httpts`, `rtmp`, `rtsp`, `srt`, `srt_passphrase`, `push`). The `yaml` and `json` tags are equal. Over TLS: `rtmps://` (listen input on the server's RTMPS address, pull, push) and `rtsps://` (pull, TCP only) verify the peer against the system roots; `rtmps+insecure://` and `rtsps+insecure://` skip that for one URL.
 
 Anchors, aliases and merge keys are refused, and every number must be a plain decimal integer.
 
 Packages of the control plane:
 
-- `internal/spec`: the stream document; `Validate`, `Redacted`, `ETag` (a keyed tag, new at every start), `Diff`.
-- `internal/config`: parse (strict; lenient for streams at start), the node-tree edits `SetStream`/`DeleteStream`, `File` (atomic write, stale detection by SHA-256).
+- `internal/spec`: the stream document; `Validate`, `Redacted`, `ETag` (a keyed tag, new at every start), `Diff`, `Unmask`. A secret field must be masked in `Redacted` and resolved in `Unmask` and `config.Unmask`.
+- `internal/config`: parse (strict; lenient for streams at start), the node-tree edits `SetStream`/`DeleteStream`, `Mask`/`Unmask` (the editor's text, masked and resolved on the bytes), `ETag` (keyed, new at every start), `File` (atomic write, stale detection by a private SHA-256).
 - `internal/auth`: PBKDF2 hashes, `Users` (verification, remembered logins), the failed-login `Limiter`.
 - `internal/stream`: `Supervisor` (one goroutine per stream, mailbox, `View`/`Status` behind atomic pointers, rebuild with backoff, no reconciler) and `Manager` (the set, `Check`, listen claims, `copy://` cycles, `Replace`, the output lookups).
-- `internal/api`: the REST API on `net/http.ServeMux`, Basic auth and roles, the hand-written `openapi.json` (kept equal to the routes and the spec by tests).
+- `internal/api`: the REST API on `net/http.ServeMux`, Basic auth and roles, the hand-written `openapi.json` (kept equal to the routes and the spec by tests). Every response is masked; the mask written back keeps the stored secret (`spec.Stream.Unmask`, `config.Unmask`).
 - `internal/metrics` (Prometheus text, `metricstest` for tests), `internal/logging` (slog with a scrubbing handler), `internal/server` (listeners, wiring, the apply path), `internal/certs` (the certificate in force, behind an atomic pointer); test certificates come from `pkg/tlstest`, never from a checked-in key.
 - `internal/asset`: the flat asset directory `server.assets_dir` (images `.png`/`.jpg`/`.jpeg`, fonts `.ttf`/`.otf`; content checks, the font probe `ostranscoder -probe font`, quota, temp-file-and-rename writes, SHA-256 ETags), served as `GET /api/v1/assets` and `GET`/`PUT`/`DELETE /api/v1/assets/{name}` (raw `application/octet-stream` body; writes are editor-only). A `PUT` refreshes every running watermark that names the asset (`Manager.RefreshAsset`); a `DELETE` of an asset a stream names is 409 `asset_in_use`.
 

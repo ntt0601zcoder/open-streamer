@@ -32,10 +32,10 @@ which documents every key. Besides `version: 1` it has three sections:
 - `streams`: one document per stream (inputs by priority, an optional
   transcode ladder and thumbnail, the outputs and the push targets).
 
-**Users and roles.** A `viewer` reads everything except secrets (streams with
-their URLs redacted, status, thumbnails, `/metrics`). An `editor` also writes,
-reads the config file and stream keys, and reaches pprof. The config needs at
-least one editor. The `password` field holds a hash, never the password:
+**Users and roles.** A `viewer` reads streams, status, thumbnails and
+`/metrics`. An `editor` also writes, reads and writes the config file through
+the API, and reaches pprof. Neither is ever shown a secret ([Secrets](#secrets)).
+The config needs at least one editor. The `password` field holds a hash, never the password:
 
 ```sh
 bin/openstreamer hash-password       # asks twice on a terminal, echo off
@@ -45,7 +45,8 @@ bin/openstreamer hash-password < password.txt          # or reads a file or a pi
 It prints `pbkdf2-sha256$600000$…`, which goes into the file as the user's
 `password`. Passwords are at least 12 bytes and never go on the command line.
 
-**File and directory.** The file holds stream keys and password hashes, so on
+**File and directory.** The file holds every stream secret in clear (URL
+passwords, stream keys, SRT passphrases) and the password hashes, so on
 Unix it must be mode 0600 or the server does not start. The server rewrites it
 when the API edits the config (a temp file in the same directory, then a
 rename), so the service user must own the file **and its directory**: keep it
@@ -103,7 +104,7 @@ curl -u ops -X PUT http://127.0.0.1:8081/api/v1/streams/cam1 \
 ```
 
 It answers 201 for a new stream and 200 for a replaced one, with the stream
-(URLs redacted) and how the edit was applied. A `PUT` of the document the
+(its secrets masked, [Secrets](#secrets)) and how the edit was applied. A `PUT` of the document the
 stream already has is `unchanged` and does not rewrite the file. An output
 whose listener is off (`rtmp`, `rtsp` or `srt` while that `server.*.listen`
 is empty) is refused with 422 `invalid_spec`: turn the output off, or set the
@@ -127,9 +128,11 @@ tags (`W/"…"`) do not match. It is optional on a stream's `PUT` and `DELETE`
 and required on the config's `PUT`. A `DELETE` with `If-Match` on a name
 that does not exist is 412, not 404: the condition is checked first.
 
-Edit the whole config in one round trip. `GET` returns the file as it is,
-comments included, with an `ETag`; `PUT` takes the whole file back with that
-`ETag` in `If-Match`, applies it and writes the bytes exactly as sent:
+Edit the whole config in one round trip. `GET` returns the file, comments
+included, with every secret masked ([Secrets](#secrets)) and an `ETag`; `PUT`
+takes the whole file back with that `ETag` in `If-Match`, puts the stored
+secret back wherever the text still holds its mask, applies it and writes
+the bytes as sent, with those masks resolved:
 
 ```sh
 curl -u ops -D headers.txt -o openstreamer.yaml http://127.0.0.1:8081/api/v1/config
@@ -265,6 +268,67 @@ TLS errors. So do not alert on its raw rate. Anything else `net/http`
 reports (a handler's panic, an accept error) is logged at error level as
 `server: media: …` or `server: api: …`.
 
+### Secrets
+
+A secret is stored in the config file and never shown again, to any role:
+no API response, log line, metric or error text holds one. The secrets are
+the credentials inside input and push URLs and each stream's
+`outputs.srt_passphrase`.
+
+**What is hidden in a URL.** Everywhere a URL is shown, these parts become
+`xxxxx`:
+
+- the password of `user:password@` (or a lone user);
+- the value of a query pair whose name is a secret name, also when the
+  value is empty: `?password=xxxxx`, `?token=xxxxx`, `?api_key=xxxxx`;
+- the value of such a pair inside a path segment or the fragment, which is
+  how many cameras take their credentials. Two Xiongmai forms:
+  `rtsp://cam/user=admin_password=S3cret_channel=1_stream=0.sdp?real_stream`
+  shows `rtsp://cam/user=admin_password=xxxxx_channel=1_stream=0.sdp?real_stream`,
+  and `rtsp://cam/x?user=admin&password=S3cret` shows
+  `rtsp://cam/x?user=admin&password=xxxxx`;
+- in an SRT `streamid`, the same pairs, and the password of MediaMTX's
+  `publish:<path>:<user>:<pass>` and `read:…`;
+- the stream key of an RTMP URL, cut to its first two characters
+  (`rtmp://host/live/abxxxxx`).
+
+A secret name is one that contains `pass`, `pwd`, `psw`, `secret`, `token`,
+`signature`, `credential`, `hmac`, `jwt`, `authorization`, `sessionid` or
+`accesskeyid`, or is `key`, `pw`, `sig`, `auth`, `authbasic`, `loginpas`,
+`hash`, `md5`, `hdnts`, `hdnea`, `wmsauthsign`, `cred` or `sid`, or ends in
+`key`, in any case. A user name is never hidden. The rule over-masks on
+purpose: `?passthrough=1` and a path `/media/pass=1/x.ts` show `xxxxx` too.
+Only what is shown changes; the server uses the URL as written. A credential
+under a name the rule does not know (`?p=`, `?k=`) is shown: report it, it is
+one line to add.
+
+**Writing with the mask.** `?secrets=1` is gone: any query with a `secrets`
+key is 400, for every role. Instead, a write that sends `xxxxx` back keeps the
+stored value, so a client edits a stream or the whole config without ever
+holding a secret: `GET`, change what you need, `PUT` it back. The mask is
+matched by the whole URL around it, in the same stream: change the host, the
+port, the user, the path or the query of a masked URL, or copy it into
+another stream, and the write is 422 ("holds the redaction mask and the stored
+stream has no one secret it stands for; send the real value"), so retype the
+whole URL with its secret. A URL the server cannot parse is shown as the bare
+`xxxxx` and must be retyped too. Two pushes to one platform whose keys look
+alike when masked (`rtmp://a.example/live/abxxxxx` twice) are resolved in
+their order, the first mask to the first stored key; a third push with a new
+key can be added beside them. Sending no secret where one was stored (a URL
+without its password, no `srt_passphrase`) removes it.
+
+**The config editor.** `GET /api/v1/config` masks the same URLs in every
+value and every comment, and every `srt_passphrase`. A secret in a comment is
+masked too, so after a round trip through the editor the comment holds
+`xxxxx` for good: the secret it held is gone from the file. The users'
+password hashes are not masked: an editor can read them. The config's `ETag`
+is a keyed tag, not a hash of the file: compute nothing from the file, and
+expect a new one after every restart (an old one gets 412; read again).
+
+**The file.** The config file holds the secrets in clear: whoever can read it
+reads them. On Unix the server refuses a file on which its group or others
+have any permission, and writes it 0600.
+
 ### Assets
 
 Watermark images and fonts are assets: regular files directly in
@@ -376,7 +440,8 @@ DASH, the first rendition elsewhere), and each rendition also as
 `cam1_<label>`. The thumbnail is an operator preview behind the API:
 `/api/v1/streams/cam1/thumbnail.jpg`. Playback needs no credentials. With TLS
 listeners the same paths play over `https://`, `rtmps://` and `rtsps://`
-([TLS](#tls)); SRT has no TLS.
+([TLS](#tls)); SRT has no TLS, but a stream's SRT output can require a
+passphrase, and is then encrypted ([The SRT passphrase](#the-srt-passphrase)).
 
 `audio_language` declares the language of a stream's audio. It is a BCP 47
 tag such as `vi` or `en-US` (a primary subtag of 2 or 3 letters, then
@@ -389,6 +454,43 @@ playlists and carry none, though their CMAF master and MPD do) and as
 media playlist with no master, so it carries no language. A stream whose
 `layout` has no audio refuses the field. Changing it is a `live` edit: the
 next master or MPD a player fetches has the new value.
+
+### The SRT passphrase
+
+`outputs.srt_passphrase` makes a stream's SRT output encrypted: a player must
+give the passphrase, and it covers every name the stream is served under, its
+renditions included. It needs `srt: true` and is 10 to 79 characters, each one
+of `A-Z a-z 0-9 . _ ~ -`: players pass it in a URL, and ffmpeg mangles `+`,
+`&` and `#` there. In the YAML file, quote a value with a leading zero or a
+dot (`"0123456789"`, `"1234567890.5"`), which YAML reads as a number
+otherwise; quoting is always safe. The key length (16, 24 or 32 bytes) is
+the player's choice.
+
+```yaml
+    outputs:
+      srt: true
+      srt_passphrase: "replace-with-a-long-passphrase"
+```
+
+Players:
+
+| Player | How |
+|---|---|
+| ffmpeg, ffplay | `ffplay 'srt://host:9999?streamid=live/cam1&passphrase=replace-with-a-long-passphrase'` (add `-pbkeylen 32` for AES-256) |
+| GStreamer | `gst-launch-1.0 srtsrc uri='srt://host:9999?streamid=live/cam1' passphrase=replace-with-a-long-passphrase ! tsdemux ! …` |
+| VLC 3 | `vlc --passphrase=replace-with-a-long-passphrase 'srt://host:9999?streamid=live/cam1'` (VLC 3's option is `--passphrase`, not `--srt-passphrase`) |
+
+A player without the passphrase is refused, and libsrt tells it "Password
+required or unexpected" (`ERROR:UNSECURE`); one with a wrong passphrase hears
+"Incorrect passphrase" (`ERROR:BADSECRET`). Both count in
+`openstreamer_output_rejected_total{output="srt",reason="secret"}`. An address
+that sends 5 wrong passphrases inside 10 s has its encrypted requests refused
+unchecked until 10 s after its first failure
+(`openstreamer_output_rejected_total{output="srt",reason="limited"}`); players
+behind one NAT share that limit. A stream without a passphrase refuses an
+encrypted request, as before. Setting, changing or removing the passphrase is
+an `outputs` edit: the stream's SRT players are disconnected and must
+reconnect with the new one, and nothing else is touched.
 
 ### Metrics and logs
 
