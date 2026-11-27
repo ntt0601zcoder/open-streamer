@@ -506,7 +506,7 @@ func (s *scan) commentLine(line string) string {
 	settled := false
 	for range 4 {
 		was := out
-		out = maskPassText(restOfLine(replaceTokens(out, s.commentToken)))
+		out = maskPassText(restOfLine(s.commentTokens(out)))
 		if settled = out == was; settled {
 			break
 		}
@@ -518,6 +518,30 @@ func (s *scan) commentLine(line string) string {
 		s.lines[line] = out
 	}
 	return out
+}
+
+// commentTokens returns a comment's line with each URL-shaped token
+// redacted (commentToken). Where a token cannot be read, the line ends
+// with redact.Invalid in its place: what follows may be the rest of a
+// secret that holds a space ("rtsp://admin:my pw@cam/s"), and a scalar
+// with such a token is hidden whole too.
+func (s *scan) commentTokens(line string) string {
+	var b strings.Builder
+	at := 0
+	for _, t := range tokens(line) {
+		r := s.commentToken(line[t.at:t.end])
+		b.WriteString(line[at:t.at])
+		b.WriteString(r)
+		at = t.end
+		if r == redact.Invalid {
+			return b.String()
+		}
+	}
+	if at == 0 {
+		return line
+	}
+	b.WriteString(line[at:])
+	return b.String()
 }
 
 // maxRests is how many URL-shaped tokens of a comment's line are judged
@@ -545,7 +569,9 @@ func restOfLine(line string) string {
 		if len(rest) == t.end-t.at {
 			continue
 		}
-		if r, hid := hidesNew(rest); hid {
+		// A tab is no part of a URL, and may be part of a secret as a
+		// space is: the rest is read with a space in its place.
+		if r, hid := hidesNew(strings.ReplaceAll(rest, "\t", " ")); hid {
 			return line[:t.at] + r
 		}
 	}
@@ -617,12 +643,15 @@ func cleanURL(p string) bool {
 func maskValue(v string) string { return maskScalar(v, false) }
 
 // maskScalar is maskValue; with url, v is the value of a url key, and one
-// that starts with a URL and does not parse as a whole is the bare mask,
-// as the stream API shows it. Anywhere else such a value is text, judged
-// by its tokens: a watermark text is not lost for beginning with a URL.
+// that does not parse as a whole is the bare mask, whatever it starts
+// with, as the stream API shows it. Anywhere else such a value is text,
+// judged by its tokens: a watermark text is not lost for holding a URL.
 func maskScalar(v string, url bool) string {
 	if !strings.Contains(v, "://") {
 		return v
+	}
+	if url && redact.URL(strings.TrimSpace(v)) == redact.Invalid {
+		return redact.Mask
 	}
 	for range 4 {
 		was := v
@@ -642,8 +671,6 @@ func maskScalar(v string, url bool) string {
 			if t, ok := nextToken(w, 0, false); ok && t.at == 0 && t.end < len(w) {
 				if r, hid := hidesNew(w); hid {
 					v = r
-				} else if url && r == w && redact.URL(w) == redact.Invalid {
-					return redact.Mask
 				}
 			}
 		}

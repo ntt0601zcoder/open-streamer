@@ -409,7 +409,10 @@ func TestMaskOddYAML(t *testing.T) {
 		for _, c := range []struct {
 			name, line, want, field string
 		}{
-			{"after other text", "      - url: see rtsp://u:pw@h/s now", "      - url: see rtsp://u:xxxxx@h/s now\n", "inputs[0].url"},
+			// Under a url key a value that is no URL as a whole is the bare
+			// mask, as the stream API shows it; under another key it is
+			// text (TestMaskWholeValue).
+			{"after other text", "      - url: see rtsp://u:pw@h/s now", "      - url: xxxxx\n", "inputs[0].url"},
 			{"glued to its key", "      - url:rtsp://u:pw@h/s", "      - url:rtsp://u:xxxxx@h/s\n", "inputs[0]"},
 			{"as a key", "      - rtsp://u:pw@h/s: x", "      - rtsp://u:xxxxx@h/s: x\n", "inputs[0]"},
 		} {
@@ -1388,6 +1391,7 @@ var fuzzURLs = []string{
 	"a://b/\u2003rtsp://admin:" + fuzzSecret + "@192.0.2.1/s",
 	"https://cdn/x.m3u8?token=AA " + fuzzSecret,
 	"rtmp://h/live/AAAA " + fuzzSecret,
+	"rtsp://admin:my " + fuzzSecret + "@cam/s",
 }
 
 // FuzzMask plants a secret URL, between white space, somewhere in a text.
@@ -1458,6 +1462,17 @@ func FuzzMask(f *testing.F) {
 			root, err := decodeNode(out)
 			if err != nil {
 				t.Fatalf("the output does not decode: %v\n%q", err, out)
+			}
+			if strings.Contains(secret, " ") && (before == "\n# " || before == " # ") && bytes.Contains(out, []byte(fuzzSecret)) && !bytes.Contains(text, []byte(fuzzSecret)) {
+				// Planted as a comment: gone, unless the place is inside a
+				// scalar after all.
+				inScalar := false
+				for _, n := range scalarNodes(root) {
+					inScalar = inScalar || strings.Contains(n.Value, fuzzSecret)
+				}
+				if !inScalar && !strings.HasPrefix(secret, "rtmp") && !strings.HasPrefix(secret, "https") {
+					t.Fatalf("the secret is in a comment\n--- text\n%q\n--- output\n%q", in, out)
+				}
 			}
 			if strings.Contains(secret, " ") {
 				// A secret that holds a space: hidden where a scalar's

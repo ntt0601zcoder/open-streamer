@@ -800,6 +800,72 @@ func TestMaskWholeValue(t *testing.T) {
 	assert.Equal(t, "# a://b c://d e://f https://c/x?token=xxxxx", restOfLine("# a://b c://d e://f https://c/x?token=xxxxx BB"))
 }
 
+// Review round 4: a comment's token that cannot be read takes the rest of
+// its line with it, and a url value that is no URL as a whole is the bare
+// mask whatever it starts with.
+func TestMaskUnreadable(t *testing.T) {
+	const tail = "R3Tzz"
+	for _, c := range []struct{ name, line, want string }{
+		{"a space in the password", "# - url: rtsp://admin:my " + tail + "@cam/s", "# - url: <invalid url>"},
+		{"a space in the password, words after", "# - url: rtsp://admin:my " + tail + "@cam/s # the door", "# - url: <invalid url>"},
+		{"a tab in the password", "# - url: rtsp://admin:my\t" + tail + "@cam/s", "# - url: <invalid url>"},
+		{"a tab in a query secret", "# - url: https://c/x.m3u8?token=AA\t" + tail, "# - url: https://c/x.m3u8?token=xxxxx"},
+		{"a tab in a streamid secret", "# - url: srt://h:9000?streamid=publish:cam:u:AA\t" + tail, "# - url: srt://h:9000?streamid=publish:cam:u:xxxxx"},
+		{"a tab in a path secret", "# - url: rtsp://h/user=a_password=AA\t" + tail + "_channel=1", "# - url: rtsp://h/user=a_password=xxxxx_channel=1"},
+		{"a bad escape, then words", "# was rtsp://admin:p%ss@cam/s and " + tail, "# was <invalid url>"},
+		{"a bad port, then the path", "# rtsp://u:pw@h:port /" + tail, "# <invalid url>"},
+		{"a token too long", "# a://h/" + strings.Repeat("y", maxToken) + " " + tail, "# <invalid url>"},
+		{"a second token that cannot be read", "# see http://h/x and rtsp://admin:my " + tail + "@cam/s", "# see http://h/x and <invalid url>"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			// As a head comment, a line comment, a foot comment, and in a
+			// comment the parser drops.
+			out := checkMask(t, head()+c.line+"\nstreams: []\n", tail)
+			assert.Equal(t, head()+c.want+"\nstreams: []\n", string(out))
+			out = checkMask(t, head()+"streams: [] "+c.line+"\n", tail)
+			assert.Equal(t, head()+"streams: [] "+c.want+"\n", string(out))
+			checkMask(t, head()+"streams: []\n"+c.line+"\n", tail)
+			checkMask(t, head()+"x: [ "+c.line+"\n  1]\n", tail)
+			assert.Equal(t, c.want, (*scan)(nil).commentLine(c.line))
+		})
+	}
+	// The line before and after it are kept.
+	out := checkMask(t, head()+"# one\n# rtsp://admin:my "+tail+"@cam/s\n# three http://h/x\nstreams: []\n", tail)
+	assert.Equal(t, head()+"# one\n# <invalid url>\n# three http://h/x\nstreams: []\n", string(out))
+
+	// A url value that is no URL as a whole.
+	for _, c := range []struct{ value, other string }{
+		{"see https://c/x.m3u8?token=AA " + advSecret, "see https://c/x.m3u8?token=xxxxx " + advSecret},
+		{"see rtsp://u:pw@h/s now", "see rtsp://u:xxxxx@h/s now"},
+		{"udp://h:1 udp://h:2", "udp://h:1 udp://h:2"},
+		{"https://c/x?token=AA\\t" + advSecret, ""},
+	} {
+		for _, q := range []string{`"`, ``} {
+			if q == "" && strings.Contains(c.value, `\`) {
+				continue
+			}
+			text := camDoc("    inputs:", "      - url: "+q+c.value+q, "    note: "+q+c.value+q)
+			// The stream is stored and left stopped; the stream API shows
+			// the bare mask for it.
+			_, skipped, err := ParseLenient([]byte(text), testOpt)
+			require.NoError(t, err)
+			require.Len(t, skipped, 1, "note is no key of a stream: the row need not run")
+			out, err := Mask([]byte(text))
+			require.NoError(t, err)
+			assert.Contains(t, string(out), "      - url: "+q+"xxxxx"+q+"\n")
+			if c.other != "" {
+				assert.Contains(t, string(out), "    note: "+q+c.other+q+"\n", "under another key it is text, judged by its tokens")
+			}
+			// The write-back of a bare mask is refused.
+			assert.Equal(t, []string{refusal("streams[0] (cam)", "inputs[0].url")}, unmaskErrors(t, oddEdit(string(out), "\n"), text))
+		}
+	}
+	assert.Equal(t, "xxxxx", maskScalar("see https://c/x.m3u8?token=AA BB", true))
+	assert.Equal(t, "xxxxx", spec.Stream{Inputs: []spec.Input{{URL: "see https://c/x.m3u8?token=AA BB"}}}.Redacted().Inputs[0].URL)
+	assert.Equal(t, "udp://h:1234\t", maskScalar("udp://h:1234\t", true), "white space around a URL is not in it")
+	assert.Equal(t, "plain text", maskScalar("plain text", true))
+}
+
 // The token finder is written out by hand: it finds what the pattern it
 // stands for finds. On ASCII white space that is the log scrub's pattern.
 func TestTokens(t *testing.T) {
