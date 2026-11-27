@@ -339,6 +339,7 @@ func TestUnmaskRefuses(t *testing.T) {
 		{"an input's mask among the pushes", &stored, func(s *Stream) {
 			s.Outputs.Push[0].URL = "rtsp://u:xxxxx@cam/s"
 		}, []string{"outputs.push[0].url"}},
+		{"a push's mask among the inputs", &stored, input(keyMask), []string{"inputs[0].url"}},
 		{"one mask for two keys", &two, func(s *Stream) {
 			s.Outputs.Push = s.Outputs.Push[:1]
 		}, []string{"outputs.push[0].url"}},
@@ -387,4 +388,48 @@ func TestUnmaskRefuses(t *testing.T) {
 			assert.NotContains(t, string(b), secret, c.name)
 		}
 	}
+}
+
+// A URL in which nothing is hidden is shown as it is stored, whatever
+// redact.URL would rewrite in it, so writing back what was read changes
+// nothing (controller ruling).
+func TestRedactedKeepsUnmaskedText(t *testing.T) {
+	for _, u := range []string{"RTSP://cam/s", "rtsp://cam/a b", "rtsp://cam/s#"} {
+		require.NotEqual(t, u, redact.URL(u), "redact.URL rewrites %s", u)
+		stored := unmaskStored()
+		stored.Inputs = append(stored.Inputs, Input{URL: u})
+		stored.Outputs.Push = append(stored.Outputs.Push, Push{URL: u})
+
+		red := stored.Redacted()
+		assert.Equal(t, u, red.Inputs[2].URL)
+		assert.Equal(t, u, red.Outputs.Push[1].URL)
+		got, err := red.Unmask(&stored)
+		require.NoError(t, err, u)
+		assert.Equal(t, stored, got, u)
+		assert.Equal(t, ChangeNone, Diff(stored, got), u)
+		assert.Equal(t, stored.ETag(), got.ETag(), u)
+	}
+
+	// A rewritten URL that hides a secret is still shown redacted, and
+	// still resolves.
+	for u, want := range map[string]string{
+		"RTSP://u:Pw-9q@cam/s":     "rtsp://u:xxxxx@cam/s",
+		"rtsp://u:Pw-9q@cam/a b":   "rtsp://u:xxxxx@cam/a%20b",
+		"RTMP://h/live/Key-7zq#":   "rtmp://h/live/Kexxxxx",
+		"rtsp://Tok-4w@cam/s":      "rtsp://xxxxx@cam/s",
+		"SRT://h:1?passphrase=A b": "srt://h:1?passphrase=xxxxx",
+	} {
+		stored := unmaskStored()
+		stored.Inputs = []Input{{URL: u}}
+		red := stored.Redacted()
+		assert.Equal(t, want, red.Inputs[0].URL)
+		got, err := red.Unmask(&stored)
+		require.NoError(t, err, want)
+		assert.Equal(t, ChangeNone, Diff(stored, got), want)
+	}
+
+	// A URL that holds the mask's text of its own, where it hides
+	// nothing, is shown as redact.URL writes it: never less redacted.
+	s := Stream{Inputs: []Input{{URL: "UDP://xxxxx:5000"}}}
+	assert.Equal(t, "udp://xxxxx:5000", s.Redacted().Inputs[0].URL)
 }

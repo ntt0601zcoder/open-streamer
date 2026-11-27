@@ -9,6 +9,7 @@ import (
 	"io"
 	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
@@ -146,7 +147,10 @@ func Decode(r io.Reader) (Stream, error) {
 }
 
 // Redacted returns a deep copy of s with every input and push URL passed
-// through redact.URL, for responses and logs. It also replaces a non-empty
+// through redact.URL, for responses. A URL in which redact.URL hides
+// nothing is shown as it is stored, not as redact.URL rewrites it (the
+// scheme in lower case, a space escaped), so that what a response shows,
+// written back, is the stored document. It also replaces a non-empty
 // SRTPassphrase by the mask, and shows a URL that redact.URL cannot parse
 // (its "<invalid url>") as the bare mask: the same view config.Mask gives
 // of it (R-T8), and one that says a value is stored.
@@ -164,12 +168,18 @@ func (s Stream) Redacted() Stream {
 	return c
 }
 
-// redactedURL is redact.URL of u, or the bare mask when redact.URL could
-// not parse u.
+// redactedURL is redact.URL of u; the bare mask when redact.URL could not
+// parse u; and u itself when redact.URL hid nothing in it. Hiding always
+// writes the mask, so a redacted form without the mask's text hides
+// nothing; a URL that holds that text of its own is shown as redact.URL
+// wrote it.
 func redactedURL(u string) string {
 	r := redact.URL(u)
-	if r == invalid && u != invalid {
+	switch {
+	case r == invalid && u != invalid:
 		return mask
+	case !strings.Contains(r, mask):
+		return u
 	}
 	return r
 }
