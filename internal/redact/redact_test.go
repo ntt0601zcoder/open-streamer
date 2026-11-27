@@ -325,6 +325,42 @@ var reviewRows = []struct{ in, want string }{
 	{"srt://h:9000?streamid=%23!::m=publish,r=cam,u=user,s=S3CR3T", "srt://h:9000?streamid=%23!::m=publish,r=cam,u=user,s=xxxxx"},
 	{"srt://h:9000?streamid=%23!::s=S3CR3T,r=cam", "srt://h:9000?streamid=%23!::s=xxxxx,r=cam"},
 	{"srt://h:9000?streamid=%23!::r=cam,password=S3CR3T", "srt://h:9000?streamid=%23!::r=cam,password=xxxxx"},
+	// An escaped '=' after a secret name hides the value on every scheme.
+	{"rtsp://h/password%3DS3CR3T", "rtsp://h/password%3Dxxxxx"},
+	{"rtsp://h/password%3dS3CR3T", "rtsp://h/password%3dxxxxx"},
+	{"rtsp://h/user%3Dadmin_password%3DS3CR3T", "rtsp://h/user%3Dadmin_password%3Dxxxxx"},
+	{"http://h/live/token%3DS3CR3T/index.m3u8", "http://h/live/token%3Dxxxxx/index.m3u8"},
+	{"srt://h:9000/x/passphrase%3DS3CR3T", "srt://h:9000/x/passphrase%3Dxxxxx"},
+	{"http://h/x?password%3DS3CR3T", "http://h/x?password%3Dxxxxx"},
+	{"http://h/x#token%3DS3CR3T", "http://h/x#token%3Dxxxxx"},
+	// An escaped '=' ends a name too, so URL of the result changes nothing.
+	{"srt://h#token%3D;_http=rtspx", "srt://h#token%3Dxxxxx_http=rtspx"},
+}
+
+// newSecretNames are the names the controller added after review round 1.
+var newSecretNames = []string{
+	"authorization", "Authorization", "cred", "credential", "credentials", "sessionid", "jsessionid", "sid",
+	"accesskeyid", "AWSAccessKeyId", "signature",
+}
+
+func TestNewSecretNames(t *testing.T) {
+	for _, n := range newSecretNames {
+		assert.True(t, SecretName(n), n)
+		for _, r := range []struct{ in, want string }{
+			{"http://h/x?a=1&" + n + "=S3CR3T", "http://h/x?a=1&" + n + "=xxxxx"},
+			{"rtsp://h/user=a_" + n + "=S3CR3T_channel=1", "rtsp://h/user=a_" + n + "=xxxxx_channel=1"},
+			{"srt://h:9000?streamid=%23!::r=cam," + n + "=S3CR3T", "srt://h:9000?streamid=%23!::r=cam," + n + "=xxxxx"},
+		} {
+			assert.Equal(t, r.want, URL(r.in), r.in)
+			assert.False(t, Masked(r.in), r.in)
+			assert.True(t, Masked(r.want), r.want)
+			assert.Equal(t, r.want, URL(r.want), r.want)
+		}
+	}
+	// Whole names only: these stay.
+	for _, n := range []string{"side", "inside", "credit", "streamid"} {
+		assert.False(t, SecretName(n), n)
+	}
 }
 
 // unchangedRows come back from URL byte for byte.

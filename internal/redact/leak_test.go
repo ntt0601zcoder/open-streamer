@@ -15,7 +15,8 @@ var leakNames = []string{
 	"password", "PASSWORD", "pass%77ord", "pwd", "psw", "pw", "pass", "passphrase", "client_secret", "access_token",
 	"hdnts", "hdnea", "wmsauthsign", "sig", "X-Amz-Signature", "X-Amz-Credential", "auth", "key", "api_key",
 	"streamkey", "loginpas", "authbasic", "jwt", "hmac", "hash", "md5", "password_b64", "token_v2", "secret_id",
-	"pass.word", "my.password", "2password", "api%5Fkey",
+	"pass.word", "my.password", "2password", "api%5Fkey", "authorization", "cred", "credentials", "sessionid",
+	"sid", "AWSAccessKeyId", "signature",
 }
 
 // leakPlaces are URL templates: %[1]s is the scheme, %[2]s the name and
@@ -26,6 +27,8 @@ var leakPlaces = []string{
 	"%[1]s://h:9/user=a_%[2]s=%[3]s_channel=1/x",
 	"%[1]s://h:9/live/user=a&%[2]s=%[3]s&channel=1",
 	"%[1]s://h:9/app/%[2]s%%3D%[3]s/streamkey",
+	"%[1]s://h:9/live/%[2]s%%3D%[3]s/x",
+	"%[1]s://h:9/x?a=1&%[2]s%%3D%[3]s",
 	"%[1]s://h:9/app/user=a%%26%[2]s=%[3]s/streamkey",
 	"%[1]s://h:9/app/a%%2F%[2]s=%[3]s/streamkey",
 	"%[1]s://h:9/x#a/%[2]s=%[3]s",
@@ -68,6 +71,8 @@ func FuzzNoSecretSurvives(f *testing.F) {
 	f.Add("x%26y=z", uint8(0), uint8(4), uint8(1))
 	f.Add("p/q;r,s", uint8(2), uint8(5), uint8(2))
 	f.Add("tlJwpbo6", uint8(0), uint8(2), uint8(0))
+	f.Add("S3CR3Tv4lue", uint8(0), uint8(5), uint8(0))  // rtsp://h:9/live/password%3D…/x
+	f.Add("S3CR3Tv4lue", uint8(34), uint8(6), uint8(5)) // http query, a new name before %3D
 	f.Fuzz(func(t *testing.T, secret string, name, place, scheme uint8) {
 		tmpl := leakPlaces[int(place)%len(leakPlaces)]
 		esc := escapeAll(secret)

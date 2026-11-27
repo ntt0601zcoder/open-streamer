@@ -48,17 +48,23 @@ const Invalid = "<invalid url>"
 
 // secretParts are the words whose presence anywhere in a name makes it a
 // secret name.
-var secretParts = []string{"pass", "pwd", "psw", "secret", "token", "signature", "credential", "hmac", "jwt"}
+var secretParts = []string{
+	"pass", "pwd", "psw", "secret", "token", "signature", "credential", "hmac", "jwt",
+	"authorization", "sessionid", "accesskeyid",
+}
 
 // secretNames are the whole names that are secret names.
 var secretNames = []string{
 	"key", "pw", "sig", "auth", "authbasic", "loginpas", "hash", "md5", "hdnts", "hdnea", "wmsauthsign",
+	"cred", "sid",
 }
 
 // SecretName reports whether name names a credential (R-T2), in any case:
-// it contains pass, pwd, psw, secret, token, signature, credential, hmac
-// or jwt; or is key, pw, sig, auth, authbasic, loginpas, hash, md5, hdnts,
-// hdnea or wmsauthsign; or ends in key. Percent-decoding is the caller's.
+// it contains pass, pwd, psw, secret, token, signature, credential, hmac,
+// jwt, authorization, sessionid or accesskeyid (AWSAccessKeyId); or is
+// key, pw, sig, auth, authbasic, loginpas, hash, md5, hdnts, hdnea,
+// wmsauthsign, cred or sid; or ends in key. Percent-decoding is the
+// caller's.
 func SecretName(name string) bool {
 	n := strings.ToLower(name)
 	for _, p := range secretParts {
@@ -97,7 +103,9 @@ func SecretName(name string) bool {
 // A name is judged apart from the pair grammar: it is the text before the
 // '=' back to the previous '=', '&', ';', ',' or '/', or to the start, and
 // it is secret when, raw or percent-decoded, it is a SecretName or ends in
-// one of SecretName's whole names after a byte that is no letter or digit. Rules 2
+// one of SecretName's whole names after a byte that is no letter or digit.
+// An escaped '=' (%3D) after a secret name hides its value too, on every
+// scheme. Rules 2
 // and 3 walk the escaped text, so an escaped separator separates nothing;
 // a name keeps its bytes. The grammar only decides where a value ends. A
 // user name is never hidden. Everything else keeps its bytes, but the
@@ -324,17 +332,18 @@ func join(x, y []span) []span {
 func querySpans(q string) []span {
 	return pieceSpans(q, '&', func(piece string) []span {
 		for e := 0; e < len(piece); e++ {
-			if piece[e] != '=' {
+			w := eqWidth(piece, e)
+			if w == 0 {
 				continue
 			}
 			n := nameBefore(piece, e)
 			switch {
 			case secretText(n):
-				return []span{{e + 1, len(piece)}}
+				return []span{{e + w, len(piece)}}
 			case strings.EqualFold(decode(n), "streamid"):
 				var out []span
-				for _, sp := range streamIDSpans(piece[e+1:]) {
-					out = append(out, span{e + 1 + sp.a, e + 1 + sp.b})
+				for _, sp := range streamIDSpans(piece[e+w:]) {
+					out = append(out, span{e + w + sp.a, e + w + sp.b})
 				}
 				return out
 			}
@@ -411,7 +420,8 @@ func spans(s, seps string, decoded bool, secret func(string) bool) []span {
 	}
 	var out []span
 	for e := 0; e < len(s); e++ {
-		if s[e] != '=' || !secret(nameBefore(s, e)) {
+		w := eqWidth(s, e)
+		if w == 0 || !secret(nameBefore(s, e)) {
 			continue
 		}
 		end := len(s)
@@ -421,16 +431,33 @@ func spans(s, seps string, decoded bool, secret func(string) bool) []span {
 				break
 			}
 		}
-		out = append(out, span{e + 1, end})
+		out = append(out, span{e + w, end})
 		e = end
 	}
 	return out
 }
 
+// eqWidth returns how many bytes of s an '=' at i takes: 1 for '=', 3 for
+// an escaped one (%3D), whose value is hidden on every scheme too, and 0
+// when s[i:] starts with neither.
+func eqWidth(s string, i int) int {
+	switch {
+	case s[i] == '=':
+		return 1
+	case s[i] == '%' && i+2 < len(s) && s[i+1] == '3' && s[i+2]|0x20 == 'd':
+		return 3
+	}
+	return 0
+}
+
 // nameBefore returns the name of the '=' at eq in s: the text before it
-// back to the previous byte of stops, or to the start.
+// back to the previous byte of stops or escaped '=' (%3D), or to the start.
 func nameBefore(s string, eq int) string {
-	return s[strings.LastIndexAny(s[:eq], stops)+1 : eq]
+	i := strings.LastIndexAny(s[:eq], stops) + 1
+	if j := max(strings.LastIndex(s[:eq], "%3D"), strings.LastIndex(s[:eq], "%3d")); j >= 0 {
+		i = max(i, j+3)
+	}
+	return s[i:eq]
 }
 
 // secretText reports whether n, raw or percent-decoded, is a SecretName,
