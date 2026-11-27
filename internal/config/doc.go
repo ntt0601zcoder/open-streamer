@@ -20,11 +20,14 @@
 // out and reported, so one bad stream cannot keep every other one offline;
 // an error anywhere else stops the start.
 //
-// Two rules are checked on the YAML node tree before anything is decoded:
+// Three rules are checked on the YAML node tree before anything is decoded:
 //
 //   - Anchors, aliases and merge keys (&a, *a, <<:) are refused. They make
 //     one entry's text depend on another place in the file, which neither
 //     the per-entry lenient decoding nor the node edits can keep whole.
+//   - The !!binary tag is refused. Its scalar is base64 of what the
+//     decoder hands on, so a URL or a passphrase written that way could
+//     not be told from its text, in a key, a value or a stream's name.
 //   - Every scalar the library resolves as a number must be a plain
 //     decimal integer. YAML converts silently (0720 is 464, 1.5 is 1,
 //     1_000 is 1000), so 0720, 0x2d0, 1_080 and 720.0 are refused. The
@@ -56,8 +59,13 @@
 // text as a response shows it: in every scalar, keys and values, each
 // URL-shaped token is shown as redact.URL shows it, a scalar holding a
 // token that does not parse is shown as the bare mask ("xxxxx"), every
-// non-empty srt_passphrase is the mask, and the URLs in comments are
-// redacted as a log line is. The users' password hashes are not hidden.
+// scalar under an srt_passphrase key (in any case, whatever its value's
+// shape) is the mask unless it is empty, a !!binary scalar is the mask,
+// and in comments the URLs are redacted as a log line is and whatever
+// follows "srt_passphrase:" or "srt_passphrase=" on a line is the mask,
+// as is a line comment beside a passphrase. A token ends at any white
+// space, ASCII or not; one longer than 4 KiB is not read and is hidden
+// whole. The users' password hashes are not hidden.
 // Unmask is the way back for a write: in each stream entry, an
 // inputs[i].url, an outputs.push[j].url or an outputs.srt_passphrase that
 // holds the mask takes the value the stored entry of the same name holds
@@ -81,7 +89,9 @@
 // value, and what follows a '#' inside a token by itself, since a comment
 // may start there. A text whose bytes still fail after one re-encoding (a
 // URL as a mapping key, read together with the colon after it) is encoded
-// once more with its URLs in double quotes. Mask does not depend on the
+// once more with its URLs in double quotes. A text in UTF-16 is always
+// re-encoded, also when it holds no secret: its bytes cannot be searched,
+// and what comes back is UTF-8. Mask does not depend on the
 // text passing Parse: anchors, aliases, merge keys and entries the lenient
 // start skipped are masked like everything else.
 //

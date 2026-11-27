@@ -1,0 +1,626 @@
+package config
+
+import (
+	"bytes"
+	"encoding/base64"
+	"fmt"
+	"math/rand/v2"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf16"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/logging"
+)
+
+// advSecret is the secret of the adversarial rows; advURL holds it as a
+// password.
+const (
+	advSecret = "S3CR3Tzz"
+	advURL    = "rtsp://admin:" + advSecret + "@192.0.2.1/s"
+)
+
+// u16 is s in UTF-16, big or little endian, with a byte order mark or
+// without.
+func u16(s string, be, bom bool) []byte {
+	var b []byte
+	put := func(v uint16) {
+		if be {
+			b = append(b, byte(v>>8), byte(v))
+		} else {
+			b = append(b, byte(v), byte(v>>8))
+		}
+	}
+	if bom {
+		put(0xFEFF)
+	}
+	for _, v := range utf16.Encode([]rune(s)) {
+		put(v)
+	}
+	return b
+}
+
+// cfg is a config with the stream entries given.
+func cfg(streams string) string { return head() + "\nstreams:\n" + streams }
+
+// advVisible are the rows whose secret Mask shows, by the rules: it is no
+// credential R-T2 knows, where it stands.
+var advVisible = map[string]string{
+	"glue outer":                 "a URL inside another URL's query value (u=) is that URL's text",
+	"no slash":                   "rtsp:admin:… has no \"://\": it is no URL-shaped token",
+	"pass elsewhere":             "a passphrase under a key that is not srt_passphrase is not known to be one",
+	"plain url glued hash":       "in a scalar, a URL after '#' is the fragment of the URL before it (R-T8)",
+	"comment rtmp glued":         "old.rtmp:// is no RTMP scheme, as in a log line",
+	"comment rtmp dropped glued": "old.rtmp:// is no RTMP scheme, as in a log line",
+}
+
+// advRows are the review's adversarial texts: a secret URL or passphrase
+// in every place and shape of YAML the reviewer tried.
+func advRows() map[string]string {
+	const (
+		SEC = advSecret
+		U   = advURL
+	)
+	return map[string]string{
+		"block plain":                     cfg("  - name: cam\n    inputs:\n      - url: " + U + "\n"),
+		"single":                          cfg("  - name: cam\n    inputs:\n      - url: '" + U + "'\n"),
+		"double":                          cfg("  - name: cam\n    inputs:\n      - url: \"" + U + "\"\n"),
+		"double esc x":                    cfg("  - name: cam\n    inputs:\n      - url: \"rtsp://admin:\\x53" + SEC[1:] + "@h/s\"\n"),
+		"double esc u":                    cfg("  - name: cam\n    inputs:\n      - url: \"rtsp://admin:\\u0053" + SEC[1:] + "@h/s\"\n"),
+		"double esc U":                    cfg("  - name: cam\n    inputs:\n      - url: \"rtsp://admin:\\U00000053" + SEC[1:] + "@h/s\"\n"),
+		"double esc tab":                  cfg("  - name: cam\n    inputs:\n      - url: \"" + U + "\\t\"\n"),
+		"double esc ://":                  cfg("  - name: cam\n    inputs:\n      - url: \"rtsp:\\x2f/admin:" + SEC + "@h/s\"\n"),
+		"double esc :":                    cfg("  - name: cam\n    inputs:\n      - url: \"rtsp\\x3a//admin:" + SEC + "@h/s\"\n"),
+		"double esc /":                    cfg("  - name: cam\n    inputs:\n      - url: \"rtsp:\\/\\/admin:" + SEC + "@h/s\"\n"),
+		"double cont":                     cfg("  - name: cam\n    inputs:\n      - url: \"rtsp://admin:S3C\\\n          R3Tzz@h/s\"\n"),
+		"double cont2":                    cfg("  - name: cam\n    inputs:\n      - url: \"rtsp:\\\n          //admin:" + SEC + "@h/s\"\n"),
+		"double fold":                     cfg("  - name: cam\n    inputs:\n      - url: \"x\n          " + U + "\n          y\"\n"),
+		"single fold":                     cfg("  - name: cam\n    inputs:\n      - url: 'x\n          " + U + "\n          y'\n"),
+		"plain multi":                     cfg("  - name: cam\n    inputs:\n      - url: x\n          " + U + "\n          y\n"),
+		"literal":                         cfg("  - name: cam\n    inputs:\n      - url: |\n          " + U + "\n"),
+		"literal keep":                    cfg("  - name: cam\n    inputs:\n      - url: |+\n          a " + U + " b\n\n"),
+		"folded":                          cfg("  - name: cam\n    inputs:\n      - url: >-\n          " + U + "\n"),
+		"folded2":                         cfg("  - name: cam\n    inputs:\n      - url: >\n          see\n          " + U + "\n          now\n"),
+		"flow":                            cfg("  - {name: cam, inputs: [{url: " + U + "}]}\n"),
+		"flow glued":                      cfg("  - {name: cam, inputs: [{url: " + U + "},{url: " + U + "x}]}\n"),
+		"flow seq scalars":                cfg("  - {name: cam, x: [" + U + "," + U + "]}\n"),
+		"json":                            `{"version": 1, "server": {"http": {"listen": "127.0.0.1:8080"}}, "streams": [{"name": "cam", "inputs": [{"url": "` + U + `"}]}]}`,
+		"json nospace":                    `{"version":1,"streams":[{"name":"cam","inputs":[{"url":"` + U + `"}]}]}`,
+		"key url":                         cfg("  - name: cam\n    " + U + ": x\n"),
+		"key url quoted":                  cfg("  - name: cam\n    \"" + U + "\": x\n"),
+		"key url flow":                    cfg("  - {name: cam, " + U + ": x}\n"),
+		"complex key":                     cfg("  - name: cam\n    ? " + U + "\n    : x\n"),
+		"complex key map":                 cfg("  - name: cam\n    ? {a: " + U + "}\n    : x\n"),
+		"complex key lit":                 cfg("  - name: cam\n    ? |\n      " + U + "\n    : x\n"),
+		"anchor scalar":                   cfg("  - name: cam\n    inputs:\n      - url: &u " + U + "\n      - url: *u\n"),
+		"anchor dq":                       cfg("  - name: cam\n    inputs:\n      - url: &u \"" + U + "\"\n      - url: *u\n"),
+		"anchor map":                      cfg("  - name: cam\n    inputs:\n      - &i {url: " + U + "}\n      - *i\n"),
+		"merge":                           cfg("  - &b\n    name: cam\n    inputs: [{url: " + U + "}]\n  - <<: *b\n    name: cam2\n"),
+		"merge inline":                    cfg("  - name: cam\n    inputs:\n      - <<: {url: " + U + "}\n"),
+		"tag str":                         cfg("  - name: cam\n    inputs:\n      - url: !!str " + U + "\n"),
+		"tag custom":                      cfg("  - name: cam\n    inputs:\n      - url: !foo " + U + "\n"),
+		"tag custom dq":                   cfg("  - name: cam\n    inputs:\n      - url: !foo \"" + U + "\"\n"),
+		"tag binary":                      cfg("  - name: cam\n    inputs:\n      - url: !!binary cnRzcDovL2FkbWluOlMzQ1IzVHp6QDE5Mi4wLjIuMS9z\n"),
+		"tag is url":                      cfg("  - name: cam\n    x: !" + U + " v\n"),
+		"tag verbatim":                    cfg("  - name: cam\n    x: !<" + U + "> v\n"),
+		"tag pct":                         cfg("  - name: cam\n    x: !rtsp://admin:%53" + SEC[1:] + "@h/s v\n"),
+		"tag on map":                      cfg("  - name: cam\n    x: !" + U + "\n      a: b\n"),
+		"tag on seq":                      cfg("  - name: cam\n    x: !" + U + " [a]\n"),
+		"tag on key":                      cfg("  - name: cam\n    !" + U + " x: v\n"),
+		"tag directive":                   "%TAG !e! rtsp://admin:" + SEC + "@h/\n---\n" + cfg("  - name: cam\n    x: !e!s v\n"),
+		"tag directive unused":            "%TAG !e! rtsp://admin:" + SEC + "@h/\n---\n" + cfg("  - name: cam\n"),
+		"tag directive glued":             "%TAG !e! tag:x,2000:" + U + "\n---\n" + cfg("  - name: cam\n    x: !e!s v\n"),
+		"comment head":                    cfg("  # old " + U + "\n  - name: cam\n"),
+		"comment line":                    cfg("  - name: cam # " + U + "\n"),
+		"comment foot":                    cfg("  - name: cam\n# " + U + "\n"),
+		"comment nospace":                 cfg("  - name: cam #" + U + "\n"),
+		"comment glued q":                 cfg("  - name: 'cam'#" + U + "\n"),
+		"comment glued dq":                cfg("  - name: \"cam\"#" + U + "\n"),
+		"comment after [":                 cfg("  - name: cam\n    inputs: [ # " + U + "\n      {url: udp://239.0.0.1:1234}]\n"),
+		"comment after [ glued":           cfg("  - name: cam\n    inputs: [#" + U + "\n      {url: udp://239.0.0.1:1234}]\n"),
+		"comment after {":                 cfg("  - { # " + U + "\n    name: cam}\n"),
+		"comment after ,":                 cfg("  - {name: cam, # " + U + "\n    inputs: [{url: udp://239.0.0.1:1234}]}\n"),
+		"comment after ,glued":            cfg("  - {name: cam,#" + U + "\n    inputs: [{url: udp://239.0.0.1:1234}]}\n"),
+		"comment after ]":                 cfg("  - {name: cam, inputs: [{url: udp://239.0.0.1:1234}]#" + U + "\n  }\n"),
+		"comment after }":                 cfg("  - {name: cam}#" + U + "\n"),
+		"comment after :":                 cfg("  - name: # " + U + "\n      cam\n"),
+		"comment after -":                 cfg("  - # " + U + "\n    name: cam\n"),
+		"comment in flow between":         cfg("  - {name: cam,\n    # " + U + "\n    inputs: [{url: udp://239.0.0.1:1234}]}\n"),
+		"comment after ?":                 cfg("  - name: cam\n    ? # " + U + "\n      a\n    : b\n"),
+		"comment after anchor":            cfg("  - name: &a # " + U + "\n      cam\n"),
+		"comment after tag":               cfg("  - name: !!str # " + U + "\n      cam\n"),
+		"comment after |":                 cfg("  - name: cam\n    x: | # " + U + "\n      text\n"),
+		"comment after >":                 cfg("  - name: cam\n    x: >- # " + U + "\n      text\n"),
+		"comment eof no nl":               cfg("  - name: cam\n") + "# " + U,
+		"comment before doc":              "# " + U + "\n---\n" + cfg("  - name: cam\n"),
+		"comment after ---":               "--- # " + U + "\n" + cfg("  - name: cam\n"),
+		"comment after ...":               cfg("  - name: cam\n") + "... # " + U + "\n",
+		"comment after ... nl":            cfg("  - name: cam\n") + "...\n# " + U + "\n",
+		"comment after directive":         "%YAML 1.1 # " + U + "\n---\n" + cfg("  - name: cam\n"),
+		"comment glued url":               cfg("  - name: cam # see:" + U + "\n"),
+		"comment glued paren":             cfg("  - name: cam # (" + U + ")\n"),
+		"comment glued quotes":            cfg("  - name: cam # \"" + U + "\",\n"),
+		"comment rtmp glued":              cfg("  - name: cam # old.rtmp://h/live/" + SEC + "\n"),
+		"comment rtmp dropped glued":      cfg("  - name: cam\n    inputs: [ # old.rtmp://h/live/" + SEC + "\n      {url: udp://239.0.0.1:1234}]\n"),
+		"comment tab":                     cfg("  - name: cam\t#\t" + U + "\n"),
+		"comment NEL":                     cfg("  - name: cam\n    inputs: [ # x\u0085#" + U + "\n      {url: udp://239.0.0.1:1234}]\n"),
+		"comment NEL2":                    cfg("  - name: cam\n    inputs: [ # x\u0085 # " + U + "\n      {url: udp://239.0.0.1:1234}]\n"),
+		"comment LS":                      cfg("  - name: cam\n    inputs: [ # a://b/\u2028# " + U + "\n      {url: udp://239.0.0.1:1234}]\n"),
+		"comment LS glued":                cfg("  - name: cam\n    inputs: [ # a://b/\u2028#" + U + "\n      {url: udp://239.0.0.1:1234}]\n"),
+		"comment CR":                      cfg("  - name: cam\n    inputs: [ # a://b/\r# " + U + "\r      {url: udp://239.0.0.1:1234}]\n"),
+		"comment nbsp":                    cfg("  - name: cam\n    inputs: [ # a://b/\u00a0" + U + "\n      {url: udp://239.0.0.1:1234}]\n"),
+		"comment vt":                      cfg("  - name: cam\n    inputs: [ # a://b/\v" + U + "\n      {url: udp://239.0.0.1:1234}]\n"),
+		"comment dq then drop":            cfg("  - {name: \"k://h\", inputs: [#" + U + "\n  {url: udp://239.0.0.1:1234}]}\n"),
+		"dq key then drop":                "{\"k://h\":[#" + U + "\n]}",
+		"sq key then drop":                "{'k://h/':[#" + U + "\n]}",
+		"plain url then drop":             "{k: [a://h/ #" + U + "\n]}",
+		"plain url glued hash":            "{k: [a://h/#" + U + "\n]}",
+		"crlf":                            strings.ReplaceAll(cfg("  # c "+U+"\n  - name: cam\n    inputs:\n      - url: "+U+" # "+U+"\n"), "\n", "\r\n"),
+		"cr only":                         strings.ReplaceAll(cfg("  # c "+U+"\n  - name: cam\n    inputs:\n      - url: "+U+" # "+U+"\n"), "\n", "\r"),
+		"bom":                             "\ufeff" + cfg("  # c "+U+"\n  - name: cam\n    inputs:\n      - url: \""+U+"\" # "+U+"\n"),
+		"tabs":                            cfg("  - name: cam\n    inputs:\n      - url:\t" + U + "\t#\t" + U + "\n"),
+		"docstart":                        "---\n" + cfg("  - name: cam\n    inputs:\n      - url: "+U+"\n") + "...\n",
+		"docend trailing comment dropped": "---\n" + cfg("  - name: cam\n") + "...\n# " + U + "\n",
+		"nonascii before":                 cfg("  - name: cam\n    x: \"ĐÀI 📺\"\n    inputs:\n      - {x: \"é📺\", url: \"" + U + "\"}\n"),
+		"nonascii same line dq":           cfg("  - name: cam\n    inputs:\n      - {x: 📺é, url: \"" + U + "\\t\", y: [ #" + U + "\n ]}\n"),
+		"pass plain":                      cfg("  - name: cam\n    outputs:\n      srt_passphrase: " + SEC + "0123\n"),
+		"pass single":                     cfg("  - name: cam\n    outputs:\n      srt_passphrase: '" + SEC + "0123'\n"),
+		"pass double":                     cfg("  - name: cam\n    outputs:\n      srt_passphrase: \"" + SEC + "0123\"\n"),
+		"pass double esc":                 cfg("  - name: cam\n    outputs:\n      srt_passphrase: \"\\x53" + SEC[1:] + "0123\"\n"),
+		"pass literal":                    cfg("  - name: cam\n    outputs:\n      srt_passphrase: |\n        " + SEC + "0123\n"),
+		"pass folded":                     cfg("  - name: cam\n    outputs:\n      srt_passphrase: >-\n        " + SEC + "0123\n"),
+		"pass multiline":                  cfg("  - name: cam\n    outputs:\n      srt_passphrase:\n        " + SEC + "0123\n"),
+		"pass flow":                       cfg("  - {name: cam, outputs: {srt_passphrase: " + SEC + "0123}}\n"),
+		"pass json":                       cfg("  - {\"name\": \"cam\", \"outputs\": {\"srt_passphrase\":\"" + SEC + "0123\"}}\n"),
+		"pass quoted key":                 cfg("  - name: cam\n    outputs:\n      \"srt_passphrase\": " + SEC + "0123\n"),
+		"pass esc key":                    cfg("  - name: cam\n    outputs:\n      \"srt\\x5fpassphrase\": " + SEC + "0123\n"),
+		"pass complex key":                cfg("  - name: cam\n    outputs:\n      ? srt_passphrase\n      : " + SEC + "0123\n"),
+		"pass anchor":                     cfg("  - name: cam\n    outputs:\n      srt_passphrase: &p " + SEC + "0123\n      x: *p\n"),
+		"pass alias":                      cfg("  - name: cam\n    x: &p " + SEC + "0123\n    outputs:\n      srt_passphrase: *p\n"),
+		"pass alias key":                  cfg("  - name: cam\n    x: &k srt_passphrase\n    outputs:\n      *k : " + SEC + "0123\n"),
+		"pass merge":                      cfg("  - name: cam\n    x: &o {srt_passphrase: " + SEC + "0123}\n    outputs:\n      <<: *o\n"),
+		"pass tagged":                     cfg("  - name: cam\n    outputs:\n      srt_passphrase: !!str " + SEC + "0123\n"),
+		"pass tagged key":                 cfg("  - name: cam\n    outputs:\n      !!str srt_passphrase: " + SEC + "0123\n"),
+		"pass null tag":                   cfg("  - name: cam\n    outputs:\n      srt_passphrase: !!null " + SEC + "0123\n"),
+		"pass custom tag":                 cfg("  - name: cam\n    outputs:\n      srt_passphrase: !x " + SEC + "0123\n"),
+		"pass seq":                        cfg("  - name: cam\n    outputs:\n      srt_passphrase: [" + SEC + "0123]\n"),
+		"pass map":                        cfg("  - name: cam\n    outputs:\n      srt_passphrase: {a: " + SEC + "0123}\n"),
+		"pass alias seq":                  cfg("  - name: cam\n    x: &p [" + SEC + "0123]\n    outputs:\n      srt_passphrase: *p\n"),
+		"pass commented":                  cfg("  - name: cam\n    outputs:\n      # srt_passphrase: " + SEC + "0123\n      hls: true\n"),
+		"pass line comment":               cfg("  - name: cam\n    outputs:\n      srt_passphrase: " + SEC + "0123 # was " + SEC + "0123\n"),
+		"pass elsewhere":                  cfg("  - name: cam\n    note: " + SEC + "0123\n    outputs:\n      srt_passphrase: " + SEC + "0123\n"),
+		"pass top level":                  head() + "\nsrt_passphrase: " + SEC + "0123\n",
+		"pass in users":                   strings.Replace(head(), "users:", "users:\n  - srt_passphrase: "+SEC+"0123", 1),
+		"pass case":                       cfg("  - name: cam\n    outputs:\n      SRT_Passphrase: " + SEC + "0123\n"),
+		"pass dup":                        cfg("  - name: cam\n    outputs:\n      srt_passphrase: " + SEC + "0123\n      srt_passphrase: " + SEC + "4567\n"),
+		"pass number":                     cfg("  - name: cam\n    outputs:\n      srt_passphrase: 1234567890\n"),
+		"unknown key url":                 cfg("  - name: cam\n    whatever: " + U + "\n"),
+		"users url":                       strings.Replace(head(), "users:", "users:\n  - name: "+U, 1),
+		"server url":                      strings.Replace(head(), "server:", "server:\n  x: "+U, 1),
+		"seq scalar":                      cfg("  - " + U + "\n"),
+		"top scalar":                      U + "\n",
+		"top seq":                         "- " + U + "\n- [" + U + "]\n",
+		"streams scalar":                  head() + "\nstreams: " + U + "\n",
+		"empty":                           "",
+		"glue outer":                      cfg("  - name: cam\n    inputs:\n      - url: http://p/x?u=" + U + "\n"),
+		"rtmp key":                        cfg("  - name: cam\n    outputs:\n      push:\n        - url: rtmp://h/live/" + SEC + "\n"),
+		"rtmp key }}":                     cfg("  - {name: cam, outputs: {push: [{url: rtmp://h/live/" + SEC + "}]}}\n"),
+		"query end":                       cfg("  - {name: cam, inputs: [{url: \"https://cdn/x.m3u8?token=" + SEC + "\"}]}\n"),
+		"upper scheme":                    cfg("  - name: cam\n    inputs:\n      - url: RTSP://admin:" + SEC + "@h/s\n"),
+		"no slash":                        cfg("  - name: cam\n    inputs:\n      - url: rtsp:admin:" + SEC + "@h/s\n"),
+	}
+}
+
+// advCheck is what holds of every adversarial text that decodes: Mask
+// does not fail, the secret is not in its output in UTF-8 or UTF-16, Mask
+// of the output is the output itself, and Unmask of it is the text.
+func advCheck(t *testing.T, name string, in []byte) {
+	t.Helper()
+	if _, err := decodeNode(in); err != nil {
+		_, err := Mask(in)
+		require.Error(t, err)
+		return
+	}
+	out, err := Mask(in)
+	require.NoError(t, err)
+	leaked := bytes.Contains(out, []byte(advSecret)) || bytes.Contains(out, u16(advSecret, false, false)) || bytes.Contains(out, u16(advSecret, true, false))
+	if _, visible := advVisible[name]; visible {
+		assert.True(t, leaked, "the row is listed as visible by the rules and is not: take it off the list")
+	} else if leaked {
+		t.Errorf("the secret is in the output\n--- text\n%s\n--- output\n%s", in, out)
+	}
+	again, err := Mask(out)
+	require.NoError(t, err)
+	assert.True(t, sameSlice(again, out), "Mask of the output is not the output")
+	back, err := Unmask(out, in)
+	require.NoError(t, err)
+	assert.Equal(t, string(in), string(back), "Unmask(Mask(t), t)")
+}
+
+func TestMaskAdversarial(t *testing.T) {
+	for name, text := range advRows() {
+		t.Run(name, func(t *testing.T) { advCheck(t, name, []byte(text)) })
+	}
+	base := cfg("  # c " + advURL + "\n  - name: cam\n    inputs:\n      - url: " + advURL + "\n    outputs:\n      srt_passphrase: " + advSecret + "0123\n")
+	for name, in := range map[string][]byte{
+		"utf16le bom":          u16(base, false, true),
+		"utf16be bom":          u16(base, true, true),
+		"utf16le no bom":       u16(base, false, false),
+		"utf16le bom, dropped": u16(cfg("  - name: cam\n    inputs: [ # "+advURL+"\n ]\n"), false, true),
+	} {
+		t.Run(name, func(t *testing.T) { advCheck(t, name, in) })
+	}
+}
+
+// C1: a scalar tagged !!binary is base64 of what the decoder reads, so its
+// text says nothing of what it holds.
+func TestBinary(t *testing.T) {
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	rows := map[string]string{
+		"a url":              cfg("  - name: cam\n    inputs:\n      - url: !!binary " + b64(advURL) + "\n"),
+		"the passphrase key": cfg("  - name: cam\n    inputs:\n      - url: udp://239.0.0.1:1234\n    outputs:\n      srt: true\n      !!binary " + b64("srt_passphrase") + ": " + advSecret + "0123\n"),
+		"a passphrase":       cfg("  - name: cam\n    inputs:\n      - url: udp://239.0.0.1:1234\n    outputs:\n      srt: true\n      srt_passphrase: !!binary " + b64(advSecret+"0123") + "\n"),
+		"a push":             cfg("  - name: cam\n    inputs:\n      - url: udp://239.0.0.1:1234\n    outputs:\n      push:\n        - url: !!binary " + b64("rtmp://h/live/"+advSecret+"0123") + "\n"),
+		"a url in JSON":      cfg("  - {\"name\": \"cam\", \"inputs\": [{\"url\": !!binary \"" + b64(advURL) + "\"}]}\n"),
+		"a name":             cfg("  - name: !!binary " + b64("cam") + "\n    inputs:\n      - url: " + advURL + "\n"),
+		"the name key":       cfg("  - !!binary " + b64("name") + ": cam\n    inputs:\n      - url: " + advURL + "\n"),
+		"a verbatim tag":     cfg("  - name: cam\n    inputs:\n      - url: !<tag:yaml.org,2002:binary> " + b64(advURL) + "\n"),
+	}
+	for name, text := range rows {
+		t.Run(name, func(t *testing.T) {
+			hidden := []string{advSecret, b64(advURL), b64(advSecret + "0123"), b64("rtmp://h/live/" + advSecret + "0123")}
+			// (a) The strict parse refuses it, and the start skips the entry.
+			_, err := Parse([]byte(text), testOpt)
+			var es Errors
+			require.ErrorAs(t, err, &es)
+			require.Len(t, es, 1)
+			assert.Regexp(t, `^streams\[0\]( \(cam\))?: line \d+: !!binary is not supported$`, es[0].Error())
+			p, skipped, err := ParseLenient([]byte(text), testOpt)
+			require.NoError(t, err)
+			assert.Empty(t, p.Doc.Streams)
+			require.Len(t, skipped, 1)
+			assert.Contains(t, skipped[0].Error(), msgBinary)
+			// (b) Mask hides it whole.
+			out := checkMask(t, text, hidden...)
+			assert.Contains(t, string(out), "xxxxx")
+			assert.NotContains(t, string(out), "!!binary")
+		})
+	}
+
+	t.Run("outside streams", func(t *testing.T) {
+		text := strings.Replace(head(), "name: ops", "name: !!binary "+b64("ops"), 1)
+		_, err := Parse([]byte(text), testOpt)
+		var es Errors
+		require.ErrorAs(t, err, &es)
+		assert.Equal(t, "line 3: !!binary is not supported", es[0].Error())
+		_, _, err = ParseLenient([]byte(text), testOpt)
+		require.ErrorContains(t, err, "line 3: !!binary is not supported")
+	})
+
+	// (c) A name in base64 is no name: a mask is not resolved through it
+	// against another stream, whatever its text or its decoded value is.
+	t.Run("a mask under a binary name", func(t *testing.T) {
+		stored := cfg("  - name: ai0w\n    inputs:\n      - url: " + advURL + "\n    outputs:\n      srt: true\n      srt_passphrase: PASS" + advSecret + "01\n" +
+			"  - name: cam\n    inputs:\n      - url: udp://239.0.0.1:1234\n")
+		masked := "    inputs:\n      - url: rtsp://admin:xxxxx@192.0.2.1/s\n    outputs:\n      srt: true\n      srt_passphrase: xxxxx\n"
+		for _, second := range []string{
+			"  - name: !!binary ai0w\n",                // the text is the other stream's name
+			"  - name: !!binary " + b64("ai0w") + "\n", // the decoded value is
+			"  - !!binary " + b64("name") + ": ai0w\n", // the key is written in base64
+			"  - !!binary name: ai0w\n",                // a key that reads name and decodes to something else
+			"  - name: &n ai0w\n",                      // not binary, and still resolved: it is a name
+		} {
+			sent := cfg("  - name: ai0w\n" + masked + second + masked)
+			out, err := Unmask([]byte(sent), []byte(stored))
+			if strings.Contains(second, "&n") {
+				require.NoError(t, err)
+				continue
+			}
+			assert.Nil(t, out)
+			var es Errors
+			require.ErrorAs(t, err, &es, second)
+			texts := make([]string, len(es))
+			for i, e := range es {
+				texts[i] = e.Error()
+			}
+			assert.Equal(t, []string{refusal("streams[1]", "inputs[0].url"), refusal("streams[1]", "outputs.srt_passphrase")}, texts, second)
+		}
+		// A url or a passphrase tagged !!binary is not resolved either.
+		for _, sent := range []string{
+			cfg("  - name: ai0w\n    inputs:\n      - url: !!binary rtsp://admin:xxxxx@192.0.2.1/s\n"),
+			cfg("  - name: ai0w\n    inputs:\n      - !!binary " + b64("url") + ": rtsp://admin:xxxxx@192.0.2.1/s\n"),
+			cfg("  - name: ai0w\n    inputs:\n      - !!binary url: rtsp://admin:xxxxx@192.0.2.1/s\n"),
+		} {
+			assert.Equal(t, []string{refusal("streams[0] (ai0w)", "inputs[0]")}, unmaskErrors(t, sent, stored))
+		}
+		sent := cfg("  - name: ai0w\n    inputs:\n      - url: udp://239.0.0.1:1\n    outputs:\n      srt: true\n      srt_passphrase: !!binary xxxxx\n")
+		out, err := Unmask([]byte(sent), []byte(stored))
+		require.NoError(t, err)
+		assert.Equal(t, sent, string(out), "left as sent: the strict parse refuses the tag")
+		_, err = Parse(out, testOpt)
+		require.ErrorContains(t, err, msgBinary)
+	})
+}
+
+// A mask behind any tag: whatever Unmask does with it, neither it nor the
+// parse after it says the secret.
+func TestUnmaskTags(t *testing.T) {
+	stored := cfg("  - name: ai0w\n    inputs:\n      - url: " + advURL + "\n    outputs:\n      srt: true\n      srt_passphrase: PASS" + advSecret + "01\n")
+	for _, tag := range []string{"!!bool", "!!timestamp", "!!null", "!!map", "!!seq", "!!merge", "!!float", "!!int", "!x", "!!set", "!!binary", "!!str"} {
+		sent := cfg("  - name: ai0w\n    inputs:\n      - url: " + tag + " rtsp://admin:xxxxx@192.0.2.1/s\n    outputs:\n      srt: true\n      srt_passphrase: " + tag + " xxxxx\n")
+		out, err := Unmask([]byte(sent), []byte(stored))
+		if err != nil {
+			assert.NotContains(t, err.Error(), advSecret, tag)
+			continue
+		}
+		if _, err := Parse(out, testOpt); err != nil {
+			assert.NotContains(t, err.Error(), advSecret, tag)
+		}
+		if _, skipped, err := ParseLenient(out, testOpt); err != nil {
+			assert.NotContains(t, err.Error(), advSecret, tag)
+		} else {
+			assert.NotContains(t, fmt.Sprint(skipped), advSecret, tag)
+		}
+	}
+}
+
+// I1: the work on one token is bounded, so Mask is linear in the text. A
+// config of the largest size made of the worst tokens is masked in a time
+// a request can wait for. The bound is loose: before the fix 40 KiB took
+// half a minute.
+func TestMaskIsLinear(t *testing.T) {
+	// The race detector makes everything some ten times slower, and it
+	// is not the timing it is there for: a quarter of the size.
+	size, bound := MaxBytes, 8*time.Second
+	if raceEnabled {
+		size, bound = MaxBytes/4, 30*time.Second
+	}
+	fill := func(line string) string {
+		text := head() + "streams:\n" + streamYAML("cam")
+		return text + strings.Repeat(line, (size-len(text))/len(line))
+	}
+	for name, line := range map[string]string{
+		"URLs after '#', a token just under the limit": "# " + strings.Repeat("a://b#", (maxToken-8)/6) + "\n",
+		"URLs after '#', a token over the limit":       "# " + strings.Repeat("a://b#", 40<<10/6) + "\n",
+		"URLs after '#', eight deep":                   "# " + strings.Repeat("a://b#", maxNested) + "x " + strings.Repeat("a://b#", maxNested+1) + "x\n",
+		"closing bytes":                                "# a://h:1" + strings.Repeat(`"`, maxTail) + " a://h:1" + strings.Repeat(`"`, maxTail+1) + "\n",
+		"a long tail of closing bytes":                 "# a://h:1" + strings.Repeat(`"]`, (maxToken-16)/2) + "\n",
+		"passphrases in comments":                      "# srt_passphrase: " + advSecret + " # srt_passphrase= x\n",
+		"secrets in comments":                          "# was " + advURL + "\n",
+		"a scalar of URLs":                             "note: " + strings.Repeat("a://b#", (maxToken-8)/6) + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			text := fill(line)
+			if strings.HasPrefix(line, "note:") {
+				text = head() + line // one key, once
+			}
+			start := time.Now()
+			out, err := Mask([]byte(text))
+			took := time.Since(start)
+			require.NoError(t, err)
+			t.Logf("%d bytes in %s", len(text), took)
+			assert.Less(t, took, bound, "%d bytes", len(text))
+			assert.NotContains(t, string(out), advSecret)
+			again, err := Mask(out)
+			require.NoError(t, err)
+			assert.True(t, sameSlice(again, out))
+		})
+	}
+
+	// Nothing is remembered between these tokens: every one is different.
+	t.Run("different tokens", func(t *testing.T) {
+		var b strings.Builder
+		b.WriteString(head())
+		for i := 0; b.Len() < size-200; i++ {
+			fmt.Fprintf(&b, "# a%d://h:1%s b%d://u:pw@h:1\"}] c%d://x#d://y#e://u:pw@h/%d\n", i, strings.Repeat("}", maxTail+1), i, i, i)
+		}
+		start := time.Now()
+		out, err := Mask([]byte(b.String()))
+		took := time.Since(start)
+		require.NoError(t, err)
+		t.Logf("%d bytes in %s", b.Len(), took)
+		assert.Less(t, took, bound, "%d bytes", b.Len())
+		assert.NotContains(t, string(out), ":pw@")
+	})
+
+	// What the bounds do to a token.
+	long := "a://h/" + strings.Repeat("x", maxToken)
+	assert.False(t, cleanToken(long))
+	assert.False(t, cleanRaw(long))
+	assert.Equal(t, "<invalid url>", maskCommentToken(long))
+	assert.Equal(t, "xxxxx", maskValue("see "+long))
+	assert.True(t, cleanToken("a://h/"+strings.Repeat("x", maxToken-6)))
+	assert.True(t, cleanToken("udp://h:1"+strings.Repeat("}", maxTail)))
+	assert.False(t, cleanToken("udp://h:1"+strings.Repeat("}", maxTail+1)))
+	assert.True(t, cleanRaw(strings.Repeat("a://b#", maxNested)))
+	assert.False(t, cleanRaw(strings.Repeat("a://b#", maxNested+1)))
+	assert.Equal(t, "<invalid url>", maskCommentToken(strings.Repeat("a://b#", maxNested)+"rtsp://u:pw@h/s"))
+	assert.Equal(t, "a://b#rtsp://u:xxxxx@h/s", maskCommentToken("a://b#rtsp://u:pw@h/s"))
+	assert.NotContains(t, maskCommentToken(strings.Repeat("a://b#", maxNested-1)+"rtsp://u:pw@h/s"), ":pw@")
+	// The prefixes that are tried: the whole, the shortest, and three more.
+	assert.True(t, cleanToken(`http://[::1]"}]`))
+	out := checkMask(t, head()+"# "+long+"\nnote: "+long+" rtsp://u:pw@h/s\n", ":pw@")
+	assert.Equal(t, head()+"# <invalid url>\nnote: xxxxx\n", string(out))
+}
+
+// I2 and the review's minor 1: a passphrase in a comment, and everything
+// under an srt_passphrase key.
+func TestMaskPassphraseText(t *testing.T) {
+	const pass = advSecret + "0123"
+	entry := func(lines ...string) string {
+		return cfg("  - name: cam\n    inputs:\n      - url: udp://239.0.0.1:1234\n    outputs:\n      srt: true\n" + strings.Join(lines, "\n") + "\n")
+	}
+	for _, c := range []struct{ name, text, want string }{
+		{"commented out", entry("      # srt_passphrase: "+pass, "      hls: true"), entry("      # srt_passphrase: xxxxx", "      hls: true")},
+		{"beside its replacement", entry("      srt_passphrase: new-0123456789 # was " + pass), entry("      srt_passphrase: xxxxx # xxxxx")},
+		{"beside its replacement, quoted", entry(`      srt_passphrase: "new-0123456789"   # was ` + pass), entry(`      srt_passphrase: "xxxxx"   # xxxxx`)},
+		{"with '=', in upper case", entry("      # SRT_PASSPHRASE = " + pass + " (old)"), entry("      # SRT_PASSPHRASE = xxxxx")},
+		{"quoted, as JSON has it", entry(`      # "srt_passphrase": "` + pass + `",`), entry(`      # "srt_passphrase": xxxxx`)},
+		{"twice on a line", entry("      hls: true # srt_passphrase: " + pass + " srt_passphrase: " + pass), entry("      hls: true # srt_passphrase: xxxxx")},
+		{"after a URL", entry("      # rtsp://u:" + pass + "@h/s srt_passphrase=" + pass), entry("      # rtsp://u:xxxxx@h/s srt_passphrase= xxxxx")},
+		{"nothing after it", entry("      # set srt_passphrase: ", "      # srt_passphrase= xxxxx"), entry("      # set srt_passphrase: ", "      # srt_passphrase= xxxxx")},
+		{"a foot comment", entry("      hls: true") + "# srt_passphrase: " + pass + "\n", entry("      hls: true") + "# srt_passphrase: xxxxx\n"},
+		{"a list", entry("      srt_passphrase: [" + pass + ", '" + pass + "']"), entry("      srt_passphrase: [xxxxx, 'xxxxx']")},
+		{"a mapping", entry("      srt_passphrase: {" + pass + ": " + pass + "}"), entry("      srt_passphrase: {xxxxx: xxxxx}")},
+		{"a block list", entry("      srt_passphrase:", "        - "+pass+" # "+pass, "        - ~"), entry("      srt_passphrase:", "        - xxxxx # xxxxx", "        - ~")},
+		{"another case", entry("      SRT_Passphrase: " + pass), entry("      SRT_Passphrase: xxxxx")},
+		{"a quoted key with an escape", entry(`      "srt\x5fpassphrase": ` + pass), entry(`      "srt\x5fpassphrase": xxxxx`)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out := checkMask(t, c.text, advSecret)
+			assert.Equal(t, c.want, string(out))
+		})
+	}
+	// CRLF line ends are kept.
+	crlf := strings.ReplaceAll(entry("      # srt_passphrase: "+pass, "      srt_passphrase: "+pass+" # was "+pass), "\n", "\r\n")
+	out := checkMask(t, crlf, advSecret)
+	assert.Equal(t, strings.ReplaceAll(entry("      # srt_passphrase: xxxxx", "      srt_passphrase: xxxxx # xxxxx"), "\n", "\r\n"), string(out))
+
+	// Shapes that cannot be written in place: hidden all the same.
+	for name, text := range map[string]string{
+		"a null tag":                 entry("      srt_passphrase: !!null " + pass),
+		"a custom tag":               entry("      srt_passphrase: !x " + pass),
+		"an aliased key":             cfg("  - name: cam\n    x: &k srt_passphrase\n    outputs:\n      *k : " + pass + "\n"),
+		"an alias of a list":         cfg("  - name: cam\n    x: &p [" + pass + "]\n    outputs:\n      srt_passphrase: *p\n"),
+		"an alias of a mapping":      cfg("  - name: cam\n    x: &p {a: {b: " + pass + "}}\n    outputs:\n      srt_passphrase: *p # " + pass + "\n"),
+		"an alias of itself":         cfg("  - name: cam\n    outputs:\n      srt_passphrase: &p [" + pass + ", *p, [[[[" + pass + "]]]]]\n"),
+		"a merge key":                cfg("  - name: cam\n    x: &o {srt_passphrase: " + pass + "}\n    outputs:\n      <<: *o\n"),
+		"a literal":                  entry("      srt_passphrase: |", "        "+pass),
+		"a comment the parser drops": entry("      push: [ # srt_passphrase: "+pass, "        {url: udp://239.0.0.9:1}]"),
+		"a dropped comment, glued":   entry("      push: [ #SRT_PASSPHRASE="+pass, "        {url: udp://239.0.0.9:1}]"),
+	} {
+		t.Run(name, func(t *testing.T) { checkMask(t, text, advSecret) })
+	}
+
+	// A scalar that reads like such a comment is kept, and Mask does not
+	// fail on it: its bytes go into double quotes, out of the scan's way.
+	for name, text := range map[string]string{
+		"single quotes": head() + "note: 'see # srt_passphrase: hello'\n",
+		"a literal":     head() + "note: |\n  see # srt_passphrase: hello\n",
+		"a plain '#'":   head() + "x: {note: a#b, srt_passphrase: [x, y]}\n",
+		"a key":         head() + "'a # srt_passphrase= hello': 1\n",
+	} {
+		t.Run("in a scalar: "+name, func(t *testing.T) {
+			out := checkMask(t, text)
+			if name != "a plain '#'" {
+				assert.Contains(t, string(out), "hello")
+			}
+		})
+	}
+	out = checkMask(t, head()+"note: \"see # srt_passphrase: hello\"\n")
+	assert.Equal(t, head()+"note: \"see # srt_passphrase: hello\"\n", string(out), "in double quotes it is left where it is")
+}
+
+// The review's minor 2: a token ends at white space that is not ASCII.
+func TestMaskUnicodeSpace(t *testing.T) {
+	for _, sp := range []string{"\u00a0", "\u3000", "\u2003", "\u202f"} {
+		out := checkMask(t, head()+"# a://b/"+sp+"rtsp://u:pw@h/s\nnote: \"a://b/"+sp+"rtsp://u:pw@h/s\"\n", ":pw@")
+		assert.Equal(t, head()+"# a://b/"+sp+"rtsp://u:xxxxx@h/s\nnote: \"a://b/"+sp+"rtsp://u:xxxxx@h/s\"\n", string(out))
+		// Dropped by the parser, found by the scan.
+		checkMask(t, head()+"x: [ # a://b/"+sp+"rtsp://u:pw@h/s\n  1]\n", ":pw@")
+	}
+	// NEL, LS and PS end a line for the parser, and a token here.
+	for _, br := range []string{"\u0085", "\u2028", "\u2029"} {
+		checkMask(t, head()+"x: [ # a://b/"+br+"# rtsp://u:pw@h/s\n  1]\nnote: \"a://b/"+br+"rtsp://u:pw@h/s\"\n", ":pw@")
+		assert.Equal(t, []string{"a://b/", "rtsp://u:pw@h/s"}, tokenStrings("a://b/"+br+"rtsp://u:pw@h/s"))
+	}
+}
+
+// tokenStrings are the URL-shaped tokens of s.
+func tokenStrings(s string) []string {
+	ts := tokens(s)
+	if len(ts) == 0 {
+		return nil
+	}
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		out[i] = s[t.at:t.end]
+	}
+	return out
+}
+
+// The token finder is written out by hand: it finds what the pattern it
+// stands for finds. On ASCII white space that is the log scrub's pattern.
+func TestTokens(t *testing.T) {
+	wide := regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s\x{85}\p{Z}]+`)
+	check := func(s string) {
+		t.Helper()
+		got, want := tokens(s), wide.FindAllStringIndex(s, -1)
+		require.Len(t, got, len(want), "%q", s)
+		for i, m := range want {
+			require.Equal(t, span{m[0], m[1]}, got[i], "%q", s)
+		}
+	}
+	for _, s := range []string{
+		"see rtsp://u:pw@h/s now", "a://b\tc://d\ne://f\rg://h\fi://j", "x a+b.c-1://h:1\"}], y", "no url", "", "://", "a://", "a:// b", "://x",
+		"1a://x", "-a://x", "a1+.-://x", "9://x", "a://b://c", "a:b://c", "a://b a://b", "x://\u00a0y", "é://x", "aé://x b\xff://\xffz", "a://\vb",
+		"a:://b", "a://://b", "+://a://b", "a:// a://b", "a://:// ", "ab://c\u3000de://f\u2028g://h\u0085i://j\u2003",
+	} {
+		check(s)
+		if !strings.ContainsAny(s, "\u00a0\u3000\u2028\u0085\u2003") {
+			assert.Equal(t, logging.URLPattern.FindAllString(s, -1), tokenStrings(s), "%q", s)
+		}
+	}
+	for _, text := range tableTexts() {
+		check(text)
+	}
+	for _, text := range advRows() {
+		check(text)
+	}
+	// Random strings over the bytes that matter.
+	r := rand.New(rand.NewPCG(7, 11))
+	const alphabet = "a:/ \n\t#b1+.-\"'\u00a0\u2028\xff"
+	for range 20000 {
+		b := make([]byte, r.IntN(24))
+		for i := range b {
+			b[i] = alphabet[r.IntN(len(alphabet))]
+		}
+		check(string(b))
+	}
+}
+
+// passRests is written out by hand too: it finds what these patterns
+// find, in ASCII case.
+func TestPassRests(t *testing.T) {
+	for _, c := range []struct {
+		s           string
+		all, hashed []string
+	}{
+		{"srt_passphrase: a", []string{" a"}, nil},
+		{"# srt_passphrase: a", []string{" a"}, []string{" a"}},
+		{"x # y SRT_Passphrase = a b # c", []string{" a b # c"}, []string{" a b # c"}},
+		{"srt_passphrase: a # srt_passphrase: b", []string{" a # srt_passphrase: b"}, []string{" b"}},
+		{"#\nsrt_passphrase: a\n# \"srt_passphrase\":\"b\",\r\n#srt_passphrase='c'", []string{" a", "\"b\",", "'c'"}, []string{"\"b\",", "'c'"}},
+		{"# srt_passphrase a, srt_passphras: b, rt_passphrase: c, srt-passphrase: d, srt_passphrase", nil, nil},
+		{"# srt_passphrase:", []string{""}, []string{""}},
+		{"# x\u2028srt_passphrase: a\u0085# srt_passphrase= b\u2029c", []string{" a", " b"}, []string{" b"}},
+		{"# \u017frt_passphrase: a", nil, nil},
+		{"_passphrase: a # srt_", nil, nil},
+	} {
+		var all, hashed []string
+		for _, r := range passRests(c.s, false) {
+			all = append(all, c.s[r.at:r.end])
+		}
+		for _, r := range passRests(c.s, true) {
+			hashed = append(hashed, c.s[r.at:r.end])
+		}
+		assert.Equal(t, c.all, all, "%q", c.s)
+		assert.Equal(t, c.hashed, hashed, "%q after a '#'", c.s)
+	}
+}
+
+// The review's minor 4: what Unmask checks of a text it encoded.
+func TestUnresolved(t *testing.T) {
+	stored := tree([]byte(secretText()))
+	require.NotNil(t, stored)
+	kept := streamsNode(stored)
+	assert.False(t, unresolved([]byte(secretText()), kept))
+	assert.True(t, unresolved([]byte(maskedText()), kept), "masks that would be resolved")
+	assert.True(t, unresolved([]byte(cfg("  - name: new\n    inputs:\n      - url: rtsp://u:xxxxx@h/s\n")), kept), "a mask that would be refused")
+	assert.True(t, unresolved([]byte("a: [\n"), kept), "not YAML")
+	assert.False(t, unresolved([]byte(head()+"# rtsp://u:xxxxx@h/s\n"), kept), "a mask where Unmask does not look")
+}

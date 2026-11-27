@@ -16,8 +16,10 @@ import (
 // URLPattern matches a URL-shaped substring: a scheme, "://" and everything
 // to the next white space. It runs to the next white space because net/url
 // accepts quotes and most punctuation in the userinfo, so stopping earlier
-// would leave the tail of a password in the log. Scrub and config.Mask
-// share it, so a log line and the config text are searched alike.
+// would leave the tail of a password in the log. White space here is
+// ASCII's. config.Mask finds the same tokens in the config text with a
+// finder of its own, which also ends a token at white space that is not
+// ASCII; a test there holds the two equal on ASCII.
 var URLPattern = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
 
 // secretKeys are the lower-cased attribute names whose values are always

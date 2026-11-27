@@ -139,6 +139,7 @@ func (e Errors) Error() string {
 const (
 	msgAnchor = "anchors, aliases and merge keys are not supported"
 	msgNumber = "write the number as a plain decimal integer, or quote it if it is text"
+	msgBinary = "!!binary is not supported"
 )
 
 // decimalRE is the only form a number may take in the config.
@@ -350,7 +351,8 @@ func (v violation) String() string { return fmt.Sprintf("line %d: %s", v.line, v
 
 // walk returns the node-tree violations under n, in document order, one
 // per line and rule. The children of skip are not visited (skip itself
-// is). numbers adds the plain-decimal rule to the anchor rule.
+// is). numbers adds the plain-decimal rule and the refusal of !!binary to
+// the anchor rule.
 func walk(n, skip *yaml.Node, numbers bool) []violation {
 	var out []violation
 	seen := map[violation]bool{}
@@ -365,6 +367,9 @@ func walk(n, skip *yaml.Node, numbers bool) []violation {
 	visit = func(n *yaml.Node) {
 		if n.Anchor != "" || n.Kind == yaml.AliasNode {
 			add(n.Line, msgAnchor)
+		}
+		if numbers && n.ShortTag() == binaryTag {
+			add(n.Line, msgBinary)
 		}
 		switch n.Kind {
 		case yaml.AliasNode:
@@ -393,13 +398,16 @@ func walk(n, skip *yaml.Node, numbers bool) []violation {
 }
 
 // entryName returns the value of a stream entry's name key, when the entry
-// is a mapping with a scalar name.
+// is a mapping with a scalar name. A name or a name key tagged !!binary is
+// no name: its text is base64 of what the decoder reads, and a mask must
+// not be resolved against another stream by it.
 func entryName(e *yaml.Node) (string, bool) {
 	if e.Kind != yaml.MappingNode {
 		return "", false
 	}
 	for i := 0; i+1 < len(e.Content); i += 2 {
-		if k, v := e.Content[i], e.Content[i+1]; k.Kind == yaml.ScalarNode && k.Value == "name" && v.Kind == yaml.ScalarNode {
+		k, v := e.Content[i], e.Content[i+1]
+		if k.Kind == yaml.ScalarNode && k.Value == "name" && v.Kind == yaml.ScalarNode && k.ShortTag() != binaryTag && v.ShortTag() != binaryTag {
 			return v.Value, true
 		}
 	}

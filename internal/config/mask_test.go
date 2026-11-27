@@ -205,12 +205,12 @@ func TestMask(t *testing.T) {
 		assert.Contains(t, out, "      srt_passphrase:\n")
 		assert.Contains(t, out, "      srt_passphrase: ~\n")
 		assert.Contains(t, out, "      srt_passphrase: xxxxx\n")
-		assert.Contains(t, out, "      srt_passphrase: \"xxxxx\" # the key\n")
+		assert.Contains(t, out, "      srt_passphrase: \"xxxxx\" # xxxxx\n")
 		assert.Contains(t, out, "      srt_passphrase: 'xxxxx'\n")
 		for _, name := range []string{"a", "b", "c", "d", "e", "f"} {
 			text = strings.Replace(text, "/live/"+name+"\n", "/live/xxxxx\n", 1)
 		}
-		text = strings.NewReplacer(": 1234567890\n", ": xxxxx\n", "quoted-0123456789", "xxxxx", "single-0123456789", "xxxxx").Replace(text)
+		text = strings.NewReplacer(": 1234567890\n", ": xxxxx\n", "quoted-0123456789", "xxxxx", "single-0123456789", "xxxxx", "# the key", "# xxxxx").Replace(text)
 		assert.Equal(t, text, out)
 	})
 
@@ -1368,6 +1368,11 @@ func FuzzMask(f *testing.F) {
 			f.Add([]byte(text), uint16(i*len(text)/4), uint8(i), uint8(i))
 		}
 	}
+	i := 0
+	for _, text := range advRows() {
+		f.Add([]byte(text), uint16(len(text)), uint8(i), uint8(i))
+		i++
+	}
 	r := rand.New(rand.NewPCG(1, 2))
 	for i := range 64 {
 		text, _ := generated(r)
@@ -1384,7 +1389,14 @@ func FuzzMask(f *testing.F) {
 		}
 		before := seps[int(sep)%len(seps)]
 		after := seps[int(sep/8)%2] // a space or a line end
-		planted := slicesConcat(text[:i], []byte(before+fuzzURLs[int(which)%len(fuzzURLs)]+after), text[i:])
+		secret := fuzzURLs[int(which)%(len(fuzzURLs)+1)%len(fuzzURLs)]
+		passphrase := int(which)%(len(fuzzURLs)+1) == len(fuzzURLs)
+		if passphrase {
+			// A passphrase commented out: hidden in a comment, kept in a
+			// scalar that only reads like one.
+			before, secret = []string{"\n# ", " # ", "\n#"}[int(sep)%3], []string{"srt_passphrase: ", "SRT_PASSPHRASE="}[int(sep/4)%2]+fuzzSecret
+		}
+		planted := slicesConcat(text[:i], []byte(before+secret+after), text[i:])
 		// Where YAML glues the planted URL to the text before it, it is no
 		// token of its own but the tail of another, as it would be in a
 		// log line, and R-T2 may find no secret in it: in double quotes
@@ -1395,7 +1407,7 @@ func FuzzMask(f *testing.F) {
 			pre = pre[j+1:]
 		}
 		glued := bytes.HasSuffix(bytes.TrimRight(text[:i], " \t\r\n"), []byte(`\`)) ||
-			(strings.HasSuffix(before, "#") && bytes.Contains(pre, []byte("://")))
+			(strings.HasSuffix(before, "#") && bytes.Contains(pre, []byte("://"))) || passphrase
 		for _, in := range [][]byte{planted, text} {
 			out, err := Mask(in)
 			if _, derr := decodeNode(in); derr != nil {
@@ -1415,11 +1427,16 @@ func FuzzMask(f *testing.F) {
 				t.Fatalf("the output does not decode: %v\n%q", err, out)
 			}
 			if bytes.Contains(out, []byte(fuzzSecret)) && !bytes.Contains(text, []byte(fuzzSecret)) {
-				inScalar := false
+				// In a scalar's value the planted URL may also follow a
+				// '#' as the fragment of a URL the bytes do not show (an
+				// escape in double quotes): the value tells.
+				inScalar, fragment := false, false
 				for _, n := range scalarNodes(root) {
+					i := strings.Index(n.Value, "#"+secret)
 					inScalar = inScalar || strings.Contains(n.Value, fuzzSecret)
+					fragment = fragment || i >= 0 && strings.Contains(n.Value[strings.LastIndexAny(n.Value[:i], " \t\r\n")+1:i], "://")
 				}
-				if !glued || !inScalar {
+				if (!glued && !fragment) || !inScalar {
 					t.Fatalf("the secret is in the output\n--- text\n%q\n--- output\n%q", in, out)
 				}
 			}
