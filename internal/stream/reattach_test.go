@@ -292,4 +292,37 @@ func TestReattachPassphrase(t *testing.T) {
 	}
 	assert.Equal(t, uint64(1), s.View().Gen)
 	assert.Zero(t, s.Status().Rebuilds)
+
+	// A ladder: the SRT sessions of every rung's hub end too, and only those.
+	lr := newRig(t)
+	fakeChild(t, &lr.env)
+	lsp := ladderSpec("720", "360")
+	ls := lr.start(lsp)
+	waitRunning(t, ls)
+	lv := ls.View()
+	rungs := []string{"cam_720", "cam_360"}
+	rungSRT := map[string]*tapper{}
+	rungOther := map[string]*tapper{}
+	for _, name := range rungs {
+		rh := lv.Single[name]
+		require.NotNil(t, rh, name)
+		rungSRT[name] = tap(t, rh, "srt "+name)
+		rungOther[name] = tap(t, rh, "rtsp "+name)
+		rungSRT[name].more(t, 5)
+	}
+	next := lsp
+	next.Outputs.SRTPassphrase = "p4-0123456789"
+	require.Equal(t, spec.ChangeOutputs, answer(t, ls.Submit(next)))
+	for _, name := range rungs {
+		require.Eventually(t, rungSRT[name].closed, waitFor, time.Millisecond, "%s: an SRT session survived the passphrase change", name)
+	}
+	for _, name := range rungs {
+		rungOther[name].more(t, 10)
+		assert.False(t, rungOther[name].closed(), "%s: another output's session ended", name)
+		fresh := tap(t, lv.Single[name], "srt "+name+" new")
+		fresh.more(t, 5)
+		assert.False(t, fresh.closed(), "%s: a new SRT session was refused after the relax", name)
+	}
+	assert.Equal(t, lv.Gen, ls.View().Gen)
+	assert.Zero(t, ls.Status().Rebuilds)
 }

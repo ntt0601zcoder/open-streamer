@@ -329,9 +329,11 @@ func hasPush(o spec.Outputs, url string) bool {
 // (R-D6), and publishes the View. The order matters; see each step.
 //
 // A changed SRT passphrase (set, changed or removed while srt stays on) ends
-// the SRT sessions subscribed when the View is published, which were
-// admitted under the old one (R-T9). A session answered before the publish
-// that subscribes after step 5 is srtout's to end: it asks Manager.SRT again
+// the SRT sessions of every hub of g, its rungs' included, that subscribed
+// before step 5 refuses "srt ": they were admitted under the old one (R-T9).
+// A session that subscribes between the publish and the relax is refused by
+// the hub (a closed Sub). Only a session answered before the publish that
+// subscribes after the relax is srtout's to end: it asks Manager.SRT again
 // once subscribed, and finds the new passphrase.
 //
 // A field added to spec.Outputs must be handled here (and in off, when it is
