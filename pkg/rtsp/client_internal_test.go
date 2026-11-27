@@ -2,6 +2,7 @@ package rtsp
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"testing"
 	"time"
@@ -80,6 +81,7 @@ func TestNewTargetTLS(t *testing.T) {
 		{"rtsps://u:p@cam:8322/s", "cam:8322", "rtsps://cam:8322/s", "cam", "u", "p"},
 		{"RTSPS://cam/s", "cam:322", "RTSPS://cam/s", "cam", "", ""},
 		{"rtsps://[::1]/s", "[::1]:322", "rtsps://[::1]/s", "::1", "", ""},
+		{"rtsps://[fe80::1%25eth0]/s", "[fe80::1%eth0]:322", "rtsps://[fe80::1%25eth0]/s", "fe80::1%eth0", "", ""},
 	} {
 		tg, err := newTarget(tc.in)
 		require.NoError(t, err, tc.in)
@@ -95,4 +97,32 @@ func TestNewTargetTLS(t *testing.T) {
 	assert.False(t, tg.secure)
 	_, err = newTarget("rtsps+insecure://cam/s")
 	assert.EqualError(t, err, "rtsp: dial: unsupported scheme")
+}
+
+// TestClientTLSServerName checks the server name an rtsps:// dial verifies:
+// the URL's host without an IPv6 zone, unless the caller's config names one;
+// the caller's config is cloned, not changed. No connection is made.
+func TestClientTLSServerName(t *testing.T) {
+	for _, tc := range []struct{ in, name string }{
+		{"rtsps://cam/s", "cam"},
+		{"rtsps://[::1]/s", "::1"},
+		{"rtsps://[fe80::1%25eth0]/s", "fe80::1"},
+		{"rtsps://127.0.0.1:8322/s", "127.0.0.1"},
+	} {
+		tg, err := newTarget(tc.in)
+		require.NoError(t, err, tc.in)
+		c := clientTLS(Config{}, tg)
+		assert.Equal(t, tc.name, c.ServerName, tc.in)
+		assert.EqualValues(t, tls.VersionTLS12, c.MinVersion, tc.in)
+
+		own := &tls.Config{MinVersion: tls.VersionTLS13}
+		c = clientTLS(Config{TLS: own}, tg)
+		assert.Equal(t, tc.name, c.ServerName, tc.in)
+		assert.EqualValues(t, tls.VersionTLS13, c.MinVersion, tc.in)
+		assert.Empty(t, own.ServerName, "%s: the caller's config is cloned", tc.in)
+	}
+	tg, err := newTarget("rtsps://[fe80::1%25eth0]/s")
+	require.NoError(t, err)
+	named := &tls.Config{ServerName: "cam.example", MinVersion: tls.VersionTLS12}
+	assert.Equal(t, "cam.example", clientTLS(Config{TLS: named}, tg).ServerName)
 }

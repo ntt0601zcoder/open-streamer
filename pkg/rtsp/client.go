@@ -355,14 +355,7 @@ func dialSession(ctx context.Context, cfg Config, tg target, udp bool) (*Client,
 // ctx and the Timeout, and returns the TLS connection; a failed handshake
 // closes raw.
 func secureConn(ctx context.Context, cfg Config, tg target, raw net.Conn) (net.Conn, error) {
-	tc := &tls.Config{MinVersion: tls.VersionTLS12}
-	if cfg.TLS != nil {
-		tc = cfg.TLS.Clone()
-	}
-	if tc.ServerName == "" {
-		tc.ServerName = tg.host
-	}
-	conn := tls.Client(raw, tc)
+	conn := tls.Client(raw, clientTLS(cfg, tg))
 	hctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
 	if err := conn.HandshakeContext(hctx); err != nil {
@@ -370,6 +363,21 @@ func secureConn(ctx context.Context, cfg Config, tg target, raw net.Conn) (net.C
 		return nil, fmt.Errorf("rtsp: dial: tls: %w", err)
 	}
 	return conn, nil
+}
+
+// clientTLS returns the client config of an rtsps:// dial: a clone of
+// Config.TLS, or a TLS 1.2 floor with none, whose ServerName defaults to the
+// URL's host. pkg/rtmp's dial is the twin of this choice.
+func clientTLS(cfg Config, tg target) *tls.Config {
+	tc := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.TLS != nil {
+		tc = cfg.TLS.Clone()
+	}
+	if tc.ServerName == "" {
+		// An IPv6 zone is no part of a name a certificate can carry.
+		tc.ServerName, _, _ = strings.Cut(tg.host, "%")
+	}
+	return tc
 }
 
 // closeGrace is how long closeConn lets a TLS connection send its
