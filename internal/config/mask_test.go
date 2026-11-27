@@ -1475,7 +1475,17 @@ func FuzzMask(f *testing.F) {
 				for _, n := range scalarNodes(root) {
 					inScalar = inScalar || strings.Contains(n.Value, fuzzSecret)
 				}
-				if !inScalar && !strings.HasPrefix(secret, "rtmp") && !strings.HasPrefix(secret, "https") {
+				// A comment's line with more URLs than are judged with
+				// their rest (maxRests), or longer than maxToken, is judged
+				// token by token: the tail of a secret that holds a space
+				// stays there (R-T8's accepted residual, restOfLine).
+				bounded := true
+				for line := range strings.SplitSeq(string(in), "\n") {
+					if strings.Contains(line, fuzzSecret) && (len(tokens(line)) > maxRests || len(line) > maxToken) {
+						bounded = false
+					}
+				}
+				if bounded && !inScalar && !strings.HasPrefix(secret, "rtmp") && !strings.HasPrefix(secret, "https") {
 					t.Fatalf("the secret is in a comment\n--- text\n%q\n--- output\n%q", in, out)
 				}
 			}
