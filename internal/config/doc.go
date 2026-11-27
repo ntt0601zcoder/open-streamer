@@ -63,9 +63,12 @@
 // shape) is the mask unless it is empty, a !!binary scalar is the mask,
 // and in comments the URLs are redacted as a log line is and whatever
 // follows "srt_passphrase:" or "srt_passphrase=" on a line is the mask,
-// as is a line comment beside a passphrase. A token ends at any white
-// space, ASCII or not; one longer than 4 KiB is not read and is hidden
-// whole. The users' password hashes are not hidden.
+// as is a line comment beside a passphrase. A token runs to the next
+// ASCII white space, as in a log line, and is judged both as that and cut
+// at white space that is not ASCII: a secret that holds such white space
+// is hidden whole, and so is a URL glued to another by it. A token longer
+// than 4 KiB is not read and is hidden whole. The users' password hashes
+// are not hidden.
 // Unmask is the way back for a write: in each stream entry, an
 // inputs[i].url, an outputs.push[j].url or an outputs.srt_passphrase that
 // holds the mask takes the value the stored entry of the same name holds

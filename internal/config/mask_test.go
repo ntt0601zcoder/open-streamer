@@ -837,7 +837,7 @@ func TestMaskNeverLeaks(t *testing.T) {
 					t.Parallel()
 					root, err := decodeNode([]byte(text))
 					require.NoError(t, err)
-					starts := lineStarts([]byte(text))
+					where := newLines([]byte(text))
 					for k, at := range scalarNodes(root) {
 						for j, s := range leakStrings {
 							// Through the node tree, in every style.
@@ -852,7 +852,7 @@ func TestMaskNeverLeaks(t *testing.T) {
 								}
 							}
 							// In the bytes, where a plain scalar is written.
-							if i := offset([]byte(text), starts, at.Line, at.Column); at.Style == 0 && at.Value != "" && i >= 0 && strings.HasPrefix(text[i:], at.Value) {
+							if i := where.offset(at.Line, at.Column); at.Style == 0 && at.Value != "" && i >= 0 && strings.HasPrefix(text[i:], at.Value) {
 								raw := []byte(text[:i] + s.text + text[i+len(at.Value):])
 								if _, err := decodeNode(raw); err == nil {
 									neverLeaks(t, raw, s.secret)
@@ -1150,9 +1150,33 @@ func TestMaskChecks(t *testing.T) {
 	text = []byte("a: &k !!str \"udp://h:1\\t\"\n")
 	assert.Equal(t, []span{{12, 25}}, quotedSpans(text, node(string(text))))
 	// Positions that point nowhere give no span.
-	assert.Equal(t, -1, offset(text, lineStarts(text), 3, 1))
-	assert.Equal(t, -1, offset(text, lineStarts(text), 1, 200))
-	assert.Equal(t, -1, offset(text, lineStarts(text), 0, 1))
+	assert.Equal(t, -1, newLines(text).offset(3, 1))
+	assert.Equal(t, -1, newLines(text).offset(1, 200))
+	assert.Equal(t, -1, newLines(text).offset(0, 1))
+	assert.Equal(t, -1, newLines(text).offset(1, 0))
+	// A column counts characters, on a line of any length, asked in any
+	// order.
+	long := []byte("ab\n" + strings.Repeat("é", 200) + "x" + strings.Repeat("𝄞", 70) + "y\nz\n")
+	where := newLines(long)
+	for _, c := range []struct{ line, column, want int }{
+		{2, 272, 3 + 400 + 1 + 280},
+		{2, 1, 3},
+		{2, 201, 403},
+		{2, 64, 3 + 126},
+		{2, 65, 3 + 128},
+		{2, 66, 3 + 130},
+		{2, 202, 404},
+		{2, 203, 408},
+		{1, 2, 1},
+		{1, 3, 2},
+		{1, 4, -1},
+		{3, 1, 3 + 400 + 1 + 280 + 2},
+		{2, 274, -1},
+		{2, 5000, -1},
+		{3, 3, -1},
+	} {
+		assert.Equal(t, c.want, where.offset(c.line, c.column), "line %d column %d", c.line, c.column)
+	}
 	_, ok := quotedSpan(text, -1)
 	assert.False(t, ok)
 	_, ok = quotedSpan([]byte(`a: "open`), 3)
@@ -1355,6 +1379,9 @@ var fuzzURLs = []string{
 	"srt://h:9000?streamid=publish:cam:u:" + fuzzSecret,
 	"rtsp://admin:p%ss" + fuzzSecret + "@cam/s",
 	"rtsp://u:" + fuzzSecret + "@h:port/s",
+	"rtsp://192.0.2.2/user=admin_password=AA\u00a0" + fuzzSecret + "_channel=1",
+	"https://cdn/x.m3u8?token=AA\u3000" + fuzzSecret,
+	"a://b/\u2003rtsp://admin:" + fuzzSecret + "@192.0.2.1/s",
 }
 
 // FuzzMask plants a secret URL, between white space, somewhere in a text.

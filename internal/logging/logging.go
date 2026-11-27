@@ -18,8 +18,9 @@ import (
 // accepts quotes and most punctuation in the userinfo, so stopping earlier
 // would leave the tail of a password in the log. White space here is
 // ASCII's. config.Mask finds the same tokens in the config text with a
-// finder of its own, which also ends a token at white space that is not
-// ASCII; a test there holds the two equal on ASCII.
+// finder of its own (a test there holds the two equal), and judges each
+// a second time cut at white space that is not ASCII, which Scrub does
+// not.
 var URLPattern = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
 
 // secretKeys are the lower-cased attribute names whose values are always

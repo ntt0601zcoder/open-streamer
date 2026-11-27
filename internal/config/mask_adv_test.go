@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/rand/v2"
+	"net/url"
 	"regexp"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/logging"
+	"github.com/ntt0601zcoder/open-streamer/internal/spec"
 )
 
 // advSecret is the secret of the adversarial rows; advURL holds it as a
@@ -56,6 +58,8 @@ var advVisible = map[string]string{
 	"plain url glued hash":       "in a scalar, a URL after '#' is the fragment of the URL before it (R-T8)",
 	"comment rtmp glued":         "old.rtmp:// is no RTMP scheme, as in a log line",
 	"comment rtmp dropped glued": "old.rtmp:// is no RTMP scheme, as in a log line",
+	"pass old after flow":        "an old passphrase in a comment that does not repeat the key, after a flow mapping: nothing says what it is",
+	"pass old dropped in list":   "the same after the bracket of a list under the key, in a comment the parser drops",
 }
 
 // advRows are the review's adversarial texts: a secret URL or passphrase
@@ -197,6 +201,8 @@ func advRows() map[string]string {
 		"pass in users":                   strings.Replace(head(), "users:", "users:\n  - srt_passphrase: "+SEC+"0123", 1),
 		"pass case":                       cfg("  - name: cam\n    outputs:\n      SRT_Passphrase: " + SEC + "0123\n"),
 		"pass dup":                        cfg("  - name: cam\n    outputs:\n      srt_passphrase: " + SEC + "0123\n      srt_passphrase: " + SEC + "4567\n"),
+		"pass old after flow":             cfg("  - {name: cam, outputs: {srt: true, srt_passphrase: new-0123456789}} # was " + SEC + "0123\n"),
+		"pass old dropped in list":        cfg("  - name: cam\n    outputs:\n      srt_passphrase: [ # " + SEC + "0123\n        new-0123456789]\n"),
 		"pass number":                     cfg("  - name: cam\n    outputs:\n      srt_passphrase: 1234567890\n"),
 		"unknown key url":                 cfg("  - name: cam\n    whatever: " + U + "\n"),
 		"users url":                       strings.Replace(head(), "users:", "users:\n  - name: "+U, 1),
@@ -411,6 +417,121 @@ func TestMaskIsLinear(t *testing.T) {
 		})
 	}
 
+	// A whole config on one line, at the spec's limits: 1000 streams of 8
+	// inputs and 8 pushes, a secret in every URL. Every scalar's position
+	// is a column on that one line.
+	full := spec.MaxStreams
+	if raceEnabled {
+		full /= 10
+	}
+	filler := strings.Repeat("y", 100)
+	oneLine := func(streams int, q, before, between string) string {
+		var b strings.Builder
+		b.WriteString("{" + q + "version" + q + ": 1, " + before + q + "streams" + q + ": [" + between)
+		for i := range streams {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "{%[1]sname%[1]s: %[1]ss%[2]d%[1]s, %[1]sinputs%[1]s: [", q, i)
+			for j := range 8 {
+				if j > 0 {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(&b, "{%[1]surl%[1]s: %[1]srtsp://admin:%[4]s-%[2]d-%[3]d@192.0.2.%[3]d:554/user=admin_password=%[4]s%[2]d_channel=%[3]d/a/rather/long/path/to/the/stream/of/camera/number/%[2]d/input/%[3]d/%[5]s%[1]s}", q, i, j, advSecret, filler)
+			}
+			b.WriteString("], " + q + "outputs" + q + ": {" + q + "srt" + q + ": true, " + q + "srt_passphrase" + q + ": " + q + advSecret + "-0123456789" + q + ", " + q + "push" + q + ": [")
+			for j := range 8 {
+				if j > 0 {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(&b, "{%[1]surl%[1]s: %[1]srtmp://platform-%[3]d.example/live/%[4]s-%[2]d-%[3]d?token=%[4]s%[2]d&a=rather&long=query&to=make&the=line&as=long&as=it&can=be&%[5]s=1%[1]s}", q, i, j, advSecret, filler)
+			}
+			b.WriteString("]}}")
+		}
+		b.WriteString("]}\n")
+		return b.String()
+	}
+	for name, c := range map[string]struct {
+		streams int
+		text    string
+	}{
+		"one line of JSON":                                {full, oneLine(full, `"`, "", "")},
+		"one line of JSON and a dropped comment":          {full, oneLine(full, `"`, "", " # was "+advURL+"\n")},
+		"one line of JSON, text that is not ASCII before": {full / 4, oneLine(full/4, `"`, `"note": "`+strings.Repeat("Trực tiếp 📺 ", 500)+`", `, "")},
+		"one line in single quotes":                       {full / 4, oneLine(full/4, "'", "", "")},
+	} {
+		streams, text := c.streams, c.text
+		t.Run(name, func(t *testing.T) {
+			_, err := decodeNode([]byte(text))
+			require.NoError(t, err)
+			start := time.Now()
+			out, err := Mask([]byte(text))
+			took := time.Since(start)
+			require.NoError(t, err)
+			t.Logf("%d bytes in %s", len(text), took)
+			assert.Less(t, took, bound, "%d bytes", len(text))
+			assert.NotContains(t, string(out), advSecret)
+			assert.Equal(t, streams*33, strings.Count(string(out), "xxxxx"), "8 inputs with two masks each, 8 pushes with two, a passphrase")
+			// An edited text back: every mask is resolved.
+			edited := strings.Replace(string(out), "{", "{ ", 1)
+			start = time.Now()
+			back, err := Unmask([]byte(edited), []byte(text))
+			took = time.Since(start)
+			require.NoError(t, err)
+			t.Logf("Unmask in %s", took)
+			assert.Less(t, took, bound)
+			assert.Equal(t, streams*33, strings.Count(string(back), advSecret))
+		})
+	}
+
+	// Unmask reads the stored entries once, however many there are and
+	// whatever their names, and resolves no list longer than a stream has.
+	t.Run("Unmask, entries of one name", func(t *testing.T) {
+		n := 40000
+		if raceEnabled {
+			n /= 10
+		}
+		var b strings.Builder
+		b.WriteString(head() + "streams:\n")
+		for i := range n {
+			fmt.Fprintf(&b, "  - {name: a, inputs: [{url: 'rtsp://u:%s%d@h/s'}], outputs: {srt_passphrase: p-%d}}\n", advSecret, i, i)
+		}
+		stored := b.String()
+		shown, err := Mask([]byte(stored))
+		require.NoError(t, err)
+		start := time.Now()
+		_, err = Unmask(append(shown, "# edited\n"...), []byte(stored))
+		took := time.Since(start)
+		t.Logf("%d bytes in %s", len(stored), took)
+		assert.Less(t, took, bound)
+		var es Errors
+		require.ErrorAs(t, err, &es)
+		require.Len(t, es, MaxErrors+1)
+		assert.Equal(t, refusal("streams[0] (a)", "inputs[0].url"), es[0].Error())
+		assert.Equal(t, refusal("streams[0] (a)", "outputs.srt_passphrase"), es[1].Error())
+		assert.Equal(t, fmt.Sprintf("and %d more", 2*n-MaxErrors), es[MaxErrors].Error())
+	})
+	t.Run("Unmask, a list longer than a stream has", func(t *testing.T) {
+		list := func(n int, password string) string {
+			var b strings.Builder
+			b.WriteString(head() + "streams:\n  - name: cam\n    inputs:\n")
+			for i := range n {
+				fmt.Fprintf(&b, "      - url: rtsp://u:%s@h/%d\n", password, i)
+			}
+			return b.String()
+		}
+		got, err := Unmask([]byte(list(maxList, "xxxxx")+"# edited\n"), []byte(list(maxList, advSecret)))
+		require.NoError(t, err)
+		assert.Equal(t, list(maxList, advSecret)+"# edited\n", string(got))
+		texts := unmaskErrors(t, list(maxList+1, "xxxxx")+"# edited\n", list(maxList+1, advSecret))
+		require.Len(t, texts, maxList+1)
+		assert.Equal(t, refusal("streams[0] (cam)", "inputs[0].url"), texts[0])
+		assert.Equal(t, refusal("streams[0] (cam)", fmt.Sprintf("inputs[%d].url", maxList)), texts[maxList])
+		// The stored list is the long one.
+		texts = unmaskErrors(t, list(1, "xxxxx")+"# edited\n", list(maxList+1, advSecret))
+		assert.Equal(t, []string{refusal("streams[0] (cam)", "inputs[0].url")}, texts)
+	})
+
 	// Nothing is remembered between these tokens: every one is different.
 	t.Run("different tokens", func(t *testing.T) {
 		var b strings.Builder
@@ -517,42 +638,91 @@ func TestMaskPassphraseText(t *testing.T) {
 
 // The review's minor 2: a token ends at white space that is not ASCII.
 func TestMaskUnicodeSpace(t *testing.T) {
-	for _, sp := range []string{"\u00a0", "\u3000", "\u2003", "\u202f"} {
+	spaces := []string{"\u00a0", "\u3000", "\u2003", "\u202f"}
+	// Two URLs glued by such white space: redact.URL reads one URL with
+	// nothing to hide, a reader sees two. The second is hidden, and the
+	// white space comes back escaped, as redact.URL writes a URL it
+	// changed.
+	for _, sp := range spaces {
 		out := checkMask(t, head()+"# a://b/"+sp+"rtsp://u:pw@h/s\nnote: \"a://b/"+sp+"rtsp://u:pw@h/s\"\n", ":pw@")
-		assert.Equal(t, head()+"# a://b/"+sp+"rtsp://u:xxxxx@h/s\nnote: \"a://b/"+sp+"rtsp://u:xxxxx@h/s\"\n", string(out))
+		esc := url.PathEscape(sp)
+		assert.Equal(t, head()+"# a://b/"+esc+"rtsp://u:xxxxx@h/s\nnote: \"a://b/"+esc+"rtsp://u:xxxxx@h/s\"\n", string(out))
 		// Dropped by the parser, found by the scan.
 		checkMask(t, head()+"x: [ # a://b/"+sp+"rtsp://u:pw@h/s\n  1]\n", ":pw@")
+		assert.False(t, cleanRaw("a://b/"+sp+"rtsp://u:pw@h/s"))
+		assert.True(t, cleanRaw("a://b/"+sp+"rtsp://h/s"))
+		assert.True(t, cleanRaw("a://b/"+esc+"rtsp://u:xxxxx@h/s"))
 	}
-	// NEL, LS and PS end a line for the parser, and a token here.
+
+	// A secret that holds such white space is one secret: the token is
+	// first redacted whole, as redact.URL and the stream API show it, so
+	// the part after the white space is not left over. Each is a live
+	// stream that passes Parse, and each mask comes back on an edit.
+	for _, sp := range spaces {
+		for _, c := range []struct{ line, want string }{
+			{"      - url: rtsp://h/user=a_password=AA" + sp + advSecret, "      - url: rtsp://h/user=a_password=xxxxx"},
+			{"      - url: \"https://c/x.m3u8?token=AA" + sp + advSecret + "\"", "      - url: \"https://c/x.m3u8?token=xxxxx\""},
+			{"      - url: rtsp://h/user=a_password=AA" + sp + advSecret + "_channel=1", "      - url: rtsp://h/user=a_password=xxxxx_channel=1"},
+			{"      - url: 'srt://h:9000?streamid=publish:cam:u:AA" + sp + advSecret + "'", "      - url: 'srt://h:9000?streamid=publish:cam:u:xxxxx'"},
+		} {
+			text := camDoc("    inputs:", c.line)
+			parseOK(t, text)
+			out := checkMask(t, text, advSecret, "AA")
+			assert.Equal(t, strings.Replace(camDoc("    inputs:", c.want), "/live/other", "/live/otxxxxx", 1), string(out))
+			got, err := Unmask([]byte(oddEdit(string(out), "\n")), []byte(text))
+			require.NoError(t, err)
+			assert.Equal(t, oddEdit(text, "\n"), string(got))
+
+			// The same line in a comment.
+			comment := head() + "# was" + strings.TrimPrefix(c.line, "      - url:") + "\n"
+			out = checkMask(t, comment, advSecret)
+			assert.NotContains(t, string(out), sp, "nothing of the secret is left after the white space")
+		}
+		// The whole and the pieces: both are redacted.
+		for _, line := range []string{"# %s\n", "note: %s\n", "note: \"%s\"\n"} {
+			both := "rtsp://h/password=AA" + sp + advSecret + "/a" + sp + "rtsp://u2:" + advSecret + "@h/b"
+			out := checkMask(t, head()+fmt.Sprintf(line, both), advSecret)
+			assert.Equal(t, head()+fmt.Sprintf(line, "rtsp://h/password=xxxxx/a"+url.PathEscape(sp)+"rtsp://u2:xxxxx@h/b"), string(out))
+		}
+	}
+
+	// NEL, LS and PS end a line for the parser, and a piece here.
 	for _, br := range []string{"\u0085", "\u2028", "\u2029"} {
 		checkMask(t, head()+"x: [ # a://b/"+br+"# rtsp://u:pw@h/s\n  1]\nnote: \"a://b/"+br+"rtsp://u:pw@h/s\"\n", ":pw@")
-		assert.Equal(t, []string{"a://b/", "rtsp://u:pw@h/s"}, tokenStrings("a://b/"+br+"rtsp://u:pw@h/s"))
+		checkMask(t, head()+"x: [ # a://b/"+br+"rtsp://u:pw@h/s: 1\n  ]\n", ":pw@")
 	}
-}
 
-// tokenStrings are the URL-shaped tokens of s.
-func tokenStrings(s string) []string {
-	ts := tokens(s)
-	if len(ts) == 0 {
-		return nil
-	}
-	out := make([]string, len(ts))
-	for i, t := range ts {
-		out[i] = s[t.at:t.end]
-	}
-	return out
+	// More pieces than are judged: hidden whole.
+	many := strings.Repeat("a://b/\u00a0", maxPieces) + "rtsp://u:pw@h/s"
+	assert.False(t, cleanRaw(many))
+	assert.Equal(t, "<invalid url>", maskCommentToken(many))
+	assert.Equal(t, "xxxxx", maskValue(many))
+	assert.True(t, cleanRaw(strings.Repeat("a://b/\u00a0", maxPieces-1)+"c://d"))
 }
 
 // The token finder is written out by hand: it finds what the pattern it
 // stands for finds. On ASCII white space that is the log scrub's pattern.
 func TestTokens(t *testing.T) {
-	wide := regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s\x{85}\p{Z}]+`)
+	narrow := regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s\x{85}\p{Z}]+`)
 	check := func(s string) {
 		t.Helper()
-		got, want := tokens(s), wide.FindAllStringIndex(s, -1)
+		// As a log line's: logging.URLPattern.
+		got, want := tokens(s), logging.URLPattern.FindAllStringIndex(s, -1)
 		require.Len(t, got, len(want), "%q", s)
 		for i, m := range want {
 			require.Equal(t, span{m[0], m[1]}, got[i], "%q", s)
+		}
+		// Cut at white space that is not ASCII too.
+		want = narrow.FindAllStringIndex(s, -1)
+		for i, at := 0, 0; ; i++ {
+			p, ok := nextToken(s, at, true)
+			if !ok {
+				require.Len(t, want, i, "%q", s)
+				break
+			}
+			require.Greater(t, len(want), i, "%q", s)
+			require.Equal(t, span{want[i][0], want[i][1]}, p, "%q", s)
+			at = p.end
 		}
 	}
 	for _, s := range []string{
@@ -561,9 +731,6 @@ func TestTokens(t *testing.T) {
 		"a:://b", "a://://b", "+://a://b", "a:// a://b", "a://:// ", "ab://c\u3000de://f\u2028g://h\u0085i://j\u2003",
 	} {
 		check(s)
-		if !strings.ContainsAny(s, "\u00a0\u3000\u2028\u0085\u2003") {
-			assert.Equal(t, logging.URLPattern.FindAllString(s, -1), tokenStrings(s), "%q", s)
-		}
 	}
 	for _, text := range tableTexts() {
 		check(text)
@@ -580,6 +747,27 @@ func TestTokens(t *testing.T) {
 			b[i] = alphabet[r.IntN(len(alphabet))]
 		}
 		check(string(b))
+	}
+
+	// The pieces of a token.
+	for _, c := range []struct {
+		tok  string
+		want []string
+		cut  bool
+	}{
+		{"a://b/c", nil, false},
+		{"a://b/é", nil, false},
+		{"a://b/\u00a0c://d\u3000x\u2028e://f", []string{"a://b/", "c://d", "e://f"}, true},
+		{"a://b/\u00a0", []string{"a://b/"}, true},
+	} {
+		ps, cut, ok := pieces(c.tok)
+		require.True(t, ok)
+		assert.Equal(t, c.cut, cut, "%q", c.tok)
+		var got []string
+		for _, p := range ps {
+			got = append(got, c.tok[p.at:p.end])
+		}
+		assert.Equal(t, c.want, got, "%q", c.tok)
 	}
 }
 

@@ -54,9 +54,11 @@ func ETag(text []byte) string {
 // still hold such a token.
 //
 // Whatever path it took, the text it returns was decoded again and holds
-// nothing Mask would hide, so Mask of it is the same text. The work is
-// linear in the text: a token is read at most a fixed number of times,
-// and one longer than 4 KiB not at all.
+// nothing Mask would hide, so Mask of it is the same text. The work grows
+// with the text's length and no faster than n log n (the changes are
+// sorted): a token is read at most a fixed number of times, one longer
+// than 4 KiB not at all, and a scalar's place on its line is found from
+// an index of the line, also when the whole config is one line.
 func Mask(text []byte) ([]byte, error) {
 	root, err := decodeNode(text)
 	if err != nil {
@@ -111,13 +113,14 @@ type change struct {
 }
 
 // nextToken finds the first URL-shaped token of s at or after from: what
-// logging.URLPattern matches in a log line (a scheme, "://" and everything
-// to the next white space), with one difference: the token also ends at
-// white space that is not ASCII (NEL, a no-break space, U+3000, LS, PS and
-// the other separators). YAML ends a line at some of them, and a reader
-// sees a gap at all of them. It is written out, not a regular expression,
+// logging.URLPattern matches in a log line, a scheme, "://" and everything
+// to the next white space. With wide false that is ASCII's white space,
+// as in a log line and as redact.URL and the stream API see a URL; with
+// wide true the token also ends at white space that is not ASCII (NEL, a
+// no-break space, U+3000, LS, PS and the other separators). A token is
+// judged both ways (pieces). It is written out, not a regular expression,
 // because it runs over the whole text several times.
-func nextToken(s string, from int) (span, bool) {
+func nextToken(s string, from int, wide bool) (span, bool) {
 	for from < len(s) {
 		i := strings.Index(s[from:], "://")
 		if i < 0 {
@@ -137,6 +140,10 @@ func nextToken(s string, from int) (span, bool) {
 		for end < len(s) {
 			r, w := rune(s[end]), 1
 			if r >= utf8.RuneSelf {
+				if !wide {
+					end++
+					continue
+				}
 				r, w = utf8.DecodeRuneInString(s[end:])
 			}
 			if tokenSpace(r) {
@@ -159,20 +166,48 @@ func schemeByte(c byte) bool {
 }
 
 // tokenSpace reports whether r ends a token: the white space of a regular
-// expression's \s, NEL, and every Unicode separator.
+// expression's \s and, beyond ASCII, NEL and every Unicode separator.
 func tokenSpace(r rune) bool {
 	switch r {
-	case ' ', '\t', '\n', '\f', '\r', 0x85:
+	case ' ', '\t', '\n', '\f', '\r':
 		return true
 	}
-	return r >= utf8.RuneSelf && unicode.Is(unicode.Z, r)
+	return r >= utf8.RuneSelf && (r == 0x85 || unicode.Is(unicode.Z, r))
+}
+
+// pieces returns the URL-shaped tokens inside tok, a token of nextToken,
+// when it is cut at white space that is not ASCII too, and whether it
+// holds any such white space. The one URL that redact.URL reads in
+// "a://b/<NBSP>rtsp://u:pw@h/s" has nothing to hide; the second of the
+// two a reader sees has. ok is false when there are more than maxPieces.
+func pieces(tok string) (ps []span, cut, ok bool) {
+	for i := 0; i < len(tok) && !cut; i++ {
+		if tok[i] >= utf8.RuneSelf {
+			r, w := utf8.DecodeRuneInString(tok[i:])
+			cut = tokenSpace(r)
+			i += w - 1
+		}
+	}
+	if !cut {
+		return nil, false, true
+	}
+	for at := 0; ; {
+		t, found := nextToken(tok, at, true)
+		if !found {
+			return ps, true, true
+		}
+		if len(ps) == maxPieces {
+			return nil, true, false
+		}
+		ps, at = append(ps, t), t.end
+	}
 }
 
 // tokens returns where the URL-shaped tokens of s are.
 func tokens(s string) []span {
 	var out []span
 	for at := 0; ; {
-		t, ok := nextToken(s, at)
+		t, ok := nextToken(s, at, false)
 		if !ok {
 			return out
 		}
@@ -257,12 +292,14 @@ func wideBreak(s string) int {
 // longer than maxToken is not read at all and hidden whole; at most
 // maxTail closing bytes are cut from a token's end, and at most tailTries
 // of the prefixes that leaves are tried; and at most maxNested URLs, each
-// after a '#' inside the one before, are judged in one token.
+// after a '#' inside the one before, are judged in one token, and at most
+// maxPieces URLs between white space that is not ASCII.
 const (
 	maxToken  = 4 << 10
 	maxTail   = 12
 	tailTries = 4
 	maxNested = 8
+	maxPieces = 8
 )
 
 // maskedComment is what a comment that is hidden whole reads.
@@ -503,32 +540,93 @@ func cleanURL(p string) bool {
 }
 
 // maskValue is a scalar's value as a response shows it: each URL-shaped
-// token with something to hide replaced by its redact.URL form, the other
-// tokens with the bytes they have, and the bare mask when redact.URL
-// cannot parse one of them or one is longer than maxToken.
+// token with something to hide replaced by its redacted form (maskToken),
+// the other tokens with the bytes they have, and the bare mask when one
+// of them cannot be read.
 func maskValue(v string) string {
 	if !strings.Contains(v, "://") {
 		return v
 	}
 	whole := false
 	out := replaceTokens(v, func(tok string) string {
-		if whole || len(tok) > maxToken {
-			whole = true
-			return tok
-		}
-		r := redact.URL(tok)
-		switch {
-		case r == redact.Invalid:
-			whole = true
-		case r != tok && strings.Contains(r, redact.Mask):
-			return r
-		}
-		return tok
+		r, ok := maskToken(tok)
+		whole = whole || !ok
+		return r
 	})
 	if whole {
 		return redact.Mask
 	}
 	return out
+}
+
+// hides reports whether r, redact.URL of tok, hid something in it. Hiding
+// always writes the mask, so a form without the mask's text hid nothing,
+// and a form equal to tok is redact.URL's own.
+func hides(r, tok string) bool {
+	return r != tok && strings.Contains(r, redact.Mask)
+}
+
+// maskToken is a scalar's URL-shaped token as a response shows it, judged
+// both ways (bothWays): each URL between white space that is not ASCII
+// goes through redact.URL (pieces), so a URL glued to another by such
+// white space is hidden; and the whole token does, as the stream API shows
+// the URL and as spec.KeepSecrets compares it, so a secret that holds such
+// white space is hidden whole and not up to it. That is repeated until
+// nothing changes: redact.URL escapes that white space in a URL it
+// changed. ok is false when the token is longer than maxToken, when
+// redact.URL cannot parse it or one of its pieces, when it has more than
+// maxPieces, or when it does not settle.
+func maskToken(tok string) (out string, ok bool) {
+	if len(tok) > maxToken {
+		return tok, false
+	}
+	strict := func(t string) (string, bool) {
+		r := redact.URL(t)
+		if r == redact.Invalid {
+			return "", false
+		}
+		if !hides(r, t) {
+			r = t
+		}
+		return r, true
+	}
+	for range 4 {
+		was := tok
+		if tok, ok = bothWays(tok, strict); !ok {
+			return was, false
+		}
+		if tok == was {
+			return tok, true
+		}
+	}
+	return tok, false
+}
+
+// bothWays redacts tok by f in each of its pieces, then as a whole. The
+// pieces come first: redacting the whole escapes the white space between
+// them, and what was a URL of its own after it would no longer be seen as
+// one. ok is false when f fails or there are more than maxPieces.
+func bothWays(tok string, f func(string) (string, bool)) (out string, ok bool) {
+	ps, cut, ok := pieces(tok)
+	if !ok {
+		return "", false
+	}
+	if cut {
+		var b strings.Builder
+		at := 0
+		for _, p := range ps {
+			r, ok := f(tok[p.at:p.end])
+			if !ok {
+				return "", false
+			}
+			b.WriteString(tok[at:p.at])
+			b.WriteString(r)
+			at = p.end
+		}
+		b.WriteString(tok[at:])
+		tok = b.String()
+	}
+	return f(tok)
 }
 
 // nested returns where the URL-shaped tokens of tok start that the scan
@@ -542,7 +640,7 @@ func nested(tok string) (starts []int, ok bool) {
 		if i < 0 {
 			return starts, true
 		}
-		m, found := nextToken(tok, at+i+1)
+		m, found := nextToken(tok, at+i+1, false)
 		if !found {
 			return starts, true
 		}
@@ -594,13 +692,14 @@ func redactTail(tok string) (out string, ok bool) {
 }
 
 // maskCommentToken is a comment's URL-shaped token as a response shows it.
-// A token the scan finds clean (cleanRaw) keeps its bytes. Otherwise each
-// URL in it that the scan judges (nested) is redacted by redactTail, the
-// innermost first, while it can still be read as a URL: redacting the one
-// around it may take its "://" away. It is redact.Invalid when the token
-// is longer than maxToken, holds more than maxNested URLs, when one of
-// them does not parse, or when the scan would still not find the result
-// clean: what a comment shows is always what the scan accepts.
+// A token the scan finds clean (cleanRaw) keeps its bytes. Otherwise it
+// is redacted both ways, as a scalar's token is (maskToken): as it is,
+// and in each URL between white space that is not ASCII, each time by
+// redactNested, until nothing changes. It is redact.Invalid when the
+// token is longer than maxToken, holds more than maxNested URLs or
+// maxPieces pieces, when one of them does not parse, or when the scan
+// would still not find the result clean: what a comment shows is always
+// what the scan accepts.
 func maskCommentToken(tok string) string {
 	return (*scan)(nil).commentToken(tok)
 }
@@ -614,17 +713,14 @@ func cleanToken(tok string) bool {
 	return len(tok) <= maxToken && prefixes(tok, cleanURL)
 }
 
-// cleanRaw is cleanToken for a token of the text or of a comment, where a
-// '#' may start a comment: the parser takes one after a closing quote, a
+// cleanNested is cleanToken for a token of the text or of a comment, where
+// a '#' may start a comment: the parser takes one after a closing quote, a
 // bracket or a comma without white space between, so the URL-shaped token
 // after the first '#' is judged by itself as well, and so on inside it
 // (nested). ('b://h'#rtsp://u:pw@h is, to redact.URL, one URL with a
 // fragment and nothing to hide.) A token with more than maxNested of them
 // is never clean.
-func cleanRaw(tok string) bool {
-	if len(tok) > maxToken {
-		return false
-	}
+func cleanNested(tok string) bool {
 	starts, ok := nested(tok)
 	if !ok {
 		return false
@@ -635,6 +731,45 @@ func cleanRaw(tok string) bool {
 		}
 	}
 	return true
+}
+
+// cleanRaw is the scan's whole rule for a token of the text or of a
+// comment: it is clean when cleanNested finds it so both as it is and in
+// each of the URLs between white space that is not ASCII (pieces). A token
+// longer than maxToken or with more than maxPieces is never clean.
+func cleanRaw(tok string) bool {
+	if len(tok) > maxToken || !cleanNested(tok) {
+		return false
+	}
+	ps, _, ok := pieces(tok)
+	if !ok {
+		return false
+	}
+	for _, p := range ps {
+		if !cleanNested(tok[p.at:p.end]) {
+			return false
+		}
+	}
+	return true
+}
+
+// redactNested redacts each URL of tok that cleanNested judges by
+// redactTail, the innermost first, while it can still be read as a URL:
+// redacting the one around it may take its "://" away. ok is false when
+// there are more than maxNested or one does not parse.
+func redactNested(tok string) (out string, ok bool) {
+	starts, ok := nested(tok)
+	if !ok {
+		return "", false
+	}
+	for _, at := range slices.Backward(starts) {
+		r, ok := redactTail(tok[at:])
+		if !ok {
+			return "", false
+		}
+		tok = tok[:at] + r
+	}
+	return tok, true
 }
 
 // scan remembers what was found of each token while one text is masked:
@@ -684,16 +819,15 @@ func (s *scan) redactToken(tok string) string {
 	if s.cleanRaw(tok) {
 		return tok
 	}
-	starts, ok := nested(tok)
-	if !ok {
-		return redact.Invalid
-	}
-	for _, at := range slices.Backward(starts) {
-		r, ok := redactTail(tok[at:])
-		if !ok {
+	for range 4 {
+		was := tok
+		var ok bool
+		if tok, ok = bothWays(tok, redactNested); !ok {
 			return redact.Invalid
 		}
-		tok = tok[:at] + r
+		if tok == was {
+			break
+		}
 	}
 	if !s.cleanRaw(tok) {
 		return redact.Invalid
@@ -761,12 +895,12 @@ type span struct{ at, end int }
 // themselves, are the node's value: then they hold nothing the value does
 // not, wherever the node's position was taken from.
 func quotedSpans(text []byte, root *yaml.Node) []span {
-	starts := lineStarts(text)
+	at := newLines(text)
 	var out []span
 	var visit func(n *yaml.Node)
 	visit = func(n *yaml.Node) {
 		if n.Kind == yaml.ScalarNode && n.Style&yaml.DoubleQuotedStyle != 0 && hidable(n.Value) {
-			if s, ok := quotedSpan(text, offset(text, starts, n.Line, n.Column)); ok {
+			if s, ok := quotedSpan(text, at.offset(n.Line, n.Column)); ok {
 				var v string
 				if yaml.Unmarshal(text[s.at:s.end], &v) == nil && v == n.Value {
 					out = append(out, s)
@@ -842,21 +976,66 @@ func lineStarts(text []byte) []int {
 	return starts
 }
 
-// offset returns where a node's Line and Column, which count characters
-// from 1, point in text; -1 when they point nowhere.
-func offset(text []byte, starts []int, line, column int) int {
-	if line < 1 || line > len(starts) || column < 1 {
+// lines finds where a node's Line and Column point in a text. A column
+// counts characters, so a line that is not ASCII is indexed once, the
+// first time a position on it is asked for: finding each of the thousands
+// of scalars of a config written on one line by walking the line from its
+// start would be quadratic.
+type lines struct {
+	text   []byte
+	starts []int
+	// marks holds, for each line asked about, the offset of every
+	// markEvery-th character; nil for a line that is ASCII, where a
+	// character is a byte.
+	marks map[int][]int
+}
+
+const markEvery = 64
+
+func newLines(text []byte) *lines {
+	return &lines{text: text, starts: lineStarts(text), marks: make(map[int][]int)}
+}
+
+// offset returns where line and column, which count from 1, point in the
+// text; -1 when they point nowhere.
+func (l *lines) offset(line, column int) int {
+	if line < 1 || line > len(l.starts) || column < 1 {
 		return -1
 	}
-	i := starts[line-1]
-	for range column - 1 {
-		if i >= len(text) {
+	at, end := l.starts[line-1], len(l.text)
+	if line < len(l.starts) {
+		end = l.starts[line]
+	}
+	marks, ok := l.marks[line]
+	if !ok {
+		ascii := true
+		for i := at; i < end && ascii; i++ {
+			ascii = l.text[i] < utf8.RuneSelf
+		}
+		if !ascii {
+			for i, n := at, 0; i < end; n++ {
+				if n%markEvery == 0 {
+					marks = append(marks, i)
+				}
+				_, w := utf8.DecodeRune(l.text[i:end])
+				i += w
+			}
+		}
+		l.marks[line] = marks
+	}
+	i := at + column - 1
+	if marks != nil {
+		k := (column - 1) / markEvery
+		if k >= len(marks) {
 			return -1
 		}
-		_, w := utf8.DecodeRune(text[i:])
-		i += w
+		i = marks[k]
+		for n := k * markEvery; n < column-1 && i < end; n++ {
+			_, w := utf8.DecodeRune(l.text[i:end])
+			i += w
+		}
 	}
-	if i >= len(text) {
+	if i >= end || i >= len(l.text) {
 		return -1
 	}
 	return i
@@ -958,9 +1137,9 @@ func (m *masker) patch(text []byte) (out []byte, ok bool) {
 // the text's order; ok is false when one cannot be written in place or two
 // overlap.
 func scalarPatches(text []byte, changes []change) (patches []patch, ok bool) {
-	starts := lineStarts(text)
+	at := newLines(text)
 	for _, c := range changes {
-		p, ok := scalarPatch(text, offset(text, starts, c.n.Line, c.n.Column), c)
+		p, ok := scalarPatch(text, at.offset(c.n.Line, c.n.Column), c)
 		if !ok {
 			return nil, false
 		}
@@ -1182,16 +1361,27 @@ func resolve(seq, stored *yaml.Node) (changes []change, refused []error) {
 	if seq == nil {
 		return nil, nil
 	}
+	// The stored entries' places by name, read once: a text may hold any
+	// number of entries, of one name too.
+	kept := make(map[string]*secrets)
+	if stored != nil {
+		for _, e := range stored.Content {
+			if name, ok := entryName(e); ok {
+				if kept[name] == nil {
+					kept[name] = new(secrets)
+				}
+				kept[name].add(e)
+			}
+		}
+	}
 	for i, e := range seq.Content {
 		if e.Kind != yaml.MappingNode {
 			continue
 		}
 		var old secrets
-		if name, ok := entryName(e); ok && stored != nil {
-			for _, s := range stored.Content {
-				if n, ok := entryName(s); ok && n == name {
-					old.add(s)
-				}
+		if name, ok := entryName(e); ok {
+			if s := kept[name]; s != nil {
+				old = *s
 			}
 		}
 		var now secrets
@@ -1200,6 +1390,20 @@ func resolve(seq, stored *yaml.Node) (changes []change, refused []error) {
 			refused = append(refused, errors.New(entryRef(i, e)+": "+spec.MaskRefusal(field)))
 		}
 		keep := func(list string, sent, stored []item) {
+			if len(sent) > maxList || len(stored) > maxList {
+				// No stream has so many: nothing is resolved, and the
+				// work stays linear in the text.
+				for j, it := range sent {
+					field := list + "[" + strconv.Itoa(j) + "]"
+					switch {
+					case it.stray:
+						refuse(field)
+					case it.url == redact.Mask || redact.Masked(it.url):
+						refuse(field + ".url")
+					}
+				}
+				return
+			}
 			urls := make([]string, len(sent))
 			for j, it := range sent {
 				urls[j] = it.url
@@ -1242,6 +1446,11 @@ func resolve(seq, stored *yaml.Node) (changes []change, refused []error) {
 	return changes, refused
 }
 
+// maxList is the longest inputs or outputs.push list, of a sent entry or
+// of the stored entries of its name together, that Unmask resolves. The
+// spec allows far fewer in a stream.
+const maxList = 64
+
 // item is one entry of an inputs or outputs.push list, as KeepSecrets
 // takes it.
 type item struct {
@@ -1268,7 +1477,9 @@ func (s *secrets) add(e *yaml.Node) {
 		if s.passphrase == nil {
 			s.passphrase = p
 		}
-		if v := scalarText(p); v != "" && !slices.Contains(s.passphrases, v) {
+		// Two different ones are as good as any number: the mask then
+		// stands for no one of them.
+		if v := scalarText(p); v != "" && len(s.passphrases) < 2 && !slices.Contains(s.passphrases, v) {
 			s.passphrases = append(s.passphrases, v)
 		}
 	}
