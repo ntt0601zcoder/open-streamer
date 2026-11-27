@@ -1392,6 +1392,9 @@ var fuzzURLs = []string{
 	"https://cdn/x.m3u8?token=AA " + fuzzSecret,
 	"rtmp://h/live/AAAA " + fuzzSecret,
 	"rtsp://admin:my " + fuzzSecret + "@cam/s",
+	"rtsp://admin:8554 " + fuzzSecret + "@192.0.2.1:554/s",
+	"rtmp://h/live/AAAA " + fuzzSecret + " 100%",
+	"rtsp://h/user=a_password=AA " + fuzzSecret + "_channel=1 at 50% zoom",
 }
 
 // FuzzMask plants a secret URL, between white space, somewhere in a text.

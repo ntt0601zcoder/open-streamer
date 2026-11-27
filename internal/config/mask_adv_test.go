@@ -791,7 +791,7 @@ func TestMaskWholeValue(t *testing.T) {
 		"rtsp://u:pw@h/s":            true,
 		"udp://h:1 udp://h:2":        false,
 	} {
-		_, hid := hidesNew(v)
+		_, hid, _ := hidesNew(v)
 		assert.Equal(t, want, hid, v)
 	}
 	// More tokens on a comment's line than are judged with its rest, or a
@@ -971,4 +971,86 @@ func TestUnresolved(t *testing.T) {
 	assert.True(t, unresolved([]byte(cfg("  - name: new\n    inputs:\n      - url: rtsp://u:xxxxx@h/s\n")), kept), "a mask that would be refused")
 	assert.True(t, unresolved([]byte("a: [\n"), kept), "not YAML")
 	assert.False(t, unresolved([]byte(head()+"# rtsp://u:xxxxx@h/s\n"), kept), "a mask where Unmask does not look")
+}
+
+// Review round 5: a comment's token that reads, followed by text that does
+// not read as the URL's rest. The line ends with the token when what
+// follows holds an '@' or the token had something hidden in it; otherwise
+// the words stay.
+func TestMaskUnreadableRest(t *testing.T) {
+	for _, c := range []struct {
+		name, line, want string
+		secrets          []string
+	}{
+		{
+			"a space in a numeric password", "# - url: rtsp://admin:1234 5678@cam/s",
+			"# - url: rtsp://admin:1234",
+			[]string{"5678"},
+		},
+		{
+			"a space in a password that starts as a port", "# - url: rtsp://admin:8554 R3Tzz@192.0.2.1:554/s",
+			"# - url: rtsp://admin:8554",
+			[]string{"R3Tzz"},
+		},
+		{
+			"a path secret with a space, then words", "# rtsp://h/user=a_password=AA R3Tzz_channel=1 at 50% zoom",
+			"# rtsp://h/user=a_password=xxxxx",
+			[]string{"R3Tzz"},
+		},
+		{
+			"an RTMP key with a space, then words", "# rtmp://h/live/AAAA R3Tzz 100%",
+			"# rtmp://h/live/AAxxxxx",
+			[]string{"R3Tzz"},
+		},
+		{
+			"a tab in a numeric password", "# - url: rtsp://admin:1234\t5678@cam/s",
+			"# - url: rtsp://admin:1234",
+			[]string{"5678"},
+		},
+		{
+			"a second token, its rest with an '@'", "# see http://h/x or rtsp://admin:1234 5678@cam/s",
+			"# see http://h/x or rtsp://admin:1234",
+			[]string{"5678"},
+		},
+		{
+			"an already masked token, then words", "# rtmp://h/live/AAxxxxx R3Tzz 100%",
+			"# rtmp://h/live/AAxxxxx",
+			[]string{"R3Tzz"},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			// As a head comment, a line comment, a foot comment, and in a
+			// comment the parser drops.
+			out := checkMask(t, head()+c.line+"\nstreams: []\n", c.secrets...)
+			assert.Equal(t, head()+c.want+"\nstreams: []\n", string(out))
+			out = checkMask(t, head()+"streams: [] "+c.line+"\n", c.secrets...)
+			assert.Equal(t, head()+"streams: [] "+c.want+"\n", string(out))
+			checkMask(t, head()+"streams: []\n"+c.line+"\n", c.secrets...)
+			checkMask(t, head()+"x: [ "+c.line+"\n  1]\n", c.secrets...)
+			assert.Equal(t, c.want, (*scan)(nil).commentLine(c.line))
+			assert.Equal(t, c.want, (*scan)(nil).commentLine(c.want))
+		})
+	}
+
+	// Nothing hidden and no '@': the words stay, and the text is the same slice.
+	for _, line := range []string{
+		"# see http://h/x for 100% details",
+		"# udp://239.0.0.1:1234 at 50% load",
+		"# mail ops@example.org about http://h/x at 100% load",
+	} {
+		assert.Equal(t, line, restOfLine(line))
+		assert.Equal(t, line, (*scan)(nil).commentLine(line))
+		text := []byte(head() + line + "\nstreams: []\n")
+		out, err := Mask(text)
+		require.NoError(t, err)
+		assert.Same(t, &text[0], &out[0], line)
+		assert.Equal(t, string(text), string(out))
+	}
+
+	// The bounds hold: more tokens than maxRests, or a longer line, is
+	// judged token by token.
+	many := "# a://b c://d e://f g://h rtmp://h/live/AAxxxxx tail 100%"
+	assert.Equal(t, many, restOfLine(many))
+	long := "# rtmp://h/live/AAxxxxx tail 100% " + strings.Repeat("y", maxToken)
+	assert.Equal(t, long, restOfLine(long))
 }

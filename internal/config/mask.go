@@ -553,9 +553,13 @@ const maxRests = 4
 // the line. When redact.URL hides something in that (hidesNew) which it
 // did not hide in the token alone, the rest of the line is replaced by
 // redact.URL's form. So "# - url: https://c/x?token=AA BB" loses BB, as
-// the scalar it was does. The cost is prose: the words after an RTMP URL
-// or a query secret go with it. A line longer than maxToken, or with more
-// tokens, is judged token by token only.
+// the scalar it was does. When that text cannot be read as a URL, the line
+// ends with the token if what follows it may be the rest of a secret: it
+// holds an '@' ("rtsp://admin:12 34@cam/s", whose token reads as a host and
+// a port), or the token had something hidden in it (it carries the mask),
+// as an unreadable token ends its line (commentTokens). The cost is prose:
+// the words after an RTMP URL or a query secret go with it. A line longer
+// than maxToken, or with more tokens, is judged token by token only.
 func restOfLine(line string) string {
 	if len(line) > maxToken {
 		return line
@@ -571,24 +575,31 @@ func restOfLine(line string) string {
 		}
 		// A tab is no part of a URL, and may be part of a secret as a
 		// space is: the rest is read with a space in its place.
-		if r, hid := hidesNew(strings.ReplaceAll(rest, "\t", " ")); hid {
+		r, hid, read := hidesNew(strings.ReplaceAll(rest, "\t", " "))
+		switch {
+		case hid:
 			return line[:t.at] + r
+		case !read && (strings.Contains(line[t.end:], "@") || strings.Contains(line[t.at:t.end], redact.Mask)):
+			return line[:t.end]
 		}
 	}
 	return line
 }
 
-// hidesNew returns redact.URL of v and whether it hid something there that
-// was not hidden yet: its form differs from v as net/url alone writes it.
-// (Comparing with v itself would take every escaped space for a secret.)
-// A v that does not parse hides nothing here.
-func hidesNew(v string) (r string, hid bool) {
+// hidesNew returns redact.URL of v, whether it hid something there that
+// was not hidden yet (its form differs from v as net/url alone writes it;
+// comparing with v itself would take every escaped space for a secret),
+// and whether v could be read as a URL at all. A v that cannot be read
+// hides nothing here.
+func hidesNew(v string) (r string, hid, read bool) {
 	u, err := url.Parse(v)
 	if err != nil {
-		return v, false
+		return v, false, false
 	}
-	r = redact.URL(v)
-	return r, r != redact.Invalid && r != u.String()
+	if r = redact.URL(v); r == redact.Invalid {
+		return v, false, false
+	}
+	return r, r != u.String(), true
 }
 
 // maskPassText returns the comment c with whatever follows the passphrase
@@ -669,7 +680,7 @@ func maskScalar(v string, url bool) string {
 		// URL, white space and all.
 		if w := strings.TrimSpace(v); w != "" {
 			if t, ok := nextToken(w, 0, false); ok && t.at == 0 && t.end < len(w) {
-				if r, hid := hidesNew(w); hid {
+				if r, hid, _ := hidesNew(w); hid {
 					v = r
 				}
 			}
