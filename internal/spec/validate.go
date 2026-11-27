@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
 
 // imageRE is the shape of a watermark image's asset name (R-C8).
@@ -171,7 +172,7 @@ func (o Outputs) checkPassphrase() error {
 		return nil
 	case !o.SRT:
 		return errors.New("needs outputs.srt")
-	case p == mask:
+	case p == redact.Mask:
 		return errors.New(maskNotSecret)
 	case len(p) < minPassphraseBytes || len(p) > maxPassphraseBytes:
 		return fmt.Errorf("%d bytes, want %d to %d", len(p), minPassphraseBytes, maxPassphraseBytes)

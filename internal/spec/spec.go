@@ -163,7 +163,7 @@ func (s Stream) Redacted() Stream {
 		c.Outputs.Push[i].URL = redactedURL(c.Outputs.Push[i].URL)
 	}
 	if c.Outputs.SRTPassphrase != "" {
-		c.Outputs.SRTPassphrase = mask
+		c.Outputs.SRTPassphrase = redact.Mask
 	}
 	return c
 }
@@ -176,9 +176,9 @@ func (s Stream) Redacted() Stream {
 func redactedURL(u string) string {
 	r := redact.URL(u)
 	switch {
-	case r == invalid && u != invalid:
-		return mask
-	case !strings.Contains(r, mask):
+	case r == redact.Invalid && u != redact.Invalid:
+		return redact.Mask
+	case !strings.Contains(r, redact.Mask):
 		return u
 	}
 	return r

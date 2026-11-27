@@ -50,6 +50,41 @@
 // entry. A whole-config write never goes through a node: File.Write writes
 // the exact bytes it is given.
 //
+// # Secrets
+//
+// The file holds every secret in clear; no API response does. Mask is the
+// text as a response shows it: in every scalar, keys and values, each
+// URL-shaped token is shown as redact.URL shows it, a scalar holding a
+// token that does not parse is shown as the bare mask ("xxxxx"), every
+// non-empty srt_passphrase is the mask, and the URLs in comments are
+// redacted as a log line is. The users' password hashes are not hidden.
+// Unmask is the way back for a write: in each stream entry, an
+// inputs[i].url, an outputs.push[j].url or an outputs.srt_passphrase that
+// holds the mask takes the value the stored entry of the same name holds
+// for it (spec.KeepSecrets), and a mask that stands for no one stored
+// secret is refused, naming the field and never a value. A mask anywhere
+// else is not resolved: a comment, or a URL under another key, is stored
+// as it was sent.
+//
+// Both work on the bytes. A scalar is replaced where it is written and
+// everything else is copied, so a text with nothing to hide is returned
+// as it is, and Unmask(Mask(t), t) is t. Each decodes its result and
+// compares it with the node tree it wanted; a scalar that cannot be
+// replaced in place (one with an escape, an anchor or a tag, a folded or
+// multi-line one) sends the whole document through the node tree instead,
+// with the loss of layout described under Editing. Mask also searches the
+// bytes of what it returns, because the parser drops some comments: a
+// URL-shaped token there that still has something to hide re-encodes the
+// document, which drops those comments, and Mask returns an error rather
+// than a text that holds one. In the bytes a token is judged without the
+// quotes, commas and brackets that close it, a double-quoted scalar by its
+// value, and what follows a '#' inside a token by itself, since a comment
+// may start there. A text whose bytes still fail after one re-encoding (a
+// URL as a mapping key, read together with the colon after it) is encoded
+// once more with its URLs in double quotes. Mask does not depend on the
+// text passing Parse: anchors, aliases, merge keys and entries the lenient
+// start skipped are masked like everything else.
+//
 // # The file
 //
 // File reads the file, refuses it on Unix when its mode has any group or

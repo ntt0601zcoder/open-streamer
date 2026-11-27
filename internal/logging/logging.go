@@ -13,10 +13,12 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
 
-// urlLike matches a URL-shaped substring. It runs to the next white space
-// because net/url accepts quotes and most punctuation in the userinfo, so
-// stopping earlier would leave the tail of a password in the log.
-var urlLike = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
+// URLPattern matches a URL-shaped substring: a scheme, "://" and everything
+// to the next white space. It runs to the next white space because net/url
+// accepts quotes and most punctuation in the userinfo, so stopping earlier
+// would leave the tail of a password in the log. Scrub and config.Mask
+// share it, so a log line and the config text are searched alike.
+var URLPattern = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
 
 // secretKeys are the lower-cased attribute names whose values are always
 // hidden, beside every redact.SecretName.
@@ -60,7 +62,7 @@ func Scrub(s string) string {
 	if !strings.Contains(s, "://") {
 		return s
 	}
-	return urlLike.ReplaceAllStringFunc(s, redact.URL)
+	return URLPattern.ReplaceAllStringFunc(s, redact.URL)
 }
 
 // handler scrubs every record before the wrapped handler writes it.

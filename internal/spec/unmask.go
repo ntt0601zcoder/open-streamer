@@ -8,15 +8,6 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
 
-// mask is what redact.URL writes in place of a hidden value, and what
-// Redacted shows for a stored passphrase. It is a private copy of redact's
-// text, held equal to it by TestMaskIsRedacts.
-const mask = "xxxxx"
-
-// invalid is what redact.URL returns for a URL it cannot parse. It is a
-// private copy of redact's text, held equal to it by TestMaskIsRedacts.
-const invalid = "<invalid url>"
-
 // maskNotSecret is what Validate says of a field that holds the mask.
 const maskNotSecret = "holds the redaction mask, not the secret; send the real value"
 
@@ -24,7 +15,7 @@ const maskNotSecret = "holds the redaction mask, not the secret; send the real v
 // hidden: one that redact.Masked reports, or the bare mask, which Redacted
 // shows for a URL that does not parse.
 func isMask(u string) bool {
-	return u == mask || redact.Masked(u)
+	return u == redact.Mask || redact.Masked(u)
 }
 
 // KeepSecrets resolves one list of URLs by R-T4: sent is a stream's input
@@ -56,7 +47,7 @@ func KeepSecrets(sent, stored []string) (out []string, bad []int) {
 	}
 	for form, at := range masks {
 		var values []string // the distinct stored values of the form, in order
-		if form != mask {
+		if form != redact.Mask {
 			for _, v := range stored {
 				if redact.URL(v) == form && !slices.Contains(values, v) {
 					values = append(values, v)
@@ -84,7 +75,7 @@ func KeepSecrets(sent, stored []string) (out []string, bad []int) {
 // it is unless it is the mask; the mask is replaced by stored, and ok is
 // false when stored is empty. Unmask and config.Unmask both use it.
 func KeepPassphrase(sent, stored string) (out string, ok bool) {
-	if sent != mask {
+	if sent != redact.Mask {
 		return sent, true
 	}
 	if stored == "" {

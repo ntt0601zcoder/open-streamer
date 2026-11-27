@@ -10,12 +10,6 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
 
-// The package's private copies of redact's two texts are redact's.
-func TestMaskIsRedacts(t *testing.T) {
-	assert.Equal(t, "rtsp://u:"+mask+"@h/s", redact.URL("rtsp://u:p@h/s"))
-	assert.Equal(t, invalid, redact.URL("rtsp://u:p@h:port/s"))
-}
-
 // Two push URLs whose keys start alike, and the one form both redact to.
 const (
 	keyOne  = "rtmp://h/live/secretkey"
