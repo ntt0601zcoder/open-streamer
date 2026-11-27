@@ -642,18 +642,25 @@ func TestTLSHandshakeFailedReported(t *testing.T) {
 // drops frames for the handler's subscriber.
 func stalledReader(t *testing.T, s *testServer, ca *tlstest.CA, name string) {
 	t.Helper()
-	before := s.mediaTLS.open()
 	raw := dialTCP(t, s.Addrs().HTTPS)
-	// A small window on this side, a small buffer on the server's.
+	// A small window on this side, a small buffer on the server's. The
+	// server's end is found by address, not by a count: an earlier
+	// reader's connection may close in the same instant this one is
+	// tracked.
 	require.NoError(t, raw.(*net.TCPConn).SetReadBuffer(4096)) //nolint:forcetypeassert // a TCP connection
-	require.Eventually(t, func() bool { return s.mediaTLS.open() == before+1 }, waitFor, time.Millisecond)
-	s.mediaTLS.mu.Lock()
-	for c := range s.mediaTLS.conns {
-		if c.RemoteAddr().String() == raw.LocalAddr().String() {
-			require.NoError(t, c.Conn.(*net.TCPConn).SetWriteBuffer(4096)) //nolint:forcetypeassert // a TCP connection
+	var server *net.TCPConn
+	require.Eventually(t, func() bool {
+		s.mediaTLS.mu.Lock()
+		defer s.mediaTLS.mu.Unlock()
+		for c := range s.mediaTLS.conns {
+			if c.RemoteAddr().String() == raw.LocalAddr().String() {
+				server = c.Conn.(*net.TCPConn) //nolint:forcetypeassert // a TCP connection
+				return true
+			}
 		}
-	}
-	s.mediaTLS.mu.Unlock()
+		return false
+	}, waitFor, time.Millisecond, "the server never tracked the connection")
+	require.NoError(t, server.SetWriteBuffer(4096))
 	cfg := ca.Client()
 	cfg.ServerName = "127.0.0.1"
 	tc := tls.Client(raw, cfg)
