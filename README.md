@@ -290,14 +290,21 @@ the credentials inside input and push URLs and each stream's
 - in an SRT `streamid`, the same pairs, and the password of MediaMTX's
   `publish:<path>:<user>:<pass>` and `read:…`;
 - the stream key of an RTMP URL, cut to its first two characters
-  (`rtmp://host/live/abxxxxx`).
+  (`rtmp://host/live/abxxxxx`);
+- the same parts of a URL inside the URL, in its query, path or fragment:
+  `http://gw/fetch?url=rtsp://admin:S3cret@cam/s` shows
+  `http://gw/fetch?url=rtsp://admin:xxxxx@cam/s`. When the inner URL is
+  percent-encoded (`?url=rtsp%3A%2F%2Fadmin%3AS3cret%40cam%2Fs`) its whole
+  value becomes `xxxxx` (`?url=xxxxx`).
 
 A secret name is one that contains `pass`, `pwd`, `psw`, `secret`, `token`,
 `signature`, `credential`, `hmac`, `jwt`, `authorization`, `sessionid` or
 `accesskeyid`, or is `key`, `pw`, `sig`, `auth`, `authbasic`, `loginpas`,
 `hash`, `md5`, `hdnts`, `hdnea`, `wmsauthsign`, `cred` or `sid`, or ends in
 `key`, in any case. A user name is never hidden. The rule over-masks on
-purpose: `?passthrough=1` and a path `/media/pass=1/x.ts` show `xxxxx` too.
+purpose: `?passthrough=1` and a path `/media/pass=1/x.ts` show `xxxxx` too,
+and so does base64 padding after a value that ends in such a name
+(`?data=abcKEY==` shows `?data=abcKEY=xxxxx`).
 Only what is shown changes; the server uses the URL as written. A credential
 under a name the rule does not know (`?p=`, `?k=`) is shown: report it, it is
 one line to add.
@@ -311,7 +318,13 @@ port, the user, the path or the query of a masked URL, or copy it into
 another stream, and the write is 422 ("holds the redaction mask and the stored
 stream has no one secret it stands for; send the real value"), so retype the
 whole URL with its secret. A URL the server cannot parse is shown as the bare
-`xxxxx` and must be retyped too. Two pushes to one platform whose keys look
+`xxxxx` and must be retyped too. A URL may not hold `xxxxx` as a whole query
+value, as its last path segment or as its fragment (`?mode=xxxxx`): that is
+what a masked inner URL looks like, so it is taken for a mask. A value that
+holds two URLs (a second one after a space) is shown with each one masked,
+and is a mask as a whole. One URL with a space in it and a secret is the
+exception: the stream API shows the space as `%20` and the config editor
+keeps it, so after editing the config such a URL must be retyped. Two pushes to one platform whose keys look
 alike when masked (`rtmp://a.example/live/abxxxxx` twice) are resolved in
 their order, the first mask to the first stored key; a third push with a new
 key can be added beside them. Sending no secret where one was stored (a URL

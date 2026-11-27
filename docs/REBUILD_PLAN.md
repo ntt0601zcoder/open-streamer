@@ -1216,7 +1216,8 @@ an RTSPS listener (play only, TCP only) and RTSPS pull. M5c2 is two plans
 too (R-T1 of the M5c2a plan). M5c2a, secrets (done): credentials in URL
 paths, queries and stream IDs redacted (the M2c note), secrets write-only
 over the API, and SRT output encryption with a per-stream passphrase.
-M5c2b (not yet planned): SRTP for RTSP. M6 and the M7 soak need only M5a; M5b2 and M5c may run beside M6.
+M5c2b (not yet planned): SRTP for RTSP. M6 and the M7 soak need only M5a;
+M5b2 and M5c may run beside M6.
 Until M5b1 an input edit rebuilt the stream (R-D6), and assets were files
 the operator copied into a directory; until M5c1 the Basic credentials and
 every stream key crossed the network in clear. The API's plain listener
@@ -1236,15 +1237,15 @@ the config's `ETag` is a keyed tag too, `"` + the first 32 hex digits of
 `redact.Tag` of the stored text + `"` (`config.ETag`), so it changes at a
 restart and no longer serves as an offline oracle beside the masked text;
 a push's ID is tagged over the stream's name and the URL. (Until M5c2a the
-config's `ETag` was the plain SHA-256 of its text.) Only a real verification that succeeds clears a limiter entry,
-and room among the 4096 tracked pairs is made only when a new pair is
-inserted: pairs under 5 failures first, oldest first, a blocked pair
-only when nothing else can go, never one with a login in flight. The API
-itself refused a stream document that carried the redaction mask and a
-viewer's `?secrets=1` was 403 on every route, until M5c2a resolved the mask
-and made `?secrets=1` a 400 for every role (R-T4, R-T6); and a handler's panic after a
-part of the answer is written aborts the connection instead of ending it as
-a whole answer. `server.New` binds every listener and starts the streams
+config's `ETag` was the plain SHA-256 of its text.) Only a real
+verification that succeeds clears a limiter entry, and room among the 4096
+tracked pairs is made only when a new pair is inserted: pairs under 5
+failures first, oldest first, a blocked pair only when nothing else can go,
+never one with a login in flight. The API itself refused a stream document
+that carried the redaction mask and a viewer's `?secrets=1` was 403 on
+every route, until M5c2a resolved the mask and made `?secrets=1` a 400 for
+every role (R-T4, R-T6); and a handler's panic after a part of the answer
+is written aborts the connection instead of ending it as a whole answer. `server.New` binds every listener and starts the streams
 through `Manager.Load`, so a server it returns must be run. The e2e
 scenarios run in `make test` and the amd64 `test` job; after M5c1 the
 package takes about 357 s on the host (`make test` and `make cover` allow
@@ -1437,7 +1438,28 @@ Facts the code settled while it ran, beyond the rulings:
   hides the value for every scheme, so `sid=` and `signature=` values are
   hidden in non-secret uses too. A `streamid` secret that holds an escaped
   `,name=` or `/name=` shows its tail, as a camera password that holds
-  `_name=` does.
+  `_name=` does. A name is the text back to the previous `=`, so a value
+  that ends in a secret name before a second `=` is over-masked: base64
+  padding after `…KEY`, as in `?data=abcKEY==`, shows `?data=abcKEY=xxxxx`
+  (frozen exception 5's over-masking; only what is shown changes).
+- **R-T2, a URL inside a URL** (final review). In a query piece, in the
+  path or the opaque part and in the fragment, the text from a scheme and
+  `://` to the end of that part is a URL too, and is redacted by the same
+  rules where it stands: `http://gw/fetch?url=rtsp://admin:pw@cam/s` shows
+  `http://gw/fetch?url=rtsp://admin:xxxxx@cam/s`, and so does a second URL
+  after a space, which is part of the first one's path or query. When the
+  scheme or the `://` shows only once the part is percent-decoded
+  (`?url=rtsp%3A%2F%2Fadmin%3Apw%40cam%2Fs`) and the decoded URL has
+  something to hide, the whole value is the mask (`?url=xxxxx`): the text
+  after the last `/` or `=` before it, to the end of the part. So is a
+  nested URL that parses neither way, and one nested more than 8 deep.
+  `redact.Masked` follows: it reads the nested URL, and it reports a whole
+  value that is the mask (the last path segment, a query value or the
+  fragment being exactly `xxxxx`, after a `/` or an `=`), whatever the
+  name. The cost: `http://h/x?mode=xxxxx` and `http://h/xxxxx`, which hold
+  those five letters of their own, are refused as masks (422), where
+  before they were stored. A string that is no URL by its start and whose
+  only `://` was in a value hidden whole is shown as the bare `xxxxx`.
 - **R-T3's residual oracles, corrected.** (a) The input count rule is an
   oracle beside `repeated`: a `PUT` of {mask, guess} and then of {mask}
   resolves exactly when the guess is the stored URL. Conceded, as
@@ -1446,33 +1468,60 @@ Facts the code settled while it ran, beyond the rulings:
   with a guessed real URL in place of the mask answers 200 `unchanged` when
   the guess is the stored URL and 422 (nothing stored) when it is not, so
   an editor can confirm a guess of the stored secret without a trace in the
-  config. Editor-only and online; accepted.
+  config. Editor-only and online; accepted. (c) The 409 of the listen
+  claims (`internal/stream/claims.go:192`, "listen address … has the RTMP
+  publish path of an input of <stream>") tells an editor that a guessed
+  RTMP publish path, which holds the stream key, is taken by another
+  stream; nothing is stored by the refused write. Editor-only and online;
+  accepted, as the device is an oracle for the same guess.
 - **Frozen exception 12.** A config that uses an explicit `!!binary` tag
   anywhere is refused at start and at reload ("!!binary is not supported"),
   since `config.Mask` cannot judge the bytes of a binary scalar. So R-T10
   has one exception: a config that works at HEAD loads unchanged unless it
   holds `!!binary`.
+- **Frozen exception 13.** `spec.Stream.Redacted` shows a URL in which
+  nothing is hidden as it is stored, not as `redact.URL` normalises it:
+  `RTSP://h/s` keeps its case in `GET /api/v1/streams`, where HEAD showed
+  `rtsp://h/s`. What a response shows, written back, is the stored
+  document.
+- **Frozen exception 14.** One URL with a space in or after it and a
+  secret is shown differently by the two views: the stream API shows
+  `redact.URL`'s form, the space as `%20` (`rtsp://u:xxxxx@h/s%20`), and
+  the config view keeps the space (`rtsp://u:xxxxx@h/s `). Each view's form
+  written back unchanged through its own route keeps the secret; an edited
+  config round trip of such a URL is 422, since the config's form is not
+  the form the stored URL is matched by (R-T4), and the URL is retyped.
+  Either form is a mask to both routes, so neither is ever stored. A value
+  that is more than one URL (a second URL after white space, or a URL after
+  other text) is not under this exception: both views show it by one rule
+  (`redact.Value`), each URL-shaped token judged and then the whole, and
+  its shown form resolves through both routes (final review, finding 9).
 - **R-T8's residuals, all accepted** (each costs a rare tail of a secret
   shown to an editor, or text masked that held none):
   - a URL with white space inside it and a secret must be retyped after an
-    edit;
+    edit of the config (frozen exception 14);
   - a value that does not start with a URL keeps the token view (prose), so
     under a key other than `url` a secret that holds a space can show its
     tail;
   - a comment line with more than 4 URLs or over 4 KiB is judged token by
     token;
-  - a secret that holds a space, followed by a second secret URL, must be
-    retyped;
   - in comments, a token that redacts to `<invalid url>` drops the rest of
-    its line, and when a URL is followed by a rest that does not parse and
-    holds `@`, or the URL itself hid something, the rest of the line is
-    dropped: `# http://h/x is 100% up, ask ops@example.org` becomes
-    `# http://h/x`. A comment URL that holds `xxxxx` is taken as masked;
+    its line. When a URL is followed by a rest that does not parse and
+    holds `@`, the URL may itself be the start of a password
+    (`# - url: rtsp://admin:1234 5678@cam/s`, whose first token reads as a
+    host and a port), so the line ends with `<invalid url>` in the URL's
+    place (final review, finding 2):
+    `# http://h/x is 100% up, ask ops@example.org` becomes
+    `# <invalid url>`. When the URL itself hid something, the rest of the
+    line is dropped after it. A comment URL that holds `xxxxx` is taken as
+    masked;
   - tokens glued by a ZWSP or a U+FEFF, and the visible rows of
-    `TestMaskAdversarial` (`advVisible`: a URL nested in another's query, an
-    `rtsp:` without `//`, a passphrase under another key or in a comment
-    that does not repeat the key, a URL after `#` in a scalar, `old.rtmp://`
-    in comments), are pinned as shown;
+    `TestMaskAdversarial` (`advVisible`: an `rtsp:` without `//`, a
+    passphrase under another key or in a comment that does not repeat the
+    key, `old.rtmp://` in comments), are pinned as shown. A URL nested in
+    another's query and a URL after `#` in a scalar were on that list until
+    the final review: `redact.URL` now reads a URL inside a URL (R-T2
+    above);
   - the users' password hashes stay readable to editors (salted PBKDF2,
     600 000 iterations); masking them is backlog.
 - **R-T9's known limit.** gosrt marks the retransmissions around a key
@@ -2350,18 +2399,16 @@ branches. That is a repository setting, which no commit can change.
 #### M5c2a deferred minors
 
 - config (Task 4):
-  - prose after a clean URL in a comment is lost when an `@` follows on a
-    rest that does not parse;
+  - a clean URL in a comment, and the prose after it, is lost when an `@`
+    follows on a rest that does not parse;
   - a comment URL that holds `xxxxx` is taken as masked;
   - the UTF-16 re-encode is documented, not changed.
-- api and server (Task 6):
-  - `PutConfig` computes `Mask(stored)` again though the snapshot caches it
-    (one extra pass under the config lock);
-  - `TestPutStreamMaskRace`'s masked writers do not write: they should
-    toggle `audio_language`, so that they go through resolution and
-    `SetStream` under contention.
-- server (Task 7): `TestSRTPassphrase`'s log scan sees the default level
-  only.
+- redact (final review): `FuzzNoSecretSurvives` escapes a secret twice
+  where a value is walked decoded, and has no template with a URL inside a
+  URL; `TestURLNested` and `FuzzURL`'s seeds cover those.
+- server (final review): only two lines are logged at debug level (a
+  failed TLS handshake, a skipped asset retry), so the leak scans that run
+  at debug level read few lines the default level does not write.
 - config and spec (pre-flight F7): `config.Unmask` re-implements the
   `srt_passphrase` mask rule and R-T4's refusal text beside
   `spec.Stream.Unmask` (the duplication is accepted).

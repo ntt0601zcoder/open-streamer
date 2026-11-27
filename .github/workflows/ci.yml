@@ -221,12 +221,13 @@ jobs:
   # took about 90 s with -race on an amd64 workstation, and
   # TestM5c2aSRTFFmpeg adds about 15 s: well inside the 10 min timeout of
   # this job's step. Their only peers are the bundle and apt's ffmpeg and
-  # ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a failure. The VLC and GStreamer rows stay amd64-only, and so do
-  # the SRT and RTSP rows that need more than ffmpeg: TestM4aVLC,
-  # TestM4bPlayers and TestM5c2aPlayers are not in the pattern (they run in
-  # the test job), and OS_TRANSCODE_E2E_ARM=1 still skips TestM4aMatrix's
-  # t180/srt-steady and t180/rtsp-steady. TestM5c2aSRTFFmpeg is the one
-  # SRT row here, and it needs only ffmpeg.
+  # ffprobe, so OS_REQUIRE_PEERS=1 turns a missing one into a failure. The
+  # VLC and GStreamer rows stay amd64-only, and so do the SRT and RTSP rows
+  # that need more than ffmpeg: TestM4aVLC, TestM4bPlayers and
+  # TestM5c2aPlayers are not in the pattern (they run in the test job), and
+  # OS_TRANSCODE_E2E_ARM=1 still skips TestM4aMatrix's t180/srt-steady and
+  # t180/rtsp-steady. TestM5c2aSRTFFmpeg is the one SRT row here, and it
+  # needs only ffmpeg.
   transcode-e2e-arm64:
     needs: transcoder-arm64
     runs-on: ubuntu-24.04-arm
@@ -251,8 +252,11 @@ jobs:
           ostx="$GITHUB_WORKSPACE/dist/ostranscoder-arm64/ostranscoder"
           "$ostx" -version
           echo "OS_TRANSCODER=$ostx" >> "$GITHUB_ENV"
-      # ffprobe for the b-frames rows, ffmpeg for the slow-consumer rows.
-      # The EC2 regional mirror is dropped as in the test job.
+      # ffprobe for the b-frames rows, ffmpeg for the slow-consumer rows,
+      # and for the SRT row (TestM5c2aSRTFFmpeg) apt's ffmpeg in particular:
+      # Ubuntu 24.04's build is linked with libsrt, which a static ffmpeg
+      # download usually is not. The EC2 regional mirror is dropped as in
+      # the test job.
       - name: Install ffmpeg
         run: |
           if [ -f /etc/apt/apt-mirrors.txt ] && grep -qv '\.ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
