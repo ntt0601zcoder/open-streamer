@@ -1,7 +1,13 @@
-.PHONY: test lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers ostranscoder test-transcode test-nvenc openstreamer
+.PHONY: test test-pinned lint tools fmt tidy vet check cover covercheck fixtures test-ci-peers ostranscoder test-transcode test-nvenc openstreamer
 
 test:
 	go test -race -shuffle=on -count=1 -timeout=20m ./...
+
+# test-pinned is make test under go.mod's Go, the version CI installs: run it
+# before pushing when the host's Go is newer.
+GO_PINNED := $(shell awk '$$1 == "go" { print $$2; exit }' go.mod)
+test-pinned:
+	GOTOOLCHAIN=go$(GO_PINNED) go test -race -shuffle=on -count=1 -timeout=20m ./...
 
 lint:
 	golangci-lint run ./...

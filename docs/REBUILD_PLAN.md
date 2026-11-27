@@ -808,7 +808,10 @@ testdata/fixtures/     generated clips and the script that makes them
 ## 5. Milestones
 
 Every milestone ends with green tests in CI. Conformance checks are written
-before the code they check.
+before the code they check. When the host's Go is newer than `go.mod`'s,
+run `make test-pinned` (`make test` under `go.mod`'s Go, which CI installs)
+before pushing: M5c1's `TestHTTPTSOverTLS` passed on the host's Go 1.27 and
+failed every run on 1.26.11.
 
 | | Milestone | Depends on | Exit criteria |
 |---|---|---|---|
