@@ -1395,10 +1395,14 @@ type view struct {
 }
 
 // views is the state behind a test's Secure; calls counts Secure's calls.
+// When watch is set (before the Server serves), each call first records
+// the number of watch's subscribers.
 type views struct {
 	mu    sync.Mutex
 	m     map[string]view
 	calls atomic.Int64
+	watch *hub.Hub
+	subs  []int
 }
 
 func newViews() *views { return &views{m: map[string]view{}} }
@@ -1417,10 +1421,24 @@ func (v *views) remove(name string) {
 
 func (v *views) Secure(name string) (*hub.Hub, string, bool) {
 	v.calls.Add(1)
+	subs := -1
+	if v.watch != nil {
+		subs = len(v.watch.Stats())
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if v.watch != nil {
+		v.subs = append(v.subs, subs)
+	}
 	w, ok := v.m[name]
 	return w.h, w.pass, ok
+}
+
+// subscribers returns what each call recorded of watch's subscribers.
+func (v *views) subscribers() []int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return slices.Clone(v.subs)
 }
 
 // rejections records the reason given to each refused request, by stream
@@ -1712,10 +1730,11 @@ func TestPassphraseChangedMidLookup(t *testing.T) {
 			h, other := audioHub(t), audioHub(t)
 			v := newViews()
 			v.set("s", h, tc.before)
+			v.watch = h // the admitted hub
 			paused, release := make(chan struct{}, 1), make(chan struct{})
 			var written atomic.Int64
 			srv, addr := serveSecure(t, Options{Secure: v.Secure}, func(s *Server) {
-				s.serving = func(string) func() {
+				s.serving = func(bool) func() {
 					paused <- struct{}{}
 					<-release
 					return nil
@@ -1748,7 +1767,8 @@ func TestPassphraseChangedMidLookup(t *testing.T) {
 			assert.Empty(t, got.data, "nothing but the shutdown")
 			waitStats(t, srv, func(s Stats) bool { return s.EndedHubClosed == 1 && s.Conns == 0 }, "ended as hub_closed")
 			assert.Zero(t, written.Load())
-			assert.Equal(t, calls+1, v.calls.Load(), "asked once more, after subscribing")
+			assert.Equal(t, calls+1, v.calls.Load(), "asked once more")
+			assert.Equal(t, []int{0, 1}, v.subscribers(), "asked again once subscribed to the admitted hub")
 		})
 	}
 
@@ -1757,14 +1777,16 @@ func TestPassphraseChangedMidLookup(t *testing.T) {
 		v := newViews()
 		v.set("s", h, lockedPass)
 		rej := newRejections()
-		var open, admitted atomic.Int64 // connections admitted under lockedPass: being served, and in all
+		// Connections admitted under a passphrase, which can only be
+		// lockedPass (the callers hold no other): being served, and in all.
+		var open, admitted atomic.Int64
 		srv, addr := serveSecure(t, Options{Secure: v.Secure}, func(s *Server) {
 			s.request = rej.wrap
 			// A key per caller address, so that the limiter leaves the
 			// callers' wrong passphrases to the check.
 			s.fails.key = func(a net.Addr) string { return a.String() }
-			s.serving = func(pass string) func() {
-				if pass != lockedPass {
+			s.serving = func(secret bool) func() {
+				if !secret {
 					return nil
 				}
 				open.Add(1)
@@ -1774,6 +1796,10 @@ func TestPassphraseChangedMidLookup(t *testing.T) {
 		})
 		ctx, cancel := context.WithCancel(context.Background())
 		var callers sync.WaitGroup
+		defer func() {
+			cancel()
+			callers.Wait()
+		}()
 		for i := range 50 {
 			callers.Go(func() {
 				// A check costs about 8 ms under the race detector: the
@@ -1940,4 +1966,17 @@ func TestKeyRefreshFFmpeg(t *testing.T) {
 	assert.NotContains(t, log, "decrypt")
 	assert.Greater(t, written.Load(), int64(2*4*1024*payloadSize), "more than 4096 packets sent to each")
 	waitStats(t, srv, func(s Stats) bool { return s.EndedHubClosed == 2 }, "both ended by the hub")
+}
+
+// KMRefresh is 0 or at least 4: below, the announcement would come 0
+// packets before the refresh, which gosrt refuses.
+func TestKMRefreshMinimum(t *testing.T) {
+	for _, n := range []uint64{1, 3} {
+		srv := New(nil, Options{KMRefresh: n})
+		require.Error(t, srv.Listen("127.0.0.1:0"), n)
+		require.NoError(t, srv.Close())
+	}
+	srv := New(nil, Options{KMRefresh: 4})
+	require.NoError(t, srv.Listen("127.0.0.1:0"))
+	require.NoError(t, srv.Close())
 }

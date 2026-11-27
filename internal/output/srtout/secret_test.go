@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -174,4 +175,50 @@ func TestPassphraseLimiter(t *testing.T) {
 	st = srv.Stats()
 	assert.Equal(t, st.Rejected, rejectedSum(st))
 	assert.Zero(t, st.RejectedCaps)
+}
+
+// The production key is the address without its port, an IPv6 address by
+// its /64: 5 wrong passphrases from one host on 5 source ports limit it.
+func TestPassphraseLimiterKey(t *testing.T) {
+	h, _ := liveHub(t, 1)
+	v := newViews()
+	v.set("locked", h, lockedPass)
+	srv := New(nil, Options{Secure: v.Secure})
+	var checks atomic.Int64
+	ask := func(addr, pass string) srt.RejectionReason {
+		var reason srt.RejectionReason
+		a := net.UDPAddrFromAddrPort(netip.MustParseAddrPort(addr))
+		srv.answer(fakeReq{addr: a, id: "live/locked", pass: pass, checks: &checks, reason: &reason})
+		return reason
+	}
+	for _, tc := range []struct {
+		name   string
+		wrong  []string // five addresses of one peer key
+		same   string   // another address of that key
+		others string   // an address of another key
+	}{
+		{
+			"IPv4",
+			[]string{"127.0.0.1:40001", "127.0.0.1:40002", "127.0.0.1:40003", "127.0.0.1:40004", "127.0.0.1:40005"},
+			"127.0.0.1:40006", "127.0.0.2:40001",
+		},
+		{
+			"IPv6",
+			[]string{"[2001:db8:1:2::1]:1", "[2001:db8:1:2::2]:2", "[2001:db8:1:2:ffff::9]:3", "[2001:db8:1:2::1]:4", "[2001:db8:1:2::5]:5"},
+			"[2001:db8:1:2:abcd::1]:6", "[2001:db8:1:3::1]:1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, a := range tc.wrong {
+				assert.Equal(t, srt.REJ_BADSECRET, ask(a, wrongPass), a)
+			}
+			before := checks.Load()
+			assert.Equal(t, srt.REJ_RESOURCE, ask(tc.same, lockedPass), "the sixth, from another port or host of the key")
+			assert.Equal(t, before, checks.Load(), "refused unchecked")
+			assert.Equal(t, srt.REJ_BADSECRET, ask(tc.others, wrongPass), "another key is checked")
+		})
+	}
+	st := srv.Stats()
+	assert.Equal(t, uint64(2), st.RejectedLimited)
+	assert.Equal(t, uint64(12), st.RejectedSecret)
 }

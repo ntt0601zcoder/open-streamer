@@ -204,7 +204,9 @@ type Options struct {
 	Secure func(name string) (h *hub.Hub, passphrase string, ok bool)
 	// KMRefresh is the number of packets after which a connection's key is
 	// replaced; 0 means gosrt's default (1<<24). The new key is announced
-	// KMRefresh/4 packets before. Tests lower it.
+	// KMRefresh/4 packets before, so any other value must be at least 4:
+	// Listen fails for 1 to 3, whose announcement would come 0 packets
+	// before (gosrt refuses that). Tests lower it.
 	KMRefresh uint64
 }
 
@@ -260,11 +262,11 @@ type Server struct {
 	// Seams of the tests, set before Serve. wrap stands between each
 	// connection's writer and gosrt. request stands between the listener
 	// and answer. serving is called by each connection before it
-	// subscribes, with the passphrase it was admitted under; the func it
-	// returns, when not nil, is called when its stream has ended.
+	// subscribes, told whether it was admitted under a passphrase; the
+	// func it returns, when not nil, is called when its stream has ended.
 	wrap    func(io.Writer) io.Writer
 	request func(srt.ConnRequest) srt.ConnRequest
-	serving func(passphrase string) func()
+	serving func(secret bool) func()
 }
 
 // New returns a Server for the hubs that lookup finds by stream name;
@@ -653,7 +655,7 @@ func (s *Server) serve(conn srt.Conn, h *hub.Hub, name, key, pass string, size i
 	}
 	var ended func()
 	if s.serving != nil {
-		ended = s.serving(pass)
+		ended = s.serving(pass != "")
 	}
 	st, err := tsstream.Stream(ctx, h, "srt "+conn.RemoteAddr().String(), w, tsstream.Options{Queue: s.opt.Queue, Meter: w})
 	if ended != nil {
