@@ -14,6 +14,7 @@ import (
 	"github.com/datarhei/gosrt"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 )
@@ -43,15 +44,17 @@ var (
 )
 
 // readSRT reads a TS stream from an SRT listener as a caller: the stream ID
-// is the URL's streamid query, latency (milliseconds) an optional query. A
-// goroutine copies the connection into a bounded buffer, so that demuxing
-// never stalls SRT delivery.
+// is the URL's streamid query, latency (milliseconds) and passphrase
+// optional queries. A goroutine copies the connection into a bounded
+// buffer, so that demuxing never stalls SRT delivery. Errors quote the URL
+// redacted.
 func readSRT(ctx context.Context, pu *url.URL, opt ReadOptions) (Capture, error) {
 	r := newReader(opt)
-	u := pu.String()
+	u := redact.URL(pu.String())
 	cfg := srt.DefaultConfig()
 	q := pu.Query()
 	cfg.StreamId = q.Get("streamid")
+	cfg.Passphrase = q.Get("passphrase")
 	if v := q.Get("latency"); v != "" {
 		ms, err := strconv.Atoi(v)
 		if err != nil || ms < 0 {

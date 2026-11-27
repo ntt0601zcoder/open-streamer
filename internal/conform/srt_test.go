@@ -19,6 +19,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/hub"
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
 	"github.com/ntt0601zcoder/open-streamer/internal/output/srtout"
+	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 	"github.com/ntt0601zcoder/open-streamer/internal/ts"
 	"github.com/ntt0601zcoder/open-streamer/pkg/mpegts"
 )
@@ -200,6 +201,46 @@ func TestReadSRTReject(t *testing.T) {
 		assert.Contains(t, err.Error(), "rejected", q)
 		assert.Less(t, time.Since(start), 5*time.Second, q)
 	}
+}
+
+// A passphrase in the URL's query reads an encrypted output; a wrong one
+// fails with an error that quotes the URL redacted and holds neither
+// passphrase.
+func TestReadSRTPassphrase(t *testing.T) {
+	const pass, wrong = "srtpass-0123456789", "wrongwrong-0123"
+	h := hub.New(hub.Options{})
+	srv := srtout.New(nil, srtout.Options{Secure: func(name string) (*hub.Hub, string, bool) {
+		return h, pass, name == "locked"
+	}})
+	require.NoError(t, srv.Listen("127.0.0.1:0"))
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve() }()
+	t.Cleanup(func() {
+		require.NoError(t, srv.Close())
+		<-served
+		h.Close()
+	})
+	e := &srtServer{h: h, srv: srv, addr: srv.Addr().String()}
+	frames := streamClip(t, "h264_aac.ts")
+	pre, rest := splitAtKey(frames)
+
+	bad := "srt://" + e.addr + "?streamid=live/locked&passphrase=" + wrong
+	for _, f := range pre {
+		h.Write(f)
+	}
+	_, err := ReadTS(context.Background(), bad, ReadOptions{Timeout: srtWait})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), redact.URL(bad))
+	assert.NotContains(t, err.Error(), wrong)
+	assert.NotContains(t, err.Error(), pass)
+
+	ch := connectSRT(t, e, nil, "?streamid=live/locked&passphrase="+pass+"&latency=500", ReadOptions{})
+	feedSRT(h, rest, 4)
+	r := awaitSRT(t, ch)
+	require.NoError(t, r.err)
+	assert.Empty(t, r.c.Violations)
+	assert.Len(t, r.c.Frames, len(frames))
+	assert.Positive(t, srv.Stats().RejectedSecret)
 }
 
 func TestReadSRTBadURL(t *testing.T) {
