@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -164,6 +165,66 @@ func TestValidateRejectsMaskedURL(t *testing.T) {
 	s = full()
 	s.Inputs[0].URL = "rtsp://user:pw@host/a"
 	require.NoError(t, s.Validate())
+}
+
+// The SRT passphrase is 10 to 79 bytes of the characters a URL carries
+// unescaped, and needs the SRT output (R-T5). No error holds the value.
+func TestSRTPassphraseValidate(t *testing.T) {
+	const allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-"
+	cycle := func(n int) string {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = allowed[i%len(allowed)]
+		}
+		return string(b)
+	}
+	doc := func(srt bool, passphrase string) Stream {
+		s := full()
+		s.Outputs.SRT, s.Outputs.SRTPassphrase = srt, passphrase
+		return s
+	}
+
+	for _, p := range []string{"0123456789", "1234567890", "Aa0._~-Aa0._~-", cycle(79), cycle(66) + cycle(13), ""} {
+		assert.NoError(t, doc(true, p).Validate(), "%d bytes", len(p))
+	}
+	require.NoError(t, doc(false, "").Validate())
+
+	refuses := func(name string, srt bool, passphrase, want string) {
+		err := doc(srt, passphrase).Validate()
+		require.Error(t, err, name)
+		assert.Equal(t, "spec: validate: outputs.srt_passphrase: "+want, err.Error(), name)
+		if passphrase != "xxxxx" {
+			assert.NotContains(t, err.Error(), passphrase, name)
+		}
+	}
+	refuses("srt off", false, "Aa0._~-Aa0._~-", "needs outputs.srt")
+	refuses("srt off and too short", false, "short", "needs outputs.srt")
+	refuses("9 bytes", true, "Aa0._~-Aa", "9 bytes, want 10 to 79")
+	refuses("1 byte", true, "A", "1 bytes, want 10 to 79")
+	refuses("80 bytes", true, cycle(80), "80 bytes, want 10 to 79")
+	refuses("the mask", true, "xxxxx", "holds the redaction mask, not the secret; send the real value")
+	for _, c := range []string{" ", "\t", "+", "&", "#", "=", "%", "/", "?", ":", "@", "!", "é", "\x00", "\n", "\x7f", "\xff"} {
+		p := "Qw3rtyUiopA"[:12-len(c)] + c
+		require.Len(t, p, 12)
+		refuses("a passphrase holding "+strconv.Quote(c), true, p,
+			"holds a character outside A-Z, a-z, 0-9, '.', '_', '~' and '-'")
+	}
+	// Every byte of the allowed set is accepted, and no other byte is.
+	for b := range 256 {
+		err := doc(true, "Qw3rtyUiopA"+string([]byte{byte(b)})).Validate()
+		assert.Equal(t, strings.IndexByte(allowed, byte(b)) >= 0, err == nil, "byte %#x", b)
+	}
+
+	// The bare mask is no URL: redact.Masked does not report a string
+	// without "://", and checkURL refuses it all the same.
+	s := full()
+	s.Inputs[0].URL = "xxxxx"
+	require.EqualError(t, s.Validate(),
+		"spec: validate: inputs[0].url: holds the redaction mask, not the secret; send the real value")
+	s = full()
+	s.Outputs.Push[0].URL = "xxxxx"
+	require.EqualError(t, s.Validate(),
+		"spec: validate: outputs.push[0].url: holds the redaction mask, not the secret; send the real value")
 }
 
 // A message quotes at most 64 bytes of a value, on a rune boundary.

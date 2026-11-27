@@ -20,7 +20,11 @@ import (
 // not know would be accepted by the API, stored, and silently never served
 // or never stopped.
 func TestReattachCoversEveryOutput(t *testing.T) {
-	known := []string{"HLS", "DASH", "HTTPTS", "RTMP", "RTSP", "SRT", "Push"}
+	known := []string{
+		"HLS", "DASH", "HTTPTS", "RTMP", "RTSP", "SRT",
+		"SRTPassphrase", // its sessions end on a change: Task 5
+		"Push",
+	}
 	typ := reflect.TypeFor[spec.Outputs]()
 	got := make([]string, 0, typ.NumField())
 	for i := range typ.NumField() {

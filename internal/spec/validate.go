@@ -9,7 +9,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/media"
-	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
 
 // imageRE is the shape of a watermark image's asset name (R-C8).
@@ -139,6 +138,9 @@ func (w *Watermark) validate() error {
 }
 
 func (o Outputs) validate() error {
+	if err := o.checkPassphrase(); err != nil {
+		return fmt.Errorf("outputs.srt_passphrase: %w", err)
+	}
 	if n := len(o.Push); n > MaxPushes {
 		return fmt.Errorf("outputs.push: %d pushes, want at most %d", n, MaxPushes)
 	}
@@ -151,6 +153,47 @@ func (o Outputs) validate() error {
 		}
 	}
 	return nil
+}
+
+// The lengths of an SRT passphrase, in bytes (R-T5): gosrt takes 10 to 80,
+// and libsrt before 1.5 stops at 79.
+const (
+	minPassphraseBytes = 10
+	maxPassphraseBytes = 79
+)
+
+// checkPassphrase checks the SRT passphrase (R-T5). Its errors never quote
+// the value.
+func (o Outputs) checkPassphrase() error {
+	p := o.SRTPassphrase
+	switch {
+	case p == "":
+		return nil
+	case !o.SRT:
+		return errors.New("needs outputs.srt")
+	case p == mask:
+		return errors.New(maskNotSecret)
+	case len(p) < minPassphraseBytes || len(p) > maxPassphraseBytes:
+		return fmt.Errorf("%d bytes, want %d to %d", len(p), minPassphraseBytes, maxPassphraseBytes)
+	}
+	for i := range len(p) {
+		if !passphraseByte(p[i]) {
+			return errors.New("holds a character outside A-Z, a-z, 0-9, '.', '_', '~' and '-'")
+		}
+	}
+	return nil
+}
+
+// passphraseByte reports whether c may be in an SRT passphrase: the
+// characters a URL carries unescaped.
+func passphraseByte(c byte) bool {
+	switch {
+	case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		return true
+	case c == '.', c == '_', c == '~', c == '-':
+		return true
+	}
+	return false
 }
 
 // maxQuoted is how many bytes of a value an error message quotes.
@@ -171,15 +214,16 @@ func Quote(v string) string {
 }
 
 // checkURL checks an input or push URL. Its errors never quote the URL,
-// which may hold a secret.
+// which may hold a secret. The bare mask is refused beside what
+// redact.Masked reports, which is no string without "://".
 func checkURL(u string) error {
 	switch {
 	case u == "":
 		return fmt.Errorf("empty")
 	case len(u) > MaxURLBytes:
 		return fmt.Errorf("%d bytes, want at most %d", len(u), MaxURLBytes)
-	case redact.Masked(u):
-		return fmt.Errorf("holds the redaction mask, not the secret; send the real value")
+	case isMask(u):
+		return errors.New(maskNotSecret)
 	}
 	return nil
 }

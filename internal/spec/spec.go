@@ -92,13 +92,14 @@ type Thumbnail struct {
 
 // Outputs are the outputs a stream is served on, and where it is pushed.
 type Outputs struct {
-	HLS    bool   `json:"hls,omitempty" yaml:"hls,omitempty"`   // hls/* and cmaf/*.m3u8
-	DASH   bool   `json:"dash,omitempty" yaml:"dash,omitempty"` // cmaf/*.mpd
-	HTTPTS bool   `json:"httpts,omitempty" yaml:"httpts,omitempty"`
-	RTMP   bool   `json:"rtmp,omitempty" yaml:"rtmp,omitempty"`
-	RTSP   bool   `json:"rtsp,omitempty" yaml:"rtsp,omitempty"`
-	SRT    bool   `json:"srt,omitempty" yaml:"srt,omitempty"`
-	Push   []Push `json:"push,omitempty" yaml:"push,omitempty"`
+	HLS           bool   `json:"hls,omitempty" yaml:"hls,omitempty"`   // hls/* and cmaf/*.m3u8
+	DASH          bool   `json:"dash,omitempty" yaml:"dash,omitempty"` // cmaf/*.mpd
+	HTTPTS        bool   `json:"httpts,omitempty" yaml:"httpts,omitempty"`
+	RTMP          bool   `json:"rtmp,omitempty" yaml:"rtmp,omitempty"`
+	RTSP          bool   `json:"rtsp,omitempty" yaml:"rtsp,omitempty"`
+	SRT           bool   `json:"srt,omitempty" yaml:"srt,omitempty"`
+	SRTPassphrase string `json:"srt_passphrase,omitempty" yaml:"srt_passphrase,omitempty"` // required of SRT players; write-only (R-T5)
+	Push          []Push `json:"push,omitempty" yaml:"push,omitempty"`
 }
 
 // Push is one target the stream is pushed to.
@@ -145,16 +146,32 @@ func Decode(r io.Reader) (Stream, error) {
 }
 
 // Redacted returns a deep copy of s with every input and push URL passed
-// through redact.URL, for responses and logs.
+// through redact.URL, for responses and logs. It also replaces a non-empty
+// SRTPassphrase by the mask, and shows a URL that redact.URL cannot parse
+// (its "<invalid url>") as the bare mask: the same view config.Mask gives
+// of it (R-T8), and one that says a value is stored.
 func (s Stream) Redacted() Stream {
 	c := s.clone()
 	for i := range c.Inputs {
-		c.Inputs[i].URL = redact.URL(c.Inputs[i].URL)
+		c.Inputs[i].URL = redactedURL(c.Inputs[i].URL)
 	}
 	for i := range c.Outputs.Push {
-		c.Outputs.Push[i].URL = redact.URL(c.Outputs.Push[i].URL)
+		c.Outputs.Push[i].URL = redactedURL(c.Outputs.Push[i].URL)
+	}
+	if c.Outputs.SRTPassphrase != "" {
+		c.Outputs.SRTPassphrase = mask
 	}
 	return c
+}
+
+// redactedURL is redact.URL of u, or the bare mask when redact.URL could
+// not parse u.
+func redactedURL(u string) string {
+	r := redact.URL(u)
+	if r == invalid && u != invalid {
+		return mask
+	}
+	return r
 }
 
 // ETag is the document's entity tag: `"` + the first 16 hex digits of

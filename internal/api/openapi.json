@@ -1595,6 +1595,10 @@
             "type": "boolean",
             "description": "SRT play."
           },
+          "srt_passphrase": {
+            "type": "string",
+            "description": "Required of SRT players of this stream: 10 to 79 characters of A-Z, a-z, 0-9, '.', '_', '~' and '-'. Write-only: a response shows xxxxx when one is stored, and xxxxx written back keeps it"
+          },
           "push": {
             "type": "array",
             "description": "The targets the stream is pushed to; URLs are distinct.",

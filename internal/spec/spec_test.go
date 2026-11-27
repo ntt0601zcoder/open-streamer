@@ -104,6 +104,56 @@ func TestRedacted(t *testing.T) {
 	assert.Equal(t, zero, zero.Redacted())
 }
 
+// A URL that redact.URL cannot parse is shown as the bare mask, which says
+// a value is stored (R-T8); redact.URL itself keeps "<invalid url>", so
+// logs and error texts do.
+func TestRedactedUnparseable(t *testing.T) {
+	s := Stream{
+		Name:    "cam",
+		Inputs:  []Input{{URL: "rtsp://admin:p%ss@cam/s"}, {URL: "rtsp://u:pw@h:port/s"}, {URL: "udp://:5000"}},
+		Outputs: Outputs{HLS: true, Push: []Push{{URL: "rtmp://h:port/live/k"}}},
+	}
+	for _, u := range []string{s.Inputs[0].URL, s.Inputs[1].URL, s.Outputs.Push[0].URL} {
+		assert.Equal(t, "<invalid url>", redact.URL(u), u)
+	}
+
+	r := s.Redacted()
+	assert.Equal(t, []Input{{URL: "xxxxx"}, {URL: "xxxxx"}, {URL: "udp://:5000"}}, r.Inputs)
+	assert.Equal(t, []Push{{URL: "xxxxx"}}, r.Outputs.Push)
+	b, err := json.Marshal(r)
+	require.NoError(t, err)
+	for _, secret := range []string{"p%ss", "pw", "admin", "port", "/live/k", "invalid"} {
+		assert.NotContains(t, string(b), secret)
+	}
+	assert.Equal(t, "rtsp://admin:p%ss@cam/s", s.Inputs[0].URL, "the receiver is unchanged")
+
+	// What is shown is refused when it is written back.
+	require.ErrorContains(t, r.Validate(), "inputs[0].url: holds the redaction mask")
+}
+
+// A stored passphrase is shown as the mask, and none as nothing.
+func TestRedactedPassphrase(t *testing.T) {
+	s := full()
+	s.Outputs.SRTPassphrase = "Zq7-Vb2_Kx9.Wm4~"
+	r := s.Redacted()
+	assert.Equal(t, "xxxxx", r.Outputs.SRTPassphrase)
+	assert.Equal(t, "Zq7-Vb2_Kx9.Wm4~", s.Outputs.SRTPassphrase, "the receiver is unchanged")
+	b, err := json.Marshal(r)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"srt_passphrase":"xxxxx"`)
+	for n := 4; n <= len("Zq7-Vb2_Kx9.Wm4~"); n++ {
+		for i := 0; i+n <= len("Zq7-Vb2_Kx9.Wm4~"); i++ {
+			assert.NotContains(t, string(b), "Zq7-Vb2_Kx9.Wm4~"[i:i+n])
+		}
+	}
+
+	r = full().Redacted()
+	assert.Empty(t, r.Outputs.SRTPassphrase)
+	b, err = json.Marshal(r)
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "srt_passphrase")
+}
+
 // The deep copy behind Redacted and ETag carries the M5b1 fields, and the
 // tag follows them.
 func TestCloneCopiesNewFields(t *testing.T) {

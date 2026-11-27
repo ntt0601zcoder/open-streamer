@@ -158,3 +158,27 @@ func TestDiffAudioLanguage(t *testing.T) {
 	assert.Equal(t, "vi", a.AudioLanguage)
 	assert.Equal(t, "en", b.AudioLanguage)
 }
+
+// A change to the SRT passphrase is an outputs edit (R-T5), and the ETag
+// follows it.
+func TestDiffPassphrase(t *testing.T) {
+	with := func(p string) Stream {
+		s := full()
+		s.Outputs.SRTPassphrase = p
+		return s
+	}
+	assert.Equal(t, ChangeOutputs, Diff(with(""), with("Hk4-passphrase.1")), "set")
+	assert.Equal(t, ChangeOutputs, Diff(with("Hk4-passphrase.1"), with("Hk4-passphrase.2")), "changed")
+	assert.Equal(t, ChangeOutputs, Diff(with("Hk4-passphrase.1"), with("")), "removed")
+	assert.Equal(t, ChangeNone, Diff(with("Hk4-passphrase.1"), with("Hk4-passphrase.1")), "equal")
+	assert.Equal(t, ChangeNone, Diff(with(""), with("")), "equal, none")
+
+	assert.Equal(t, with("Hk4-passphrase.1").ETag(), with("Hk4-passphrase.1").ETag())
+	assert.NotEqual(t, with("Hk4-passphrase.1").ETag(), with("Hk4-passphrase.2").ETag())
+	assert.NotEqual(t, with("Hk4-passphrase.1").ETag(), with("").ETag())
+
+	// With an input changed too, the edit is live, as for any output.
+	s := with("Hk4-passphrase.1")
+	s.Inputs[0].URL = "udp://:7000"
+	assert.Equal(t, ChangeLive, Diff(with(""), s))
+}

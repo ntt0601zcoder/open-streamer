@@ -16,4 +16,16 @@
 // touches: none, outputs only, live (the inputs or the watermark, applied
 // to the running pipeline) and rebuild. Assets names the asset files a
 // document refers to: the watermark's image or font.
+//
+// A document's secrets are the credentials inside its input and push URLs
+// and outputs.srt_passphrase. They are write-only: Redacted is the view
+// every response shows, with each secret replaced by the mask xxxxx, and
+// Unmask resolves a document that was written back with masks in it against
+// the stored one. A mask stands only for a stored URL of the same stream
+// and the same list whose redacted form equals the sent text, so changing
+// anything around a mask (host, port, user, path) needs the secret typed
+// again. Masks of one form that stand for several stored values are
+// resolved by order of occurrence when their counts are equal, and refused
+// otherwise (KeepSecrets). Validate refuses a mask wherever it is left, so
+// one is never stored.
 package spec
