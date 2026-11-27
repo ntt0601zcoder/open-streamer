@@ -39,12 +39,15 @@ func TestOpenErrorsHideEmbeddedCredentials(t *testing.T) {
 		"rtsp://127.0.0.1:1/x?user=admin&password=hunter2-q",
 		"http://127.0.0.1:1/live/token=abc123tok/index.m3u8",
 		"srt://127.0.0.1:1?streamid=publish:cam:user:pw12345",
+		"rtsp://127.0.0.1:99999/user=admin_password=tlJwpbo6", // refused by Parse: an invalid port
 	} {
 		t.Run("", func(t *testing.T) {
 			t.Parallel()
 			var texts []string
 			if _, err := Parse(u); err != nil {
 				texts = append(texts, err.Error())
+			} else if strings.Contains(u, ":99999/") {
+				t.Fatalf("Parse(%q) succeeded", Redact(u))
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()

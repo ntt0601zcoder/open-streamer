@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"net/url"
+	"slices"
 	"sync"
 	"testing"
 
@@ -234,8 +235,8 @@ var embeddedRows = []struct{ in, want string }{
 	{"rtsp://192.0.2.1/user=admin&password=p%2Fq&channel=1", "rtsp://192.0.2.1/user=admin&password=xxxxx&channel=1"},
 	// x%26y=z hidden whole: the escaped & starts no pair "y".
 	{"rtsp://192.0.2.1/user=admin&password=x%26y=z&channel=1", "rtsp://192.0.2.1/user=admin&password=xxxxx&channel=1"},
-	// ; in a query.
-	{"rtsp://cam/av_stream?user=admin;password=x;channel=1", "rtsp://cam/av_stream?user=admin;password=xxxxx;channel=1"},
+	// ; in a query: before a secret it separates pairs; a secret runs to the next & (review ruling I3).
+	{"rtsp://cam/av_stream?user=admin;password=x;channel=1", "rtsp://cam/av_stream?user=admin;password=xxxxx"},
 	{"http://cam/videostream.cgi?loginuse=admin&loginpas=12345", "http://cam/videostream.cgi?loginuse=admin&loginpas=xxxxx"},
 	{"http://cam/snap?authbasic=YWRtaW46eA==", "http://cam/snap?authbasic=xxxxx"},
 	{"https://cdn/x.m3u8?jwt=e30.e30.sig&md5=abc&hash=def", "https://cdn/x.m3u8?jwt=xxxxx&md5=xxxxx&hash=xxxxx"},
@@ -280,6 +281,52 @@ var embeddedRows = []struct{ in, want string }{
 	{"file:///media/pass=1/x.ts", "file:///media/pass=xxxxx/x.ts"},
 }
 
+// reviewRows are the rows of the Task 1 review's rulings (fix round 1).
+var reviewRows = []struct{ in, want string }{
+	// I1: rule 5 writes the decoded path, so rule 3 runs again on it.
+	{"rtmp://h/app/password%3DS3CR3T/streamkey1", "rtmp://h/app/password=xxxxx/stxxxxx"},
+	{"rtmp://h/app/user=a%26password=S3CR3T/key", "rtmp://h/app/user=a&password=xxxxx/kexxxxx"},
+	{"rtmp://h/app/a%2Fpassword=S3CR3T/key", "rtmp://h/app/a/password=xxxxx/kexxxxx"},
+	{"rtmp://h/token%3DS3CR3T/live/key", "rtmp://h/token=xxxxx/live/kexxxxx"},
+	// I3: a secret value in a query runs to the next &.
+	{"http://h/x?password=a;b=S3CR3T", "http://h/x?password=xxxxx"},
+	{"http://h/x?user=admin;password=x", "http://h/x?user=admin;password=xxxxx"},
+	{"srt://h:9000?streamid=publish:path:user:a;b=S3CR3T", "srt://h:9000?streamid=publish:path:user:xxxxx"},
+	// I4: a name is judged apart from the pair grammar.
+	{"rtsp://h/user=admin_api%5Fkey=S3CR3T", "rtsp://h/user=admin_api%5Fkey=xxxxx"},
+	{"rtsp://h/user=admin&password_b64=S3CR3T", "rtsp://h/user=admin&password_b64=xxxxx"},
+	{"rtsp://h/user=admin&token_v2=S3CR3T", "rtsp://h/user=admin&token_v2=xxxxx"},
+	{"rtsp://h/user=admin&pwd_enc=S3CR3T&channel=1", "rtsp://h/user=admin&pwd_enc=xxxxx&channel=1"},
+	{"rtsp://h/user=admin_secret_id=S3CR3T", "rtsp://h/user=admin_secret_id=xxxxx"},
+	{"rtsp://h/user=admin&pass.word=S3CR3T", "rtsp://h/user=admin&pass.word=xxxxx"},
+	{"rtsp://h/user=admin&my.password=S3CR3T", "rtsp://h/user=admin&my.password=xxxxx"},
+	{"rtsp://h/user=admin&password%20=S3CR3T", "rtsp://h/user=admin&password%20=xxxxx"},
+	{"rtsp://h/user=admin&2password=S3CR3T", "rtsp://h/user=admin&2password=xxxxx"},
+	{"rtsp://h/user=admin&password[0]=S3CR3T", "rtsp://h/user=admin&password[0]=xxxxx"},
+	{"rtsp://h/x%3Fpassword=S3CR3T", "rtsp://h/x%3Fpassword=xxxxx"},
+	{"rtsp://h/user=admin:password=S3CR3T", "rtsp://h/user=admin:password=xxxxx"},
+	{"rtsp://h/admin.password=S3CR3T", "rtsp://h/admin.password=xxxxx"},
+	{"rtsp://h/admin+password=S3CR3T", "rtsp://h/admin+password=xxxxx"},
+	// A whole secret name after a byte that is no letter or digit.
+	{"rtsp://h/user=admin_pw=S3CR3T_channel=1", "rtsp://h/user=admin_pw=xxxxx_channel=1"},
+	{"srt://h:9000?streamid=live%2Fcam%3Fhdnts%3DS3CR3T", "srt://h:9000?streamid=live%2Fcam%3Fhdnts%3Dxxxxx"},
+	{"http://h/x#cb?sig=S3CR3T", "http://h/x#cb?sig=xxxxx"},
+	// I4's accepted cost.
+	{"rtsp://h/user=passenger_channel=1", "rtsp://h/user=passenger_channel=xxxxx"},
+	// I5: in a streamid and the fragment, / and ? are pair boundaries; a streamid is walked once decoded.
+	{"srt://h:9000?streamid=live/cam/token=S3CR3T", "srt://h:9000?streamid=live/cam/token=xxxxx"},
+	{"srt://h:9000?streamid=live/cam?token=S3CR3T", "srt://h:9000?streamid=live/cam?token=xxxxx"},
+	{"srt://h:9000?streamid=%23!::r=cam%2Ctoken%3DS3CR3T", "srt://h:9000?streamid=%23!::r=cam%2Ctoken%3Dxxxxx"},
+	{"srt://h:9000?streamid=srt%3A%2F%2Fh%3A9999%2Fapp%2Fstream%3Fpolicy%3Dp%26signature%3DS3CR3T", "srt://h:9000?streamid=srt%3A%2F%2Fh%3A9999%2Fapp%2Fstream%3Fpolicy%3Dp%26signature%3Dxxxxx"},
+	{"http://h/x#a/password=S3CR3T", "http://h/x#a/password=xxxxx"},
+	{"http://h/x#?token=S3CR3T", "http://h/x#?token=xxxxx"},
+	{"http://h/x#x?password=S3CR3T", "http://h/x#x?password=xxxxx"},
+	// I6: MediaMTX's #!:: form, its s key and any secret name.
+	{"srt://h:9000?streamid=%23!::m=publish,r=cam,u=user,s=S3CR3T", "srt://h:9000?streamid=%23!::m=publish,r=cam,u=user,s=xxxxx"},
+	{"srt://h:9000?streamid=%23!::s=S3CR3T,r=cam", "srt://h:9000?streamid=%23!::s=xxxxx,r=cam"},
+	{"srt://h:9000?streamid=%23!::r=cam,password=S3CR3T", "srt://h:9000?streamid=%23!::r=cam,password=xxxxx"},
+}
+
 // unchangedRows come back from URL byte for byte.
 var unchangedRows = []string{
 	"rtsp://cam/Streaming/Channels/101",
@@ -291,7 +338,7 @@ var unchangedRows = []string{
 }
 
 func TestURLEmbeddedCredentials(t *testing.T) {
-	for _, r := range embeddedRows {
+	for _, r := range slices.Concat(embeddedRows, reviewRows) {
 		assert.Equal(t, r.want, URL(r.in), r.in)
 	}
 	for _, x := range unchangedRows {
@@ -303,7 +350,7 @@ func TestURLEmbeddedCredentials(t *testing.T) {
 }
 
 func TestMaskedEmbeddedCredentials(t *testing.T) {
-	for _, r := range embeddedRows {
+	for _, r := range slices.Concat(embeddedRows, reviewRows) {
 		assert.False(t, Masked(r.in), r.in)
 		assert.True(t, Masked(r.want), r.want)
 		assert.Equal(t, r.want, URL(r.want), "URL of %q", r.want)
@@ -328,7 +375,7 @@ func TestConstants(t *testing.T) {
 // nothing. A string whose only "://" sits elsewhere, such as inside a
 // hidden value, is not a URL: hiding can take its "://" away.
 func FuzzURL(f *testing.F) {
-	for _, r := range embeddedRows {
+	for _, r := range slices.Concat(embeddedRows, reviewRows) {
 		f.Add(r.in)
 	}
 	for _, x := range unchangedRows {
