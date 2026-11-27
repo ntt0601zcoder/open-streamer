@@ -13,15 +13,13 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/redact"
 )
 
-// mask replaces the value of an attribute with a secret-like name.
-const mask = "xxxxx"
-
 // urlLike matches a URL-shaped substring. It runs to the next white space
 // because net/url accepts quotes and most punctuation in the userinfo, so
 // stopping earlier would leave the tail of a password in the log.
 var urlLike = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
 
-// secretKeys are the lower-cased attribute names whose values are always hidden.
+// secretKeys are the lower-cased attribute names whose values are always
+// hidden, beside every redact.SecretName.
 var secretKeys = map[string]bool{
 	"token": true, "password": true, "passphrase": true, "secret": true, "authorization": true,
 	"key": true, "api_key": true, "stream_key": true, "streamkey": true, "passwd": true,
@@ -100,10 +98,11 @@ func (h *handler) WithGroup(name string) slog.Handler {
 }
 
 // scrubAttr returns a with LogValuers resolved, strings and errors scrubbed,
-// groups scrubbed recursively and a secret-named value replaced by mask.
+// groups scrubbed recursively and the value of an attribute whose key is in
+// secretKeys or is a redact.SecretName replaced by redact.Mask.
 func scrubAttr(a slog.Attr) slog.Attr {
-	if secretKeys[strings.ToLower(a.Key)] {
-		return slog.String(a.Key, mask)
+	if secretKeys[strings.ToLower(a.Key)] || redact.SecretName(a.Key) {
+		return slog.String(a.Key, redact.Mask)
 	}
 	v := a.Value.Resolve()
 	switch v.Kind() {

@@ -3,10 +3,12 @@ package redact
 import (
 	"bytes"
 	"crypto/sha256"
+	"net/url"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Fake credentials are assembled from parts so secret scanners do not flag
@@ -192,4 +194,181 @@ func TestRTMPScheme(t *testing.T) {
 	for _, s := range []string{"", "rtsp", "rtsps", "rtsps+insecure", "rtmpt", "rtmp+insecure", "http", "rtmps+"} {
 		assert.False(t, RTMPScheme(s), s)
 	}
+}
+
+func TestSecretName(t *testing.T) {
+	for _, n := range []string{
+		"password", "Password", "PASSWD", "pwd", "psw", "pw", "pass", "passphrase", "secret", "client_secret",
+		"token", "access_token", "hdnts", "hdnea", "wmsauthsign", "sig", "signature", "X-Amz-Signature",
+		"X-Amz-Credential", "X-Amz-Security-Token", "auth", "key", "apikey", "api_key", "authkey", "streamkey",
+		"stream_key", "loginpas", "authbasic", "jwt", "id_jwt", "hmac", "hash", "md5",
+	} {
+		assert.True(t, SecretName(n), n)
+	}
+	name, err := url.PathUnescape("pass%77ord")
+	require.NoError(t, err)
+	assert.True(t, SecretName(name), "pass%77ord after the caller's unescape")
+	for _, n := range []string{
+		"user", "username", "usr", "channel", "stream", "subtype", "mode", "transport", "latency", "streamid",
+		"iface", "loop", "pace", "pkt_size", "Policy", "Key-Pair-Id", "author", "keyframe", "design", "loginuse",
+		"hashtag",
+	} {
+		assert.False(t, SecretName(n), n)
+	}
+}
+
+// embeddedRows are R-T2's rows: an input and what URL returns for it.
+var embeddedRows = []struct{ in, want string }{
+	// Xiongmai, & form.
+	{"rtsp://192.0.2.1:554/user=admin&password=s3cret&channel=1&stream=0.sdp?real_stream", "rtsp://192.0.2.1:554/user=admin&password=xxxxx&channel=1&stream=0.sdp?real_stream"},
+	// Xiongmai, _ form.
+	{"rtsp://192.0.2.1/user=admin_password=tlJwpbo6_channel=1_stream=0.sdp?real_stream", "rtsp://192.0.2.1/user=admin_password=xxxxx_channel=1_stream=0.sdp?real_stream"},
+	// A password with _.
+	{"rtsp://192.0.2.1/user=admin_password=a_b_channel=1", "rtsp://192.0.2.1/user=admin_password=xxxxx_channel=1"},
+	// Empty.
+	{"rtsp://192.0.2.1/user=admin&password=&channel=1", "rtsp://192.0.2.1/user=admin&password=xxxxx&channel=1"},
+	{"rtsp://192.0.2.1/USER=admin&PASSWORD=x&channel=1", "rtsp://192.0.2.1/USER=admin&PASSWORD=xxxxx&channel=1"},
+	// A name keeps its bytes, the value x%26y is hidden whole and channel=1 is kept.
+	{"rtsp://192.0.2.1/user=admin&pass%77ord=x%26y&channel=1", "rtsp://192.0.2.1/user=admin&pass%77ord=xxxxx&channel=1"},
+	// p%2Fq hidden whole: no "q" is left, channel=1 kept, one segment.
+	{"rtsp://192.0.2.1/user=admin&password=p%2Fq&channel=1", "rtsp://192.0.2.1/user=admin&password=xxxxx&channel=1"},
+	// x%26y=z hidden whole: the escaped & starts no pair "y".
+	{"rtsp://192.0.2.1/user=admin&password=x%26y=z&channel=1", "rtsp://192.0.2.1/user=admin&password=xxxxx&channel=1"},
+	// ; in a query.
+	{"rtsp://cam/av_stream?user=admin;password=x;channel=1", "rtsp://cam/av_stream?user=admin;password=xxxxx;channel=1"},
+	{"http://cam/videostream.cgi?loginuse=admin&loginpas=12345", "http://cam/videostream.cgi?loginuse=admin&loginpas=xxxxx"},
+	{"http://cam/snap?authbasic=YWRtaW46eA==", "http://cam/snap?authbasic=xxxxx"},
+	{"https://cdn/x.m3u8?jwt=e30.e30.sig&md5=abc&hash=def", "https://cdn/x.m3u8?jwt=xxxxx&md5=xxxxx&hash=xxxxx"},
+	// A query is not split at _ (base64url).
+	{"https://cdn/x.m3u8?token=ab_cd=", "https://cdn/x.m3u8?token=xxxxx"},
+	// cd starts no pair.
+	{"https://cdn/x.m3u8?token=ab;cd", "https://cdn/x.m3u8?token=xxxxx"},
+	// & is a hard split, as at HEAD.
+	{"https://cdn/x.m3u8?key=x&flag", "https://cdn/x.m3u8?key=xxxxx&flag"},
+	{"https://cdn/x.m3u8?user=u&real_stream&password=x", "https://cdn/x.m3u8?user=u&real_stream&password=xxxxx"},
+	// Rule 3, then rule 5.
+	{"rtmp://h/app/key=abcdef", "rtmp://h/app/kexxxxx"},
+	// All after the third colon.
+	{"srt://h:9000?streamid=publish:cam:user:pw:12:345", "srt://h:9000?streamid=publish:cam:user:xxxxx"},
+	// Also when empty.
+	{"srt://h:9000?streamid=publish:cam:user:", "srt://h:9000?streamid=publish:cam:user:xxxxx"},
+	// Not the last segment.
+	{"rtsp://192.0.2.1/live/user=admin&password=x/ch1", "rtsp://192.0.2.1/live/user=admin&password=xxxxx/ch1"},
+	// The M2c note.
+	{"rtsp://cam/av_stream?user=admin&password=x", "rtsp://cam/av_stream?user=admin&password=xxxxx"},
+	{"rtsp://cam/h264/ch1/main/av_stream?username=admin&passwd=x", "rtsp://cam/h264/ch1/main/av_stream?username=admin&passwd=xxxxx"},
+	// Foscam.
+	{"http://cam/videostream.cgi?user=admin&pwd=x", "http://cam/videostream.cgi?user=admin&pwd=xxxxx"},
+	{"rtsp://cam/videoMain?usr=admin&pwd=x", "rtsp://cam/videoMain?usr=admin&pwd=xxxxx"},
+	{"http://cam/axis-cgi/mjpg/video.cgi?auth=YWRtaW46YWRtaW4=", "http://cam/axis-cgi/mjpg/video.cgi?auth=xxxxx"},
+	{"https://cdn/live.m3u8?hdnts=exp=1~acl=/*~hmac=abc", "https://cdn/live.m3u8?hdnts=xxxxx"},
+	{"https://cdn/live.m3u8?Policy=p&Signature=s&Key-Pair-Id=K1", "https://cdn/live.m3u8?Policy=p&Signature=xxxxx&Key-Pair-Id=K1"},
+	{"https://s3/x.ts?X-Amz-Credential=c&X-Amz-Signature=s&X-Amz-Security-Token=t&X-Amz-Date=d", "https://s3/x.ts?X-Amz-Credential=xxxxx&X-Amz-Signature=xxxxx&X-Amz-Security-Token=xxxxx&X-Amz-Date=d"},
+	{"http://h/live/token=abc123/index.m3u8", "http://h/live/token=xxxxx/index.m3u8"},
+	// MediaMTX.
+	{"srt://h:9000?streamid=publish:cam:user:pw12345", "srt://h:9000?streamid=publish:cam:user:xxxxx"},
+	{"srt://h:9000?streamid=%23!::r=live/cam,token=abc", "srt://h:9000?streamid=%23!::r=live/cam,token=xxxxx"},
+	{"srt://h:9000?streamid=live/cam&passphrase=0123456789", "srt://h:9000?streamid=live/cam&passphrase=xxxxx"},
+	{"rtsp://h/x#password=abc", "rtsp://h/x#password=xxxxx"},
+	// Kept from today.
+	{"rtsp://u:pw@cam/s", "rtsp://u:xxxxx@cam/s"},
+	{"rtmp://h/live/abcdef", "rtmp://h/live/abxxxxx"},
+	{"rtmps://h/live/abcdef", "rtmps://h/live/abxxxxx"},
+	{"rtmps+insecure://h/live/abcdef", "rtmps+insecure://h/live/abxxxxx"},
+	// Over-masked, by R-T2.
+	{"http://h/x?passthrough=1", "http://h/x?passthrough=xxxxx"},
+	{"file:///media/pass=1/x.ts", "file:///media/pass=xxxxx/x.ts"},
+}
+
+// unchangedRows come back from URL byte for byte.
+var unchangedRows = []string{
+	"rtsp://cam/Streaming/Channels/101",
+	"rtsp://cam/cam/realmonitor?channel=1&subtype=0",
+	"http://h/a=b/c",
+	"udp://239.0.0.1:1234?pkt_size=1316",
+	"srt://h:9000?streamid=live/cam&latency=200&mode=listen",
+	"rtsp://h/user=admin_channel=1",
+}
+
+func TestURLEmbeddedCredentials(t *testing.T) {
+	for _, r := range embeddedRows {
+		assert.Equal(t, r.want, URL(r.in), r.in)
+	}
+	for _, x := range unchangedRows {
+		assert.Equal(t, x, URL(x))
+	}
+	// Nothing of a hidden value is left.
+	assert.NotContains(t, URL("rtsp://192.0.2.1/user=admin&password=p%2Fq&channel=1"), "q&")
+	assert.NotContains(t, URL("rtsp://192.0.2.1/user=admin_password=tlJwpbo6_channel=1"), "tlJwpbo6")
+}
+
+func TestMaskedEmbeddedCredentials(t *testing.T) {
+	for _, r := range embeddedRows {
+		assert.False(t, Masked(r.in), r.in)
+		assert.True(t, Masked(r.want), r.want)
+		assert.Equal(t, r.want, URL(r.want), "URL of %q", r.want)
+	}
+	for _, x := range unchangedRows {
+		assert.False(t, Masked(x), x)
+		assert.Equal(t, x, URL(x))
+	}
+}
+
+func TestConstants(t *testing.T) {
+	assert.Equal(t, "xxxxx", Mask)
+	assert.Equal(t, "<invalid url>", Invalid)
+	assert.Equal(t, Invalid, URL("http://[::1"))
+	assert.Equal(t, Invalid, URL(Invalid))
+	assert.False(t, Masked(Invalid))
+}
+
+// FuzzURL checks R-T2's postcondition: for a URL (a string that starts with
+// its scheme and "://") that Masked does not report, Masked(URL(u)) is
+// true exactly when URL hid something, and URL of its own result changes
+// nothing. A string whose only "://" sits elsewhere, such as inside a
+// hidden value, is not a URL: hiding can take its "://" away.
+func FuzzURL(f *testing.F) {
+	for _, r := range embeddedRows {
+		f.Add(r.in)
+	}
+	for _, x := range unchangedRows {
+		f.Add(x)
+	}
+	f.Add("srt://h:9000?streamid=publish%3Acam%3Auser%3Apw")
+	f.Add("srt://h:9000?streamid=%23!::token=abc,r=x")
+	f.Add("rtmp://h/token=abc/key")
+	f.Fuzz(func(t *testing.T, u string) {
+		p, err := url.Parse(u)
+		if err != nil || !schemeURL(u, p) || Masked(u) {
+			return
+		}
+		out, hid := redactURL(u)
+		if Masked(out) != hid {
+			t.Errorf("URL(%q) = %q, hid %v, Masked %v", u, out, hid, Masked(out))
+		}
+		if again := URL(out); again != out {
+			t.Errorf("URL(%q) = %q, URL of that = %q", u, out, again)
+		}
+	})
+}
+
+func TestURLShortStreamKeyIdempotent(t *testing.T) {
+	for _, x := range []string{"rtmp://h/live/ab", "rtmp:///0", "rtmps://h/live/s"} {
+		once := URL(x)
+		assert.True(t, Masked(once), once)
+		assert.Equal(t, once, URL(once), x)
+	}
+}
+
+func TestURLEmptyAuthorityKeepsScheme(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"srt://?token=t", "srt://?token=xxxxx"},
+		{"a://#pass=", "a://#pass=xxxxx"},
+	} {
+		got := URL(c.in)
+		assert.Equal(t, c.want, got, c.in)
+		assert.True(t, Masked(got), got)
+		assert.Equal(t, got, URL(got))
+	}
+	assert.Equal(t, "srt:?mode=listener", URL("srt://?mode=listener"), "nothing hidden: as at HEAD")
 }

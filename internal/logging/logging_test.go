@@ -251,3 +251,37 @@ func TestHandlerScrubsURLValue(t *testing.T) {
 		}
 	}
 }
+
+func TestScrubEmbeddedCredentials(t *testing.T) {
+	var buf bytes.Buffer
+	log, err := New(&buf, "debug", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Info("open rtsp://192.0.2.1/user=admin_password=tlJwpbo6_channel=1: refused",
+		"pwd", "pwdvalue7", "srt_passphrase", "passvalue7", "X-Amz-Signature", "sigvalue7", "api_key", "keyvalue7",
+		"user", "admin7", "stream", "cam7", "input", "rtsp://cam/s7")
+	out := buf.String()
+	for _, s := range []string{"tlJwpbo6", "pwdvalue7", "passvalue7", "sigvalue7", "keyvalue7"} {
+		if strings.Contains(out, s) {
+			t.Errorf("%q leaked in %s", s, out)
+		}
+	}
+	var m map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"pwd", "srt_passphrase", "X-Amz-Signature", "api_key"} {
+		if m[k] != "xxxxx" {
+			t.Errorf("%s = %v, want xxxxx", k, m[k])
+		}
+	}
+	for k, v := range map[string]string{"user": "admin7", "stream": "cam7", "input": "rtsp://cam/s7"} {
+		if m[k] != v {
+			t.Errorf("%s = %v, want %s", k, m[k], v)
+		}
+	}
+	if !strings.Contains(m["msg"].(string), "user=admin_password=xxxxx_channel=1") {
+		t.Errorf("msg = %v", m["msg"])
+	}
+}
