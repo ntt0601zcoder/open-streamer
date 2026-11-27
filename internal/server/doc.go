@@ -58,6 +58,17 @@
 // for an apply that waits for a rebuild. Stale is not in the snapshot: it is
 // asked of the file at every ConfigStatus, under the File's own mutex.
 //
+// # SRT passphrase
+//
+// A stream's outputs.srt_passphrase is asked of the SRT callers of its
+// served names: the SRT server's Secure option is Manager.SRT, which gives
+// the hub and the passphrase from one reading of the stream's state and
+// answers not-found while no manager is in force. A changed passphrase ends
+// the stream's SRT sessions. /metrics counts the refusals as
+// openstreamer_output_rejected_total{output="srt"} with reason "secret" (a
+// missing or wrong passphrase) and "limited" (a peer refused unchecked after
+// repeated wrong ones).
+//
 // # Goroutines
 //
 // New starts the RTSP and the SRT server's accept loops, the RTMP

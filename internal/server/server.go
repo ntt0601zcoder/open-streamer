@@ -390,6 +390,17 @@ func (s *Server) lookup(out stream.Output) func(string) (*hub.Hub, bool) {
 	}
 }
 
+// secureSRT asks the manager in force for the hub of a served name and the
+// passphrase its SRT callers must present, from one reading of the stream's
+// state. It answers ok == false while there is no manager.
+func (s *Server) secureSRT(name string) (*hub.Hub, string, bool) {
+	m := s.manager.Load()
+	if m == nil {
+		return nil, "", false
+	}
+	return m.SRT(name)
+}
+
 // listen binds every listener of sec, fills s.addrs and returns the claims
 // of what was bound. On an error the caller closes what was bound so far.
 func (s *Server) listen(sec config.Server) ([]stream.Claim, error) {
@@ -703,9 +714,10 @@ func serveErr(err error) error {
 // startSRT serves SRT receivers on sec's address. It returns once the
 // listener is bound.
 func (s *Server) startSRT(sec config.Server) error {
-	srv := srtout.New(s.lookup(stream.OutSRT), srtout.Options{
+	srv := srtout.New(nil, srtout.Options{
 		App:     sec.SRT.App,
 		Latency: time.Duration(sec.SRT.LatencyMS) * time.Millisecond,
+		Secure:  s.secureSRT,
 	})
 	if err := srv.Listen(sec.SRT.Listen); err != nil {
 		return err

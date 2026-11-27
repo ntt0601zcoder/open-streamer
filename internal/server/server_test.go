@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/datarhei/gosrt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -871,4 +872,155 @@ func TestStatusAndShotThroughTheAPI(t *testing.T) {
 	assert.NotContains(t, res.body, "rtmp://src.example/live/cam")
 	_, etag := s.ConfigText()
 	assert.Equal(t, etag, res.header.Get("ETag"))
+}
+
+const (
+	srtPassA = "srtpass-0123456789"
+	srtPassB = "srtpass-9876543210"
+)
+
+// srtCaller dials the server's SRT listener for stream name with the passphrase
+// pass ("" for none).
+func srtCaller(addr, name, pass string) (srt.Conn, error) {
+	cfg := srt.DefaultConfig()
+	cfg.StreamId = "live/" + name
+	cfg.ConnectionTimeout = 3 * time.Second
+	cfg.Passphrase = pass
+	return srt.Dial("srt", addr, cfg)
+}
+
+// srtRead reads from c until it has 10000 bytes and returns whether it did.
+func srtRead(c srt.Conn) bool {
+	const n = 10000
+	buf := make([]byte, 2048)
+	got := 0
+	_ = c.SetReadDeadline(time.Now().Add(waitFor))
+	for got < n {
+		k, err := c.Read(buf)
+		if err != nil {
+			return false
+		}
+		got += k
+	}
+	return true
+}
+
+func TestSRTPassphrase(t *testing.T) {
+	locked := streamYAML("locked", `{srt: true, srt_passphrase: "`+srtPassA+`"}`)
+	s := testConfig(t, func(su *setup) {
+		su.Text = baseText(streamYAML("open", "{srt: true}"), locked)
+	})
+	addr := s.Addrs().SRT
+	rejected := func(reason string) float64 {
+		return s.metric("openstreamer_output_rejected_total", "output", "srt", "reason", reason)
+	}
+
+	// Plays: the streams run once a caller reads from them.
+	var open srt.Conn
+	require.Eventually(t, func() bool {
+		c, err := srtCaller(addr, "open", "")
+		if err != nil {
+			return false
+		}
+		open = c
+		return true
+	}, waitFor, 50*time.Millisecond)
+	assert.True(t, srtRead(open))
+	require.NoError(t, open.Close())
+
+	var reader srt.Conn
+	require.Eventually(t, func() bool {
+		c, err := srtCaller(addr, "locked", srtPassA)
+		if err != nil {
+			return false
+		}
+		reader = c
+		return true
+	}, waitFor, 50*time.Millisecond)
+	t.Cleanup(func() { _ = reader.Close() })
+	assert.True(t, srtRead(reader))
+
+	// Refusals.
+	before := rejected("secret")
+	_, err := srtCaller(addr, "locked", "")
+	require.Error(t, err)
+	_, err = srtCaller(addr, "locked", "wrongwrong-0123")
+	require.Error(t, err)
+	assert.GreaterOrEqual(t, rejected("secret")-before, 2.0)
+	_, err = srtCaller(addr, "open", srtPassA)
+	require.Error(t, err)
+
+	// A changed passphrase ends the session within 2 s.
+	ended := func() float64 {
+		return s.metric("openstreamer_output_sessions_ended_total", "output", "srt", "reason", "hub_closed")
+	}
+	endedBefore := ended()
+	st, ok := s.Status("locked")
+	require.True(t, ok)
+	rebuilds := st.Rebuilds
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			_ = reader.SetReadDeadline(time.Now().Add(waitFor))
+			if _, err := reader.Read(buf); err != nil {
+				readDone <- err
+				return
+			}
+		}
+	}()
+	t0 := time.Now()
+	cur, _ := s.Get("locked")
+	cur.Outputs.SRTPassphrase = srtPassB
+	_, _, err = s.PutStream(context.Background(), cur, "")
+	require.NoError(t, err)
+	select {
+	case <-readDone:
+		assert.Less(t, time.Since(t0), 2*time.Second)
+	case <-time.After(waitFor):
+		require.Fail(t, "the caller's Read did not end")
+	}
+	require.Eventually(t, func() bool { return ended()-endedBefore >= 1 }, 2*time.Second, 20*time.Millisecond)
+	assert.InDelta(t, 1, ended()-endedBefore, 0)
+	st, _ = s.Status("locked")
+	assert.Equal(t, rebuilds, st.Rebuilds)
+
+	var fresh srt.Conn
+	require.Eventually(t, func() bool {
+		c, err := srtCaller(addr, "locked", srtPassB)
+		if err != nil {
+			return false
+		}
+		fresh = c
+		return true
+	}, waitFor, 50*time.Millisecond)
+	assert.True(t, srtRead(fresh))
+	require.NoError(t, fresh.Close())
+	_, err = srtCaller(addr, "locked", srtPassA)
+	require.Error(t, err)
+
+	// The passphrase removed: a plain caller reads.
+	cur, _ = s.Get("locked")
+	cur.Outputs.SRTPassphrase = ""
+	_, _, err = s.PutStream(context.Background(), cur, "")
+	require.NoError(t, err)
+	var plain srt.Conn
+	require.Eventually(t, func() bool {
+		c, err := srtCaller(addr, "locked", "")
+		if err != nil {
+			return false
+		}
+		plain = c
+		return true
+	}, waitFor, 50*time.Millisecond)
+	assert.True(t, srtRead(plain))
+	require.NoError(t, plain.Close())
+
+	// Neither passphrase is in a log line or in /metrics.
+	res := s.do(http.MethodGet, "/metrics", "ops", "")
+	require.Equal(t, http.StatusOK, res.code)
+	for _, p := range []string{srtPassA, srtPassB} {
+		assert.NotContains(t, res.body, p)
+		assert.NotContains(t, s.logs.String(), p)
+	}
 }

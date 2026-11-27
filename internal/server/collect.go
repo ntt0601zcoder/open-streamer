@@ -102,6 +102,8 @@ func (s *Server) collect(w *metrics.Writer) {
 				{"mode", x.RejectedMode},
 				{"caps", x.RejectedCaps},
 				{"mss", x.RejectedMSS},
+				{"secret", x.RejectedSecret},
+				{"limited", x.RejectedLimited},
 			},
 		})
 	}
