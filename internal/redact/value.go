@@ -156,7 +156,9 @@ func HidesNew(v string) (r string, hid, read bool) {
 // server reads it: when URL hides something in the whole that the tokens
 // did not (a secret that holds a space), the value is URL's form of it.
 // That is repeated until nothing changes. The value is the bare mask when
-// a token cannot be read or when it does not settle.
+// a token cannot be read, when it does not settle, or when something was
+// hidden and the result would not be known for a mask again (Masked,
+// HoldsMask).
 //
 // With isURL, v is a field that holds one URL (a url key), and one that
 // does not parse as a whole is the bare mask, whatever it starts with.
@@ -170,12 +172,26 @@ func Value(v string, isURL bool) string {
 		return Mask
 	}
 	r := settle(v)
-	if isURL && r != v && URL(strings.TrimSpace(r)) == Invalid {
+	switch {
+	case r == v:
+		return v
+	case isURL && URL(strings.TrimSpace(r)) == Invalid:
 		// Hiding a token left a whole that no longer parses: shown
 		// again, it would be the bare mask.
 		return Mask
+	case masks(r) > masks(v) && !Masked(r) && !HoldsMask(r):
+		// Something was hidden (the mask was written), and what is left
+		// would not be known for a mask again: a write could send it
+		// back and have it stored in the secret's place.
+		return Mask
 	}
 	return r
+}
+
+// masks counts the mask's text in v, in any case: URL writes a scheme in
+// lower case, which can make that text of letters that were there.
+func masks(v string) int {
+	return strings.Count(strings.ToLower(v), Mask)
 }
 
 // settle does Value's rounds; it returns the bare mask when a token cannot

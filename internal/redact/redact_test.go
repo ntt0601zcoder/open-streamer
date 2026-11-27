@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -539,4 +541,27 @@ func TestURLNested(t *testing.T) {
 	assert.NotContains(t, got, vSecret)
 	assert.True(t, Masked(got), got)
 	assert.Equal(t, got, URL(got))
+}
+
+// The work on a URL grows with its length: a long name of bytes that are
+// no letters, and a long run of '=', were once read again for each byte
+// (found by FuzzRedactedURL: 2.8 s for a 4 KiB URL).
+func TestURLIsLinear(t *testing.T) {
+	const n = 256 << 10
+	for name, u := range map[string]string{
+		"a long name of other bytes": "a://h/?\x90!!" + strings.Repeat("\xc9", n) + "!!=a://% a://0",
+		"a run of pairs":             "a://h/?" + strings.Repeat("a=b=", n/4),
+		"nested URLs":                "a://h/" + strings.Repeat("a://b/", n/6) + "rtsp://u:" + vSecret + "@h/s",
+		"escaped nested URLs":        "a://h/" + strings.Repeat("x%3A//y/", n/8),
+		"URLs after '#'":             "a://h/#" + strings.Repeat("a://b#", n/6),
+	} {
+		start := time.Now()
+		out := URL(u)
+		Masked(out)
+		Masked(u)
+		took := time.Since(start)
+		t.Logf("%s: %d bytes in %s", name, len(u), took)
+		assert.Less(t, took, 5*time.Second, name)
+		assert.NotContains(t, out, vSecret, name)
+	}
 }

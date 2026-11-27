@@ -704,8 +704,9 @@ func eqWidth(s string, i int) int {
 // back to the previous byte of stops or escaped '=' (%3D), or to the start.
 func nameBefore(s string, eq int) string {
 	i := strings.LastIndexAny(s[:eq], stops) + 1
-	if j := max(strings.LastIndex(s[:eq], "%3D"), strings.LastIndex(s[:eq], "%3d")); j >= 0 {
-		i = max(i, j+3)
+	// An escape holds no byte of stops, so one that counts lies after i.
+	if j := max(strings.LastIndex(s[i:eq], "%3D"), strings.LastIndex(s[i:eq], "%3d")); j >= 0 {
+		i += j + 3
 	}
 	return s[i:eq]
 }
@@ -724,7 +725,13 @@ func endsIn(n string, names []string, whole func(string) bool) bool {
 	if whole(n) {
 		return true
 	}
-	for i := 0; i < len(n); i++ {
+	// Only a suffix as short as a name can be one: a long name of bytes
+	// that are no letters is not lowered once per byte.
+	longest := 0
+	for _, name := range names {
+		longest = max(longest, len(name))
+	}
+	for i := max(0, len(n)-longest-1); i < len(n); i++ {
 		if c := n[i]; !isLetter(c) && (c < '0' || c > '9') && slices.Contains(names, strings.ToLower(n[i+1:])) {
 			return true
 		}
